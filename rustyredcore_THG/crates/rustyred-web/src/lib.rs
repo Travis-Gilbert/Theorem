@@ -1,15 +1,16 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::IpAddr;
 use std::rc::Rc;
 
 use lol_html::{element, HtmlRewriter, Settings};
 use rustyred_thg_core::{
     EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphWriteResult, NodeRecord,
+    GraphWriteResult, NodeRecord, Provenance, TTL_PROPERTY,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use url::Url;
 
 pub const LABEL_CRAWL_RUN: &str = "CrawlRun";
@@ -18,6 +19,8 @@ pub const LABEL_DOMAIN: &str = "Domain";
 pub const LABEL_PAGE: &str = "Page";
 pub const LABEL_CONTENT_SNAPSHOT: &str = "ContentSnapshot";
 pub const LABEL_ROBOTS_POLICY: &str = "RobotsPolicy";
+pub const LABEL_CRAWL_RECEIPT: &str = "CrawlReceipt";
+pub const LABEL_DISCOVERY_SEED: &str = "DiscoverySeed";
 
 pub const EDGE_FETCHED: &str = "FETCHED";
 pub const EDGE_RESULTED_IN: &str = "RESULTED_IN";
@@ -26,6 +29,10 @@ pub const EDGE_LINKS_TO: &str = "LINKS_TO";
 pub const EDGE_ON_DOMAIN: &str = "ON_DOMAIN";
 pub const EDGE_ROBOTS_APPLIED: &str = "ROBOTS_APPLIED";
 pub const EDGE_CANONICAL_OF: &str = "CANONICAL_OF";
+pub const EDGE_EMITTED_RECEIPT: &str = "EMITTED_RECEIPT";
+pub const EDGE_SEEDED: &str = "SEEDED";
+
+pub type FetchedPage = FixturePage;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrawlConfig {
@@ -74,6 +81,105 @@ pub struct CrawlCounters {
     pub links: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CrawlBudget {
+    pub max_pages: usize,
+    pub max_seconds: u64,
+    pub max_depth: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for CrawlBudget {
+    fn default() -> Self {
+        Self {
+            max_pages: 25,
+            max_seconds: 30,
+            max_depth: 2,
+            max_bytes: 5 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CrawlScope {
+    pub namespace: String,
+    pub follow_offsite: bool,
+    pub ttl_expires_at_ms: Option<i64>,
+    pub source_graph: String,
+    pub source_license: String,
+    pub federable: bool,
+    pub actor_id: String,
+}
+
+impl Default for CrawlScope {
+    fn default() -> Self {
+        Self {
+            namespace: "link".to_string(),
+            follow_offsite: true,
+            ttl_expires_at_ms: None,
+            source_graph: "theorem_crawler".to_string(),
+            source_license: "unknown".to_string(),
+            federable: false,
+            actor_id: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CrawlRequest {
+    pub run_id: String,
+    pub seeds: Vec<String>,
+    pub budget: CrawlBudget,
+    pub scope: CrawlScope,
+}
+
+impl CrawlRequest {
+    pub fn new(run_id: impl Into<String>, seeds: Vec<String>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            seeds,
+            budget: CrawlBudget::default(),
+            scope: CrawlScope::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UrlGuardPolicy {
+    pub allow_loopback: bool,
+    pub allow_private_networks: bool,
+    pub block_metadata_services: bool,
+}
+
+impl Default for UrlGuardPolicy {
+    fn default() -> Self {
+        Self {
+            allow_loopback: false,
+            allow_private_networks: false,
+            block_metadata_services: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CrawlReceipt {
+    pub receipt_id: String,
+    pub run_id: String,
+    pub namespace: String,
+    pub status: String,
+    pub seed_count: usize,
+    pub counters: CrawlCounters,
+    pub graph_delta_hash: String,
+    pub budget: CrawlBudget,
+    pub scope: CrawlScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CrawlRunOutput {
+    pub graph: CrawlGraph,
+    pub receipt: CrawlReceipt,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrawlGraph {
     pub run_id: String,
@@ -117,6 +223,9 @@ impl CrawlGraph {
 pub enum RustyWebError {
     InvalidUrl { url: String, reason: String },
     HtmlParse { reason: String },
+    EmptySeeds,
+    InvalidBudget { reason: String },
+    BlockedUrl { url: String, reason: String },
 }
 
 impl fmt::Display for RustyWebError {
@@ -126,6 +235,9 @@ impl fmt::Display for RustyWebError {
                 write!(f, "invalid URL {url:?}: {reason}")
             }
             Self::HtmlParse { reason } => write!(f, "HTML parse failed: {reason}"),
+            Self::EmptySeeds => write!(f, "crawl request requires at least one seed URL"),
+            Self::InvalidBudget { reason } => write!(f, "invalid crawl budget: {reason}"),
+            Self::BlockedUrl { url, reason } => write!(f, "blocked URL {url:?}: {reason}"),
         }
     }
 }
@@ -349,6 +461,47 @@ pub fn build_fixture_crawl_graph(
     })
 }
 
+pub fn build_v2_fixture_crawl(
+    request: CrawlRequest,
+    pages: &[FetchedPage],
+) -> RustyWebResult<CrawlRunOutput> {
+    let guarded_seeds = validate_crawl_request(&request, &UrlGuardPolicy::default())?;
+    let (selected_pages, budget_limited) = select_budgeted_pages(&request.budget, pages);
+    let status = if budget_limited {
+        "budget_limited"
+    } else {
+        "completed"
+    }
+    .to_string();
+    let mut graph = build_fixture_crawl_graph(
+        CrawlConfig {
+            run_id: request.run_id.clone(),
+            namespace: request.scope.namespace.clone(),
+            user_agent: "RustyWeb/0.2 fixture".to_string(),
+        },
+        &selected_pages,
+    )?;
+
+    add_seed_nodes(&mut graph, &request, &guarded_seeds);
+    annotate_graph_for_scope(&mut graph, &request.scope);
+    let graph_delta_hash = graph_delta_hash(&graph.batch);
+    let receipt_id = crawl_receipt_id(&request.run_id, &graph_delta_hash);
+    let receipt = CrawlReceipt {
+        receipt_id,
+        run_id: request.run_id.clone(),
+        namespace: request.scope.namespace.clone(),
+        status,
+        seed_count: guarded_seeds.len(),
+        counters: graph.counters.clone(),
+        graph_delta_hash,
+        budget: request.budget.clone(),
+        scope: request.scope.clone(),
+    };
+    add_receipt_node(&mut graph, &receipt);
+
+    Ok(CrawlRunOutput { graph, receipt })
+}
+
 pub fn apply_batch_to_store(
     store: &mut impl GraphStore,
     batch: &GraphMutationBatch,
@@ -361,6 +514,36 @@ pub fn apply_batch_to_store(
         }
     }
     Ok(writes)
+}
+
+pub fn validate_crawl_request(
+    request: &CrawlRequest,
+    policy: &UrlGuardPolicy,
+) -> RustyWebResult<Vec<String>> {
+    if request.seeds.is_empty() {
+        return Err(RustyWebError::EmptySeeds);
+    }
+    if request.budget.max_pages == 0 {
+        return Err(RustyWebError::InvalidBudget {
+            reason: "max_pages must be greater than zero".to_string(),
+        });
+    }
+    if request.budget.max_seconds == 0 {
+        return Err(RustyWebError::InvalidBudget {
+            reason: "max_seconds must be greater than zero".to_string(),
+        });
+    }
+    if request.budget.max_bytes == 0 {
+        return Err(RustyWebError::InvalidBudget {
+            reason: "max_bytes must be greater than zero".to_string(),
+        });
+    }
+
+    let mut seeds = BTreeSet::new();
+    for seed in &request.seeds {
+        seeds.insert(guarded_canonicalize_url(seed, policy)?);
+    }
+    Ok(seeds.into_iter().collect())
 }
 
 pub fn canonicalize_url(raw: &str) -> RustyWebResult<String> {
@@ -379,6 +562,49 @@ pub fn canonicalize_url(raw: &str) -> RustyWebResult<String> {
             reason: format!("unsupported scheme {}", url.scheme()),
         })
     }
+}
+
+pub fn guarded_canonicalize_url(raw: &str, policy: &UrlGuardPolicy) -> RustyWebResult<String> {
+    let canonical = canonicalize_url(raw)?;
+    guard_canonical_url(&canonical, policy)?;
+    Ok(canonical)
+}
+
+pub fn guard_canonical_url(canonical: &str, policy: &UrlGuardPolicy) -> RustyWebResult<()> {
+    let url = Url::parse(canonical).map_err(|err| RustyWebError::InvalidUrl {
+        url: canonical.to_string(),
+        reason: err.to_string(),
+    })?;
+    let host =
+        url.host_str()
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| RustyWebError::InvalidUrl {
+                url: canonical.to_string(),
+                reason: "missing host".to_string(),
+            })?;
+
+    if policy.block_metadata_services && is_metadata_service_host(&host) {
+        return Err(RustyWebError::BlockedUrl {
+            url: canonical.to_string(),
+            reason: "metadata service host".to_string(),
+        });
+    }
+    if host == "localhost" && !policy.allow_loopback {
+        return Err(RustyWebError::BlockedUrl {
+            url: canonical.to_string(),
+            reason: "loopback hostname".to_string(),
+        });
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(reason) = blocked_ip_reason(ip, policy) {
+            return Err(RustyWebError::BlockedUrl {
+                url: canonical.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 pub fn extract_links(base_url: &str, html: &str) -> RustyWebResult<Vec<String>> {
@@ -416,6 +642,195 @@ pub fn extract_links(base_url: &str, html: &str) -> RustyWebResult<Vec<String>> 
     })?;
     let extracted = links.borrow().iter().cloned().collect();
     Ok(extracted)
+}
+
+pub fn graph_delta_hash(batch: &GraphMutationBatch) -> String {
+    let bytes = serde_json::to_vec(batch).unwrap_or_default();
+    blake3_hash(&bytes)
+}
+
+fn select_budgeted_pages(budget: &CrawlBudget, pages: &[FetchedPage]) -> (Vec<FetchedPage>, bool) {
+    let mut selected = Vec::new();
+    let mut consumed_bytes = 0usize;
+    let mut budget_limited = pages.len() > budget.max_pages;
+
+    for page in pages.iter().take(budget.max_pages) {
+        let next_bytes = page.body.len();
+        if consumed_bytes.saturating_add(next_bytes) > budget.max_bytes {
+            budget_limited = true;
+            break;
+        }
+        consumed_bytes += next_bytes;
+        selected.push(page.clone());
+    }
+
+    (selected, budget_limited)
+}
+
+fn add_seed_nodes(graph: &mut CrawlGraph, request: &CrawlRequest, seeds: &[String]) {
+    let run_node_id = crawl_run_id(&request.run_id);
+    for seed in seeds {
+        let seed_id = discovery_seed_id(seed);
+        graph
+            .batch
+            .mutations
+            .push(GraphMutation::NodeUpsert(NodeRecord::new(
+                seed_id.clone(),
+                [LABEL_DISCOVERY_SEED],
+                json!({
+                    "url": seed,
+                    "namespace": request.scope.namespace,
+                    "seed_hash": stable_part(seed),
+                }),
+            )));
+        graph
+            .batch
+            .mutations
+            .push(GraphMutation::EdgeUpsert(EdgeRecord::new(
+                edge_id(&run_node_id, EDGE_SEEDED, &seed_id),
+                run_node_id.clone(),
+                EDGE_SEEDED,
+                seed_id,
+                json!({"source": "crawl_request"}),
+            )));
+    }
+}
+
+fn add_receipt_node(graph: &mut CrawlGraph, receipt: &CrawlReceipt) {
+    let run_node_id = crawl_run_id(&receipt.run_id);
+    let mut properties = serde_json::to_value(receipt).unwrap_or_else(|_| {
+        json!({
+            "receipt_id": receipt.receipt_id,
+            "run_id": receipt.run_id,
+            "status": receipt.status,
+        })
+    });
+    let props = properties_object(&mut properties);
+    insert_scope_properties(props, &receipt.scope);
+    props.insert(
+        "graph_delta_hash_algorithm".to_string(),
+        Value::String("blake3".to_string()),
+    );
+
+    graph
+        .batch
+        .mutations
+        .push(GraphMutation::NodeUpsert(NodeRecord::new(
+            receipt.receipt_id.clone(),
+            [LABEL_CRAWL_RECEIPT],
+            properties,
+        )));
+    graph.batch.mutations.push(GraphMutation::EdgeUpsert(
+        EdgeRecord::new(
+            edge_id(&run_node_id, EDGE_EMITTED_RECEIPT, &receipt.receipt_id),
+            run_node_id,
+            EDGE_EMITTED_RECEIPT,
+            receipt.receipt_id.clone(),
+            json!({
+                "receipt_id": receipt.receipt_id,
+                "graph_delta_hash": receipt.graph_delta_hash,
+            }),
+        )
+        .with_provenance(provenance_for_scope(&receipt.scope)),
+    ));
+}
+
+fn annotate_graph_for_scope(graph: &mut CrawlGraph, scope: &CrawlScope) {
+    for mutation in &mut graph.batch.mutations {
+        match mutation {
+            GraphMutation::NodeUpsert(node) => {
+                let props = properties_object(&mut node.properties);
+                insert_scope_properties(props, scope);
+            }
+            GraphMutation::EdgeUpsert(edge) => {
+                let props = properties_object(&mut edge.properties);
+                insert_scope_properties(props, scope);
+                edge.provenance = Some(provenance_for_scope(scope));
+            }
+        }
+    }
+}
+
+fn properties_object(value: &mut Value) -> &mut Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value.as_object_mut().expect("object inserted above")
+}
+
+fn insert_scope_properties(properties: &mut Map<String, Value>, scope: &CrawlScope) {
+    properties.insert(
+        "source_graph".to_string(),
+        Value::String(scope.source_graph.clone()),
+    );
+    properties.insert(
+        "source_license".to_string(),
+        Value::String(scope.source_license.clone()),
+    );
+    properties.insert("federable".to_string(), Value::Bool(scope.federable));
+    properties.insert(
+        "admission_tier".to_string(),
+        Value::String("advisory".to_string()),
+    );
+    properties.insert(
+        "follow_offsite".to_string(),
+        Value::Bool(scope.follow_offsite),
+    );
+    if let Some(expires_at_ms) = scope.ttl_expires_at_ms {
+        properties.insert(TTL_PROPERTY.to_string(), json!(expires_at_ms));
+    }
+    if !scope.actor_id.is_empty() {
+        properties.insert(
+            "actor_id".to_string(),
+            Value::String(scope.actor_id.clone()),
+        );
+    }
+}
+
+fn provenance_for_scope(scope: &CrawlScope) -> Provenance {
+    Provenance {
+        source_id: Some(scope.source_graph.clone()),
+        timestamp: None,
+        method: Some("rustyweb_v2".to_string()),
+    }
+}
+
+fn is_metadata_service_host(host: &str) -> bool {
+    matches!(
+        host,
+        "169.254.169.254" | "169.254.170.2" | "metadata" | "metadata.google.internal"
+    )
+}
+
+fn blocked_ip_reason(ip: IpAddr, policy: &UrlGuardPolicy) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(ip) => {
+            if policy.block_metadata_services
+                && (ip.octets() == [169, 254, 169, 254] || ip.octets() == [169, 254, 170, 2])
+            {
+                return Some("metadata service ip address");
+            }
+            if ip.is_loopback() && !policy.allow_loopback {
+                return Some("loopback ip address");
+            }
+            if (ip.is_private() || ip.is_link_local() || ip.is_unspecified())
+                && !policy.allow_private_networks
+            {
+                return Some("private, link-local, or unspecified ip address");
+            }
+        }
+        IpAddr::V6(ip) => {
+            if ip.is_loopback() && !policy.allow_loopback {
+                return Some("loopback ip address");
+            }
+            if (ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_unspecified())
+                && !policy.allow_private_networks
+            {
+                return Some("private, link-local, or unspecified ip address");
+            }
+        }
+    }
+    None
 }
 
 fn insert_node(nodes: &mut BTreeMap<String, NodeRecord>, node: NodeRecord) {
@@ -555,6 +970,17 @@ fn content_snapshot_id(content_hash: &str) -> String {
 
 fn robots_policy_id(domain: &str) -> String {
     format!("robots_policy:{}", stable_part(domain))
+}
+
+fn discovery_seed_id(seed: &str) -> String {
+    format!("discovery_seed:{}", stable_part(seed))
+}
+
+fn crawl_receipt_id(run_id: &str, graph_delta_hash: &str) -> String {
+    format!(
+        "crawl_receipt:{}",
+        stable_part(&format!("{run_id}:{graph_delta_hash}"))
+    )
 }
 
 fn edge_id(from_id: &str, edge_type: &str, to_id: &str) -> String {

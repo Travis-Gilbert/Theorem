@@ -16,6 +16,11 @@ The current `feat/theseus-burst-crawler-scaffold` branch is useful seed code, bu
 
 - `docs/plans/commonplace/implementation-plan.md` already defines RustyWeb as the third Commonplace layer and gives V0's target: `link` tenant, URL frontier, HTTP/1.1+2, robots/politeness, streaming parse, BLAKE3 content-hash dedup, gRPC query/control, and local graph search.
 - `docs/plans/rustyweb-v1-design/` defines V1: graph-yielding discovery broker, AnswerDraft, and license-tiering.
+- `rustyredcore_THG/crates/rustyred-web` contains the RustyWeb graph kernel and
+  V2 fixture contract. It emits V0 crawl graph mutations, accepts
+  `CrawlRequest`/`CrawlBudget`/`CrawlScope`, guards seed URLs, annotates hot
+  graph mutations with TTL/license/federation metadata, and emits
+  content-addressed `CrawlReceipt` nodes.
 - `feat/theseus-burst-crawler-scaffold` contains an isolated Rust+Tokio scaffold:
   - `crates/theseus-burst-crawler/src/main.rs`
   - `crates/theseus-burst-crawler/Dockerfile`
@@ -32,7 +37,9 @@ The current `feat/theseus-burst-crawler-scaffold` branch is useful seed code, bu
 ### Not built or drifted
 
 - The active Index-API checkout has only `crates/theseus-burst-crawler/target/`; the source is on the feature branch, not in the working tree.
-- There is no `rustyweb` or `rustyred-web` crate in `rustyredcore_THG/crates/` or the sibling RustyRed workspace.
+- The live `rustyred-web` crate is still a deterministic fixture/contract layer,
+  not the impure network fetch loop. It has no `reqwest`, Tokio crawler service,
+  real robots fetch/cache, frontier scheduler, or MCP crawl tool yet.
 - `/api/v2/theseus/search/crawl/` currently returns a deliberate `501` in `apps/notebook/api/search.py`, even though docs/tests claim the native Scrapy dispatch exists. This is code/docs/test drift and must be reconciled before claiming the crawl surface is shipped.
 - The feature-branch burst crawler still lacks robots enforcement at the source, streaming HTML parsing, graph writes, local graph search, gRPC/control, and RustyRed integration.
 
@@ -122,6 +129,14 @@ The service/fetcher layers below remain next work.
    - operator caps for total pages, per-domain pages, in-flight requests, and bytes.
 
 Acceptance: local fixture crawl produces `Domain`, `Page`, `ContentSnapshot`, `CrawlRun`, `FetchAttempt`, and `LINKS_TO` edges in a RustyRed store.
+
+**V2 contract status:** Started in `rustyredcore_THG/crates/rustyred-web`.
+`build_v2_fixture_crawl` wraps the V0 fixture kernel with agent-invokable
+request shape, budget enforcement, seed URL SSRF guards, scope metadata
+(`source_graph`, `source_license`, `federable`, advisory tier, TTL), and
+content-addressed `CrawlReceipt` / `DiscoverySeed` graph nodes. This is still
+fixture-fed; replacing `FixturePage` with a live fetch loop remains RW-1/RW-2
+work.
 
 ### RW-2: Graph search and frontier loop
 

@@ -1,10 +1,13 @@
-use rustyred_thg_core::{InMemoryGraphStore, NodeQuery};
+use rustyred_thg_core::{InMemoryGraphStore, NodeQuery, TTL_PROPERTY};
 use rustyred_web::{
-    build_fixture_crawl_graph, canonicalize_url, extract_links, CrawlConfig, FixturePage,
-    EDGE_CANONICAL_OF, EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, EDGE_ON_DOMAIN, EDGE_RESULTED_IN,
-    LABEL_CONTENT_SNAPSHOT, LABEL_CRAWL_RUN, LABEL_DOMAIN, LABEL_FETCH_ATTEMPT, LABEL_PAGE,
+    build_fixture_crawl_graph, build_v2_fixture_crawl, canonicalize_url, extract_links,
+    guarded_canonicalize_url, CrawlBudget, CrawlConfig, CrawlRequest, CrawlScope, FixturePage,
+    UrlGuardPolicy, EDGE_CANONICAL_OF, EDGE_EMITTED_RECEIPT, EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO,
+    EDGE_ON_DOMAIN, EDGE_RESULTED_IN, EDGE_SEEDED, LABEL_CONTENT_SNAPSHOT, LABEL_CRAWL_RECEIPT,
+    LABEL_CRAWL_RUN, LABEL_DISCOVERY_SEED, LABEL_DOMAIN, LABEL_FETCH_ATTEMPT, LABEL_PAGE,
     LABEL_ROBOTS_POLICY,
 };
+use serde_json::json;
 
 fn label_count(graph: &rustyred_web::CrawlGraph, label: &str) -> usize {
     graph
@@ -94,5 +97,121 @@ fn canonicalization_and_link_extraction_are_deterministic() {
             "https://example.com/a".to_string(),
             "https://example.org/z".to_string(),
         ],
+    );
+}
+
+#[test]
+fn v2_fixture_crawl_emits_receipt_ttl_license_and_seed_nodes() {
+    let mut request = CrawlRequest::new(
+        "rw-v2-1",
+        vec![
+            "https://example.com/index.html#top".to_string(),
+            "https://docs.example.org/start".to_string(),
+        ],
+    );
+    request.budget = CrawlBudget {
+        max_pages: 1,
+        max_seconds: 10,
+        max_depth: 1,
+        max_bytes: 8192,
+    };
+    request.scope = CrawlScope {
+        namespace: "link".to_string(),
+        follow_offsite: true,
+        ttl_expires_at_ms: Some(1_893_456_000_000),
+        source_graph: "fixture_graph".to_string(),
+        source_license: "CC0".to_string(),
+        federable: true,
+        actor_id: "codex".to_string(),
+    };
+
+    let output = build_v2_fixture_crawl(
+        request,
+        &[
+            FixturePage::html(
+                "https://example.com/index.html#top",
+                r#"
+                <html>
+                  <body>
+                    <a href="/about">About</a>
+                    <a href="https://docs.example.org/start">Docs</a>
+                  </body>
+                </html>
+                "#,
+            ),
+            FixturePage::html(
+                "https://example.com/about",
+                r#"<html><body><a href="/index.html">Home</a></body></html>"#,
+            ),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(output.receipt.status, "budget_limited");
+    assert_eq!(output.receipt.seed_count, 2);
+    assert_eq!(output.receipt.counters.fetched_pages, 1);
+    assert!(!output.receipt.graph_delta_hash.is_empty());
+
+    assert_eq!(label_count(&output.graph, LABEL_CRAWL_RECEIPT), 1);
+    assert_eq!(label_count(&output.graph, LABEL_DISCOVERY_SEED), 2);
+    assert_eq!(edge_count(&output.graph, EDGE_EMITTED_RECEIPT), 1);
+    assert_eq!(edge_count(&output.graph, EDGE_SEEDED), 2);
+
+    let fetched_page = output
+        .graph
+        .nodes()
+        .into_iter()
+        .find(|node| {
+            node.labels.iter().any(|label| label == LABEL_PAGE)
+                && node.properties.get("page_state") == Some(&json!("fetched"))
+        })
+        .unwrap();
+    assert_eq!(
+        fetched_page.properties.get(TTL_PROPERTY),
+        Some(&json!(1_893_456_000_000i64))
+    );
+    assert_eq!(
+        fetched_page.properties.get("source_graph"),
+        Some(&json!("fixture_graph"))
+    );
+    assert_eq!(
+        fetched_page.properties.get("source_license"),
+        Some(&json!("CC0"))
+    );
+    assert_eq!(fetched_page.properties.get("federable"), Some(&json!(true)));
+    assert_eq!(
+        fetched_page.properties.get("admission_tier"),
+        Some(&json!("advisory"))
+    );
+
+    let link_edge = output
+        .graph
+        .edges()
+        .into_iter()
+        .find(|edge| edge.edge_type == EDGE_LINKS_TO)
+        .unwrap();
+    assert_eq!(
+        link_edge
+            .provenance
+            .as_ref()
+            .and_then(|p| p.method.as_deref()),
+        Some("rustyweb_v2")
+    );
+    assert_eq!(
+        link_edge.properties.get("source_license"),
+        Some(&json!("CC0"))
+    );
+}
+
+#[test]
+fn url_guard_blocks_metadata_loopback_and_private_ips() {
+    let policy = UrlGuardPolicy::default();
+
+    assert!(guarded_canonicalize_url("http://169.254.169.254/latest/meta-data/", &policy).is_err());
+    assert!(guarded_canonicalize_url("http://127.0.0.1:8000/", &policy).is_err());
+    assert!(guarded_canonicalize_url("http://10.0.0.1/", &policy).is_err());
+    assert_eq!(
+        guarded_canonicalize_url("https://example.com/a#b", &policy).unwrap(),
+        "https://example.com/a"
     );
 }

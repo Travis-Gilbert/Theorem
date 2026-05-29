@@ -45,6 +45,7 @@ These are on the roadmap, in roughly this priority order:
 | Crate | Purpose |
 |-------|---------|
 | `rustyred-thg-core` | Graph store engine, command executor, HNSW vector index, epistemic edges |
+| `rustyred-web` | Graph-native crawler kernel and V2 crawl receipt contract |
 | `rustyred-thg-mcp` | MCP agent port: tool dispatch, resource reads, prompt surface |
 | `rustyred-rustyred-thg-compat-server` | HTTP server, query surface, graph cache, auth, OpenAPI |
 | `rustyred-thg-compat-server` | Standalone THG command server (non-product) |
