@@ -97,6 +97,11 @@ Acceptance: the scaffold builds/tests on a current worktree and its remaining ga
 
 ### RW-1: Create the RustyRed Web crate
 
+**Started:** `rustyredcore_THG/crates/rustyred-web` now contains the first
+fixture/local RustyWeb kernel in the Theorem repo. It emits the V0 graph
+contract as `GraphMutationBatch` and applies it to a RustyRed `GraphStore`.
+The service/fetcher layers below remain next work.
+
 1. Add `crates/rustyred-web` to the RustyRed workspace.
 2. Move/adapt the scaffold's safe pieces:
    - Axum service shell

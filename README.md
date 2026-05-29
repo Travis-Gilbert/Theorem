@@ -38,6 +38,14 @@ RustyWeb is now active work. The first implementation move is to recover the
 burst-crawler scaffold as seed code, then build the real product as a RustyRed-
 backed graph crawler rather than treating the fetcher scaffold as complete.
 
+## Current Code
+
+- `rustyredcore_THG/` - mirrored Rust theorem projection from Theseus.
+- `rustyredcore_THG/crates/rustyred-web/` - first RustyWeb crate. It currently
+  contains the V0 fixture crawler kernel: URL canonicalization, streaming
+  `a[href]` extraction, BLAKE3 content snapshots, V0 graph node/edge emission,
+  and application into a RustyRed `GraphStore`.
+
 ## Mirror Rule
 
 Theseus remains the canonical application/runtime workspace. Theorem mirrors the

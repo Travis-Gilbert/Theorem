@@ -17,6 +17,7 @@ members = [
     "crates/rustyred-thg-compat-server",
     "crates/rustyred-thg-server",
     "crates/rustyred-thg-resp-server",
+    "crates/rustyred-web",
 ]
 resolver = "2"
 
