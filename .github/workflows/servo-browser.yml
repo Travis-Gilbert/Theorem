@@ -74,6 +74,27 @@ jobs:
           python3 -m pip install --break-system-packages toml
           if [ -f python/requirements.txt ]; then python3 -m pip install --break-system-packages -r python/requirements.txt; fi
 
+      - name: Free disk space
+        # A Servo --dev build's target dir exceeds ubuntu-latest's ~14GB free
+        # (prior run failed with "No space left on device" deep in components/).
+        # Reclaim the preinstalled SDKs we don't use (~20-25GB: Android, .NET,
+        # Haskell, CodeQL, boost). Do NOT remove /opt/hostedtoolcache root: the
+        # runner's python3 (which ran bootstrap + holds mach's deps) lives there.
+        run: |
+          echo "Before:"; df -h /
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc /usr/local/.ghcup || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo apt-get clean || true
+          echo "After:"; df -h /
+
       - name: Build Servo (dev)
         working-directory: servo
+        env:
+          # Drop debuginfo: it is the bulk of a Servo debug target dir and we are
+          # validating that Servo builds, not debugging Servo internals. Large
+          # disk + link-time win with no effect on build-validation.
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: python3 ./mach build --dev

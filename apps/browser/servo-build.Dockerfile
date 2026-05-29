@@ -12,8 +12,16 @@
 #   move `mach build` to the container CMD (runtime) so it runs on service
 #   resources rather than the build step, and size the service plan accordingly.
 # - Local Docker: build at image time is fine; runs on the dev machine.
+#
+# Disk: a Servo --dev target dir exceeds ~14GB. The GH Actions run failed at
+# "No space left on device" until ~20-25GB of preinstalled SDKs were reclaimed.
+# Any host (Railway/local) needs >~25GB free for the build dir; the workflow
+# also sets CARGO_PROFILE_DEV_DEBUG=0 to drop debuginfo (the bulk of the size).
 
 FROM ubuntu:24.04
+
+# Validation build drops debuginfo to keep the target dir small (see disk note).
+ENV CARGO_PROFILE_DEV_DEBUG=0
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
