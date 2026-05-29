@@ -51,7 +51,13 @@ The Servo build runs OFF the developer machine, in CI, reproducibly. It does not
 
 ## Substrate-seam reuse (less new code than it looks)
 
-The browser's `load_web_resource` hook writes a loaded page into the substrate as graph state. That is the SAME operation `rustyred-web` already performs (`build_fixture_crawl_graph` turns pages into `Page`/`ContentSnapshot`/`LINKS_TO`/`Domain` nodes). So the seam feeds Servo's loaded pages into rustyred-web's existing page-to-graph logic. The substrate side is largely built and buildable today without Servo; the Servo build is needed only for the rendering + the hook itself.
+The browser's `load_web_resource` hook writes a loaded page into the substrate as graph state. That is the SAME operation `rustyred-web` already performs. Concrete seam (grounded against `rustyredcore_THG/crates/rustyred-web/src/lib.rs`, verified 2026-05-29):
+
+1. The hook builds a `FetchedPage` (url + body + status + content_type) from the Servo `WebResourceLoad`.
+2. It calls `build_v2_fixture_crawl(CrawlRequest, &[FetchedPage]) -> CrawlRunOutput` (V2: budget + URL guard + scope + `CrawlReceipt`), or `build_fixture_crawl_graph(CrawlConfig, &[FixturePage])` for the no-budget path.
+3. It writes the result with `CrawlGraph::apply_to_store(&mut impl GraphStore)`.
+
+That emits `Page`/`Domain`/`ContentSnapshot`/`FetchAttempt` nodes + `LINKS_TO`/`HAS_SNAPSHOT`/`ON_DOMAIN` edges via `extract_links` + `canonicalize_url` + `blake3_hash`. No new page-to-graph code: the only glue the embedder adds is `WebResourceLoad` -> `FetchedPage`. The substrate side is built and buildable today without Servo; the Servo build is needed only for the rendering + the hook itself.
 
 ## Next increments
 
