@@ -65,6 +65,15 @@ jobs:
         working-directory: servo
         run: python3 ./mach bootstrap --force || python3 ./mach bootstrap
 
+      - name: Install mach Python dependencies
+        working-directory: servo
+        # mach loads its command modules (bootstrap_commands.py imports toml) with
+        # the invoking Python BEFORE activating its managed venv, so the runner
+        # Python needs mach's deps. Fixes "ModuleNotFoundError: No module named 'toml'".
+        run: |
+          python3 -m pip install --break-system-packages toml
+          if [ -f python/requirements.txt ]; then python3 -m pip install --break-system-packages -r python/requirements.txt; fi
+
       - name: Build Servo (dev)
         working-directory: servo
         run: python3 ./mach build --dev

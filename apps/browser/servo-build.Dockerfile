@@ -32,6 +32,12 @@ WORKDIR /build/servo
 # mach bootstrap installs the remaining platform build dependencies.
 RUN python3 ./mach bootstrap --force || python3 ./mach bootstrap
 
+# mach loads command modules (bootstrap_commands.py imports toml) with the
+# invoking Python before activating its managed venv, so install mach's Python
+# deps into the runner Python first (fixes "No module named 'toml'").
+RUN python3 -m pip install --break-system-packages toml \
+    && if [ -f python/requirements.txt ]; then python3 -m pip install --break-system-packages -r python/requirements.txt; fi
+
 # Heavy step. In GitHub Actions / local Docker, keep it here (build time). On
 # Railway, move this to the CMD so it runs at container runtime, not the build step.
 RUN python3 ./mach build --dev
