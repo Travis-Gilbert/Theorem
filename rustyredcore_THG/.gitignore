@@ -1,0 +1,6 @@
+/target
+.pytest_cache/
+*.so
+*.pyd
+__pycache__/
+.theorem/
