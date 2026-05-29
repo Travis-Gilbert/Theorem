@@ -3,15 +3,15 @@
 # Validates the Servo build environment OFF the developer machine. Headless;
 # no window. Pin a known-good Servo revision before relying on this.
 #
-# Host notes:
-# - Modal (recommended for the heavy build): the `mach build` belongs in the
-#   image build; Modal is built for heavy compute + scale-to-zero. Adapt this
-#   into a Modal image (it mirrors these apt + rustup + mach steps).
-# - Railway: a full Servo build at IMAGE-BUILD time (the RUN mach build below)
-#   may exceed Railway's build-time / image-size limits. If using Railway, move
-#   `mach build` to the container CMD (runtime) so it runs on service resources
-#   rather than the build step, and size the service plan accordingly.
-# - GitHub Actions: blocked on this account by Actions billing as of 2026-05-29.
+# Host notes (Modal is NOT a host: deprecated from the stack as of 2026-05-29):
+# - GitHub Actions (current): the working CI build host once Actions billing was
+#   fixed; see .github/workflows/servo-browser.yml. Preferred for the headless
+#   build/verify.
+# - Railway (fallback): a full Servo build at IMAGE-BUILD time (the RUN mach build
+#   below) may exceed Railway's build-time / image-size limits. If using Railway,
+#   move `mach build` to the container CMD (runtime) so it runs on service
+#   resources rather than the build step, and size the service plan accordingly.
+# - Local Docker: build at image time is fine; runs on the dev machine.
 
 FROM ubuntu:24.04
 
@@ -32,8 +32,8 @@ WORKDIR /build/servo
 # mach bootstrap installs the remaining platform build dependencies.
 RUN python3 ./mach bootstrap --force || python3 ./mach bootstrap
 
-# Heavy step. On Modal/local-Docker keep it here (image build). On Railway move
-# this to the CMD so it runs at container runtime instead of the build step.
+# Heavy step. In GitHub Actions / local Docker, keep it here (build time). On
+# Railway, move this to the CMD so it runs at container runtime, not the build step.
 RUN python3 ./mach build --dev
 
 # v2: also build the theorem-browser embedder (apps/browser) as an external
