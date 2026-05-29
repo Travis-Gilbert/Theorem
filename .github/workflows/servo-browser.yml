@@ -1,0 +1,70 @@
+name: servo-browser build
+
+# Validates the Servo build environment in CI (the long-pole dependency for the
+# substrate-native browser; build host chosen 2026-05-29). Keeps the heavy Servo
+# build OFF the developer machine and reproducible.
+#
+# v1 (this file): prove Servo builds off-machine in CI, using Servo's own
+#   documented build (./mach bootstrap + ./mach build). Validates the long pole.
+# v2 (next): add the theorem-browser embedder (apps/browser) as an external
+#   consumer of the `servo` crate (reference: paulrouget/servo-embedding-example
+#   and Verso), build it here headless, and run a test that loads a URL and
+#   asserts the ServoDelegate::load_web_resource hook writes Page/ContentSnapshot
+#   nodes into the substrate (reusing rustyred-web's existing page->graph logic).
+# Windowed macOS desktop run is a later milestone (a macOS runner or local).
+#
+# Manual trigger only: a full Servo build is heavy. Do not run on every push.
+# No workflow inputs by design (avoids untrusted-input injection; pin the Servo
+# rev in-file below for reproducibility).
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  servo-build:
+    # Linux headless build/verify is the cheapest path and proves the embed +
+    # substrate seam without a window. NOTE: ubuntu-latest may be undersized for
+    # a full Servo build (disk/cores). If the first run hits resource limits,
+    # move to a larger GitHub runner, a self-hosted runner, or the remote-box
+    # build option. This is the iterate-by-running step.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout theorem
+        uses: actions/checkout@v4
+        with:
+          path: theorem
+
+      - name: Checkout Servo
+        uses: actions/checkout@v4
+        with:
+          repository: servo/servo
+          # Pin a known-good revision here before relying on this build.
+          ref: main
+          path: servo
+
+      - name: Show Rust toolchain (Servo pins its own via rust-toolchain.toml)
+        working-directory: servo
+        run: rustup show
+
+      - name: Cache cargo registry + Servo target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            servo/target
+          key: servo-${{ runner.os }}-${{ hashFiles('servo/rust-toolchain.toml', 'servo/Cargo.lock') }}
+          restore-keys: |
+            servo-${{ runner.os }}-
+
+      - name: Bootstrap Servo build dependencies
+        working-directory: servo
+        run: python3 ./mach bootstrap --force || python3 ./mach bootstrap
+
+      - name: Build Servo (dev)
+        working-directory: servo
+        run: python3 ./mach build --dev

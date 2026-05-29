@@ -1,0 +1,24 @@
+[package]
+name = "theorem-browser"
+version = "0.0.0"
+edition = "2021"
+description = "Substrate-native browser: Servo embedder that renders the open web and SceneOS scenes in-process with the RustyRed substrate. Foundation; not yet built (Servo requires its own build toolchain)."
+license = "MIT"
+publish = false
+
+# Servo is NOT a plain crates.io dependency. It is consumed as a git dependency
+# pinned to a known-good revision, and it requires the Servo build toolchain
+# (./mach bootstrap system deps) to compile. Pin REV deliberately and bump on
+# evidence; the embedding API (WebViewBuilder / ServoDelegate / spin_event_loop)
+# moves between revisions. Left unpinned here until the build env is stood up
+# (see README "Build prerequisites"); fill REV before the first build.
+[dependencies]
+# servo = { git = "https://github.com/servo/servo", rev = "<PIN-ME>" }
+winit = "0.30"
+url = "2"
+euclid = "0.22"
+
+# Once the engine integration needs modifications the embedder API cannot express
+# (DOM-at-parse-time into the substrate, compositor-level scene fusion), repoint
+# the `servo` dependency at a Travis-Gilbert/servo fork pinned to a maintained
+# delta against upstream. Embed first; fork on evidence (README "Fork vs embed").
