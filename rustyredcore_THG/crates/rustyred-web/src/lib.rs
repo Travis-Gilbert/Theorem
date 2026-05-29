@@ -3,8 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::rc::Rc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lol_html::{element, HtmlRewriter, Settings};
+use reqwest::header::CONTENT_TYPE;
 use rustyred_thg_core::{
     EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, GraphStoreError, GraphStoreResult,
     GraphWriteResult, NodeRecord, Provenance, TTL_PROPERTY,
@@ -162,6 +164,23 @@ impl Default for UrlGuardPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LiveFetchOptions {
+    pub user_agent: String,
+    pub timeout_seconds: u64,
+    pub guard_policy: UrlGuardPolicy,
+}
+
+impl Default for LiveFetchOptions {
+    fn default() -> Self {
+        Self {
+            user_agent: "RustyWeb/0.2 live".to_string(),
+            timeout_seconds: 10,
+            guard_policy: UrlGuardPolicy::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrawlReceipt {
     pub receipt_id: String,
     pub run_id: String,
@@ -223,6 +242,8 @@ impl CrawlGraph {
 pub enum RustyWebError {
     InvalidUrl { url: String, reason: String },
     HtmlParse { reason: String },
+    Fetch { url: String, reason: String },
+    BodyLimitExceeded { url: String, limit: usize },
     EmptySeeds,
     InvalidBudget { reason: String },
     BlockedUrl { url: String, reason: String },
@@ -235,6 +256,10 @@ impl fmt::Display for RustyWebError {
                 write!(f, "invalid URL {url:?}: {reason}")
             }
             Self::HtmlParse { reason } => write!(f, "HTML parse failed: {reason}"),
+            Self::Fetch { url, reason } => write!(f, "fetch failed for {url:?}: {reason}"),
+            Self::BodyLimitExceeded { url, limit } => {
+                write!(f, "fetch body for {url:?} exceeded {limit} bytes")
+            }
             Self::EmptySeeds => write!(f, "crawl request requires at least one seed URL"),
             Self::InvalidBudget { reason } => write!(f, "invalid crawl budget: {reason}"),
             Self::BlockedUrl { url, reason } => write!(f, "blocked URL {url:?}: {reason}"),
@@ -465,7 +490,15 @@ pub fn build_v2_fixture_crawl(
     request: CrawlRequest,
     pages: &[FetchedPage],
 ) -> RustyWebResult<CrawlRunOutput> {
-    let guarded_seeds = validate_crawl_request(&request, &UrlGuardPolicy::default())?;
+    build_v2_fixture_crawl_with_policy(request, pages, &UrlGuardPolicy::default())
+}
+
+pub fn build_v2_fixture_crawl_with_policy(
+    request: CrawlRequest,
+    pages: &[FetchedPage],
+    guard_policy: &UrlGuardPolicy,
+) -> RustyWebResult<CrawlRunOutput> {
+    let guarded_seeds = validate_crawl_request(&request, guard_policy)?;
     let (selected_pages, budget_limited) = select_budgeted_pages(&request.budget, pages);
     let status = if budget_limited {
         "budget_limited"
@@ -500,6 +533,41 @@ pub fn build_v2_fixture_crawl(
     add_receipt_node(&mut graph, &receipt);
 
     Ok(CrawlRunOutput { graph, receipt })
+}
+
+pub async fn run_live_crawl(request: CrawlRequest) -> RustyWebResult<CrawlRunOutput> {
+    run_live_crawl_with_options(request, &LiveFetchOptions::default()).await
+}
+
+pub async fn run_live_crawl_with_options(
+    request: CrawlRequest,
+    options: &LiveFetchOptions,
+) -> RustyWebResult<CrawlRunOutput> {
+    let pages = fetch_seed_pages(&request, options).await?;
+    build_v2_fixture_crawl_with_policy(request, &pages, &options.guard_policy)
+}
+
+pub async fn fetch_seed_pages(
+    request: &CrawlRequest,
+    options: &LiveFetchOptions,
+) -> RustyWebResult<Vec<FetchedPage>> {
+    let seeds = validate_crawl_request(request, &options.guard_policy)?;
+    let mut effective_options = options.clone();
+    effective_options.timeout_seconds = options.timeout_seconds.min(request.budget.max_seconds);
+    let client = build_live_http_client(&effective_options)?;
+    let mut pages = Vec::new();
+    let mut remaining_bytes = request.budget.max_bytes;
+
+    for seed in seeds.into_iter().take(request.budget.max_pages) {
+        if remaining_bytes == 0 {
+            break;
+        }
+        let page = fetch_one_page(&client, &seed, remaining_bytes).await?;
+        remaining_bytes = remaining_bytes.saturating_sub(page.body.len());
+        pages.push(page);
+    }
+
+    Ok(pages)
 }
 
 pub fn apply_batch_to_store(
@@ -831,6 +899,77 @@ fn blocked_ip_reason(ip: IpAddr, policy: &UrlGuardPolicy) -> Option<&'static str
         }
     }
     None
+}
+
+fn build_live_http_client(options: &LiveFetchOptions) -> RustyWebResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(options.user_agent.clone())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(options.timeout_seconds))
+        .build()
+        .map_err(|err| RustyWebError::Fetch {
+            url: "<client>".to_string(),
+            reason: err.to_string(),
+        })
+}
+
+async fn fetch_one_page(
+    client: &reqwest::Client,
+    canonical_url: &str,
+    max_bytes: usize,
+) -> RustyWebResult<FetchedPage> {
+    let response = client
+        .get(canonical_url)
+        .send()
+        .await
+        .map_err(|err| RustyWebError::Fetch {
+            url: canonical_url.to_string(),
+            reason: err.to_string(),
+        })?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let body = read_limited_body(response, canonical_url, max_bytes).await?;
+
+    Ok(FetchedPage {
+        url: canonical_url.to_string(),
+        status,
+        body: String::from_utf8_lossy(&body).into_owned(),
+        content_type,
+        fetched_at: current_unix_ms_string(),
+    })
+}
+
+async fn read_limited_body(
+    mut response: reqwest::Response,
+    url: &str,
+    limit: usize,
+) -> RustyWebResult<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| RustyWebError::Fetch {
+        url: url.to_string(),
+        reason: err.to_string(),
+    })? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(RustyWebError::BodyLimitExceeded {
+                url: url.to_string(),
+                limit,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn current_unix_ms_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn insert_node(nodes: &mut BTreeMap<String, NodeRecord>, node: NodeRecord) {

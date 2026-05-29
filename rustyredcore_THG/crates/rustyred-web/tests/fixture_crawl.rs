@@ -1,11 +1,15 @@
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
+
 use rustyred_thg_core::{InMemoryGraphStore, NodeQuery, TTL_PROPERTY};
 use rustyred_web::{
     build_fixture_crawl_graph, build_v2_fixture_crawl, canonicalize_url, extract_links,
-    guarded_canonicalize_url, CrawlBudget, CrawlConfig, CrawlRequest, CrawlScope, FixturePage,
-    UrlGuardPolicy, EDGE_CANONICAL_OF, EDGE_EMITTED_RECEIPT, EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO,
-    EDGE_ON_DOMAIN, EDGE_RESULTED_IN, EDGE_SEEDED, LABEL_CONTENT_SNAPSHOT, LABEL_CRAWL_RECEIPT,
-    LABEL_CRAWL_RUN, LABEL_DISCOVERY_SEED, LABEL_DOMAIN, LABEL_FETCH_ATTEMPT, LABEL_PAGE,
-    LABEL_ROBOTS_POLICY,
+    guarded_canonicalize_url, run_live_crawl_with_options, CrawlBudget, CrawlConfig, CrawlRequest,
+    CrawlScope, FixturePage, LiveFetchOptions, RustyWebError, UrlGuardPolicy, EDGE_CANONICAL_OF,
+    EDGE_EMITTED_RECEIPT, EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, EDGE_ON_DOMAIN, EDGE_RESULTED_IN,
+    EDGE_SEEDED, LABEL_CONTENT_SNAPSHOT, LABEL_CRAWL_RECEIPT, LABEL_CRAWL_RUN,
+    LABEL_DISCOVERY_SEED, LABEL_DOMAIN, LABEL_FETCH_ATTEMPT, LABEL_PAGE, LABEL_ROBOTS_POLICY,
 };
 use serde_json::json;
 
@@ -214,4 +218,110 @@ fn url_guard_blocks_metadata_loopback_and_private_ips() {
         guarded_canonicalize_url("https://example.com/a#b", &policy).unwrap(),
         "https://example.com/a"
     );
+}
+
+#[tokio::test]
+async fn live_fetch_loop_feeds_the_v2_receipt_contract() {
+    let url = spawn_one_shot_server(
+        200,
+        "text/html; charset=utf-8",
+        r#"<html><body><h1>Live fixture</h1><a href="/next">Next</a></body></html>"#,
+    );
+    let mut request = CrawlRequest::new("rw-live-1", vec![url]);
+    request.budget = CrawlBudget {
+        max_pages: 1,
+        max_seconds: 5,
+        max_depth: 0,
+        max_bytes: 8192,
+    };
+    request.scope = CrawlScope {
+        namespace: "link".to_string(),
+        follow_offsite: false,
+        ttl_expires_at_ms: Some(1_893_456_000_000),
+        source_graph: "live_fixture".to_string(),
+        source_license: "local-test".to_string(),
+        federable: false,
+        actor_id: "codex".to_string(),
+    };
+    let options = live_test_options();
+
+    let output = run_live_crawl_with_options(request, &options)
+        .await
+        .unwrap();
+
+    assert_eq!(output.receipt.status, "completed");
+    assert_eq!(output.receipt.counters.fetched_pages, 1);
+    assert_eq!(output.receipt.counters.links, 1);
+    assert_eq!(label_count(&output.graph, LABEL_CRAWL_RECEIPT), 1);
+    assert_eq!(label_count(&output.graph, LABEL_CONTENT_SNAPSHOT), 1);
+
+    let snapshot = output
+        .graph
+        .nodes()
+        .into_iter()
+        .find(|node| {
+            node.labels
+                .iter()
+                .any(|label| label == LABEL_CONTENT_SNAPSHOT)
+        })
+        .unwrap();
+    assert_eq!(
+        snapshot.properties.get("source_graph"),
+        Some(&json!("live_fixture"))
+    );
+    assert!(snapshot
+        .properties
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap()
+        .contains("Live fixture"));
+}
+
+#[tokio::test]
+async fn live_fetch_loop_enforces_body_budget() {
+    let url = spawn_one_shot_server(200, "text/plain", "0123456789");
+    let mut request = CrawlRequest::new("rw-live-cap", vec![url]);
+    request.budget = CrawlBudget {
+        max_pages: 1,
+        max_seconds: 5,
+        max_depth: 0,
+        max_bytes: 4,
+    };
+
+    let error = run_live_crawl_with_options(request, &live_test_options())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RustyWebError::BodyLimitExceeded { limit: 4, .. }
+    ));
+}
+
+fn live_test_options() -> LiveFetchOptions {
+    LiveFetchOptions {
+        user_agent: "RustyWeb test".to_string(),
+        timeout_seconds: 5,
+        guard_policy: UrlGuardPolicy {
+            allow_loopback: true,
+            allow_private_networks: false,
+            block_metadata_services: true,
+        },
+    }
+}
+
+fn spawn_one_shot_server(status: u16, content_type: &'static str, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request_buf = [0; 1024];
+        let _ = stream.read(&mut request_buf);
+        let response = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    format!("http://{address}/")
 }

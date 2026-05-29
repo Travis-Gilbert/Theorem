@@ -20,7 +20,9 @@ The current `feat/theseus-burst-crawler-scaffold` branch is useful seed code, bu
   V2 fixture contract. It emits V0 crawl graph mutations, accepts
   `CrawlRequest`/`CrawlBudget`/`CrawlScope`, guards seed URLs, annotates hot
   graph mutations with TTL/license/federation metadata, and emits
-  content-addressed `CrawlReceipt` nodes.
+  content-addressed `CrawlReceipt` nodes. It also has the first bounded live
+  seed fetch loop (`run_live_crawl_with_options`) that turns guarded HTTP
+  responses into `FetchedPage` values and feeds the same receipt path.
 - `feat/theseus-burst-crawler-scaffold` contains an isolated Rust+Tokio scaffold:
   - `crates/theseus-burst-crawler/src/main.rs`
   - `crates/theseus-burst-crawler/Dockerfile`
@@ -37,9 +39,10 @@ The current `feat/theseus-burst-crawler-scaffold` branch is useful seed code, bu
 ### Not built or drifted
 
 - The active Index-API checkout has only `crates/theseus-burst-crawler/target/`; the source is on the feature branch, not in the working tree.
-- The live `rustyred-web` crate is still a deterministic fixture/contract layer,
-  not the impure network fetch loop. It has no `reqwest`, Tokio crawler service,
-  real robots fetch/cache, frontier scheduler, or MCP crawl tool yet.
+- The live `rustyred-web` crate now has a guarded seed fetch loop, but it is not
+  a full crawler service yet. It has no Tokio frontier scheduler, real robots
+  fetch/cache, per-domain politeness, Axum/MCP tool surface, or graph query
+  endpoint yet.
 - `/api/v2/theseus/search/crawl/` currently returns a deliberate `501` in `apps/notebook/api/search.py`, even though docs/tests claim the native Scrapy dispatch exists. This is code/docs/test drift and must be reconciled before claiming the crawl surface is shipped.
 - The feature-branch burst crawler still lacks robots enforcement at the source, streaming HTML parsing, graph writes, local graph search, gRPC/control, and RustyRed integration.
 
@@ -134,9 +137,14 @@ Acceptance: local fixture crawl produces `Domain`, `Page`, `ContentSnapshot`, `C
 `build_v2_fixture_crawl` wraps the V0 fixture kernel with agent-invokable
 request shape, budget enforcement, seed URL SSRF guards, scope metadata
 (`source_graph`, `source_license`, `federable`, advisory tier, TTL), and
-content-addressed `CrawlReceipt` / `DiscoverySeed` graph nodes. This is still
-fixture-fed; replacing `FixturePage` with a live fetch loop remains RW-1/RW-2
-work.
+content-addressed `CrawlReceipt` / `DiscoverySeed` graph nodes.
+
+**Live fetch status:** Started in `rustyredcore_THG/crates/rustyred-web`.
+`run_live_crawl_with_options` fetches guarded seed URLs with `reqwest`, disables
+automatic redirects, enforces the crawl byte budget while reading response
+chunks, and feeds the fetched pages through the same V2 graph/receipt contract.
+The next RW-1/RW-2 work is frontier scheduling, robots/politeness, and a service
+or MCP affordance around this library path.
 
 ### RW-2: Graph search and frontier loop
 
