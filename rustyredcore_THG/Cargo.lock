@@ -2407,6 +2407,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scene-os-web"
+version = "0.1.0"
+dependencies = [
+ "scene-os-core",
+ "serde_json",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
