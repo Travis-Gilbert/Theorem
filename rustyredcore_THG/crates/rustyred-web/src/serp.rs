@@ -29,8 +29,16 @@ use crate::search::{search_substrate, SearchOptions, SubstrateSearch};
 /// time. Served verbatim (empty state) when no search has run.
 const SERP_TEMPLATE: &str = include_str!("serp.html");
 
+/// Vendored d3 (v7), inlined into the page so the browser's own results page is
+/// self-contained — it never fetches a graph library from a CDN to render its
+/// results. The force-directed graph in `serp.html` uses this.
+const D3_MIN: &str = include_str!("vendor/d3.min.js");
+
 /// The exact line in the template that carries the payload placeholder.
 const PAYLOAD_MARKER: &str = "var SERP_DATA = null; // __SERP_DATA__";
+
+/// The placeholder where the vendored d3 source is inlined.
+const D3_MARKER: &str = "/*__D3__*/";
 
 /// Serialize a search to a `<script>`-safe JSON literal.
 ///
@@ -50,7 +58,9 @@ pub fn serp_payload_json(search: &SubstrateSearch) -> String {
 pub fn render_serp_html(search: &SubstrateSearch) -> String {
     let payload = serp_payload_json(search);
     let injected = format!("var SERP_DATA = {payload};");
-    SERP_TEMPLATE.replacen(PAYLOAD_MARKER, &injected, 1)
+    SERP_TEMPLATE
+        .replacen(PAYLOAD_MARKER, &injected, 1)
+        .replacen(D3_MARKER, D3_MIN, 1)
 }
 
 /// One-call browser search: search the substrate, then render the SERP graph,
@@ -112,6 +122,10 @@ mod tests {
         assert!(!html.contains("// __SERP_DATA__"), "marker consumed");
         assert!(html.contains("http://ex.com/apple"), "matched url present");
         assert!(html.contains("orchard"), "neighbour present");
+        // d3 is inlined (self-contained), and its placeholder is consumed.
+        assert!(html.contains("d3js.org"), "vendored d3 inlined");
+        assert!(!html.contains("/*__D3__*/"), "d3 placeholder consumed");
+        assert!(html.contains("forceSimulation"), "force-graph code present");
     }
 
     #[test]

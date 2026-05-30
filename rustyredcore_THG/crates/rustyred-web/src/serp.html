@@ -17,36 +17,38 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--paper); color: var(--ink); }
   body { display: flex; flex-direction: column; font-family: var(--mono); }
-  header {
-    border-bottom: 1px solid var(--rule);
-    background: var(--paper-soft);
-    padding: 14px 22px 12px;
+  header { border-bottom: 1px solid var(--rule); background: var(--paper-soft); padding: 14px 22px 12px; }
+  .eyebrow { margin: 0 0 8px; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft); }
+  form.search { display: flex; gap: 8px; align-items: stretch; }
+  form.search input {
+    flex: 1; min-width: 0; border: 1.5px solid var(--rule); border-radius: 7px;
+    background: var(--paper); color: var(--ink); font-family: var(--mono); font-size: 17px;
+    padding: 9px 12px; outline: none;
   }
-  .eyebrow {
-    margin: 0; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
-    color: var(--ink-soft);
+  form.search input:focus { border-color: var(--accent); }
+  form.search button {
+    border: 1.5px solid var(--accent); background: var(--accent); color: var(--paper);
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 0 16px; border-radius: 7px; cursor: pointer;
   }
-  .query { margin: 4px 0 0; font-size: 22px; font-weight: 600; min-height: 26px; }
-  .query.empty { color: var(--ink-soft); font-weight: 400; }
-  .status { margin: 8px 0 0; font-size: 11px; color: var(--ink-soft); min-height: 14px; }
-  .legend { display: flex; gap: 14px; margin-top: 8px; font-size: 10px;
-            letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft); }
+  form.search button:hover { background: #9c4a22; }
+  .status { margin: 9px 0 0; font-size: 11px; color: var(--ink-soft); min-height: 14px; }
+  .legend { display: flex; gap: 14px; margin-top: 8px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft); }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--accent); }
   #stage { position: relative; flex: 1; min-height: 0; }
-  canvas { display: block; width: 100%; height: 100%; }
+  #graph { display: block; width: 100%; height: 100%; cursor: grab; }
   #empty {
-    position: absolute; inset: 0; display: none; flex-direction: column;
-    align-items: center; justify-content: center; text-align: center; padding: 32px;
-    color: var(--ink-soft); font-size: 13px; line-height: 1.6; max-width: 460px; margin: 0 auto;
+    position: absolute; inset: 0; display: none; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; padding: 32px; color: var(--ink-soft);
+    font-size: 13px; line-height: 1.6; max-width: 460px; margin: 0 auto;
   }
   #empty strong { display: block; color: var(--ink); font-size: 18px; margin-bottom: 6px; }
   #empty .accent { color: var(--accent); }
   #tip {
-    position: absolute; pointer-events: none; display: none; max-width: 320px;
-    padding: 8px 10px; border: 1px solid var(--rule); border-radius: 6px;
-    background: var(--paper-soft); font-size: 11px; line-height: 1.45; color: var(--ink);
-    box-shadow: 0 4px 14px rgba(42, 40, 35, 0.12);
+    position: absolute; pointer-events: none; display: none; max-width: 320px; padding: 8px 10px;
+    border: 1px solid var(--rule); border-radius: 6px; background: var(--paper-soft);
+    font-size: 11px; line-height: 1.45; color: var(--ink); box-shadow: 0 4px 14px rgba(42, 40, 35, 0.12);
   }
   #tip .u { color: var(--accent); word-break: break-all; margin-top: 2px; }
   #tip .s { color: var(--ink-soft); margin-top: 3px; }
@@ -55,66 +57,64 @@
 </head>
 <body>
   <header>
-    <p class="query" id="query"></p>
+    <p class="eyebrow">Substrate search</p>
+    <form class="search" action="/search" method="get" autocomplete="off">
+      <input id="q" name="q" type="search" placeholder="Search your substrate…" aria-label="Search your substrate" />
+      <button type="submit">Search</button>
+    </form>
     <p class="status" id="status"></p>
     <div class="legend" id="legend"></div>
   </header>
   <div id="stage">
-    <canvas id="graph"></canvas>
+    <svg id="graph"></svg>
     <div id="empty"></div>
     <div id="tip"></div>
   </div>
 
+<!-- d3 (vendored, inlined by the renderer so the page is self-contained) -->
+<script>/*__D3__*/</script>
+
 <script>
 // The browser's load_web_resource hook replaces the next line with the real
-// SubstrateSearch payload (serde JSON) before serving this page. Left as null,
-// the page renders an honest empty state — never fake data. All page text is
-// set via textContent / DOM construction (never innerHTML): titles, urls, and
-// snippets come from crawled pages and are untrusted.
+// SubstrateSearch payload (serde JSON) before serving. Left null -> honest empty
+// state, never fake data. All text rendered via textContent / d3 .text() (never
+// innerHTML): titles/urls/snippets come from crawled pages and are untrusted.
 var SERP_DATA = null; // __SERP_DATA__
 
 (function () {
   "use strict";
 
   var INK = "#2A2823", INK_SOFT = "#6b665c", ACCENT = "#b45a2d", PAPER = "#f4f1ea";
+  var MONO = '"JetBrains Mono", ui-monospace, monospace';
   var RING_NAMES = ["match", "adjacent", "nearby", "distant"];
-
   function ringName(r) { return RING_NAMES[r] || "distant"; }
-
-  /** createElement helper: tag, className, textContent (text is always safe). */
   function el(tag, cls, text) {
-    var node = document.createElement(tag);
-    if (cls) node.className = cls;
-    if (text != null) node.textContent = String(text);
-    return node;
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
   }
+  function trunc(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 
   var data = SERP_DATA && Array.isArray(SERP_DATA.hits)
     ? SERP_DATA
     : { query: "", hits: [], links: [], matched_count: 0, kept_count: 0 };
 
-  // ---- header (textContent only) ----
-  var queryEl = document.getElementById("query");
-  if (data.query) {
-    queryEl.textContent = data.query;
-  } else {
-    queryEl.classList.add("empty");
-    queryEl.textContent = "Browse your substrate";
-  }
+  // Search box reflects the current query (set as a property, never HTML).
+  document.getElementById("q").value = data.query || "";
 
+  // Status line.
   var statusEl = document.getElementById("status");
   if (data.kept_count === 0) {
-    statusEl.textContent = data.query
-      ? "New territory: nothing in scope matches yet."
-      : "Nothing captured yet.";
+    statusEl.textContent = data.query ? "New territory: nothing in scope matches yet." : "Nothing captured yet — browse a few pages.";
   } else if (!data.query) {
     statusEl.textContent = "Browsing " + data.kept_count + " pages.";
   } else {
-    statusEl.textContent = data.matched_count + " direct match"
-      + (data.matched_count === 1 ? "" : "es") + ", " + data.kept_count + " in the neighbourhood.";
+    statusEl.textContent = data.matched_count + " direct match" + (data.matched_count === 1 ? "" : "es")
+      + ", " + data.kept_count + " in the neighbourhood. Drag to rearrange, scroll to zoom.";
   }
 
-  // ---- legend (ring names only, no user data; still built via DOM) ----
+  // Legend.
   var maxRing = data.hits.reduce(function (m, h) { return Math.max(m, h.ring || 0); }, 0);
   var legend = document.getElementById("legend");
   if (data.kept_count > 0) {
@@ -129,7 +129,7 @@ var SERP_DATA = null; // __SERP_DATA__
     }
   }
 
-  // ---- empty state (query is untrusted -> textContent) ----
+  // Empty state.
   if (data.kept_count === 0) {
     var emptyEl = document.getElementById("empty");
     if (data.query) {
@@ -145,125 +145,99 @@ var SERP_DATA = null; // __SERP_DATA__
     return;
   }
 
-  // ---- canvas graph ----
-  var canvas = document.getElementById("graph");
-  var ctx = canvas.getContext("2d");
+  // ---- d3 force-directed graph ----
   var stage = document.getElementById("stage");
   var tip = document.getElementById("tip");
-  var nodes = [];
-  var nodeIndex = {};
-  var W = 0, H = 0;
+  var svg = d3.select("#graph");
+  var W = stage.clientWidth || 800, H = stage.clientHeight || 600;
+  svg.attr("viewBox", [0, 0, W, H]);
+  var g = svg.append("g");
 
-  function layout() {
-    var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    var rect = stage.getBoundingClientRect();
-    W = Math.max(1, Math.min(rect.width, 8192));
-    H = Math.max(1, Math.min(rect.height, 8192));
-    canvas.width = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  var nodes = data.hits.map(function (h) { return Object.assign({ id: h.node_id }, h); });
+  var links = (data.links || []).map(function (l) { return { source: l.source, target: l.target }; });
 
-    var byRing = {};
-    data.hits.forEach(function (h) { (byRing[h.ring] = byRing[h.ring] || []).push(h); });
-
-    var cx = W / 2, cy = H / 2;
-    var step = Math.max(70, Math.min(W, H) / (2 * (maxRing + 1.4)));
-    var index = {};
-    nodes = [];
-
-    Object.keys(byRing).map(Number).sort(function (a, b) { return a - b; }).forEach(function (ring) {
-      var group = byRing[ring];
-      var n = group.length;
-      var radius = ring === 0 ? (n === 1 ? 0 : step * 0.5) : step * (ring + 0.4);
-      group.forEach(function (hit, i) {
-        var angle = (i / Math.max(1, n)) * Math.PI * 2 + ring * 0.6;
-        var x = cx + Math.cos(angle) * radius;
-        var y = cy + Math.sin(angle) * radius;
-        var nodeR = ring === 0 ? 7 + Math.min(8, (hit.match_score || 1) * 1.5) : Math.max(3.5, 6 - ring);
-        var node = { hit: hit, x: x, y: y, r: nodeR };
-        nodes.push(node);
-        index[hit.node_id] = node;
-      });
-    });
-    return index;
+  function nodeR(d) {
+    return (d.ring || 0) === 0 ? 7 + Math.min(8, (d.match_score || 1) * 1.5) : Math.max(4, 7 - d.ring);
   }
+  function nodeOpacity(d) { return Math.max(0.45, 1 - (d.ring || 0) * 0.2); }
 
-  function draw() {
-    ctx.clearRect(0, 0, W, H);
+  var sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(function (d) { return d.id; }).distance(62).strength(0.45))
+    .force("charge", d3.forceManyBody().strength(-230))
+    .force("center", d3.forceCenter(W / 2, H / 2))
+    .force("collide", d3.forceCollide().radius(function (d) { return nodeR(d) + 7; }))
+    .force("x", d3.forceX(W / 2).strength(0.04))
+    .force("y", d3.forceY(H / 2).strength(0.04));
 
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = "rgba(42,40,35,0.16)";
-    (data.links || []).forEach(function (link) {
-      var a = nodeIndex[link.source], b = nodeIndex[link.target];
-      if (!a || !b) return;
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
-      ctx.stroke();
-    });
+  var link = g.append("g")
+    .attr("stroke", "rgba(42,40,35,0.18)")
+    .attr("stroke-width", 1)
+    .selectAll("line").data(links).join("line");
 
-    nodes.forEach(function (node) {
-      var ring = node.hit.ring || 0;
-      ctx.globalAlpha = Math.max(0.35, 1 - ring * 0.22);
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, node.r, 0, Math.PI * 2);
-      if (ring === 0) {
-        ctx.fillStyle = ACCENT;
-        ctx.fill();
-      } else {
-        ctx.fillStyle = PAPER;
-        ctx.fill();
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = INK_SOFT;
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-    });
+  var node = g.append("g")
+    .selectAll("circle").data(nodes).join("circle")
+    .attr("r", nodeR)
+    .attr("fill", function (d) { return (d.ring || 0) === 0 ? ACCENT : PAPER; })
+    .attr("stroke", function (d) { return (d.ring || 0) === 0 ? ACCENT : INK_SOFT; })
+    .attr("stroke-width", function (d) { return (d.ring || 0) === 0 ? 0 : 1.5; })
+    .attr("opacity", nodeOpacity)
+    .style("cursor", "grab")
+    .call(drag(sim))
+    .on("mouseover", showTip)
+    .on("mousemove", moveTip)
+    .on("mouseout", hideTip);
 
-    ctx.fillStyle = INK;
-    ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
-    ctx.textAlign = "center";
-    nodes.forEach(function (node) {
-      if ((node.hit.ring || 0) > 1) return;
-      var label = node.hit.title || node.hit.url || node.hit.node_id;
-      if (label.length > 22) label = label.slice(0, 21) + "…";
-      ctx.globalAlpha = (node.hit.ring || 0) === 0 ? 1 : 0.7;
-      ctx.fillText(label, node.x, node.y + node.r + 13);
-      ctx.globalAlpha = 1;
-    });
-  }
+  var label = g.append("g")
+    .attr("font-family", MONO).attr("font-size", 11).attr("fill", INK)
+    .selectAll("text").data(nodes.filter(function (d) { return (d.ring || 0) <= 1; })).join("text")
+    .attr("text-anchor", "middle")
+    .attr("dy", function (d) { return nodeR(d) + 13; })
+    .attr("opacity", function (d) { return (d.ring || 0) === 0 ? 1 : 0.7; })
+    .style("pointer-events", "none")
+    .text(function (d) { return trunc(d.title || d.url || d.id, 22); });
 
-  function hitTest(mx, my) {
-    for (var i = nodes.length - 1; i >= 0; i--) {
-      var n = nodes[i];
-      var dx = mx - n.x, dy = my - n.y;
-      if (dx * dx + dy * dy <= (n.r + 4) * (n.r + 4)) return n;
-    }
-    return null;
-  }
-
-  stage.addEventListener("mousemove", function (e) {
-    var rect = stage.getBoundingClientRect();
-    var node = hitTest(e.clientX - rect.left, e.clientY - rect.top);
-    if (!node) { tip.style.display = "none"; return; }
-    var h = node.hit;
-    // Rebuild tooltip with textContent (title/url/snippet are untrusted).
-    while (tip.firstChild) tip.removeChild(tip.firstChild);
-    var head = el("div", null, h.title || "");
-    head.appendChild(el("span", "r", " [" + ringName(h.ring) + "]"));
-    tip.appendChild(head);
-    if (h.url) tip.appendChild(el("div", "u", h.url));
-    if (h.snippet) tip.appendChild(el("div", "s", h.snippet));
-    tip.style.display = "block";
-    var tx = Math.min(e.clientX - rect.left + 14, rect.width - 330);
-    tip.style.left = Math.max(8, tx) + "px";
-    tip.style.top = (e.clientY - rect.top + 14) + "px";
+  sim.on("tick", function () {
+    link.attr("x1", function (d) { return d.source.x; }).attr("y1", function (d) { return d.source.y; })
+        .attr("x2", function (d) { return d.target.x; }).attr("y2", function (d) { return d.target.y; });
+    node.attr("cx", function (d) { return d.x; }).attr("cy", function (d) { return d.y; });
+    label.attr("x", function (d) { return d.x; }).attr("y", function (d) { return d.y; });
   });
-  stage.addEventListener("mouseleave", function () { tip.style.display = "none"; });
 
-  function render() { nodeIndex = layout(); draw(); }
-  window.addEventListener("resize", render);
-  render();
+  svg.call(d3.zoom().scaleExtent([0.3, 4]).on("zoom", function (e) { g.attr("transform", e.transform); }));
+
+  function drag(simulation) {
+    return d3.drag()
+      .on("start", function (e, d) { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on("drag", function (e, d) { d.fx = e.x; d.fy = e.y; })
+      .on("end", function (e, d) { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; });
+  }
+
+  function showTip(event, d) {
+    while (tip.firstChild) tip.removeChild(tip.firstChild);
+    var head = el("div", null, d.title || "");
+    head.appendChild(el("span", "r", " [" + ringName(d.ring) + "]"));
+    tip.appendChild(head);
+    if (d.url) tip.appendChild(el("div", "u", d.url));
+    if (d.snippet) tip.appendChild(el("div", "s", d.snippet));
+    tip.style.display = "block";
+    moveTip(event);
+  }
+  function moveTip(event) {
+    var rect = stage.getBoundingClientRect();
+    var x = Math.min(event.clientX - rect.left + 14, rect.width - 330);
+    tip.style.left = Math.max(8, x) + "px";
+    tip.style.top = (event.clientY - rect.top + 14) + "px";
+  }
+  function hideTip() { tip.style.display = "none"; }
+
+  window.addEventListener("resize", function () {
+    W = stage.clientWidth || W; H = stage.clientHeight || H;
+    svg.attr("viewBox", [0, 0, W, H]);
+    sim.force("center", d3.forceCenter(W / 2, H / 2));
+    sim.force("x", d3.forceX(W / 2).strength(0.04));
+    sim.force("y", d3.forceY(H / 2).strength(0.04));
+    sim.alpha(0.3).restart();
+  });
 })();
 </script>
 </body>
