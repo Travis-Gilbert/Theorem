@@ -2,18 +2,22 @@
 name = "theorem-browser"
 version = "0.0.0"
 edition = "2021"
-description = "Substrate-native browser: Servo embedder that renders the open web and SceneOS scenes in-process with the RustyRed substrate. Foundation; not yet built (Servo requires its own build toolchain)."
+description = "Substrate-native browser: Servo embedder that renders the open web and SceneOS scenes in-process with the RustyRed substrate. v2b step 1: build-validation (engine construction only)."
 license = "MIT"
 publish = false
 
-# Servo is NOT a plain crates.io dependency. It is consumed as a git dependency
-# pinned to a known-good revision, and it requires the Servo build toolchain
-# (./mach bootstrap system deps) to compile. Pin REV deliberately and bump on
+# Servo is consumed as a git dependency pinned to a known-good revision, and it
+# requires the Servo build toolchain (./mach bootstrap system deps) to compile.
+# The pinned rev below is the exact commit our CI build validated green
+# (.github/workflows/servo-browser.yml, 2026-05-29). Bump deliberately and on
 # evidence; the embedding API (WebViewBuilder / ServoDelegate / spin_event_loop)
-# moves between revisions. Left unpinned here until the build env is stood up
-# (see README "Build prerequisites"); fill REV before the first build.
+# moves between revisions.
 [dependencies]
-# servo = { git = "https://github.com/servo/servo", rev = "<PIN-ME>" }
+servo = { git = "https://github.com/servo/servo", rev = "b891f04d0819272b27e80ac975e2e57d3cb9e66b" }
+# The Servo-free page->substrate seam (LoadedPage -> rustyred-web -> substrate).
+# The WebViewDelegate::load_web_resource hook (step 2) calls into this crate.
+theorem-browser-substrate = { path = "../browser-substrate" }
+# For step 2's windowed/headless runtime (WebView surface, URL, Scale/PhysicalSize).
 winit = "0.30"
 url = "2"
 euclid = "0.22"

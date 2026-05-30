@@ -4,13 +4,17 @@ name: servo-browser build
 # substrate-native browser; build host chosen 2026-05-29). Keeps the heavy Servo
 # build OFF the developer machine and reproducible.
 #
-# v1 (this file): prove Servo builds off-machine in CI, using Servo's own
-#   documented build (./mach bootstrap + ./mach build). Validates the long pole.
-# v2 (next): add the theorem-browser embedder (apps/browser) as an external
-#   consumer of the `servo` crate (reference: paulrouget/servo-embedding-example
-#   and Verso), build it here headless, and run a test that loads a URL and
-#   asserts the ServoDelegate::load_web_resource hook writes Page/ContentSnapshot
-#   nodes into the substrate (reusing rustyred-web's existing page->graph logic).
+# v1 (done): proved Servo builds off-machine via its own ./mach bootstrap +
+#   ./mach build. Green at rev b891f04 on 2026-05-29 (toml dep + disk reclaim).
+# v2b step 1 (this file now): build the theorem-browser embedder (apps/browser)
+#   as an EXTERNAL Cargo consumer of the `servo` crate pinned to that same rev.
+#   `mach bootstrap` still provides the system libs; the embedder then builds
+#   libservo via plain cargo (the real consumer-side proof) with a minimal
+#   engine-construction main.rs. Reference: servo/components/servo/examples/
+#   winit_minimal.rs at the pinned rev.
+# v2b step 2 (next, on a warm cache): add the WebView + the
+#   WebViewDelegate::load_web_resource substrate seam (calls
+#   theorem_browser_substrate::ingest_loaded_pages) and load a real URL headless.
 # Windowed macOS desktop run is a later milestone (a macOS runner or local).
 #
 # Manual trigger only: a full Servo build is heavy. Do not run on every push.
@@ -42,24 +46,28 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: servo/servo
-          # Pin a known-good revision here before relying on this build.
-          ref: main
+          # Pinned to the rev the embedder's Cargo.toml depends on, so `mach
+          # bootstrap` installs the system libs matching the libservo we build.
+          ref: b891f04d0819272b27e80ac975e2e57d3cb9e66b
           path: servo
 
       - name: Show Rust toolchain (Servo pins its own via rust-toolchain.toml)
         working-directory: servo
         run: rustup show
 
-      - name: Cache cargo registry + Servo target
+      - name: Cache cargo registry + embedder target
         uses: actions/cache@v4
         with:
+          # Cache the embedder's target (where libservo compiles as a git dep)
+          # so the FIRST build pays the full libservo cost once and step-2
+          # iterations (WebView + seam) recompile only our crate on a warm cache.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            servo/target
-          key: servo-${{ runner.os }}-${{ hashFiles('servo/rust-toolchain.toml', 'servo/Cargo.lock') }}
+            theorem/apps/browser/target
+          key: embed-${{ runner.os }}-${{ hashFiles('theorem/apps/browser/Cargo.toml', 'theorem/apps/browser/rust-toolchain.toml') }}
           restore-keys: |
-            servo-${{ runner.os }}-
+            embed-${{ runner.os }}-
 
       - name: Bootstrap Servo build dependencies
         working-directory: servo
@@ -90,11 +98,18 @@ jobs:
           sudo apt-get clean || true
           echo "After:"; df -h /
 
-      - name: Build Servo (dev)
-        working-directory: servo
+      - name: Build theorem-browser embedder (cargo; builds libservo as a git dep)
+        working-directory: theorem/apps/browser
         env:
-          # Drop debuginfo: it is the bulk of a Servo debug target dir and we are
-          # validating that Servo builds, not debugging Servo internals. Large
-          # disk + link-time win with no effect on build-validation.
+          # Drop debuginfo: libservo debug artifacts are the bulk of the target
+          # dir; we validate the build, not debug libservo internals.
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: python3 ./mach build --dev
+        # v2b step 1: prove libservo builds + links as an EXTERNAL Cargo git
+        # dependency (not via mach) at the pinned rev, with the embedder's
+        # minimal engine-construction main.rs. `mach bootstrap` above provided
+        # the system libs; apps/browser pins Servo's toolchain via its own
+        # rust-toolchain.toml so the whole graph builds with 1.95.0. This is the
+        # real consumer-side proof and the open question (does external cargo
+        # embed work without mach orchestration). If it fails, the log says
+        # whether the gap is a missing system lib, a build-script, or crown.
+        run: cargo build
