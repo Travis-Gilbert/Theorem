@@ -29,7 +29,7 @@ use servo::{
     EventLoopWaker, LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext,
     WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
-use theorem_browser_substrate::{ingest_loaded_pages, LoadedPage};
+use theorem_browser_substrate::{browser_affordances, ingest_loaded_pages, LoadedPage};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -294,6 +294,7 @@ fn run_engine_constructor() {
         .build();
 
     println!("theorem-browser: Servo engine constructed (build validation OK)");
+    print_browser_affordances();
 }
 
 fn run_headless_smoke() -> Result<(), Box<dyn Error>> {
@@ -352,6 +353,15 @@ fn run_windowed(initial_url: Url) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = WindowedApp::new(&event_loop, initial_url);
     Ok(event_loop.run_app(&mut app)?)
+}
+
+fn print_browser_affordances() {
+    for affordance in browser_affordances() {
+        println!(
+            "theorem-browser affordance: {} [{}] - {}",
+            affordance.id, affordance.provider, affordance.label
+        );
+    }
 }
 
 fn intercept_smoke_page(load: WebResourceLoad) {

@@ -24,6 +24,44 @@ use rustyred_web::{
     build_v2_fixture_crawl, CrawlRequest, CrawlRunOutput, FetchedPage, RustyWebError,
 };
 
+/// A browser-callable capability exposed by this seam.
+///
+/// These are intentionally small and static: the Servo embedder can inspect this
+/// list without constructing a graph store or running a crawl, while tests can
+/// lock the affordance contract that the browser is expected to have.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserAffordance {
+    pub id: &'static str,
+    pub provider: &'static str,
+    pub label: &'static str,
+    pub detail: &'static str,
+}
+
+const BROWSER_AFFORDANCES: &[BrowserAffordance] = &[
+    BrowserAffordance {
+        id: "rustyred.graph_write",
+        provider: "rustyred",
+        label: "Write loaded pages as graph mutations",
+        detail: "Uses GraphStore plus GraphMutationBatch writes through the RustyRed substrate.",
+    },
+    BrowserAffordance {
+        id: "rustyweb.page_to_graph",
+        provider: "rustyweb",
+        label: "Turn a loaded page into crawl graph state",
+        detail: "Uses rustyred-web to emit Page, Domain, ContentSnapshot, FetchAttempt, and LINKS_TO state.",
+    },
+    BrowserAffordance {
+        id: "rustyweb.substrate_search",
+        provider: "rustyweb",
+        label: "Query browser-ingested web graph state",
+        detail: "Uses rustyred-web substrate search over the same graph state the browser writes.",
+    },
+];
+
+pub fn browser_affordances() -> &'static [BrowserAffordance] {
+    BROWSER_AFFORDANCES
+}
+
 /// A page the embedder has loaded, decoupled from any specific browser engine.
 ///
 /// The Servo seam builds this from a `WebResourceLoad` (url + the intercepted
@@ -206,5 +244,15 @@ mod tests {
 
         // The receipt carries a content-addressed delta hash (the audit anchor).
         assert!(!output.receipt.graph_delta_hash.is_empty());
+    }
+
+    #[test]
+    fn browser_affordances_expose_rustyred_and_rustyweb() {
+        let affordances = browser_affordances();
+        assert!(affordances.iter().any(|item| item.provider == "rustyred"));
+        assert!(affordances.iter().any(|item| item.provider == "rustyweb"));
+        assert!(affordances
+            .iter()
+            .any(|item| item.id == "rustyweb.page_to_graph"));
     }
 }
