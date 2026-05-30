@@ -40,6 +40,10 @@ pub type FetchedPage = FixturePage;
 pub mod search;
 pub use search::{search_substrate, SearchHit, SearchLink, SearchOptions, SubstrateSearch};
 
+// The browser's SERP: render a search as a node-and-edge graph page. See serp.rs.
+pub mod serp;
+pub use serp::{render_serp_html, serp_payload_json};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrawlConfig {
     pub run_id: String,
