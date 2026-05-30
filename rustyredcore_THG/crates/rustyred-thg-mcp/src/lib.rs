@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
 use rustyred_thg_core::{
-    CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphSnapshot, GraphStats,
-    GraphStoreError, GraphStoreResult, HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore,
-    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta,
-    VectorDesignation, VerifyReport,
+    compile_graph_pack, diff_graph_snapshots, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphSnapshot, GraphStats, GraphStoreError,
+    GraphStoreResult, HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta, VectorDesignation,
+    VerifyReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -532,6 +533,41 @@ fn call_tool<P: McpGraphProvider>(
         "rustyred_thg_graph_index_status" => index_status_payload(&tenant, &backend)?,
         "rustyred_thg_graph_explain" => explain_payload(&tenant, &arguments),
         "rustyred_thg_graph_query" => query_payload(&tenant, &backend, &arguments)?,
+        "rustyred_thg_graph_version_compile"
+        | "rustyred_thg_git_compile"
+        | "rustyred.graph.version.compile"
+        | "rustyred.git.compile" => {
+            let snapshot = backend.graph_snapshot()?;
+            let options = serde_json::from_value::<GraphCompileOptions>(arguments.clone())
+                .map_err(|error| {
+                    McpError::invalid_params(format!("invalid graph compile options: {error}"))
+                })?;
+            json!({
+                "tenant": tenant,
+                "pack": compile_graph_pack(&snapshot, options)
+            })
+        }
+        "rustyred_thg_graph_version_diff"
+        | "rustyred_thg_git_diff"
+        | "rustyred.graph.version.diff"
+        | "rustyred.git.diff" => {
+            let base = arguments.get("base").cloned().ok_or_else(|| {
+                McpError::invalid_params("rustyred_thg_graph_version_diff requires base snapshot")
+            })?;
+            let base = serde_json::from_value::<GraphSnapshot>(base).map_err(|error| {
+                McpError::invalid_params(format!("base must be a graph snapshot: {error}"))
+            })?;
+            let target = match arguments.get("target").cloned() {
+                Some(value) => serde_json::from_value::<GraphSnapshot>(value).map_err(|error| {
+                    McpError::invalid_params(format!("target must be a graph snapshot: {error}"))
+                })?,
+                None => backend.graph_snapshot()?,
+            };
+            json!({
+                "tenant": tenant,
+                "diff": diff_graph_snapshots(&base, &target)
+            })
+        }
         // §P6-B pb6.1: SPEC names `thg.algo.*` are aliases for the existing
         // `thg.algorithm.*` arms below. Either name reaches the same payload.
         "rustyred_thg_algorithm_ppr" | "rustyred_thg_algo_ppr" => {
@@ -1337,6 +1373,8 @@ fn inline_adjacency_to_edges(adjacency: &InlineAdjacency) -> Vec<EdgeRecord> {
                 properties: json!({}),
                 version: 0,
                 tombstone: false,
+                content_hash: None,
+                parent_hashes: Vec::new(),
                 confidence: Some(*weight),
                 epistemic_type: None,
                 provenance: None,
@@ -2205,6 +2243,36 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": { "tenant": { "type": "string" } }
+            }),
+        ),
+        tool(
+            "rustyred_thg_graph_version_compile",
+            "Compile the tenant graph into a content-addressed Prolly-tree graph pack.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "name": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "parent_commits": { "type": "array", "items": { "type": "string" } },
+                    "author": { "type": "string" },
+                    "message": { "type": "string" },
+                    "timestamp_unix_ms": { "type": "integer" },
+                    "include_payloads": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
+        tool(
+            "rustyred_thg_graph_version_diff",
+            "Diff a base graph snapshot against the tenant graph or an explicit target snapshot.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "base": { "type": "object" },
+                    "target": { "type": "object" }
+                },
+                "required": ["base"]
             }),
         ),
         tool(

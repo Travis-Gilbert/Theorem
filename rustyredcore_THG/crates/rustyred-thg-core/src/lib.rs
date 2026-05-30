@@ -19,6 +19,7 @@ pub mod spatial_s2;
 pub mod state;
 pub mod store;
 pub mod symbolic;
+pub mod versioned_graph;
 
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use errors::{ThgError, ThgResult};
@@ -61,4 +62,11 @@ pub use symbolic::{
     evolution_archive_from_json, probabilistic_expected_value, probabilistic_expected_value_from_json,
     probabilistic_source_reliability, probabilistic_source_reliability_from_json, stable_hash_json,
     stable_hash_value, DATALOG_RULE_IDS,
+};
+pub use versioned_graph::{
+    build_prolly_tree, compile_graph_pack, diff_graph_snapshots, snapshot_content_objects,
+    CompiledGraphPack, GraphCommit, GraphCompileOptions, GraphCompilerCapability,
+    GraphContentObject, GraphDiffEntry, GraphObjectKind, GraphPackManifest, GraphProllyTree,
+    GraphTreeChild, GraphTreeEntry, GraphTreeNode, GraphVersionDiff, DEFAULT_GRAPH_BRANCH,
+    GRAPH_PACK_COMPILER_VERSION, VERSIONED_GRAPH_PROTOCOL_VERSION,
 };

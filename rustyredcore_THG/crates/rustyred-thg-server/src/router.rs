@@ -14,7 +14,8 @@ use rustyred_thg_core::commands::{ThgCommand, ThgRequest, ThgResponse};
 use rustyred_thg_core::errors::ThgError;
 use rustyred_thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
 use rustyred_thg_core::{
-    stable_hash, CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphStats, GraphStoreError,
+    compile_graph_pack, diff_graph_snapshots, stable_hash, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphSnapshot, GraphStats, GraphStoreError,
     HarnessInstantKg, NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
 };
 use rustyred_thg_mcp::{
@@ -186,6 +187,13 @@ pub struct TransactionMutationBody {
     pub tenant_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionDiffBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub target: Option<GraphSnapshot>,
+}
+
 fn default_k() -> usize {
     10
 }
@@ -259,6 +267,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/rebuild-indexes",
             post(graph_rebuild_indexes),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/compile",
+            post(graph_version_compile),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/diff",
+            post(graph_version_diff),
         )
         .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
         .route(
@@ -1411,6 +1427,76 @@ async fn graph_rebuild_indexes(
         .into_response(),
         Err(error) => graph_store_error_response(error),
     }
+}
+
+async fn graph_version_compile(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(options): Json<GraphCompileOptions>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let pack = compile_graph_pack(&snapshot, options);
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "pack": pack
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_diff(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionDiffBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let target = match body.target {
+        Some(target) => target,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    let diff = diff_graph_snapshots(&body.base, &target);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "diff": diff
+    }))
+    .into_response()
 }
 
 fn execute_tenant_command(
