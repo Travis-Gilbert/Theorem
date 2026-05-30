@@ -36,6 +36,10 @@ pub const EDGE_SEEDED: &str = "SEEDED";
 
 pub type FetchedPage = FixturePage;
 
+// Substrate-native local graph search (the READ seam). See search.rs.
+pub mod search;
+pub use search::{search_substrate, SearchHit, SearchLink, SearchOptions, SubstrateSearch};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrawlConfig {
     pub run_id: String,
