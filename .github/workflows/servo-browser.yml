@@ -122,4 +122,4 @@ jobs:
         # context, intercept a known URL through WebViewDelegate::load_web_resource,
         # and write that loaded page into theorem-browser-substrate/RustyRed.
         # This proves the browser seam after the heavy libservo build is warm.
-        run: cargo run -- --headless-smoke
+        run: timeout 180s cargo run -- --headless-smoke

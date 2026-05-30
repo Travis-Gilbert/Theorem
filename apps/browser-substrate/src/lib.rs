@@ -21,7 +21,8 @@ use std::fmt;
 
 use rustyred_thg_core::graph_store::{GraphStore, GraphStoreError, GraphWriteResult};
 use rustyred_web::{
-    build_v2_fixture_crawl, CrawlRequest, CrawlRunOutput, FetchedPage, RustyWebError,
+    build_v2_fixture_crawl, render_serp_html, search_substrate, CrawlRequest, CrawlRunOutput,
+    FetchedPage, RustyWebError, SearchOptions,
 };
 
 /// A browser-callable capability exposed by this seam.
@@ -178,6 +179,17 @@ pub fn ingest_loaded_pages(
     Ok((output, writes))
 }
 
+/// Render the browser's graph-native search page from the same substrate the
+/// browser writes into.
+///
+/// The Servo embedder calls this for its local search URL. Keeping it in the
+/// Servo-free crate lets the SERP/search contract test quickly without building
+/// Servo.
+pub fn render_substrate_search_page(store: &impl GraphStore, query: &str) -> String {
+    let search = search_substrate(store, query, SearchOptions::default());
+    render_serp_html(&search)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +266,27 @@ mod tests {
         assert!(affordances
             .iter()
             .any(|item| item.id == "rustyweb.page_to_graph"));
+    }
+
+    #[test]
+    fn substrate_search_page_renders_from_browser_written_graph_state() {
+        let pages = vec![LoadedPage::html(
+            "https://example.com/index.html",
+            r#"<html><body><h1>Substrate browser</h1><a href="/search">Search</a></body></html>"#,
+        )];
+
+        let mut store = InMemoryGraphStore::new();
+        ingest_loaded_pages(
+            &mut store,
+            "browser-search-test",
+            vec!["https://example.com/index.html".to_string()],
+            &pages,
+        )
+        .expect("fixture page should be written to the substrate");
+
+        let html = render_substrate_search_page(&store, "substrate");
+        assert!(html.contains("var SERP_DATA = {"));
+        assert!(html.contains("https://example.com/index.html"));
+        assert!(html.contains("Substrate browser"));
     }
 }

@@ -29,7 +29,9 @@ use servo::{
     EventLoopWaker, LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext,
     WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
-use theorem_browser_substrate::{browser_affordances, ingest_loaded_pages, LoadedPage};
+use theorem_browser_substrate::{
+    browser_affordances, ingest_loaded_pages, render_substrate_search_page, LoadedPage,
+};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -38,6 +40,7 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 const SMOKE_URL: &str = "http://theorem.local/smoke";
+const SEARCH_URL_PREFIX: &str = "http://theorem.local/search";
 const SMOKE_HTML: &str = r#"<!doctype html>
 <html>
   <head><title>Theorem browser smoke</title></head>
@@ -45,6 +48,7 @@ const SMOKE_HTML: &str = r#"<!doctype html>
     <main>
       <h1>Theorem browser smoke</h1>
       <a href="/substrate">Substrate seam</a>
+      <a href="/search?q=substrate">Search the substrate</a>
     </main>
   </body>
 </html>"#;
@@ -136,7 +140,7 @@ impl SubstrateSmokeDelegate {
 
 impl WebViewDelegate for SubstrateSmokeDelegate {
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
-        intercept_smoke_page(load);
+        intercept_local_theorem_page(load, &self.store);
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
@@ -156,6 +160,7 @@ struct WindowedState {
     servo: servo::Servo,
     rendering_context: Rc<WindowRenderingContext>,
     webviews: RefCell<Vec<WebView>>,
+    store: RefCell<InMemoryGraphStore>,
 }
 
 impl WebViewDelegate for WindowedState {
@@ -164,7 +169,7 @@ impl WebViewDelegate for WindowedState {
     }
 
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
-        intercept_smoke_page(load);
+        intercept_local_theorem_page(load, &self.store);
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
@@ -220,6 +225,7 @@ impl ApplicationHandler<WindowWakeEvent> for WindowedApp {
                 servo,
                 rendering_context,
                 webviews: RefCell::new(Vec::new()),
+                store: RefCell::new(seed_browser_store()),
             });
 
             let webview = WebViewBuilder::new(&state.servo, state.rendering_context.clone())
@@ -298,6 +304,7 @@ fn run_engine_constructor() {
 }
 
 fn run_headless_smoke() -> Result<(), Box<dyn Error>> {
+    eprintln!("theorem-browser: starting headless WebView substrate smoke");
     let rendering_context: Rc<dyn RenderingContext> = Rc::new(
         SoftwareRenderingContext::new(PhysicalSize {
             width: 800,
@@ -321,6 +328,7 @@ fn run_headless_smoke() -> Result<(), Box<dyn Error>> {
         .delegate(delegate.clone())
         .build();
 
+    eprintln!("theorem-browser: WebView created; spinning Servo until load complete");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !delegate.complete.get() {
         servo.spin_event_loop();
@@ -364,10 +372,20 @@ fn print_browser_affordances() {
     }
 }
 
-fn intercept_smoke_page(load: WebResourceLoad) {
-    if load.request().url.as_str() != SMOKE_URL {
+fn intercept_local_theorem_page(load: WebResourceLoad, store: &RefCell<InMemoryGraphStore>) {
+    let url = load.request().url.clone();
+    let body = if url.as_str() == SMOKE_URL {
+        SMOKE_HTML.to_string()
+    } else if url.as_str().starts_with(SEARCH_URL_PREFIX) {
+        let query = url
+            .query_pairs()
+            .find(|(key, _)| key == "q")
+            .map(|(_, value)| value.to_string())
+            .unwrap_or_default();
+        render_substrate_search_page(&*store.borrow(), &query)
+    } else {
         return;
-    }
+    };
 
     let mut headers = http::HeaderMap::new();
     headers.insert(
@@ -377,6 +395,18 @@ fn intercept_smoke_page(load: WebResourceLoad) {
 
     let response = WebResourceResponse::new(load.request().url.clone()).headers(headers);
     let mut intercepted = load.intercept(response);
-    intercepted.send_body_data(SMOKE_HTML.as_bytes().to_vec());
+    intercepted.send_body_data(body.into_bytes());
     intercepted.finish();
+}
+
+fn seed_browser_store() -> InMemoryGraphStore {
+    let mut store = InMemoryGraphStore::new();
+    let pages = vec![LoadedPage::html(SMOKE_URL, SMOKE_HTML)];
+    let _ = ingest_loaded_pages(
+        &mut store,
+        "browser-seed",
+        vec![SMOKE_URL.to_string()],
+        &pages,
+    );
+    store
 }

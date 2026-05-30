@@ -441,8 +441,14 @@ mod tests {
         let kept = urls(&out);
         assert!(kept.contains(&"http://ex.com/apple".to_string()));
         assert!(kept.contains(&"http://ex.com/orchard".to_string()));
-        assert!(!kept.contains(&"http://ex.com/soil".to_string()), "soil is 2 hops");
-        assert!(!kept.contains(&"http://ex.com/banana".to_string()), "banana unrelated");
+        assert!(
+            !kept.contains(&"http://ex.com/soil".to_string()),
+            "soil is 2 hops"
+        );
+        assert!(
+            !kept.contains(&"http://ex.com/banana".to_string()),
+            "banana unrelated"
+        );
 
         let orchard = out
             .hits
@@ -474,8 +480,15 @@ mod tests {
             },
         );
         let kept = urls(&out);
-        assert!(kept.contains(&"http://ex.com/soil".to_string()), "soil reached at ring 2");
-        let soil = out.hits.iter().find(|h| h.url == "http://ex.com/soil").unwrap();
+        assert!(
+            kept.contains(&"http://ex.com/soil".to_string()),
+            "soil reached at ring 2"
+        );
+        let soil = out
+            .hits
+            .iter()
+            .find(|h| h.url == "http://ex.com/soil")
+            .unwrap();
         assert_eq!(soil.ring, 2);
         assert_eq!(soil.ring_label, "nearby");
     }
