@@ -3644,6 +3644,56 @@ impl RedisGraphStore {
     }
 }
 
+impl GraphStore for RedCoreGraphStore {
+    // Writes go through the inherent AOF-backed durable upserts (commit_batch),
+    // so persistence holds when RedCore is used as a generic GraphStore (e.g.
+    // CrawlGraph::apply_to_store / the browser page-ingest seam, instead of the
+    // ephemeral InMemoryGraphStore). The fully-qualified `RedCoreGraphStore::`
+    // path selects the inherent method, not this trait method: no recursion.
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
+        RedCoreGraphStore::upsert_node(self, node)
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+        RedCoreGraphStore::upsert_edge(self, edge)
+    }
+
+    // Reads serve from the in-memory mirror, which `recover()` rebuilds from the
+    // durable AOF on open and which every committed batch keeps current.
+    fn get_node(&self, id: &str) -> Option<&NodeRecord> {
+        self.store.get_node(id)
+    }
+
+    fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
+        self.store.get_edge(id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
+        self.store.query_nodes(query)
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
+        self.store.neighbors(query)
+    }
+
+    fn stats(&self) -> GraphStats {
+        self.store.stats()
+    }
+
+    fn verify(&self) -> VerifyReport {
+        self.store.verify()
+    }
+
+    fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        self.store.rebuild_indexes()
+    }
+
+    // TTL methods intentionally keep the trait defaults: delegating a TTL write
+    // to the in-memory mirror would skip the AOF and lose durability. Durable
+    // TTL on RedCore is a separate follow-up; until then RedCore reports no TTL
+    // support (the loud default) rather than a non-durable one.
+}
+
 impl GraphStore for InMemoryGraphStore {
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
         InMemoryGraphStore::upsert_node(self, node)
