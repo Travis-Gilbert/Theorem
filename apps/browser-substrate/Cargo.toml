@@ -1,0 +1,14 @@
+[package]
+name = "theorem-browser-substrate"
+version = "0.0.0"
+edition = "2021"
+description = "Servo-free page->substrate seam. Turns a loaded web page (url/body/status/content_type) into RustyRed graph state via rustyred-web. The browser's load_web_resource hook calls this; it is kept OUT of the heavy Servo build so it compiles and tests in seconds, and it is reusable by anything that has a page (crawler, harness)."
+license = "MIT"
+publish = false
+
+# Pure-Rust deps only: NO servo. This is the whole point of the crate split.
+# Path deps into the rustyredcore_THG workspace; that workspace resolves its own
+# inheritance independently.
+[dependencies]
+rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
