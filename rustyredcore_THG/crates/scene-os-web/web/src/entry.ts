@@ -17,7 +17,7 @@
  *     mount programmatically in addition to the injected global.
  *
  * All DOM text comes from `textContent` (atom labels are untrusted), never
- * innerHTML — same discipline as the SERP page.
+ * innerHTML: same discipline as the SERP page.
  */
 
 import { SceneRenderer } from './renderer/SceneRenderer';
@@ -27,6 +27,7 @@ import { validateScenePackageV2 } from './v2-package';
 interface MountHandles {
   canvas: HTMLCanvasElement;
   tooltip: HTMLElement | null;
+  overlay: SVGSVGElement | null;
   header: HTMLElement | null;
   title: HTMLElement | null;
   meta: HTMLElement | null;
@@ -41,6 +42,7 @@ function handles(): MountHandles {
   return {
     canvas: document.getElementById('scene-canvas') as HTMLCanvasElement,
     tooltip: document.getElementById('scene-tooltip'),
+    overlay: document.getElementById('scene-annotations') as SVGSVGElement | null,
     header: document.getElementById('scene-header'),
     title: document.getElementById('scene-title'),
     meta: document.getElementById('scene-meta'),
@@ -127,6 +129,7 @@ export function mount(pkg: unknown): SceneRenderer | null {
 
   const renderer = new SceneRenderer(h.canvas, candidate, {
     tooltip: h.tooltip,
+    overlay: h.overlay,
     callbacks: {
       onSelectAtom: (atom) => {
         const refs = atom.sourceRefs?.length ?? 0;
@@ -134,7 +137,7 @@ export function mount(pkg: unknown): SceneRenderer | null {
         setNote(
           h.note,
           refs > 0
-            ? `Selected: ${label} — ${refs} source${refs === 1 ? '' : 's'}`
+            ? `Selected: ${label} (${refs} source${refs === 1 ? '' : 's'})`
             : `Selected: ${label}`,
         );
       },
@@ -159,7 +162,7 @@ export function mount(pkg: unknown): SceneRenderer | null {
   if (layout && layout.fellBack) {
     setNote(
       h.note,
-      `Projection "${layout.requestedProjectionId}" is not available in this build — ` +
+      `Projection "${layout.requestedProjectionId}" is not available in this build: ` +
         `rendered in freeform space.`,
     );
   } else if (layout && layout.gridFallback) {

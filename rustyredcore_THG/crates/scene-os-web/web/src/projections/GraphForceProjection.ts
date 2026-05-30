@@ -5,12 +5,12 @@
  * Theseus-UI `graph_force` adapter (which only seeds atoms on a ring and
  * delegates the actual solve to cosmos.gl inside the React substrate), this
  * adapter runs the simulation ITSELF, synchronously, and returns settled
- * positions — so the vanilla canvas bundle draws a balanced constellation with
+ * positions: so the vanilla canvas bundle draws a balanced constellation with
  * no cosmos.gl, no React, no live animation loop (the static result is painted
  * immediately, which is rAF-safe).
  *
  * The recipe is lifted from `renderers/graphLayout.ts` + the coordination-room
- * components, because the spacing is NOT "use a force graph" — a naive force
+ * components, because the spacing is NOT "use a force graph": a naive force
  * graph is a hairball. The spacing comes from a specific composition:
  *
  *   charge:  forceManyBody, strong negative   (push apart)
@@ -64,7 +64,7 @@ export interface GraphForceProjectionParams {
 }
 
 /** Virtual layout space. The renderer fits this to the canvas, so absolute
- *  tuning (charge, distance, radius) stays stable across viewport sizes — the
+ *  tuning (charge, distance, radius) stays stable across viewport sizes: the
  *  same space the coordination-room reference tunes against. */
 const VW = 1080;
 const VH = 680;

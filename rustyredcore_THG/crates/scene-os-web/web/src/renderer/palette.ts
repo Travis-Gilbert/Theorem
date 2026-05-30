@@ -9,8 +9,8 @@
  *      relations are lines, atoms are filled marks; default relation stroke
  *      `#9aa0a6`, default atom fill `#3c5572`.
  *   2. The browser chrome (`rustyred-web/src/serp.html`): the studio-journal
- *      palette — paper `#f4f1ea`, ink `#2A2823`, ink-soft `#6b665c`, terracotta
- *      accent `#b45a2d`, JetBrains Mono — and the project's section colors
+ *      palette: paper `#f4f1ea`, ink `#2A2823`, ink-soft `#6b665c`, terracotta
+ *      accent `#b45a2d`, JetBrains Mono: and the project's section colors
  *      (terracotta / teal / gold / green).
  *
  * Atom kind drives color and glyph shape (mirroring `projections/shared.ts`

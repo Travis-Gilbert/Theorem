@@ -3,7 +3,7 @@
  *
  * Lane B slice 1: NOT the React `AtomSubstrate` (cosmos.gl force engine). This
  * is a self-contained canvas renderer that takes the scene package Lane A
- * produced, runs the projection to place the atoms, and draws them — one file
+ * produced, runs the projection to place the atoms, and draws them: one file
  * Servo serves, no SPA, no WebGL.
  *
  * It draws the substrate's established vocabulary (relations as lines, atoms as
@@ -19,6 +19,8 @@
  * output and are untrusted. Every piece of DOM text is written via
  * `textContent` / `createElement` (never `innerHTML`), mirroring the SERP page.
  */
+
+import { curveBumpY, link } from 'd3-shape';
 
 import type { Atom } from '../atoms/types';
 import type { ScenePackageV2 } from '../v2-package';
@@ -40,6 +42,7 @@ import {
   type SceneLayout,
   type Viewport,
 } from './sceneGeometry';
+import { AnnotationLayer } from './annotationLayer';
 
 const MAX_CANVAS_PX = 8192;
 const FIT_PADDING_PX = 64;
@@ -59,9 +62,28 @@ interface PlacedAtom {
   shape: ShapeKind;
 }
 
+/** A relation's two screen-space endpoints, the datum the d3-shape link
+ *  generator reads. */
+interface LinkEndpoints {
+  source: { x: number; y: number };
+  target: { x: number; y: number };
+}
+
+/**
+ * Smooth-curve relation generator (d3-shape). `curveBumpY` draws a vertical
+ * bezier between the two endpoints, so relations read as gentle arcs instead of
+ * hard straight segments. Built once at module load (it is a pure path
+ * generator with no DOM / no canvas binding) and reused per relation: each call
+ * with a `LinkEndpoints` datum returns an SVG path string the canvas strokes
+ * via `Path2D`. No randomness, no time: same endpoints produce the same path.
+ */
+const RELATION_LINK = link<LinkEndpoints, { x: number; y: number }>(curveBumpY)
+  .x((point) => point.x)
+  .y((point) => point.y);
+
 export interface SceneRendererCallbacks {
   /** Called when the user clicks an atom (real selection, wired by the host
-   *  shell — e.g. open evidence / ask follow-up). */
+   *  shell: e.g. open evidence / ask follow-up). */
   onSelectAtom?(atom: Atom): void;
 }
 
@@ -76,12 +98,18 @@ export class SceneRenderer {
   private transform: FitTransform | null = null;
   private placed: PlacedAtom[] = [];
   private hoveredId: string | null = null;
+  private selectedId: string | null = null;
   private viewport: Viewport = { width: 0, height: 0 };
+  private readonly annotations: AnnotationLayer | null;
 
   constructor(
     canvas: HTMLCanvasElement,
     pkg: ScenePackageV2,
-    options: { tooltip?: HTMLElement | null; callbacks?: SceneRendererCallbacks } = {},
+    options: {
+      tooltip?: HTMLElement | null;
+      overlay?: SVGSVGElement | null;
+      callbacks?: SceneRendererCallbacks;
+    } = {},
   ) {
     this.canvas = canvas;
     const ctx = canvas.getContext('2d');
@@ -92,6 +120,12 @@ export class SceneRenderer {
     this.tooltip = options.tooltip ?? null;
     this.callbacks = options.callbacks ?? {};
     this.pkg = pkg;
+    // The annotation overlay is optional: when no <svg> is supplied the renderer
+    // simply draws no callouts (the canvas + tooltip path is unchanged).
+    this.annotations =
+      options.overlay != null
+        ? new AnnotationLayer(options.overlay, () => this.viewport)
+        : null;
 
     this.onPointerMove = this.onPointerMove.bind(this);
     this.onPointerLeave = this.onPointerLeave.bind(this);
@@ -132,6 +166,9 @@ export class SceneRenderer {
     this.transform = fitTransform(this.layout.bounds, this.viewport, FIT_PADDING_PX);
     this.computePlaced();
     this.paint();
+    // Re-anchor any open callout to the selected atom's new screen position
+    // (the re-fit moved every glyph).
+    this.refreshAnnotation();
   }
 
   destroy(): void {
@@ -139,6 +176,24 @@ export class SceneRenderer {
     this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
     this.canvas.removeEventListener('click', this.onClick);
     if (this.tooltip) this.tooltip.style.display = 'none';
+    if (this.annotations) this.annotations.clear();
+  }
+
+  /** Redraw the callout for the currently-selected atom at its current screen
+   *  position, or clear it if nothing is selected / the atom is gone. */
+  private refreshAnnotation(): void {
+    const layer = this.annotations;
+    if (layer === null) return;
+    if (this.selectedId === null) {
+      layer.clear();
+      return;
+    }
+    const placed = this.placed.find((p) => p.atom.id === this.selectedId);
+    if (placed === undefined) {
+      layer.clear();
+      return;
+    }
+    layer.showCallout(placed.atom, placed.sx, placed.sy);
   }
 
   // ------------------------------------------------------------------------
@@ -180,7 +235,7 @@ export class SceneRenderer {
   /**
    * Paint the current scene at full opacity. Synchronous and idempotent: no
    * rAF, no time-based fade. A scene MUST be visible the instant it mounts,
-   * and rAF is throttled in headless / background tabs — gating visibility on
+   * and rAF is throttled in headless / background tabs: gating visibility on
    * it would leave the canvas blank. Lifecycle-driven per-atom opacity
    * (entering / leaving) still applies because it is data-driven, not
    * time-driven. Choreographed enter/morph transitions are a later enrichment
@@ -224,10 +279,15 @@ export class SceneRenderer {
       const stroke = relationStroke(rel.color);
       ctx.strokeStyle = highlight ? ACCENT : stroke;
       ctx.globalAlpha = (highlight ? 0.95 : 0.5) * fade;
-      ctx.beginPath();
-      ctx.moveTo(a.sx, a.sy);
-      ctx.lineTo(b.sx, b.sy);
-      ctx.stroke();
+      // Smooth curve (d3-shape) between the two glyph centers. The generator
+      // returns an SVG path string; Path2D lets the canvas stroke it directly.
+      const pathStr = RELATION_LINK({
+        source: { x: a.sx, y: a.sy },
+        target: { x: b.sx, y: b.sy },
+      });
+      if (pathStr !== null) {
+        ctx.stroke(new Path2D(pathStr));
+      }
       drawArrowhead(ctx, a, b, highlight ? ACCENT : stroke);
     }
     ctx.globalAlpha = fade;
@@ -302,8 +362,20 @@ export class SceneRenderer {
   private onClick(event: PointerEvent): void {
     const rect = this.canvas.getBoundingClientRect();
     const hit = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
-    if (hit && this.callbacks.onSelectAtom) {
-      this.callbacks.onSelectAtom(hit.atom);
+    // Selecting an atom opens its callout at the atom's screen position;
+    // clicking empty space clears the selection and the callout. Selection is
+    // real state (also surfaced to the host via onSelectAtom), not theater.
+    if (hit) {
+      this.selectedId = hit.atom.id;
+      if (this.annotations) {
+        this.annotations.showCallout(hit.atom, hit.sx, hit.sy);
+      }
+      if (this.callbacks.onSelectAtom) {
+        this.callbacks.onSelectAtom(hit.atom);
+      }
+    } else if (this.selectedId !== null) {
+      this.selectedId = null;
+      if (this.annotations) this.annotations.clear();
     }
   }
 

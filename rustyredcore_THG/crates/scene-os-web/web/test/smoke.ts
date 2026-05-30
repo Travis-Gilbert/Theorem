@@ -1,11 +1,12 @@
 /**
  * Headless smoke for the pure scene pipeline (no DOM).
  *
- * Verifies that each of Lane A's six production projection ids resolves to an
- * adapter, places every atom at a finite position, and produces non-degenerate
- * bounds — plus the two honesty paths (unknown id -> freeform fallback,
- * positionless atoms -> grid fallback). Bundled to CJS by esbuild and run under
- * node; the canvas drawing is verified separately by a browser screenshot.
+ * Verifies that each of the bundle's eight production projection ids resolves
+ * to an adapter, places every atom at a finite position, and produces non-
+ * degenerate bounds, plus the two honesty paths (unknown id -> freeform
+ * fallback, positionless atoms -> grid fallback). Bundled to CJS by esbuild and
+ * run under node; the canvas drawing is verified separately by a browser
+ * screenshot.
  */
 
 import type { Atom, Relation } from '../src/atoms/types';
@@ -59,7 +60,7 @@ const relations: Relation[] = [
 ];
 
 console.log('registry');
-check('seven projection ids registered', supportedProjectionIds().length === 7);
+check('eight projection ids registered', supportedProjectionIds().length === 8);
 for (const id of [
   'patent_diagram',
   'tree_hierarchy',
@@ -68,6 +69,7 @@ for (const id of [
   'flow_layered',
   'sankey_flow',
   'graph_force',
+  'geo',
 ]) {
   check(`resolves ${id} without fallback`, resolveProjection(id).fellBack === false);
 }

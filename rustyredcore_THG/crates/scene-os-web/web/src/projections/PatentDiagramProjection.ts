@@ -4,7 +4,7 @@
  * Unlike the canvas-rendered projections (geo, graph, matrix, cinematic,
  * image), patent_diagram is *artifact-shaped*: the agent has already
  * produced a fully-laid-out PatentScenePayload (DOT source, callouts,
- * legend, title block). The substrate's canvas is therefore optional —
+ * legend, title block). The substrate's canvas is therefore optional :
  * the chrome shell (`patent_plate_shell`) renders the patent via the
  * existing `<PatentDiagram>` primitive, which runs Graphviz layout
  * inside its own React tree.
@@ -138,8 +138,8 @@ export const PATENT_DIAGRAM_PROJECTION: ProjectionAdapter = {
   terminalState(input) {
     // Delegate to the generic SVG generator for the substrate-level
     // SVG artifact (deterministic, sortable, source-refs aggregated).
-    // The full patent_scene payload is in package.projection.params —
-    // not on TerminalStateInput — so the chrome's freeze handler reads
+    // The full patent_scene payload is in package.projection.params :
+    // not on TerminalStateInput: so the chrome's freeze handler reads
     // it from the package directly and POSTs a richer artifact when
     // needed. The substrate-level SVG here serves as the always-
     // available baseline artifact (per the v2 spec's determinism

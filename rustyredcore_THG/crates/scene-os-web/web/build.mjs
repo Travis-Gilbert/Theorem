@@ -18,6 +18,19 @@ const outfile = join(here, 'dist', 'scene-os.bundle.js');
 
 mkdirSync(join(here, 'dist'), { recursive: true });
 
+// d3-svg-annotation ships two builds. Its ESM `module` build imports
+// `{ event }` from d3-selection, a symbol d3-selection v3 removed, so bundling
+// it against our d3-selection v3 fails. Its CJS `main` build (indexRollup.js)
+// is fully self-contained (it inlines its own d3-selection 1.4.0, where `event`
+// exists), so we alias the package to that build. The renderer never enables
+// the annotation editMode, so the inlined drag/selection code stays inert.
+const selfContainedAnnotation = join(
+  here,
+  'node_modules',
+  'd3-svg-annotation',
+  'indexRollup.js',
+);
+
 await build({
   entryPoints: [join(here, 'src', 'entry.ts')],
   bundle: true,
@@ -26,6 +39,9 @@ await build({
   target: ['es2020'],
   minify: true,
   legalComments: 'none',
+  alias: {
+    'd3-svg-annotation': selfContainedAnnotation,
+  },
   outfile,
   logLevel: 'info',
 });

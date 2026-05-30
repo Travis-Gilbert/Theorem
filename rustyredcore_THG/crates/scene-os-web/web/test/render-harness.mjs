@@ -35,11 +35,19 @@ const ctx = {
   beginPath: rec('beginPath'),
   moveTo: rec('moveTo'),
   lineTo: rec('lineTo'),
+  bezierCurveTo: rec('bezierCurveTo'),
   arc: rec('arc'),
   rect: rec('rect'),
   quadraticCurveTo: rec('quadraticCurveTo'),
   closePath: rec('closePath'),
-  stroke: rec('stroke'),
+  // stroke records both stroke() and stroke(path); a Path2D arg means a curved
+  // relation was stroked (d3-shape link -> SVG path string -> Path2D).
+  stroke: (arg) => {
+    calls.stroke = (calls.stroke ?? 0) + 1;
+    if (arg instanceof Path2DStub) {
+      calls.strokePath = (calls.strokePath ?? 0) + 1;
+    }
+  },
   fill: rec('fill'),
   fillText: rec('fillText'),
   measureText: (t) => {
@@ -47,6 +55,17 @@ const ctx = {
     return { width: String(t).length * 6 };
   },
 };
+
+// The renderer strokes curved relations via `new Path2D(svgPathString)`. Node
+// has no Path2D, so stub it: record construction and retain the path string so
+// the draw path executes exactly as in the browser.
+class Path2DStub {
+  constructor(d) {
+    calls.Path2D = (calls.Path2D ?? 0) + 1;
+    this.d = typeof d === 'string' ? d : '';
+  }
+}
+globalThis.Path2D = Path2DStub;
 
 // ---- Stub DOM -------------------------------------------------------------
 function makeEl(id) {
@@ -102,6 +121,10 @@ globalThis.document = {
   getElementById: (id) => elements.get(id) ?? null,
   createElement: (tag) => makeEl(`new-${tag}`),
   addEventListener: () => {},
+  // d3-svg-annotation's inlined d3-selection sniffs `'onmouseenter' in
+  // document.documentElement` at import; give it a real element so the bundle
+  // initializes (the browser always has documentElement).
+  documentElement: { onmouseenter: null },
 };
 globalThis.window = {
   devicePixelRatio: 2,
@@ -153,7 +176,8 @@ check('background + label halos painted (fillRect)', (calls.fillRect ?? 0) > 0);
 check('glyph paths built (arc or rect)', (calls.arc ?? 0) + (calls.rect ?? 0) > 0);
 check('atoms stroked', (calls.stroke ?? 0) > 0);
 check('atoms filled', (calls.fill ?? 0) > 0);
-check('relation segments drawn (moveTo + lineTo)', (calls.moveTo ?? 0) > 0 && (calls.lineTo ?? 0) > 0);
+check('curved relations stroked (d3-shape link -> Path2D)', (calls.strokePath ?? 0) > 0);
+check('relation arrowheads drawn (moveTo + lineTo)', (calls.moveTo ?? 0) > 0 && (calls.lineTo ?? 0) > 0);
 check('labels drawn (fillText)', (calls.fillText ?? 0) > 0);
 
 // Header reflects the resolved projection + counts.

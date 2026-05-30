@@ -31,15 +31,20 @@ import { CATEGORICAL_SET_PROJECTION } from './CategoricalSetProjection';
 import { FLOW_LAYERED_PROJECTION } from './FlowLayeredProjection';
 import { SANKEY_FLOW_PROJECTION } from './SankeyFlowProjection';
 import { GRAPH_FORCE_PROJECTION } from './GraphForceProjection';
+import { GEO_PROJECTION } from './GeoProjection';
 
 /**
- * The adapters this bundle can render, keyed by id.
+ * The adapters this bundle can render, keyed by id (eight total).
  *
  * The first six are Lane A's production catalog set. `graph_force` is the
  * renderer-side d3-force layout: it runs the simulation synchronously and
  * returns settled positions (it does NOT require cosmos.gl, unlike the
  * Theseus-UI graph adapter), so the canvas draws a well-spaced constellation
- * for any graph-shaped scene — the layout the coordination room needs.
+ * for any graph-shaped scene: the layout the coordination room needs. `geo`
+ * is the renderer-side d3-geo Mercator layout: it places atoms carrying
+ * geographic coordinates in the `geo` coordinate space, proving the bundle's
+ * full d3 math generalizes across coordinate spaces (not just graph / diagram /
+ * rank).
  */
 const PRODUCTION_PROJECTIONS: ReadonlyArray<ProjectionAdapter> = [
   PATENT_DIAGRAM_PROJECTION,
@@ -49,6 +54,7 @@ const PRODUCTION_PROJECTIONS: ReadonlyArray<ProjectionAdapter> = [
   FLOW_LAYERED_PROJECTION,
   SANKEY_FLOW_PROJECTION,
   GRAPH_FORCE_PROJECTION,
+  GEO_PROJECTION,
 ];
 
 const REGISTRY: ReadonlyMap<string, ProjectionAdapter> = new Map(

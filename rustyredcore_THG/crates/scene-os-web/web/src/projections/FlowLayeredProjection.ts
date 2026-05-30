@@ -9,7 +9,7 @@
  *
  * This is the PLACEMENT half of the catalog's sankey-flow slot. It does not
  * compute sankey ribbon geometry (node rectangles sized by throughput, link
- * widths by flow) — that needs the d3-sankey dependency and is a future
+ * widths by flow): that needs the d3-sankey dependency and is a future
  * decoration on top of this layering. Named `flow_layered` rather than
  * `sankey_flow` so the richer sankey slot stays honestly open.
  *
