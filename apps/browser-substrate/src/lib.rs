@@ -21,8 +21,8 @@ use std::fmt;
 
 use rustyred_thg_core::graph_store::{GraphStore, GraphStoreError, GraphWriteResult};
 use rustyred_web::{
-    build_v2_fixture_crawl, render_serp_html, search_substrate, CrawlRequest, CrawlRunOutput,
-    FetchedPage, RustyWebError, SearchOptions,
+    build_v2_fixture_crawl, render_search_page, CrawlRequest, CrawlRunOutput, FetchedPage,
+    RustyWebError,
 };
 
 /// A browser-callable capability exposed by this seam.
@@ -186,8 +186,95 @@ pub fn ingest_loaded_pages(
 /// Servo-free crate lets the SERP/search contract test quickly without building
 /// Servo.
 pub fn render_substrate_search_page(store: &impl GraphStore, query: &str) -> String {
-    let search = search_substrate(store, query, SearchOptions::default());
-    render_serp_html(&search)
+    render_search_page(store, query)
+}
+
+/// Receipt for a browser session graph write.
+///
+/// This is intentionally smaller than the full crawl receipt: the embedder
+/// needs a stable audit handle and enough counters for smoke/test output, while
+/// the substrate keeps the full graph mutation detail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserSessionReceipt {
+    pub session_id: String,
+    pub run_id: String,
+    pub page_count: usize,
+    pub total_page_count: usize,
+    pub write_count: usize,
+    pub graph_delta_hash: String,
+}
+
+/// Browser-owned substrate state for one local browsing session.
+///
+/// The Servo embedder should talk to this object instead of passing a raw graph
+/// store around. That gives the browser one stable place to write loaded pages,
+/// render graph-native search, and later swap the backing store from memory to
+/// RustyRed/THG without changing browser event wiring.
+#[derive(Clone, Debug)]
+pub struct BrowserSessionStore<S> {
+    store: S,
+    session_id: String,
+    ingested_pages: usize,
+    run_sequence: usize,
+}
+
+impl<S: GraphStore> BrowserSessionStore<S> {
+    pub fn new(store: S, session_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            session_id: session_id.into(),
+            ingested_pages: 0,
+            run_sequence: 0,
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn ingested_page_count(&self) -> usize {
+        self.ingested_pages
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
+    pub fn ingest_loaded_page(
+        &mut self,
+        page: LoadedPage,
+    ) -> Result<BrowserSessionReceipt, SeamError> {
+        self.ingest_pages(std::slice::from_ref(&page))
+    }
+
+    pub fn ingest_pages(
+        &mut self,
+        pages: &[LoadedPage],
+    ) -> Result<BrowserSessionReceipt, SeamError> {
+        self.run_sequence += 1;
+        let run_id = format!("{}-{}", self.session_id, self.run_sequence);
+        let seeds = pages.iter().map(|page| page.url.clone()).collect();
+        let (output, writes) = ingest_loaded_pages(&mut self.store, run_id.clone(), seeds, pages)?;
+
+        self.ingested_pages += pages.len();
+
+        Ok(BrowserSessionReceipt {
+            session_id: self.session_id.clone(),
+            run_id,
+            page_count: pages.len(),
+            total_page_count: self.ingested_pages,
+            write_count: writes.len(),
+            graph_delta_hash: output.receipt.graph_delta_hash,
+        })
+    }
+
+    pub fn render_search_page(&self, query: &str) -> String {
+        render_substrate_search_page(&self.store, query)
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +375,51 @@ mod tests {
         assert!(html.contains("var SERP_DATA = {"));
         assert!(html.contains("https://example.com/index.html"));
         assert!(html.contains("Substrate browser"));
+    }
+
+    #[test]
+    fn browser_session_store_ingests_pages_and_renders_search() {
+        let mut session = BrowserSessionStore::new(InMemoryGraphStore::new(), "browser-session");
+        let receipt = session
+            .ingest_loaded_page(LoadedPage::html(
+                "https://example.com/session.html",
+                r#"<html><body><h1>Session substrate</h1></body></html>"#,
+            ))
+            .expect("session ingest should write to the substrate");
+
+        assert_eq!(receipt.session_id, "browser-session");
+        assert_eq!(receipt.run_id, "browser-session-1");
+        assert_eq!(receipt.page_count, 1);
+        assert_eq!(receipt.total_page_count, 1);
+        assert!(receipt.write_count > 0);
+        assert!(!receipt.graph_delta_hash.is_empty());
+        assert_eq!(session.ingested_page_count(), 1);
+
+        let html = session.render_search_page("session");
+        assert!(html.contains("var SERP_DATA = {"));
+        assert!(html.contains("https://example.com/session.html"));
+        assert!(html.contains("Session substrate"));
+    }
+
+    #[test]
+    fn browser_session_store_receipts_increment_run_ids() {
+        let mut session = BrowserSessionStore::new(InMemoryGraphStore::new(), "browser-session");
+
+        let first = session
+            .ingest_loaded_page(LoadedPage::html(
+                "https://example.com/one.html",
+                "<html><body>One</body></html>",
+            ))
+            .expect("first ingest should succeed");
+        let second = session
+            .ingest_loaded_page(LoadedPage::html(
+                "https://example.com/two.html",
+                "<html><body>Two</body></html>",
+            ))
+            .expect("second ingest should succeed");
+
+        assert_eq!(first.run_id, "browser-session-1");
+        assert_eq!(second.run_id, "browser-session-2");
+        assert_eq!(second.total_page_count, 2);
     }
 }
