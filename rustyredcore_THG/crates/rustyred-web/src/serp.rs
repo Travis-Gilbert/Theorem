@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     use crate::search::{SearchHit, SearchLink};
 
-    fn hit(node_id: &str, url: &str, title: &str, ring: usize, score: u32) -> SearchHit {
+    fn hit(node_id: &str, url: &str, title: &str, ring: usize, score: f64) -> SearchHit {
         SearchHit {
             node_id: node_id.to_string(),
             url: url.to_string(),
@@ -103,8 +103,8 @@ mod tests {
         SubstrateSearch {
             query: "apple".to_string(),
             hits: vec![
-                hit("p1", "http://ex.com/apple", "apple", 0, 3),
-                hit("p2", "http://ex.com/orchard", "orchard", 1, 0),
+                hit("p1", "http://ex.com/apple", "apple", 0, 0.3),
+                hit("p2", "http://ex.com/orchard", "orchard", 1, 0.1),
             ],
             links: vec![SearchLink {
                 source: "p1".to_string(),
@@ -193,7 +193,10 @@ mod tests {
 
         let html = render_search_page(&store, "apple");
         assert!(html.contains("var SERP_DATA = {"), "rendered a SERP");
-        assert!(html.contains("http://ex.com/apple"), "found the loaded page");
+        assert!(
+            html.contains("http://ex.com/apple"),
+            "found the loaded page"
+        );
 
         // A query with nothing loaded for it is the honest empty page.
         let empty = render_search_page(&store, "quantum");

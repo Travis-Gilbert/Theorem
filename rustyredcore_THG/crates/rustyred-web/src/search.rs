@@ -25,9 +25,11 @@
 //! search", V0). Mirrors the web-side `searchRelevance.ts` relevance engine
 //! shipped in Theseus-UI so the two surfaces share one mental model.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustyred_thg_core::graph_store::{GraphStore, NeighborQuery, NodeQuery, NodeRecord};
+use rustyred_thg_core::personalized_pagerank;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -39,6 +41,12 @@ const DEFAULT_MAX_RING: usize = 2;
 const DEFAULT_SCAN_LIMIT: usize = 10_000;
 /// Snippet length (characters of the page's extracted text).
 const SNIPPET_CHARS: usize = 240;
+/// ACL local-push PageRank alpha, matching THG's native graph algorithm default.
+const DEFAULT_PPR_ALPHA: f64 = 0.15;
+/// PPR residual threshold. Kept low enough for browser-size page graphs.
+const DEFAULT_PPR_EPSILON: f64 = 1e-5;
+/// Hard cap for local-push work. Browser substrates should stay well below this.
+const DEFAULT_PPR_MAX_PUSHES: usize = 100_000;
 
 /// Knobs for a substrate search. `Default` is the common browser case.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,8 +82,9 @@ pub struct SearchHit {
     pub ring: usize,
     /// Plain-language ring name: match / adjacent / nearby / distant / browse.
     pub ring_label: String,
-    /// Lexical relevance score (0 for ring > 0 pages pulled in by links).
-    pub match_score: u32,
+    /// Graph-aware relevance score. Direct matches seed native PPR; linked
+    /// neighbours can receive non-zero score when the link graph supports them.
+    pub match_score: f64,
 }
 
 /// A `LINKS_TO` edge that survives inside the result neighbourhood.
@@ -220,12 +229,74 @@ fn links_among(store: &impl GraphStore, kept: &BTreeSet<String>) -> Vec<SearchLi
         .collect()
 }
 
+fn ppr_adjacency(
+    store: &impl GraphStore,
+    pages: &[NodeRecord],
+) -> HashMap<String, Vec<(String, f64)>> {
+    let known: BTreeSet<String> = pages.iter().map(|page| page.id.clone()).collect();
+    let mut adjacency: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+    for page in pages {
+        adjacency.entry(page.id.clone()).or_default();
+        for hit in store
+            .neighbors(NeighborQuery::out(&page.id).with_edge_type(EDGE_LINKS_TO))
+            .into_iter()
+            .filter(|hit| known.contains(&hit.node_id))
+        {
+            adjacency
+                .entry(page.id.clone())
+                .or_default()
+                .entry(hit.node_id.clone())
+                .or_insert(1.0);
+            adjacency
+                .entry(hit.node_id)
+                .or_default()
+                .entry(page.id.clone())
+                .or_insert(1.0);
+        }
+    }
+    adjacency
+        .into_iter()
+        .map(|(source, targets)| (source, targets.into_iter().collect()))
+        .collect()
+}
+
+fn ppr_seed_scores(score_of: &BTreeMap<String, u32>) -> HashMap<String, f64> {
+    let total: f64 = score_of.values().map(|score| *score as f64).sum();
+    if total <= 0.0 {
+        return HashMap::new();
+    }
+    score_of
+        .iter()
+        .map(|(id, score)| (id.clone(), *score as f64 / total))
+        .collect()
+}
+
+fn rank_score(
+    id: &str,
+    lexical_scores: &BTreeMap<String, u32>,
+    ppr_scores: &HashMap<String, f64>,
+) -> f64 {
+    ppr_scores
+        .get(id)
+        .copied()
+        .or_else(|| lexical_scores.get(id).map(|score| *score as f64))
+        .unwrap_or(0.0)
+}
+
+fn compare_ranked_hits(a: &(String, usize, f64), b: &(String, usize, f64)) -> Ordering {
+    b.2.partial_cmp(&a.2)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.1.cmp(&b.1))
+        .then_with(|| a.0.cmp(&b.0))
+}
+
 /// Search the substrate for the shape of the user's knowledge about `query`.
 ///
 /// Empty query => browse mode: every `Page` node (bounded by `scan_limit`),
 /// unranked. Otherwise: pages whose url or extracted text match the query terms
-/// (`ring 0`), expanded out along `LINKS_TO` to `max_ring` hops. The result is
-/// deterministic for a fixed substrate + query + options.
+/// (`ring 0`) seed native THG PPR over the page-link graph, then the result is
+/// expanded out along `LINKS_TO` to `max_ring` hops. Ring labels explain how a
+/// page entered the neighbourhood; score and ordering come from graph rank.
 pub fn search_substrate(
     store: &impl GraphStore,
     query: &str,
@@ -261,7 +332,7 @@ pub fn search_substrate(
                     snippet: snippet_of(&snippet),
                     ring: 0,
                     ring_label: "browse".to_string(),
-                    match_score: 0,
+                    match_score: 0.0,
                 }
             })
             .collect();
@@ -314,20 +385,34 @@ pub fn search_substrate(
         frontier = next.into_iter().collect();
     }
 
-    // Emit hits ordered by (ring, node_id).
+    let ppr_scores = personalized_pagerank(
+        &ppr_adjacency(store, &pages),
+        &ppr_seed_scores(&score_of),
+        DEFAULT_PPR_ALPHA,
+        DEFAULT_PPR_EPSILON,
+        DEFAULT_PPR_MAX_PUSHES,
+    );
+
+    // Emit hits ordered by graph-aware rank, then ring, then node id.
     let kept_ids: BTreeSet<String> = ring_of.keys().cloned().collect();
-    let mut ordered: Vec<(String, usize)> = ring_of.into_iter().collect();
-    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let mut ordered: Vec<(String, usize, f64)> = ring_of
+        .into_iter()
+        .map(|(id, ring)| {
+            let score = rank_score(&id, &score_of, &ppr_scores);
+            (id, ring, score)
+        })
+        .collect();
+    ordered.sort_by(compare_ranked_hits);
 
     let hits: Vec<SearchHit> = ordered
         .into_iter()
-        .map(|(id, ring)| {
+        .map(|(id, ring, score)| {
             let (url, title, snippet) = meta
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| page_meta(store, &id));
             SearchHit {
-                match_score: score_of.get(&id).copied().unwrap_or(0),
+                match_score: score,
                 node_id: id,
                 url,
                 title,
@@ -421,7 +506,7 @@ mod tests {
         assert_eq!(hit.url, "http://ex.com/apple");
         assert_eq!(hit.ring, 0);
         assert_eq!(hit.ring_label, "match");
-        assert!(hit.match_score > 0);
+        assert!(hit.match_score > 0.0);
         assert!(hit.snippet.contains("apple"), "snippet carries the text");
     }
 
@@ -456,7 +541,10 @@ mod tests {
             .find(|h| h.url == "http://ex.com/orchard")
             .unwrap();
         assert_eq!(orchard.ring, 1);
-        assert_eq!(orchard.match_score, 0, "pulled in by a link, not a match");
+        assert!(
+            orchard.match_score > 0.0,
+            "linked neighbours receive graph-rank mass"
+        );
 
         // The surviving LINKS_TO edge (apple -> orchard) is reported.
         assert!(
@@ -491,6 +579,7 @@ mod tests {
             .unwrap();
         assert_eq!(soil.ring, 2);
         assert_eq!(soil.ring_label, "nearby");
+        assert!(soil.match_score > 0.0, "PPR reaches the second hop");
     }
 
     #[test]

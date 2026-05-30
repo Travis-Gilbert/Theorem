@@ -5,11 +5,12 @@ use std::thread;
 use rustyred_thg_core::{InMemoryGraphStore, NodeQuery, TTL_PROPERTY};
 use rustyred_web::{
     build_fixture_crawl_graph, build_v2_fixture_crawl, canonicalize_url, extract_links,
-    guarded_canonicalize_url, run_live_crawl_with_options, CrawlBudget, CrawlConfig, CrawlRequest,
-    CrawlScope, FixturePage, LiveFetchOptions, RustyWebError, UrlGuardPolicy, EDGE_CANONICAL_OF,
-    EDGE_EMITTED_RECEIPT, EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, EDGE_ON_DOMAIN, EDGE_RESULTED_IN,
-    EDGE_SEEDED, LABEL_CONTENT_SNAPSHOT, LABEL_CRAWL_RECEIPT, LABEL_CRAWL_RUN,
-    LABEL_DISCOVERY_SEED, LABEL_DOMAIN, LABEL_FETCH_ATTEMPT, LABEL_PAGE, LABEL_ROBOTS_POLICY,
+    extract_links_with_profile, guarded_canonicalize_url, profile_for, run_live_crawl_with_options,
+    CrawlBudget, CrawlConfig, CrawlRequest, CrawlScope, FixturePage, LiveFetchOptions,
+    RustyWebError, SourceClass, UrlGuardPolicy, EDGE_CANONICAL_OF, EDGE_EMITTED_RECEIPT,
+    EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, EDGE_ON_DOMAIN, EDGE_RESULTED_IN, EDGE_SEEDED,
+    LABEL_CONTENT_SNAPSHOT, LABEL_CRAWL_RECEIPT, LABEL_CRAWL_RUN, LABEL_DISCOVERY_SEED,
+    LABEL_DOMAIN, LABEL_FETCH_ATTEMPT, LABEL_PAGE, LABEL_ROBOTS_POLICY,
 };
 use serde_json::json;
 
@@ -102,6 +103,17 @@ fn canonicalization_and_link_extraction_are_deterministic() {
             "https://example.org/z".to_string(),
         ],
     );
+}
+
+#[test]
+fn extraction_profile_can_disable_html_link_extraction() {
+    let links = extract_links_with_profile(
+        "https://example.com/file.pdf",
+        r#"<a href="https://example.com/nope">Nope</a>"#,
+        &profile_for(SourceClass::Pdf),
+    )
+    .unwrap();
+    assert!(links.is_empty());
 }
 
 #[test]
@@ -298,7 +310,62 @@ async fn live_fetch_loop_enforces_body_budget() {
     ));
 }
 
+#[tokio::test]
+async fn live_fetch_loop_fetches_robots_before_page() {
+    let url = spawn_sequence_server(vec![
+        (
+            200,
+            "text/plain",
+            "User-agent: *\nAllow: /\nCrawl-delay: 0\n",
+        ),
+        (
+            200,
+            "text/html; charset=utf-8",
+            r#"<html><body><h1>Robots allowed</h1><a href="/next">Next</a></body></html>"#,
+        ),
+    ]);
+    let mut request = CrawlRequest::new("rw-live-robots-allow", vec![url]);
+    request.budget = CrawlBudget {
+        max_pages: 1,
+        max_seconds: 5,
+        max_depth: 0,
+        max_bytes: 8192,
+    };
+
+    let output = run_live_crawl_with_options(request, &live_robots_options(true))
+        .await
+        .unwrap();
+
+    assert_eq!(output.receipt.counters.fetched_pages, 1);
+    assert_eq!(output.receipt.counters.links, 1);
+}
+
+#[tokio::test]
+async fn live_fetch_loop_blocks_robots_disallow() {
+    let url = spawn_sequence_server(vec![(200, "text/plain", "User-agent: *\nDisallow: /\n")]);
+    let mut request = CrawlRequest::new("rw-live-robots-deny", vec![url]);
+    request.budget = CrawlBudget {
+        max_pages: 1,
+        max_seconds: 5,
+        max_depth: 0,
+        max_bytes: 8192,
+    };
+
+    let error = run_live_crawl_with_options(request, &live_robots_options(true))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RustyWebError::BlockedUrl { reason, .. } if reason.contains("robots disallowed")
+    ));
+}
+
 fn live_test_options() -> LiveFetchOptions {
+    live_robots_options(false)
+}
+
+fn live_robots_options(respect_robots: bool) -> LiveFetchOptions {
     LiveFetchOptions {
         user_agent: "RustyWeb test".to_string(),
         timeout_seconds: 5,
@@ -307,6 +374,7 @@ fn live_test_options() -> LiveFetchOptions {
             allow_private_networks: false,
             block_metadata_services: true,
         },
+        respect_robots,
     }
 }
 
@@ -322,6 +390,24 @@ fn spawn_one_shot_server(status: u16, content_type: &'static str, body: &'static
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
+    });
+    format!("http://{address}/")
+}
+
+fn spawn_sequence_server(responses: Vec<(u16, &'static str, &'static str)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for (status, content_type, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_buf = [0; 1024];
+            let _ = stream.read(&mut request_buf);
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
     });
     format!("http://{address}/")
 }

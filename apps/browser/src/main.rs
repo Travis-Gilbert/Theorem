@@ -26,6 +26,7 @@ use dpi::PhysicalSize;
 use embedder_traits::WebResourceResponse;
 use euclid::Scale;
 use http::header::{HeaderValue, CONTENT_TYPE};
+use http::StatusCode;
 use scene_os_core::{
     compile_scene_package, AtomLifecycle, SceneAtom, SceneCompileInput, SceneRelation, SceneScene,
     SourceRef,
@@ -37,8 +38,9 @@ use servo::{
     WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use theorem_browser_substrate::{
-    browser_affordances, durable_browser_session, memory_browser_session, LoadedPage,
-    RedCoreBrowserSessionStore, SubstrateSearch,
+    browser_affordances, durable_browser_session, memory_browser_session,
+    render_substrate_search_result_page, LiveFetchOptions, LoadedPage, RedCoreBrowserSessionStore,
+    SubstrateSearch, TriggerGateConfig, UrlGuardPolicy,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -564,22 +566,72 @@ fn intercept_local_theorem_page(
     session: &RefCell<RedCoreBrowserSessionStore>,
 ) {
     let url = load.request().url.clone();
-    let body = if url.as_str() == SMOKE_URL {
-        SMOKE_HTML.to_string()
+    let (body, status, content_type) = if url.as_str() == SMOKE_URL {
+        (
+            SMOKE_HTML.as_bytes().to_vec(),
+            StatusCode::OK,
+            "text/html; charset=utf-8".to_string(),
+        )
     } else if url.as_str().starts_with(SEARCH_URL_PREFIX) {
         let query = url
             .query_pairs()
             .find(|(key, _)| key == "q")
             .map(|(_, value)| value.to_string())
             .unwrap_or_default();
-        session.borrow().render_search_page(&query)
+        let gate_config = browser_search_gate_config_from_url(&url);
+        let body = match session.borrow_mut().search_or_crawl_blocking(
+            &query,
+            &browser_open_web_options(),
+            &gate_config,
+        ) {
+            Ok(result) => render_substrate_search_result_page(&result.final_search),
+            Err(error) => {
+                eprintln!("theorem-browser: search crawl failed for {url}: {error}");
+                open_web_error_page(&url, &error.to_string())
+            }
+        };
+        (
+            body.into_bytes(),
+            StatusCode::OK,
+            "text/html; charset=utf-8".to_string(),
+        )
     } else if url.as_str().starts_with(SCENE_URL_PREFIX) {
         let query = scene_query_from_url(&url);
-        match render_browser_scene_page(&session.borrow(), &query) {
+        let body = match render_browser_scene_page(&session.borrow(), &query) {
             Ok(body) => body,
             Err(error) => {
                 eprintln!("theorem-browser: SceneOS route failed: {error}");
                 scene_os_web::render_scene_html("null")
+            }
+        };
+        (
+            body.into_bytes(),
+            StatusCode::OK,
+            "text/html; charset=utf-8".to_string(),
+        )
+    } else if is_open_web_url(&url) {
+        match session
+            .borrow_mut()
+            .fetch_and_ingest_open_web_page_blocking(url.as_str(), &browser_open_web_options())
+        {
+            Ok((page, receipt)) => {
+                eprintln!(
+                    "theorem-browser: fetched {} into substrate delta {}",
+                    page.url, receipt.graph_delta_hash
+                );
+                (
+                    page.body.into_bytes(),
+                    status_code_from_u16(page.status),
+                    page.content_type,
+                )
+            }
+            Err(error) => {
+                eprintln!("theorem-browser: open-web fetch failed for {url}: {error}");
+                (
+                    open_web_error_page(&url, &error.to_string()).into_bytes(),
+                    StatusCode::BAD_GATEWAY,
+                    "text/html; charset=utf-8".to_string(),
+                )
             }
         }
     } else {
@@ -589,13 +641,70 @@ fn intercept_local_theorem_page(
     let mut headers = http::HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
+        HeaderValue::from_str(&content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
 
-    let response = WebResourceResponse::new(load.request().url.clone()).headers(headers);
+    let response = WebResourceResponse::new(load.request().url.clone())
+        .headers(headers)
+        .status_code(status)
+        .status_message(
+            status
+                .canonical_reason()
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec(),
+        );
     let mut intercepted = load.intercept(response);
-    intercepted.send_body_data(body.into_bytes());
+    intercepted.send_body_data(body);
     intercepted.finish();
+}
+
+fn is_open_web_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https") && url.host_str() != Some("theorem.local")
+}
+
+fn browser_open_web_options() -> LiveFetchOptions {
+    LiveFetchOptions {
+        user_agent: "Theorem Browser/RustyWeb".to_string(),
+        timeout_seconds: 10,
+        guard_policy: UrlGuardPolicy::default(),
+        respect_robots: true,
+    }
+}
+
+fn browser_search_gate_config_from_url(url: &Url) -> TriggerGateConfig {
+    let crawl_mode = url
+        .query_pairs()
+        .find(|(key, _)| key == "mode" || key == "crawl")
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_default();
+    if crawl_mode.eq_ignore_ascii_case("broad") {
+        TriggerGateConfig::broad()
+    } else {
+        TriggerGateConfig::conservative()
+    }
+}
+
+fn status_code_from_u16(status: u16) -> StatusCode {
+    StatusCode::from_u16(status).unwrap_or(StatusCode::OK)
+}
+
+fn open_web_error_page(url: &Url, error: &str) -> String {
+    format!(
+        "<!doctype html><html><head><title>Theorem fetch failed</title></head><body><main><h1>Theorem fetch failed</h1><p>{}</p><pre>{}</pre></main></body></html>",
+        escape_html_text(url.as_str()),
+        escape_html_text(error)
+    )
+}
+
+fn escape_html_text(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn scene_query_from_url(url: &Url) -> String {
@@ -655,7 +764,7 @@ fn scene_from_substrate_search(search: &SubstrateSearch) -> SceneScene {
                 kind: if hit.ring == 0 { "claim" } else { "concept" }.to_string(),
                 label: Some(label.clone()),
                 position: None,
-                weight: Some((hit.match_score as f64).max(1.0) + 1.0 / (hit.ring + 1) as f64),
+                weight: Some(hit.match_score.max(1.0) + 1.0 / (hit.ring + 1) as f64),
                 color: None,
                 opacity: None,
                 glyph: None,

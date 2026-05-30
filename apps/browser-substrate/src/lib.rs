@@ -17,15 +17,19 @@
 //! LINKS_TO/HAS_SNAPSHOT/ON_DOMAIN edges via `extract_links` + `canonicalize_url`
 //! + blake3). This crate is the thin, engine-agnostic adapter onto it.
 
-use std::{fmt, path::Path};
+use std::{collections::BTreeSet, fmt, path::Path};
 
 use rustyred_thg_core::graph_store::{GraphStore, GraphStoreError, GraphWriteResult};
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use rustyred_web::{
-    build_v2_fixture_crawl, render_search_page, search_substrate, CrawlRequest, CrawlRunOutput,
+    build_v2_fixture_crawl_with_policy, evaluate_trigger_gate, fetch_seed_pages,
+    render_search_page, render_serp_html, search_substrate, CrawlRequest, CrawlRunOutput,
     FetchedPage, RustyWebError, SearchOptions,
 };
-pub use rustyred_web::{SearchHit, SearchLink, SubstrateSearch};
+pub use rustyred_web::{
+    CrawlDial, LiveFetchOptions, SearchHit, SearchLink, SubstrateSearch, TriggerGateConfig,
+    TriggerGateDecision, UrlGuardPolicy,
+};
 
 /// A browser-callable capability exposed by this seam.
 ///
@@ -114,6 +118,16 @@ pub fn loaded_page_to_fetched_page(page: &LoadedPage) -> FetchedPage {
     }
 }
 
+/// Map a crawler-fetched page onto the browser-neutral loaded-page shape.
+pub fn fetched_page_to_loaded_page(page: &FetchedPage) -> LoadedPage {
+    LoadedPage {
+        url: page.url.clone(),
+        body: page.body.clone(),
+        status: page.status,
+        content_type: page.content_type.clone(),
+    }
+}
+
 /// Failure modes of the seam, kept distinct because a browser cares about the
 /// difference: the page could not be turned into a graph (crawl/parse) vs. the
 /// graph could not be written to the substrate (store).
@@ -158,10 +172,24 @@ pub fn loaded_pages_to_graph(
     seeds: Vec<String>,
     pages: &[LoadedPage],
 ) -> Result<CrawlRunOutput, SeamError> {
+    loaded_pages_to_graph_with_policy(run_id, seeds, pages, &UrlGuardPolicy::default())
+}
+
+/// Build the crawl graph for loaded pages under an explicit URL guard policy.
+///
+/// The default path keeps production SSRF protections. Browser tests and local
+/// harnesses can pass a loopback-allowing policy without weakening the default.
+pub fn loaded_pages_to_graph_with_policy(
+    run_id: impl Into<String>,
+    seeds: Vec<String>,
+    pages: &[LoadedPage],
+    guard_policy: &UrlGuardPolicy,
+) -> Result<CrawlRunOutput, SeamError> {
     let fetched: Vec<FetchedPage> = pages.iter().map(loaded_page_to_fetched_page).collect();
-    Ok(build_v2_fixture_crawl(
+    Ok(build_v2_fixture_crawl_with_policy(
         CrawlRequest::new(run_id, seeds),
         &fetched,
+        guard_policy,
     )?)
 }
 
@@ -176,7 +204,18 @@ pub fn ingest_loaded_pages(
     seeds: Vec<String>,
     pages: &[LoadedPage],
 ) -> Result<(CrawlRunOutput, Vec<GraphWriteResult>), SeamError> {
-    let output = loaded_pages_to_graph(run_id, seeds, pages)?;
+    ingest_loaded_pages_with_policy(store, run_id, seeds, pages, &UrlGuardPolicy::default())
+}
+
+/// Turn loaded pages into graph state and write them with an explicit URL guard.
+pub fn ingest_loaded_pages_with_policy(
+    store: &mut impl GraphStore,
+    run_id: impl Into<String>,
+    seeds: Vec<String>,
+    pages: &[LoadedPage],
+    guard_policy: &UrlGuardPolicy,
+) -> Result<(CrawlRunOutput, Vec<GraphWriteResult>), SeamError> {
+    let output = loaded_pages_to_graph_with_policy(run_id, seeds, pages, guard_policy)?;
     let writes = output.graph.apply_to_store(store)?;
     Ok((output, writes))
 }
@@ -189,6 +228,10 @@ pub fn ingest_loaded_pages(
 /// Servo.
 pub fn render_substrate_search_page(store: &impl GraphStore, query: &str) -> String {
     render_search_page(store, query)
+}
+
+pub fn render_substrate_search_result_page(search: &SubstrateSearch) -> String {
+    render_serp_html(search)
 }
 
 /// Receipt for a browser session graph write.
@@ -204,6 +247,15 @@ pub struct BrowserSessionReceipt {
     pub total_page_count: usize,
     pub write_count: usize,
     pub graph_delta_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchOrCrawlResult {
+    pub initial_search: SubstrateSearch,
+    pub final_search: SubstrateSearch,
+    pub decision: TriggerGateDecision,
+    pub fetched_pages: usize,
+    pub receipt: Option<BrowserSessionReceipt>,
 }
 
 /// Browser-owned substrate state for one local browsing session.
@@ -257,10 +309,78 @@ impl<S: GraphStore> BrowserSessionStore<S> {
         &mut self,
         pages: &[LoadedPage],
     ) -> Result<BrowserSessionReceipt, SeamError> {
+        self.ingest_pages_with_policy(pages, &UrlGuardPolicy::default())
+    }
+
+    pub fn ingest_pages_with_policy(
+        &mut self,
+        pages: &[LoadedPage],
+        guard_policy: &UrlGuardPolicy,
+    ) -> Result<BrowserSessionReceipt, SeamError> {
         self.run_sequence += 1;
         let run_id = format!("{}-{}", self.session_id, self.run_sequence);
         let seeds = pages.iter().map(|page| page.url.clone()).collect();
-        let (output, writes) = ingest_loaded_pages(&mut self.store, run_id.clone(), seeds, pages)?;
+        self.ingest_pages_for_run(run_id, seeds, pages, guard_policy)
+    }
+
+    pub async fn fetch_and_ingest_open_web_page(
+        &mut self,
+        url: &str,
+        options: &LiveFetchOptions,
+    ) -> Result<(LoadedPage, BrowserSessionReceipt), SeamError> {
+        self.run_sequence += 1;
+        let run_id = format!("{}-{}", self.session_id, self.run_sequence);
+        let mut request = CrawlRequest::new(run_id.clone(), vec![url.to_string()]);
+        request.budget.max_pages = 1;
+        request.budget.max_depth = 0;
+
+        let fetched = fetch_seed_pages(&request, options).await?;
+        let first = fetched.first().ok_or_else(|| RustyWebError::Fetch {
+            url: url.to_string(),
+            reason: "fetch completed without a page".to_string(),
+        })?;
+        let page = fetched_page_to_loaded_page(first);
+        let receipt = self.ingest_pages_for_run(
+            run_id,
+            vec![url.to_string()],
+            std::slice::from_ref(&page),
+            &options.guard_policy,
+        )?;
+        Ok((page, receipt))
+    }
+
+    pub fn fetch_and_ingest_open_web_page_blocking(
+        &mut self,
+        url: &str,
+        options: &LiveFetchOptions,
+    ) -> Result<(LoadedPage, BrowserSessionReceipt), SeamError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| {
+                SeamError::Crawl(RustyWebError::Fetch {
+                    url: "<tokio-runtime>".to_string(),
+                    reason: error.to_string(),
+                })
+            })?;
+        runtime.block_on(self.fetch_and_ingest_open_web_page(url, options))
+    }
+
+    fn ingest_pages_for_run(
+        &mut self,
+        run_id: String,
+        seeds: Vec<String>,
+        pages: &[LoadedPage],
+        guard_policy: &UrlGuardPolicy,
+    ) -> Result<BrowserSessionReceipt, SeamError> {
+        let (output, writes) = ingest_loaded_pages_with_policy(
+            &mut self.store,
+            run_id.clone(),
+            seeds,
+            pages,
+            guard_policy,
+        )?;
 
         self.ingested_pages += pages.len();
 
@@ -281,6 +401,96 @@ impl<S: GraphStore> BrowserSessionStore<S> {
     pub fn search_substrate(&self, query: &str) -> SubstrateSearch {
         search_substrate(&self.store, query, SearchOptions::default())
     }
+
+    pub async fn search_or_crawl(
+        &mut self,
+        query: &str,
+        fetch_options: &LiveFetchOptions,
+        gate_config: &TriggerGateConfig,
+    ) -> Result<SearchOrCrawlResult, SeamError> {
+        let initial_search = self.search_substrate(query);
+        let decision = evaluate_trigger_gate(&initial_search, gate_config);
+        if !decision.should_crawl {
+            return Ok(SearchOrCrawlResult {
+                final_search: initial_search.clone(),
+                initial_search,
+                decision,
+                fetched_pages: 0,
+                receipt: None,
+            });
+        }
+
+        let seeds = discovered_frontier_seeds(&initial_search, decision.max_crawl_seeds);
+        if seeds.is_empty() {
+            return Ok(SearchOrCrawlResult {
+                final_search: initial_search.clone(),
+                initial_search,
+                decision,
+                fetched_pages: 0,
+                receipt: None,
+            });
+        }
+
+        self.run_sequence += 1;
+        let run_id = format!("{}-{}", self.session_id, self.run_sequence);
+        let mut request = CrawlRequest::new(run_id.clone(), seeds.clone());
+        request.budget.max_pages = seeds.len().max(1);
+        request.budget.max_depth = match gate_config.dial {
+            CrawlDial::Conservative => 0,
+            CrawlDial::Broad => 1,
+        };
+
+        let fetched = fetch_seed_pages(&request, fetch_options).await?;
+        let pages: Vec<LoadedPage> = fetched.iter().map(fetched_page_to_loaded_page).collect();
+        let fetched_pages = pages.len();
+        let receipt = if pages.is_empty() {
+            None
+        } else {
+            Some(self.ingest_pages_for_run(run_id, seeds, &pages, &fetch_options.guard_policy)?)
+        };
+        let final_search = self.search_substrate(query);
+
+        Ok(SearchOrCrawlResult {
+            initial_search,
+            final_search,
+            decision,
+            fetched_pages,
+            receipt,
+        })
+    }
+
+    pub fn search_or_crawl_blocking(
+        &mut self,
+        query: &str,
+        fetch_options: &LiveFetchOptions,
+        gate_config: &TriggerGateConfig,
+    ) -> Result<SearchOrCrawlResult, SeamError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| {
+                SeamError::Crawl(RustyWebError::Fetch {
+                    url: "<tokio-runtime>".to_string(),
+                    reason: error.to_string(),
+                })
+            })?;
+        runtime.block_on(self.search_or_crawl(query, fetch_options, gate_config))
+    }
+}
+
+pub fn discovered_frontier_seeds(search: &SubstrateSearch, max_seeds: usize) -> Vec<String> {
+    let mut seeds = BTreeSet::new();
+    for hit in &search.hits {
+        if seeds.len() >= max_seeds {
+            break;
+        }
+        if hit.url.trim().is_empty() || !hit.snippet.trim().is_empty() {
+            continue;
+        }
+        seeds.insert(hit.url.clone());
+    }
+    seeds.into_iter().collect()
 }
 
 pub type RedCoreBrowserSessionStore = BrowserSessionStore<RedCoreGraphStore>;
@@ -317,6 +527,9 @@ mod tests {
     use super::*;
     use rustyred_thg_core::graph_store::InMemoryGraphStore;
     use rustyred_web::{EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, LABEL_CONTENT_SNAPSHOT, LABEL_PAGE};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn label_count(graph: &rustyred_web::CrawlGraph, label: &str) -> usize {
         graph
@@ -460,5 +673,102 @@ mod tests {
         assert_eq!(first.run_id, "browser-session-1");
         assert_eq!(second.run_id, "browser-session-2");
         assert_eq!(second.total_page_count, 2);
+    }
+
+    #[test]
+    fn browser_session_can_fetch_open_web_page_and_ingest_it() {
+        let url = spawn_sequence_server(vec![
+            (200, "text/plain", "User-agent: *\nAllow: /\n"),
+            (
+                200,
+                "text/html; charset=utf-8",
+                r#"<html><body><h1>External substrate page</h1></body></html>"#,
+            ),
+        ]);
+        let mut session = BrowserSessionStore::new(InMemoryGraphStore::new(), "browser-open-web");
+
+        let (page, receipt) = session
+            .fetch_and_ingest_open_web_page_blocking(&url, &live_loopback_options())
+            .expect("loopback live page should fetch and write to the substrate");
+
+        assert_eq!(receipt.run_id, "browser-open-web-1");
+        assert_eq!(receipt.page_count, 1);
+        assert_eq!(receipt.total_page_count, 1);
+        assert!(receipt.write_count > 0);
+        assert!(page.body.contains("External substrate page"));
+
+        let search = session.search_substrate("external substrate");
+        assert_eq!(search.matched_count, 1);
+        assert!(search.hits.iter().any(|hit| hit.url == url));
+    }
+
+    #[test]
+    fn search_or_crawl_fetches_unfetched_frontier_links() {
+        let frontier_url = spawn_sequence_server(vec![
+            (200, "text/plain", "User-agent: *\nAllow: /\n"),
+            (
+                200,
+                "text/html; charset=utf-8",
+                r#"<html><body><h1>Fetched frontier substrate</h1></body></html>"#,
+            ),
+        ]);
+        let mut session =
+            BrowserSessionStore::new(InMemoryGraphStore::new(), "browser-frontier-crawl");
+        session
+            .ingest_loaded_page(LoadedPage::html(
+                "https://example.com/root",
+                format!(
+                    r#"<html><body>frontier substrate root <a href="{frontier_url}">more</a></body></html>"#
+                ),
+            ))
+            .expect("root page should seed an unfetched frontier link");
+
+        let result = session
+            .search_or_crawl_blocking(
+                "frontier substrate",
+                &live_loopback_options(),
+                &TriggerGateConfig::broad(),
+            )
+            .expect("frontier link should fetch and write");
+
+        assert!(result.decision.should_crawl);
+        assert_eq!(result.fetched_pages, 1);
+        assert!(result.receipt.is_some());
+        assert!(result
+            .final_search
+            .hits
+            .iter()
+            .any(|hit| hit.url == frontier_url && hit.snippet.contains("Fetched frontier")));
+    }
+
+    fn live_loopback_options() -> LiveFetchOptions {
+        LiveFetchOptions {
+            user_agent: "Theorem browser-substrate test".to_string(),
+            timeout_seconds: 5,
+            guard_policy: UrlGuardPolicy {
+                allow_loopback: true,
+                allow_private_networks: false,
+                block_metadata_services: true,
+            },
+            respect_robots: true,
+        }
+    }
+
+    fn spawn_sequence_server(responses: Vec<(u16, &'static str, &'static str)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for (status, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request_buf = [0; 1024];
+                let _ = stream.read(&mut request_buf);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}/")
     }
 }

@@ -12,3 +12,4 @@ publish = false
 [dependencies]
 rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web" }
 rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+tokio = { version = "1.47.1", features = ["net", "rt", "time"] }

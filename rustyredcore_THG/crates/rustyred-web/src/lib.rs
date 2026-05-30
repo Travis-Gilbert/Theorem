@@ -3,10 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lol_html::{element, HtmlRewriter, Settings};
-use reqwest::header::CONTENT_TYPE;
 use rustyred_thg_core::{
     EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, GraphStoreError, GraphStoreResult,
     GraphWriteResult, NodeRecord, Provenance, TTL_PROPERTY,
@@ -35,6 +34,24 @@ pub const EDGE_EMITTED_RECEIPT: &str = "EMITTED_RECEIPT";
 pub const EDGE_SEEDED: &str = "SEEDED";
 
 pub type FetchedPage = FixturePage;
+
+pub mod fetch_cascade;
+pub use fetch_cascade::{
+    should_promote, FetchCascade, FetchCascadeOptions, FetchTier, FetchTierResult,
+};
+
+pub mod robots;
+pub use robots::{
+    crawl_delay_duration, global_robots_cache, RobotsCache, RobotsDecision, RobotsPolicyState,
+};
+
+pub mod source_class;
+pub use source_class::{
+    classify_url, profile_for, profile_for_url, CitationStrategy, ExtractionProfile, SourceClass,
+};
+
+pub mod trigger_gate;
+pub use trigger_gate::{evaluate_trigger_gate, CrawlDial, TriggerGateConfig, TriggerGateDecision};
 
 // Substrate-native local graph search (the READ seam). See search.rs.
 pub mod search;
@@ -176,6 +193,7 @@ pub struct LiveFetchOptions {
     pub user_agent: String,
     pub timeout_seconds: u64,
     pub guard_policy: UrlGuardPolicy,
+    pub respect_robots: bool,
 }
 
 impl Default for LiveFetchOptions {
@@ -184,6 +202,7 @@ impl Default for LiveFetchOptions {
             user_agent: "RustyWeb/0.2 live".to_string(),
             timeout_seconds: 10,
             guard_policy: UrlGuardPolicy::default(),
+            respect_robots: true,
         }
     }
 }
@@ -424,7 +443,7 @@ pub fn build_fixture_crawl_graph(
             );
         }
 
-        for target_url in extract_links(&canonical_url, &fixture.body)? {
+        for target_url in extract_links_for_url(&canonical_url, &fixture.body)? {
             let target_domain = domain_for_url(&target_url)?;
             let target_domain_node_id = domain_id(&target_domain);
             let target_page_node_id = page_id(&target_url);
@@ -562,15 +581,39 @@ pub async fn fetch_seed_pages(
     let seeds = validate_crawl_request(request, &options.guard_policy)?;
     let mut effective_options = options.clone();
     effective_options.timeout_seconds = options.timeout_seconds.min(request.budget.max_seconds);
-    let client = build_live_http_client(&effective_options)?;
+    let fetcher = FetchCascade::new(FetchCascadeOptions {
+        user_agent: effective_options.user_agent.clone(),
+        timeout_seconds: effective_options.timeout_seconds,
+    })?;
     let mut pages = Vec::new();
     let mut remaining_bytes = request.budget.max_bytes;
+    let mut last_fetch_by_domain: BTreeMap<String, Instant> = BTreeMap::new();
 
     for seed in seeds.into_iter().take(request.budget.max_pages) {
         if remaining_bytes == 0 {
             break;
         }
-        let page = fetch_one_page(&client, &seed, remaining_bytes).await?;
+        if effective_options.respect_robots {
+            let decision = global_robots_cache()
+                .check(fetcher.client(), &seed, &effective_options.user_agent)
+                .await?;
+            if !decision.allowed {
+                return Err(RustyWebError::BlockedUrl {
+                    url: seed,
+                    reason: format!("robots disallowed: {}", decision.reason),
+                });
+            }
+            honor_crawl_delay(&seed, &decision, &mut last_fetch_by_domain).await?;
+        }
+
+        let result = fetcher.fetch_with_promotion(&seed, remaining_bytes).await?;
+        let page = FetchedPage {
+            url: result.final_url,
+            status: result.http_status,
+            body: String::from_utf8_lossy(&result.html_bytes).into_owned(),
+            content_type: result.content_type,
+            fetched_at: current_unix_ms_string(),
+        };
         remaining_bytes = remaining_bytes.saturating_sub(page.body.len());
         pages.push(page);
     }
@@ -684,6 +727,25 @@ pub fn guard_canonical_url(canonical: &str, policy: &UrlGuardPolicy) -> RustyWeb
 }
 
 pub fn extract_links(base_url: &str, html: &str) -> RustyWebResult<Vec<String>> {
+    extract_links_with_profile(base_url, html, &ExtractionProfile::default())
+}
+
+pub fn extract_links_for_url(base_url: &str, html: &str) -> RustyWebResult<Vec<String>> {
+    let base = Url::parse(base_url).map_err(|err| RustyWebError::InvalidUrl {
+        url: base_url.to_string(),
+        reason: err.to_string(),
+    })?;
+    extract_links_with_profile(base_url, html, &profile_for_url(&base))
+}
+
+pub fn extract_links_with_profile(
+    base_url: &str,
+    html: &str,
+    profile: &ExtractionProfile,
+) -> RustyWebResult<Vec<String>> {
+    if !profile.include_links {
+        return Ok(Vec::new());
+    }
     let base = Url::parse(base_url).map_err(|err| RustyWebError::InvalidUrl {
         url: base_url.to_string(),
         reason: err.to_string(),
@@ -909,75 +971,30 @@ fn blocked_ip_reason(ip: IpAddr, policy: &UrlGuardPolicy) -> Option<&'static str
     None
 }
 
-fn build_live_http_client(options: &LiveFetchOptions) -> RustyWebResult<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(options.user_agent.clone())
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(options.timeout_seconds))
-        .build()
-        .map_err(|err| RustyWebError::Fetch {
-            url: "<client>".to_string(),
-            reason: err.to_string(),
-        })
-}
-
-async fn fetch_one_page(
-    client: &reqwest::Client,
-    canonical_url: &str,
-    max_bytes: usize,
-) -> RustyWebResult<FetchedPage> {
-    let response = client
-        .get(canonical_url)
-        .send()
-        .await
-        .map_err(|err| RustyWebError::Fetch {
-            url: canonical_url.to_string(),
-            reason: err.to_string(),
-        })?;
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let body = read_limited_body(response, canonical_url, max_bytes).await?;
-
-    Ok(FetchedPage {
-        url: canonical_url.to_string(),
-        status,
-        body: String::from_utf8_lossy(&body).into_owned(),
-        content_type,
-        fetched_at: current_unix_ms_string(),
-    })
-}
-
-async fn read_limited_body(
-    mut response: reqwest::Response,
-    url: &str,
-    limit: usize,
-) -> RustyWebResult<Vec<u8>> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|err| RustyWebError::Fetch {
-        url: url.to_string(),
-        reason: err.to_string(),
-    })? {
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(RustyWebError::BodyLimitExceeded {
-                url: url.to_string(),
-                limit,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 fn current_unix_ms_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+async fn honor_crawl_delay(
+    url: &str,
+    decision: &RobotsDecision,
+    last_fetch_by_domain: &mut BTreeMap<String, Instant>,
+) -> RustyWebResult<()> {
+    let Some(delay) = crawl_delay_duration(decision) else {
+        return Ok(());
+    };
+    let domain = domain_for_url(url)?;
+    if let Some(last_fetch) = last_fetch_by_domain.get(&domain) {
+        let elapsed = last_fetch.elapsed();
+        if elapsed < delay {
+            tokio::time::sleep(delay - elapsed).await;
+        }
+    }
+    last_fetch_by_domain.insert(domain, Instant::now());
+    Ok(())
 }
 
 fn insert_node(nodes: &mut BTreeMap<String, NodeRecord>, node: NodeRecord) {
@@ -1037,6 +1054,10 @@ fn insert_page_node(
                 "domain": domain,
                 "namespace": namespace,
                 "page_state": page_state,
+                "source_class": Url::parse(url)
+                    .ok()
+                    .map(|parsed| classify_url(&parsed).as_str())
+                    .unwrap_or(SourceClass::Unknown.as_str()),
             }),
         )
     });
