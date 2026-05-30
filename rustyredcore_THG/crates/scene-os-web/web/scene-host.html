@@ -55,10 +55,27 @@
     letter-spacing: 0.08em; text-transform: uppercase;
   }
   #scene-tooltip .tip-src { color: var(--ink-soft); margin-top: 3px; }
+  form.scene-search { display: flex; gap: 8px; align-items: stretch; margin-bottom: 11px; }
+  form.scene-search input {
+    flex: 1; min-width: 0; border: 1.5px solid var(--rule); border-radius: 7px;
+    background: var(--paper); color: var(--ink); font-family: var(--mono);
+    font-size: 15px; padding: 8px 12px; outline: none;
+  }
+  form.scene-search input:focus { border-color: var(--accent); }
+  form.scene-search button {
+    border: 1.5px solid var(--accent); background: var(--accent); color: var(--paper);
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
+    text-transform: uppercase; padding: 0 16px; border-radius: 7px; cursor: pointer;
+  }
+  form.scene-search button:hover { background: #9c4a22; }
 </style>
 </head>
 <body>
   <header id="scene-header">
+    <form class="scene-search" action="/search" method="get" autocomplete="off">
+      <input id="scene-q" name="q" type="search" placeholder="Search your substrate…" aria-label="Search your substrate" />
+      <button type="submit">Search</button>
+    </form>
     <p class="eyebrow">Scene</p>
     <div class="titlerow">
       <h1 id="scene-title">Scene</h1>
@@ -71,6 +88,17 @@
     <div id="scene-empty"></div>
     <div id="scene-tooltip"></div>
   </div>
+
+<script>
+// Reflect the current query in the search box (read-only prefill from the URL;
+// .value assignment only, never innerHTML).
+(function () {
+  try {
+    var q = new URLSearchParams(window.location.search).get('q');
+    if (q) document.getElementById('scene-q').value = q;
+  } catch (e) { /* no-op */ }
+})();
+</script>
 
 <script>
 // The Rust render_scene_html hook replaces the next line with the real
