@@ -59,7 +59,7 @@ const relations: Relation[] = [
 ];
 
 console.log('registry');
-check('six production ids registered', supportedProjectionIds().length === 6);
+check('seven projection ids registered', supportedProjectionIds().length === 7);
 for (const id of [
   'patent_diagram',
   'tree_hierarchy',
@@ -67,6 +67,7 @@ for (const id of [
   'categorical_set',
   'flow_layered',
   'sankey_flow',
+  'graph_force',
 ]) {
   check(`resolves ${id} without fallback`, resolveProjection(id).fellBack === false);
 }

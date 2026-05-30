@@ -116,8 +116,18 @@ reference of the call.
 
 ## Later enrichments (not slice 1)
 
-- The full React `SceneHost` / `AtomSubstrate` (cosmos.gl force engine) for the
-  `graph` coordinate space, once Lane A emits a graph projection.
+- **Done (2026-05-30):** the `graph` coordinate space now has a real layout —
+  `graph_force` runs d3-force SYNCHRONOUSLY in the projection (zone-anchored
+  charge/collide/link recipe from `graphLayout.ts`) and returns settled
+  positions, so the canvas draws a well-spaced constellation with NO cosmos.gl
+  and NO React. The Theseus-UI `graph_force` adapter only seeded a ring and
+  delegated the solve to cosmos.gl; this one solves itself. A cosmos.gl/WebGL
+  force engine is only needed later for very large graphs (live GPU sim); normal
+  scenes settle fine in-canvas. See `GraphForceProjection.ts`.
+- Graph **reactivity** to match theoremweb.com/coordination-room: drag (pin +
+  re-settle), a selection inspector panel + metric cards (the SceneHost chrome),
+  edge labels, node glyph initials, and the dashed editorial annotations. The
+  layout (well-spaced) is done; this is the interaction + chrome layer.
 - Choreographed enter / morph transitions between recompiles (the substrate's
   lifecycle/transition machinery). Slice 1 paints synchronously at full opacity;
   time-based motion was removed after it proved fragile under rAF throttling and
