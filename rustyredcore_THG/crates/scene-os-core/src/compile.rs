@@ -1,0 +1,251 @@
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::atoms::SceneScene;
+use crate::catalogs::{production_chrome_catalog, production_projection_catalog};
+use crate::package::{ChromeBinding, ProjectionBinding, ScenePackageV2, SCENE_PACKAGE_V2_VERSION};
+use crate::select::{
+    classify_goal, detect_shape, select_chrome, select_projection, ChromeSelection, DataShape,
+    DataShapeDetection, Goal, GoalDetection, ProjectionSelection,
+};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneCompileInput {
+    pub query: String,
+    #[serde(default)]
+    pub answer_type: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub scene: SceneScene,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub manifest_ref: Option<String>,
+    #[serde(default)]
+    pub provenance: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneCompileError {
+    pub code: String,
+    pub message: String,
+}
+
+impl SceneCompileError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for SceneCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for SceneCompileError {}
+
+pub fn compile_scene_package(
+    input: SceneCompileInput,
+) -> Result<ScenePackageV2, SceneCompileError> {
+    if input.query.trim().is_empty() {
+        return Err(SceneCompileError::new("empty_query", "query is required"));
+    }
+
+    let goal_detection = classify_goal(&input.query, None);
+    let shape_detection = detect_shape(&input.scene.atoms, &input.scene.relations);
+    let (goal_for_select, shape_for_select) = selector_overrides(
+        input.answer_type.as_deref(),
+        goal_detection.goal,
+        shape_detection.shape,
+    );
+
+    let projection_catalog = production_projection_catalog();
+    let projection_selection =
+        select_projection(goal_for_select, shape_for_select, &projection_catalog).map_err(
+            |refusal| {
+                SceneCompileError::new(
+                    "projection_select_failed",
+                    format!("{}: {}", refusal.code, refusal.message),
+                )
+            },
+        )?;
+    let selected_projection = projection_catalog
+        .iter()
+        .find(|projection| projection.id == projection_selection.projection_id)
+        .ok_or_else(|| {
+            SceneCompileError::new(
+                "projection_missing",
+                format!(
+                    "selected projection {} was not present in catalog",
+                    projection_selection.projection_id
+                ),
+            )
+        })?;
+
+    let chrome_catalog = production_chrome_catalog();
+    let chrome_selection = select_chrome(goal_for_select, selected_projection, &chrome_catalog)
+        .map_err(|refusal| {
+            SceneCompileError::new(
+                "chrome_select_failed",
+                format!("{}: {}", refusal.code, refusal.message),
+            )
+        })?;
+
+    let mut provenance = input.provenance;
+    provenance.insert(
+        "compileTrace".to_string(),
+        serde_json::to_value(CompileTrace {
+            goal: goal_detection,
+            shape: shape_detection,
+            projection_select: projection_selection.clone(),
+            chrome_select: chrome_selection.clone(),
+            selected_goal: goal_for_select,
+            selected_shape: shape_for_select,
+        })
+        .expect("compile trace serializes"),
+    );
+    provenance.insert("director".to_string(), json!("scene-os-core"));
+
+    let package_id = input.trace_id.as_ref().map_or_else(
+        || {
+            format!(
+                "scene-{}-{}-{}",
+                projection_selection.projection_id,
+                input.scene.atoms.len(),
+                input.scene.relations.len()
+            )
+        },
+        |trace_id| format!("scene-{trace_id}"),
+    );
+
+    Ok(ScenePackageV2 {
+        version: SCENE_PACKAGE_V2_VERSION.to_string(),
+        id: package_id,
+        manifest_ref: input.manifest_ref.unwrap_or_else(|| {
+            input
+                .trace_id
+                .as_ref()
+                .map_or_else(|| "theorem-rust-scene".to_string(), |trace_id| {
+                    format!("manifest-{trace_id}")
+                })
+        }),
+        atoms: input.scene.atoms,
+        relations: input.scene.relations,
+        projection: ProjectionBinding {
+            id: projection_selection.projection_id,
+            params: BTreeMap::from([
+                (
+                    "coordinateSpace".to_string(),
+                    json!(selected_projection.coordinate_space.as_str()),
+                ),
+                ("fit".to_string(), json!("content")),
+            ]),
+        },
+        chrome: ChromeBinding {
+            id: chrome_selection.chrome_id,
+            params: BTreeMap::new(),
+        },
+        actions: Vec::new(),
+        transitions: None,
+        terminal_state: None,
+        provenance,
+    })
+}
+
+fn selector_overrides(answer_type: Option<&str>, goal: Goal, shape: DataShape) -> (Goal, DataShape) {
+    match answer_type {
+        Some("patent_diagram") | Some("patent_scene") => (Goal::ExplainProcess, DataShape::Dag),
+        _ => (goal, shape),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompileTrace {
+    goal: GoalDetection,
+    shape: DataShapeDetection,
+    projection_select: ProjectionSelection,
+    chrome_select: ChromeSelection,
+    selected_goal: Goal,
+    selected_shape: DataShape,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::atoms::{AtomLifecycle, SceneAtom, SceneRelation};
+
+    #[test]
+    fn compiles_patent_scene_package_with_trace() {
+        let scene = SceneScene {
+            atoms: vec![atom("a"), atom("b")],
+            relations: vec![relation("a", "b")],
+        };
+        let package = compile_scene_package(SceneCompileInput {
+            query: "How does the browser scene work?".to_string(),
+            answer_type: Some("patent_diagram".to_string()),
+            title: Some("Browser Scene".to_string()),
+            scene,
+            trace_id: Some("trace-1".to_string()),
+            manifest_ref: None,
+            provenance: BTreeMap::new(),
+        })
+        .expect("compile patent scene");
+
+        assert_eq!(package.version, SCENE_PACKAGE_V2_VERSION);
+        assert_eq!(package.id, "scene-trace-1");
+        assert_eq!(package.manifest_ref, "manifest-trace-1");
+        assert_eq!(package.projection.id, "patent_diagram");
+        assert_eq!(package.chrome.id, "patent_plate_shell");
+        assert!(package.provenance.get("compileTrace").is_some());
+        assert_eq!(package.atoms.len(), 2);
+
+        let value = serde_json::to_value(package).expect("serialize package");
+        assert_eq!(value["manifestRef"], "manifest-trace-1");
+        assert_eq!(value["projection"]["params"]["coordinateSpace"], "diagram");
+        assert_eq!(
+            value["provenance"]["compileTrace"]["selectedGoal"],
+            "explain-process"
+        );
+    }
+
+    fn atom(id: &str) -> SceneAtom {
+        SceneAtom {
+            id: id.to_string(),
+            kind: "evidence".to_string(),
+            label: Some(id.to_string()),
+            position: None,
+            weight: None,
+            color: None,
+            opacity: None,
+            glyph: None,
+            scale: None,
+            lifecycle: AtomLifecycle::Present,
+            metadata: BTreeMap::new(),
+            source_refs: Vec::new(),
+        }
+    }
+
+    fn relation(source: &str, target: &str) -> SceneRelation {
+        SceneRelation {
+            id: format!("{source}->{target}"),
+            source_id: source.to_string(),
+            target_id: target.to_string(),
+            kind: "related".to_string(),
+            weight: Some(1.0),
+            color: None,
+            opacity: None,
+            glyph: None,
+            lifecycle: AtomLifecycle::Present,
+            metadata: BTreeMap::new(),
+            source_refs: Vec::new(),
+        }
+    }
+}
