@@ -1,8 +1,8 @@
 # Theorem Browser (Servo-embedded substrate browser)
 
-**Status:** Foundation. Grounded against the current Servo embedding API (`servo::WebViewBuilder`, `ServoDelegate`, `Servo::spin_event_loop`, pulled from doc.servo.org 2026-05-29). This crate is the start of the substrate-native browser: the surface where Servo renders both the open web and SceneOS scenes, in-process with the RustyRed substrate.
+**Status:** External embedder build is green in GitHub Actions at `713eded` (run `26669852900`, 2026-05-30). Grounded against the pinned Servo embedding API (`servo::WebViewBuilder`, `WebViewDelegate`, `Servo::spin_event_loop`, `SoftwareRenderingContext`). This crate is the start of the substrate-native browser: the surface where Servo renders both the open web and SceneOS scenes, in-process with the RustyRed substrate.
 
-**Honest state:** this lays the embedder skeleton + build plan against the real API. It is NOT yet built or rendering. Servo is a heavy build (its own `mach`/cargo toolchain + system deps); getting it to compile + render a page is the next increment and needs a Servo build environment, not a plain `cargo build`. The skeleton marks every seam; the constructor wiring (Opts/Preferences/RenderingContext) is validated when the Servo build env is stood up.
+**Honest state:** the external `cargo build` path has compiled successfully in CI. The next checked increment is `cargo run -- --headless-smoke`: create a real WebView with a software rendering context, intercept a known URL through `WebViewDelegate::load_web_resource`, and write that supplied page into `theorem-browser-substrate`. This proves the delegate-to-substrate seam without claiming full arbitrary-page response capture yet.
 
 ---
 
@@ -45,7 +45,7 @@ This is why the build env is its own setup step.
 
 The Servo build runs OFF the developer machine, in CI, reproducibly. It does not have to be local: Servo must be built from source (no prebuilt embeddable crate), but where it builds is our choice, and early verification runs headless (offscreen, no window). Only the eventual interactive windowed desktop browser must run on a macOS desktop, which is a later milestone.
 
-- `.github/workflows/servo-browser.yml` is the build pipeline. v1 validates that Servo builds in CI via its own `./mach bootstrap` + `./mach build` (manual trigger; a full build is heavy). v2 adds this embedder crate as an external consumer of the `servo` crate, builds it headless, and runs the substrate-seam test.
+- `.github/workflows/servo-browser.yml` is the build pipeline. v1 validated that Servo builds in CI via its own `./mach bootstrap` + `./mach build` (manual trigger; a full build is heavy). v2 builds this embedder crate as an external consumer of the `servo` crate, then runs the headless WebView substrate smoke.
 - External-embed reference: `paulrouget/servo-embedding-example` and Verso (the `servo` crate as a git dependency, not a fork).
 - Resource caveat: ubuntu-latest may be undersized for a full Servo build; the first run reveals whether it needs a larger/self-hosted runner or the remote-box fallback.
 
@@ -61,9 +61,9 @@ That emits `Page`/`Domain`/`ContentSnapshot`/`FetchAttempt` nodes + `LINKS_TO`/`
 
 ## Next increments
 
-1. Stand up the Servo build env (mach bootstrap deps; pin the `servo` git rev). Validate the constructor wiring (Opts/Preferences/RenderingContext) against the pinned rev.
+1. Keep the external Servo embedder build green in CI (done for constructor wiring; now includes the headless WebView smoke).
 2. Get a minimal WebView rendering a single URL in a winit window (the "it renders the open web" milestone).
-3. Implement `load_web_resource` interception writing the loaded page into the RustyRed substrate as graph state (seam 1).
+3. Extend the current intercepted smoke seam into true loaded-page capture. Important API note: `load_web_resource` sees requests before load, not response bodies after download, so arbitrary open-web capture will need either interception/fetch ownership or a separate completed-document extraction path.
 4. Compose a SceneOS scene into the surface (seam 2).
 5. Then the cost-graded dossier + search-as-graph chrome (these trigger the design-gate).
 

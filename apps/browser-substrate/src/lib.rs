@@ -118,7 +118,10 @@ pub fn loaded_pages_to_graph(
     pages: &[LoadedPage],
 ) -> Result<CrawlRunOutput, SeamError> {
     let fetched: Vec<FetchedPage> = pages.iter().map(loaded_page_to_fetched_page).collect();
-    Ok(build_v2_fixture_crawl(CrawlRequest::new(run_id, seeds), &fetched)?)
+    Ok(build_v2_fixture_crawl(
+        CrawlRequest::new(run_id, seeds),
+        &fetched,
+    )?)
 }
 
 /// The seam: turn loaded pages into graph state AND write them to the substrate.
@@ -187,13 +190,19 @@ mod tests {
 
         // The loaded page became graph state: the fetched page + the discovered
         // /about link target are both Page nodes, with a snapshot and a link edge.
-        assert!(label_count(&output.graph, LABEL_PAGE) >= 2, "page + discovered link target");
+        assert!(
+            label_count(&output.graph, LABEL_PAGE) >= 2,
+            "page + discovered link target"
+        );
         assert_eq!(label_count(&output.graph, LABEL_CONTENT_SNAPSHOT), 1);
         assert_eq!(edge_count(&output.graph, EDGE_LINKS_TO), 1);
         assert_eq!(edge_count(&output.graph, EDGE_HAS_SNAPSHOT), 1);
 
         // The graph was actually written to the substrate (one write per mutation).
-        assert_eq!(writes.len(), output.graph.nodes().len() + output.graph.edges().len());
+        assert_eq!(
+            writes.len(),
+            output.graph.nodes().len() + output.graph.edges().len()
+        );
 
         // The receipt carries a content-addressed delta hash (the audit anchor).
         assert!(!output.receipt.graph_delta_hash.is_empty());

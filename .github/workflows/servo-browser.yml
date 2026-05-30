@@ -113,3 +113,13 @@ jobs:
         # embed work without mach orchestration). If it fails, the log says
         # whether the gap is a missing system lib, a build-script, or crown.
         run: cargo build
+
+      - name: Run theorem-browser headless WebView substrate smoke
+        working-directory: theorem/apps/browser
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        # v2b step 2: create a real Servo WebView using a software rendering
+        # context, intercept a known URL through WebViewDelegate::load_web_resource,
+        # and write that loaded page into theorem-browser-substrate/RustyRed.
+        # This proves the browser seam after the heavy libservo build is warm.
+        run: cargo run -- --headless-smoke
