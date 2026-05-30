@@ -14,9 +14,11 @@ use rustyred_thg_core::commands::{ThgCommand, ThgRequest, ThgResponse};
 use rustyred_thg_core::errors::ThgError;
 use rustyred_thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
 use rustyred_thg_core::{
-    compile_graph_pack, diff_graph_snapshots, stable_hash, CodeKgManifest, Direction, EdgeRecord,
-    EpistemicType, GraphCompileOptions, GraphSnapshot, GraphStats, GraphStoreError,
-    HarnessInstantKg, NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
+    checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
+    merge_graph_snapshots, stable_hash, update_graph_ref, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats,
+    GraphStoreError, GraphVersionRepository, HarnessInstantKg, NeighborQuery, NodeQuery,
+    NodeRecord, SessionDelta,
 };
 use rustyred_thg_mcp::{
     agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
@@ -194,6 +196,39 @@ pub struct GraphVersionDiffBody {
     pub target: Option<GraphSnapshot>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionRefBody {
+    #[serde(default)]
+    pub repository: Option<GraphVersionRepository>,
+    #[serde(default)]
+    pub updated_at_unix_ms: Option<u128>,
+    #[serde(flatten)]
+    pub options: GraphCompileOptions,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionLogBody {
+    pub repository: GraphVersionRepository,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionCheckoutBody {
+    pub repository: GraphVersionRepository,
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionMergeBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub ours: Option<GraphSnapshot>,
+    pub theirs: GraphSnapshot,
+    #[serde(flatten)]
+    pub options: GraphMergeOptions,
+}
+
 fn default_k() -> usize {
     10
 }
@@ -275,6 +310,22 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/version/diff",
             post(graph_version_diff),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/ref",
+            post(graph_version_ref),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/log",
+            post(graph_version_log_route),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/checkout",
+            post(graph_version_checkout),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/merge",
+            post(graph_version_merge),
         )
         .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
         .route(
@@ -1495,6 +1546,137 @@ async fn graph_version_diff(
         "ok": true,
         "tenant": tenant_id,
         "diff": diff
+    }))
+    .into_response()
+}
+
+async fn graph_version_ref(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionRefBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let branch = body.options.branch.clone();
+            let pack = compile_graph_pack(&snapshot, body.options);
+            let ref_update = update_graph_ref(
+                body.repository.unwrap_or_default(),
+                pack,
+                branch,
+                body.updated_at_unix_ms,
+            );
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "ref_update": ref_update
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_log_route(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionLogBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "log": graph_version_log(&body.repository, body.target.as_deref())
+    }))
+    .into_response()
+}
+
+async fn graph_version_checkout(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionCheckoutBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    match checkout_graph_version(&body.repository, &body.target) {
+        Some(checkout) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "checkout": checkout
+        }))
+        .into_response(),
+        None => graph_store_error_response(GraphStoreError::new(
+            "version_target_not_found",
+            format!(
+                "version target not found or has no payloads: {}",
+                body.target
+            ),
+        )),
+    }
+}
+
+async fn graph_version_merge(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionMergeBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let ours = match body.ours {
+        Some(ours) => ours,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "merge": merge_graph_snapshots(&body.base, &ours, &body.theirs, body.options)
     }))
     .into_response()
 }

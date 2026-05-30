@@ -170,6 +170,10 @@ POST /v1/tenants/{tenant_id}/graph/bulk/nodes
 POST /v1/tenants/{tenant_id}/graph/bulk/edges
 POST /v1/tenants/{tenant_id}/graph/version/compile
 POST /v1/tenants/{tenant_id}/graph/version/diff
+POST /v1/tenants/{tenant_id}/graph/version/ref
+POST /v1/tenants/{tenant_id}/graph/version/log
+POST /v1/tenants/{tenant_id}/graph/version/checkout
+POST /v1/tenants/{tenant_id}/graph/version/merge
 POST /v1/tenants/{tenant_id}/instant-kg/status
 POST /v1/tenants/{tenant_id}/instant-kg/ppr
 POST /v1/tenants/{tenant_id}/instant-kg/impact
@@ -189,7 +193,7 @@ The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/ca
 |------|-------------|
 | `thg.graph.query` / `thg.graph.explain` / `thg.graph.neighbors` | Bounded native graph reads and plan inspection |
 | `thg.graph.schema` / `thg.graph.index_status` | Graph schema and index-health reads |
-| `rustyred_thg_graph_version_compile` (`rustyred_thg_git_compile`) / `rustyred_thg_graph_version_diff` (`rustyred_thg_git_diff`) | Content-addressed graph pack compiler and snapshot diff tools |
+| `rustyred_thg_graph_version_compile` (`rustyred_thg_git_compile`) / `rustyred_thg_graph_version_diff` (`rustyred_thg_git_diff`) / `rustyred_thg_graph_version_ref` (`rustyred_thg_git_ref`) / `rustyred_thg_graph_version_log` (`rustyred_thg_git_log`) / `rustyred_thg_graph_version_checkout` (`rustyred_thg_git_checkout`) / `rustyred_thg_graph_version_merge` (`rustyred_thg_git_merge`) | Content-addressed graph pack, refs/log/checkout, and three-way merge tools |
 | `thg.algorithm.ppr` (alias: `thg.algo.ppr`) / `thg.algorithm.components` (`thg.algo.components`) / `thg.algorithm.pagerank` (`thg.algo.pagerank`) / `thg.algorithm.communities` (`thg.algo.communities`) | Graph algorithms (PPR, connected components, PageRank, label-propagation communities). §P6-B SPEC names accepted as aliases. |
 | `harness_kg_status` / `harness_kg_ppr` / `harness_kg_impact` / `harness_kg_related_objects` / `harness_kg_search` / `harness_kg_explain_edge` | Harness Instant KG tools over a RedCore tenant base graph plus an optional session delta. Legacy `RUSTY_RED_MODE=redis` returns a diagnostic because Instant KG is a native THG/RedCore capability. |
 | `thg.fulltext.search` (alias: `thg.graph.fulltext.search`) / `thg.spatial.radius` (`thg.graph.spatial.radius`) / `thg.spatial.bbox` (`thg.graph.spatial.bbox`) | Full-text and spatial read surfaces. §P6-B SPEC names accepted as aliases. |
@@ -206,7 +210,7 @@ The public query surface is now split cleanly:
 - `/v1/cypher` and `/v1/cypher/explain` are the bounded OpenCypher-compatible surface for read queries plus transaction-scoped `CREATE`/`MERGE`/`SET`/`DELETE` writes.
 - `/v1/tenants/{tenant_id}/graph/query` remains the older debug bridge and should not be treated as the product route.
 
-The graph version routes are the THG Git/provenance substrate. `/graph/version/compile` reads the current tenant graph and returns a `rustyred-versioned-graph-v1` pack with content hashes, a Prolly-style tree root, Git-like commit metadata, and declarative compiler capabilities. `/graph/version/diff` compares a supplied base snapshot against the current graph or an explicit target snapshot. Full Skill Encoder promotion, code-corpus lowering, and model-adapter policy stay in Theseus/Theorem encode surfaces rather than in the public RedCore release.
+The graph version routes are the THG Git/provenance substrate. `/graph/version/compile` reads the current tenant graph and returns a `rustyred-versioned-graph-v1` pack with content hashes, a Prolly-style tree root, Git-like commit metadata, and declarative compiler capabilities. `/graph/version/diff` compares a supplied base snapshot against the current graph or an explicit target snapshot. `/graph/version/ref`, `/log`, and `/checkout` operate on caller-supplied graph repositories so downstream products can choose their own persistence layer; checkout returns a snapshot and does not mutate the tenant graph. `/graph/version/merge` performs a read-only three-way merge with content-hash conflict detection and confidence-weighted edge conflict resolution. Full Skill Encoder promotion, code-corpus lowering, and model-adapter policy stay in Theseus/Theorem encode surfaces rather than in the public RedCore release.
 
 `GET /v1/diagnostics/config` returns the static runtime config snapshot, including
 startup-only tenant override details. Runtime mutation of tenant config is not

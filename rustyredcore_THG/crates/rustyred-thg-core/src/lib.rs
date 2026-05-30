@@ -59,14 +59,19 @@ pub use spatial::{
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};
 pub use symbolic::{
     derive_datalog_receipt, derive_datalog_receipt_from_json, evolution_archive,
-    evolution_archive_from_json, probabilistic_expected_value, probabilistic_expected_value_from_json,
-    probabilistic_source_reliability, probabilistic_source_reliability_from_json, stable_hash_json,
-    stable_hash_value, DATALOG_RULE_IDS,
+    evolution_archive_from_json, probabilistic_expected_value,
+    probabilistic_expected_value_from_json, probabilistic_source_reliability,
+    probabilistic_source_reliability_from_json, stable_hash_json, stable_hash_value,
+    DATALOG_RULE_IDS,
 };
 pub use versioned_graph::{
-    build_prolly_tree, compile_graph_pack, diff_graph_snapshots, snapshot_content_objects,
-    CompiledGraphPack, GraphCommit, GraphCompileOptions, GraphCompilerCapability,
-    GraphContentObject, GraphDiffEntry, GraphObjectKind, GraphPackManifest, GraphProllyTree,
-    GraphTreeChild, GraphTreeEntry, GraphTreeNode, GraphVersionDiff, DEFAULT_GRAPH_BRANCH,
-    GRAPH_PACK_COMPILER_VERSION, VERSIONED_GRAPH_PROTOCOL_VERSION,
+    build_prolly_tree, checkout_graph_version, compile_graph_pack, diff_graph_snapshots,
+    graph_version_log, merge_graph_snapshots, snapshot_content_objects, update_graph_ref,
+    CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
+    GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
+    GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide, GraphMergeStrategy,
+    GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefUpdate, GraphTreeChild,
+    GraphTreeEntry, GraphTreeNode, GraphVersionDiff, GraphVersionLog, GraphVersionRef,
+    GraphVersionRepository, DEFAULT_GRAPH_BRANCH, GRAPH_PACK_COMPILER_VERSION,
+    VERSIONED_GRAPH_PROTOCOL_VERSION,
 };

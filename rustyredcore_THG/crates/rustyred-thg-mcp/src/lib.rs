@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use rustyred_thg_core::{
-    compile_graph_pack, diff_graph_snapshots, CodeKgManifest, Direction, EdgeRecord,
-    EpistemicType, GraphCompileOptions, GraphSnapshot, GraphStats, GraphStoreError,
-    GraphStoreResult, HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta, VectorDesignation,
-    VerifyReport,
+    checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
+    merge_graph_snapshots, update_graph_ref, CodeKgManifest, Direction, EdgeRecord, EpistemicType,
+    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStoreError,
+    GraphStoreResult, GraphVersionRepository, HarnessInstantKg, HybridScoringConfig,
+    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
+    SessionDelta, VectorDesignation, VerifyReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -566,6 +567,84 @@ fn call_tool<P: McpGraphProvider>(
             json!({
                 "tenant": tenant,
                 "diff": diff_graph_snapshots(&base, &target)
+            })
+        }
+        "rustyred_thg_graph_version_ref"
+        | "rustyred_thg_git_ref"
+        | "rustyred.graph.version.ref"
+        | "rustyred.git.ref" => {
+            let snapshot = backend.graph_snapshot()?;
+            let options = serde_json::from_value::<GraphCompileOptions>(arguments.clone())
+                .map_err(|error| {
+                    McpError::invalid_params(format!("invalid graph compile options: {error}"))
+                })?;
+            let repository = optional_repository(&arguments)?;
+            let branch = arguments
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let updated_at_unix_ms = arguments.get("updated_at_unix_ms").and_then(Value::as_u64);
+            let pack = compile_graph_pack(&snapshot, options);
+            json!({
+                "tenant": tenant,
+                "ref_update": update_graph_ref(repository, pack, branch, updated_at_unix_ms.map(u128::from))
+            })
+        }
+        "rustyred_thg_graph_version_log"
+        | "rustyred_thg_git_log"
+        | "rustyred.graph.version.log"
+        | "rustyred.git.log" => {
+            let repository = required_repository(&arguments, name)?;
+            let target = arguments.get("target").and_then(Value::as_str);
+            json!({
+                "tenant": tenant,
+                "log": graph_version_log(&repository, target)
+            })
+        }
+        "rustyred_thg_graph_version_checkout"
+        | "rustyred_thg_git_checkout"
+        | "rustyred.graph.version.checkout"
+        | "rustyred.git.checkout" => {
+            let repository = required_repository(&arguments, name)?;
+            let target = required_str(&arguments, "target", name)?;
+            let checkout = checkout_graph_version(&repository, target).ok_or_else(|| {
+                McpError::invalid_params(format!("target not found or has no payloads: {target}"))
+            })?;
+            json!({
+                "tenant": tenant,
+                "checkout": checkout
+            })
+        }
+        "rustyred_thg_graph_version_merge"
+        | "rustyred_thg_git_merge"
+        | "rustyred.graph.version.merge"
+        | "rustyred.git.merge" => {
+            let base = arguments.get("base").cloned().ok_or_else(|| {
+                McpError::invalid_params("rustyred_thg_graph_version_merge requires base snapshot")
+            })?;
+            let base = serde_json::from_value::<GraphSnapshot>(base).map_err(|error| {
+                McpError::invalid_params(format!("base must be a graph snapshot: {error}"))
+            })?;
+            let ours = match arguments.get("ours").cloned() {
+                Some(value) => serde_json::from_value::<GraphSnapshot>(value).map_err(|error| {
+                    McpError::invalid_params(format!("ours must be a graph snapshot: {error}"))
+                })?,
+                None => backend.graph_snapshot()?,
+            };
+            let theirs = arguments.get("theirs").cloned().ok_or_else(|| {
+                McpError::invalid_params(
+                    "rustyred_thg_graph_version_merge requires theirs snapshot",
+                )
+            })?;
+            let theirs = serde_json::from_value::<GraphSnapshot>(theirs).map_err(|error| {
+                McpError::invalid_params(format!("theirs must be a graph snapshot: {error}"))
+            })?;
+            let options = serde_json::from_value::<GraphMergeOptions>(arguments.clone()).map_err(
+                |error| McpError::invalid_params(format!("invalid graph merge options: {error}")),
+            )?;
+            json!({
+                "tenant": tenant,
+                "merge": merge_graph_snapshots(&base, &ours, &theirs, options)
             })
         }
         // §P6-B pb6.1: SPEC names `thg.algo.*` are aliases for the existing
@@ -1785,12 +1864,14 @@ fn algorithm_communities_inline_payload(arguments: &Value) -> Result<Value, McpE
 fn symbolic_datalog_derive_payload(arguments: &Value) -> Result<Value, McpError> {
     let facts = arguments
         .get("facts")
-        .or_else(|| arguments.get("fact_pack").and_then(|pack| pack.get("facts")))
+        .or_else(|| {
+            arguments
+                .get("fact_pack")
+                .and_then(|pack| pack.get("facts"))
+        })
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            McpError::invalid_params(
-                "rustyred_thg_symbolic_datalog_derive requires facts array",
-            )
+            McpError::invalid_params("rustyred_thg_symbolic_datalog_derive requires facts array")
         })?;
     let max_facts = max_symbolic_facts();
     if facts.len() > max_facts {
@@ -1812,11 +1893,8 @@ fn symbolic_datalog_derive_payload(arguments: &Value) -> Result<Value, McpError>
     Ok(receipt)
 }
 
-fn symbolic_probabilistic_source_reliability_payload(
-    arguments: &Value,
-) -> Result<Value, McpError> {
-    rustyred_thg_core::probabilistic_source_reliability(arguments)
-        .map_err(McpError::invalid_params)
+fn symbolic_probabilistic_source_reliability_payload(arguments: &Value) -> Result<Value, McpError> {
+    rustyred_thg_core::probabilistic_source_reliability(arguments).map_err(McpError::invalid_params)
 }
 
 fn symbolic_probabilistic_expected_value_payload(arguments: &Value) -> Result<Value, McpError> {
@@ -2005,6 +2083,25 @@ fn parse_f32_array(arguments: &Value, key: &str) -> Result<Vec<f32>, McpError> {
                 "{key} is required and must be an array of numbers"
             )))
         })
+}
+
+fn optional_repository(arguments: &Value) -> Result<GraphVersionRepository, McpError> {
+    match arguments.get("repository").cloned() {
+        Some(value) => serde_json::from_value(value)
+            .map_err(|error| McpError::invalid_params(format!("repository is invalid: {error}"))),
+        None => Ok(GraphVersionRepository::default()),
+    }
+}
+
+fn required_repository(
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<GraphVersionRepository, McpError> {
+    let value = arguments.get("repository").cloned().ok_or_else(|| {
+        McpError::invalid_params(format!("{tool_name} requires repository object"))
+    })?;
+    serde_json::from_value(value)
+        .map_err(|error| McpError::invalid_params(format!("repository is invalid: {error}")))
 }
 
 fn parse_node_record(raw: &Value) -> Result<NodeRecord, McpError> {
@@ -2273,6 +2370,76 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "target": { "type": "object" }
                 },
                 "required": ["base"]
+            }),
+        ),
+        tool(
+            "rustyred_thg_graph_version_ref",
+            "Compile the current tenant graph and update a branch ref inside a caller-supplied graph repository value.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "repository": { "type": "object" },
+                    "name": { "type": "string" },
+                    "branch": { "type": "string", "default": "main" },
+                    "parent_commits": { "type": "array", "items": { "type": "string" } },
+                    "author": { "type": "string" },
+                    "message": { "type": "string" },
+                    "timestamp_unix_ms": { "type": "integer" },
+                    "updated_at_unix_ms": { "type": "integer" },
+                    "include_payloads": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
+        tool(
+            "rustyred_thg_graph_version_log",
+            "Walk graph commit history from a branch name or commit hash in a caller-supplied graph repository.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "repository": { "type": "object" },
+                    "target": { "type": "string", "default": "main" }
+                },
+                "required": ["repository"]
+            }),
+        ),
+        tool(
+            "rustyred_thg_graph_version_checkout",
+            "Reconstruct a graph snapshot from a branch name or commit hash in a caller-supplied graph repository.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "repository": { "type": "object" },
+                    "target": { "type": "string" }
+                },
+                "required": ["repository", "target"]
+            }),
+        ),
+        tool(
+            "rustyred_thg_graph_version_merge",
+            "Three-way merge graph snapshots with content-hash conflict detection and confidence-weighted edge resolution.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "base": { "type": "object" },
+                    "ours": { "type": "object" },
+                    "theirs": { "type": "object" },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["auto_confidence", "prefer_ours", "prefer_theirs", "manual"],
+                        "default": "auto_confidence"
+                    },
+                    "min_confidence_delta": { "type": "number", "default": 0.0 },
+                    "branch": { "type": "string" },
+                    "author": { "type": "string" },
+                    "message": { "type": "string" },
+                    "timestamp_unix_ms": { "type": "integer" },
+                    "include_payloads": { "type": "boolean", "default": true }
+                },
+                "required": ["base", "theirs"]
             }),
         ),
         tool(
@@ -3243,7 +3410,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        handle_mcp_request, handle_mcp_request_with_context, McpError, McpGraphProvider,
+        handle_mcp_request, handle_mcp_request_with_context, McpError, McpGraphBackend,
+        McpGraphProvider,
         McpRequestContext, McpServerConfig,
     };
 
@@ -3342,6 +3510,9 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_spatial_radius"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "rustyred_thg_graph_version_merge"));
         assert!(tools.iter().any(|tool| tool["name"] == "harness_kg_status"));
         assert!(tools
             .iter()
@@ -3349,9 +3520,9 @@ mod tests {
         assert!(tools.iter().any(|tool| {
             tool["name"] == "rustyred_thg_symbolic_probabilistic_source_reliability"
         }));
-        assert!(tools.iter().any(|tool| {
-            tool["name"] == "rustyred_thg_symbolic_probabilistic_expected_value"
-        }));
+        assert!(tools
+            .iter()
+            .any(|tool| { tool["name"] == "rustyred_thg_symbolic_probabilistic_expected_value" }));
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_admin_verify"));
@@ -3419,8 +3590,14 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(source["result"]["structuredContent"]["posterior"]["alpha"], 8.0);
-        assert_eq!(source["result"]["structuredContent"]["posterior"]["beta"], 4.0);
+        assert_eq!(
+            source["result"]["structuredContent"]["posterior"]["alpha"],
+            8.0
+        );
+        assert_eq!(
+            source["result"]["structuredContent"]["posterior"]["beta"],
+            4.0
+        );
 
         let expected_value = handle_mcp_request(
             &provider,
@@ -3539,6 +3716,90 @@ mod tests {
         assert_eq!(
             response["result"]["structuredContent"]["explain"]["plan"][1]["op"],
             "node_index_seek"
+        );
+    }
+
+    #[test]
+    fn version_tools_support_refs_checkout_and_merge() {
+        let (provider, config) = fixture();
+        let base = provider.0.graph_snapshot().expect("fixture snapshot");
+        let ref_update = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "ref",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred_thg_graph_version_ref",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "branch": "main",
+                        "timestamp_unix_ms": 1,
+                        "updated_at_unix_ms": 2
+                    }
+                }
+            }),
+        );
+        let repository =
+            ref_update["result"]["structuredContent"]["ref_update"]["repository"].clone();
+        assert_eq!(
+            ref_update["result"]["structuredContent"]["ref_update"]["reference"]["name"],
+            "main"
+        );
+
+        let checkout = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "checkout",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred_thg_graph_version_checkout",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "repository": repository,
+                        "target": "main"
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            checkout["result"]["structuredContent"]["checkout"]["snapshot"]["nodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            base.nodes.len()
+        );
+
+        let mut theirs = base.clone();
+        theirs.nodes.push(NodeRecord::new(
+            "node:d",
+            ["Person"],
+            json!({"name": "Dorothy"}),
+        ));
+        let merge = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "merge",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred_thg_graph_version_merge",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "base": base,
+                        "theirs": theirs,
+                        "timestamp_unix_ms": 3
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            merge["result"]["structuredContent"]["merge"]["status"],
+            "clean"
         );
     }
 
