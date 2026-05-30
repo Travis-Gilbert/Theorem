@@ -94,13 +94,16 @@ Python one.
 | `test/smoke.ts` (40) | all 6 projections place every atom at finite positions, non-degenerate bounds; unknown-id → freeform; positionless → grid |
 | `test/render-harness.mjs` (13) | paint path runs without throwing; setTransform/arc/rect/stroke/fill/moveTo/lineTo/fillText all fire; header + empty state correct |
 | `cargo run --example render_sample` | wrote a 57 KB self-contained page (the exact bytes Servo would serve) |
+| browser screenshot (headless chromium) | scene renders correctly + immediately (≤150 ms): tidy-tree layout, kind-colored glyphs (teal sources, green person, terracotta claim/evidence), arrowed relations, labels with paper halos, no console errors |
 
-**Named gap:** no pixel screenshot. Playwright/Chrome could not be installed in
-this environment (OS-dep install needs sudo). The draw path is proven to execute
-and issue the right canvas ops (recording-context harness), but its visual
-appearance has not been eyeballed in a real browser. Follow-up: open
-`/tmp/scene-sample.html` (or `cargo run --example render_sample -- out.html`) in
-a browser and screenshot.
+Visual verification surfaced + fixed a real bug: the original enter-fade was
+rAF-driven, and `requestAnimationFrame` is throttled in headless / background
+documents, so the canvas stayed blank until the page was foregrounded. The
+recording-context harness could not catch it (it stubs rAF to fire
+synchronously). Fixed by painting synchronously at full opacity — lifecycle
+per-atom opacity (entering/leaving) stays because it is data-driven, not
+time-driven. Reproduce the screenshot via `test/screenshot.mjs` (optional
+playwright, documented in the file).
 
 ## Handoff to Lane C (Codex, plan step 7)
 
@@ -115,8 +118,11 @@ reference of the call.
 
 - The full React `SceneHost` / `AtomSubstrate` (cosmos.gl force engine) for the
   `graph` coordinate space, once Lane A emits a graph projection.
-- Choreographed morph transitions between recompiles (the substrate's
-  lifecycle/transition machinery); slice 1 does a single enter-fade.
+- Choreographed enter / morph transitions between recompiles (the substrate's
+  lifecycle/transition machinery). Slice 1 paints synchronously at full opacity;
+  time-based motion was removed after it proved fragile under rAF throttling and
+  returns with the real choreographer, which must keep the scene visible from
+  frame 0.
 - The patent `<PatentDiagram>` Graphviz chrome (slice 1 renders patent atoms in
   the column-placement baseline the adapter provides).
 - Additional projections (geo, cinematic, matrix, image, heatmap) when Lane A's

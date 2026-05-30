@@ -71,15 +71,12 @@ export class SceneRenderer {
   private readonly tooltip: HTMLElement | null;
   private readonly callbacks: SceneRendererCallbacks;
   private readonly pkg: ScenePackageV2;
-  private readonly reducedMotion: boolean;
 
   private layout: SceneLayout | null = null;
   private transform: FitTransform | null = null;
   private placed: PlacedAtom[] = [];
   private hoveredId: string | null = null;
   private viewport: Viewport = { width: 0, height: 0 };
-  private fadeStart = 0;
-  private rafId = 0;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -95,10 +92,6 @@ export class SceneRenderer {
     this.tooltip = options.tooltip ?? null;
     this.callbacks = options.callbacks ?? {};
     this.pkg = pkg;
-    this.reducedMotion =
-      typeof window !== 'undefined' && typeof window.matchMedia === 'function'
-        ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
-        : false;
 
     this.onPointerMove = this.onPointerMove.bind(this);
     this.onPointerLeave = this.onPointerLeave.bind(this);
@@ -138,13 +131,10 @@ export class SceneRenderer {
     this.layout = layoutScene(this.pkg, this.viewport);
     this.transform = fitTransform(this.layout.bounds, this.viewport, FIT_PADDING_PX);
     this.computePlaced();
-
-    this.fadeStart = now();
-    this.startPaintLoop();
+    this.paint();
   }
 
   destroy(): void {
-    if (this.rafId !== 0) cancelAnimationFrame(this.rafId);
     this.canvas.removeEventListener('pointermove', this.onPointerMove);
     this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
     this.canvas.removeEventListener('click', this.onClick);
@@ -187,28 +177,16 @@ export class SceneRenderer {
   // Paint
   // ------------------------------------------------------------------------
 
-  private startPaintLoop(): void {
-    if (this.rafId !== 0) cancelAnimationFrame(this.rafId);
-    const tick = (): void => {
-      const alpha = this.reducedMotion ? 1 : easeInOut(clamp01((now() - this.fadeStart) / 280));
-      this.paint(alpha);
-      if (alpha < 1) {
-        this.rafId = requestAnimationFrame(tick);
-      } else {
-        this.rafId = 0;
-      }
-    };
-    tick();
-  }
-
-  /** Repaint immediately (used by hover so the highlight is responsive even
-   *  after the enter fade has settled). */
-  private repaint(): void {
-    if (this.rafId !== 0) return; // a fade is already running; it will repaint
-    this.paint(1);
-  }
-
-  private paint(alpha: number): void {
+  /**
+   * Paint the current scene at full opacity. Synchronous and idempotent: no
+   * rAF, no time-based fade. A scene MUST be visible the instant it mounts,
+   * and rAF is throttled in headless / background tabs — gating visibility on
+   * it would leave the canvas blank. Lifecycle-driven per-atom opacity
+   * (entering / leaving) still applies because it is data-driven, not
+   * time-driven. Choreographed enter/morph transitions are a later enrichment
+   * (the substrate's real choreographer), not a slice-1 concern.
+   */
+  private paint(): void {
     const { ctx } = this;
     const { width, height } = this.viewport;
     const layout = this.layout;
@@ -217,10 +195,15 @@ export class SceneRenderer {
     ctx.fillStyle = PAPER;
     ctx.fillRect(0, 0, width, height);
 
-    ctx.globalAlpha = alpha;
+    ctx.globalAlpha = 1;
     this.paintRelations(layout);
     this.paintAtoms(layout);
     ctx.globalAlpha = 1;
+  }
+
+  /** Repaint immediately (used by hover to refresh the highlight). */
+  private repaint(): void {
+    this.paint();
   }
 
   private paintRelations(layout: SceneLayout): void {
@@ -526,20 +509,4 @@ function lifecycleAlpha(atom: Atom): number {
 function truncate(value: string, max: number): string {
   const s = String(value);
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
-}
-
-function clamp01(value: number): number {
-  if (value < 0) return 0;
-  if (value > 1) return 1;
-  return value;
-}
-
-function easeInOut(t: number): number {
-  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-}
-
-function now(): number {
-  return typeof performance !== 'undefined' && typeof performance.now === 'function'
-    ? performance.now()
-    : 0;
 }
