@@ -67,7 +67,11 @@ pub fn compile_scene_package(
     );
 
     let projection_catalog = production_projection_catalog();
-    let projection_selection =
+    let projection_selection = if let Some(projection_id) =
+        explicit_projection_hint(input.answer_type.as_deref())
+    {
+        explicit_projection_selection(projection_id, &projection_catalog)?
+    } else {
         select_projection(goal_for_select, shape_for_select, &projection_catalog).map_err(
             |refusal| {
                 SceneCompileError::new(
@@ -75,7 +79,8 @@ pub fn compile_scene_package(
                     format!("{}: {}", refusal.code, refusal.message),
                 )
             },
-        )?;
+        )?
+    };
     let selected_projection = projection_catalog
         .iter()
         .find(|projection| projection.id == projection_selection.projection_id)
@@ -162,8 +167,52 @@ pub fn compile_scene_package(
 fn selector_overrides(answer_type: Option<&str>, goal: Goal, shape: DataShape) -> (Goal, DataShape) {
     match answer_type {
         Some("patent_diagram") | Some("patent_scene") => (Goal::ExplainProcess, DataShape::Dag),
+        Some("tree_hierarchy") | Some("reconstruction_node_tree") => {
+            (Goal::ExplainProcess, DataShape::Tree)
+        }
+        Some("numeric_series") => (Goal::Rank, DataShape::NumericSeries),
+        Some("categorical_set") => (Goal::Summarize, DataShape::CategoricalSet),
+        Some("flow_layered") | Some("sankey_flow") => (Goal::ExplainProcess, DataShape::Dag),
         _ => (goal, shape),
     }
+}
+
+fn explicit_projection_hint(answer_type: Option<&str>) -> Option<&str> {
+    match answer_type {
+        Some(
+            id @ ("patent_diagram"
+            | "tree_hierarchy"
+            | "numeric_series"
+            | "categorical_set"
+            | "flow_layered"
+            | "sankey_flow"),
+        ) => Some(id),
+        Some("patent_scene") => Some("patent_diagram"),
+        Some("reconstruction_node_tree") => Some("tree_hierarchy"),
+        _ => None,
+    }
+}
+
+fn explicit_projection_selection(
+    projection_id: &str,
+    catalog: &[crate::capabilities::ProjectionCapability],
+) -> Result<ProjectionSelection, SceneCompileError> {
+    if !catalog.iter().any(|projection| projection.id == projection_id) {
+        return Err(SceneCompileError::new(
+            "projection_hint_missing",
+            format!("answer_type requested unknown projection {projection_id:?}"),
+        ));
+    }
+
+    Ok(ProjectionSelection {
+        projection_id: projection_id.to_string(),
+        fallbacks: catalog
+            .iter()
+            .filter(|projection| projection.id != projection_id)
+            .map(|projection| projection.id.clone())
+            .collect(),
+        rationale: format!("answer_type={projection_id}; explicit projection hint"),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +262,39 @@ mod tests {
         assert_eq!(
             value["provenance"]["compileTrace"]["selectedGoal"],
             "explain-process"
+        );
+    }
+
+    #[test]
+    fn explicit_tree_answer_type_selects_tree_projection_and_document_rail() {
+        let scene = SceneScene {
+            atoms: vec![atom("root"), atom("child")],
+            relations: vec![relation("root", "child")],
+        };
+        let package = compile_scene_package(SceneCompileInput {
+            query: "Show me the browser substrate scene.".to_string(),
+            answer_type: Some("tree_hierarchy".to_string()),
+            title: None,
+            scene,
+            trace_id: Some("tree-1".to_string()),
+            manifest_ref: None,
+            provenance: BTreeMap::new(),
+        })
+        .expect("compile tree hierarchy scene");
+
+        assert_eq!(package.projection.id, "tree_hierarchy");
+        assert_eq!(package.chrome.id, "document_rail");
+
+        let value = serde_json::to_value(package).expect("serialize package");
+        assert_eq!(
+            value["provenance"]["compileTrace"]["selectedShape"],
+            "tree"
+        );
+        assert!(
+            value["provenance"]["compileTrace"]["projectionSelect"]["rationale"]
+                .as_str()
+                .unwrap()
+                .contains("explicit projection hint")
         );
     }
 

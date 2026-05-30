@@ -16,6 +16,7 @@
 //! response body, so a known intercepted body is the first auditable seam.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -25,13 +26,19 @@ use dpi::PhysicalSize;
 use embedder_traits::WebResourceResponse;
 use euclid::Scale;
 use http::header::{HeaderValue, CONTENT_TYPE};
+use scene_os_core::{
+    compile_scene_package, AtomLifecycle, SceneAtom, SceneCompileInput, SceneRelation, SceneScene,
+    SourceRef,
+};
+use scene_os_web::render_scene;
+use serde_json::json;
 use servo::{
     EventLoopWaker, LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext,
     WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use theorem_browser_substrate::{
     browser_affordances, durable_browser_session, memory_browser_session, LoadedPage,
-    RedCoreBrowserSessionStore,
+    RedCoreBrowserSessionStore, SubstrateSearch,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -42,6 +49,9 @@ use winit::window::Window;
 
 const SMOKE_URL: &str = "http://theorem.local/smoke";
 const SEARCH_URL_PREFIX: &str = "http://theorem.local/search";
+const SCENE_URL_PREFIX: &str = "http://theorem.local/scene";
+const SCENE_SMOKE_URL: &str = "http://theorem.local/scene?q=substrate";
+const DEFAULT_SCENE_QUERY: &str = "substrate";
 const STORE_DIR_ENV: &str = "THEOREM_BROWSER_STORE_DIR";
 const SMOKE_HTML: &str = r#"<!doctype html>
 <html>
@@ -51,6 +61,7 @@ const SMOKE_HTML: &str = r#"<!doctype html>
       <h1>Theorem browser smoke</h1>
       <a href="/substrate">Substrate seam</a>
       <a href="/search?q=substrate">Search the substrate</a>
+      <a href="/scene?q=substrate">SceneOS view</a>
     </main>
   </body>
 </html>"#;
@@ -93,6 +104,7 @@ impl BrowserStoreOptions {
 enum BrowserMode {
     EngineConstructor,
     HeadlessSmoke,
+    HeadlessSceneSmoke,
     Windowed(Url),
 }
 
@@ -144,6 +156,7 @@ impl EventLoopWaker for WindowWaker {
 struct SubstrateSmokeDelegate {
     complete: Cell<bool>,
     ingested: Cell<bool>,
+    ingest_on_complete: bool,
     write_count: Cell<usize>,
     graph_delta_hash: RefCell<Option<String>>,
     error: RefCell<Option<String>>,
@@ -155,10 +168,23 @@ impl SubstrateSmokeDelegate {
         Ok(Self {
             complete: Cell::new(false),
             ingested: Cell::new(false),
+            ingest_on_complete: true,
             write_count: Cell::new(0),
             graph_delta_hash: RefCell::new(None),
             error: RefCell::new(None),
             session: RefCell::new(store_options.open_session("browser-headless-smoke")?),
+        })
+    }
+
+    fn new_scene(store_options: &BrowserStoreOptions) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            complete: Cell::new(false),
+            ingested: Cell::new(false),
+            ingest_on_complete: false,
+            write_count: Cell::new(0),
+            graph_delta_hash: RefCell::new(None),
+            error: RefCell::new(None),
+            session: RefCell::new(seed_browser_session(store_options)?),
         })
     }
 
@@ -194,7 +220,9 @@ impl WebViewDelegate for SubstrateSmokeDelegate {
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         if status == LoadStatus::Complete {
-            self.ingest_completed_page(webview);
+            if self.ingest_on_complete {
+                self.ingest_completed_page(webview);
+            }
             self.complete.set(true);
         }
     }
@@ -346,6 +374,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = parse_config(std::env::args().skip(1))?;
     match config.mode {
         BrowserMode::HeadlessSmoke => run_headless_smoke(&config.store),
+        BrowserMode::HeadlessSceneSmoke => run_headless_scene_smoke(&config.store),
         BrowserMode::Windowed(url) => run_windowed(url, config.store),
         BrowserMode::EngineConstructor => {
             run_engine_constructor(&config.store);
@@ -379,6 +408,7 @@ fn parse_config(args: impl IntoIterator<Item = String>) -> Result<BrowserConfig,
 
     let mode = match mode_args.first().map(String::as_str) {
         Some("--headless-smoke") => BrowserMode::HeadlessSmoke,
+        Some("--headless-scene-smoke") => BrowserMode::HeadlessSceneSmoke,
         Some("--windowed") => {
             let url = mode_args
                 .get(1)
@@ -417,8 +447,7 @@ fn run_engine_constructor(store_options: &BrowserStoreOptions) {
     print_browser_affordances();
 }
 
-fn run_headless_smoke(store_options: &BrowserStoreOptions) -> Result<(), Box<dyn Error>> {
-    eprintln!("theorem-browser: starting headless WebView substrate smoke");
+fn software_rendering_context() -> Result<Rc<dyn RenderingContext>, Box<dyn Error>> {
     let rendering_context: Rc<dyn RenderingContext> = Rc::new(
         SoftwareRenderingContext::new(PhysicalSize {
             width: 800,
@@ -429,6 +458,12 @@ fn run_headless_smoke(store_options: &BrowserStoreOptions) -> Result<(), Box<dyn
     rendering_context
         .make_current()
         .map_err(|error| format!("could not make rendering context current: {error:?}"))?;
+    Ok(rendering_context)
+}
+
+fn run_headless_smoke(store_options: &BrowserStoreOptions) -> Result<(), Box<dyn Error>> {
+    eprintln!("theorem-browser: starting headless WebView substrate smoke");
+    let rendering_context = software_rendering_context()?;
 
     let servo = ServoBuilder::default()
         .event_loop_waker(Box::new(HeadlessWaker))
@@ -471,6 +506,41 @@ fn run_headless_smoke(store_options: &BrowserStoreOptions) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn run_headless_scene_smoke(store_options: &BrowserStoreOptions) -> Result<(), Box<dyn Error>> {
+    eprintln!("theorem-browser: starting headless SceneOS WebView smoke");
+    let rendering_context = software_rendering_context()?;
+
+    let servo = ServoBuilder::default()
+        .event_loop_waker(Box::new(HeadlessWaker))
+        .build();
+    servo.setup_logging();
+
+    let delegate = Rc::new(SubstrateSmokeDelegate::new_scene(store_options)?);
+    let _webview = WebViewBuilder::new(&servo, rendering_context)
+        .url(Url::parse(SCENE_SMOKE_URL)?)
+        .hidpi_scale_factor(Scale::new(1.0))
+        .delegate(delegate.clone())
+        .build();
+
+    eprintln!("theorem-browser: SceneOS WebView created; spinning Servo until load complete");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !delegate.complete.get() {
+        servo.spin_event_loop();
+        std::thread::sleep(Duration::from_millis(5));
+
+        if Instant::now() > deadline {
+            return Err("timed out waiting for Servo WebView scene smoke load".into());
+        }
+    }
+
+    if let Some(error) = delegate.error.borrow().as_ref() {
+        return Err(format!("SceneOS smoke failed: {error}").into());
+    }
+
+    println!("theorem-browser: headless SceneOS WebView smoke OK; url={SCENE_SMOKE_URL}");
+    Ok(())
+}
+
 fn run_windowed(
     initial_url: Url,
     store_options: BrowserStoreOptions,
@@ -503,6 +573,15 @@ fn intercept_local_theorem_page(
             .map(|(_, value)| value.to_string())
             .unwrap_or_default();
         session.borrow().render_search_page(&query)
+    } else if url.as_str().starts_with(SCENE_URL_PREFIX) {
+        let query = scene_query_from_url(&url);
+        match render_browser_scene_page(&session.borrow(), &query) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("theorem-browser: SceneOS route failed: {error}");
+                scene_os_web::render_scene_html("null")
+            }
+        }
     } else {
         return;
     };
@@ -519,10 +598,195 @@ fn intercept_local_theorem_page(
     intercepted.finish();
 }
 
+fn scene_query_from_url(url: &Url) -> String {
+    url.query_pairs()
+        .find(|(key, _)| key == "q" || key == "query")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_SCENE_QUERY.to_string())
+}
+
+fn render_browser_scene_page(
+    session: &RedCoreBrowserSessionStore,
+    query: &str,
+) -> Result<String, String> {
+    let search = session.search_substrate(query);
+    let scene = scene_from_substrate_search(&search);
+    let compile_query = if query.trim().is_empty() {
+        DEFAULT_SCENE_QUERY
+    } else {
+        query
+    };
+    let package = compile_scene_package(SceneCompileInput {
+        query: compile_query.to_string(),
+        answer_type: Some("tree_hierarchy".to_string()),
+        title: Some(format!("Substrate scene: {compile_query}")),
+        scene,
+        trace_id: Some(scene_trace_id(compile_query)),
+        manifest_ref: Some(format!("browser-scene:{compile_query}")),
+        provenance: BTreeMap::from([
+            ("route".to_string(), json!("theorem.local/scene")),
+            ("query".to_string(), json!(search.query)),
+            ("matchedCount".to_string(), json!(search.matched_count)),
+            ("keptCount".to_string(), json!(search.kept_count)),
+        ]),
+    })
+    .map_err(|error| error.to_string())?;
+    render_scene(&package).map_err(|error| error.to_string())
+}
+
+fn scene_from_substrate_search(search: &SubstrateSearch) -> SceneScene {
+    let atoms = search
+        .hits
+        .iter()
+        .map(|hit| {
+            let label = if hit.title.trim().is_empty() {
+                hit.url
+                    .trim()
+                    .strip_prefix("http://")
+                    .or_else(|| hit.url.trim().strip_prefix("https://"))
+                    .unwrap_or(&hit.node_id)
+                    .to_string()
+            } else {
+                hit.title.clone()
+            };
+            SceneAtom {
+                id: hit.node_id.clone(),
+                kind: if hit.ring == 0 { "claim" } else { "concept" }.to_string(),
+                label: Some(label.clone()),
+                position: None,
+                weight: Some((hit.match_score as f64).max(1.0) + 1.0 / (hit.ring + 1) as f64),
+                color: None,
+                opacity: None,
+                glyph: None,
+                scale: None,
+                lifecycle: AtomLifecycle::Present,
+                metadata: BTreeMap::from([
+                    ("url".to_string(), json!(hit.url)),
+                    ("snippet".to_string(), json!(hit.snippet)),
+                    ("ring".to_string(), json!(hit.ring)),
+                    ("ringLabel".to_string(), json!(hit.ring_label)),
+                    ("matchScore".to_string(), json!(hit.match_score)),
+                ]),
+                source_refs: vec![SourceRef {
+                    kind: "Page".to_string(),
+                    id: hit.node_id.clone(),
+                    label: Some(label),
+                    metadata: BTreeMap::from([("url".to_string(), json!(hit.url))]),
+                }],
+            }
+        })
+        .collect();
+
+    let relations = search
+        .links
+        .iter()
+        .map(|link| SceneRelation {
+            id: format!("{}->{}:links_to", link.source, link.target),
+            source_id: link.source.clone(),
+            target_id: link.target.clone(),
+            kind: "links_to".to_string(),
+            weight: Some(1.0),
+            color: None,
+            opacity: None,
+            glyph: None,
+            lifecycle: AtomLifecycle::Present,
+            metadata: BTreeMap::new(),
+            source_refs: Vec::new(),
+        })
+        .collect();
+
+    SceneScene { atoms, relations }
+}
+
+fn scene_trace_id(query: &str) -> String {
+    let mut out = String::from("browser-scene");
+    let mut pending_dash = true;
+
+    for ch in query.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash {
+                out.push('-');
+                pending_dash = false;
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+
+    if out == "browser-scene" {
+        out.push_str("-substrate");
+    }
+
+    out
+}
+
 fn seed_browser_session(
     store_options: &BrowserStoreOptions,
 ) -> Result<RedCoreBrowserSessionStore, Box<dyn Error>> {
     let mut session = store_options.open_session("browser-seed")?;
-    let _ = session.ingest_loaded_page(LoadedPage::html(SMOKE_URL, SMOKE_HTML));
+    session.ingest_loaded_page(LoadedPage::html(SMOKE_URL, SMOKE_HTML))?;
     Ok(session)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seeded_session() -> RedCoreBrowserSessionStore {
+        let mut session = memory_browser_session("scene-test");
+        session
+            .ingest_loaded_page(LoadedPage::html(SMOKE_URL, SMOKE_HTML))
+            .expect("seed should write to substrate");
+        session
+    }
+
+    #[test]
+    fn scene_url_query_defaults_to_substrate() {
+        let url = Url::parse("http://theorem.local/scene").unwrap();
+        assert_eq!(scene_query_from_url(&url), DEFAULT_SCENE_QUERY);
+
+        let url = Url::parse("http://theorem.local/scene?query=browser").unwrap();
+        assert_eq!(scene_query_from_url(&url), "browser");
+    }
+
+    #[test]
+    fn browser_scene_page_uses_lane_a_package_and_lane_b_renderer() {
+        let session = seeded_session();
+        let html = render_browser_scene_page(&session, "substrate").expect("render scene");
+
+        assert!(html.contains("window.__SCENE_PACKAGE__ = {"));
+        assert!(html.contains("\"projection\":{\"id\":\"tree_hierarchy\""));
+        assert!(html.contains("\"chrome\":{\"id\":\"document_rail\""));
+        assert!(html.contains("\"route\":\"theorem.local/scene\""));
+        assert!(html.contains("SceneOS"));
+    }
+
+    #[test]
+    fn search_result_maps_to_scene_atoms_and_relations() {
+        let session = seeded_session();
+        let search = session.search_substrate("substrate");
+        let scene = scene_from_substrate_search(&search);
+
+        assert!(!scene.atoms.is_empty());
+        assert!(scene.atoms.iter().any(|atom| atom.kind == "claim"));
+        assert!(scene
+            .atoms
+            .iter()
+            .all(|atom| atom.lifecycle == AtomLifecycle::Present));
+        assert!(scene
+            .atoms
+            .iter()
+            .all(|atom| atom.metadata.contains_key("url")));
+    }
+
+    #[test]
+    fn scene_trace_id_slug_collapses_separators() {
+        assert_eq!(
+            scene_trace_id("Substrate browser scene"),
+            "browser-scene-substrate-browser-scene"
+        );
+        assert_eq!(scene_trace_id("???"), "browser-scene-substrate");
+    }
 }

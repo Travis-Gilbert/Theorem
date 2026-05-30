@@ -87,6 +87,12 @@ lane B's bundle with the package injected (the SERP injection pattern) → Servo
 renders. In-process: the director and the graph are in the same process as the
 browser.
 
+Status: first slice shipped in `apps/browser`. The browser now intercepts
+`http://theorem.local/scene?q=...`, turns browser-session substrate search into
+a `SceneScene`, compiles it with `scene-os-core`, and serves the `scene-os-web`
+HTML through Servo's `load_web_resource` hook. See
+`lane-c-servo-integration.md`.
+
 ## Sequencing
 
 1. Lane A atoms + catalogs (data layer; small, builds on `scene_atoms.rs`).

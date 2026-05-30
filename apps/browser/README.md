@@ -2,7 +2,7 @@
 
 **Status:** External embedder build is green in GitHub Actions at `713eded` (run `26669852900`, 2026-05-30). Grounded against the pinned Servo embedding API (`servo::WebViewBuilder`, `WebViewDelegate`, `Servo::spin_event_loop`, `SoftwareRenderingContext`). This crate is the start of the substrate-native browser: the surface where Servo renders both the open web and SceneOS scenes, in-process with the RustyRed substrate.
 
-**Honest state:** the external `cargo build` path has compiled successfully in CI. The checked smoke increment is `cargo run -- --headless-smoke`: create a real WebView with a software rendering context, intercept a known URL through `WebViewDelegate::load_web_resource`, and write that supplied page into `theorem-browser-substrate`. The next scene is `cargo run -- --windowed [url]`, a minimal desktop winit shell that opens a real Servo WebView. The browser now also serves `http://theorem.local/search?q=...` as a graph-native RustyWeb SERP from its browser session substrate. By default that session is memory-backed; pass `--store-dir <path>` or set `THEOREM_BROWSER_STORE_DIR=<path>` to make it a durable RedCore store. This proves the visible browser shell and local search surface without claiming full arbitrary-page response capture yet.
+**Honest state:** the external `cargo build` path has compiled successfully in CI. The checked smoke increment is `cargo run -- --headless-smoke`: create a real WebView with a software rendering context, intercept a known URL through `WebViewDelegate::load_web_resource`, and write that supplied page into `theorem-browser-substrate`. The browser also serves `http://theorem.local/search?q=...` as a graph-native RustyWeb SERP and `http://theorem.local/scene?q=...` as a generated SceneOS page from the same browser session substrate. The SceneOS route is Lane C: `apps/browser` asks `scene-os-core` for a typed `ScenePackageV2`, then serves the `scene-os-web` bundle HTML in-process. By default that session is memory-backed; pass `--store-dir <path>` or set `THEOREM_BROWSER_STORE_DIR=<path>` to make it a durable RedCore store. This proves the visible browser shell, local search surface, and scene-host surface without claiming full arbitrary-page response capture yet.
 
 ---
 
@@ -21,7 +21,7 @@ Servo IS the browser: the UI renders in it; there is no front-end without a rend
 ## The two substrate seams (what makes this Theorem's browser, not just an embedder)
 
 1. **DOM-as-substrate-write: `WebViewDelegate::load_web_resource(&self, webview, WebResourceLoad)`.** Servo calls this when a `WebView` is about to load an HTTP/HTTPS resource; the embedder may `WebResourceLoad::intercept(...)` to supply alternate contents, or let it continue. (Verified against doc.servo.org 2026-05-29: `ServoDelegate::load_web_resource` fires only for loads NOT associated with a `WebView`; page navigations are WebView-associated, so the page seam lives on `WebViewDelegate`, and `WebViewDelegate::notify_load_status_changed(LoadStatus::Complete)` is the "page finished" signal that triggers the substrate write.) This is the hook where a loaded page becomes graph state in the RustyRed substrate, and where substrate-resident content (a generated SceneOS scene) can be served in place of a network load. In-process with RustyRed, no API boundary. The page->graph logic itself is the `theorem-browser-substrate` crate (`ingest_loaded_pages`), already built and unit-tested without Servo.
-2. **Scene compositing.** SceneOS scenes (generated atoms placed by D3-backed projections) compose into the same Servo surface as web pages. A generated scene is served as a substrate-resident resource through the same `load_web_resource` interception, or painted as an overlay webview.
+2. **Scene compositing.** SceneOS scenes (generated atoms placed by D3-backed projections) compose into the same Servo surface as web pages. `http://theorem.local/scene?q=...` is served through the same `load_web_resource` interception: browser substrate search becomes SceneOS atoms, `scene-os-core::compile_scene_package` produces a typed package, and `scene-os-web::render_scene` returns the self-contained HTML that Servo loads.
 
 ## Fork vs embed (recommendation)
 
@@ -66,13 +66,15 @@ The browser owns a `BrowserSessionStore<RedCoreGraphStore>`:
 - default: ephemeral RedCore memory mode for constructor/smoke runs
 - durable: `cargo run -- --store-dir /tmp/theorem-browser-store --windowed http://theorem.local/smoke`
 - env-configured durable: `THEOREM_BROWSER_STORE_DIR=/tmp/theorem-browser-store cargo run -- --headless-smoke`
+- scene smoke: `cargo run -- --headless-scene-smoke`
+- windowed scene: `cargo run -- --windowed http://theorem.local/scene?q=substrate`
 - explicit throwaway run: add `--memory-store` to ignore the env var
 
 The important point is that `/smoke` writes and `/search?q=...` reads go through the same session object. Switching memory to disk changes only the backing RedCore store, not the browser delegate wiring.
 
 ## Next increments
 
-1. Keep the external Servo embedder build green in CI (done for constructor wiring; now includes the headless WebView smoke).
+1. Keep the external Servo embedder build green in CI (done for constructor wiring; now includes the headless WebView smoke and the SceneOS WebView smoke).
 2. Get a minimal WebView rendering a single URL in a winit window (the "it renders the open web" milestone). The `--windowed [url]` entrypoint is now the compile-validated shell for this.
 3. Extend the current intercepted smoke seam into true loaded-page capture. Important API note: `load_web_resource` sees requests before load, not response bodies after download, so arbitrary open-web capture will need either interception/fetch ownership or a separate completed-document extraction path.
 4. Compose a SceneOS scene into the surface (seam 2), then move into the cost-graded dossier/search chrome.
@@ -80,4 +82,4 @@ The important point is that `/smoke` writes and `/search?q=...` reads go through
 ## Files
 
 - `Cargo.toml`: the embedder crate (depends on the `servo` git crate + winit + url).
-- `src/main.rs`: the embedder entrypoint. Default mode constructs the Servo engine, `--headless-smoke` validates WebView + substrate ingest headlessly, and `--windowed [url]` opens the minimal desktop WebView shell.
+- `src/main.rs`: the embedder entrypoint. Default mode constructs the Servo engine, `--headless-smoke` validates WebView + substrate ingest headlessly, `--headless-scene-smoke` validates the local SceneOS route through Servo, and `--windowed [url]` opens the minimal desktop WebView shell.

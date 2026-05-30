@@ -12,9 +12,11 @@ name: servo-browser build
 #   libservo via plain cargo (the real consumer-side proof) with a minimal
 #   engine-construction main.rs. Reference: servo/components/servo/examples/
 #   winit_minimal.rs at the pinned rev.
-# v2b step 2 (next, on a warm cache): add the WebView + the
+# v2b step 2: add the WebView + the
 #   WebViewDelegate::load_web_resource substrate seam (calls
 #   theorem_browser_substrate::ingest_loaded_pages) and load a real URL headless.
+# v2b step 3: serve a generated SceneOS package through the same WebView
+#   interception seam, using scene-os-core + scene-os-web in-process.
 # Windowed macOS desktop run is a later milestone (a macOS runner or local).
 #
 # Manual trigger only: a full Servo build is heavy. Do not run on every push.
@@ -123,3 +125,13 @@ jobs:
         # and write that loaded page into theorem-browser-substrate/RustyRed.
         # This proves the browser seam after the heavy libservo build is warm.
         run: timeout 180s cargo run -- --headless-smoke
+
+      - name: Run theorem-browser headless SceneOS WebView smoke
+        working-directory: theorem/apps/browser
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        # Lane C: serve http://theorem.local/scene?q=substrate through the same
+        # WebViewDelegate interception seam. The browser seeds its local
+        # substrate, scene-os-core compiles a typed ScenePackageV2, and
+        # scene-os-web renders the self-contained scene host HTML.
+        run: timeout 180s cargo run -- --headless-scene-smoke

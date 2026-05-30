@@ -22,9 +22,10 @@ use std::{fmt, path::Path};
 use rustyred_thg_core::graph_store::{GraphStore, GraphStoreError, GraphWriteResult};
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use rustyred_web::{
-    build_v2_fixture_crawl, render_search_page, CrawlRequest, CrawlRunOutput, FetchedPage,
-    RustyWebError,
+    build_v2_fixture_crawl, render_search_page, search_substrate, CrawlRequest, CrawlRunOutput,
+    FetchedPage, RustyWebError, SearchOptions,
 };
+pub use rustyred_web::{SearchHit, SearchLink, SubstrateSearch};
 
 /// A browser-callable capability exposed by this seam.
 ///
@@ -276,6 +277,10 @@ impl<S: GraphStore> BrowserSessionStore<S> {
     pub fn render_search_page(&self, query: &str) -> String {
         render_substrate_search_page(&self.store, query)
     }
+
+    pub fn search_substrate(&self, query: &str) -> SubstrateSearch {
+        search_substrate(&self.store, query, SearchOptions::default())
+    }
 }
 
 pub type RedCoreBrowserSessionStore = BrowserSessionStore<RedCoreGraphStore>;
@@ -429,6 +434,10 @@ mod tests {
         assert!(html.contains("var SERP_DATA = {"));
         assert!(html.contains("https://example.com/session.html"));
         assert!(html.contains("Session substrate"));
+
+        let search = session.search_substrate("session");
+        assert_eq!(search.matched_count, 1);
+        assert_eq!(search.hits[0].title, "session.html");
     }
 
     #[test]
