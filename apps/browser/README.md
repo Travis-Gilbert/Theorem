@@ -2,7 +2,7 @@
 
 **Status:** External embedder build is green in GitHub Actions at `713eded` (run `26669852900`, 2026-05-30). Grounded against the pinned Servo embedding API (`servo::WebViewBuilder`, `WebViewDelegate`, `Servo::spin_event_loop`, `SoftwareRenderingContext`). This crate is the start of the substrate-native browser: the surface where Servo renders both the open web and SceneOS scenes, in-process with the RustyRed substrate.
 
-**Honest state:** the external `cargo build` path has compiled successfully in CI. The checked smoke increment is `cargo run -- --headless-smoke`: create a real WebView with a software rendering context, intercept a known URL through `WebViewDelegate::load_web_resource`, and write that supplied page into `theorem-browser-substrate`. The next scene is `cargo run -- --windowed [url]`, a minimal desktop winit shell that opens a real Servo WebView. The browser now also serves `http://theorem.local/search?q=...` as a graph-native RustyWeb SERP from its local substrate seed. This proves the visible browser shell and local search surface without claiming full arbitrary-page response capture yet.
+**Honest state:** the external `cargo build` path has compiled successfully in CI. The checked smoke increment is `cargo run -- --headless-smoke`: create a real WebView with a software rendering context, intercept a known URL through `WebViewDelegate::load_web_resource`, and write that supplied page into `theorem-browser-substrate`. The next scene is `cargo run -- --windowed [url]`, a minimal desktop winit shell that opens a real Servo WebView. The browser now also serves `http://theorem.local/search?q=...` as a graph-native RustyWeb SERP from its browser session substrate. By default that session is memory-backed; pass `--store-dir <path>` or set `THEOREM_BROWSER_STORE_DIR=<path>` to make it a durable RedCore store. This proves the visible browser shell and local search surface without claiming full arbitrary-page response capture yet.
 
 ---
 
@@ -59,13 +59,23 @@ The browser's `load_web_resource` hook writes a loaded page into the substrate a
 
 That emits `Page`/`Domain`/`ContentSnapshot`/`FetchAttempt` nodes + `LINKS_TO`/`HAS_SNAPSHOT`/`ON_DOMAIN` edges via `extract_links` + `canonicalize_url` + `blake3_hash`. No new page-to-graph code: the only glue the embedder adds is `WebResourceLoad` -> `FetchedPage`. The substrate side is built and buildable today without Servo; the Servo build is needed only for the rendering + the hook itself.
 
+## Session store
+
+The browser owns a `BrowserSessionStore<RedCoreGraphStore>`:
+
+- default: ephemeral RedCore memory mode for constructor/smoke runs
+- durable: `cargo run -- --store-dir /tmp/theorem-browser-store --windowed http://theorem.local/smoke`
+- env-configured durable: `THEOREM_BROWSER_STORE_DIR=/tmp/theorem-browser-store cargo run -- --headless-smoke`
+- explicit throwaway run: add `--memory-store` to ignore the env var
+
+The important point is that `/smoke` writes and `/search?q=...` reads go through the same session object. Switching memory to disk changes only the backing RedCore store, not the browser delegate wiring.
+
 ## Next increments
 
 1. Keep the external Servo embedder build green in CI (done for constructor wiring; now includes the headless WebView smoke).
 2. Get a minimal WebView rendering a single URL in a winit window (the "it renders the open web" milestone). The `--windowed [url]` entrypoint is now the compile-validated shell for this.
-3. Replace the local in-memory seed with a durable tenant-backed browser store, so search reads the pages the user actually loaded.
-4. Extend the current intercepted smoke seam into true loaded-page capture. Important API note: `load_web_resource` sees requests before load, not response bodies after download, so arbitrary open-web capture will need either interception/fetch ownership or a separate completed-document extraction path.
-5. Compose a SceneOS scene into the surface (seam 2), then move into the cost-graded dossier/search chrome.
+3. Extend the current intercepted smoke seam into true loaded-page capture. Important API note: `load_web_resource` sees requests before load, not response bodies after download, so arbitrary open-web capture will need either interception/fetch ownership or a separate completed-document extraction path.
+4. Compose a SceneOS scene into the surface (seam 2), then move into the cost-graded dossier/search chrome.
 
 ## Files
 

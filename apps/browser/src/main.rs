@@ -17,6 +17,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::error::Error;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -24,12 +25,14 @@ use dpi::PhysicalSize;
 use embedder_traits::WebResourceResponse;
 use euclid::Scale;
 use http::header::{HeaderValue, CONTENT_TYPE};
-use rustyred_thg_core::graph_store::InMemoryGraphStore;
 use servo::{
     EventLoopWaker, LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext,
     WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
-use theorem_browser_substrate::{browser_affordances, BrowserSessionStore, LoadedPage};
+use theorem_browser_substrate::{
+    browser_affordances, durable_browser_session, memory_browser_session, LoadedPage,
+    RedCoreBrowserSessionStore,
+};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -39,6 +42,7 @@ use winit::window::Window;
 
 const SMOKE_URL: &str = "http://theorem.local/smoke";
 const SEARCH_URL_PREFIX: &str = "http://theorem.local/search";
+const STORE_DIR_ENV: &str = "THEOREM_BROWSER_STORE_DIR";
 const SMOKE_HTML: &str = r#"<!doctype html>
 <html>
   <head><title>Theorem browser smoke</title></head>
@@ -50,6 +54,53 @@ const SMOKE_HTML: &str = r#"<!doctype html>
     </main>
   </body>
 </html>"#;
+
+#[derive(Clone, Debug, Default)]
+struct BrowserStoreOptions {
+    data_dir: Option<PathBuf>,
+}
+
+impl BrowserStoreOptions {
+    fn from_parts(cli_data_dir: Option<PathBuf>, force_memory: bool) -> Self {
+        let env_data_dir = std::env::var_os(STORE_DIR_ENV).map(PathBuf::from);
+        Self {
+            data_dir: if force_memory {
+                None
+            } else {
+                cli_data_dir.or(env_data_dir)
+            },
+        }
+    }
+
+    fn open_session(&self, session_id: &str) -> Result<RedCoreBrowserSessionStore, Box<dyn Error>> {
+        match &self.data_dir {
+            Some(data_dir) => {
+                eprintln!(
+                    "theorem-browser: using durable RedCore substrate store at {}",
+                    data_dir.display()
+                );
+                Ok(durable_browser_session(data_dir, session_id)?)
+            }
+            None => {
+                eprintln!("theorem-browser: using ephemeral in-memory substrate store");
+                Ok(memory_browser_session(session_id))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum BrowserMode {
+    EngineConstructor,
+    HeadlessSmoke,
+    Windowed(Url),
+}
+
+#[derive(Clone, Debug)]
+struct BrowserConfig {
+    mode: BrowserMode,
+    store: BrowserStoreOptions,
+}
 
 /// Minimal event-loop waker.
 ///
@@ -96,22 +147,19 @@ struct SubstrateSmokeDelegate {
     write_count: Cell<usize>,
     graph_delta_hash: RefCell<Option<String>>,
     error: RefCell<Option<String>>,
-    session: RefCell<BrowserSessionStore<InMemoryGraphStore>>,
+    session: RefCell<RedCoreBrowserSessionStore>,
 }
 
 impl SubstrateSmokeDelegate {
-    fn new() -> Self {
-        Self {
+    fn new(store_options: &BrowserStoreOptions) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
             complete: Cell::new(false),
             ingested: Cell::new(false),
             write_count: Cell::new(0),
             graph_delta_hash: RefCell::new(None),
             error: RefCell::new(None),
-            session: RefCell::new(BrowserSessionStore::new(
-                InMemoryGraphStore::new(),
-                "browser-headless-smoke",
-            )),
-        }
+            session: RefCell::new(store_options.open_session("browser-headless-smoke")?),
+        })
     }
 
     fn ingest_completed_page(&self, webview: WebView) {
@@ -161,7 +209,7 @@ struct WindowedState {
     servo: servo::Servo,
     rendering_context: Rc<WindowRenderingContext>,
     webviews: RefCell<Vec<WebView>>,
-    session: RefCell<BrowserSessionStore<InMemoryGraphStore>>,
+    session: RefCell<RedCoreBrowserSessionStore>,
 }
 
 impl WebViewDelegate for WindowedState {
@@ -186,22 +234,33 @@ enum WindowedApp {
     Initial {
         waker: WindowWaker,
         initial_url: Url,
+        store_options: BrowserStoreOptions,
     },
     Running(Rc<WindowedState>),
 }
 
 impl WindowedApp {
-    fn new(event_loop: &EventLoop<WindowWakeEvent>, initial_url: Url) -> Self {
+    fn new(
+        event_loop: &EventLoop<WindowWakeEvent>,
+        initial_url: Url,
+        store_options: BrowserStoreOptions,
+    ) -> Self {
         Self::Initial {
             waker: WindowWaker::new(event_loop),
             initial_url,
+            store_options,
         }
     }
 }
 
 impl ApplicationHandler<WindowWakeEvent> for WindowedApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if let Self::Initial { waker, initial_url } = self {
+        if let Self::Initial {
+            waker,
+            initial_url,
+            store_options,
+        } = self
+        {
             let display_handle = event_loop
                 .display_handle()
                 .expect("failed to get display handle");
@@ -226,7 +285,10 @@ impl ApplicationHandler<WindowWakeEvent> for WindowedApp {
                 servo,
                 rendering_context,
                 webviews: RefCell::new(Vec::new()),
-                session: RefCell::new(seed_browser_session()),
+                session: RefCell::new(
+                    seed_browser_session(store_options)
+                        .expect("failed to open browser substrate session"),
+                ),
             });
 
             let webview = WebViewBuilder::new(&state.servo, state.rendering_context.clone())
@@ -279,21 +341,58 @@ impl ApplicationHandler<WindowWakeEvent> for WindowedApp {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("--headless-smoke") => run_headless_smoke(),
-        Some("--windowed") => {
-            let url = args.next().unwrap_or_else(|| SMOKE_URL.to_string());
-            run_windowed(Url::parse(&url)?)
-        }
-        _ => {
-            run_engine_constructor();
+    let config = parse_config(std::env::args().skip(1))?;
+    match config.mode {
+        BrowserMode::HeadlessSmoke => run_headless_smoke(&config.store),
+        BrowserMode::Windowed(url) => run_windowed(url, config.store),
+        BrowserMode::EngineConstructor => {
+            run_engine_constructor(&config.store);
             Ok(())
         }
     }
 }
 
-fn run_engine_constructor() {
+fn parse_config(args: impl IntoIterator<Item = String>) -> Result<BrowserConfig, Box<dyn Error>> {
+    let mut cli_data_dir = None;
+    let mut force_memory = false;
+    let mut mode_args = Vec::new();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--store-dir" => {
+                let value = args.next().ok_or("--store-dir requires a path")?;
+                cli_data_dir = Some(PathBuf::from(value));
+            }
+            "--memory-store" => {
+                force_memory = true;
+            }
+            _ => mode_args.push(arg),
+        }
+    }
+
+    let mode = match mode_args.first().map(String::as_str) {
+        Some("--headless-smoke") => BrowserMode::HeadlessSmoke,
+        Some("--windowed") => {
+            let url = mode_args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| SMOKE_URL.to_string());
+            BrowserMode::Windowed(Url::parse(&url)?)
+        }
+        Some(other) => {
+            return Err(format!("unknown theorem-browser mode or argument: {other}").into());
+        }
+        None => BrowserMode::EngineConstructor,
+    };
+
+    Ok(BrowserConfig {
+        mode,
+        store: BrowserStoreOptions::from_parts(cli_data_dir, force_memory),
+    })
+}
+
+fn run_engine_constructor(store_options: &BrowserStoreOptions) {
     // Construct the engine with defaults (Opts/Preferences default; only the
     // waker is required). Proves the git-dep builds and the wiring compiles.
     let _servo = ServoBuilder::default()
@@ -301,10 +400,18 @@ fn run_engine_constructor() {
         .build();
 
     println!("theorem-browser: Servo engine constructed (build validation OK)");
+    if let Some(data_dir) = &store_options.data_dir {
+        println!(
+            "theorem-browser: durable substrate store configured at {}",
+            data_dir.display()
+        );
+    } else {
+        println!("theorem-browser: substrate store mode is memory");
+    }
     print_browser_affordances();
 }
 
-fn run_headless_smoke() -> Result<(), Box<dyn Error>> {
+fn run_headless_smoke(store_options: &BrowserStoreOptions) -> Result<(), Box<dyn Error>> {
     eprintln!("theorem-browser: starting headless WebView substrate smoke");
     let rendering_context: Rc<dyn RenderingContext> = Rc::new(
         SoftwareRenderingContext::new(PhysicalSize {
@@ -322,7 +429,7 @@ fn run_headless_smoke() -> Result<(), Box<dyn Error>> {
         .build();
     servo.setup_logging();
 
-    let delegate = Rc::new(SubstrateSmokeDelegate::new());
+    let delegate = Rc::new(SubstrateSmokeDelegate::new(store_options)?);
     let _webview = WebViewBuilder::new(&servo, rendering_context)
         .url(Url::parse(SMOKE_URL)?)
         .hidpi_scale_factor(Scale::new(1.0))
@@ -358,9 +465,12 @@ fn run_headless_smoke() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_windowed(initial_url: Url) -> Result<(), Box<dyn Error>> {
+fn run_windowed(
+    initial_url: Url,
+    store_options: BrowserStoreOptions,
+) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::with_user_event().build()?;
-    let mut app = WindowedApp::new(&event_loop, initial_url);
+    let mut app = WindowedApp::new(&event_loop, initial_url, store_options);
     Ok(event_loop.run_app(&mut app)?)
 }
 
@@ -375,7 +485,7 @@ fn print_browser_affordances() {
 
 fn intercept_local_theorem_page(
     load: WebResourceLoad,
-    session: &RefCell<BrowserSessionStore<InMemoryGraphStore>>,
+    session: &RefCell<RedCoreBrowserSessionStore>,
 ) {
     let url = load.request().url.clone();
     let body = if url.as_str() == SMOKE_URL {
@@ -403,8 +513,10 @@ fn intercept_local_theorem_page(
     intercepted.finish();
 }
 
-fn seed_browser_session() -> BrowserSessionStore<InMemoryGraphStore> {
-    let mut session = BrowserSessionStore::new(InMemoryGraphStore::new(), "browser-seed");
+fn seed_browser_session(
+    store_options: &BrowserStoreOptions,
+) -> Result<RedCoreBrowserSessionStore, Box<dyn Error>> {
+    let mut session = store_options.open_session("browser-seed")?;
     let _ = session.ingest_loaded_page(LoadedPage::html(SMOKE_URL, SMOKE_HTML));
-    session
+    Ok(session)
 }

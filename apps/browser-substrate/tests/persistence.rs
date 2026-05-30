@@ -15,9 +15,11 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyred_thg_core::graph_store::GraphStore;
-use rustyred_thg_core::{RedCoreDurability, RedCoreGraphStore, RedCoreOptions};
+use rustyred_thg_core::{RedCoreDurability, RedCoreOptions};
 use rustyred_web::{LABEL_CONTENT_SNAPSHOT, LABEL_PAGE};
-use theorem_browser_substrate::{ingest_loaded_pages, LoadedPage};
+use theorem_browser_substrate::{
+    durable_browser_session_with_options, ingest_loaded_pages, LoadedPage,
+};
 
 fn unique_temp_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -59,10 +61,11 @@ fn ingested_page_survives_store_reopen() {
 
     // Phase 1: ingest into a fresh durable store, capture the node ids, drop it.
     let (page_id, snapshot_id) = {
-        let mut store =
-            RedCoreGraphStore::open(&dir, durable_opts()).expect("open RedCore store");
+        let mut session =
+            durable_browser_session_with_options(&dir, "browser-persist-test", durable_opts())
+                .expect("open RedCore browser session");
         let (output, writes) = ingest_loaded_pages(
-            &mut store,
+            session.store_mut(),
             "rr-persist-test",
             vec!["https://example.com/index.html".to_string()],
             &[page],
@@ -74,9 +77,12 @@ fn ingested_page_survives_store_reopen() {
         let snapshot_id = first_id_with_label(&output.graph, LABEL_CONTENT_SNAPSHOT);
 
         // The live store sees the nodes immediately.
-        assert!(GraphStore::get_node(&store, &page_id).is_some(), "live store has the page");
         assert!(
-            GraphStore::get_node(&store, &snapshot_id).is_some(),
+            GraphStore::get_node(session.store(), &page_id).is_some(),
+            "live store has the page"
+        );
+        assert!(
+            GraphStore::get_node(session.store(), &snapshot_id).is_some(),
             "live store has the snapshot"
         );
 
@@ -86,15 +92,22 @@ fn ingested_page_survives_store_reopen() {
 
     // Phase 2: reopen the SAME data dir. The nodes must have persisted.
     {
-        let store =
-            RedCoreGraphStore::open(&dir, durable_opts()).expect("reopen RedCore store");
+        let session =
+            durable_browser_session_with_options(&dir, "browser-persist-test", durable_opts())
+                .expect("reopen RedCore browser session");
         assert!(
-            GraphStore::get_node(&store, &page_id).is_some(),
+            GraphStore::get_node(session.store(), &page_id).is_some(),
             "page node must persist across reopen ({page_id})"
         );
         assert!(
-            GraphStore::get_node(&store, &snapshot_id).is_some(),
+            GraphStore::get_node(session.store(), &snapshot_id).is_some(),
             "content snapshot must persist across reopen ({snapshot_id})"
+        );
+
+        let html = session.render_search_page("example");
+        assert!(
+            html.contains("https://example.com/index.html"),
+            "reopened browser session search should read the durable page"
         );
     }
 

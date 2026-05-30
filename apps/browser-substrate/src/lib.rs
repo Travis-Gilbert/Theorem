@@ -17,9 +17,10 @@
 //! LINKS_TO/HAS_SNAPSHOT/ON_DOMAIN edges via `extract_links` + `canonicalize_url`
 //! + blake3). This crate is the thin, engine-agnostic adapter onto it.
 
-use std::fmt;
+use std::{fmt, path::Path};
 
 use rustyred_thg_core::graph_store::{GraphStore, GraphStoreError, GraphWriteResult};
+use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use rustyred_web::{
     build_v2_fixture_crawl, render_search_page, CrawlRequest, CrawlRunOutput, FetchedPage,
     RustyWebError,
@@ -275,6 +276,35 @@ impl<S: GraphStore> BrowserSessionStore<S> {
     pub fn render_search_page(&self, query: &str) -> String {
         render_substrate_search_page(&self.store, query)
     }
+}
+
+pub type RedCoreBrowserSessionStore = BrowserSessionStore<RedCoreGraphStore>;
+
+/// Open an ephemeral RedCore-backed browser session.
+///
+/// This uses the same concrete store type as the durable path, so browser code
+/// can switch between memory and disk-backed sessions without changing its
+/// event/delegate wiring.
+pub fn memory_browser_session(session_id: impl Into<String>) -> RedCoreBrowserSessionStore {
+    BrowserSessionStore::new(RedCoreGraphStore::memory(), session_id)
+}
+
+/// Open a durable RedCore-backed browser session with default durability.
+pub fn durable_browser_session(
+    data_dir: impl AsRef<Path>,
+    session_id: impl Into<String>,
+) -> Result<RedCoreBrowserSessionStore, SeamError> {
+    durable_browser_session_with_options(data_dir, session_id, RedCoreOptions::default())
+}
+
+/// Open a durable RedCore-backed browser session with explicit durability.
+pub fn durable_browser_session_with_options(
+    data_dir: impl AsRef<Path>,
+    session_id: impl Into<String>,
+    options: RedCoreOptions,
+) -> Result<RedCoreBrowserSessionStore, SeamError> {
+    let store = RedCoreGraphStore::open(data_dir.as_ref(), options)?;
+    Ok(BrowserSessionStore::new(store, session_id))
 }
 
 #[cfg(test)]
