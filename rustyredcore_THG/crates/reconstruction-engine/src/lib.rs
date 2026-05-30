@@ -26,6 +26,14 @@ use uuid::Uuid;
 pub const SPACETIME_EMBEDDING_DIMS: usize = 256;
 pub const DEFAULT_ADJACENT_RADIUS_M: f64 = 100.0;
 
+// Theorem port — SceneOS atom-substrate adapter (browser plan step 2): the
+// reconstruction engine's relational output feeding the SceneOS atom substrate.
+pub mod scene_atoms;
+pub use scene_atoms::{
+    scene_from_pipeline, scene_from_subgraph, SceneAtom, SceneAtomPosition, SceneRelation,
+    SceneScene,
+};
+
 #[derive(Debug, Clone)]
 pub struct ReconstructionRequest {
     pub tenant_context: TenantContext,
