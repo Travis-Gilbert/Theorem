@@ -42,7 +42,7 @@ pub use search::{search_substrate, SearchHit, SearchLink, SearchOptions, Substra
 
 // The browser's SERP: render a search as a node-and-edge graph page. See serp.rs.
 pub mod serp;
-pub use serp::{render_serp_html, serp_payload_json};
+pub use serp::{render_search_page, render_serp_html, serp_payload_json};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrawlConfig {

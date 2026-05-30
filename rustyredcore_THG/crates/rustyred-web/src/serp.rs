@@ -21,7 +21,9 @@
 //!      title containing `</script>` cannot break out of the `<script>` block
 //!      the payload is injected into (no script-injection).
 
-use crate::search::SubstrateSearch;
+use rustyred_thg_core::graph_store::GraphStore;
+
+use crate::search::{search_substrate, SearchOptions, SubstrateSearch};
 
 /// The self-contained SERP page. The `null` payload marker is replaced at render
 /// time. Served verbatim (empty state) when no search has run.
@@ -49,6 +51,20 @@ pub fn render_serp_html(search: &SubstrateSearch) -> String {
     let payload = serp_payload_json(search);
     let injected = format!("var SERP_DATA = {payload};");
     SERP_TEMPLATE.replacen(PAYLOAD_MARKER, &injected, 1)
+}
+
+/// One-call browser search: search the substrate, then render the SERP graph,
+/// at the default search depth.
+///
+/// This is the read+render half of a browser session ("show me the page for
+/// this query"). It is the primitive a `BrowserSessionStore` in
+/// `apps/browser-substrate` delegates its `render_search_page` to, and what
+/// `apps/browser` serves when it intercepts a search URL: one store, written by
+/// browsing (`ingest_loaded_pages`), read by searching here. Both halves operate
+/// on the same `GraphStore`, so the browser searches the pages it actually
+/// loaded.
+pub fn render_search_page(store: &impl GraphStore, query: &str) -> String {
+    render_serp_html(&search_substrate(store, query, SearchOptions::default()))
 }
 
 #[cfg(test)]
@@ -137,5 +153,36 @@ mod tests {
         assert!(html.contains("var SERP_DATA = {"));
         assert!(html.contains("\"kept_count\":0"));
         assert!(html.contains("<!doctype html>"));
+    }
+
+    #[test]
+    fn render_search_page_searches_then_renders_one_store() {
+        // The browser-session loop: pages written to a store via the real write
+        // path, then read+rendered through the SAME store.
+        use crate::{build_v2_fixture_crawl, CrawlRequest, FetchedPage};
+        use rustyred_thg_core::graph_store::InMemoryGraphStore;
+
+        let pages = vec![FetchedPage {
+            url: "http://ex.com/apple".to_string(),
+            status: 200,
+            body: "<p>apple cultivation notes</p>".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            fetched_at: String::new(),
+        }];
+        let output = build_v2_fixture_crawl(
+            CrawlRequest::new("serp-compose", vec!["http://ex.com/apple".to_string()]),
+            &pages,
+        )
+        .expect("crawl");
+        let mut store = InMemoryGraphStore::new();
+        output.graph.apply_to_store(&mut store).expect("apply");
+
+        let html = render_search_page(&store, "apple");
+        assert!(html.contains("var SERP_DATA = {"), "rendered a SERP");
+        assert!(html.contains("http://ex.com/apple"), "found the loaded page");
+
+        // A query with nothing loaded for it is the honest empty page.
+        let empty = render_search_page(&store, "quantum");
+        assert!(empty.contains("\"kept_count\":0"));
     }
 }
