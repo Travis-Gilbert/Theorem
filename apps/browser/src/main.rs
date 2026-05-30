@@ -341,6 +341,8 @@ impl ApplicationHandler<WindowWakeEvent> for WindowedApp {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider();
+
     let config = parse_config(std::env::args().skip(1))?;
     match config.mode {
         BrowserMode::HeadlessSmoke => run_headless_smoke(&config.store),
@@ -350,6 +352,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
     }
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn parse_config(args: impl IntoIterator<Item = String>) -> Result<BrowserConfig, Box<dyn Error>> {

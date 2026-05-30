@@ -27,6 +27,10 @@ url = "2"
 euclid = "0.22"
 dpi = "0.1"
 http = "1.4"
+# Servo's network stack can reach Rustls before a downstream crate has selected
+# a process-wide crypto provider. The browser process installs the ring provider
+# explicitly at startup so headless CI and desktop runs behave the same.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # Once the engine integration needs modifications the embedder API cannot express
 # (DOM-at-parse-time into the substrate, compositor-level scene fusion), repoint
