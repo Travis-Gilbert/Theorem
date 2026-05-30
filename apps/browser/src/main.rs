@@ -27,10 +27,15 @@ use http::header::{HeaderValue, CONTENT_TYPE};
 use rustyred_thg_core::graph_store::InMemoryGraphStore;
 use servo::{
     EventLoopWaker, LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext,
-    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate,
+    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use theorem_browser_substrate::{ingest_loaded_pages, LoadedPage};
 use url::Url;
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use winit::window::Window;
 
 const SMOKE_URL: &str = "http://theorem.local/smoke";
 const SMOKE_HTML: &str = r#"<!doctype html>
@@ -55,6 +60,28 @@ struct HeadlessWaker;
 
 impl EventLoopWaker for HeadlessWaker {
     fn wake(&self) {}
+
+    fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct WindowWaker(EventLoopProxy<WindowWakeEvent>);
+
+#[derive(Debug)]
+struct WindowWakeEvent;
+
+impl WindowWaker {
+    fn new(event_loop: &EventLoop<WindowWakeEvent>) -> Self {
+        Self(event_loop.create_proxy())
+    }
+}
+
+impl EventLoopWaker for WindowWaker {
+    fn wake(&self) {
+        let _ = self.0.send_event(WindowWakeEvent);
+    }
 
     fn clone_box(&self) -> Box<dyn EventLoopWaker> {
         Box::new(self.clone())
@@ -109,20 +136,7 @@ impl SubstrateSmokeDelegate {
 
 impl WebViewDelegate for SubstrateSmokeDelegate {
     fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
-        if load.request().url.as_str() != SMOKE_URL {
-            return;
-        }
-
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        );
-
-        let response = WebResourceResponse::new(load.request().url.clone()).headers(headers);
-        let mut intercepted = load.intercept(response);
-        intercepted.send_body_data(SMOKE_HTML.as_bytes().to_vec());
-        intercepted.finish();
+        intercept_smoke_page(load);
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
@@ -137,13 +151,139 @@ impl WebViewDelegate for SubstrateSmokeDelegate {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    if std::env::args().any(|arg| arg == "--headless-smoke") {
-        return run_headless_smoke();
+struct WindowedState {
+    window: Window,
+    servo: servo::Servo,
+    rendering_context: Rc<WindowRenderingContext>,
+    webviews: RefCell<Vec<WebView>>,
+}
+
+impl WebViewDelegate for WindowedState {
+    fn notify_new_frame_ready(&self, _webview: WebView) {
+        self.window.request_redraw();
     }
 
-    run_engine_constructor();
-    Ok(())
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        intercept_smoke_page(load);
+    }
+
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::Complete {
+            if let Some(url) = webview.url() {
+                println!("theorem-browser: loaded {url}");
+            }
+        }
+    }
+}
+
+enum WindowedApp {
+    Initial {
+        waker: WindowWaker,
+        initial_url: Url,
+    },
+    Running(Rc<WindowedState>),
+}
+
+impl WindowedApp {
+    fn new(event_loop: &EventLoop<WindowWakeEvent>, initial_url: Url) -> Self {
+        Self::Initial {
+            waker: WindowWaker::new(event_loop),
+            initial_url,
+        }
+    }
+}
+
+impl ApplicationHandler<WindowWakeEvent> for WindowedApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Self::Initial { waker, initial_url } = self {
+            let display_handle = event_loop
+                .display_handle()
+                .expect("failed to get display handle");
+            let window = event_loop
+                .create_window(Window::default_attributes().with_title("Theorem Browser"))
+                .expect("failed to create theorem browser window");
+            let window_handle = window.window_handle().expect("failed to get window handle");
+
+            let rendering_context = Rc::new(
+                WindowRenderingContext::new(display_handle, window_handle, window.inner_size())
+                    .expect("could not create rendering context for window"),
+            );
+            let _ = rendering_context.make_current();
+
+            let servo = ServoBuilder::default()
+                .event_loop_waker(Box::new(waker.clone()))
+                .build();
+            servo.setup_logging();
+
+            let state = Rc::new(WindowedState {
+                window,
+                servo,
+                rendering_context,
+                webviews: RefCell::new(Vec::new()),
+            });
+
+            let webview = WebViewBuilder::new(&state.servo, state.rendering_context.clone())
+                .url(initial_url.clone())
+                .hidpi_scale_factor(Scale::new(state.window.scale_factor() as f32))
+                .delegate(state.clone())
+                .build();
+
+            state.webviews.borrow_mut().push(webview);
+            *self = Self::Running(state);
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WindowWakeEvent) {
+        if let Self::Running(state) = self {
+            state.servo.spin_event_loop();
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let Self::Running(state) = self {
+            state.servo.spin_event_loop();
+        }
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => {
+                if let Self::Running(state) = self {
+                    if let Some(webview) = state.webviews.borrow().last() {
+                        webview.paint();
+                        state.rendering_context.present();
+                    }
+                }
+            }
+            WindowEvent::Resized(new_size) => {
+                if let Self::Running(state) = self {
+                    if let Some(webview) = state.webviews.borrow().last() {
+                        webview.resize(new_size);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("--headless-smoke") => run_headless_smoke(),
+        Some("--windowed") => {
+            let url = args.next().unwrap_or_else(|| SMOKE_URL.to_string());
+            run_windowed(Url::parse(&url)?)
+        }
+        _ => {
+            run_engine_constructor();
+            Ok(())
+        }
+    }
 }
 
 fn run_engine_constructor() {
@@ -206,4 +346,27 @@ fn run_headless_smoke() -> Result<(), Box<dyn Error>> {
         graph_delta_hash
     );
     Ok(())
+}
+
+fn run_windowed(initial_url: Url) -> Result<(), Box<dyn Error>> {
+    let event_loop = EventLoop::with_user_event().build()?;
+    let mut app = WindowedApp::new(&event_loop, initial_url);
+    Ok(event_loop.run_app(&mut app)?)
+}
+
+fn intercept_smoke_page(load: WebResourceLoad) {
+    if load.request().url.as_str() != SMOKE_URL {
+        return;
+    }
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+
+    let response = WebResourceResponse::new(load.request().url.clone()).headers(headers);
+    let mut intercepted = load.intercept(response);
+    intercepted.send_body_data(SMOKE_HTML.as_bytes().to_vec());
+    intercepted.finish();
 }

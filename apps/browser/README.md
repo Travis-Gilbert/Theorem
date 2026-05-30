@@ -2,7 +2,7 @@
 
 **Status:** External embedder build is green in GitHub Actions at `713eded` (run `26669852900`, 2026-05-30). Grounded against the pinned Servo embedding API (`servo::WebViewBuilder`, `WebViewDelegate`, `Servo::spin_event_loop`, `SoftwareRenderingContext`). This crate is the start of the substrate-native browser: the surface where Servo renders both the open web and SceneOS scenes, in-process with the RustyRed substrate.
 
-**Honest state:** the external `cargo build` path has compiled successfully in CI. The next checked increment is `cargo run -- --headless-smoke`: create a real WebView with a software rendering context, intercept a known URL through `WebViewDelegate::load_web_resource`, and write that supplied page into `theorem-browser-substrate`. This proves the delegate-to-substrate seam without claiming full arbitrary-page response capture yet.
+**Honest state:** the external `cargo build` path has compiled successfully in CI. The checked smoke increment is `cargo run -- --headless-smoke`: create a real WebView with a software rendering context, intercept a known URL through `WebViewDelegate::load_web_resource`, and write that supplied page into `theorem-browser-substrate`. The next scene is `cargo run -- --windowed [url]`, a minimal desktop winit shell that opens a real Servo WebView. This proves the visible browser shell without claiming full arbitrary-page response capture yet.
 
 ---
 
@@ -62,7 +62,7 @@ That emits `Page`/`Domain`/`ContentSnapshot`/`FetchAttempt` nodes + `LINKS_TO`/`
 ## Next increments
 
 1. Keep the external Servo embedder build green in CI (done for constructor wiring; now includes the headless WebView smoke).
-2. Get a minimal WebView rendering a single URL in a winit window (the "it renders the open web" milestone).
+2. Get a minimal WebView rendering a single URL in a winit window (the "it renders the open web" milestone). The `--windowed [url]` entrypoint is now the compile-validated shell for this.
 3. Extend the current intercepted smoke seam into true loaded-page capture. Important API note: `load_web_resource` sees requests before load, not response bodies after download, so arbitrary open-web capture will need either interception/fetch ownership or a separate completed-document extraction path.
 4. Compose a SceneOS scene into the surface (seam 2).
 5. Then the cost-graded dossier + search-as-graph chrome (these trigger the design-gate).
@@ -70,4 +70,4 @@ That emits `Page`/`Domain`/`ContentSnapshot`/`FetchAttempt` nodes + `LINKS_TO`/`
 ## Files
 
 - `Cargo.toml`: the embedder crate (depends on the `servo` git crate + winit + url).
-- `src/main.rs`: the embedder skeleton against the current API, with the two substrate seams marked. Not yet built; the foundation to validate against a Servo build env.
+- `src/main.rs`: the embedder entrypoint. Default mode constructs the Servo engine, `--headless-smoke` validates WebView + substrate ingest headlessly, and `--windowed [url]` opens the minimal desktop WebView shell.
