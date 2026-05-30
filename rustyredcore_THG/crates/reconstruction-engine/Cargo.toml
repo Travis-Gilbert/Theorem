@@ -1,0 +1,23 @@
+[package]
+name = "reconstruction-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural reconstruction engine, ported whole into Theorem for the substrate-native browser. Building reference impl + civic deps are carried temporarily (path-dep on civic-atlas-types/theseus-client); stripping them for a self-standing generic core is a planned session."
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "time", "json"] }
+tonic = "0.12"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+civic-atlas-types = { path = "../../../../our-civic-atlas-backend/crates/civic-atlas-types" }
+theseus-client = { path = "../../../../our-civic-atlas-backend/crates/theseus-client" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Standalone workspace: kept OUT of rustyredcore_THG members until green.
+[workspace]
