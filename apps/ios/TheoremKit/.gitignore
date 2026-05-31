@@ -1,0 +1,8 @@
+# SwiftPM build artifacts + local state — never commit these.
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+Package.resolved
+.DS_Store
