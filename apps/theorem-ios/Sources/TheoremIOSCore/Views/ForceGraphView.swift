@@ -57,7 +57,8 @@ struct ForceGraphView: View {
                 .withGraphDragGesture(proxy, of: String.self)
                 .withGraphMagnifyGesture(proxy)
         }
-        .background(theme.background)
+        // No opaque background: the hex-blueprint watermark behind the graph
+        // (mounted by TheoremSceneView) reads through.
     }
 
     /// PPR mass for radius (matches TheoremSceneView's `radius(for:)`).

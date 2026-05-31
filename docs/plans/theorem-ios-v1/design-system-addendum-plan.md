@@ -61,11 +61,11 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
 
 ## Phase D3 — MT19937 + hex-blueprint substrate watermark
 
-- [ ] **D3.1** MT19937 generator, native Swift (~40 lines, canonical 624-word
+- [x] **D3.1** MT19937 generator, native Swift (~40 lines, canonical 624-word
   state + init/temper constants). Must reproduce the project's generator outputs
   for the same seed (coordinate the canonical constants/seed source if one
   exists). Backref: "MT19937 + hexbin substrate texture".
-- [ ] **D3.2** Hex-grid geometry (~15 lines: centers offset x by `r*1.5`, y by
+- [x] **D3.2** Hex-grid geometry (~15 lines: centers offset x by `r*1.5`, y by
   `r*sqrt(3)`, alt rows staggered `r*sqrt(3)/2`, flat-top hex path) + seeded fill
   (walk fixed order; per hex draw next MT value in [0,1); `< frequency` →
   blueprint-ink, else field). Default coverage 8–15% (watermark, not

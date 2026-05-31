@@ -11,19 +11,37 @@ struct TheoremSceneView: View {
     }
 
     var body: some View {
-        Group {
-            if projection == .forceGraph {
-                // Live force simulation (Grape) for the hero projection; the
-                // other three draw the sliver's exact positions on the Canvas.
-                ForceGraphView(package: package, theme: theme)
-            } else {
-                canvasBody
+        ZStack {
+            // The field + its MT19937-seeded hex-blueprint substrate watermark,
+            // behind the graph. The graph renderers draw transparently on top so
+            // the texture reads through; content stays at full contrast.
+            theme.field
+            HexWatermarkView(seed: watermarkSeed, theme: theme)
+            Group {
+                if projection == .forceGraph {
+                    // Live force simulation (Grape) for the hero projection; the
+                    // other three draw the sliver's exact positions on the Canvas.
+                    ForceGraphView(package: package, theme: theme)
+                } else {
+                    canvasBody
+                }
             }
         }
         .overlay(alignment: .topLeading) {
             sceneHeader
                 .padding(18)
         }
+    }
+
+    /// Per-scene watermark seed: the query if present, else the sorted atom ids,
+    /// so the texture is stable per scene and changes between scenes.
+    private var watermarkSeed: UInt32 {
+        if let query = package.provenance["query"]?.stringValue,
+           !query.trimmingCharacters(in: .whitespaces).isEmpty {
+            return MT19937.seed(from: query)
+        }
+        let ids = package.atoms.map(\.id).sorted().joined(separator: ",")
+        return MT19937.seed(from: ids.isEmpty ? "theorem" : ids)
     }
 
     private var canvasBody: some View {
