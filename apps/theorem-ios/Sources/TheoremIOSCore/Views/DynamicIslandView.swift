@@ -18,6 +18,8 @@ struct DynamicIslandView: View {
     /// Called when the user submits a query in search mode. Wired to the live
     /// substrate search in `TheoremRootView`.
     var onSubmitQuery: () -> Void = {}
+    /// Open the patent-plate view for the current center node.
+    var onOpenPatent: () -> Void = {}
 
     @Namespace private var namespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -103,6 +105,16 @@ struct DynamicIslandView: View {
                     .font(TheoremFonts.display(size: 28, relativeTo: .title))
                     .foregroundStyle(theme.textPrimary)
                     .lineLimit(2)
+                // "How does this work" -> lay a patent plate over the field.
+                Button(action: onOpenPatent) {
+                    Label("Patent view", systemImage: "doc.plaintext")
+                        .font(TheoremFonts.label(size: 12))
+                        .foregroundStyle(theme.field)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(theme.ink, in: Capsule())
+                }
+                .buttonStyle(.plain)
             } else {
                 TextField(mode == .search ? "Search substrate" : "Ask over scene", text: $query)
                     .textFieldStyle(.plain)
@@ -128,7 +140,7 @@ struct DynamicIslandView: View {
         }
         .padding(18)
         .frame(width: 356)
-        .frame(minHeight: mode == .search ? 150 : 92)
+        .frame(minHeight: mode == .ask ? 96 : 150)
         .background(theme.surface, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)

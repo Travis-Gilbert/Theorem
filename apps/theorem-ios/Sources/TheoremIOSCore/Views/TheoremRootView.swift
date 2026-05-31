@@ -10,6 +10,7 @@ public struct TheoremRootView: View {
     @State private var room: CommonplaceRoom = SampleRoom.room
     @State private var isSearching = false
     @State private var searchError: String?
+    @State private var patentFocus: String?
 
     private let theme = TheoremTheme.defaultPalette
     private let searchClient = TheoremSearchClient()
@@ -115,7 +116,8 @@ public struct TheoremRootView: View {
                 centerTitle: centerTitle,
                 projectionAvailability: projectionAvailability,
                 theme: theme,
-                onSubmitQuery: { Task { await runSearch() } }
+                onSubmitQuery: { Task { await runSearch() } },
+                onOpenPatent: { patentFocus = patentFocusID }
             )
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
@@ -146,8 +148,28 @@ public struct TheoremRootView: View {
                     Spacer()
                 }
             }
+
+            // Patent plate laid over the field (addendum D7), driven by real
+            // graph data for the focused node. Topmost; its own close/back chrome.
+            if let patentFocus {
+                PatentPlateView(
+                    package: package,
+                    focusID: patentFocus,
+                    theme: theme,
+                    onClose: { withAnimation { self.patentFocus = nil } }
+                )
+                .transition(.opacity)
+                .zIndex(10)
+            }
         }
-        .task { await autoSearchIfRequested() }
+        .animation(.easeInOut(duration: 0.2), value: patentFocus)
+        .task {
+            await autoSearchIfRequested()
+            // `-patent 1` opens the plate on the center node (deep-link + capture).
+            if UserDefaults.standard.bool(forKey: "patent") {
+                patentFocus = patentFocusID
+            }
+        }
     }
 
     /// Auto-run a search at launch when `-autoSearch <query>` is passed (deep-link
@@ -170,6 +192,12 @@ public struct TheoremRootView: View {
             return atom.label ?? atom.id
         }
         return "Theorem"
+    }
+
+    /// The node a patent plate opens on: the selected node, else the center node.
+    private var patentFocusID: String? {
+        if let selectedNodeID { return selectedNodeID }
+        return TheoremProjectionEngine.centerNodeID(in: package, mode: .pprMass)
     }
 }
 

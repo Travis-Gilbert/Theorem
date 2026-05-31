@@ -105,14 +105,16 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
 
 ## Phase D7 — Patent-callout plates (biggest; backend-coupled)
 
-- [ ] **D7.0** RESOLVE the open A/B drill-down decision with the user.
-- [ ] **D7.1** Native patent plate renderer (`Canvas`): white sheet (`field`),
+- [x] **D7.0** RESOLVE the open A/B drill-down decision with the user.
+  *(Resolved A under Travis's "continue to the end" autonomy: drilling a callout
+  opens a new deeper plate that stacks onto a breadcrumb you can pop back.)*
+- [x] **D7.1** Native patent plate renderer (`Canvas`): white sheet (`field`),
   black ink (`edge`) linework, numbered callouts with thin lead lines, serif
   title block, figure views, sheet footer. Reimplement the d3-annotation grammar
   natively (label/callout/badge + connector lead-lines + tap-to-reveal-note);
   d3-annotation is the REFERENCE, not a dependency. Backref: "Interaction:
   patent-callout click-through".
-- [ ] **D7.2** Node tap / "how does X work" answer → lay a patent plate over the
+- [x] **D7.2** Node tap / "how does X work" answer → lay a patent plate over the
   field; callouts drill into deeper plates per the resolved A/B decision. Backref:
   same + acceptance.
 - [ ] **D7.3 [Codex / backend dependency]** Scene OS must emit patent-register
