@@ -23,6 +23,12 @@ members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+# Fork patch: TurboVec 0.8.0 exposes a nightly-only AVX-512 kernel on stable
+# Rust. This branch hides that kernel unless explicitly enabled on nightly,
+# while default stable builds keep the AVX2/scalar dispatch path.
+turbovec = { git = "https://github.com/Travis-Gilbert/turbovec.git", branch = "Travis-Gilbert/stable-avx512-gate" }
+
 [lib]
 name = "rustyredcore_THG"
 crate-type = ["cdylib"]
