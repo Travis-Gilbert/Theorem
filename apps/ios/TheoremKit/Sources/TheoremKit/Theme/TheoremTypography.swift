@@ -2,25 +2,25 @@ import Foundation
 import CoreText
 import CoreGraphics
 
-/// Type tokens + runtime registration of the bundled display faces.
+/// Type tokens + runtime registration of the bundled faces.
 ///
-/// Two tokens (spec "Theming"): `display*` is Berthold Akzidenz-Grotesk
-/// (Travis supplied the licensed files; they ship in the binary as
-/// Bundle.module resources), `body*` is IBM Plex Sans SemiCondensed (SIL OFL).
-/// Views read these tokens; no hardcoded font names in views.
+/// Two distinct faces (Travis: not a one-font app), both OFL so they ship in the
+/// binary: `display*` is Archivo Black (the free stand-in for Berthold
+/// Akzidenz-Grotesk, which has no embed license and is NOT shipped); `body*` is
+/// IBM Plex Sans (variable). Views read these tokens; no hardcoded font names in
+/// views.
 ///
 /// Registration is at runtime via CoreText because SwiftPM-bundled fonts are not
 /// auto-registered the way an app target's `UIAppFonts` Info.plist entries are.
 public enum TheoremTypography {
-    /// PostScript names (read from the .ttf headers via fc-scan), the strings
-    /// SwiftUI `Font.custom(_:size:)` resolves once the faces are registered.
-    public static let displayRegularName = "AkzidenzGroteskBE-Regular"
-    public static let displayMediumName = "AGSchulbuchBQ-Medium"
+    /// Family name SwiftUI `Font.custom(_:size:)` resolves once the face is
+    /// registered. Archivo Black is a single heavy weight, so regular and medium
+    /// both resolve to it.
+    public static let displayRegularName = "Archivo Black"
+    public static let displayMediumName = "Archivo Black"
 
-    /// IBM Plex Sans SemiCondensed PostScript name. The .ttf is not yet bundled
-    /// (it is freely available under the SIL OFL); until it is, body text falls
-    /// back to the system face. `bodyIsBundled` reports the honest state.
-    public static let bodyName = "IBMPlexSansCondensed-Regular"
+    /// IBM Plex Sans (variable) family name; the body face, bundled OFL.
+    public static let bodyName = "IBM Plex Sans"
 
     /// Whether the body face actually shipped (vs. system fallback). False until
     /// the Plex .ttf is added to Resources/Fonts.
