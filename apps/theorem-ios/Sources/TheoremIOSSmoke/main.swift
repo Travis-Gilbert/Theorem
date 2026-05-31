@@ -1,3 +1,4 @@
+import Foundation
 import TheoremIOSCore
 
 let availability = TheoremProjectionEngine.availableProjections(for: SampleScene.package)
@@ -45,6 +46,34 @@ precondition(
     TheoremProjectionEngine.centerNodeID(in: centerScene, mode: .pprMass) == "center",
     "PPR mass should control center node selection"
 )
+
+// Omission safety: the Rust serde layer omits empty maps/arrays/None options
+// (skip_serializing_if). Decoding a real wire payload must NOT throw
+// keyNotFound on the omitted metadata/sourceRefs/params/actions/provenance —
+// the bug the custom decoders fix. The sample scene is built in Swift, so this
+// is the only place the omitted-field wire shape is exercised.
+do {
+    let wireJSON = """
+    {
+      "version": "scene-package-v2",
+      "id": "pkg-omit",
+      "manifestRef": "m",
+      "atoms": [{"id":"a","kind":"evidence","lifecycle":"present"}],
+      "relations": [{"id":"a->a","sourceId":"a","targetId":"a","kind":"links_to","lifecycle":"present"}],
+      "projection": {"id":"force_graph"},
+      "chrome": {"id":"document_rail"}
+    }
+    """.data(using: .utf8)!
+    let decoded = try JSONDecoder().decode(ScenePackageV2.self, from: wireJSON)
+    precondition(decoded.atoms.first?.metadata.isEmpty == true, "omitted metadata -> empty")
+    precondition(decoded.atoms.first?.sourceRefs.isEmpty == true, "omitted sourceRefs -> empty")
+    precondition(decoded.projection.params.isEmpty, "omitted params -> empty")
+    precondition(decoded.actions.isEmpty, "omitted actions -> empty")
+    precondition(decoded.provenance.isEmpty, "omitted provenance -> empty")
+    precondition(decoded.transitions == nil && decoded.terminalState == nil, "omitted optionals -> nil")
+} catch {
+    fatalError("omission-safe decode threw on the real wire shape: \(error)")
+}
 
 print("TheoremIOSSmoke passed")
 

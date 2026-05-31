@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreText
 
 public struct TheoremTheme: Equatable, Sendable {
     public var nodeCore: Color
@@ -30,16 +31,44 @@ public struct TheoremTheme: Equatable, Sendable {
     )
 }
 
+/// Type tokens. Two distinct faces (Travis: not a one-font app), both OFL so
+/// they ship in the binary:
+///   - display: Archivo Black — a heavy grotesque standing in for Berthold
+///     Akzidenz-Grotesk (which has no embed license). For headers, the Dynamic
+///     Island readout, surface titles.
+///   - body: IBM Plex Sans (variable; `.fontWeight()` drives the weight axis).
+///   - mono: the system monospaced face for technical labels.
+/// Views read these tokens; no hardcoded font names in views.
 public enum TheoremFonts {
+    public static let displayFamily = "Archivo Black"
+    public static let bodyFamily = "IBM Plex Sans"
+
     public static func display(size: CGFloat, relativeTo textStyle: Font.TextStyle = .largeTitle) -> Font {
-        .custom("Berthold Akzidenz Grotesk BE", size: size, relativeTo: textStyle)
+        .custom(displayFamily, size: size, relativeTo: textStyle)
     }
 
     public static func body(size: CGFloat, relativeTo textStyle: Font.TextStyle = .body) -> Font {
-        .custom("IBM Plex Sans SemiCondensed", size: size, relativeTo: textStyle)
+        .custom(bodyFamily, size: size, relativeTo: textStyle)
     }
 
     public static func mono(size: CGFloat, relativeTo textStyle: Font.TextStyle = .caption) -> Font {
         .system(size: size, weight: .medium, design: .monospaced)
     }
+
+    /// Register the bundled OFL faces with CoreText. SwiftPM-bundled fonts are
+    /// not auto-registered (unlike an app target's `UIAppFonts` Info.plist), so
+    /// the app calls this once at launch. Idempotent. If a face is missing,
+    /// `.custom` falls back to the system face (honest, never a crash).
+    public static func registerBundledFonts() {
+        guard !didRegister else { return }
+        didRegister = true
+        for name in ["ArchivoBlack-Regular", "IBMPlexSans"] {
+            let url = Bundle.module.url(forResource: name, withExtension: "ttf")
+                ?? Bundle.module.url(forResource: name, withExtension: "ttf", subdirectory: "Fonts")
+            guard let url else { continue }
+            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        }
+    }
+
+    private nonisolated(unsafe) static var didRegister = false
 }

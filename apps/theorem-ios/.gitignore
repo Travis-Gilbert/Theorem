@@ -1,5 +1,7 @@
-Sources/TheoremIOSCore/Resources/Fonts/*.ttf
-Sources/TheoremIOSCore/Resources/Fonts/*.otf
-Sources/TheoremIOSCore/Resources/Fonts/*.ttc
+# Fonts policy: OFL (or otherwise embed-licensed) fonts ARE committed, together
+# with their license file (OFL-*.txt). Commercial fonts without an embedding
+# license (e.g. Berthold Akzidenz-Grotesk) must NOT be added to the repo.
+# Currently bundled: Archivo Black (display) + IBM Plex Sans (body), both OFL.
+
 .build/
 DerivedData/
