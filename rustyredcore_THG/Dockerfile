@@ -4,7 +4,10 @@
 # `rustyred-thg-server` (was `thg-product-server` before the C1 cutover
 # at commit 26282991) and copy-renaming the output.
 
-FROM rust:1.88-bookworm AS builder
+# Experimental Theorem-only lane: TurboVec 0.8.0 currently compiles AVX-512
+# intrinsics that stable Rust rejects, so this branch uses nightly while we
+# prepare a proper TurboVec fork/patch with feature-gated AVX-512.
+FROM rustlang/rust:nightly-bookworm AS builder
 
 WORKDIR /app
 
