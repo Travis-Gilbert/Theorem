@@ -57,5 +57,10 @@ let package = Package(
             dependencies: ["TheoremKit"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .testTarget(
+            name: "TheoremKitTests",
+            dependencies: ["TheoremKit"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
     ]
 )

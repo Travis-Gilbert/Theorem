@@ -42,6 +42,80 @@ final class WireModelTests: XCTestCase {
         XCTAssertEqual(search.keptCount, 2)
     }
 
+    func testNativeSearchConvertsToSubstrateScene() throws {
+        let json = """
+        {
+          "query": "rusty web",
+          "search_session_id": "searchsess:ios",
+          "ranked_results": [
+            {
+              "id": "webdoc:1",
+              "title": "RustyWeb result",
+              "url": "https://example.test/rustyweb",
+              "snippet": "RustyWeb found this page.",
+              "score": 0.91,
+              "source_type": "webdoc"
+            }
+          ],
+          "graph_nodes": [
+            {
+              "id": "webdoc:2",
+              "label": "Adjacent page",
+              "properties": {
+                "url": "https://example.test/adjacent",
+                "score": 0.33
+              }
+            }
+          ],
+          "graph_edges": [
+            {"source": "webdoc:1", "target": "webdoc:2", "kind": "links_to"}
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let native = try JSONDecoder().decode(TheoremNativeSearchResponse.self, from: json)
+        let search = SubstrateSearch(nativeSearch: native)
+        XCTAssertEqual(search.query, "rusty web")
+        XCTAssertEqual(search.matchedCount, 1)
+        XCTAssertEqual(search.keptCount, 2)
+        XCTAssertEqual(search.hits[0].nodeID, "webdoc:1")
+        XCTAssertEqual(search.hits[0].ringLabel, "match")
+        XCTAssertEqual(search.hits[1].ringLabel, "adjacent")
+        XCTAssertEqual(search.links, [SearchLink(source: "webdoc:1", target: "webdoc:2")])
+
+        let scene = search.scenePackage(id: "scene-1", manifestRef: "searchsess:ios")
+        XCTAssertEqual(scene.atoms.count, 2)
+        XCTAssertEqual(scene.relations.count, 1)
+        XCTAssertEqual(scene.projection.id, ProjectionID.forceGraph)
+        XCTAssertEqual(scene.provenance["source"]?.stringValue, "theorem-native-search")
+        XCTAssertEqual(scene.atoms[0].metadata["match_score"]?.doubleValue, 0.91)
+    }
+
+    func test31BPromptUsesSearchEvidence() {
+        let search = SubstrateSearch(
+            query: "rusty web",
+            hits: [
+                SearchHit(
+                    nodeID: "webdoc:1",
+                    url: "https://example.test/rustyweb",
+                    title: "RustyWeb result",
+                    snippet: "RustyWeb found this page.",
+                    ring: 0,
+                    ringLabel: "match",
+                    matchScore: 0.91
+                ),
+            ],
+            links: [],
+            matchedCount: 1,
+            keptCount: 1
+        )
+
+        let prompt = TheoremSearchClient.build31BPrompt(query: "rusty web", search: search)
+        XCTAssertTrue(prompt.contains("GL-Fusion 31B"))
+        XCTAssertTrue(prompt.contains("Theorem search evidence"))
+        XCTAssertTrue(prompt.contains("RustyWeb found this page."))
+    }
+
     // MARK: ScenePackageV2 (camelCase, kebab enums, omitted-empty fields)
 
     func testScenePackageDecodesWireShape() throws {
