@@ -18,16 +18,27 @@ struct ForceGraphView: View {
 
     var body: some View {
         let maxMag = max(package.atoms.map(magnitude).max() ?? 1, 1)
+        // A labeled graph is the product; an unlabeled one is decoration. Above
+        // ~14 nodes the labels would crowd the live layout, so they drop out.
+        let showLabels = package.atoms.count <= 14
 
         ForceDirectedGraph(states: graphState) {
             Series(package.atoms) { atom in
+                let r = 6 + (magnitude(atom) / maxMag) * 16
                 // Monochrome instrument node: field fill, ink outline (mirrors
                 // TheoremSceneView's Canvas renderer so switching is continuous).
+                // The label offset scales with radius so it clears the node
+                // regardless of size (Grape's annotation anchors near center).
                 NodeMark(id: atom.id)
                     .symbol(.circle)
-                    .symbolSize(radius: 6 + (magnitude(atom) / maxMag) * 16)
+                    .symbolSize(radius: r)
                     .foregroundStyle(theme.field)
                     .stroke(theme.ink, StrokeStyle(lineWidth: 1.2))
+                    .annotation(
+                        showLabels ? labelText(atom) : nil,
+                        alignment: .bottom,
+                        offset: SIMD2(0, r + 5)
+                    )
             }
             Series(package.relations) { relation in
                 LinkMark(from: relation.sourceId, to: relation.targetId)
@@ -52,5 +63,17 @@ struct ForceGraphView: View {
     /// PPR mass for radius (matches TheoremSceneView's `radius(for:)`).
     private func magnitude(_ atom: SceneAtom) -> Double {
         atom.metadata["matchScore"]?.doubleValue ?? atom.weight ?? 0.1
+    }
+
+    /// Node label (atom.label, else id), in the instrument label face. Returns a
+    /// `Text` so Grape's `.annotation(_ text: Text?, ...)` overload renders it —
+    /// the `String?` overload silently discards its argument.
+    private func labelText(_ atom: SceneAtom) -> Text? {
+        let raw = atom.label ?? atom.id
+        guard !raw.isEmpty else { return nil }
+        let shown = raw.count > 18 ? String(raw.prefix(17)) + "\u{2026}" : raw
+        return Text(shown)
+            .font(TheoremFonts.label(size: 9))
+            .foregroundStyle(theme.ink)
     }
 }

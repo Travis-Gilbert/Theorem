@@ -53,7 +53,7 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
   selection flips the node to `signal`/oxblood at 2px stroke. Edit
   `TheoremSceneView` `color(for:)` / draw. Backref: "Color tokens" graph para +
   acceptance.
-- [ ] **D2.2** Annotations: render `relation.kind` as edge labels (JetBrains
+- [x] **D2.2** Annotations: render `relation.kind` as edge labels (JetBrains
   Mono) and `atom.label` as node labels. Above ~12 nodes, edge labels only for
   the selected node's edges; others fade in on zoom. Backref: "Annotations
   restored". (A graph of unlabeled dots is decoration; labeled edges are the

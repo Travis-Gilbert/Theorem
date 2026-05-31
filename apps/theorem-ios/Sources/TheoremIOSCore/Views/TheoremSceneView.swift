@@ -121,6 +121,24 @@ struct TheoremSceneView: View {
             path.move(to: source)
             path.addLine(to: target)
             context.stroke(path, with: .color(theme.edge), lineWidth: 1.2)
+
+            // Edge-kind label (relation.kind) in the data face. Gated by the
+            // >12-node rule: dense graphs only label the selected node's edges.
+            guard showEdgeLabel(for: relation), !relation.kind.isEmpty else { continue }
+            let mid = CGPoint(x: (source.x + target.x) / 2, y: (source.y + target.y) / 2)
+            let resolved = context.resolve(
+                Text(relation.kind)
+                    .font(TheoremFonts.mono(size: 8))
+                    .foregroundStyle(theme.textMuted)
+            )
+            let sz = resolved.measure(in: size)
+            // Field chip behind the label so the rule line doesn't strike through.
+            let chip = CGRect(
+                x: mid.x - sz.width / 2 - 3, y: mid.y - sz.height / 2 - 1,
+                width: sz.width + 6, height: sz.height + 2
+            )
+            context.fill(Path(roundedRect: chip, cornerRadius: 2), with: .color(theme.field))
+            context.draw(resolved, at: mid, anchor: .center)
         }
     }
 
@@ -140,6 +158,18 @@ struct TheoremSceneView: View {
                 with: .color(selected ? theme.signal : theme.ink),
                 lineWidth: selected ? 2 : 1.2
             )
+
+            // Node label (atom.label) below the node, in the instrument label
+            // face. Shown for sparse graphs, or the selected node when dense.
+            if (package.atoms.count <= 14 || selected), let label = nodeLabel(atom) {
+                context.draw(
+                    Text(label)
+                        .font(TheoremFonts.label(size: 9))
+                        .foregroundStyle(selected ? theme.signal : theme.ink),
+                    at: CGPoint(x: point.x, y: point.y + radius + 7),
+                    anchor: .top
+                )
+            }
         }
     }
 
@@ -159,5 +189,20 @@ struct TheoremSceneView: View {
     private func radius(for atom: SceneAtom) -> Double {
         let score = atom.metadata["matchScore"]?.doubleValue ?? atom.weight ?? 0.1
         return 8 + min(max(score, 0.05), 1.0) * 18
+    }
+
+    /// >12-node gate (addendum): sparse graphs label every edge; dense graphs
+    /// label only the selected node's edges (others would crowd the field).
+    private func showEdgeLabel(for relation: SceneRelation) -> Bool {
+        package.atoms.count <= 12
+            || relation.sourceId == selectedNodeID
+            || relation.targetId == selectedNodeID
+    }
+
+    /// Node label text (atom.label, else id), truncated for the canvas.
+    private func nodeLabel(_ atom: SceneAtom) -> String? {
+        let raw = atom.label ?? atom.id
+        guard !raw.isEmpty else { return nil }
+        return raw.count > 18 ? String(raw.prefix(17)) + "\u{2026}" : raw
     }
 }
