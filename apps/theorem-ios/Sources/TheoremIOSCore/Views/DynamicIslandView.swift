@@ -1,4 +1,5 @@
 import SwiftUI
+import Pow
 
 public enum DynamicIslandMode: String {
     case idle
@@ -19,6 +20,7 @@ struct DynamicIslandView: View {
     var onSubmitQuery: () -> Void = {}
 
     @Namespace private var namespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,7 +32,9 @@ struct DynamicIslandView: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: mode)
+        // Chrome motion: crisp, no spring overshoot (addendum D5). Collapses to
+        // near-instant under reduced-motion.
+        .animation(TheoremMotion.chrome(0.26, reduceMotion: reduceMotion), value: mode)
     }
 
     private var collapsed: some View {
@@ -68,6 +72,13 @@ struct DynamicIslandView: View {
         .shadow(color: theme.ink.opacity(0.12), radius: 10, y: 3)
         .matchedGeometryEffect(id: "island", in: namespace)
         .sensoryFeedback(.selection, trigger: centerTitle)
+        // One restrained Pow moment: a faint oxblood-signal glow when the center
+        // node changes (a new scene resolved). Off under reduced-motion.
+        .changeEffect(
+            .glow(color: theme.signal.opacity(0.45), radius: 16),
+            value: centerTitle,
+            isEnabled: !reduceMotion
+        )
     }
 
     private var expanded: some View {

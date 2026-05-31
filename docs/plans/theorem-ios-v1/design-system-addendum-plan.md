@@ -87,7 +87,7 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
 
 ## Phase D5 — Motion discipline + Pow
 
-- [ ] **D5.1** Add `Pow` (`movingparts-io/Pow`) to Package.swift. Chrome motion:
+- [x] **D5.1** Add `Pow` (`movingparts-io/Pow`) to Package.swift. Chrome motion:
   fast/crisp 150–250ms, `cubic-bezier(0.22,1,0.36,1)`, no spring overshoot.
   Reserve spring for DATA motion only (graph layout convergence, fractal
   wavefront). `prefers-reduced-motion` → ~0ms. Backref: "Motion" + "Libraries".
