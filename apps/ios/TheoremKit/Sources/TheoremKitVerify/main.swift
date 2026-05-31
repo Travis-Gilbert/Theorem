@@ -183,6 +183,111 @@ check(registered.contains(TheoremTypography.displayMediumName),
       "registered \(TheoremTypography.displayMediumName)")
 
 // ---------------------------------------------------------------------------
+// Reprojection sliver: honest-shape rule (the spec differentiator)
+// ---------------------------------------------------------------------------
+func atom(_ id: String, ring: Int? = nil, score: Double? = nil, kind: String = "source") -> SceneAtom {
+    var meta: [String: JSONValue] = [:]
+    if let ring { meta["ring"] = .number(Double(ring)) }
+    if let score { meta["match_score"] = .number(score) }
+    return SceneAtom(id: id, kind: kind, metadata: meta)
+}
+func rel(_ s: String, _ t: String) -> SceneRelation {
+    SceneRelation(id: "\(s)->\(t)", sourceId: s, targetId: t)
+}
+func makeScene(_ atoms: [SceneAtom], _ rels: [SceneRelation]) -> ScenePackageV2 {
+    ScenePackageV2(id: "t", manifestRef: "m", atoms: atoms, relations: rels,
+                   projection: ProjectionBinding(id: "force_graph"),
+                   chrome: ChromeBinding(id: "document_rail"))
+}
+
+let engine = StubReprojectionEngine()
+
+section("Reprojection — valid tree scene")
+do {
+    // a is the match (ring 0, top score), star/tree beneath it. Acyclic.
+    let tree = makeScene(
+        [atom("a", ring: 0, score: 0.9), atom("b", ring: 1, score: 0.5),
+         atom("c", ring: 1, score: 0.4), atom("d", ring: 2, score: 0.2)],
+        [rel("a", "b"), rel("a", "c"), rel("b", "d")])
+    let avail = Dictionary(uniqueKeysWithValues:
+        engine.availableProjections(tree).map { ($0.projectionID, $0) })
+    check(avail[ProjectionID.forceGraph]?.available == true, "force_graph available")
+    check(avail[ProjectionID.radialRings]?.available == true, "radial available (rings present)")
+    check(avail[ProjectionID.treeLayout]?.available == true, "tree available (acyclic)")
+    check(avail[ProjectionID.fractalExpansion]?.available == true, "fractal available")
+
+    check(engine.centerNodeID(tree, mode: .pprMass) == "a", "center by PPR mass = a")
+    check(engine.centerNodeID(tree, mode: .degree) == "a", "center by degree = a (star hub)")
+
+    let treeResult = try engine.reproject(tree, projectionID: ProjectionID.treeLayout)
+    check(treeResult.positions.count == 4, "tree lays out all atoms")
+    check(treeResult.positions["a"]?.y == 0, "tree root a at depth 0 (y=0)")
+    check(treeResult.coordinateSpace == .diagram, "tree space = diagram")
+
+    let radialResult = try engine.reproject(tree, projectionID: ProjectionID.radialRings)
+    check(radialResult.positions["a"] == LayoutPoint(x: 0, y: 0), "radial: lone ring-0 at center")
+    check(radialResult.positions.count == 4, "radial lays out all atoms")
+} catch {
+    check(false, "valid-tree reprojection threw: \(error)")
+}
+
+section("Reprojection — cyclic scene greys out tree")
+do {
+    // x -> y -> z -> x : a cycle. No ring metadata.
+    let cyclic = makeScene(
+        [atom("x", score: 0.8), atom("y", score: 0.6), atom("z", score: 0.5)],
+        [rel("x", "y"), rel("y", "z"), rel("z", "x")])
+    let avail = Dictionary(uniqueKeysWithValues:
+        engine.availableProjections(cyclic).map { ($0.projectionID, $0) })
+    check(avail[ProjectionID.treeLayout]?.available == false, "tree UNavailable on a cycle")
+    check(avail[ProjectionID.treeLayout]?.reason?.contains("cycle") == true,
+          "tree reason names the cycle")
+    check(avail[ProjectionID.forceGraph]?.available == true, "force_graph still available")
+    check(avail[ProjectionID.radialRings]?.available == false, "radial UNavailable (no rings)")
+
+    // reproject must REFUSE to fabricate a hierarchy the data lacks.
+    var threw = false
+    do { _ = try engine.reproject(cyclic, projectionID: ProjectionID.treeLayout) }
+    catch ReprojectError.shapeRejected(let pid, let reason) {
+        threw = true
+        check(pid == ProjectionID.treeLayout, "rejection names tree projection")
+        check(reason.contains("cycle"), "rejection reason names the cycle")
+    } catch { check(false, "wrong error type: \(error)") }
+    check(threw, "reproject(tree) on a cycle throws shapeRejected")
+
+    // ...but the always-available force graph lays out fine.
+    let forced = try engine.reproject(cyclic, projectionID: ProjectionID.forceGraph)
+    check(forced.positions.count == 3, "force seed lays out the cyclic scene")
+} catch {
+    check(false, "cyclic reprojection section threw: \(error)")
+}
+
+section("Reprojection — guards")
+do {
+    let one = makeScene([atom("solo")], [])
+    let availSolo = Dictionary(uniqueKeysWithValues:
+        engine.availableProjections(one).map { ($0.projectionID, $0.available) })
+    check(availSolo[ProjectionID.forceGraph] == false, "force_graph needs >= 2 nodes + a link")
+
+    var unknownThrew = false
+    do { _ = try engine.reproject(makeScene([atom("a"), atom("b")], [rel("a", "b")]),
+                                  projectionID: "made_up") }
+    catch ReprojectError.unknownProjection { unknownThrew = true } catch {}
+    check(unknownThrew, "unknown projection id throws")
+
+    var emptyThrew = false
+    do { _ = try engine.reproject(makeScene([], []), projectionID: ProjectionID.forceGraph) }
+    catch ReprojectError.emptyScene { emptyThrew = true } catch {}
+    check(emptyThrew, "empty scene throws emptyScene")
+
+    // Self-loop is not a tree.
+    let selfLoop = makeScene([atom("a"), atom("b")], [rel("a", "a"), rel("a", "b")])
+    let treeAvail = engine.availableProjections(selfLoop)
+        .first { $0.projectionID == ProjectionID.treeLayout }?.available
+    check(treeAvail == false, "self-loop greys out tree")
+}
+
+// ---------------------------------------------------------------------------
 print("")
 if failures > 0 {
     print("\(passed) passed, \(failures) FAILED")
