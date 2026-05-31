@@ -1,0 +1,5 @@
+Sources/TheoremIOSCore/Resources/Fonts/*.ttf
+Sources/TheoremIOSCore/Resources/Fonts/*.otf
+Sources/TheoremIOSCore/Resources/Fonts/*.ttc
+.build/
+DerivedData/
