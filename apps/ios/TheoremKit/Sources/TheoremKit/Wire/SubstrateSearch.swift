@@ -99,3 +99,166 @@ public struct SubstrateSearch: Codable, Hashable, Sendable {
         self.keptCount = keptCount
     }
 }
+
+public extension SubstrateSearch {
+    init(nativeSearch response: TheoremNativeSearchResponse, fallbackQuery: String = "") {
+        var seen = Set<String>()
+        var hits: [SearchHit] = []
+
+        for (index, result) in (response.rankedResults ?? []).enumerated() {
+            let nodeID = Self.searchNodeID(
+                id: result.id,
+                url: result.url,
+                fallback: "ranked-\(index + 1)"
+            )
+            guard seen.insert(nodeID).inserted else { continue }
+            hits.append(SearchHit(
+                nodeID: nodeID,
+                url: result.url ?? result.metadata?["url"]?.stringValue ?? "",
+                title: result.title ?? result.metadata?["title"]?.stringValue ?? "",
+                snippet: result.snippet ?? "",
+                ring: 0,
+                ringLabel: "match",
+                matchScore: result.score ?? 0
+            ))
+        }
+
+        for (index, node) in (response.graphNodes ?? []).enumerated() {
+            let nodeID = Self.searchNodeID(
+                id: node.id,
+                url: node.properties?["url"]?.stringValue,
+                fallback: "graph-\(index + 1)"
+            )
+            guard seen.insert(nodeID).inserted else { continue }
+            hits.append(SearchHit(
+                nodeID: nodeID,
+                url: node.properties?["url"]?.stringValue ?? "",
+                title: node.title ?? node.label ?? "",
+                snippet: node.properties?["snippet"]?.stringValue ?? "",
+                ring: 1,
+                ringLabel: "adjacent",
+                matchScore: node.properties?["score"]?.doubleValue ?? 0
+            ))
+        }
+
+        let ids = Set(hits.map(\.nodeID))
+        let links = (response.graphEdges ?? []).compactMap { edge -> SearchLink? in
+            let source = edge.source ?? edge.fromID ?? ""
+            let target = edge.target ?? edge.toID ?? ""
+            guard ids.contains(source), ids.contains(target), source != target else {
+                return nil
+            }
+            return SearchLink(source: source, target: target)
+        }
+
+        self.init(
+            query: response.query ?? fallbackQuery,
+            hits: hits,
+            links: links,
+            matchedCount: (response.rankedResults ?? []).count,
+            keptCount: hits.count
+        )
+    }
+
+    init(evidenceSearch response: TheoremEvidenceSearchResponse, fallbackQuery: String = "") {
+        let hits = (response.results ?? []).enumerated().map { index, result in
+            let nodeID = Self.searchNodeID(
+                id: result.objectID ?? result.webdocID,
+                url: result.url ?? result.canonicalURL,
+                fallback: "evidence-\(index + 1)"
+            )
+            let snippet = result.snippet ?? String((result.markdown ?? "").prefix(360))
+            return SearchHit(
+                nodeID: nodeID,
+                url: result.url ?? result.canonicalURL ?? "",
+                title: result.title ?? "",
+                snippet: snippet,
+                ring: 0,
+                ringLabel: "match",
+                matchScore: result.rankScore ?? result.sourceQuality ?? 0
+            )
+        }
+
+        self.init(
+            query: fallbackQuery,
+            hits: hits,
+            links: [],
+            matchedCount: hits.count,
+            keptCount: hits.count
+        )
+    }
+
+    func scenePackage(id: String, manifestRef: String) -> ScenePackageV2 {
+        let atoms = hits.map { hit in
+            SceneAtom(
+                id: hit.nodeID,
+                kind: "source",
+                label: hit.title.isEmpty ? hit.url : hit.title,
+                weight: max(hit.matchScore, 0.05),
+                lifecycle: .present,
+                metadata: [
+                    "url": .string(hit.url),
+                    "snippet": .string(hit.snippet),
+                    "ring": .number(Double(hit.ring)),
+                    "ring_label": .string(hit.ringLabel),
+                    "match_score": .number(hit.matchScore),
+                ],
+                sourceRefs: [
+                    SourceRef(
+                        kind: "WebDoc",
+                        id: hit.nodeID,
+                        label: hit.title,
+                        metadata: ["url": .string(hit.url)]
+                    ),
+                ]
+            )
+        }
+
+        let relations = links.map { link in
+            SceneRelation(
+                id: "\(link.source)->\(link.target)",
+                sourceId: link.source,
+                targetId: link.target,
+                kind: "links_to"
+            )
+        }
+
+        let actions = hits.compactMap { hit -> ActionDescriptor? in
+            guard !hit.url.isEmpty else { return nil }
+            return ActionDescriptor(
+                id: "open-\(hit.nodeID)",
+                label: "Open",
+                actionType: "open-url",
+                interaction: "tap",
+                target: hit.nodeID,
+                payload: ["url": .string(hit.url)]
+            )
+        }
+
+        return ScenePackageV2(
+            id: id,
+            manifestRef: manifestRef,
+            atoms: atoms,
+            relations: relations,
+            projection: ProjectionBinding(id: ProjectionID.forceGraph),
+            chrome: ChromeBinding(id: "search_scene"),
+            actions: actions,
+            provenance: [
+                "source": .string("theorem-native-search"),
+                "query": .string(query),
+                "matched_count": .number(Double(matchedCount)),
+                "kept_count": .number(Double(keptCount)),
+            ]
+        )
+    }
+
+    private static func searchNodeID(id: String?, url: String?, fallback: String) -> String {
+        let cleanID = (id ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanID.isEmpty { return cleanID }
+
+        let cleanURL = (url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanURL.isEmpty { return cleanURL }
+
+        return fallback
+    }
+}
