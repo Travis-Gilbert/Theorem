@@ -142,7 +142,6 @@ pub struct LiveSearchRequest {
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
-
 #[derive(Debug, Deserialize)]
 pub struct FederateSubmitBody {
     #[serde(default, alias = "tenant_id")]
@@ -914,7 +913,6 @@ fn wikipedia_title_token(raw: &str) -> Option<String> {
     let rest = chars.as_str().to_ascii_lowercase();
     Some(format!("{first}{rest}"))
 }
-
 fn render_search_response(
     state: &AppState,
     headers: &HeaderMap,

@@ -1,9 +1,11 @@
 //! Theorem's first gRPC server.
 //!
 //! Serves theseus_search.v1.SearchService over the RustyRed substrate. Pure
-//! gRPC (no HTTP surface): the smaller server. Binds 0.0.0.0:$PORT so Railway's
-//! IPv4 healthcheck/router reaches it. The civic-atlas-server dials this by
-//! setting THEOREM_SEARCH_URL.
+//! gRPC (no HTTP surface): the smaller server. Binds [::]:$PORT (IPv6
+//! dual-stack) so Railway's private network (IPv6) reaches it via
+//! theorem-grpc.railway.internal, and IPv4 healthchecks work too. The
+//! civic-atlas-server dials this by setting THEOREM_SEARCH_URL (or the legacy
+//! THESEUS_BRIDGE_URL).
 
 mod engine;
 mod pb;
@@ -26,8 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(50071);
 
-    // Bind 0.0.0.0 (not [::]) so Railway's IPv4 healthcheck/router reaches it.
-    let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    // Bind [::] (IPv6 dual-stack) so Railway's IPv6 private network reaches it
+    // via the railway.internal domain; it also accepts IPv4 for healthchecks.
+    let addr: SocketAddr = format!("[::]:{port}").parse()?;
 
     // Build the engine (empty substrate is the honest slice-1 default) and wrap
     // it in an Arc so the owned store outlives every borrowing handler call.

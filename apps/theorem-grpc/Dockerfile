@@ -18,9 +18,15 @@
 FROM rust:1.89-bookworm AS builder
 WORKDIR /app
 
-# tonic-build invokes protoc at compile time.
+# Build-time system deps:
+#   protobuf-compiler: tonic-build invokes protoc at compile time.
+#   libopenblas-dev + gfortran: rustyred-web pulls nalgebra/ndarray/statrs/cblas
+#     which link OpenBLAS (-lopenblas) at the final link step.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        libopenblas-dev \
+        gfortran \
     && rm -rf /var/lib/apt/lists/*
 
 # Context = Theorem repo root. Copy the crate + its path-dep sources.
@@ -32,12 +38,17 @@ WORKDIR /app/apps/theorem-grpc
 RUN cargo build -p theorem-grpc --release
 
 FROM debian:bookworm-slim
+# Runtime system deps:
+#   ca-certificates: outbound TLS.
+#   libopenblas0: the OpenBLAS shared library the binary dynamically links.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/apps/theorem-grpc/target/release/theorem-grpc-server /usr/local/bin/theorem-grpc-server
 
-# The binary reads PORT from env and binds 0.0.0.0:$PORT (Railway injects PORT).
-# EXPOSE is documentation only.
+# The binary reads PORT from env and binds [::]:$PORT (IPv6 dual-stack, so
+# Railway's IPv6 private network reaches it). EXPOSE is documentation only.
 EXPOSE 8080
 CMD ["theorem-grpc-server"]

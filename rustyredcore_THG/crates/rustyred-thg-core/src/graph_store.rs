@@ -4371,6 +4371,36 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_records_content_hash_parent_chain() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:1",
+                ["Person"],
+                json!({ "name": "Ada" }),
+            ))
+            .unwrap();
+        let first_hash = store
+            .get_node("node:1")
+            .unwrap()
+            .content_hash
+            .clone()
+            .unwrap();
+
+        store
+            .upsert_node(NodeRecord::new(
+                "node:1",
+                ["Person"],
+                json!({ "name": "Ada Lovelace" }),
+            ))
+            .unwrap();
+        let updated = store.get_node("node:1").unwrap();
+
+        assert_ne!(updated.content_hash.as_ref().unwrap(), &first_hash);
+        assert_eq!(updated.parent_hashes, vec![first_hash]);
+    }
+
+    #[test]
     fn memory_store_upserts_nodes_edges_and_adjacency() {
         let mut store = InMemoryGraphStore::new();
         store
