@@ -94,7 +94,7 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
 
 ## Phase D6 — Scramble-text reveal (bigger)
 
-- [ ] **D6.1** Native scramble-text (~40 lines): `TimelineView(.animation)` tick;
+- [x] **D6.1** Native scramble-text (~40 lines): `TimelineView(.animation)` tick;
   per-char show random scramble-set `["░","▒","▓","█"]`+alnum until reveal time,
   then lock real char; reveal front advances L→R; render MONOSPACE (Terminal
   Grotesque/JetBrains Mono) so width doesn't reflow; `.sensoryFeedback(.selection)`

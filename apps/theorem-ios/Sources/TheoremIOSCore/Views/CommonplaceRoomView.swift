@@ -207,9 +207,9 @@ private struct ContributionRow: View {
                     .foregroundStyle(theme.ink)
                     .lineLimit(1)
 
-                Text(contribution.body)
-                    .font(TheoremFonts.body(size: 11, relativeTo: .caption2))
-                    .foregroundStyle(theme.textMuted)
+                // The AI-summary detail decodes via scramble-text (addendum D6);
+                // the summary above stays a crisp label.
+                ScrambleText(text: contribution.body, size: 11, color: theme.textMuted)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             }
