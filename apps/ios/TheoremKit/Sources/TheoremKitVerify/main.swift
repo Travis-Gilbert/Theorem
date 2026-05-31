@@ -173,14 +173,13 @@ do {
 }
 
 // ---------------------------------------------------------------------------
-// Bundled display fonts (Berthold Akzidenz-Grotesk) register from the module
+// Bundled OFL fonts (Archivo Black display + IBM Plex Sans body) register
 // ---------------------------------------------------------------------------
-section("Bundled display fonts (Berthold Akzidenz-Grotesk)")
+section("Bundled OFL fonts (Archivo Black + IBM Plex Sans)")
 let registered = TheoremTypography.registerBundledFonts()
-check(registered.contains(TheoremTypography.displayRegularName),
-      "registered \(TheoremTypography.displayRegularName)")
-check(registered.contains(TheoremTypography.displayMediumName),
-      "registered \(TheoremTypography.displayMediumName)")
+check(registered.count >= 2, "registered 2 bundled faces (got \(registered.count): \(registered))")
+check(registered.contains { $0.localizedCaseInsensitiveContains("archivo") }, "Archivo Black registered")
+check(registered.contains { $0.localizedCaseInsensitiveContains("plex") }, "IBM Plex Sans registered")
 
 // ---------------------------------------------------------------------------
 // Reprojection sliver: honest-shape rule (the spec differentiator)
