@@ -37,22 +37,26 @@ public struct TheoremTheme: Equatable, Sendable {
     public var hairline: Color { textPrimary.opacity(0.12) }
     public var ruleStrong: Color { textPrimary.opacity(0.72) }
 
-    /// The instrument palette. The graph is monochrome — node fills are the field
-    /// color (drawn as ink outlines in `TheoremSceneView`); the only hue anywhere
-    /// is oxblood `signal` on selection and `blueprintInk` in the hex watermark.
+    /// The instrument palette. Cool-neutral, NOT warm: the field + chrome are
+    /// paper-cool (blue channel >= red) so the ground reads as clean drafting
+    /// paper, never cream/beige. The graph is monochrome — node fills are the
+    /// field color (drawn as ink outlines in `TheoremSceneView`); the only hues
+    /// are oxblood `signal` on selection and `blueprintInk` in the hex watermark.
+    /// (Deviates from the addendum's warm hexes per Travis's "still reads beige"
+    /// feedback; the warm field #F6F5F2 + taupe chrome #EAE8E2 read beige.)
     public static let defaultPalette = TheoremTheme(
-        nodeCore: Color(red: 0.965, green: 0.961, blue: 0.949),  // field (node fill)
-        nodeWeb: Color(red: 0.965, green: 0.961, blue: 0.949),   // field
-        nodeTool: Color(red: 0.965, green: 0.961, blue: 0.949),  // field
-        nodeDimmed: Color(red: 0.784, green: 0.769, blue: 0.737),// pebble #C8C4BC
-        edge: Color(red: 0.165, green: 0.157, blue: 0.137).opacity(0.42), // rule
+        nodeCore: Color(red: 0.957, green: 0.965, blue: 0.976),  // field (node fill)
+        nodeWeb: Color(red: 0.957, green: 0.965, blue: 0.976),   // field
+        nodeTool: Color(red: 0.957, green: 0.965, blue: 0.976),  // field
+        nodeDimmed: Color(red: 0.761, green: 0.780, blue: 0.808),// pebble #C2C7CE (cool)
+        edge: Color(red: 0.133, green: 0.145, blue: 0.165).opacity(0.42), // rule
         ringMatch: Color(red: 0.482, green: 0.180, blue: 0.149), // OXBLOOD #7B2E26
-        ringAdjacent: Color(red: 0.965, green: 0.961, blue: 0.949), // field
-        ringNearby: Color(red: 0.965, green: 0.961, blue: 0.949),   // field
-        background: Color(red: 0.965, green: 0.961, blue: 0.949), // FIELD #F6F5F2
-        surface: Color(red: 0.918, green: 0.910, blue: 0.886),   // CHROME #EAE8E2
-        textPrimary: Color(red: 0.165, green: 0.157, blue: 0.137),// INK #2A2823
-        textSecondary: Color(red: 0.165, green: 0.157, blue: 0.137).opacity(0.62), // muted
+        ringAdjacent: Color(red: 0.957, green: 0.965, blue: 0.976), // field
+        ringNearby: Color(red: 0.957, green: 0.965, blue: 0.976),   // field
+        background: Color(red: 0.957, green: 0.965, blue: 0.976), // FIELD #F4F6F9 (cool paper)
+        surface: Color(red: 0.898, green: 0.910, blue: 0.929),   // CHROME #E5E8ED (cool grey)
+        textPrimary: Color(red: 0.133, green: 0.145, blue: 0.165),// INK #22252A (cool near-black)
+        textSecondary: Color(red: 0.133, green: 0.145, blue: 0.165).opacity(0.62), // muted
         blueprintInk: Color(red: 0.122, green: 0.251, blue: 0.388) // #1F4063
     )
 }
