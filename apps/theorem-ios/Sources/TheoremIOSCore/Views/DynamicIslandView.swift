@@ -15,11 +15,18 @@ struct DynamicIslandView: View {
     var centerTitle: String
     var projectionAvailability: [ProjectionAvailability]
     var theme: TheoremTheme
+    /// The node the dossier opens on in .detail mode (the tapped node, else the
+    /// center node). When set and mode == .detail, the island IS the dossier.
+    var focusedAtom: SceneAtom?
+    /// Drives the dossier's real substrate summary (the /ask/ compose stream).
+    var searchClient: TheoremSearchClient
     /// Called when the user submits a query in search mode. Wired to the live
     /// substrate search in `TheoremRootView`.
     var onSubmitQuery: () -> Void = {}
-    /// Open the patent-plate view for the current center node.
-    var onOpenPatent: () -> Void = {}
+    /// Open the on-device scene view (SceneOS) for the focused node.
+    var onSceneOS: () -> Void = {}
+    /// Run a deeper substrate search seeded from a node label.
+    var onDeeperSearch: (String) -> Void = { _ in }
 
     @Namespace private var namespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -85,62 +92,60 @@ struct DynamicIslandView: View {
 
     private var expanded: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(modeTitle)
-                    .font(TheoremFonts.mono(size: 11))
-                    .textCase(.uppercase)
-                    .foregroundStyle(theme.textSecondary)
-                Spacer()
-                Button {
-                    mode = .idle
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .bold))
-                }
-                .buttonStyle(.plain)
-            }
-
             if mode == .detail {
-                Text(centerTitle)
-                    .font(TheoremFonts.display(size: 28, relativeTo: .title))
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(2)
-                // "How does this work" -> lay a patent plate over the field.
-                Button(action: onOpenPatent) {
-                    Label("Patent view", systemImage: "doc.plaintext")
-                        .font(TheoremFonts.label(size: 12))
-                        .foregroundStyle(theme.field)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(theme.ink, in: Capsule())
+                if let focusedAtom {
+                    // The node dossier IS the island here: it brings its own
+                    // header, close, choice menu, and the real substrate summary.
+                    NodeDossierView(
+                        atom: focusedAtom,
+                        theme: theme,
+                        searchClient: searchClient,
+                        onSceneOS: onSceneOS,
+                        onDeeperSearch: onDeeperSearch,
+                        onClose: { mode = .idle }
+                    )
+                } else {
+                    Text("No node selected.")
+                        .font(TheoremFonts.body(size: 13))
+                        .foregroundStyle(theme.textMuted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .buttonStyle(.plain)
             } else {
+                HStack {
+                    Text(modeTitle)
+                        .font(TheoremFonts.mono(size: 11))
+                        .textCase(.uppercase)
+                        .foregroundStyle(theme.textSecondary)
+                    Spacer()
+                    Button { mode = .idle } label: {
+                        Image(systemName: "xmark").font(.system(size: 12, weight: .bold))
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 TextField(mode == .search ? "Search substrate" : "Ask over scene", text: $query)
                     .textFieldStyle(.plain)
                     .font(TheoremFonts.body(size: 18))
                     .foregroundStyle(theme.textPrimary)
                     .submitLabel(.search)
                     .autocorrectionDisabled()
-                    .onSubmit {
-                        if mode == .search { onSubmitQuery() }
-                    }
-            }
+                    .onSubmit { if mode == .search { onSubmitQuery() } }
 
-            // Algorithm (projection) switcher revealed only on search — the
-            // expanded search surface is where you re-project. Honest-shape
-            // gated (unavailable projections grey out). Hidden in ask/detail.
-            if mode == .search {
-                ProjectionPicker(
-                    selection: $projection,
-                    availability: projectionAvailability,
-                    theme: theme
-                )
+                // Algorithm (projection) switcher revealed only on search — the
+                // expanded search surface is where you re-project. Honest-shape
+                // gated (unavailable projections grey out).
+                if mode == .search {
+                    ProjectionPicker(
+                        selection: $projection,
+                        availability: projectionAvailability,
+                        theme: theme
+                    )
+                }
             }
         }
         .padding(18)
         .frame(width: 356)
-        .frame(minHeight: mode == .ask ? 96 : 150)
+        .frame(minHeight: mode == .detail ? 300 : (mode == .ask ? 96 : 150))
         .background(theme.surface, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)

@@ -45,6 +45,88 @@ public struct TheoremSearchClient: Sendable {
         }
     }
 
+    /// Ask the substrate for a graph-grounded summary of a focus (a node, in the
+    /// context of the rest of the graph). Two-step async: enqueue the compose job,
+    /// then consume the SSE stream to the terminal `complete` event. The compose
+    /// engine is Index-API only, so this always targets the Index-API base
+    /// regardless of the search backend. Honest failure paths only: the queue-down
+    /// case returns 503 with a message, stream `error` events surface their
+    /// payload. It never fabricates an answer.
+    public func ask(query: String, maxObjects: Int = 8) async throws -> AskResult {
+        let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { throw TheoremSearchError.emptyQuery }
+        let askBase = (backend == .indexAPI) ? baseURL : Self.productionIndexAPIBaseURL
+
+        guard let enqueueURL = URL(string: "/api/v2/theseus/ask/async/", relativeTo: askBase)?.absoluteURL else {
+            throw TheoremSearchError.invalidEndpoint("/api/v2/theseus/ask/async/")
+        }
+        var enqueueRequest = URLRequest(url: enqueueURL)
+        enqueueRequest.httpMethod = "POST"
+        enqueueRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        enqueueRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        enqueueRequest.httpBody = try JSONEncoder().encode(AskRequest(query: clean, maxObjects: maxObjects))
+
+        let (enqueueData, enqueueResponse) = try await dataLoader(enqueueRequest)
+        if let http = enqueueResponse as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            if let payload = try? JSONDecoder().decode(AskEnqueueResponse.self, from: enqueueData),
+               let message = payload.message ?? payload.error {
+                throw TheoremSearchError.server(message)
+            }
+            throw TheoremSearchError.httpStatus(http.statusCode)
+        }
+        let enqueue = try JSONDecoder().decode(AskEnqueueResponse.self, from: enqueueData)
+        if let error = enqueue.error {
+            throw TheoremSearchError.server(enqueue.message ?? error)
+        }
+        guard let streamPath = enqueue.streamURL,
+              let streamURL = URL(string: streamPath, relativeTo: askBase)?.absoluteURL else {
+            throw TheoremSearchError.server("Ask enqueue returned no stream URL.")
+        }
+        return try await consumeAskStream(streamURL)
+    }
+
+    /// Read the SSE stream line-by-line, dispatching on blank-line event
+    /// boundaries, and return the answer at the terminal `complete` event.
+    private func consumeAskStream(_ url: URL) async throws -> AskResult {
+        var request = URLRequest(url: url)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 90
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw TheoremSearchError.httpStatus(http.statusCode)
+        }
+        var eventName = "message"
+        var dataLines: [String] = []
+        for try await line in bytes.lines {
+            if line.hasPrefix(":") { continue }                 // SSE comment / keep-alive
+            if line.isEmpty {
+                guard !dataLines.isEmpty else { eventName = "message"; continue }
+                let dataRaw = dataLines.joined(separator: "\n")
+                dataLines.removeAll(keepingCapacity: true)
+                if eventName == "complete" {
+                    let payload = try JSONDecoder().decode(AskComplete.self, from: Data(dataRaw.utf8))
+                    let answer = (payload.answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !answer.isEmpty else {
+                        throw TheoremSearchError.server("The substrate returned an empty answer.")
+                    }
+                    return AskResult(answer: answer)
+                }
+                if eventName == "error" {
+                    let message = (try? JSONDecoder().decode(AskErrorEvent.self, from: Data(dataRaw.utf8)))?.error
+                    throw TheoremSearchError.server(message ?? "The substrate ask failed.")
+                }
+                eventName = "message"
+                continue
+            }
+            if line.hasPrefix("event:") {
+                eventName = line.dropFirst("event:".count).trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("data:") {
+                dataLines.append(String(line.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces))
+            }
+        }
+        throw TheoremSearchError.server("The ask stream ended before completing.")
+    }
+
     private func searchIndexAPI(query clean: String, topK: Int) async throws -> ScenePackageV2 {
         let native = try await post(
             "/api/v2/theseus/native-search/",
@@ -410,6 +492,50 @@ struct NativeSearchRequest: Encodable {
         case maxPages = "max_pages"
         case maxDepth = "max_depth"
     }
+}
+
+// MARK: - Wire types (ask / compose)
+
+struct AskRequest: Encodable {
+    let query: String
+    let maxObjects: Int
+    let mode = "full"
+    let includeWeb = true
+    let scope = "all"
+    let renderHints: [String: String] = [:]
+
+    enum CodingKeys: String, CodingKey {
+        case query, mode, scope
+        case maxObjects = "max_objects"
+        case includeWeb = "include_web"
+        case renderHints = "render_hints"
+    }
+}
+
+struct AskEnqueueResponse: Decodable {
+    let jobId: String?
+    let streamURL: String?
+    let error: String?
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case jobId = "job_id"
+        case streamURL = "stream_url"
+        case error, message
+    }
+}
+
+struct AskComplete: Decodable {
+    let answer: String?
+}
+
+struct AskErrorEvent: Decodable {
+    let error: String?
+}
+
+/// The graph-grounded answer the substrate composed for a focus.
+public struct AskResult: Sendable, Equatable {
+    public let answer: String
 }
 
 public struct TheoremNativeSearchResponse: Codable, Hashable, Sendable {

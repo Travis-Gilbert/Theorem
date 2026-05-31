@@ -116,8 +116,14 @@ public struct TheoremRootView: View {
                 centerTitle: centerTitle,
                 projectionAvailability: projectionAvailability,
                 theme: theme,
+                focusedAtom: focusedAtom,
+                searchClient: searchClient,
                 onSubmitQuery: { Task { await runSearch() } },
-                onOpenPatent: { patentFocus = patentFocusID }
+                onSceneOS: { patentFocus = focusedAtom?.id ?? patentFocusID },
+                onDeeperSearch: { label in
+                    query = label
+                    Task { await runSearch() }
+                }
             )
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
@@ -163,6 +169,11 @@ public struct TheoremRootView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: patentFocus)
+        // Tapping a node morphs the island into that node's dossier (addendum D8):
+        // the dossier IS the island expanding, never a slab below the graph.
+        .onChange(of: selectedNodeID) { _, newValue in
+            if newValue != nil { islandMode = .detail }
+        }
         .task {
             await autoSearchIfRequested()
             // `-patent 1` opens the plate on the center node (deep-link + capture).
@@ -198,6 +209,14 @@ public struct TheoremRootView: View {
     private var patentFocusID: String? {
         if let selectedNodeID { return selectedNodeID }
         return TheoremProjectionEngine.centerNodeID(in: package, mode: .pprMass)
+    }
+
+    /// The node the island dossier opens on: the selected node, else the center.
+    private var focusedAtom: SceneAtom? {
+        if let id = patentFocusID {
+            return package.atoms.first { $0.id == id }
+        }
+        return package.atoms.first
     }
 }
 
