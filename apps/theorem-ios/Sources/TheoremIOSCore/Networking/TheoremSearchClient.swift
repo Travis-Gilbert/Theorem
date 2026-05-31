@@ -1,26 +1,32 @@
 import Foundation
 
-/// Talks to the hosted Theorem API (the deployed Index-API) and turns a query
-/// into a real `ScenePackageV2` the graph renders. This is the search-box → live
-/// scene seam (spec build-step 3): heavy retrieval runs server-side; the phone
-/// receives the neighbourhood and draws it.
+/// Talks to the hosted Theorem/RustyRed search API and turns a query into a real
+/// `ScenePackageV2` the graph renders. This is the search-box to live-scene seam:
+/// retrieval runs server-side; the phone receives the neighbourhood and draws it.
 ///
 /// Ported from Codex's `apps/ios` search client, adapted to this app's models.
-/// v1 wires the GRAPH path (native-search → scene). The 31B answer
-/// (`/console/chat`) is the Ask flow and lands when there is a panel to show it.
+/// The default backend is the pure Rust `rustyred-thg-server` `/search.json`
+/// route. Index-API normalization remains only as an explicit diagnostic
+/// override via `-searchBackend index-api`.
 public struct TheoremSearchClient: Sendable {
     public typealias DataLoader = @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
-    public static let productionBaseURL = URL(string: "https://index-api-production-a5f7.up.railway.app")!
+    public static let productionIndexAPIBaseURL = URL(string: "https://index-api-production-a5f7.up.railway.app")!
+    public static let productionRustyRedBaseURL = URL(string: "https://rustyredcore-theorem-production.up.railway.app")!
+    public static let localRustyRedBaseURL = URL(string: "http://127.0.0.1:8380")!
 
     public let baseURL: URL
+    public let backend: TheoremSearchBackend
     private let dataLoader: DataLoader
 
     public init(
-        baseURL: URL = TheoremSearchClient.productionBaseURL,
+        baseURL: URL? = nil,
+        backend: TheoremSearchBackend? = nil,
         dataLoader: @escaping DataLoader = { try await URLSession.shared.data(for: $0) }
     ) {
-        self.baseURL = baseURL
+        let resolvedBackend = backend ?? Self.configuredBackend
+        self.backend = resolvedBackend
+        self.baseURL = baseURL ?? Self.configuredBaseURL(for: resolvedBackend)
         self.dataLoader = dataLoader
     }
 
@@ -31,6 +37,15 @@ public struct TheoremSearchClient: Sendable {
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw TheoremSearchError.emptyQuery }
 
+        switch backend {
+        case .indexAPI:
+            return try await searchIndexAPI(query: clean, topK: topK)
+        case .rustyRed:
+            return try await searchRustyRed(query: clean)
+        }
+    }
+
+    private func searchIndexAPI(query clean: String, topK: Int) async throws -> ScenePackageV2 {
         let native = try await post(
             "/api/v2/theseus/native-search/",
             body: NativeSearchRequest(query: clean, topK: topK),
@@ -44,11 +59,35 @@ public struct TheoremSearchClient: Sendable {
         return scene
     }
 
+    private func searchRustyRed(query clean: String) async throws -> ScenePackageV2 {
+        let tenant = Self.configuredTenant
+        let route = try await get(
+            "/search.json",
+            queryItems: [
+                URLQueryItem(name: "q", value: clean),
+                tenant.map { URLQueryItem(name: "tenant", value: $0) },
+            ].compactMap { $0 },
+            response: RustyRedSearchResponse.self
+        )
+        if let ok = route.ok, !ok {
+            throw TheoremSearchError.server(route.error ?? "RustyRed search failed.")
+        }
+        guard let search = route.search else {
+            throw TheoremSearchError.server(route.error ?? "RustyRed search returned no search payload.")
+        }
+        let scene = Self.scene(from: search, tenant: route.tenant ?? tenant, query: clean)
+        guard !scene.atoms.isEmpty else { throw TheoremSearchError.noResults(clean) }
+        return scene
+    }
+
     // MARK: native response -> ScenePackageV2
 
     static func scene(from native: TheoremNativeSearchResponse, query: String) -> ScenePackageV2 {
         var seen = Set<String>()
         var atoms: [SceneAtom] = []
+        let queryID = native.graphNodes?
+            .first(where: { ($0.label ?? "").caseInsensitiveCompare("Query") == .orderedSame })?
+            .id ?? "query:\(stableQueryID(query))"
 
         // Ranked results are the direct matches (ring 0).
         for (index, result) in (native.rankedResults ?? []).enumerated() {
@@ -70,20 +109,37 @@ public struct TheoremSearchClient: Sendable {
             guard seen.insert(nodeID).inserted else { continue }
             let url = node.properties?["url"]?.stringValue ?? ""
             let title = displayTitle(nonEmpty(node.title) ?? nonEmpty(node.label), url: url)
-            atoms.append(atom(
-                id: nodeID, url: url, title: title,
-                snippet: node.properties?["snippet"]?.stringValue ?? "", ring: 1, ringLabel: "adjacent",
-                score: node.properties?["score"]?.doubleValue ?? 0))
+            if nodeID == queryID {
+                atoms.append(queryAtom(id: nodeID, query: query))
+            } else {
+                atoms.append(atom(
+                    id: nodeID, url: url, title: title,
+                    snippet: node.properties?["snippet"]?.stringValue ?? "", ring: 1, ringLabel: "adjacent",
+                    score: node.properties?["score"]?.doubleValue ?? 0))
+            }
+        }
+
+        if !seen.contains(queryID) {
+            seen.insert(queryID)
+            atoms.insert(queryAtom(id: queryID, query: query), at: 0)
         }
 
         let ids = Set(atoms.map(\.id))
-        let relations = (native.graphEdges ?? []).compactMap { edge -> SceneRelation? in
+        var relations = (native.graphEdges ?? []).compactMap { edge -> SceneRelation? in
             let source = edge.source ?? edge.fromID ?? ""
             let target = edge.target ?? edge.toID ?? ""
             guard ids.contains(source), ids.contains(target), source != target else { return nil }
             return SceneRelation(
                 id: "\(source)->\(target)", sourceId: source, targetId: target,
-                kind: edge.kind ?? edge.edgeType ?? "links_to")
+                kind: edge.kind ?? edge.edgeType ?? "links_to",
+                weight: edge.weight,
+                metadata: [
+                    "reason": .string(edge.reason ?? ""),
+                    "source": .string("native-search"),
+                ])
+        }
+        if relations.isEmpty {
+            relations = retrievalRelations(queryID: queryID, atoms: atoms)
         }
 
         let actions = atoms.compactMap { atom -> ActionDescriptor? in
@@ -106,6 +162,56 @@ public struct TheoremSearchClient: Sendable {
                 "query": .string(query),
                 "matched_count": .double(Double(native.rankedResults?.count ?? 0)),
                 "kept_count": .double(Double(atoms.count)),
+                "relation_count": .double(Double(relations.count)),
+                "backend": .string(TheoremSearchBackend.indexAPI.rawValue),
+            ])
+    }
+
+    static func scene(from substrate: RustyRedSubstrateSearch, tenant: String?, query: String) -> ScenePackageV2 {
+        let queryID = "query:\(stableQueryID(query))"
+        var atoms = [queryAtom(id: queryID, query: query)]
+        atoms.append(contentsOf: substrate.hits.map { hit in
+            atom(
+                id: hit.nodeID, url: hit.url, title: hit.title, snippet: hit.snippet,
+                ring: hit.ring, ringLabel: hit.ringLabel, score: hit.matchScore)
+        })
+
+        let ids = Set(atoms.map(\.id))
+        var relations = substrate.links.compactMap { link -> SceneRelation? in
+            guard ids.contains(link.source), ids.contains(link.target), link.source != link.target else {
+                return nil
+            }
+            return SceneRelation(
+                id: "\(link.source)->\(link.target)",
+                sourceId: link.source,
+                targetId: link.target,
+                kind: "LINKS_TO",
+                metadata: ["source": .string("rustyred-substrate")])
+        }
+        relations.append(contentsOf: retrievalRelations(queryID: queryID, atoms: atoms))
+
+        let actions = atoms.compactMap { atom -> ActionDescriptor? in
+            guard let url = atom.metadata["url"]?.stringValue, !url.isEmpty else { return nil }
+            return ActionDescriptor(
+                id: "open-\(atom.id)", label: "Open", actionType: "open-url",
+                interaction: "tap", target: atom.id, payload: ["url": .string(url)])
+        }
+
+        return ScenePackageV2(
+            id: "rustyred-search-\(UUID().uuidString)",
+            manifestRef: tenant ?? "rustyred-search",
+            atoms: atoms,
+            relations: relations,
+            projection: ProjectionBinding(id: ProjectionID.forceGraph.rawValue),
+            chrome: ChromeBinding(id: "rustyred_search_scene"),
+            actions: actions,
+            provenance: [
+                "source": .string("rustyred-thg-server"),
+                "query": .string(query),
+                "matched_count": .double(Double(substrate.matchedCount)),
+                "kept_count": .double(Double(substrate.keptCount)),
+                "relation_count": .double(Double(relations.count)),
+                "backend": .string(TheoremSearchBackend.rustyRed.rawValue),
             ])
     }
 
@@ -123,8 +229,39 @@ public struct TheoremSearchClient: Sendable {
                 "ring": .double(Double(ring)),
                 "ring_label": .string(ringLabel),
                 "match_score": .double(score),
+                "matchScore": .double(score),
             ],
             sourceRefs: [SourceRef(kind: "WebDoc", id: id, label: title, metadata: ["url": .string(url)])])
+    }
+
+    private static func queryAtom(id: String, query: String) -> SceneAtom {
+        SceneAtom(
+            id: id,
+            kind: "query",
+            label: query,
+            weight: 0.25,
+            lifecycle: "present",
+            metadata: [
+                "ring": .double(0),
+                "ring_label": .string("query"),
+                "match_score": .double(0.25),
+                "matchScore": .double(0.25),
+                "query": .string(query),
+            ])
+    }
+
+    private static func retrievalRelations(queryID: String, atoms: [SceneAtom]) -> [SceneRelation] {
+        atoms.compactMap { atom in
+            guard atom.id != queryID,
+                  atom.metadata["ring"]?.intValue == 0 else { return nil }
+            return SceneRelation(
+                id: "\(queryID)->RETRIEVED->\(atom.id)",
+                sourceId: queryID,
+                targetId: atom.id,
+                kind: "RETRIEVED",
+                weight: atom.weight,
+                metadata: ["source": .string("client-query-edge")])
+        }
     }
 
     private static func nodeID(_ id: String?, _ url: String?, fallback: String) -> String {
@@ -156,7 +293,60 @@ public struct TheoremSearchClient: Sendable {
         return nonEmpty(title) ?? (url.isEmpty ? "Result" : url)
     }
 
+    private static func stableQueryID(_ query: String) -> String {
+        String(query.lowercased().unicodeScalars.map(\.value).reduce(UInt32(2_166_136_261)) { hash, scalar in
+            (hash ^ scalar) &* 16_777_619
+        }, radix: 16)
+    }
+
+    private static var configuredBackend: TheoremSearchBackend {
+        let raw = UserDefaults.standard.string(forKey: "searchBackend")
+            ?? UserDefaults.standard.string(forKey: "theoremSearchBackend")
+        return raw.flatMap(TheoremSearchBackend.init(rawValue:)) ?? .rustyRed
+    }
+
+    private static func configuredBaseURL(for backend: TheoremSearchBackend) -> URL {
+        let raw = UserDefaults.standard.string(forKey: "searchBaseURL")
+            ?? UserDefaults.standard.string(forKey: "theoremSearchBaseURL")
+        if let raw, let url = URL(string: raw), !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return url
+        }
+        switch backend {
+        case .indexAPI:
+            return productionIndexAPIBaseURL
+        case .rustyRed:
+            return productionRustyRedBaseURL
+        }
+    }
+
+    private static var configuredTenant: String? {
+        nonEmpty(UserDefaults.standard.string(forKey: "searchTenant")
+            ?? UserDefaults.standard.string(forKey: "theoremSearchTenant"))
+    }
+
     // MARK: HTTP
+
+    private func get<Response: Decodable>(
+        _ path: String, queryItems: [URLQueryItem], response: Response.Type
+    ) async throws -> Response {
+        guard let base = URL(string: path, relativeTo: baseURL)?.absoluteURL,
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+            throw TheoremSearchError.invalidEndpoint(path)
+        }
+        components.queryItems = queryItems
+        guard let url = components.url else {
+            throw TheoremSearchError.invalidEndpoint(path)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, urlResponse) = try await dataLoader(request)
+        if let http = urlResponse as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw TheoremSearchError.httpStatus(http.statusCode)
+        }
+        return try JSONDecoder().decode(Response.self, from: data)
+    }
 
     private func post<Body: Encodable, Response: Decodable>(
         _ path: String, body: Body, response: Response.Type
@@ -176,6 +366,11 @@ public struct TheoremSearchClient: Sendable {
         }
         return try JSONDecoder().decode(Response.self, from: data)
     }
+}
+
+public enum TheoremSearchBackend: String, Sendable, Equatable {
+    case indexAPI = "index-api"
+    case rustyRed = "rustyred"
 }
 
 public enum TheoremSearchError: Error, Sendable, Equatable {
@@ -257,11 +452,56 @@ struct TheoremGraphEdge: Codable, Hashable, Sendable {
     let toID: String?
     let kind: String?
     let edgeType: String?
+    let weight: Double?
+    let reason: String?
 
     enum CodingKeys: String, CodingKey {
-        case source, target, kind
+        case source, target, kind, weight, reason
         case fromID = "from_id"
         case toID = "to_id"
         case edgeType = "edge_type"
     }
+}
+
+struct RustyRedSearchResponse: Codable, Hashable, Sendable {
+    let ok: Bool?
+    let tenant: String?
+    let search: RustyRedSubstrateSearch?
+    let error: String?
+}
+
+struct RustyRedSubstrateSearch: Codable, Hashable, Sendable {
+    let query: String
+    let hits: [RustyRedSearchHit]
+    let links: [RustyRedSearchLink]
+    let matchedCount: Int
+    let keptCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case query, hits, links
+        case matchedCount = "matched_count"
+        case keptCount = "kept_count"
+    }
+}
+
+struct RustyRedSearchHit: Codable, Hashable, Sendable {
+    let nodeID: String
+    let url: String
+    let title: String
+    let snippet: String
+    let ring: Int
+    let ringLabel: String
+    let matchScore: Double
+
+    enum CodingKeys: String, CodingKey {
+        case nodeID = "node_id"
+        case url, title, snippet, ring
+        case ringLabel = "ring_label"
+        case matchScore = "match_score"
+    }
+}
+
+struct RustyRedSearchLink: Codable, Hashable, Sendable {
+    let source: String
+    let target: String
 }

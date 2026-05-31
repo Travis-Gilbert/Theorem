@@ -16,6 +16,10 @@ public struct TheoremRootView: View {
 
     public init() {}
 
+    private var projectionAvailability: [ProjectionAvailability] {
+        TheoremProjectionEngine.availableProjections(for: package)
+    }
+
     /// Run a live substrate search and load the resulting scene into the graph.
     /// On failure, surface the error (honest) rather than a fabricated scene.
     @MainActor
@@ -57,7 +61,7 @@ public struct TheoremRootView: View {
     }
 
     public var body: some View {
-        ZStack(alignment: .top) {
+        ZStack(alignment: .bottom) {
             theme.background.ignoresSafeArea()
 
             TabView(selection: $surface) {
@@ -83,22 +87,18 @@ public struct TheoremRootView: View {
             }
             .theoremPagedTabStyle()
 
-            VStack(spacing: 0) {
-                DynamicIslandView(
-                    mode: $islandMode,
-                    query: $query,
-                    centerTitle: centerTitle,
-                    theme: theme,
-                    onSubmitQuery: { Task { await runSearch() } }
-                )
-                .padding(.top, 10)
-
-                Spacer()
-
-                SurfaceRail(selection: $surface, theme: theme)
-                    .padding(.horizontal, 18)
-                    .padding(.bottom, 12)
-            }
+            DynamicIslandView(
+                mode: $islandMode,
+                query: $query,
+                surface: $surface,
+                projection: $projection,
+                centerTitle: centerTitle,
+                projectionAvailability: projectionAvailability,
+                theme: theme,
+                onSubmitQuery: { Task { await runSearch() } }
+            )
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
 
             if isSearching {
                 Color.black.opacity(0.18).ignoresSafeArea()
@@ -195,13 +195,9 @@ struct HomeScenePage: View {
     @Binding var selectedNodeID: String?
     var theme: TheoremTheme
 
-    private var availability: [ProjectionAvailability] {
-        TheoremProjectionEngine.availableProjections(for: package)
-    }
-
     var body: some View {
         VStack(spacing: 18) {
-            Spacer(minLength: 82)
+            Spacer(minLength: 42)
 
             TheoremSceneView(
                 package: package,
@@ -211,13 +207,7 @@ struct HomeScenePage: View {
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            ProjectionPicker(
-                selection: $projection,
-                availability: availability,
-                theme: theme
-            )
-            .padding(.horizontal, 18)
-            .padding(.bottom, 72)
+            Spacer(minLength: 92)
         }
         .padding(.horizontal, 14)
     }

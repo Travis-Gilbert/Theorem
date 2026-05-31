@@ -15,19 +15,23 @@ public struct TheoremTheme: Equatable, Sendable {
     public var textPrimary: Color
     public var textSecondary: Color
 
+    /// Dark, cool-neutral ground (no beige). Jewel-tone node colors are tuned to
+    /// pop against the near-black surface instead of going muted on cream;
+    /// text/surface steps follow a perceptually-uniform dark scale. This is the
+    /// graph-exploration default — the canvas should recede, the data should glow.
     public static let defaultPalette = TheoremTheme(
-        nodeCore: Color(red: 0.86, green: 0.60, blue: 0.22),
-        nodeWeb: Color(red: 0.18, green: 0.57, blue: 0.55),
-        nodeTool: Color(red: 0.52, green: 0.38, blue: 0.70),
-        nodeDimmed: Color(red: 0.55, green: 0.57, blue: 0.58),
-        edge: Color(red: 0.34, green: 0.37, blue: 0.40).opacity(0.58),
-        ringMatch: Color(red: 0.78, green: 0.25, blue: 0.17),
-        ringAdjacent: Color(red: 0.18, green: 0.57, blue: 0.55),
-        ringNearby: Color(red: 0.64, green: 0.48, blue: 0.76),
-        background: Color(red: 0.94, green: 0.91, blue: 0.84),
-        surface: Color(red: 0.98, green: 0.96, blue: 0.91),
-        textPrimary: Color(red: 0.10, green: 0.11, blue: 0.12),
-        textSecondary: Color(red: 0.38, green: 0.40, blue: 0.42)
+        nodeCore: Color(red: 0.96, green: 0.71, blue: 0.27),    // amber / engine core
+        nodeWeb: Color(red: 0.24, green: 0.72, blue: 0.79),     // teal / substrate-web
+        nodeTool: Color(red: 0.62, green: 0.52, blue: 0.93),    // violet / tooling
+        nodeDimmed: Color(red: 0.44, green: 0.47, blue: 0.51),  // muted gray
+        edge: Color(red: 0.42, green: 0.46, blue: 0.52).opacity(0.55),
+        ringMatch: Color(red: 0.96, green: 0.42, blue: 0.25),   // hot coral / direct match
+        ringAdjacent: Color(red: 0.90, green: 0.58, blue: 0.36),// warm mid
+        ringNearby: Color(red: 0.56, green: 0.67, blue: 0.64),  // cool sage fade
+        background: Color(red: 0.063, green: 0.071, blue: 0.086),// near-black, slightly cool
+        surface: Color(red: 0.114, green: 0.129, blue: 0.153),  // lifted panel / island
+        textPrimary: Color(red: 0.93, green: 0.94, blue: 0.95), // near-white
+        textSecondary: Color(red: 0.60, green: 0.62, blue: 0.65)// muted
     )
 }
 

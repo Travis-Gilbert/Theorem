@@ -10,7 +10,10 @@ public enum DynamicIslandMode {
 struct DynamicIslandView: View {
     @Binding var mode: DynamicIslandMode
     @Binding var query: String
+    @Binding var surface: AppSurface
+    @Binding var projection: ProjectionID
     var centerTitle: String
+    var projectionAvailability: [ProjectionAvailability]
     var theme: TheoremTheme
     /// Called when the user submits a query in search mode. Wired to the live
     /// substrate search in `TheoremRootView`.
@@ -34,7 +37,7 @@ struct DynamicIslandView: View {
     private var collapsed: some View {
         HStack(spacing: 0) {
             Button {
-                mode = .ask
+                mode = .detail
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "sparkles")
@@ -59,9 +62,11 @@ struct DynamicIslandView: View {
             .buttonStyle(.plain)
         }
         .font(TheoremFonts.body(size: 14, relativeTo: .callout))
-        .foregroundStyle(theme.surface)
+        .foregroundStyle(theme.textPrimary)
         .frame(width: 326, height: 48)
-        .background(.black, in: Capsule())
+        .background(theme.surface, in: Capsule())
+        .overlay(Capsule().stroke(theme.textPrimary.opacity(0.10), lineWidth: 1))
+        .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
         .matchedGeometryEffect(id: "island", in: namespace)
         .sensoryFeedback(.selection, trigger: centerTitle)
     }
@@ -99,10 +104,12 @@ struct DynamicIslandView: View {
                         if mode == .search { onSubmitQuery() }
                     }
             }
+
+            controlDeck
         }
         .padding(18)
         .frame(width: 356)
-        .frame(minHeight: 116)
+        .frame(minHeight: 206)
         .background(theme.surface, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
@@ -122,6 +129,78 @@ struct DynamicIslandView: View {
             "Ask"
         case .detail:
             "Center node"
+        }
+    }
+
+    private var controlDeck: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                ForEach(AppSurface.allCases) { item in
+                    Button {
+                        surface = item
+                    } label: {
+                        Image(systemName: item.symbolName)
+                            .font(.system(size: 15, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 34)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(surface == item ? theme.surface : theme.textPrimary)
+                    .background(surface == item ? theme.textPrimary : theme.background.opacity(0.42))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .help(item.rawValue)
+                }
+            }
+
+            HStack(spacing: 8) {
+                ForEach(ProjectionID.allCases) { item in
+                    let availability = projectionAvailability.first { $0.id == item }
+                    let available = availability?.available == true
+                    Button {
+                        projection = item
+                    } label: {
+                        Label(item.title, systemImage: symbol(for: item))
+                            .labelStyle(.titleAndIcon)
+                            .font(TheoremFonts.mono(size: 10))
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 34)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(projectionForeground(for: item, available: available))
+                    .background(projectionBackground(for: item, available: available))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .disabled(!available)
+                    .help(availability?.reason ?? "")
+                }
+            }
+        }
+    }
+
+    private func projectionForeground(for item: ProjectionID, available: Bool) -> Color {
+        if !available {
+            return theme.nodeDimmed
+        }
+        return projection == item ? theme.surface : theme.textPrimary
+    }
+
+    private func projectionBackground(for item: ProjectionID, available: Bool) -> Color {
+        if !available {
+            return Color.clear
+        }
+        return projection == item ? theme.textPrimary : theme.background.opacity(0.42)
+    }
+
+    private func symbol(for projection: ProjectionID) -> String {
+        switch projection {
+        case .forceGraph:
+            "circle.hexagongrid"
+        case .radialRings:
+            "circle.dashed"
+        case .treeLayout:
+            "point.3.connected.trianglepath.dotted"
+        case .fractalExpansion:
+            "wave.3.forward"
         }
     }
 }
