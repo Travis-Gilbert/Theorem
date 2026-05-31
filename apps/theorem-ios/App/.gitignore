@@ -1,0 +1,6 @@
+# The Xcode project is generated from project.yml by XcodeGen — do not commit it.
+# Regenerate with: xcodegen generate --spec apps/theorem-ios/App/project.yml
+Theorem.xcodeproj/
+*.xcworkspace/xcuserdata/
+.build/
+DerivedData/
