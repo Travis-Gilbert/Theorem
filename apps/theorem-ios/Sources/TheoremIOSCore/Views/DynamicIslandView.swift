@@ -12,6 +12,9 @@ struct DynamicIslandView: View {
     @Binding var query: String
     var centerTitle: String
     var theme: TheoremTheme
+    /// Called when the user submits a query in search mode. Wired to the live
+    /// substrate search in `TheoremRootView`.
+    var onSubmitQuery: () -> Void = {}
 
     @Namespace private var namespace
 
@@ -91,6 +94,10 @@ struct DynamicIslandView: View {
                     .font(TheoremFonts.body(size: 18))
                     .foregroundStyle(theme.textPrimary)
                     .submitLabel(.search)
+                    .autocorrectionDisabled()
+                    .onSubmit {
+                        if mode == .search { onSubmitQuery() }
+                    }
             }
         }
         .padding(18)

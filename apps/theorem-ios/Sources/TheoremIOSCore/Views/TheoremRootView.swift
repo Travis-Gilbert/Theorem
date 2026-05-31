@@ -1,16 +1,60 @@
 import SwiftUI
 
 public struct TheoremRootView: View {
-    @State private var surface: AppSurface = .home
-    @State private var projection: ProjectionID = .forceGraph
+    @State private var surface: AppSurface = TheoremRootView.launchSurface
+    @State private var projection: ProjectionID = TheoremRootView.launchProjection
     @State private var islandMode: DynamicIslandMode = .idle
     @State private var query: String = ""
     @State private var selectedNodeID: String?
 
-    private let package = SampleScene.package
+    @State private var package: ScenePackageV2 = SampleScene.package
+    @State private var isSearching = false
+    @State private var searchError: String?
+
     private let theme = TheoremTheme.defaultPalette
+    private let searchClient = TheoremSearchClient()
 
     public init() {}
+
+    /// Run a live substrate search and load the resulting scene into the graph.
+    /// On failure, surface the error (honest) rather than a fabricated scene.
+    @MainActor
+    private func runSearch() async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isSearching else { return }
+        isSearching = true
+        searchError = nil
+        do {
+            let scene = try await searchClient.search(query: trimmed)
+            package = scene
+            projection = .forceGraph
+            selectedNodeID = nil
+            islandMode = .idle
+        } catch {
+            searchError = (error as? TheoremSearchError)?.message ?? "Search failed."
+        }
+        isSearching = false
+    }
+
+    /// Optional launch-argument overrides for the initial projection / surface
+    /// (deep-link + screenshot support), e.g.
+    /// `simctl launch ... -projection radial_rings -surface Projects`.
+    /// Default to Force / Home.
+    private static var launchProjection: ProjectionID {
+        if let raw = UserDefaults.standard.string(forKey: "projection"),
+           let projection = ProjectionID(rawValue: raw) {
+            return projection
+        }
+        return .forceGraph
+    }
+
+    private static var launchSurface: AppSurface {
+        if let raw = UserDefaults.standard.string(forKey: "surface"),
+           let surface = AppSurface(rawValue: raw) {
+            return surface
+        }
+        return .home
+    }
 
     public var body: some View {
         ZStack(alignment: .top) {
@@ -44,7 +88,8 @@ public struct TheoremRootView: View {
                     mode: $islandMode,
                     query: $query,
                     centerTitle: centerTitle,
-                    theme: theme
+                    theme: theme,
+                    onSubmitQuery: { Task { await runSearch() } }
                 )
                 .padding(.top, 10)
 
@@ -54,7 +99,45 @@ public struct TheoremRootView: View {
                     .padding(.horizontal, 18)
                     .padding(.bottom, 12)
             }
+
+            if isSearching {
+                Color.black.opacity(0.18).ignoresSafeArea()
+                ProgressView("Searching the substrate…")
+                    .tint(theme.textPrimary)
+                    .font(TheoremFonts.mono(size: 12))
+                    .foregroundStyle(theme.textPrimary)
+                    .padding(22)
+                    .background(theme.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .shadow(color: .black.opacity(0.18), radius: 24, y: 12)
+            }
+
+            if let searchError {
+                VStack(spacing: 0) {
+                    Spacer().frame(height: 72)
+                    Text(searchError)
+                        .font(TheoremFonts.mono(size: 12))
+                        .foregroundStyle(theme.surface)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 11)
+                        .background(theme.ringMatch, in: Capsule())
+                        .onTapGesture { self.searchError = nil }
+                        .padding(.horizontal, 24)
+                    Spacer()
+                }
+            }
         }
+        .task { await autoSearchIfRequested() }
+    }
+
+    /// Auto-run a search at launch when `-autoSearch <query>` is passed (deep-link
+    /// + screenshot capture).
+    @MainActor
+    private func autoSearchIfRequested() async {
+        guard let query = UserDefaults.standard.string(forKey: "autoSearch"),
+              !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        self.query = query
+        await runSearch()
     }
 
     private var centerTitle: String {
