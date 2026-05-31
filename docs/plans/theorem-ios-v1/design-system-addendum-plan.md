@@ -75,7 +75,7 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
 
 ## Phase D4 — Algorithm switcher revealed on search (not always-on)
 
-- [ ] **D4.1** Rework Codex's always-on `controlDeck`: idle home = field + the
+- [x] **D4.1** Rework Codex's always-on `controlDeck`: idle home = field + the
   search/ask pill only (no algorithm bar). Tap the SEARCH half → the pill expands
   upward and the algorithm options live INSIDE that expanded search surface
   (same Dynamic Island expand mechanic). After a scene resolves, the active

@@ -3,16 +3,20 @@ import SwiftUI
 public struct TheoremRootView: View {
     @State private var surface: AppSurface = TheoremRootView.launchSurface
     @State private var projection: ProjectionID = TheoremRootView.launchProjection
-    @State private var islandMode: DynamicIslandMode = .idle
+    @State private var islandMode: DynamicIslandMode = TheoremRootView.launchIslandMode
     @State private var query: String = ""
     @State private var selectedNodeID: String?
 
-    @State private var package: ScenePackageV2 = SampleScene.package
+    @State private var room: CommonplaceRoom = SampleRoom.room
     @State private var isSearching = false
     @State private var searchError: String?
 
     private let theme = TheoremTheme.defaultPalette
     private let searchClient = TheoremSearchClient()
+
+    private var package: ScenePackageV2 {
+        room.scene
+    }
 
     public init() {}
 
@@ -30,7 +34,7 @@ public struct TheoremRootView: View {
         searchError = nil
         do {
             let scene = try await searchClient.search(query: trimmed)
-            package = scene
+            room = room.replacingScene(scene, ask: trimmed)
             projection = .forceGraph
             selectedNodeID = nil
             islandMode = .idle
@@ -60,13 +64,23 @@ public struct TheoremRootView: View {
         return .home
     }
 
+    /// `-islandMode search` opens the island already expanded (deep-link +
+    /// screenshot capture of the on-search algorithm switcher). Defaults to idle.
+    private static var launchIslandMode: DynamicIslandMode {
+        if let raw = UserDefaults.standard.string(forKey: "islandMode"),
+           let mode = DynamicIslandMode(rawValue: raw) {
+            return mode
+        }
+        return .idle
+    }
+
     public var body: some View {
         ZStack(alignment: .bottom) {
             theme.background.ignoresSafeArea()
 
             TabView(selection: $surface) {
-                HomeScenePage(
-                    package: package,
+                CommonplaceRoomView(
+                    room: room,
                     projection: $projection,
                     selectedNodeID: $selectedNodeID,
                     theme: theme
@@ -86,11 +100,17 @@ public struct TheoremRootView: View {
                     .tag(AppSurface.artifacts)
             }
             .theoremPagedTabStyle()
+            .safeAreaInset(edge: .top) {
+                // Surfaces are a distinct concern from projections (addendum D4):
+                // they get their own affordance, not the search-control island.
+                SurfaceRail(selection: $surface, theme: theme)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+            }
 
             DynamicIslandView(
                 mode: $islandMode,
                 query: $query,
-                surface: $surface,
                 projection: $projection,
                 centerTitle: centerTitle,
                 projectionAvailability: projectionAvailability,
@@ -167,7 +187,7 @@ private extension View {
 public enum AppSurface: String, CaseIterable, Identifiable {
     case home = "Home"
     case projects = "Projects"
-    case models = "Models"
+    case models = "Participants"
     case build = "Build"
     case artifacts = "Artifacts"
 
@@ -180,36 +200,12 @@ public enum AppSurface: String, CaseIterable, Identifiable {
         case .projects:
             "folder"
         case .models:
-            "cpu"
+            "person.2"
         case .build:
             "hammer"
         case .artifacts:
             "archivebox"
         }
-    }
-}
-
-struct HomeScenePage: View {
-    var package: ScenePackageV2
-    @Binding var projection: ProjectionID
-    @Binding var selectedNodeID: String?
-    var theme: TheoremTheme
-
-    var body: some View {
-        VStack(spacing: 18) {
-            Spacer(minLength: 42)
-
-            TheoremSceneView(
-                package: package,
-                projection: projection,
-                selectedNodeID: $selectedNodeID,
-                theme: theme
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            Spacer(minLength: 92)
-        }
-        .padding(.horizontal, 14)
     }
 }
 
@@ -239,11 +235,11 @@ struct SurfacePlaceholder: View {
     private var surfaceCopy: String {
         switch surface {
         case .home:
-            "Graph-native search and reason."
+            "Ask over the substrate room."
         case .projects:
             "Scoped containers and file-glyph workspaces."
         case .models:
-            "Model selection for hosted GL-fusion or user keys."
+            "Team presence and brought-agent endpoints."
         case .build:
             "Agent, skill, and plugin scaffolds."
         case .artifacts:
