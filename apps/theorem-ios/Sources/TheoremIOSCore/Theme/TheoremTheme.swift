@@ -1,6 +1,14 @@
 import SwiftUI
 import CoreText
 
+/// The instrument register (SPEC-THEOREM-IOS-V1-ADDENDUM-DESIGN.md): a Braun-era
+/// workbench. Warm off-white matte surfaces, warm-near-black ink, oxblood as the
+/// single functional accent (selection/active, 2-3% of any view), blueprint-blue
+/// as a second structural ink (the hex watermark). NOT dark, NOT beige-cozy.
+///
+/// The stored fields keep their original names (existing views read them); the
+/// VALUES are remapped to instrument tokens, and `field/chrome/ink/signal/rule/…`
+/// aliases give new code the design-language names.
 public struct TheoremTheme: Equatable, Sendable {
     public var nodeCore: Color
     public var nodeWeb: Color
@@ -14,38 +22,53 @@ public struct TheoremTheme: Equatable, Sendable {
     public var surface: Color
     public var textPrimary: Color
     public var textSecondary: Color
+    /// Deep cyanotype ink — the MT19937 hex watermark + optional second structural
+    /// ink. An ink, never a surface (do not tint the chrome blue).
+    public var blueprintInk: Color
 
-    /// Dark, cool-neutral ground (no beige). Jewel-tone node colors are tuned to
-    /// pop against the near-black surface instead of going muted on cream;
-    /// text/surface steps follow a perceptually-uniform dark scale. This is the
-    /// graph-exploration default — the canvas should recede, the data should glow.
+    // Instrument-language aliases (map onto the stored fields).
+    public var field: Color { background }      // #F6F5F2 working surface
+    public var chrome: Color { surface }        // #EAE8E2 chrome zones / island
+    public var pebble: Color { nodeDimmed }     // secondary fills / disabled
+    public var ink: Color { textPrimary }       // primary type + graph linework
+    public var signal: Color { ringMatch }      // OXBLOOD — selection/active only
+    public var rule: Color { edge }             // zone-boundary + graph edge lines
+    public var textMuted: Color { textSecondary }
+    public var hairline: Color { textPrimary.opacity(0.12) }
+    public var ruleStrong: Color { textPrimary.opacity(0.72) }
+
+    /// The instrument palette. The graph is monochrome — node fills are the field
+    /// color (drawn as ink outlines in `TheoremSceneView`); the only hue anywhere
+    /// is oxblood `signal` on selection and `blueprintInk` in the hex watermark.
     public static let defaultPalette = TheoremTheme(
-        nodeCore: Color(red: 0.96, green: 0.71, blue: 0.27),    // amber / engine core
-        nodeWeb: Color(red: 0.24, green: 0.72, blue: 0.79),     // teal / substrate-web
-        nodeTool: Color(red: 0.62, green: 0.52, blue: 0.93),    // violet / tooling
-        nodeDimmed: Color(red: 0.44, green: 0.47, blue: 0.51),  // muted gray
-        edge: Color(red: 0.42, green: 0.46, blue: 0.52).opacity(0.55),
-        ringMatch: Color(red: 0.96, green: 0.42, blue: 0.25),   // hot coral / direct match
-        ringAdjacent: Color(red: 0.90, green: 0.58, blue: 0.36),// warm mid
-        ringNearby: Color(red: 0.56, green: 0.67, blue: 0.64),  // cool sage fade
-        background: Color(red: 0.063, green: 0.071, blue: 0.086),// near-black, slightly cool
-        surface: Color(red: 0.114, green: 0.129, blue: 0.153),  // lifted panel / island
-        textPrimary: Color(red: 0.93, green: 0.94, blue: 0.95), // near-white
-        textSecondary: Color(red: 0.60, green: 0.62, blue: 0.65)// muted
+        nodeCore: Color(red: 0.965, green: 0.961, blue: 0.949),  // field (node fill)
+        nodeWeb: Color(red: 0.965, green: 0.961, blue: 0.949),   // field
+        nodeTool: Color(red: 0.965, green: 0.961, blue: 0.949),  // field
+        nodeDimmed: Color(red: 0.784, green: 0.769, blue: 0.737),// pebble #C8C4BC
+        edge: Color(red: 0.165, green: 0.157, blue: 0.137).opacity(0.42), // rule
+        ringMatch: Color(red: 0.482, green: 0.180, blue: 0.149), // OXBLOOD #7B2E26
+        ringAdjacent: Color(red: 0.965, green: 0.961, blue: 0.949), // field
+        ringNearby: Color(red: 0.965, green: 0.961, blue: 0.949),   // field
+        background: Color(red: 0.965, green: 0.961, blue: 0.949), // FIELD #F6F5F2
+        surface: Color(red: 0.918, green: 0.910, blue: 0.886),   // CHROME #EAE8E2
+        textPrimary: Color(red: 0.165, green: 0.157, blue: 0.137),// INK #2A2823
+        textSecondary: Color(red: 0.165, green: 0.157, blue: 0.137).opacity(0.62), // muted
+        blueprintInk: Color(red: 0.122, green: 0.251, blue: 0.388) // #1F4063
     )
 }
 
-/// Type tokens. Two distinct faces (Travis: not a one-font app), both OFL so
-/// they ship in the binary:
-///   - display: Archivo Black — a heavy grotesque standing in for Berthold
-///     Akzidenz-Grotesk (which has no embed license). For headers, the Dynamic
-///     Island readout, surface titles.
-///   - body: IBM Plex Sans (variable; `.fontWeight()` drives the weight axis).
-///   - mono: the system monospaced face for technical labels.
+/// Type tokens — the instrument font stack (all OFL, bundled):
+///   - display: Karrik (hero + section headers; replaces Berthold/Archivo Black —
+///     display presence without the heaviness)
+///   - body: IBM Plex Sans (variable)
+///   - mono / data: JetBrains Mono (numbers, IDs, edge-label values; tabular)
+///   - flavor: Terminal Grotesque (code/flavor labels, scramble-text — NOT data)
 /// Views read these tokens; no hardcoded font names in views.
 public enum TheoremFonts {
-    public static let displayFamily = "Archivo Black"
+    public static let displayFamily = "Karrik"
     public static let bodyFamily = "IBM Plex Sans"
+    public static let dataFamily = "JetBrains Mono"
+    public static let flavorFamily = "Terminal Grotesque"
 
     public static func display(size: CGFloat, relativeTo textStyle: Font.TextStyle = .largeTitle) -> Font {
         .custom(displayFamily, size: size, relativeTo: textStyle)
@@ -55,21 +78,32 @@ public enum TheoremFonts {
         .custom(bodyFamily, size: size, relativeTo: textStyle)
     }
 
-    public static func mono(size: CGFloat, relativeTo textStyle: Font.TextStyle = .caption) -> Font {
-        .system(size: size, weight: .medium, design: .monospaced)
+    /// Instrument label (eyebrow / caption): Plex Sans semibold, set uppercase +
+    /// tracked at the call site.
+    public static func label(size: CGFloat, relativeTo textStyle: Font.TextStyle = .caption) -> Font {
+        .custom(bodyFamily, size: size, relativeTo: textStyle).weight(.semibold)
     }
 
-    /// Register the bundled OFL faces with CoreText. SwiftPM-bundled fonts are
-    /// not auto-registered (unlike an app target's `UIAppFonts` Info.plist), so
-    /// the app calls this once at launch. Idempotent. If a face is missing,
-    /// `.custom` falls back to the system face (honest, never a crash).
+    /// Data readouts (numbers, IDs, edge values) — JetBrains Mono, tabular.
+    public static func mono(size: CGFloat, relativeTo textStyle: Font.TextStyle = .caption) -> Font {
+        .custom(dataFamily, size: size, relativeTo: textStyle)
+    }
+
+    /// Code-interface / flavor chrome — Terminal Grotesque. NOT for numeric data.
+    public static func flavor(size: CGFloat, relativeTo textStyle: Font.TextStyle = .caption) -> Font {
+        .custom(flavorFamily, size: size, relativeTo: textStyle)
+    }
+
+    /// Register every bundled .ttf with CoreText (SwiftPM resources are not
+    /// auto-registered). Idempotent. Missing face → `.custom` falls back to the
+    /// system face (honest, never a crash).
     public static func registerBundledFonts() {
         guard !didRegister else { return }
         didRegister = true
-        for name in ["ArchivoBlack-Regular", "IBMPlexSans"] {
-            let url = Bundle.module.url(forResource: name, withExtension: "ttf")
-                ?? Bundle.module.url(forResource: name, withExtension: "ttf", subdirectory: "Fonts")
-            guard let url else { continue }
+        let urls = (Bundle.module.urls(forResourcesWithExtension: "ttf", subdirectory: nil) ?? [])
+            + (Bundle.module.urls(forResourcesWithExtension: "ttf", subdirectory: "Fonts") ?? [])
+        var seen = Set<String>()
+        for url in urls where seen.insert(url.lastPathComponent).inserted {
             CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
         }
     }

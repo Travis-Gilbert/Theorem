@@ -44,25 +44,44 @@ struct TheoremSceneView: View {
     }
 
     private var sceneHeader: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(projection.title)
-                .font(TheoremFonts.mono(size: 11))
+        VStack(alignment: .leading, spacing: 5) {
+            // Instrument label: "FORCE · 5 NODES" — small, muted, tracked.
+            Text(sceneCaption)
+                .font(TheoremFonts.label(size: 11))
                 .textCase(.uppercase)
-                .foregroundStyle(theme.textSecondary)
-            Text(selectedTitle)
-                .font(TheoremFonts.display(size: 30, relativeTo: .title))
-                .foregroundStyle(theme.textPrimary)
-                .lineLimit(2)
+                .tracking(0.9)
+                .foregroundStyle(theme.textMuted)
+            // The query / center-node name is the headline — never a generic title.
+            if let headline = sceneHeadline {
+                Text(headline)
+                    .font(TheoremFonts.display(size: 22, relativeTo: .title2))
+                    .foregroundStyle(theme.ink)
+                    .lineLimit(2)
+            }
         }
-        .frame(maxWidth: 250, alignment: .leading)
+        .frame(maxWidth: 280, alignment: .leading)
     }
 
-    private var selectedTitle: String {
-        guard let selectedNodeID,
-              let atom = package.atoms.first(where: { $0.id == selectedNodeID }) else {
-            return "Substrate Scene"
+    private var sceneCaption: String {
+        "\(projection.title) · \(package.atoms.count) NODES"
+    }
+
+    /// The prominent type: the selected node, else the search query, else the
+    /// center node (highest match_score) — never a generic screen title.
+    private var sceneHeadline: String? {
+        if let selectedNodeID,
+           let atom = package.atoms.first(where: { $0.id == selectedNodeID }) {
+            return atom.label ?? atom.id
         }
-        return atom.label ?? atom.id
+        if let query = package.provenance["query"]?.stringValue,
+           !query.trimmingCharacters(in: .whitespaces).isEmpty {
+            return query
+        }
+        if let center = TheoremProjectionEngine.centerNodeID(in: package, mode: .pprMass),
+           let atom = package.atoms.first(where: { $0.id == center }) {
+            return atom.label ?? atom.id
+        }
+        return nil
     }
 
     private func positionMap(in size: CGSize) -> [String: CGPoint] {
@@ -112,12 +131,14 @@ struct TheoremSceneView: View {
             }
             let radius = radius(for: atom)
             let rect = CGRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2)
-            let color = color(for: atom)
-            context.fill(Path(ellipseIn: rect), with: .color(color))
+            // Monochrome instrument node: field fill, ink outline. Selection is the
+            // only hue — the node flips to oxblood at a heavier stroke.
+            let selected = atom.id == selectedNodeID
+            context.fill(Path(ellipseIn: rect), with: .color(theme.field))
             context.stroke(
-                Path(ellipseIn: rect.insetBy(dx: -3, dy: -3)),
-                with: .color(atom.id == selectedNodeID ? theme.ringMatch : theme.surface.opacity(0.72)),
-                lineWidth: atom.id == selectedNodeID ? 3 : 1
+                Path(ellipseIn: rect),
+                with: .color(selected ? theme.signal : theme.ink),
+                lineWidth: selected ? 2 : 1.2
             )
         }
     }
@@ -138,25 +159,5 @@ struct TheoremSceneView: View {
     private func radius(for atom: SceneAtom) -> Double {
         let score = atom.metadata["matchScore"]?.doubleValue ?? atom.weight ?? 0.1
         return 8 + min(max(score, 0.05), 1.0) * 18
-    }
-
-    private func color(for atom: SceneAtom) -> Color {
-        switch atom.kind {
-        case "core":
-            theme.nodeCore
-        case "web":
-            theme.nodeWeb
-        case "tool":
-            theme.nodeTool
-        default:
-            switch atom.metadata["ring"]?.intValue {
-            case 0:
-                theme.ringMatch
-            case 1:
-                theme.ringAdjacent
-            default:
-                theme.ringNearby
-            }
-        }
     }
 }

@@ -66,7 +66,7 @@ struct DynamicIslandView: View {
         .frame(width: 326, height: 48)
         .background(theme.surface, in: Capsule())
         .overlay(Capsule().stroke(theme.textPrimary.opacity(0.10), lineWidth: 1))
-        .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
+        .shadow(color: theme.ink.opacity(0.12), radius: 10, y: 3)
         .matchedGeometryEffect(id: "island", in: namespace)
         .sensoryFeedback(.selection, trigger: centerTitle)
     }
@@ -115,7 +115,7 @@ struct DynamicIslandView: View {
             RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(theme.textPrimary.opacity(0.08), lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.16), radius: 30, x: 0, y: 18)
+        .shadow(color: theme.ink.opacity(0.10), radius: 22, x: 0, y: 12)
         .matchedGeometryEffect(id: "island", in: namespace)
     }
 

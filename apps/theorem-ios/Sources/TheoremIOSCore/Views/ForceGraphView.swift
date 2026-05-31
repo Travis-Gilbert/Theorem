@@ -21,14 +21,17 @@ struct ForceGraphView: View {
 
         ForceDirectedGraph(states: graphState) {
             Series(package.atoms) { atom in
+                // Monochrome instrument node: field fill, ink outline (mirrors
+                // TheoremSceneView's Canvas renderer so switching is continuous).
                 NodeMark(id: atom.id)
                     .symbol(.circle)
                     .symbolSize(radius: 6 + (magnitude(atom) / maxMag) * 16)
-                    .foregroundStyle(color(for: atom))
-                    .stroke(theme.background, StrokeStyle(lineWidth: 1.0))
+                    .foregroundStyle(theme.field)
+                    .stroke(theme.ink, StrokeStyle(lineWidth: 1.2))
             }
             Series(package.relations) { relation in
                 LinkMark(from: relation.sourceId, to: relation.targetId)
+                    .stroke(theme.rule, StrokeStyle(lineWidth: 1.2))
             }
         } force: {
             // Charge / link tuning carried from the proven SERP force graph.
@@ -49,27 +52,5 @@ struct ForceGraphView: View {
     /// PPR mass for radius (matches TheoremSceneView's `radius(for:)`).
     private func magnitude(_ atom: SceneAtom) -> Double {
         atom.metadata["matchScore"]?.doubleValue ?? atom.weight ?? 0.1
-    }
-
-    /// Node color (matches TheoremSceneView's `color(for:)`): kind first, then
-    /// ring (the search-derived hop-distance signal).
-    private func color(for atom: SceneAtom) -> Color {
-        switch atom.kind {
-        case "core":
-            return theme.nodeCore
-        case "web":
-            return theme.nodeWeb
-        case "tool":
-            return theme.nodeTool
-        default:
-            switch atom.metadata["ring"]?.intValue {
-            case 0:
-                return theme.ringMatch
-            case 1:
-                return theme.ringAdjacent
-            default:
-                return theme.ringNearby
-            }
-        }
     }
 }

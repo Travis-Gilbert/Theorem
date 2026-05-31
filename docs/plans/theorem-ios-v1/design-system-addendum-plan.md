@@ -23,14 +23,14 @@ recommends (A); (B) is the lighter v1. Needs the user before the patent renderer
 
 The biggest immediate visual shift; replaces the dark theme. No backend dependency.
 
-- [ ] **D1.1** Replace `TheoremTheme.defaultPalette` with the instrument tokens:
+- [x] **D1.1** Replace `TheoremTheme.defaultPalette` with the instrument tokens:
   field `#F6F5F2`, chrome `#EAE8E2` (deepen to `#E2E0DA` if more zone separation
   wanted — do NOT tint blue), pebble `#C8C4BC`, edge `#2A2823`, hairline
   `rgba(42,40,35,0.12)`, rule `…0.42`, rule-strong `…0.72`, blueprint-ink
   `#1F4063`, signal/oxblood `#7B2E26`, text-muted `…0.62`, text-faint `…0.42`.
   Re-map the role names (nodeCore/web/tool/ring* collapse — the graph is now
   monochrome; keep `signal` for selection only). Backref: "Color tokens".
-- [ ] **D1.2** Font stack (all OFL, extract from the Downloads zips → bundle +
+- [x] **D1.2** Font stack (all OFL, extract from the Downloads zips → bundle +
   register): **Karrik** Regular = display + section headers (REPLACES Archivo
   Black; hero 32px one-per-surface, headers 22/17px); IBM Plex Sans = body 14/400
   (already bundled); **JetBrains Mono** = data readouts 13/500 tabular;
@@ -38,7 +38,7 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
   ornament (optional, file as texture). Update `TheoremFonts`: `display` →
   Karrik, add `data` (JetBrains Mono) + `flavor` (Terminal Grotesque) tokens.
   Backref: "Font stack".
-- [ ] **D1.3** Hierarchy flip: kill the giant `selectedTitle`/"Substrate Scene"
+- [x] **D1.3** Hierarchy flip: kill the giant `selectedTitle`/"Substrate Scene"
   screen-title. The **query** is the headline (Karrik or Plex SemiCondensed 600,
   ~22px); the scene-type caption ("FORCE · 5 NODES") is a small muted
   instrument-label above it (Plex Sans 600, 11px, uppercase, +0.08em tracking,
@@ -47,7 +47,8 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
 
 ## Phase D2 — Monochrome ink graph + restored annotations
 
-- [ ] **D2.1** Graph goes monochrome (remove the jewel-tone node colors):
+- [x] **D2.1** Graph goes monochrome (remove the jewel-tone node colors):
+  *(done in the D1 pass — TheoremSceneView Canvas + ForceGraphView Grape hero)*
   nodes = `edge` ink outline (1.2px) filled with `field`; edges = `rule` lines;
   selection flips the node to `signal`/oxblood at 2px stroke. Edit
   `TheoremSceneView` `color(for:)` / draw. Backref: "Color tokens" graph para +
