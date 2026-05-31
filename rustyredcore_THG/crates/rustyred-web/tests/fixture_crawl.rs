@@ -2,15 +2,17 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
-use rustyred_thg_core::{InMemoryGraphStore, NodeQuery, TTL_PROPERTY};
+use rustyred_thg_core::{InMemoryGraphStore, NodeQuery};
+use rustyred_web::TTL_PROPERTY;
 use rustyred_web::{
-    build_fixture_crawl_graph, build_v2_fixture_crawl, canonicalize_url, extract_links,
-    extract_links_with_profile, guarded_canonicalize_url, profile_for, run_live_crawl_with_options,
-    CrawlBudget, CrawlConfig, CrawlRequest, CrawlScope, FixturePage, LiveFetchOptions,
-    RustyWebError, SourceClass, UrlGuardPolicy, EDGE_CANONICAL_OF, EDGE_EMITTED_RECEIPT,
-    EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, EDGE_ON_DOMAIN, EDGE_RESULTED_IN, EDGE_SEEDED,
-    LABEL_CONTENT_SNAPSHOT, LABEL_CRAWL_RECEIPT, LABEL_CRAWL_RUN, LABEL_DISCOVERY_SEED,
-    LABEL_DOMAIN, LABEL_FETCH_ATTEMPT, LABEL_PAGE, LABEL_ROBOTS_POLICY,
+    build_fixture_crawl_graph, build_v2_fixture_crawl, build_web_commons_fragment,
+    canonicalize_url, extract_links, extract_links_with_profile, guarded_canonicalize_url,
+    profile_for, run_live_crawl_with_options, CrawlBudget, CrawlConfig, CrawlRequest, CrawlScope,
+    FixturePage, LiveFetchOptions, RustyWebError, SourceClass, UrlGuardPolicy,
+    WebCommonsFragmentOptions, EDGE_CANONICAL_OF, EDGE_EMITTED_RECEIPT, EDGE_HAS_SNAPSHOT,
+    EDGE_LINKS_TO, EDGE_ON_DOMAIN, EDGE_RESULTED_IN, EDGE_SEEDED, LABEL_CONTENT_SNAPSHOT,
+    LABEL_CRAWL_RECEIPT, LABEL_CRAWL_RUN, LABEL_DISCOVERY_SEED, LABEL_DOMAIN, LABEL_FETCH_ATTEMPT,
+    LABEL_PAGE, LABEL_ROBOTS_POLICY,
 };
 use serde_json::json;
 
@@ -220,6 +222,44 @@ fn v2_fixture_crawl_emits_receipt_ttl_license_and_seed_nodes() {
 }
 
 #[test]
+fn web_commons_fragment_bounds_text_and_strips_provenance_by_default() {
+    let mut request = CrawlRequest::new(
+        "rw-commons-1",
+        vec!["https://example.com/index.html".to_string()],
+    );
+    request.scope.federable = true;
+    request.scope.actor_id = "operator-a".to_string();
+    request.scope.source_license = "CC0".to_string();
+    let output = build_v2_fixture_crawl(
+        request.clone(),
+        &[FixturePage::html(
+            "https://example.com/index.html",
+            "<html><body>alpha beta gamma delta</body></html>",
+        )],
+    )
+    .unwrap();
+
+    let fragment = build_web_commons_fragment(
+        &output,
+        &request,
+        "peer-1",
+        &WebCommonsFragmentOptions {
+            include_provenance: false,
+            snapshot_text_bytes: 10,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fragment.peer_id, "peer-1");
+    assert_eq!(fragment.pages.len(), 1);
+    assert_eq!(fragment.snapshots.len(), 1);
+    assert_eq!(fragment.source_licenses[0].source_license, "CC0");
+    assert!(fragment.provenance.is_none());
+    assert!(fragment.snapshots[0].text.len() <= 10);
+    assert!(!fragment.signing_bytes().unwrap().is_empty());
+}
+
+#[test]
 fn url_guard_blocks_metadata_loopback_and_private_ips() {
     let policy = UrlGuardPolicy::default();
 
@@ -287,6 +327,51 @@ async fn live_fetch_loop_feeds_the_v2_receipt_contract() {
         .and_then(|value| value.as_str())
         .unwrap()
         .contains("Live fixture"));
+}
+
+#[tokio::test]
+async fn live_frontier_fetches_discovered_links_within_depth() {
+    let url = spawn_path_server(vec![
+        (
+            "/",
+            200,
+            "text/html; charset=utf-8",
+            r#"<html><body><h1>Root</h1><a href="/next">Next</a></body></html>"#,
+        ),
+        (
+            "/next",
+            200,
+            "text/html; charset=utf-8",
+            r#"<html><body><h1>Second frontier page</h1></body></html>"#,
+        ),
+    ]);
+    let mut request = CrawlRequest::new("rw-live-frontier", vec![url]);
+    request.budget = CrawlBudget {
+        max_pages: 2,
+        max_seconds: 5,
+        max_depth: 1,
+        max_bytes: 16_384,
+    };
+    request.scope.follow_offsite = false;
+
+    let output = run_live_crawl_with_options(request, &live_test_options())
+        .await
+        .unwrap();
+
+    assert_eq!(output.receipt.status, "completed");
+    assert_eq!(output.receipt.counters.fetched_pages, 2);
+    assert_eq!(output.receipt.counters.snapshots, 2);
+    assert_eq!(output.receipt.counters.links, 1);
+    assert!(output.graph.nodes().into_iter().any(|node| {
+        node.labels
+            .iter()
+            .any(|label| label == LABEL_CONTENT_SNAPSHOT)
+            && node
+                .properties
+                .get("text")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| text.contains("Second frontier page"))
+    }));
 }
 
 #[tokio::test]
@@ -361,6 +446,40 @@ async fn live_fetch_loop_blocks_robots_disallow() {
     ));
 }
 
+#[tokio::test]
+async fn live_fetch_loop_skips_discovered_robots_disallow() {
+    let url = spawn_path_server(vec![
+        (
+            "/robots.txt",
+            200,
+            "text/plain",
+            "User-agent: *\nAllow: /\nDisallow: /private\n",
+        ),
+        (
+            "/",
+            200,
+            "text/html; charset=utf-8",
+            r#"<html><body><h1>Public page</h1><a href="/private">Private</a></body></html>"#,
+        ),
+    ]);
+    let mut request = CrawlRequest::new("rw-live-robots-discovered-deny", vec![url]);
+    request.budget = CrawlBudget {
+        max_pages: 2,
+        max_seconds: 5,
+        max_depth: 1,
+        max_bytes: 8192,
+    };
+    request.scope.follow_offsite = false;
+
+    let output = run_live_crawl_with_options(request, &live_robots_options(true))
+        .await
+        .unwrap();
+
+    assert_eq!(output.receipt.counters.fetched_pages, 1);
+    assert_eq!(output.receipt.counters.snapshots, 1);
+    assert_eq!(output.receipt.counters.links, 1);
+}
+
 fn live_test_options() -> LiveFetchOptions {
     live_robots_options(false)
 }
@@ -404,6 +523,36 @@ fn spawn_sequence_server(responses: Vec<(u16, &'static str, &'static str)>) -> S
             let _ = stream.read(&mut request_buf);
             let response = format!(
                 "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    format!("http://{address}/")
+}
+
+fn spawn_path_server(routes: Vec<(&'static str, u16, &'static str, &'static str)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for _ in 0..routes.len() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_buf = [0; 2048];
+            let read = stream.read(&mut request_buf).unwrap_or_default();
+            let request = String::from_utf8_lossy(&request_buf[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let route = routes
+                .iter()
+                .find(|(candidate, _, _, _)| *candidate == path)
+                .unwrap_or(&("/", 404, "text/plain", "not found"));
+            let (_, status, content_type, body) = *route;
+            let reason = if status == 404 { "Not Found" } else { "OK" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();

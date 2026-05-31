@@ -1,14 +1,14 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::net::IpAddr;
 use std::rc::Rc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lol_html::{element, HtmlRewriter, Settings};
 use rustyred_thg_core::{
     EdgeRecord, GraphMutation, GraphMutationBatch, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphWriteResult, NodeRecord, Provenance, TTL_PROPERTY,
+    GraphWriteResult, NodeRecord, Provenance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -22,6 +22,8 @@ pub const LABEL_CONTENT_SNAPSHOT: &str = "ContentSnapshot";
 pub const LABEL_ROBOTS_POLICY: &str = "RobotsPolicy";
 pub const LABEL_CRAWL_RECEIPT: &str = "CrawlReceipt";
 pub const LABEL_DISCOVERY_SEED: &str = "DiscoverySeed";
+pub const LABEL_WEB_COMMONS_PEER: &str = "WebCommonsPeer";
+pub const LABEL_WEB_COMMONS_ATTESTATION: &str = "WebCommonsAttestation";
 
 pub const EDGE_FETCHED: &str = "FETCHED";
 pub const EDGE_RESULTED_IN: &str = "RESULTED_IN";
@@ -32,6 +34,12 @@ pub const EDGE_ROBOTS_APPLIED: &str = "ROBOTS_APPLIED";
 pub const EDGE_CANONICAL_OF: &str = "CANONICAL_OF";
 pub const EDGE_EMITTED_RECEIPT: &str = "EMITTED_RECEIPT";
 pub const EDGE_SEEDED: &str = "SEEDED";
+pub const EDGE_SUBMITTED_BY: &str = "SUBMITTED_BY";
+pub const EDGE_ATTESTS_PAGE: &str = "ATTESTS_PAGE";
+
+pub const TTL_PROPERTY: &str = "_ttl_expires_at_ms";
+pub const WEB_COMMONS_PROTOCOL_VERSION: u32 = 1;
+pub const DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES: usize = 4096;
 
 pub type FetchedPage = FixturePage;
 
@@ -144,7 +152,7 @@ impl Default for CrawlScope {
             namespace: "link".to_string(),
             follow_offsite: true,
             ttl_expires_at_ms: None,
-            source_graph: "theorem_crawler".to_string(),
+            source_graph: "rustyweb_crawler".to_string(),
             source_license: "unknown".to_string(),
             federable: false,
             actor_id: String::new(),
@@ -226,6 +234,153 @@ pub struct CrawlRunOutput {
     pub receipt: CrawlReceipt,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebCommonsFragmentOptions {
+    pub include_provenance: bool,
+    pub snapshot_text_bytes: usize,
+}
+
+impl Default for WebCommonsFragmentOptions {
+    fn default() -> Self {
+        Self {
+            include_provenance: false,
+            snapshot_text_bytes: DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebCommonsFragment {
+    pub protocol_version: u32,
+    pub peer_id: String,
+    pub graph_delta_hash: String,
+    pub pages: Vec<PageRecord>,
+    pub snapshots: Vec<SnapshotRecord>,
+    pub domains: Vec<DomainRecord>,
+    pub edges: Vec<LinkEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CrawlProvenance>,
+    #[serde(default)]
+    pub source_licenses: Vec<SourceLicense>,
+    #[serde(default)]
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebCommonsUnsignedFragment {
+    pub protocol_version: u32,
+    pub peer_id: String,
+    pub graph_delta_hash: String,
+    pub pages: Vec<PageRecord>,
+    pub snapshots: Vec<SnapshotRecord>,
+    pub domains: Vec<DomainRecord>,
+    pub edges: Vec<LinkEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CrawlProvenance>,
+    #[serde(default)]
+    pub source_licenses: Vec<SourceLicense>,
+}
+
+impl WebCommonsFragment {
+    pub fn unsigned_payload(&self) -> WebCommonsUnsignedFragment {
+        WebCommonsUnsignedFragment {
+            protocol_version: self.protocol_version,
+            peer_id: self.peer_id.clone(),
+            graph_delta_hash: self.graph_delta_hash.clone(),
+            pages: self.pages.clone(),
+            snapshots: self.snapshots.clone(),
+            domains: self.domains.clone(),
+            edges: self.edges.clone(),
+            provenance: self.provenance.clone(),
+            source_licenses: self.source_licenses.clone(),
+        }
+    }
+
+    pub fn signing_bytes(&self) -> RustyWebResult<Vec<u8>> {
+        serde_json::to_vec(&self.unsigned_payload()).map_err(|err| RustyWebError::InvalidFragment {
+            reason: format!("failed to canonicalize Web Commons fragment: {err}"),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PageRecord {
+    pub id: String,
+    pub url: String,
+    pub domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    pub source_class: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRecord {
+    pub id: String,
+    pub page_id: String,
+    pub content_hash: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DomainRecord {
+    pub domain: String,
+    pub page_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LinkEdge {
+    pub from_page_id: String,
+    pub to_page_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CrawlProvenance {
+    pub run_id: String,
+    pub seeds: Vec<String>,
+    pub budget: CrawlBudget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceLicense {
+    pub domain: String,
+    pub source_graph: String,
+    pub source_license: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebCommonsPageDisposition {
+    pub page_id: String,
+    pub url: String,
+    pub disposition: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebCommonsReceipt {
+    pub accepted: bool,
+    pub peer_id: String,
+    pub graph_delta_hash: String,
+    pub accepted_pages: usize,
+    pub dropped_pages: usize,
+    pub dispositions: Vec<WebCommonsPageDisposition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebCommonsIngestPlan {
+    pub batch: GraphMutationBatch,
+    pub receipt: WebCommonsReceipt,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrawlGraph {
     pub run_id: String,
@@ -274,6 +429,7 @@ pub enum RustyWebError {
     EmptySeeds,
     InvalidBudget { reason: String },
     BlockedUrl { url: String, reason: String },
+    InvalidFragment { reason: String },
 }
 
 impl fmt::Display for RustyWebError {
@@ -290,6 +446,7 @@ impl fmt::Display for RustyWebError {
             Self::EmptySeeds => write!(f, "crawl request requires at least one seed URL"),
             Self::InvalidBudget { reason } => write!(f, "invalid crawl budget: {reason}"),
             Self::BlockedUrl { url, reason } => write!(f, "blocked URL {url:?}: {reason}"),
+            Self::InvalidFragment { reason } => write!(f, "invalid Web Commons fragment: {reason}"),
         }
     }
 }
@@ -574,13 +731,394 @@ pub async fn run_live_crawl_with_options(
     build_v2_fixture_crawl_with_policy(request, &pages, &options.guard_policy)
 }
 
+pub fn build_web_commons_fragment(
+    output: &CrawlRunOutput,
+    request: &CrawlRequest,
+    peer_id: impl Into<String>,
+    options: &WebCommonsFragmentOptions,
+) -> RustyWebResult<WebCommonsFragment> {
+    let peer_id = peer_id.into();
+    if peer_id.trim().is_empty() {
+        return Err(RustyWebError::InvalidFragment {
+            reason: "peer_id is required".to_string(),
+        });
+    }
+
+    let nodes = output.graph.nodes();
+    let edges = output.graph.edges();
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut attempt_by_page: BTreeMap<String, &NodeRecord> = BTreeMap::new();
+    let mut snapshot_page: BTreeMap<String, String> = BTreeMap::new();
+
+    for edge in &edges {
+        if edge.edge_type == EDGE_RESULTED_IN {
+            if let Some(attempt) = node_by_id.get(&edge.from_id) {
+                attempt_by_page.insert(edge.to_id.clone(), *attempt);
+            }
+        } else if edge.edge_type == EDGE_HAS_SNAPSHOT {
+            snapshot_page.insert(edge.to_id.clone(), edge.from_id.clone());
+        }
+    }
+
+    let mut pages = Vec::new();
+    let mut page_domains: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut licenses: BTreeMap<String, SourceLicense> = BTreeMap::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.labels.iter().any(|label| label == LABEL_PAGE))
+    {
+        let Some(url) = property_string(&node.properties, "url")
+            .or_else(|| property_string(&node.properties, "canonical_url"))
+        else {
+            continue;
+        };
+        let domain = property_string(&node.properties, "domain")
+            .unwrap_or_else(|| domain_for_url(&url).unwrap_or_default());
+        let source_class = property_string(&node.properties, "source_class").unwrap_or_else(|| {
+            Url::parse(&url)
+                .ok()
+                .map(|parsed| classify_url(&parsed).as_str().to_string())
+                .unwrap_or_else(|| SourceClass::Unknown.as_str().to_string())
+        });
+        let attempt = attempt_by_page.get(&node.id).copied();
+        let status = attempt.and_then(|attempt| property_u16(&attempt.properties, "status"));
+        let fetched_at =
+            attempt.and_then(|attempt| property_string(&attempt.properties, "fetched_at"));
+        pages.push(PageRecord {
+            id: node.id.clone(),
+            url: url.clone(),
+            domain: domain.clone(),
+            title: property_string(&node.properties, "title"),
+            status,
+            fetched_at,
+            source_class,
+        });
+        page_domains
+            .entry(domain.clone())
+            .or_default()
+            .push(node.id.clone());
+        licenses.entry(domain).or_insert_with(|| SourceLicense {
+            domain: property_string(&node.properties, "domain").unwrap_or_default(),
+            source_graph: property_string(&node.properties, "source_graph")
+                .unwrap_or_else(|| request.scope.source_graph.clone()),
+            source_license: property_string(&node.properties, "source_license")
+                .unwrap_or_else(|| request.scope.source_license.clone()),
+        });
+    }
+
+    let mut snapshots = Vec::new();
+    for node in nodes.iter().filter(|node| {
+        node.labels
+            .iter()
+            .any(|label| label == LABEL_CONTENT_SNAPSHOT)
+    }) {
+        let Some(page_id) = snapshot_page.get(&node.id).cloned() else {
+            continue;
+        };
+        let content_hash = property_string(&node.properties, "content_hash").unwrap_or_else(|| {
+            node.id
+                .strip_prefix("content_snapshot:")
+                .unwrap_or(&node.id)
+                .to_string()
+        });
+        let content_type = attempt_by_page
+            .get(&page_id)
+            .and_then(|attempt| property_string(&attempt.properties, "content_type"));
+        snapshots.push(SnapshotRecord {
+            id: node.id.clone(),
+            page_id,
+            content_hash,
+            text: bounded_text(
+                property_string(&node.properties, "text").unwrap_or_default(),
+                options.snapshot_text_bytes,
+            ),
+            content_type,
+        });
+    }
+
+    let mut domains = page_domains
+        .into_iter()
+        .map(|(domain, mut page_ids)| {
+            page_ids.sort();
+            page_ids.dedup();
+            DomainRecord { domain, page_ids }
+        })
+        .collect::<Vec<_>>();
+    let mut link_edges = edges
+        .iter()
+        .filter(|edge| edge.edge_type == EDGE_LINKS_TO)
+        .map(|edge| LinkEdge {
+            from_page_id: edge.from_id.clone(),
+            to_page_id: edge.to_id.clone(),
+            anchor: property_string(&edge.properties, "anchor"),
+        })
+        .collect::<Vec<_>>();
+    let mut source_licenses = licenses.into_values().collect::<Vec<_>>();
+
+    pages.sort_by(|left, right| left.id.cmp(&right.id));
+    snapshots.sort_by(|left, right| left.id.cmp(&right.id));
+    domains.sort_by(|left, right| left.domain.cmp(&right.domain));
+    link_edges.sort_by(|left, right| {
+        left.from_page_id
+            .cmp(&right.from_page_id)
+            .then_with(|| left.to_page_id.cmp(&right.to_page_id))
+    });
+    source_licenses.sort_by(|left, right| left.domain.cmp(&right.domain));
+
+    Ok(WebCommonsFragment {
+        protocol_version: WEB_COMMONS_PROTOCOL_VERSION,
+        peer_id,
+        graph_delta_hash: output.receipt.graph_delta_hash.clone(),
+        pages,
+        snapshots,
+        domains,
+        edges: link_edges,
+        provenance: options.include_provenance.then(|| CrawlProvenance {
+            run_id: request.run_id.clone(),
+            seeds: request.seeds.clone(),
+            budget: request.budget.clone(),
+            actor_id: (!request.scope.actor_id.is_empty()).then(|| request.scope.actor_id.clone()),
+        }),
+        source_licenses,
+        signature: String::new(),
+    })
+}
+
+pub fn build_web_commons_ingest_plan(
+    fragment: &WebCommonsFragment,
+    receipt: WebCommonsReceipt,
+) -> RustyWebResult<WebCommonsIngestPlan> {
+    if fragment.protocol_version != WEB_COMMONS_PROTOCOL_VERSION {
+        return Err(RustyWebError::InvalidFragment {
+            reason: format!("unsupported protocol_version {}", fragment.protocol_version),
+        });
+    }
+    if fragment.pages.is_empty() {
+        return Err(RustyWebError::InvalidFragment {
+            reason: "fragment requires at least one page".to_string(),
+        });
+    }
+
+    let disposition_by_page = receipt
+        .dispositions
+        .iter()
+        .map(|disposition| (disposition.page_id.clone(), disposition))
+        .collect::<BTreeMap<_, _>>();
+    let accepted_pages = disposition_by_page
+        .iter()
+        .filter_map(|(page_id, disposition)| {
+            (disposition.disposition != "dropped").then(|| page_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let page_by_id = fragment
+        .pages
+        .iter()
+        .map(|page| (page.id.clone(), page))
+        .collect::<BTreeMap<_, _>>();
+    let license_by_domain = fragment
+        .source_licenses
+        .iter()
+        .map(|license| (license.domain.clone(), license))
+        .collect::<BTreeMap<_, _>>();
+    let mut mutations = Vec::new();
+    let peer_node_id = web_commons_peer_id(&fragment.peer_id);
+
+    mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+        peer_node_id.clone(),
+        [LABEL_WEB_COMMONS_PEER],
+        json!({
+            "peer_id": fragment.peer_id,
+            "trust_context": "web_commons",
+            "trust_tier": "unknown",
+            "trust_weight": 0.3,
+            "last_graph_delta_hash": fragment.graph_delta_hash,
+        }),
+    )));
+
+    for domain in &fragment.domains {
+        let accepted_domain_pages = domain
+            .page_ids
+            .iter()
+            .filter(|page_id| accepted_pages.contains(*page_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if accepted_domain_pages.is_empty() {
+            continue;
+        }
+        mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+            domain_id(&domain.domain),
+            [LABEL_DOMAIN],
+            json!({
+                "domain": domain.domain,
+                "page_ids": accepted_domain_pages,
+                "namespace": "web_commons",
+                "source_graph": "web_commons",
+                "federable": true,
+            }),
+        )));
+    }
+
+    for page in &fragment.pages {
+        if !accepted_pages.contains(&page.id) {
+            continue;
+        }
+        let disposition =
+            disposition_by_page
+                .get(&page.id)
+                .ok_or_else(|| RustyWebError::InvalidFragment {
+                    reason: format!("missing disposition for page {}", page.id),
+                })?;
+        let license = license_by_domain.get(&page.domain);
+        mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+            page.id.clone(),
+            [LABEL_PAGE],
+            json!({
+                "url": page.url,
+                "domain": page.domain,
+                "title": page.title,
+                "status": page.status,
+                "fetched_at": page.fetched_at,
+                "source_class": page.source_class,
+                "namespace": "web_commons",
+                "source_graph": license
+                    .map(|license| license.source_graph.as_str())
+                    .unwrap_or("web_commons"),
+                "source_license": license
+                    .map(|license| license.source_license.as_str())
+                    .unwrap_or("unknown"),
+                "federable": true,
+                "page_state": "federated",
+                "admission_tier": disposition.disposition,
+                "admission_reason": disposition.reason,
+                "peer_id": fragment.peer_id,
+                "graph_delta_hash": fragment.graph_delta_hash,
+            }),
+        )));
+        mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+            web_commons_attestation_id(&fragment.peer_id, &fragment.graph_delta_hash, &page.id),
+            [LABEL_WEB_COMMONS_ATTESTATION],
+            json!({
+                "peer_id": fragment.peer_id,
+                "page_id": page.id,
+                "domain": page.domain,
+                "source_class": page.source_class,
+                "fetched_at": page.fetched_at,
+                "graph_delta_hash": fragment.graph_delta_hash,
+                "admission_tier": disposition.disposition,
+            }),
+        )));
+        let attestation_id =
+            web_commons_attestation_id(&fragment.peer_id, &fragment.graph_delta_hash, &page.id);
+        mutations.push(GraphMutation::EdgeUpsert(EdgeRecord::new(
+            edge_id(&attestation_id, EDGE_SUBMITTED_BY, &peer_node_id),
+            attestation_id.clone(),
+            EDGE_SUBMITTED_BY,
+            peer_node_id.clone(),
+            json!({"trust_context": "web_commons"}),
+        )));
+        mutations.push(GraphMutation::EdgeUpsert(EdgeRecord::new(
+            edge_id(&attestation_id, EDGE_ATTESTS_PAGE, &page.id),
+            attestation_id,
+            EDGE_ATTESTS_PAGE,
+            page.id.clone(),
+            json!({"graph_delta_hash": fragment.graph_delta_hash}),
+        )));
+    }
+
+    for snapshot in &fragment.snapshots {
+        if !accepted_pages.contains(&snapshot.page_id) {
+            continue;
+        }
+        mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+            snapshot.id.clone(),
+            [LABEL_CONTENT_SNAPSHOT],
+            json!({
+                "content_hash": snapshot.content_hash,
+                "hash_algorithm": "blake3",
+                "text": snapshot.text,
+                "byte_len": snapshot.text.len(),
+                "content_type": snapshot.content_type,
+                "namespace": "web_commons",
+                "source_graph": "web_commons",
+                "federable": true,
+                "peer_id": fragment.peer_id,
+                "graph_delta_hash": fragment.graph_delta_hash,
+            }),
+        )));
+        mutations.push(GraphMutation::EdgeUpsert(EdgeRecord::new(
+            edge_id(&snapshot.page_id, EDGE_HAS_SNAPSHOT, &snapshot.id),
+            snapshot.page_id.clone(),
+            EDGE_HAS_SNAPSHOT,
+            snapshot.id.clone(),
+            json!({"source": "web_commons"}),
+        )));
+    }
+
+    for link in &fragment.edges {
+        if !accepted_pages.contains(&link.from_page_id)
+            || !accepted_pages.contains(&link.to_page_id)
+        {
+            continue;
+        }
+        let admission_tier = match (
+            disposition_by_page.get(&link.from_page_id),
+            disposition_by_page.get(&link.to_page_id),
+        ) {
+            (Some(from), Some(to))
+                if from.disposition == "canonical" && to.disposition == "canonical" =>
+            {
+                "canonical"
+            }
+            _ => "probationary",
+        };
+        mutations.push(GraphMutation::EdgeUpsert(EdgeRecord::new(
+            edge_id(&link.from_page_id, EDGE_LINKS_TO, &link.to_page_id),
+            link.from_page_id.clone(),
+            EDGE_LINKS_TO,
+            link.to_page_id.clone(),
+            json!({
+                "source": "web_commons",
+                "anchor": link.anchor,
+                "admission_tier": admission_tier,
+                "peer_id": fragment.peer_id,
+                "graph_delta_hash": fragment.graph_delta_hash,
+            }),
+        )));
+
+        if let Some(page) = page_by_id.get(&link.to_page_id) {
+            mutations.push(GraphMutation::EdgeUpsert(EdgeRecord::new(
+                edge_id(&link.to_page_id, EDGE_ON_DOMAIN, &domain_id(&page.domain)),
+                link.to_page_id.clone(),
+                EDGE_ON_DOMAIN,
+                domain_id(&page.domain),
+                json!({"source": "web_commons"}),
+            )));
+        }
+    }
+
+    Ok(WebCommonsIngestPlan {
+        batch: GraphMutationBatch { mutations },
+        receipt,
+    })
+}
+
 pub async fn fetch_seed_pages(
     request: &CrawlRequest,
     options: &LiveFetchOptions,
 ) -> RustyWebResult<Vec<FetchedPage>> {
     let seeds = validate_crawl_request(request, &options.guard_policy)?;
+    let seed_domains = seeds
+        .iter()
+        .filter_map(|seed| domain_for_url(seed).ok())
+        .collect::<BTreeSet<_>>();
     let mut effective_options = options.clone();
-    effective_options.timeout_seconds = options.timeout_seconds.min(request.budget.max_seconds);
+    effective_options.timeout_seconds = options
+        .timeout_seconds
+        .min(request.budget.max_seconds)
+        .max(1);
     let fetcher = FetchCascade::new(FetchCascadeOptions {
         user_agent: effective_options.user_agent.clone(),
         timeout_seconds: effective_options.timeout_seconds,
@@ -588,37 +1126,80 @@ pub async fn fetch_seed_pages(
     let mut pages = Vec::new();
     let mut remaining_bytes = request.budget.max_bytes;
     let mut last_fetch_by_domain: BTreeMap<String, Instant> = BTreeMap::new();
+    let deadline = Instant::now() + Duration::from_secs(request.budget.max_seconds);
+    let mut seen = BTreeSet::new();
+    let mut frontier = VecDeque::new();
 
-    for seed in seeds.into_iter().take(request.budget.max_pages) {
-        if remaining_bytes == 0 {
+    for seed in seeds {
+        if seen.insert(seed.clone()) {
+            frontier.push_back((seed, 0usize));
+        }
+    }
+
+    while let Some((url, depth)) = frontier.pop_front() {
+        if remaining_bytes == 0 || pages.len() >= request.budget.max_pages {
             break;
         }
-        if effective_options.respect_robots {
-            let decision = global_robots_cache()
-                .check(fetcher.client(), &seed, &effective_options.user_agent)
-                .await?;
-            if !decision.allowed {
-                return Err(RustyWebError::BlockedUrl {
-                    url: seed,
-                    reason: format!("robots disallowed: {}", decision.reason),
-                });
-            }
-            honor_crawl_delay(&seed, &decision, &mut last_fetch_by_domain).await?;
+        if Instant::now() >= deadline {
+            break;
         }
 
-        let result = fetcher.fetch_with_promotion(&seed, remaining_bytes).await?;
+        if effective_options.respect_robots {
+            let decision = global_robots_cache()
+                .check(fetcher.client(), &url, &effective_options.user_agent)
+                .await?;
+            if !decision.allowed {
+                if depth == 0 {
+                    return Err(RustyWebError::BlockedUrl {
+                        url,
+                        reason: format!("robots disallowed: {}", decision.reason),
+                    });
+                }
+                continue;
+            }
+            honor_crawl_delay(&url, &decision, &mut last_fetch_by_domain).await?;
+        }
+
+        let result = fetcher.fetch_with_promotion(&url, remaining_bytes).await?;
+        let final_url =
+            guarded_canonicalize_url(&result.final_url, &effective_options.guard_policy)?;
         let page = FetchedPage {
-            url: result.final_url,
+            url: final_url,
             status: result.http_status,
             body: String::from_utf8_lossy(&result.html_bytes).into_owned(),
             content_type: result.content_type,
             fetched_at: current_unix_ms_string(),
         };
         remaining_bytes = remaining_bytes.saturating_sub(page.body.len());
+        if depth < request.budget.max_depth
+            && (200..400).contains(&page.status)
+            && page.content_type.to_ascii_lowercase().contains("html")
+        {
+            for target in extract_links_for_url(&page.url, &page.body)? {
+                let Ok(target) = guarded_canonicalize_url(&target, &effective_options.guard_policy)
+                else {
+                    continue;
+                };
+                if !request.scope.follow_offsite
+                    && !target_stays_on_seed_domains(&seed_domains, &target)
+                {
+                    continue;
+                }
+                if seen.insert(target.clone()) {
+                    frontier.push_back((target, depth + 1));
+                }
+            }
+        }
         pages.push(page);
     }
 
     Ok(pages)
+}
+
+fn target_stays_on_seed_domains(seed_domains: &BTreeSet<String>, target_url: &str) -> bool {
+    domain_for_url(target_url)
+        .map(|domain| seed_domains.contains(&domain))
+        .unwrap_or(false)
 }
 
 pub fn apply_batch_to_store(
@@ -925,6 +1506,32 @@ fn insert_scope_properties(properties: &mut Map<String, Value>, scope: &CrawlSco
     }
 }
 
+fn property_string(properties: &Value, key: &str) -> Option<String> {
+    properties
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn property_u16(properties: &Value, key: &str) -> Option<u16> {
+    properties
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+}
+
+fn bounded_text(text: String, max_bytes: usize) -> String {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 fn provenance_for_scope(scope: &CrawlScope) -> Provenance {
     Provenance {
         source_id: Some(scope.source_graph.clone()),
@@ -1142,6 +1749,17 @@ fn robots_policy_id(domain: &str) -> String {
 
 fn discovery_seed_id(seed: &str) -> String {
     format!("discovery_seed:{}", stable_part(seed))
+}
+
+fn web_commons_peer_id(peer_id: &str) -> String {
+    format!("web_commons_peer:{}", stable_part(peer_id))
+}
+
+fn web_commons_attestation_id(peer_id: &str, graph_delta_hash: &str, page_id: &str) -> String {
+    format!(
+        "web_commons_attestation:{}",
+        stable_part(&format!("{peer_id}:{graph_delta_hash}:{page_id}"))
+    )
 }
 
 fn crawl_receipt_id(run_id: &str, graph_delta_hash: &str) -> String {

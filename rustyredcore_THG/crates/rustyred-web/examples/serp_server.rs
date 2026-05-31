@@ -60,15 +60,30 @@ fn seed_store() -> InMemoryGraphStore {
             "http://pomology.example/cultivation",
             r#"<h1>Cultivation</h1><p>Grafting, pruning, and pollination.</p> <a href="/orchard">orchard</a>"#,
         ),
-        page("http://pomology.example/soil", r#"<h1>Soil</h1><p>Loam and drainage.</p>"#),
-        page("http://pomology.example/rootstock", r#"<h1>Rootstock</h1><p>Dwarfing rootstocks.</p>"#),
-        page("http://pomology.example/honeycrisp", r#"<h1>Honeycrisp</h1><p>A crisp apple cultivar.</p>"#),
-        page("http://pomology.example/fuji", r#"<h1>Fuji</h1><p>A sweet apple cultivar.</p>"#),
+        page(
+            "http://pomology.example/soil",
+            r#"<h1>Soil</h1><p>Loam and drainage.</p>"#,
+        ),
+        page(
+            "http://pomology.example/rootstock",
+            r#"<h1>Rootstock</h1><p>Dwarfing rootstocks.</p>"#,
+        ),
+        page(
+            "http://pomology.example/honeycrisp",
+            r#"<h1>Honeycrisp</h1><p>A crisp apple cultivar.</p>"#,
+        ),
+        page(
+            "http://pomology.example/fuji",
+            r#"<h1>Fuji</h1><p>A sweet apple cultivar.</p>"#,
+        ),
         page(
             "http://tropical.example/banana",
             r#"<h1>Banana</h1><p>Bananas are tropical herbs.</p> <a href="/plantain">plantain</a>"#,
         ),
-        page("http://tropical.example/plantain", r#"<h1>Plantain</h1><p>A cooking banana.</p>"#),
+        page(
+            "http://tropical.example/plantain",
+            r#"<h1>Plantain</h1><p>A cooking banana.</p>"#,
+        ),
     ];
     let seeds = pages.iter().map(|p| p.url.clone()).collect();
     let output =
@@ -149,14 +164,28 @@ fn handle(stream: &mut TcpStream, store: &InMemoryGraphStore) {
     // The handler Codex's Servo interception mirrors: query -> search -> render.
     let search = search_substrate(store, &query, SearchOptions::default());
     match path.as_str() {
-        "/search.json" => write_response(stream, "200 OK", "application/json", &serp_payload_json(&search)),
+        "/search.json" => write_response(
+            stream,
+            "200 OK",
+            "application/json",
+            &serp_payload_json(&search),
+        ),
         "/favicon.ico" => write_response(stream, "404 Not Found", "text/plain", "no favicon"),
-        _ => write_response(stream, "200 OK", "text/html; charset=utf-8", &render_serp_html(&search)),
+        _ => write_response(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            &render_serp_html(&search),
+        ),
     }
 
     eprintln!(
         "{} q={:?} -> {} matches / {} nodes / {} links",
-        path, query, search.matched_count, search.kept_count, search.links.len()
+        path,
+        query,
+        search.matched_count,
+        search.kept_count,
+        search.links.len()
     );
 }
 

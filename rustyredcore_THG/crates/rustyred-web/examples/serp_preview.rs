@@ -7,7 +7,7 @@
 //! the data is a fixture web, and the SERP it renders is the real renderer that
 //! ships and draws real browser-search output in production.
 //!
-//!   cargo run -p rustyred-web --example serp_preview -- /tmp/theorem-serp.html apple
+//!   cargo run -p rustyred-web --example serp_preview -- /tmp/rustyweb-serp.html apple
 
 use std::env;
 use std::fs;
@@ -89,7 +89,7 @@ fn main() {
 
     let path = env::args()
         .nth(1)
-        .unwrap_or_else(|| "/tmp/theorem-serp.html".to_string());
+        .unwrap_or_else(|| "/tmp/rustyweb-serp.html".to_string());
     let query = env::args().nth(2).unwrap_or_else(|| "apple".to_string());
 
     let search = search_substrate(&store, &query, SearchOptions::default());
