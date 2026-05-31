@@ -10,7 +10,7 @@ use std::env;
 use std::fs;
 
 use scene_os_core::{
-    AtomLifecycle, ChromeBinding, ProjectionBinding, SceneAtom, SceneRelation, ScenePackageV2,
+    AtomLifecycle, ChromeBinding, ProjectionBinding, SceneAtom, ScenePackageV2, SceneRelation,
 };
 use scene_os_web::render_scene;
 
@@ -48,16 +48,28 @@ fn relation(id: &str, source: &str, target: &str) -> SceneRelation {
 }
 
 fn main() {
-    let out = env::args().nth(1).unwrap_or_else(|| "/tmp/scene-sample.html".to_string());
+    let out = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/scene-sample.html".to_string());
 
     let package = ScenePackageV2 {
         version: "scene-package-v2".to_string(),
         id: "sample-1".to_string(),
         manifest_ref: "sample".to_string(),
         atoms: vec![
-            atom("claim", "claim", "Cities with protected bike lanes see fewer injuries", Some(3.0)),
+            atom(
+                "claim",
+                "claim",
+                "Cities with protected bike lanes see fewer injuries",
+                Some(3.0),
+            ),
             atom("ev1", "evidence", "Seville network study, 2013", Some(2.0)),
-            atom("ev2", "evidence", "Copenhagen injury rate decline", Some(2.0)),
+            atom(
+                "ev2",
+                "evidence",
+                "Copenhagen injury rate decline",
+                Some(2.0),
+            ),
             atom("src1", "source", "Transport journal A", Some(1.0)),
             atom("src2", "source", "Municipal dataset", Some(1.0)),
             atom("src3", "source", "Cohort survey", Some(1.0)),

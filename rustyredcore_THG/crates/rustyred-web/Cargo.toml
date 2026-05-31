@@ -2,7 +2,7 @@
 name = "rustyred-web"
 version = "0.1.0"
 edition = "2021"
-description = "RustyWeb graph-native crawler kernel for Theorem."
+description = "RustyWeb graph-native crawler and search kernel for Theorem/Theseus."
 license = "MIT"
 rust-version = "1.85"
 

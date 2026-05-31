@@ -9,16 +9,30 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rustyred_thg_adapters::execute_adapter_command;
 use rustyred_thg_core::commands::{ThgCommand, ThgRequest, ThgResponse};
 use rustyred_thg_core::errors::ThgError;
 use rustyred_thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
 use rustyred_thg_core::{
-    stable_hash, CodeKgManifest, Direction, EdgeRecord, EpistemicType, GraphStats, GraphStoreError,
-    HarnessInstantKg, NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
+    checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
+    merge_graph_snapshots, stable_hash, update_graph_ref, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphMergeStrategy, GraphSnapshot,
+    GraphStats, GraphStoreError, GraphVersionRepository, HarnessInstantKg, InMemoryGraphStore,
+    NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
 };
 use rustyred_thg_mcp::{
     agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
+};
+use rustyred_web::{
+    apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
+    render_serp_html, run_live_crawl, search_substrate, CrawlBudget, CrawlReceipt, CrawlRequest,
+    CrawlScope, PageRecord, RustyWebError, SearchOptions, WebCommonsFragment,
+    WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt, EDGE_LINKS_TO,
+    LABEL_PAGE, LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -75,6 +89,72 @@ pub struct GraphQueryBody {
     pub graph: Value,
     #[serde(default)]
     pub params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CrawlRouteBody {
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub budget: Option<CrawlBudget>,
+    #[serde(default)]
+    pub scope: Option<CrawlScope>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct LiveSearchRequest {
+    #[serde(default, alias = "query")]
+    pub q: Option<String>,
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub budget: Option<CrawlBudget>,
+    #[serde(default)]
+    pub scope: Option<CrawlScope>,
+    #[serde(default)]
+    pub crawl: Option<bool>,
+    #[serde(default)]
+    pub min_hits: Option<usize>,
+    #[serde(default)]
+    pub min_links: Option<usize>,
+    #[serde(default)]
+    pub max_pages: Option<usize>,
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FederateSubmitBody {
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub federable: Option<bool>,
+    #[serde(default)]
+    pub graph_delta_hash: Option<String>,
+    #[serde(default)]
+    pub receipt: Option<CrawlReceipt>,
+    #[serde(default)]
+    pub fragment: Option<WebCommonsFragment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,15 +266,73 @@ pub struct TransactionMutationBody {
     pub tenant_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionDiffBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub target: Option<GraphSnapshot>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionRefBody {
+    #[serde(default)]
+    pub repository: Option<GraphVersionRepository>,
+    #[serde(default)]
+    pub updated_at_unix_ms: Option<u128>,
+    #[serde(flatten)]
+    pub options: GraphCompileOptions,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionLogBody {
+    pub repository: GraphVersionRepository,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionCheckoutBody {
+    pub repository: GraphVersionRepository,
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionMergeBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub ours: Option<GraphSnapshot>,
+    pub theirs: GraphSnapshot,
+    #[serde(flatten)]
+    pub options: GraphMergeOptions,
+}
+
 fn default_k() -> usize {
     10
 }
 fn default_max_hops() -> usize {
     3
 }
+const LIVE_SEARCH_DEFAULT_MIN_HITS: usize = 3;
+const LIVE_SEARCH_DEFAULT_MIN_LINKS: usize = 1;
+const LIVE_SEARCH_DEFAULT_MAX_PAGES: usize = 8;
+const LIVE_SEARCH_DEFAULT_MAX_SECONDS: u64 = 20;
+const LIVE_SEARCH_DEFAULT_MAX_DEPTH: usize = 1;
+const LIVE_SEARCH_DEFAULT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const LIVE_SEARCH_HARD_MAX_PAGES: usize = 25;
+const LIVE_SEARCH_HARD_MAX_SECONDS: u64 = 30;
+const LIVE_SEARCH_HARD_MAX_DEPTH: usize = 2;
+const LIVE_SEARCH_HARD_MAX_BYTES: usize = 5 * 1024 * 1024;
+
 pub fn build_router(state: AppState) -> Router {
     let cors = cors_layer(&state);
     Router::new()
+        .route("/", get(search_home))
+        .route("/search", get(search_html))
+        .route("/search.json", get(search_json))
+        .route("/search/live", get(search_live))
+        .route("/search/answer", post(search_answer))
+        .route("/crawl", post(crawl_submit))
+        .route("/federate/submit", post(federate_submit))
         .route("/health", get(health))
         .route("/health/", get(health))
         .route("/ready", get(ready))
@@ -259,6 +397,30 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/tenants/:tenant_id/graph/rebuild-indexes",
             post(graph_rebuild_indexes),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/compile",
+            post(graph_version_compile),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/diff",
+            post(graph_version_diff),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/ref",
+            post(graph_version_ref),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/log",
+            post(graph_version_log_route),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/checkout",
+            post(graph_version_checkout),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/merge",
+            post(graph_version_merge),
         )
         .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
         .route(
@@ -425,6 +587,1194 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+async fn search_home(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    render_search_response(
+        &state,
+        &headers,
+        SearchQuery {
+            q: None,
+            tenant: None,
+        },
+    )
+}
+
+async fn search_html(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> axum::response::Response {
+    render_search_response(&state, &headers, query)
+}
+
+async fn search_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> axum::response::Response {
+    match execute_search(&state, &headers, &query) {
+        Ok((tenant_id, search)) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "search": search
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn search_live(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveSearchRequest>,
+) -> axum::response::Response {
+    execute_live_search(&state, &headers, query).await
+}
+
+async fn search_answer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LiveSearchRequest>,
+) -> axum::response::Response {
+    execute_live_search(&state, &headers, body).await
+}
+
+async fn execute_live_search(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: LiveSearchRequest,
+) -> axum::response::Response {
+    let search_query = SearchQuery {
+        q: request.q.clone(),
+        tenant: request.tenant.clone(),
+    };
+    let (tenant_id, initial) = match execute_search(state, headers, &search_query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+
+    let query_text = request.q.as_deref().unwrap_or_default().trim();
+    let min_hits = request.min_hits.unwrap_or(LIVE_SEARCH_DEFAULT_MIN_HITS);
+    let min_links = request.min_links.unwrap_or(LIVE_SEARCH_DEFAULT_MIN_LINKS);
+    let crawl_enabled = request.crawl.unwrap_or(true);
+    if !crawl_enabled
+        || query_text.is_empty()
+        || !live_search_is_sparse(&initial, min_hits, min_links)
+    {
+        let reason = if !crawl_enabled {
+            "crawl_disabled"
+        } else if query_text.is_empty() {
+            "empty_query"
+        } else {
+            "substrate_dense_enough"
+        };
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": initial.query,
+            "phase": "search_only",
+            "initial": live_search_summary(&initial),
+            "crawl": {
+                "attempted": false,
+                "reason": reason,
+                "min_hits": min_hits,
+                "min_links": min_links
+            },
+            "search": initial
+        }))
+        .into_response();
+    }
+
+    if let Err(status) = require_scope(
+        headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let (seeds, seed_strategy) = derive_live_search_seeds(query_text, &request.seeds);
+    if seeds.is_empty() {
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": initial.query,
+            "phase": "search_only",
+            "initial": live_search_summary(&initial),
+            "crawl": {
+                "attempted": false,
+                "reason": "no_crawl_seed",
+                "seed_strategy": seed_strategy,
+                "min_hits": min_hits,
+                "min_links": min_links
+            },
+            "search": initial
+        }))
+        .into_response();
+    }
+
+    let crawl_budget = live_search_budget(&request);
+    let scope_was_supplied = request.scope.is_some();
+    let mut crawl_request = CrawlRequest::new(
+        request.run_id.clone().unwrap_or_else(default_crawl_run_id),
+        seeds.clone(),
+    );
+    crawl_request.budget = crawl_budget.clone();
+    crawl_request.scope = request.scope.clone().unwrap_or_default();
+    if federation_enabled() && !scope_was_supplied {
+        crawl_request.scope.federable = true;
+    }
+
+    let federation_request = crawl_request.clone();
+    let output = match run_live_crawl(crawl_request).await {
+        Ok(output) => output,
+        Err(error) => {
+            return Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "query": initial.query,
+                "phase": "crawl_failed",
+                "initial": live_search_summary(&initial),
+                "crawl": {
+                    "attempted": true,
+                    "seed_strategy": seed_strategy,
+                    "seeds": seeds,
+                    "budget": crawl_budget,
+                    "error": "rustyweb_crawl_error",
+                    "message": error.to_string()
+                },
+                "search": initial
+            }))
+            .into_response();
+        }
+    };
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let transaction = match store.commit_batch(output.graph.batch.clone()) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let federation =
+        submit_web_commons_fragment(state, &tenant_id, &federation_request, &output).await;
+    let (_tenant_id, search) = match execute_search(state, headers, &search_query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "query": search.query,
+        "phase": "crawled",
+        "initial": live_search_summary(&initial),
+        "crawl": {
+            "attempted": true,
+            "seed_strategy": seed_strategy,
+            "seeds": seeds,
+            "receipt": output.receipt,
+            "transaction": transaction,
+            "federation": federation,
+            "min_hits": min_hits,
+            "min_links": min_links
+        },
+        "search": search
+    }))
+    .into_response()
+}
+
+fn live_search_is_sparse(
+    search: &rustyred_web::SubstrateSearch,
+    min_hits: usize,
+    min_links: usize,
+) -> bool {
+    search.matched_count < min_hits || search.links.len() < min_links
+}
+
+fn live_search_summary(search: &rustyred_web::SubstrateSearch) -> Value {
+    json!({
+        "matched_count": search.matched_count,
+        "kept_count": search.kept_count,
+        "hits": search.hits.len(),
+        "links": search.links.len()
+    })
+}
+
+fn live_search_budget(request: &LiveSearchRequest) -> CrawlBudget {
+    let mut budget = request.budget.clone().unwrap_or(CrawlBudget {
+        max_pages: LIVE_SEARCH_DEFAULT_MAX_PAGES,
+        max_seconds: LIVE_SEARCH_DEFAULT_MAX_SECONDS,
+        max_depth: LIVE_SEARCH_DEFAULT_MAX_DEPTH,
+        max_bytes: LIVE_SEARCH_DEFAULT_MAX_BYTES,
+    });
+    if let Some(max_pages) = request.max_pages {
+        budget.max_pages = max_pages;
+    }
+    if let Some(max_seconds) = request.max_seconds {
+        budget.max_seconds = max_seconds;
+    }
+    if let Some(max_depth) = request.max_depth {
+        budget.max_depth = max_depth;
+    }
+    if let Some(max_bytes) = request.max_bytes {
+        budget.max_bytes = max_bytes;
+    }
+    budget.max_pages = budget.max_pages.clamp(1, LIVE_SEARCH_HARD_MAX_PAGES);
+    budget.max_seconds = budget.max_seconds.clamp(1, LIVE_SEARCH_HARD_MAX_SECONDS);
+    budget.max_depth = budget.max_depth.min(LIVE_SEARCH_HARD_MAX_DEPTH);
+    budget.max_bytes = budget.max_bytes.clamp(1, LIVE_SEARCH_HARD_MAX_BYTES);
+    budget
+}
+
+fn derive_live_search_seeds(query: &str, supplied: &[String]) -> (Vec<String>, &'static str) {
+    let mut seeds = Vec::new();
+    let mut seen = BTreeSet::new();
+    for seed in supplied {
+        push_live_search_seed(&mut seeds, &mut seen, seed.trim().to_string());
+    }
+    if !seeds.is_empty() {
+        return (seeds, "provided");
+    }
+    if let Some(seed) = direct_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "direct_url");
+    }
+    if let Some(seed) = domain_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "domain_guess");
+    }
+    if let Some(seed) = wikipedia_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "wikipedia_title_guess");
+    }
+    (seeds, "none")
+}
+
+fn push_live_search_seed(seeds: &mut Vec<String>, seen: &mut BTreeSet<String>, seed: String) {
+    let trimmed = seed.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if seen.insert(trimmed.to_string()) {
+        seeds.push(trimmed.to_string());
+    }
+}
+
+fn direct_live_search_seed(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn domain_live_search_seed(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.chars().any(char::is_whitespace) || trimmed.contains("://") {
+        return None;
+    }
+    let host_like = trimmed
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('.');
+    if host_like.contains('.') && host_like.chars().any(|c| c.is_ascii_alphabetic()) {
+        Some(format!("https://{trimmed}"))
+    } else {
+        None
+    }
+}
+
+fn wikipedia_live_search_seed(query: &str) -> Option<String> {
+    let title: Vec<String> = query
+        .split_whitespace()
+        .filter_map(wikipedia_title_token)
+        .collect();
+    if title.is_empty() {
+        None
+    } else {
+        Some(format!("https://en.wikipedia.org/wiki/{}", title.join("_")))
+    }
+}
+
+fn wikipedia_title_token(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut chars = cleaned.chars();
+    let first = chars.next()?.to_ascii_uppercase();
+    let rest = chars.as_str().to_ascii_lowercase();
+    Some(format!("{first}{rest}"))
+}
+
+fn render_search_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: SearchQuery,
+) -> axum::response::Response {
+    let (_tenant_id, search) = match execute_search(state, headers, &query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    (
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        render_serp_html(&search),
+    )
+        .into_response()
+}
+
+fn execute_search(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &SearchQuery,
+) -> Result<(String, rustyred_web::SubstrateSearch), axum::response::Response> {
+    if let Err(status) = require_scope(
+        headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return Err(status.into_response());
+    }
+    let tenant_id = resolve_route_tenant(state, query.tenant.as_deref())?;
+    let store = search_snapshot_store(state, &tenant_id)?;
+    let search = search_substrate(
+        &store,
+        query.q.as_deref().unwrap_or_default(),
+        SearchOptions::default(),
+    );
+    Ok((tenant_id, search))
+}
+
+async fn crawl_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CrawlRouteBody>,
+) -> axum::response::Response {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id = match resolve_route_tenant(&state, body.tenant.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    let scope_was_supplied = body.scope.is_some();
+    let mut request =
+        CrawlRequest::new(body.run_id.unwrap_or_else(default_crawl_run_id), body.seeds);
+    request.budget = body.budget.unwrap_or_default();
+    request.scope = body.scope.unwrap_or_default();
+    if federation_enabled() && !scope_was_supplied {
+        request.scope.federable = true;
+    }
+
+    let federation_request = request.clone();
+    let output = match run_live_crawl(request).await {
+        Ok(output) => output,
+        Err(error) => return rustyweb_error_response(error),
+    };
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let transaction = match store.commit_batch(output.graph.batch.clone()) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let federation =
+        submit_web_commons_fragment(&state, &tenant_id, &federation_request, &output).await;
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "receipt": output.receipt,
+        "transaction": transaction,
+        "federation": federation
+    }))
+    .into_response()
+}
+
+async fn federate_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FederateSubmitBody>,
+) -> axum::response::Response {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "federation:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let tenant_id = match resolve_route_tenant(&state, body.tenant.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    if let Some(fragment) = body.fragment {
+        return ingest_web_commons_fragment(&state, &tenant_id, fragment);
+    }
+    let federable = body
+        .federable
+        .or_else(|| body.receipt.as_ref().map(|receipt| receipt.scope.federable))
+        .unwrap_or(false);
+    if !federable {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "not_federable",
+                "message": "federation submit requires federable=true or a federable crawl receipt"
+            })),
+        )
+            .into_response();
+    }
+    let graph_delta_hash = body.graph_delta_hash.or_else(|| {
+        body.receipt
+            .as_ref()
+            .map(|receipt| receipt.graph_delta_hash.clone())
+    });
+    let graph_delta_hash = match graph_delta_hash.filter(|hash| !hash.trim().is_empty()) {
+        Some(hash) => hash,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "fragment_required",
+                    "message": "federation submit requires a signed Web Commons fragment or a non-empty receipt/hash"
+                })),
+            )
+                .into_response();
+        }
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "accepted": true,
+        "merged": false,
+        "status": "validated_noop",
+        "graph_delta_hash": graph_delta_hash
+    }))
+    .into_response()
+}
+
+fn ingest_web_commons_fragment(
+    state: &AppState,
+    tenant_id: &str,
+    fragment: WebCommonsFragment,
+) -> axum::response::Response {
+    if let Err(response) = verify_web_commons_fragment_signature(&fragment) {
+        return response;
+    }
+    let mut store = match state.tenant_graph_store(tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let base = match store.graph_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let trust = web_commons_peer_trust(&base, &fragment.peer_id);
+    if trust.weight <= 0.0 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "peer_blocked",
+                "message": "web_commons peer is blocked",
+                "peer_id": fragment.peer_id,
+                "trust_tier": trust.tier,
+            })),
+        )
+            .into_response();
+    }
+
+    let receipt = web_commons_receipt_for_fragment(&base, &fragment, &trust);
+    let plan = match build_web_commons_ingest_plan(&fragment, receipt) {
+        Ok(plan) => plan,
+        Err(error) => return rustyweb_error_response(error),
+    };
+    let mut projected = match InMemoryGraphStore::from_snapshot(base.clone()) {
+        Ok(store) => store,
+        Err(error) => return graph_store_error_response(error),
+    };
+    if let Err(error) = apply_batch_to_store(&mut projected, &plan.batch) {
+        return graph_store_error_response(error);
+    }
+    let target = projected.snapshot();
+    let merge = merge_graph_snapshots(
+        &base,
+        &base,
+        &target,
+        GraphMergeOptions {
+            strategy: GraphMergeStrategy::PreferTheirs,
+            name: Some("web-commons-merge".to_string()),
+            message: Some("merge signed Web Commons fragment".to_string()),
+            ..GraphMergeOptions::default()
+        },
+    );
+    if !merge.conflicts.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "web_commons_merge_conflict",
+                "message": "signed Web Commons fragment produced merge conflicts",
+                "merge": merge,
+            })),
+        )
+            .into_response();
+    }
+    let transaction = match store.commit_batch(plan.batch.clone()) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(error),
+    };
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "accepted": plan.receipt.accepted,
+        "merged": true,
+        "status": "merged",
+        "graph_delta_hash": plan.receipt.graph_delta_hash,
+        "receipt": plan.receipt,
+        "merge": merge,
+        "transaction": transaction,
+    }))
+    .into_response()
+}
+
+async fn submit_web_commons_fragment(
+    _state: &AppState,
+    tenant_id: &str,
+    request: &CrawlRequest,
+    output: &rustyred_web::CrawlRunOutput,
+) -> Value {
+    if !federation_enabled() {
+        return json!({"enabled": false, "submitted": false, "reason": "disabled"});
+    }
+    if !request.scope.federable {
+        return json!({"enabled": true, "submitted": false, "reason": "scope_not_federable"});
+    }
+    let Some(hub_url) = federation_hub_url() else {
+        return json!({"enabled": true, "submitted": false, "reason": "hub_url_missing"});
+    };
+    let Some(private_key) = federation_private_key() else {
+        return json!({"enabled": true, "submitted": false, "reason": "private_key_missing"});
+    };
+    let public_peer_id = match public_peer_id_from_private_key(&private_key) {
+        Ok(peer_id) => peer_id,
+        Err(error) => {
+            return json!({"enabled": true, "submitted": false, "reason": "private_key_invalid", "error": error});
+        }
+    };
+    let peer_id = federation_peer_id().unwrap_or_else(|| public_peer_id.clone());
+    if normalize_peer_id(&peer_id) != public_peer_id {
+        return json!({
+            "enabled": true,
+            "submitted": false,
+            "reason": "peer_id_private_key_mismatch",
+        });
+    }
+    let options = WebCommonsFragmentOptions {
+        include_provenance: federation_provenance(),
+        snapshot_text_bytes: federation_snapshot_text_bytes(),
+    };
+    let mut fragment = match build_web_commons_fragment(output, request, peer_id, &options) {
+        Ok(fragment) => fragment,
+        Err(error) => {
+            return json!({"enabled": true, "submitted": false, "reason": "fragment_build_failed", "error": error.to_string()});
+        }
+    };
+    if let Err(error) = sign_web_commons_fragment(&mut fragment, &private_key) {
+        return json!({"enabled": true, "submitted": false, "reason": "fragment_sign_failed", "error": error});
+    }
+
+    let submit_url = federation_submit_url(&hub_url);
+    let mut request_builder = reqwest::Client::new().post(&submit_url).json(&json!({
+        "tenant": tenant_id,
+        "federable": true,
+        "graph_delta_hash": fragment.graph_delta_hash,
+        "fragment": fragment,
+    }));
+    if let Some(token) = federation_token() {
+        request_builder = request_builder.bearer_auth(token);
+    }
+    match request_builder.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.json::<Value>().await.unwrap_or_else(|error| {
+                json!({
+                    "error": "invalid_hub_response",
+                    "message": error.to_string(),
+                })
+            });
+            json!({
+                "enabled": true,
+                "submitted": status.is_success(),
+                "status": status.as_u16(),
+                "hub_url": submit_url,
+                "response": body,
+            })
+        }
+        Err(error) => json!({
+            "enabled": true,
+            "submitted": false,
+            "hub_url": submit_url,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WebCommonsPeerTrust {
+    tier: String,
+    weight: f64,
+}
+
+#[derive(Default)]
+struct PageSupport {
+    peer_weights: BTreeMap<String, f64>,
+    domains: BTreeSet<String>,
+    source_classes: BTreeSet<String>,
+    fetched_times: BTreeSet<i128>,
+    inbound_total: usize,
+    inbound_external: usize,
+}
+
+impl PageSupport {
+    fn weighted_peer_sum(&self) -> f64 {
+        self.peer_weights.values().sum()
+    }
+
+    fn external_support_ratio(&self) -> f64 {
+        if self.inbound_total == 0 {
+            0.0
+        } else {
+            self.inbound_external as f64 / self.inbound_total as f64
+        }
+    }
+
+    fn temporal_spread_ms(&self) -> i128 {
+        match (
+            self.fetched_times.iter().next(),
+            self.fetched_times.iter().next_back(),
+        ) {
+            (Some(first), Some(last)) => last - first,
+            _ => 0,
+        }
+    }
+}
+
+fn web_commons_receipt_for_fragment(
+    base: &GraphSnapshot,
+    fragment: &WebCommonsFragment,
+    trust: &WebCommonsPeerTrust,
+) -> WebCommonsReceipt {
+    let support = web_commons_support(base, fragment, trust);
+    let dispositions = fragment
+        .pages
+        .iter()
+        .map(|page| page_disposition(page, support.get(&page.id)))
+        .collect::<Vec<_>>();
+    let accepted_pages = dispositions
+        .iter()
+        .filter(|disposition| disposition.disposition != "dropped")
+        .count();
+    let dropped_pages = dispositions.len().saturating_sub(accepted_pages);
+
+    WebCommonsReceipt {
+        accepted: accepted_pages > 0,
+        peer_id: fragment.peer_id.clone(),
+        graph_delta_hash: fragment.graph_delta_hash.clone(),
+        accepted_pages,
+        dropped_pages,
+        dispositions,
+    }
+}
+
+fn page_disposition(page: &PageRecord, support: Option<&PageSupport>) -> WebCommonsPageDisposition {
+    if page.id.trim().is_empty() || page.url.trim().is_empty() || page.domain.trim().is_empty() {
+        return WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "dropped".to_string(),
+            reason: "missing required page identity fields".to_string(),
+        };
+    }
+    let Some(support) = support else {
+        return WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "probationary".to_string(),
+            reason: "first attestation recorded".to_string(),
+        };
+    };
+    let canonical = support.peer_weights.len() >= 2
+        && support.weighted_peer_sum() >= 1.0
+        && support.domains.len() >= 2
+        && support.external_support_ratio() >= 0.5
+        && support.temporal_spread_ms() >= 1;
+    if canonical {
+        WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "canonical".to_string(),
+            reason: "independent peer, domain, external-link, and temporal support satisfied"
+                .to_string(),
+        }
+    } else {
+        WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "probationary".to_string(),
+            reason: format!(
+                "awaiting corroboration: peers={}, domains={}, external_support={:.2}, temporal_spread_ms={}",
+                support.peer_weights.len(),
+                support.domains.len(),
+                support.external_support_ratio(),
+                support.temporal_spread_ms()
+            ),
+        }
+    }
+}
+
+fn web_commons_support(
+    base: &GraphSnapshot,
+    fragment: &WebCommonsFragment,
+    current_trust: &WebCommonsPeerTrust,
+) -> BTreeMap<String, PageSupport> {
+    let mut support: BTreeMap<String, PageSupport> = BTreeMap::new();
+    let peer_weights = web_commons_peer_weights(base);
+    let mut page_domains = page_domains_from_snapshot(base);
+    for page in &fragment.pages {
+        page_domains.insert(page.id.clone(), page.domain.clone());
+    }
+
+    for node in &base.nodes {
+        if !node
+            .labels
+            .iter()
+            .any(|label| label == LABEL_WEB_COMMONS_ATTESTATION)
+        {
+            continue;
+        }
+        let Some(page_id) = json_string(&node.properties, "page_id") else {
+            continue;
+        };
+        let peer_id = json_string(&node.properties, "peer_id").unwrap_or_default();
+        let weight = peer_weights
+            .get(&peer_id)
+            .copied()
+            .unwrap_or_else(|| trust_weight_for_tier("unknown"));
+        add_page_support(
+            support.entry(page_id).or_default(),
+            peer_id,
+            weight,
+            json_string(&node.properties, "domain"),
+            json_string(&node.properties, "source_class"),
+            json_string(&node.properties, "fetched_at"),
+        );
+    }
+
+    for page in &fragment.pages {
+        add_page_support(
+            support.entry(page.id.clone()).or_default(),
+            fragment.peer_id.clone(),
+            current_trust.weight,
+            Some(page.domain.clone()),
+            Some(page.source_class.clone()),
+            page.fetched_at.clone(),
+        );
+    }
+
+    for edge in &base.edges {
+        if edge.edge_type == EDGE_LINKS_TO {
+            add_inbound_support(&mut support, &page_domains, &edge.from_id, &edge.to_id);
+        }
+    }
+    for edge in &fragment.edges {
+        add_inbound_support(
+            &mut support,
+            &page_domains,
+            &edge.from_page_id,
+            &edge.to_page_id,
+        );
+    }
+
+    support
+}
+
+fn add_page_support(
+    support: &mut PageSupport,
+    peer_id: String,
+    weight: f64,
+    domain: Option<String>,
+    source_class: Option<String>,
+    fetched_at: Option<String>,
+) {
+    if !peer_id.trim().is_empty() {
+        support.peer_weights.insert(peer_id, weight);
+    }
+    if let Some(domain) = domain.filter(|value| !value.trim().is_empty()) {
+        support.domains.insert(domain);
+    }
+    if let Some(source_class) = source_class.filter(|value| !value.trim().is_empty()) {
+        support.source_classes.insert(source_class);
+    }
+    if let Some(timestamp) = fetched_at.and_then(|value| value.parse::<i128>().ok()) {
+        support.fetched_times.insert(timestamp);
+    }
+}
+
+fn add_inbound_support(
+    support: &mut BTreeMap<String, PageSupport>,
+    page_domains: &BTreeMap<String, String>,
+    from_page_id: &str,
+    to_page_id: &str,
+) {
+    let Some(from_domain) = page_domains.get(from_page_id) else {
+        return;
+    };
+    let Some(to_domain) = page_domains.get(to_page_id) else {
+        return;
+    };
+    let page_support = support.entry(to_page_id.to_string()).or_default();
+    page_support.inbound_total += 1;
+    page_support.domains.insert(from_domain.clone());
+    if from_domain != to_domain {
+        page_support.inbound_external += 1;
+    }
+}
+
+fn page_domains_from_snapshot(snapshot: &GraphSnapshot) -> BTreeMap<String, String> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.labels.iter().any(|label| label == LABEL_PAGE))
+        .filter_map(|node| {
+            json_string(&node.properties, "domain").map(|domain| (node.id.clone(), domain))
+        })
+        .collect()
+}
+
+fn web_commons_peer_trust(snapshot: &GraphSnapshot, peer_id: &str) -> WebCommonsPeerTrust {
+    let mut selected: Option<WebCommonsPeerTrust> = None;
+    for node in snapshot.nodes.iter().filter(|node| {
+        node.labels
+            .iter()
+            .any(|label| label == LABEL_WEB_COMMONS_PEER)
+            && json_string(&node.properties, "peer_id").as_deref() == Some(peer_id)
+    }) {
+        let tier =
+            json_string(&node.properties, "trust_tier").unwrap_or_else(|| "unknown".to_string());
+        let weight = json_f64(&node.properties, "trust_weight")
+            .unwrap_or_else(|| trust_weight_for_tier(&tier));
+        if tier == "blocked" || weight <= 0.0 {
+            return WebCommonsPeerTrust { tier, weight: 0.0 };
+        }
+        if selected
+            .as_ref()
+            .is_none_or(|current| weight > current.weight)
+        {
+            selected = Some(WebCommonsPeerTrust { tier, weight });
+        }
+    }
+    selected.unwrap_or_else(|| WebCommonsPeerTrust {
+        tier: "unknown".to_string(),
+        weight: trust_weight_for_tier("unknown"),
+    })
+}
+
+fn web_commons_peer_weights(snapshot: &GraphSnapshot) -> BTreeMap<String, f64> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.labels
+                .iter()
+                .any(|label| label == LABEL_WEB_COMMONS_PEER)
+        })
+        .filter_map(|node| {
+            let peer_id = json_string(&node.properties, "peer_id")?;
+            let tier = json_string(&node.properties, "trust_tier")
+                .unwrap_or_else(|| "unknown".to_string());
+            let weight = json_f64(&node.properties, "trust_weight")
+                .unwrap_or_else(|| trust_weight_for_tier(&tier));
+            Some((peer_id, weight))
+        })
+        .fold(BTreeMap::new(), |mut weights, (peer_id, weight)| {
+            weights
+                .entry(peer_id)
+                .and_modify(|current| {
+                    if weight <= 0.0 {
+                        *current = 0.0;
+                    } else if *current > 0.0 {
+                        *current = (*current).max(weight);
+                    }
+                })
+                .or_insert(weight);
+            weights
+        })
+}
+
+fn trust_weight_for_tier(tier: &str) -> f64 {
+    match tier {
+        "self" | "verified" => 1.0,
+        "blocked" => 0.0,
+        _ => 0.3,
+    }
+}
+
+fn verify_web_commons_fragment_signature(
+    fragment: &WebCommonsFragment,
+) -> Result<(), axum::response::Response> {
+    if fragment.signature.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unsigned_fragment",
+                "message": "Web Commons fragment requires an Ed25519 signature"
+            })),
+        )
+            .into_response());
+    }
+    let verifying_key = decode_ed25519_array::<32>(&fragment.peer_id, "peer_id")
+        .and_then(|bytes| VerifyingKey::from_bytes(&bytes).map_err(|error| error.to_string()));
+    let signature = decode_ed25519_array::<64>(&fragment.signature, "signature")
+        .map(|bytes| Signature::from_bytes(&bytes));
+    let signing_bytes = fragment.signing_bytes().map_err(|error| error.to_string());
+    match (verifying_key, signature, signing_bytes) {
+        (Ok(verifying_key), Ok(signature), Ok(signing_bytes)) => verifying_key
+            .verify(&signing_bytes, &signature)
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "bad_signature",
+                        "message": error.to_string(),
+                    })),
+                )
+                    .into_response()
+            }),
+        (verifying_key, signature, signing_bytes) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "bad_signature",
+                "message": verifying_key
+                    .err()
+                    .or_else(|| signature.err())
+                    .or_else(|| signing_bytes.err())
+                    .unwrap_or_else(|| "invalid signature".to_string()),
+            })),
+        )
+            .into_response()),
+    }
+}
+
+fn sign_web_commons_fragment(
+    fragment: &mut WebCommonsFragment,
+    private_key: &str,
+) -> Result<(), String> {
+    let bytes = decode_ed25519_array::<32>(private_key, "private_key")?;
+    let signing_key = SigningKey::from_bytes(&bytes);
+    let expected_peer_id = hex::encode(signing_key.verifying_key().to_bytes());
+    if normalize_peer_id(&fragment.peer_id) != expected_peer_id {
+        return Err("peer_id does not match Ed25519 private key".to_string());
+    }
+    let signature = signing_key.sign(
+        &fragment
+            .signing_bytes()
+            .map_err(|error| error.to_string())?,
+    );
+    fragment.signature = hex::encode(signature.to_bytes());
+    Ok(())
+}
+
+fn public_peer_id_from_private_key(private_key: &str) -> Result<String, String> {
+    let bytes = decode_ed25519_array::<32>(private_key, "private_key")?;
+    let signing_key = SigningKey::from_bytes(&bytes);
+    Ok(hex::encode(signing_key.verifying_key().to_bytes()))
+}
+
+fn normalize_peer_id(peer_id: &str) -> String {
+    peer_id
+        .trim()
+        .strip_prefix("ed25519:")
+        .unwrap_or_else(|| peer_id.trim())
+        .to_ascii_lowercase()
+}
+
+fn decode_ed25519_array<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
+    let normalized = normalize_peer_id(value);
+    let decoded = hex::decode(&normalized).map_err(|error| format!("{field}: {error}"))?;
+    if decoded.len() != N {
+        return Err(format!(
+            "{field}: expected {N} bytes, got {}",
+            decoded.len()
+        ));
+    }
+    let mut bytes = [0u8; N];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+fn federation_submit_url(hub_url: &str) -> String {
+    let trimmed = hub_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/federate/submit") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/federate/submit")
+    }
+}
+
+fn federation_env(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn federation_enabled() -> bool {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE",
+        "RUSTYRED_THG_FEDERATE",
+        "RUSTYRED_FEDERATE",
+    ])
+    .map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+    .unwrap_or(true)
+}
+
+fn federation_hub_url() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_HUB_URL",
+        "RUSTYRED_THG_FEDERATE_HUB_URL",
+        "RUSTYRED_FEDERATE_HUB_URL",
+    ])
+}
+
+fn federation_token() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_TOKEN",
+        "RUSTYRED_THG_FEDERATE_TOKEN",
+        "RUSTYRED_FEDERATE_TOKEN",
+    ])
+}
+
+fn federation_peer_id() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_PEER_ID",
+        "RUSTYRED_THG_FEDERATE_PEER_ID",
+        "RUSTYRED_FEDERATE_PEER_ID",
+    ])
+}
+
+fn federation_private_key() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_PRIVATE_KEY",
+        "RUSTYRED_THG_FEDERATE_PRIVATE_KEY",
+        "RUSTYRED_FEDERATE_PRIVATE_KEY",
+    ])
+}
+
+fn federation_provenance() -> bool {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_PROVENANCE",
+        "RUSTYRED_THG_FEDERATE_PROVENANCE",
+        "RUSTYRED_FEDERATE_PROVENANCE",
+    ])
+    .map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn federation_snapshot_text_bytes() -> usize {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_SNAPSHOT_TEXT_BYTES",
+        "RUSTYRED_THG_FEDERATE_SNAPSHOT_TEXT_BYTES",
+        "RUSTYRED_FEDERATE_SNAPSHOT_TEXT_BYTES",
+    ])
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or(rustyred_web::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES)
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn json_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(Value::as_f64)
+}
+
+fn resolve_route_tenant(
+    state: &AppState,
+    tenant: Option<&str>,
+) -> Result<String, axum::response::Response> {
+    resolve_tenant_id(tenant, &state.config.mcp_default_tenant)
+        .map_err(query_surface_error_response)
+}
+
+fn search_snapshot_store(
+    state: &AppState,
+    tenant_id: &str,
+) -> Result<InMemoryGraphStore, axum::response::Response> {
+    let store = state
+        .tenant_graph_store(tenant_id)
+        .map_err(store_unavailable_response)?;
+    let snapshot = store.graph_snapshot().map_err(graph_store_error_response)?;
+    InMemoryGraphStore::from_snapshot(snapshot).map_err(graph_store_error_response)
+}
+
+fn default_crawl_run_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("rustyweb-{millis}")
+}
+
+fn rustyweb_error_response(error: RustyWebError) -> axum::response::Response {
+    let status = match error {
+        RustyWebError::Fetch { .. } | RustyWebError::HtmlParse { .. } => StatusCode::BAD_GATEWAY,
+        RustyWebError::InvalidUrl { .. }
+        | RustyWebError::BodyLimitExceeded { .. }
+        | RustyWebError::EmptySeeds
+        | RustyWebError::InvalidBudget { .. }
+        | RustyWebError::BlockedUrl { .. }
+        | RustyWebError::InvalidFragment { .. } => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        Json(json!({
+            "error": "rustyweb_crawl_error",
+            "message": error.to_string()
+        })),
+    )
+        .into_response()
 }
 
 async fn command(
@@ -1411,6 +2761,207 @@ async fn graph_rebuild_indexes(
         .into_response(),
         Err(error) => graph_store_error_response(error),
     }
+}
+
+async fn graph_version_compile(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(options): Json<GraphCompileOptions>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let pack = compile_graph_pack(&snapshot, options);
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "pack": pack
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_diff(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionDiffBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let target = match body.target {
+        Some(target) => target,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    let diff = diff_graph_snapshots(&body.base, &target);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "diff": diff
+    }))
+    .into_response()
+}
+
+async fn graph_version_ref(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionRefBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let branch = body.options.branch.clone();
+            let pack = compile_graph_pack(&snapshot, body.options);
+            let ref_update = update_graph_ref(
+                body.repository.unwrap_or_default(),
+                pack,
+                branch,
+                body.updated_at_unix_ms,
+            );
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "ref_update": ref_update
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_log_route(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionLogBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "log": graph_version_log(&body.repository, body.target.as_deref())
+    }))
+    .into_response()
+}
+
+async fn graph_version_checkout(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionCheckoutBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    match checkout_graph_version(&body.repository, &body.target) {
+        Some(checkout) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "checkout": checkout
+        }))
+        .into_response(),
+        None => graph_store_error_response(GraphStoreError::new(
+            "version_target_not_found",
+            format!(
+                "version target not found or has no payloads: {}",
+                body.target
+            ),
+        )),
+    }
+}
+
+async fn graph_version_merge(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionMergeBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let ours = match body.ours {
+        Some(ours) => ours,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "merge": merge_graph_snapshots(&body.base, &ours, &body.theirs, body.options)
+    }))
+    .into_response()
 }
 
 fn execute_tenant_command(
@@ -3535,6 +5086,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use axum::body::{to_bytes, Body};
+    use axum::extract::{Query, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use axum::Json;
@@ -3542,24 +5094,25 @@ mod tests {
 
     use super::{
         default_ppr_alpha, default_ppr_epsilon, default_ppr_max_pushes, default_pr_damping,
-        default_pr_max_iter, default_pr_tolerance, execute_graph_store_command,
-        execute_tenant_cache_command, execute_tenant_command, graph_algorithm_communities,
-        graph_algorithm_components, graph_algorithm_pagerank, graph_algorithm_ppr,
-        graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_fulltext_search,
-        graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge, instant_kg_impact,
-        instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command, is_graph_command,
-        mcp_origin_allowed, public_cypher, required_scope_for_command, transaction_begin,
+        default_pr_max_iter, default_pr_tolerance, derive_live_search_seeds,
+        execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
+        graph_algorithm_communities, graph_algorithm_components, graph_algorithm_pagerank,
+        graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes, graph_error_status,
+        graph_fulltext_search, graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge,
+        instant_kg_impact, instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command,
+        is_graph_command, live_search_budget, live_search_is_sparse, mcp_origin_allowed,
+        public_cypher, required_scope_for_command, search_live, transaction_begin,
         transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
         FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
-        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, PageRankBody, PprBody,
-        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, PageRankBody,
+        PprBody, PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         config::{Config, StorageMode, TenantConfigOverride},
         metrics::diagnostics_config,
         state::AppState,
     };
-    use rustyred_thg_core::RedCoreDurability;
+    use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
 
     async fn response_payload_json(response: axum::response::Response) -> Value {
         serde_json::from_slice(
@@ -3606,6 +5159,106 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             ttl_sweep_ms: 1000,
         })
+    }
+
+    #[test]
+    fn live_search_derives_bounded_crawl_inputs() {
+        let (seeds, strategy) = derive_live_search_seeds("knowledge graph", &[]);
+        assert_eq!(strategy, "wikipedia_title_guess");
+        assert_eq!(
+            seeds,
+            vec!["https://en.wikipedia.org/wiki/Knowledge_Graph".to_string()]
+        );
+
+        let (seeds, strategy) = derive_live_search_seeds("example.com/docs", &[]);
+        assert_eq!(strategy, "domain_guess");
+        assert_eq!(seeds, vec!["https://example.com/docs".to_string()]);
+
+        let budget = live_search_budget(&LiveSearchRequest {
+            max_pages: Some(100),
+            max_seconds: Some(100),
+            max_depth: Some(10),
+            max_bytes: Some(100 * 1024 * 1024),
+            ..LiveSearchRequest::default()
+        });
+        assert_eq!(budget.max_pages, 25);
+        assert_eq!(budget.max_seconds, 30);
+        assert_eq!(budget.max_depth, 2);
+        assert_eq!(budget.max_bytes, 5 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn search_live_returns_existing_connected_substrate_without_crawl() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("tenant-live").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:knowledge",
+                    [rustyred_web::LABEL_PAGE],
+                    json!({ "url": "https://example.test/knowledge-graph" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:rustyweb",
+                    [rustyred_web::LABEL_PAGE],
+                    json!({ "url": "https://example.test/rustyweb" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "snapshot:knowledge",
+                    ["ContentSnapshot"],
+                    json!({ "text": "A knowledge graph connects concepts through typed links." }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:knowledge:snapshot",
+                    "page:knowledge",
+                    rustyred_web::EDGE_HAS_SNAPSHOT,
+                    "snapshot:knowledge",
+                    json!({}),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:knowledge:rustyweb",
+                    "page:knowledge",
+                    rustyred_web::EDGE_LINKS_TO,
+                    "page:rustyweb",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+
+        let response = search_live(
+            State(state),
+            HeaderMap::new(),
+            Query(LiveSearchRequest {
+                q: Some("knowledge graph".to_string()),
+                tenant: Some("tenant-live".to_string()),
+                min_hits: Some(1),
+                min_links: Some(1),
+                ..LiveSearchRequest::default()
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["phase"], "search_only");
+        assert_eq!(payload["crawl"]["attempted"], false);
+        assert_eq!(payload["crawl"]["reason"], "substrate_dense_enough");
+        assert_eq!(payload["initial"]["matched_count"], 1);
+        assert_eq!(payload["initial"]["links"], 1);
+        assert_eq!(payload["search"]["links"].as_array().unwrap().len(), 1);
+
+        let sparse = serde_json::from_value(payload["search"].clone()).unwrap();
+        assert!(!live_search_is_sparse(&sparse, 1, 1));
     }
 
     #[test]

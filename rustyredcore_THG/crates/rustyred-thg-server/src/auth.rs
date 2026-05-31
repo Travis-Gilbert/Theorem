@@ -1,12 +1,13 @@
 use axum::http::{HeaderMap, StatusCode};
 
-const ALL_SCOPES: [&str; 15] = [
+const ALL_SCOPES: [&str; 16] = [
     "run:write",
     "run:read",
     "context:write",
     "context:read",
     "graph:read",
     "graph:write",
+    "federation:write",
     "admin:read",
     "rustyred_thg:graph:read",
     "rustyred_thg:graph:query",
@@ -105,7 +106,9 @@ pub fn require_scope(
 
 fn scope_alias(scope: &str) -> &str {
     match scope {
-        "rustyred_thg:graph:read" | "rustyred_thg:graph:query" | "rustyred_thg:graph:index:read" => "graph:read",
+        "rustyred_thg:graph:read"
+        | "rustyred_thg:graph:query"
+        | "rustyred_thg:graph:index:read" => "graph:read",
         "rustyred_thg:graph:write:propose" | "rustyred_thg:graph:write:apply" => "graph:write",
         "rustyred_thg:graph:context" => "context:read",
         "rustyred_thg:graph:admin:verify" => "admin:read",
@@ -172,7 +175,9 @@ mod tests {
 
     #[test]
     fn accepts_thg_scope_aliases_for_mcp_tokens() {
-        let token = ApiToken::parse("secret=rustyred_thg:graph:read|rustyred_thg:graph:admin:verify").unwrap();
+        let token =
+            ApiToken::parse("secret=rustyred_thg:graph:read|rustyred_thg:graph:admin:verify")
+                .unwrap();
 
         assert!(token.allows("graph:read"));
         assert!(token.allows("admin:read"));

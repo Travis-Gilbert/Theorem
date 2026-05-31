@@ -448,6 +448,10 @@ pub struct NodeRecord {
     pub properties: Value,
     pub version: u64,
     pub tombstone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_hashes: Vec<String>,
 }
 
 impl NodeRecord {
@@ -462,11 +466,32 @@ impl NodeRecord {
             properties,
             version: 0,
             tombstone: false,
+            content_hash: None,
+            parent_hashes: Vec::new(),
         }
     }
 
+    pub fn content_address(&self) -> String {
+        #[derive(Serialize)]
+        struct NodeContent<'a> {
+            kind: &'static str,
+            id: &'a str,
+            labels: &'a [String],
+            properties: &'a Value,
+            tombstone: bool,
+        }
+
+        stable_hash(NodeContent {
+            kind: "node",
+            id: &self.id,
+            labels: &self.labels,
+            properties: &self.properties,
+            tombstone: self.tombstone,
+        })
+    }
+
     pub fn checksum(&self) -> String {
-        stable_hash(self)
+        self.content_address()
     }
 }
 
@@ -486,6 +511,10 @@ pub struct EdgeRecord {
     pub epistemic_type: Option<EpistemicType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_hashes: Vec<String>,
 }
 
 impl EdgeRecord {
@@ -507,6 +536,8 @@ impl EdgeRecord {
             confidence: None,
             epistemic_type: None,
             provenance: None,
+            content_hash: None,
+            parent_hashes: Vec::new(),
         }
     }
 
@@ -529,8 +560,37 @@ impl EdgeRecord {
         self.confidence.unwrap_or(1.0)
     }
 
+    pub fn content_address(&self) -> String {
+        #[derive(Serialize)]
+        struct EdgeContent<'a> {
+            kind: &'static str,
+            id: &'a str,
+            from_id: &'a str,
+            to_id: &'a str,
+            edge_type: &'a str,
+            properties: &'a Value,
+            tombstone: bool,
+            confidence: Option<f64>,
+            epistemic_type: &'a Option<EpistemicType>,
+            provenance: &'a Option<Provenance>,
+        }
+
+        stable_hash(EdgeContent {
+            kind: "edge",
+            id: &self.id,
+            from_id: &self.from_id,
+            to_id: &self.to_id,
+            edge_type: &self.edge_type,
+            properties: &self.properties,
+            tombstone: self.tombstone,
+            confidence: self.confidence,
+            epistemic_type: &self.epistemic_type,
+            provenance: &self.provenance,
+        })
+    }
+
     pub fn checksum(&self) -> String {
-        stable_hash(self)
+        self.content_address()
     }
 }
 
@@ -803,12 +863,25 @@ impl InMemoryGraphStore {
         }
 
         node.labels = normalize_labels(node.labels);
+        let parent_hash = self.nodes.get(&node.id).map(|existing| {
+            existing
+                .content_hash
+                .clone()
+                .unwrap_or_else(|| existing.checksum())
+        });
         if let Some(existing) = self.nodes.get(&node.id).cloned() {
             self.remove_node_indexes(&existing);
         }
 
         self.version += 1;
         node.version = self.version;
+        let content_hash = node.checksum();
+        if node.parent_hashes.is_empty() {
+            if let Some(parent_hash) = parent_hash.filter(|parent| parent != &content_hash) {
+                node.parent_hashes.push(parent_hash);
+            }
+        }
+        node.content_hash = Some(content_hash.clone());
         let checksum = node.checksum();
         let id = node.id.clone();
         if !node.tombstone {
@@ -829,6 +902,9 @@ impl InMemoryGraphStore {
             return Err(GraphStoreError::empty_field("node.id"));
         }
         node.labels = normalize_labels(node.labels);
+        if node.content_hash.is_none() {
+            node.content_hash = Some(node.checksum());
+        }
         if let Some(existing) = self.nodes.get(&node.id).cloned() {
             self.remove_node_indexes(&existing);
         }
@@ -846,12 +922,25 @@ impl InMemoryGraphStore {
         self.require_live_endpoint(&edge, "from", &edge.from_id)?;
         self.require_live_endpoint(&edge, "to", &edge.to_id)?;
 
+        let parent_hash = self.edges.get(&edge.id).map(|existing| {
+            existing
+                .content_hash
+                .clone()
+                .unwrap_or_else(|| existing.checksum())
+        });
         if let Some(existing) = self.edges.get(&edge.id).cloned() {
             self.remove_edge_indexes(&existing);
         }
 
         self.version += 1;
         edge.version = self.version;
+        let content_hash = edge.checksum();
+        if edge.parent_hashes.is_empty() {
+            if let Some(parent_hash) = parent_hash.filter(|parent| parent != &content_hash) {
+                edge.parent_hashes.push(parent_hash);
+            }
+        }
+        edge.content_hash = Some(content_hash.clone());
         let checksum = edge.checksum();
         let id = edge.id.clone();
         if !edge.tombstone {
@@ -866,8 +955,11 @@ impl InMemoryGraphStore {
         })
     }
 
-    fn apply_recovered_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+    fn apply_recovered_edge(&mut self, mut edge: EdgeRecord) -> GraphStoreResult<()> {
         validate_edge_shape(&edge)?;
+        if edge.content_hash.is_none() {
+            edge.content_hash = Some(edge.checksum());
+        }
         if !edge.tombstone {
             self.require_live_endpoint(&edge, "from", &edge.from_id)?;
             self.require_live_endpoint(&edge, "to", &edge.to_id)?;
@@ -2991,6 +3083,22 @@ impl RedisGraphStore {
                 let version = current_version + 1;
                 let mut next_node = node.clone();
                 next_node.version = version;
+                let content_hash = next_node.checksum();
+                if next_node.parent_hashes.is_empty() {
+                    if let Some(parent_hash) = existing
+                        .as_ref()
+                        .map(|record| {
+                            record
+                                .content_hash
+                                .clone()
+                                .unwrap_or_else(|| record.checksum())
+                        })
+                        .filter(|parent| parent != &content_hash)
+                    {
+                        next_node.parent_hashes.push(parent_hash);
+                    }
+                }
+                next_node.content_hash = Some(content_hash.clone());
                 let checksum = next_node.checksum();
                 let raw = match serde_json::to_string(&next_node) {
                     Ok(raw) => raw,
@@ -3112,6 +3220,22 @@ impl RedisGraphStore {
                 let version = current_version + 1;
                 let mut next_edge = edge.clone();
                 next_edge.version = version;
+                let content_hash = next_edge.checksum();
+                if next_edge.parent_hashes.is_empty() {
+                    if let Some(parent_hash) = existing
+                        .as_ref()
+                        .map(|record| {
+                            record
+                                .content_hash
+                                .clone()
+                                .unwrap_or_else(|| record.checksum())
+                        })
+                        .filter(|parent| parent != &content_hash)
+                    {
+                        next_edge.parent_hashes.push(parent_hash);
+                    }
+                }
+                next_edge.content_hash = Some(content_hash.clone());
                 let checksum = next_edge.checksum();
                 let raw = match serde_json::to_string(&next_edge) {
                     Ok(raw) => raw,
@@ -4552,6 +4676,8 @@ mod tests {
                 confidence: None,
                 epistemic_type: None,
                 provenance: None,
+                content_hash: None,
+                parent_hashes: Vec::new(),
             },
         );
 

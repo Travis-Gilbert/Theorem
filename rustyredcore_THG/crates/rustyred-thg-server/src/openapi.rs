@@ -49,7 +49,8 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
             { "name": "graph", "description": "First-class graph node, edge, adjacency, index, and verification routes." },
             { "name": "instant-kg", "description": "Harness Instant KG merged base+session-delta code graph queries." },
             { "name": "transactions", "description": "Open and commit staged transaction workflows for Cypher writes." },
-            { "name": "context", "description": "Context pack writes used by Context Theorem harness flows." }
+            { "name": "context", "description": "Context pack writes used by Context Theorem harness flows." },
+            { "name": "search", "description": "RustyWeb live search routes that compose substrate search, bounded crawl, and graph result packaging." }
         ],
         "security": [{ "bearerAuth": [] }],
         "paths": {
@@ -94,6 +95,63 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     "summary": "OpenAPI document",
                     "security": [],
                     "responses": { "200": { "description": "OpenAPI 3.1 document" } }
+                }
+            },
+            "/search/live": {
+                "get": {
+                    "tags": ["search"],
+                    "summary": "Live substrate search with bounded RustyWeb crawl fallback",
+                    "description": "Runs substrate search first. If the result is sparse and crawl is enabled, derives crawl seeds, persists the RustyWeb crawl graph into the tenant store, and returns the final connected SubstrateSearch under search.",
+                    "parameters": [
+                        {
+                            "name": "q",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "string" },
+                            "description": "Search query or URL/domain seed."
+                        },
+                        {
+                            "name": "tenant",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "string" },
+                            "description": "Tenant namespace. Alias: tenant_id."
+                        },
+                        {
+                            "name": "crawl",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "boolean", "default": true },
+                            "description": "Whether sparse results may trigger a bounded crawl."
+                        }
+                    ],
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/LiveSearchResponse" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
+                }
+            },
+            "/search/answer": {
+                "post": {
+                    "tags": ["search"],
+                    "summary": "Live substrate search request body variant",
+                    "description": "POST alias for the live search orchestration. This route accepts the same q, tenant, crawl, min_hits, min_links, seed, and budget controls as JSON for clients that prefer a body.",
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/LiveSearchRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "$ref": "#/components/responses/LiveSearchResponse" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/StoreUnavailable" }
+                    }
                 }
             },
             "/.well-known/mcp/rustyred_thg.json": {
@@ -1550,6 +1608,14 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         }
                     }
                 },
+                "LiveSearchResponse": {
+                    "description": "Live graph search response with initial summary, optional crawl receipt, and final SubstrateSearch payload.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/LiveSearchResponseBody" }
+                        }
+                    }
+                },
                 "Unauthorized": {
                     "description": "Missing or invalid bearer token when auth is required."
                 },
@@ -1616,6 +1682,54 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                         "id": {},
                         "result": {},
                         "error": {}
+                    },
+                    "additionalProperties": true
+                },
+                "LiveSearchRequest": {
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string" },
+                        "query": { "type": "string" },
+                        "tenant": { "type": "string" },
+                        "tenant_id": { "type": "string" },
+                        "crawl": { "type": "boolean", "default": true },
+                        "min_hits": { "type": "integer", "minimum": 0 },
+                        "min_links": { "type": "integer", "minimum": 0 },
+                        "max_pages": { "type": "integer", "minimum": 1, "maximum": 25 },
+                        "max_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+                        "max_depth": { "type": "integer", "minimum": 0, "maximum": 2 },
+                        "max_bytes": { "type": "integer", "minimum": 1, "maximum": 5242880 },
+                        "seeds": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "additionalProperties": true
+                },
+                "LiveSearchResponseBody": {
+                    "type": "object",
+                    "required": ["ok", "tenant", "query", "phase", "initial", "crawl", "search"],
+                    "properties": {
+                        "ok": { "const": true },
+                        "tenant": { "type": "string" },
+                        "query": { "type": "string" },
+                        "phase": { "enum": ["search_only", "crawled", "crawl_failed"] },
+                        "initial": {
+                            "type": "object",
+                            "properties": {
+                                "matched_count": { "type": "integer" },
+                                "kept_count": { "type": "integer" },
+                                "hits": { "type": "integer" },
+                                "links": { "type": "integer" }
+                            },
+                            "additionalProperties": false
+                        },
+                        "crawl": { "type": "object", "additionalProperties": true },
+                        "search": {
+                            "type": "object",
+                            "description": "RustyWeb SubstrateSearch: query, hits, links, matched_count, and kept_count.",
+                            "additionalProperties": true
+                        }
                     },
                     "additionalProperties": true
                 },
@@ -2894,6 +3008,8 @@ mod tests {
 
         for (path, method) in [
             ("/metrics", "get"),
+            ("/search/live", "get"),
+            ("/search/answer", "post"),
             ("/v1/diagnostics/slow_queries", "get"),
             ("/v1/diagnostics/config", "get"),
             ("/v1/query", "post"),

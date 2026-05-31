@@ -1340,6 +1340,8 @@ fn inline_adjacency_to_edges(adjacency: &InlineAdjacency) -> Vec<EdgeRecord> {
                 confidence: Some(*weight),
                 epistemic_type: None,
                 provenance: None,
+                content_hash: None,
+                parent_hashes: Vec::new(),
             });
         }
     }
@@ -1747,12 +1749,14 @@ fn algorithm_communities_inline_payload(arguments: &Value) -> Result<Value, McpE
 fn symbolic_datalog_derive_payload(arguments: &Value) -> Result<Value, McpError> {
     let facts = arguments
         .get("facts")
-        .or_else(|| arguments.get("fact_pack").and_then(|pack| pack.get("facts")))
+        .or_else(|| {
+            arguments
+                .get("fact_pack")
+                .and_then(|pack| pack.get("facts"))
+        })
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            McpError::invalid_params(
-                "rustyred_thg_symbolic_datalog_derive requires facts array",
-            )
+            McpError::invalid_params("rustyred_thg_symbolic_datalog_derive requires facts array")
         })?;
     let max_facts = max_symbolic_facts();
     if facts.len() > max_facts {
@@ -1774,11 +1778,8 @@ fn symbolic_datalog_derive_payload(arguments: &Value) -> Result<Value, McpError>
     Ok(receipt)
 }
 
-fn symbolic_probabilistic_source_reliability_payload(
-    arguments: &Value,
-) -> Result<Value, McpError> {
-    rustyred_thg_core::probabilistic_source_reliability(arguments)
-        .map_err(McpError::invalid_params)
+fn symbolic_probabilistic_source_reliability_payload(arguments: &Value) -> Result<Value, McpError> {
+    rustyred_thg_core::probabilistic_source_reliability(arguments).map_err(McpError::invalid_params)
 }
 
 fn symbolic_probabilistic_expected_value_payload(arguments: &Value) -> Result<Value, McpError> {
@@ -3281,9 +3282,9 @@ mod tests {
         assert!(tools.iter().any(|tool| {
             tool["name"] == "rustyred_thg_symbolic_probabilistic_source_reliability"
         }));
-        assert!(tools.iter().any(|tool| {
-            tool["name"] == "rustyred_thg_symbolic_probabilistic_expected_value"
-        }));
+        assert!(tools
+            .iter()
+            .any(|tool| { tool["name"] == "rustyred_thg_symbolic_probabilistic_expected_value" }));
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_admin_verify"));
@@ -3351,8 +3352,14 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(source["result"]["structuredContent"]["posterior"]["alpha"], 8.0);
-        assert_eq!(source["result"]["structuredContent"]["posterior"]["beta"], 4.0);
+        assert_eq!(
+            source["result"]["structuredContent"]["posterior"]["alpha"],
+            8.0
+        );
+        assert_eq!(
+            source["result"]["structuredContent"]["posterior"]["beta"],
+            4.0
+        );
 
         let expected_value = handle_mcp_request(
             &provider,

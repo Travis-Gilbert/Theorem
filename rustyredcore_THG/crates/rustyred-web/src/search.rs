@@ -22,8 +22,8 @@
 //! the in-memory store, a tenant-scoped store, or any future backing.
 //!
 //! On-spec per `docs/plans/rusty-red-web/implementation-plan.md` ("local graph
-//! search", V0). Mirrors the web-side `searchRelevance.ts` relevance engine
-//! shipped in Theseus-UI so the two surfaces share one mental model.
+//! search", V0). Mirrors the browser-side relevance model so the crawler,
+//! search page, and server route share one mental model.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -41,12 +41,20 @@ const DEFAULT_MAX_RING: usize = 2;
 const DEFAULT_SCAN_LIMIT: usize = 10_000;
 /// Snippet length (characters of the page's extracted text).
 const SNIPPET_CHARS: usize = 240;
-/// ACL local-push PageRank alpha, matching THG's native graph algorithm default.
+/// ACL local-push PageRank alpha, matching RustyRed's native graph algorithm default.
 const DEFAULT_PPR_ALPHA: f64 = 0.15;
 /// PPR residual threshold. Kept low enough for browser-size page graphs.
 const DEFAULT_PPR_EPSILON: f64 = 1e-5;
 /// Hard cap for local-push work. Browser substrates should stay well below this.
 const DEFAULT_PPR_MAX_PUSHES: usize = 100_000;
+/// Dense candidates to retrieve from the local hash-vector scorer before graph fusion.
+const DEFAULT_DENSE_LIMIT: usize = 64;
+/// Reciprocal rank fusion constant; 60 is the common IR default.
+const DEFAULT_RRF_K: usize = 60;
+/// Hash embedding dimensionality for the standalone dense layer.
+const DENSE_DIM: usize = 128;
+/// Avoid arbitrary dense-only matches when the hash vector has no meaningful overlap.
+const MIN_DENSE_SCORE: f32 = 0.08;
 
 /// Knobs for a substrate search. `Default` is the common browser case.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +63,10 @@ pub struct SearchOptions {
     pub max_ring: usize,
     /// Cap on `Page` nodes scanned. Protects against unbounded substrates.
     pub scan_limit: usize,
+    /// Cap on dense vector candidates before graph expansion.
+    pub dense_limit: usize,
+    /// Reciprocal-rank fusion constant for lexical + dense candidate ranks.
+    pub rrf_k: usize,
 }
 
 impl Default for SearchOptions {
@@ -62,6 +74,8 @@ impl Default for SearchOptions {
         Self {
             max_ring: DEFAULT_MAX_RING,
             scan_limit: DEFAULT_SCAN_LIMIT,
+            dense_limit: DEFAULT_DENSE_LIMIT,
+            rrf_k: DEFAULT_RRF_K,
         }
     }
 }
@@ -260,26 +274,26 @@ fn ppr_adjacency(
         .collect()
 }
 
-fn ppr_seed_scores(score_of: &BTreeMap<String, u32>) -> HashMap<String, f64> {
-    let total: f64 = score_of.values().map(|score| *score as f64).sum();
+fn ppr_seed_scores_f64(score_of: &BTreeMap<String, f64>) -> HashMap<String, f64> {
+    let total: f64 = score_of.values().sum();
     if total <= 0.0 {
         return HashMap::new();
     }
     score_of
         .iter()
-        .map(|(id, score)| (id.clone(), *score as f64 / total))
+        .map(|(id, score)| (id.clone(), *score / total))
         .collect()
 }
 
 fn rank_score(
     id: &str,
-    lexical_scores: &BTreeMap<String, u32>,
+    lexical_scores: &BTreeMap<String, f64>,
     ppr_scores: &HashMap<String, f64>,
 ) -> f64 {
     ppr_scores
         .get(id)
         .copied()
-        .or_else(|| lexical_scores.get(id).map(|score| *score as f64))
+        .or_else(|| lexical_scores.get(id).copied())
         .unwrap_or(0.0)
 }
 
@@ -290,11 +304,115 @@ fn compare_ranked_hits(a: &(String, usize, f64), b: &(String, usize, f64)) -> Or
         .then_with(|| a.0.cmp(&b.0))
 }
 
+fn normalized_features(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 2)
+        .map(str::to_string)
+        .collect()
+}
+
+fn add_hash_feature(vector: &mut [f32], feature: &str, weight: f32) {
+    let digest = blake3::hash(feature.as_bytes());
+    let bytes = digest.as_bytes();
+    let bucket = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize % DENSE_DIM;
+    let sign = if bytes[4] & 1 == 0 { 1.0 } else { -1.0 };
+    vector[bucket] += sign * weight;
+}
+
+fn hash_embed_text(text: &str) -> Vec<f32> {
+    let mut vector = vec![0.0; DENSE_DIM];
+    let features = normalized_features(text);
+    for token in &features {
+        add_hash_feature(&mut vector, token, 1.0);
+        if token.len() >= 3 {
+            let chars: Vec<char> = token.chars().collect();
+            for window in chars.windows(3) {
+                let trigram: String = window.iter().collect();
+                add_hash_feature(&mut vector, &format!("tri:{trigram}"), 0.35);
+            }
+        }
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 1e-6 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
+fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(a, b)| a * b).sum()
+}
+
+fn dense_candidate_scores(
+    pages: &[NodeRecord],
+    meta: &BTreeMap<String, (String, String, String)>,
+    query: &str,
+    k: usize,
+) -> BTreeMap<String, f64> {
+    if k == 0 || pages.is_empty() {
+        return BTreeMap::new();
+    }
+    let query_vector = hash_embed_text(query);
+    if query_vector.iter().all(|value| value.abs() < 1e-6) {
+        return BTreeMap::new();
+    }
+
+    let mut ranked: Vec<(String, f32)> = Vec::with_capacity(pages.len());
+    for page in pages {
+        let Some((url, title, text)) = meta.get(&page.id) else {
+            continue;
+        };
+        let dense_text = format!("{url} {title} {text}");
+        let vector = hash_embed_text(&dense_text);
+        if vector.iter().all(|value| value.abs() < 1e-6) {
+            continue;
+        }
+        let score = dot_product(&query_vector, &vector);
+        if score >= MIN_DENSE_SCORE {
+            ranked.push((page.id.clone(), score));
+        }
+    }
+
+    if ranked.is_empty() {
+        return BTreeMap::new();
+    }
+
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(k.min(ranked.len()));
+    ranked
+        .into_iter()
+        .map(|(page_id, score)| (page_id, score as f64))
+        .collect()
+}
+
+fn add_rrf_scores(
+    fused_scores: &mut BTreeMap<String, f64>,
+    mut ranked: Vec<(String, f64)>,
+    rrf_k: usize,
+) {
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    for (rank, (id, _score)) in ranked.into_iter().enumerate() {
+        let contribution = 1.0 / (rrf_k.saturating_add(rank + 1) as f64);
+        *fused_scores.entry(id).or_insert(0.0) += contribution;
+    }
+}
+
 /// Search the substrate for the shape of the user's knowledge about `query`.
 ///
 /// Empty query => browse mode: every `Page` node (bounded by `scan_limit`),
 /// unranked. Otherwise: pages whose url or extracted text match the query terms
-/// (`ring 0`) seed native THG PPR over the page-link graph, then the result is
+/// (`ring 0`) seed native RustyRed PPR over the page-link graph, then the result is
 /// expanded out along `LINKS_TO` to `max_ring` hops. Ring labels explain how a
 /// page entered the neighbourhood; score and ordering come from graph rank.
 pub fn search_substrate(
@@ -352,16 +470,31 @@ pub fn search_substrate(
         .map(|s| s.to_string())
         .collect();
 
-    // Ring 0: direct lexical matches.
-    let mut score_of: BTreeMap<String, u32> = BTreeMap::new();
+    // Ring 0: direct lexical and dense matches.
+    let mut lexical_score_of: BTreeMap<String, u32> = BTreeMap::new();
     for page in &pages {
         if let Some((url, _title, text)) = meta.get(&page.id) {
             let score = score_page(url, text, &terms);
             if score > 0 {
-                score_of.insert(page.id.clone(), score);
+                lexical_score_of.insert(page.id.clone(), score);
             }
         }
     }
+    let dense_score_of = dense_candidate_scores(&pages, &meta, &normalized, options.dense_limit);
+    let mut score_of: BTreeMap<String, f64> = BTreeMap::new();
+    add_rrf_scores(
+        &mut score_of,
+        lexical_score_of
+            .iter()
+            .map(|(id, score)| (id.clone(), *score as f64))
+            .collect(),
+        options.rrf_k,
+    );
+    add_rrf_scores(
+        &mut score_of,
+        dense_score_of.into_iter().collect(),
+        options.rrf_k,
+    );
 
     // BFS out along LINKS_TO. ring = minimum hop distance to any match.
     let mut ring_of: BTreeMap<String, usize> = BTreeMap::new();
@@ -387,7 +520,7 @@ pub fn search_substrate(
 
     let ppr_scores = personalized_pagerank(
         &ppr_adjacency(store, &pages),
-        &ppr_seed_scores(&score_of),
+        &ppr_seed_scores_f64(&score_of),
         DEFAULT_PPR_ALPHA,
         DEFAULT_PPR_EPSILON,
         DEFAULT_PPR_MAX_PUSHES,

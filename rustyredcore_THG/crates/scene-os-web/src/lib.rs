@@ -87,7 +87,7 @@ pub fn render_scene(package: &ScenePackageV2) -> Result<String, serde_json::Erro
 mod tests {
     use super::*;
     use scene_os_core::{
-        AtomLifecycle, ChromeBinding, ProjectionBinding, SceneAtom, SceneRelation, ScenePackageV2,
+        AtomLifecycle, ChromeBinding, ProjectionBinding, SceneAtom, ScenePackageV2, SceneRelation,
     };
     use std::collections::BTreeMap;
 
@@ -160,7 +160,10 @@ mod tests {
             !html.contains("// __SCENE_PACKAGE__"),
             "payload marker consumed"
         );
-        assert!(!html.contains("/*__SCENE_OS_BUNDLE__*/"), "bundle marker consumed");
+        assert!(
+            !html.contains("/*__SCENE_OS_BUNDLE__*/"),
+            "bundle marker consumed"
+        );
         assert!(html.contains("tree_hierarchy"), "projection id present");
         assert!(html.contains("Supporting source"), "atom label present");
         // The renderer bundle is inlined (self-contained): its IIFE prologue and
@@ -173,8 +176,8 @@ mod tests {
     fn payload_is_valid_json_after_escaping() {
         let html = render_scene(&sample_package()).expect("render");
         // Extract the injected literal and confirm it re-parses as JSON.
-        let start = html.find("window.__SCENE_PACKAGE__ = ").unwrap()
-            + "window.__SCENE_PACKAGE__ = ".len();
+        let start =
+            html.find("window.__SCENE_PACKAGE__ = ").unwrap() + "window.__SCENE_PACKAGE__ = ".len();
         let rest = &html[start..];
         let end = rest.find(";\n").unwrap();
         let json = &rest[..end];
@@ -205,7 +208,10 @@ mod tests {
         let html = render_scene_html("null");
         assert!(html.contains("window.__SCENE_PACKAGE__ = null;"));
         assert!(html.contains("<!doctype html>"));
-        assert!(!html.contains("/*__SCENE_OS_BUNDLE__*/"), "bundle still injected");
+        assert!(
+            !html.contains("/*__SCENE_OS_BUNDLE__*/"),
+            "bundle still injected"
+        );
         // Empty state scaffold is present so the bundle can show it honestly.
         assert!(html.contains("scene-empty"));
     }

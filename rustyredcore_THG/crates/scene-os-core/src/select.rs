@@ -172,7 +172,13 @@ fn goal_keywords() -> Vec<(Goal, Vec<&'static str>)> {
         ),
         (
             Goal::TellStory,
-            vec!["story of", "history of", "timeline", "what happened", "trajectory"],
+            vec![
+                "story of",
+                "history of",
+                "timeline",
+                "what happened",
+                "trajectory",
+            ],
         ),
         (
             Goal::Summarize,
@@ -330,7 +336,11 @@ pub fn detect_shape(atoms: &[SceneAtom], relations: &[SceneRelation]) -> DataSha
                 &format!("tree:{}-edges", relations.len()),
             );
         }
-        return shape_detection(DataShape::Dag, 0.7, &format!("dag:{}-edges", relations.len()));
+        return shape_detection(
+            DataShape::Dag,
+            0.7,
+            &format!("dag:{}-edges", relations.len()),
+        );
     }
 
     if image_kind > 0 && ratio(image_kind, total) >= 0.5 {
@@ -385,8 +395,10 @@ fn ratio(part: usize, total: usize) -> f64 {
 }
 
 fn is_tree(atoms: &[SceneAtom], relations: &[SceneRelation]) -> bool {
-    let mut in_degree: BTreeMap<&str, usize> =
-        atoms.iter().map(|atom| (atom.id.as_str(), 0usize)).collect();
+    let mut in_degree: BTreeMap<&str, usize> = atoms
+        .iter()
+        .map(|atom| (atom.id.as_str(), 0usize))
+        .collect();
     for relation in relations {
         if let Some(degree) = in_degree.get_mut(relation.target_id.as_str()) {
             *degree += 1;
@@ -481,7 +493,8 @@ pub fn select_projection(
         });
     }
 
-    hard_passers.sort_by_key(|projection| preference_rank(&preferences, projection.coordinate_space));
+    hard_passers
+        .sort_by_key(|projection| preference_rank(&preferences, projection.coordinate_space));
     let finalist = hard_passers[0];
     let fallbacks = hard_passers[1..]
         .iter()
@@ -519,7 +532,11 @@ fn shape_allowed_spaces(shape: DataShape) -> Vec<CoordinateSpace> {
             CoordinateSpace::Freeform,
         ],
         DataShape::NumericSeries => {
-            vec![CoordinateSpace::Rank, CoordinateSpace::Timeline, CoordinateSpace::Matrix]
+            vec![
+                CoordinateSpace::Rank,
+                CoordinateSpace::Timeline,
+                CoordinateSpace::Matrix,
+            ]
         }
         DataShape::CategoricalSet => vec![
             CoordinateSpace::Graph,
@@ -615,14 +632,20 @@ pub fn select_chrome(
         .iter()
         .filter(|chrome| {
             chrome.pairs_with_projections.is_empty()
-                || chrome.pairs_with_projections.iter().any(|id| id == &projection.id)
+                || chrome
+                    .pairs_with_projections
+                    .iter()
+                    .any(|id| id == &projection.id)
         })
         .collect();
 
     if candidates.is_empty() {
         return Err(ChromeSelectionRefusal {
             code: "no_compatible_chrome".to_string(),
-            message: format!("No chrome in the catalog pairs with projection {:?}.", projection.id),
+            message: format!(
+                "No chrome in the catalog pairs with projection {:?}.",
+                projection.id
+            ),
         });
     }
 
@@ -662,7 +685,11 @@ fn goal_chrome_affordances(goal: Goal) -> Vec<&'static str> {
 
 fn chrome_rank(preferred: &[&str], chrome: &ChromeCapability) -> usize {
     for (idx, affordance) in preferred.iter().enumerate() {
-        if chrome.affordances.iter().any(|candidate| candidate == affordance) {
+        if chrome
+            .affordances
+            .iter()
+            .any(|candidate| candidate == affordance)
+        {
             return idx;
         }
     }
@@ -704,11 +731,7 @@ mod tests {
     #[test]
     fn detects_dag_from_dense_relations() {
         let atoms = vec![atom("a", None), atom("b", None), atom("c", None)];
-        let relations = vec![
-            relation("a", "b"),
-            relation("a", "c"),
-            relation("b", "c"),
-        ];
+        let relations = vec![relation("a", "b"), relation("a", "c"), relation("b", "c")];
         let detection = detect_shape(&atoms, &relations);
         assert_eq!(detection.shape, DataShape::Dag);
         assert_eq!(detection.required_fields, vec!["kind"]);

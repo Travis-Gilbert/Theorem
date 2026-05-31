@@ -79,7 +79,14 @@ pub fn production_projection_catalog() -> Vec<ProjectionCapability> {
             attributes: ProjectionAttributes {
                 drives: strings(&["position"]),
             },
-            interactions: strings(&["select", "hover", "zoom", "compare", "open-evidence", "save"]),
+            interactions: strings(&[
+                "select",
+                "hover",
+                "zoom",
+                "compare",
+                "open-evidence",
+                "save",
+            ]),
             patch_support: strings(&["full-replace", "atom-update", "state-update"]),
             budgets: ProjectionBudgets {
                 max_atoms: Some(1_000),
@@ -172,6 +179,130 @@ pub fn production_projection_catalog() -> Vec<ProjectionCapability> {
     ]
 }
 
+pub fn mobile_projection_catalog() -> Vec<ProjectionCapability> {
+    vec![
+        ProjectionCapability {
+            id: "force_graph".to_string(),
+            label: "Force Graph".to_string(),
+            coordinate_space: CoordinateSpace::Graph,
+            requires: ProjectionRequirements {
+                atom_fields: strings(&["id", "label", "weight", "metadata.matchScore"]),
+                relation_fields: strings(&["id", "source_id", "target_id"]),
+                min_atoms: Some(2),
+                max_atoms: Some(400),
+                source_shape: Some("web_neighborhood".to_string()),
+            },
+            attributes: ProjectionAttributes {
+                drives: strings(&["position", "scale", "opacity"]),
+            },
+            interactions: strings(&[
+                "select",
+                "hover",
+                "drag",
+                "zoom",
+                "open-evidence",
+                "save",
+                "ask-follow-up",
+            ]),
+            patch_support: strings(&["full-replace", "atom-update", "state-update"]),
+            budgets: ProjectionBudgets {
+                max_atoms: Some(400),
+                max_relations: Some(1_200),
+                max_payload_bytes: Some(160_000),
+                expected_fps: Some(60),
+                ..ProjectionBudgets::default()
+            },
+            fallback_projection: None,
+            emits_terminal_state: false,
+        },
+        ProjectionCapability {
+            id: "radial_rings".to_string(),
+            label: "Radial Rings".to_string(),
+            coordinate_space: CoordinateSpace::Graph,
+            requires: ProjectionRequirements {
+                atom_fields: strings(&["id", "metadata.ring", "metadata.matchScore"]),
+                relation_fields: strings(&["id", "source_id", "target_id"]),
+                min_atoms: Some(1),
+                max_atoms: Some(400),
+                source_shape: Some("web_neighborhood_rings".to_string()),
+            },
+            attributes: ProjectionAttributes {
+                drives: strings(&["position", "scale"]),
+            },
+            interactions: strings(&["select", "hover", "zoom", "open-evidence", "save"]),
+            patch_support: strings(&["full-replace", "atom-update", "state-update"]),
+            budgets: ProjectionBudgets {
+                max_atoms: Some(400),
+                max_relations: Some(1_200),
+                max_payload_bytes: Some(160_000),
+                expected_fps: Some(60),
+                ..ProjectionBudgets::default()
+            },
+            fallback_projection: Some("force_graph".to_string()),
+            emits_terminal_state: false,
+        },
+        ProjectionCapability {
+            id: "tree_layout".to_string(),
+            label: "Tree Layout".to_string(),
+            coordinate_space: CoordinateSpace::Diagram,
+            requires: ProjectionRequirements {
+                atom_fields: strings(&["id", "metadata.matchScore"]),
+                relation_fields: strings(&["id", "source_id", "target_id"]),
+                min_atoms: Some(1),
+                max_atoms: Some(400),
+                source_shape: Some("rooted_tree".to_string()),
+            },
+            attributes: ProjectionAttributes {
+                drives: strings(&["position"]),
+            },
+            interactions: strings(&["select", "hover", "zoom", "open-evidence", "save"]),
+            patch_support: strings(&["full-replace", "atom-update", "state-update"]),
+            budgets: ProjectionBudgets {
+                max_atoms: Some(400),
+                max_relations: Some(399),
+                max_payload_bytes: Some(128_000),
+                expected_fps: Some(60),
+                ..ProjectionBudgets::default()
+            },
+            fallback_projection: Some("radial_rings".to_string()),
+            emits_terminal_state: false,
+        },
+        ProjectionCapability {
+            id: "fractal_expansion".to_string(),
+            label: "Fractal Expansion".to_string(),
+            coordinate_space: CoordinateSpace::Graph,
+            requires: ProjectionRequirements {
+                atom_fields: strings(&["id", "metadata.ring", "metadata.matchScore"]),
+                relation_fields: strings(&["id", "source_id", "target_id"]),
+                min_atoms: Some(2),
+                max_atoms: Some(400),
+                source_shape: Some("web_neighborhood_push_trace".to_string()),
+            },
+            attributes: ProjectionAttributes {
+                drives: strings(&["position", "opacity", "scale"]),
+            },
+            interactions: strings(&[
+                "select",
+                "hover",
+                "replay",
+                "open-evidence",
+                "save",
+                "ask-follow-up",
+            ]),
+            patch_support: strings(&["full-replace", "atom-update", "state-update"]),
+            budgets: ProjectionBudgets {
+                max_atoms: Some(400),
+                max_relations: Some(1_200),
+                max_payload_bytes: Some(192_000),
+                expected_fps: Some(60),
+                ..ProjectionBudgets::default()
+            },
+            fallback_projection: Some("force_graph".to_string()),
+            emits_terminal_state: false,
+        },
+    ]
+}
+
 pub fn production_chrome_catalog() -> Vec<ChromeCapability> {
     vec![
         ChromeCapability {
@@ -190,6 +321,19 @@ pub fn production_chrome_catalog() -> Vec<ChromeCapability> {
             pairs_with_projections: strings(&["tree_hierarchy"]),
             patch_support: strings(&["full-replace", "state-update"]),
         },
+        ChromeCapability {
+            id: "dynamic_island_shell".to_string(),
+            label: "Dynamic Island Shell".to_string(),
+            affordances: strings(&["search", "ask", "projection-switcher", "node-detail"]),
+            reserves_screen_regions: strings(&["top-floating-island"]),
+            pairs_with_projections: strings(&[
+                "force_graph",
+                "radial_rings",
+                "tree_layout",
+                "fractal_expansion",
+            ]),
+            patch_support: strings(&["full-replace", "atom-update", "state-update"]),
+        },
     ]
 }
 
@@ -206,10 +350,30 @@ mod tests {
         let projections = production_projection_catalog();
         let chromes = production_chrome_catalog();
         assert_eq!(projections.len(), 6);
-        assert_eq!(chromes.len(), 2);
+        assert_eq!(chromes.len(), 3);
         assert_eq!(projections[0].id, "patent_diagram");
         assert_eq!(projections[5].id, "sankey_flow");
         assert_eq!(chromes[0].id, "patent_plate_shell");
         assert_eq!(chromes[1].pairs_with_projections, vec!["tree_hierarchy"]);
+    }
+
+    #[test]
+    fn mobile_catalog_registers_the_ios_v1_algorithm_set() {
+        let projections = mobile_projection_catalog();
+        assert_eq!(
+            projections
+                .iter()
+                .map(|projection| projection.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "force_graph",
+                "radial_rings",
+                "tree_layout",
+                "fractal_expansion"
+            ]
+        );
+        assert!(projections
+            .iter()
+            .all(|projection| projection.budgets.expected_fps == Some(60)));
     }
 }
