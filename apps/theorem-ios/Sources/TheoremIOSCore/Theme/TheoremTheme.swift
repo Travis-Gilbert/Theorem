@@ -45,15 +45,15 @@ public struct TheoremTheme: Equatable, Sendable {
     /// (Deviates from the addendum's warm hexes per Travis's "still reads beige"
     /// feedback; the warm field #F6F5F2 + taupe chrome #EAE8E2 read beige.)
     public static let defaultPalette = TheoremTheme(
-        nodeCore: Color(red: 0.957, green: 0.965, blue: 0.976),  // field (node fill)
-        nodeWeb: Color(red: 0.957, green: 0.965, blue: 0.976),   // field
-        nodeTool: Color(red: 0.957, green: 0.965, blue: 0.976),  // field
+        nodeCore: Color(red: 1.0, green: 1.0, blue: 1.0),  // field (node fill)
+        nodeWeb: Color(red: 1.0, green: 1.0, blue: 1.0),   // field
+        nodeTool: Color(red: 1.0, green: 1.0, blue: 1.0),  // field
         nodeDimmed: Color(red: 0.761, green: 0.780, blue: 0.808),// pebble #C2C7CE (cool)
         edge: Color(red: 0.133, green: 0.145, blue: 0.165).opacity(0.42), // rule
         ringMatch: Color(red: 0.482, green: 0.180, blue: 0.149), // OXBLOOD #7B2E26
-        ringAdjacent: Color(red: 0.957, green: 0.965, blue: 0.976), // field
-        ringNearby: Color(red: 0.957, green: 0.965, blue: 0.976),   // field
-        background: Color(red: 0.957, green: 0.965, blue: 0.976), // FIELD #F4F6F9 (cool paper)
+        ringAdjacent: Color(red: 1.0, green: 1.0, blue: 1.0), // field
+        ringNearby: Color(red: 1.0, green: 1.0, blue: 1.0),   // field
+        background: Color(red: 1.0, green: 1.0, blue: 1.0), // FIELD #FFFFFF (pure white)
         surface: Color(red: 0.898, green: 0.910, blue: 0.929),   // CHROME #E5E8ED (cool grey)
         textPrimary: Color(red: 0.133, green: 0.145, blue: 0.165),// INK #22252A (cool near-black)
         textSecondary: Color(red: 0.133, green: 0.145, blue: 0.165).opacity(0.62), // muted

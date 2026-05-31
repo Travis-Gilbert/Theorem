@@ -12,11 +12,9 @@ struct TheoremSceneView: View {
 
     var body: some View {
         ZStack {
-            // The field + its MT19937-seeded hex-blueprint substrate watermark,
-            // behind the graph. The graph renderers draw transparently on top so
-            // the texture reads through; content stays at full contrast.
+            // Pure-white field. The hex-blueprint texture lives in the Dynamic
+            // Island chrome now (pill + expanded), not behind the graph.
             theme.field
-            HexWatermarkView(seed: watermarkSeed, theme: theme)
             Group {
                 if projection == .forceGraph {
                     // Live force simulation (Grape) for the hero projection; the
@@ -31,17 +29,6 @@ struct TheoremSceneView: View {
             sceneHeader
                 .padding(18)
         }
-    }
-
-    /// Per-scene watermark seed: the query if present, else the sorted atom ids,
-    /// so the texture is stable per scene and changes between scenes.
-    private var watermarkSeed: UInt32 {
-        if let query = package.provenance["query"]?.stringValue,
-           !query.trimmingCharacters(in: .whitespaces).isEmpty {
-            return MT19937.seed(from: query)
-        }
-        let ids = package.atoms.map(\.id).sorted().joined(separator: ",")
-        return MT19937.seed(from: ids.isEmpty ? "theorem" : ids)
     }
 
     private var canvasBody: some View {
@@ -63,13 +50,8 @@ struct TheoremSceneView: View {
 
     private var sceneHeader: some View {
         VStack(alignment: .leading, spacing: 5) {
-            // Instrument label: "FORCE · 5 NODES" — small, muted, tracked.
-            Text(sceneCaption)
-                .font(TheoremFonts.label(size: 11))
-                .textCase(.uppercase)
-                .tracking(0.9)
-                .foregroundStyle(theme.textMuted)
-            // The query / center-node name is the headline — never a generic title.
+            // The query / center-node name is the headline, kept subtle. The
+            // "FORCE · N NODES" caption was cut per Travis.
             if let headline = sceneHeadline {
                 Text(headline)
                     .font(TheoremFonts.display(size: 22, relativeTo: .title2))
@@ -78,10 +60,6 @@ struct TheoremSceneView: View {
             }
         }
         .frame(maxWidth: 280, alignment: .leading)
-    }
-
-    private var sceneCaption: String {
-        "\(projection.title) · \(package.atoms.count) NODES"
     }
 
     /// The prominent type: the selected node, else the search query, else the

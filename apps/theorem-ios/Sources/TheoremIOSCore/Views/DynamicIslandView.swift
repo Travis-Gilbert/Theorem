@@ -31,6 +31,24 @@ struct DynamicIslandView: View {
     @Namespace private var namespace
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    /// Near-white paper the island prints on. The page field is pure white; the
+    /// island is a hair cooler so it reads as a distinct surface, and so the
+    /// blueprint hexes have a near-white ground (the old-blueprint look).
+    private var islandPaper: Color { Color(red: 0.965, green: 0.976, blue: 0.988) }
+    /// Fixed seed: the island's hex texture is stable, not per-scene.
+    private static let islandSeed: UInt32 = MT19937.seed(from: "island-chrome")
+
+    /// The island's background: near-white paper + the hex-blueprint texture,
+    /// clipped to the island's shape. This is the ONLY place the hexbin lives.
+    @ViewBuilder
+    private func islandBackground<S: Shape>(_ shape: S) -> some View {
+        ZStack {
+            islandPaper
+            HexWatermarkView(seed: Self.islandSeed, theme: theme)
+        }
+        .clipShape(shape)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if mode == .idle {
@@ -76,7 +94,7 @@ struct DynamicIslandView: View {
         .font(TheoremFonts.body(size: 14, relativeTo: .callout))
         .foregroundStyle(theme.textPrimary)
         .frame(width: 326, height: 48)
-        .background(theme.surface, in: Capsule())
+        .background(islandBackground(Capsule()))
         .overlay(Capsule().stroke(theme.textPrimary.opacity(0.10), lineWidth: 1))
         .shadow(color: theme.ink.opacity(0.12), radius: 10, y: 3)
         .matchedGeometryEffect(id: "island", in: namespace)
@@ -146,7 +164,7 @@ struct DynamicIslandView: View {
         .padding(18)
         .frame(width: 356)
         .frame(minHeight: mode == .detail ? 300 : (mode == .ask ? 96 : 150))
-        .background(theme.surface, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .background(islandBackground(RoundedRectangle(cornerRadius: 28, style: .continuous)))
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(theme.textPrimary.opacity(0.08), lineWidth: 1)

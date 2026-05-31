@@ -1,22 +1,22 @@
 import SwiftUI
 
-/// MT19937-seeded hex-blueprint substrate watermark (addendum D3): a faint field
-/// of flat-top hexagons, ~8-15% of them inked in blueprint-blue, the rest left
-/// as field. Deterministic and static per scene (the seed is a fingerprint of
-/// the scene), so the same scene always prints the same texture, and the seed
-/// changes between scenes. Sits behind the graph; content stays at full
-/// contrast on top. This is a tiling, not a binning, so it does NOT use a
-/// hexbin: every grid cell is visited in a fixed order and the MT draw decides
-/// whether it inks.
+/// MT19937-seeded hex-blueprint texture. The instrument's own surface grain,
+/// living ONLY inside the Dynamic Island chrome (the pill + the expanded island),
+/// never the page field. A d3-hexbin pointy-top lattice: most cells blank, a
+/// sparse algorithmic fraction inked in fairly-dark blueprint blue, like an old
+/// blueprint. Deterministic (MT-seeded) and static. Blue is an accent here, not
+/// a surface, so the frequency stays low.
 struct HexWatermarkView: View {
     var seed: UInt32
     var theme: TheoremTheme
-    /// Fraction of hexes inked. 0.08-0.15 reads as a watermark, not a checkerboard.
-    var frequency: Double = 0.10
-    /// Flat-top hex radius (center to vertex), in points. Smaller = finer grain.
-    var radius: Double = 13
-    /// Ink opacity. Kept low so the texture stays a faint substrate, not a pattern.
-    var inkOpacity: Double = 0.09
+    /// Fraction of cells inked. Sparse on purpose: blue is a bonus, not a surface,
+    /// so most cells stay blank.
+    var frequency: Double = 0.05
+    /// Hex radius (center to vertex), in points.
+    var radius: Double = 12
+    /// Ink opacity. Fairly dark per cell (an old-blueprint mark), but sparse
+    /// overall so blue stays an accent, not a surface.
+    var inkOpacity: Double = 0.60
 
     var body: some View {
         Canvas { context, size in
@@ -30,34 +30,35 @@ struct HexWatermarkView: View {
     private func draw(into context: inout GraphicsContext, size: CGSize) {
         var rng = MT19937(seed: seed)
         let r = radius
-        let colStep = r * 1.5
-        let rowStep = r * sqrt(3.0)
-        let stagger = rowStep / 2
+        // d3-hexbin pointy-top lattice: dx = r*sqrt(3) across, dy = r*1.5 down,
+        // odd rows offset by dx/2.
+        let dx = r * sqrt(3.0)
+        let dy = r * 1.5
         let shading = GraphicsContext.Shading.color(theme.blueprintInk.opacity(inkOpacity))
 
-        // Walk columns then rows in a fixed order so the MT draw is deterministic;
+        let rows = Int((size.height / dy).rounded(.up)) + 2
+        let cols = Int((size.width / dx).rounded(.up)) + 2
+        // Walk rows then cols in a fixed order so the MT draw is deterministic;
         // every cell consumes exactly one MT value whether or not it inks.
-        let cols = Int((size.width / colStep).rounded(.up)) + 2
-        let rows = Int((size.height / rowStep).rounded(.up)) + 2
-        for col in 0..<cols {
-            let cx = Double(col) * colStep
-            let yOffset = (col % 2 == 0) ? 0 : stagger
-            for row in 0..<rows {
+        for row in 0..<rows {
+            let cy = Double(row) * dy
+            let xOffset = (row % 2 == 0) ? 0 : dx / 2
+            for col in 0..<cols {
                 let inked = rng.nextDouble() < frequency
                 guard inked else { continue }
-                let cy = Double(row) * rowStep + yOffset
+                let cx = Double(col) * dx + xOffset
                 context.fill(hexPath(cx: cx, cy: cy, r: r), with: shading)
             }
         }
     }
 
-    /// Flat-top hexagon: corners at 60-degree steps from angle 0 (vertices left
-    /// and right, flat edges top and bottom).
+    /// Pointy-top hexagon (d3-hexbin): first vertex straight up, flat left/right
+    /// edges. point = (sin(a)*r, -cos(a)*r) for a in 60-degree steps.
     private func hexPath(cx: Double, cy: Double, r: Double) -> Path {
         var path = Path()
         for i in 0..<6 {
             let angle = Double(i) * .pi / 3
-            let point = CGPoint(x: cx + r * cos(angle), y: cy + r * sin(angle))
+            let point = CGPoint(x: cx + sin(angle) * r, y: cy - cos(angle) * r)
             if i == 0 {
                 path.move(to: point)
             } else {
