@@ -1,9 +1,11 @@
 import SwiftUI
 import Grape
 
-/// The search-results graph as a *knowledge-frontier map*, rendered in the
-/// spirit of d3's force-directed tree (Travis's @d3/force-directed-tree
-/// reference) but encoding two real backend signals instead of pure tree shape:
+/// The search-results graph as a *knowledge-frontier map*, laid out as a
+/// **force-tree**: the simulation is driven by a spanning-tree backbone
+/// (`ForceTree.backbone`) rather than the raw relation knot, so it reads as a
+/// tree with a clear center and branches, the way @d3/force-directed-tree does.
+/// On top of that tree shape it encodes two real backend signals:
 ///
 /// - **Fill = provenance.** A hollow ring (field fill, ink stroke) is the user's
 ///   relevant *corpus*: a page the substrate has actually fetched and knows. A
@@ -32,7 +34,10 @@ struct ForceGraphView: View {
     private let queryRadius: CGFloat = 12
 
     var body: some View {
-        let degree = degreeMap()
+        // Extract a spanning-tree backbone so the simulation relaxes into a legible
+        // tree, not a hairball. The raw relations (query -> every result + substrate
+        // cross-links) are what made every prior configuration unreadable.
+        let backbone = ForceTree.backbone(atoms: package.atoms, relations: package.relations)
         let maxScore = maxMatchScore()
         // The d3 reference is unlabeled; keep labels only for sparse graphs where
         // they help, and let dense trees speak as pure structure.
@@ -41,7 +46,7 @@ struct ForceGraphView: View {
         ForceDirectedGraph(states: graphState) {
             Series(package.atoms) { atom in
                 let r = radius(for: atom, maxScore: maxScore)
-                let filled = isFilled(atom, degree: degree)
+                let filled = isFilled(atom, childCount: backbone.childCount)
                 // Frontier map: corpus = hollow ring (field fill, ink stroke),
                 // frontier = filled ink dot with a thin field halo (the halo
                 // separates dots where frontier clusters overlap).
@@ -59,18 +64,22 @@ struct ForceGraphView: View {
                         offset: SIMD2(0, Double(r) + 5)
                     )
             }
-            Series(package.relations) { relation in
-                // Thin grey edges (d3 #999 at 0.6 opacity reads as a light-mid grey).
-                LinkMark(from: relation.sourceId, to: relation.targetId)
+            // Backbone only: parent -> child springs are what give the layout its
+            // tree shape. Cross-links are intentionally absent from the force (the
+            // skeleton IS the tree), exactly as @d3/force-directed-tree drives the
+            // sim from root.links(). Thin grey edges (d3 #999 at ~0.6 reads mid-grey).
+            Series(backbone.edges) { edge in
+                LinkMark(from: edge.parent, to: edge.child)
                     .stroke(theme.ink.opacity(0.30), StrokeStyle(lineWidth: 1))
             }
         } force: {
-            // ~10 large nodes want a comfortable radial, not d3's tight 150-node
-            // clustering. Stronger charge + longer spokes spread the hub-and-leaf
-            // result across the canvas; the hollow/filled + drag stay d3-faithful.
-            .manyBody(strength: -150)
+            // A tree wants a wider spread than a knot: stronger charge pushes
+            // sibling branches apart, the spoke length sets branch reach, the center
+            // keeps the root on screen. No collide/radial chainable exists in Grape
+            // 1.1.0's DSL, so charge + link length do the spreading.
+            .manyBody(strength: -240)
             .center()
-            .link(originalLength: 44.0, stiffness: .weightedByDegree { _, _ in 1.0 })
+            .link(originalLength: 40.0, stiffness: .weightedByDegree { _, _ in 1.0 })
         }
         .graphOverlay { proxy in
             Rectangle()
@@ -84,15 +93,15 @@ struct ForceGraphView: View {
     /// Whether a node renders filled (black/new) vs hollow (white/known).
     /// Provenance is the primary signal; the query seed reads as known; the
     /// degree rule is the fallback when the backend supplies no provenance.
-    private func isFilled(_ atom: SceneAtom, degree: [String: Int]) -> Bool {
+    private func isFilled(_ atom: SceneAtom, childCount: [String: Int]) -> Bool {
         switch provenance(of: atom) {
         case "frontier": return true   // new, past the frontier => filled/black
         case "corpus": return false    // the user's known corpus => hollow/white
         default:
             // The typed query is the most-known node: render it hollow.
             if atom.kind == "query" { return false }
-            // d3 fallback: leaf (degree <= 1) filled, internal hollow.
-            return (degree[atom.id] ?? 0) <= 1
+            // d3 fallback: a backbone leaf (no children) is filled, internal hollow.
+            return (childCount[atom.id] ?? 0) == 0
         }
     }
 
@@ -116,18 +125,6 @@ struct ForceGraphView: View {
 
     private func provenance(of atom: SceneAtom) -> String? {
         atom.metadata["provenance"]?.stringValue
-    }
-
-    /// Undirected degree per node. Used only as the provenance fallback: leaf =
-    /// degree <= 1 (filled), internal = degree >= 2 (hollow), mirroring d3's
-    /// parent/child distinction on a tree.
-    private func degreeMap() -> [String: Int] {
-        var degree: [String: Int] = [:]
-        for relation in package.relations {
-            degree[relation.sourceId, default: 0] += 1
-            degree[relation.targetId, default: 0] += 1
-        }
-        return degree
     }
 
     /// Node label (atom.label, else id), in the instrument label face. Returns a

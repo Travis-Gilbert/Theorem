@@ -11,11 +11,13 @@ public enum ProjectionID: String, CaseIterable, Identifiable, Sendable {
     public var title: String {
         switch self {
         case .forceGraph:
-            "Force"
+            // The live Grape projection is now a force-tree (backbone-driven), so
+            // it carries the "Tree" name; the rigid static layout becomes "Tiers".
+            "Tree"
         case .radialRings:
             "Rings"
         case .treeLayout:
-            "Tree"
+            "Tiers"
         case .fractalExpansion:
             "Fractal"
         }
