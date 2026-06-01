@@ -251,12 +251,14 @@ durable path.
 The first exposure step is implemented in `rustyred-thg-mcp`: native
 `coordination_room`, `presence`, `coordination_intent`, `coordinate`,
 `coordination_record`, `mentions`, `read_intents_for_room`,
-`read_messages_for_room`, `read_records_for_room`, and `coordination_context`
-tools now use the Rust runtime coordination data model and persist through the
-MCP backend GraphStore. Read tools are listed in read-only mode; write tools
-appear only when MCP read/write mode is enabled. The MCP test suite covers a
-full room/presence/intent/message/mention-consume/record/readback/context-packet/
-contribution-capture round trip against a shared fixture store.
+`read_messages_for_room`, `read_records_for_room`, `coordination_context`,
+`harness_run`, and `harness_append_transition` tools now use the Rust runtime
+data model and persist through the MCP backend GraphStore. Read tools are
+listed in read-only mode; write tools appear only when MCP read/write mode is
+enabled. The MCP test suite covers a full room/presence/intent/message/
+mention-consume/record/readback/context-packet/contribution-capture round trip
+against a shared fixture store, plus a complete run lifecycle appended through
+`harness_append_transition` and read back through `harness_run`.
 
 The next native substrate slice adds durable coordination records for
 `event`, `decision`, `tension`, and `reflection`. They share one
@@ -277,6 +279,12 @@ return a `policy_receipt`, reject missing-scope or over-budget writes, and
 persist the receipt into successful record metadata. Full context IO retrieval
 and the user/run-level budget governor remain part of the broader
 runtime/substrate backlog below.
+
+For live wiring, the MCP server and `apps/theorem-harness-server` must point at
+the same RedCore tenant directory. With the THG server defaults, MCP writes
+under `$RUSTY_RED_DATA_DIR/tenants/<tenant>` and the harness HTTP server should
+use `THEOREM_HARNESS_DATA_DIR=$RUSTY_RED_DATA_DIR/tenants/<tenant>` for the iOS
+run and presence surfaces.
 
 The HTTP transport exposure now lives in `apps/theorem-harness-server` over
 `theorem-harness-runtime`. It serves run list/detail plus the native

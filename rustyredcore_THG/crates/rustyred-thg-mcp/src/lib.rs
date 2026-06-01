@@ -4,23 +4,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
     merge_graph_snapshots, update_graph_ref, CodeKgManifest, Direction, EdgeRecord, EpistemicType,
-    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStoreError,
+    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
     GraphStoreResult, GraphVersionRepository, HarnessInstantKg, HybridScoringConfig,
     InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
     SessionDelta, VectorDesignation, VerifyReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use theorem_harness_core::{TransitionInput, TransitionResult};
 use theorem_harness_runtime::{
-    coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
-    coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
-    coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
-    coordination_record_node_id, coordination_room_node_id, infer_coordination_room_id,
-    normalize_coordination_urgency, parse_coordination_mentions, stable_coordination_message_id,
-    stable_coordination_record_id, CoordinationIntentState, CoordinationMessageState,
-    CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
-    CoordinationRoomState, JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
-    WriteRecordInput,
+    append_transition_from_store, coordination_intent_edge_id, coordination_intent_node_id,
+    coordination_member_edge_id, coordination_member_node_id, coordination_mention_edge_id,
+    coordination_message_edge_id, coordination_message_node_id, coordination_presence_node_id,
+    coordination_record_edge_id, coordination_record_node_id, coordination_room_node_id,
+    infer_coordination_room_id, load_events, load_run, normalize_coordination_urgency,
+    parse_coordination_mentions, stable_coordination_message_id, stable_coordination_record_id,
+    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
+    CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, HarnessRuntimeError,
+    JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -66,6 +67,19 @@ pub trait McpGraphBackend {
         Err(GraphStoreError::new(
             "unsupported_operation",
             "edge bulk upsert is not supported by this MCP backend",
+        ))
+    }
+    fn append_harness_transition(
+        &mut self,
+        _transition: TransitionInput,
+    ) -> Result<Value, McpError> {
+        Err(McpError::internal(
+            "harness transition append is not supported by this MCP backend",
+        ))
+    }
+    fn harness_run_detail(&self, _run_id: &str) -> Result<Option<Value>, McpError> {
+        Err(McpError::internal(
+            "harness run reads are not supported by this MCP backend",
         ))
     }
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>>;
@@ -911,6 +925,18 @@ fn call_tool<P: McpGraphProvider>(
         }
         "coordination_context" | "theorem_harness_coordination_context" => {
             coordination_context_payload(&tenant, &mut backend, &arguments)?
+        }
+        "harness_append_transition" | "theorem_harness_append_transition" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native harness transition appends are unavailable while read-only mode is active."
+                })));
+            }
+            append_harness_transition_payload(&tenant, &mut backend, &arguments)?
+        }
+        "harness_run" | "theorem_harness_run" => {
+            harness_run_payload(&tenant, &backend, &arguments)?
         }
         "rustyred_thg_fulltext_search" | "rustyred_thg_graph_fulltext_search" => {
             let property = required_str(&arguments, "property", name)?;
@@ -2463,6 +2489,35 @@ fn coordination_context_payload(
     }))
 }
 
+fn append_harness_transition_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let transition = transition_from_arguments(arguments, "harness_append_transition")?;
+    let result = backend.append_harness_transition(transition)?;
+    Ok(json!({
+        "tenant": tenant,
+        "result": result
+    }))
+}
+
+fn harness_run_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "harness_run")?;
+    let detail = backend.harness_run_detail(&run_id)?;
+    let found = detail.is_some();
+    Ok(json!({
+        "tenant": tenant,
+        "run_id": run_id,
+        "detail": detail,
+        "found": found
+    }))
+}
+
 fn instant_kg_view_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
@@ -3409,6 +3464,29 @@ fn insert_policy_receipt(payload: &mut Value, policy_receipt: Option<Value>) {
     }
 }
 
+fn transition_from_arguments(
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<TransitionInput, McpError> {
+    if let Some(transition) = arguments.get("transition") {
+        return serde_json::from_value::<TransitionInput>(transition.clone()).map_err(|error| {
+            McpError::invalid_params(format!("transition must match TransitionInput: {error}"))
+        });
+    }
+
+    let event_type = required_text_any(arguments, &["type", "event_type", "eventType"], tool_name)?;
+    let mut transition = TransitionInput::new(event_type, argument_object(arguments, "payload"));
+    transition.run_id = argument_text(arguments, &["run_id", "runId"]).unwrap_or_default();
+    transition.actor =
+        argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default();
+    transition.idempotency_key =
+        argument_text(arguments, &["idempotency_key", "idempotencyKey"]).unwrap_or_default();
+    if let Some(created_at) = argument_text(arguments, &["created_at", "createdAt"]) {
+        transition.created_at = created_at;
+    }
+    Ok(transition)
+}
+
 fn coordination_policy_receipt(
     context: &McpRequestContext,
     arguments: &Value,
@@ -3748,6 +3826,46 @@ fn jsonrpc_error(id: Option<Value>, error: McpError) -> Value {
         body["error"]["data"] = data;
     }
     body
+}
+
+fn append_harness_transition_to_store<S: GraphStore>(
+    store: &mut S,
+    transition: TransitionInput,
+) -> Result<Value, McpError> {
+    append_transition_from_store(store, transition)
+        .map(transition_result_payload)
+        .map_err(mcp_harness_runtime_error)
+}
+
+fn harness_run_detail_from_store<S: GraphStore>(
+    store: &S,
+    run_id: &str,
+) -> Result<Option<Value>, McpError> {
+    match load_run(store, run_id).map_err(mcp_harness_runtime_error)? {
+        None => Ok(None),
+        Some(run) => {
+            let events = load_events(store, run_id).map_err(mcp_harness_runtime_error)?;
+            Ok(Some(json!({ "run": run, "events": events })))
+        }
+    }
+}
+
+fn transition_result_payload(result: TransitionResult) -> Value {
+    json!({
+        "run": result.run,
+        "event": result.event,
+        "effects": result.effects,
+        "state_hash_before": result.state_hash_before,
+        "state_hash_after": result.state_hash_after
+    })
+}
+
+fn mcp_harness_runtime_error(error: HarnessRuntimeError) -> McpError {
+    McpError {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({ "code": "harness_runtime_error" })),
+    }
 }
 
 fn resources(config: &McpServerConfig) -> Vec<Value> {
@@ -4348,6 +4466,23 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "harness_run",
+            "Read a native Theorem harness run plus ordered event ledger from the tenant GraphStore.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" }
+                },
+                "anyOf": [
+                    { "required": ["run_id"] },
+                    { "required": ["runId"] }
+                ]
+            }),
+        ),
+        tool(
             "mentions",
             "Read pending native Theorem harness mentions for an actor. consume=true requires write mode.",
             json!({
@@ -4610,6 +4745,40 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ));
         tools.push(tool_write(
+            "harness_append_transition",
+            "Append a native Theorem harness transition into the tenant GraphStore event log.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "transition": {
+                        "type": "object",
+                        "description": "Optional full TransitionInput object; when supplied it overrides the flat fields."
+                    },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "type": { "type": "string" },
+                    "event_type": { "type": "string" },
+                    "eventType": { "type": "string" },
+                    "payload": { "type": "object" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "actorId": { "type": "string" },
+                    "idempotency_key": { "type": "string" },
+                    "idempotencyKey": { "type": "string" },
+                    "created_at": { "type": "string" },
+                    "createdAt": { "type": "string" }
+                },
+                "anyOf": [
+                    { "required": ["transition"] },
+                    { "required": ["type"] },
+                    { "required": ["event_type"] },
+                    { "required": ["eventType"] }
+                ]
+            }),
+        ));
+        tools.push(tool_write(
             "rustyred_thg_fulltext_designate",
             "Designate a node property for full-text search.",
             json!({
@@ -4838,6 +5007,17 @@ impl McpGraphBackend for InMemoryGraphStore {
         InMemoryGraphStore::upsert_edge(self, edge).map(|_| ())
     }
 
+    fn append_harness_transition(
+        &mut self,
+        transition: TransitionInput,
+    ) -> Result<Value, McpError> {
+        append_harness_transition_to_store(self, transition)
+    }
+
+    fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
+        harness_run_detail_from_store(self, run_id)
+    }
+
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
         Ok(InMemoryGraphStore::vector_designations(self))
     }
@@ -4973,6 +5153,17 @@ impl McpGraphBackend for RedCoreGraphStore {
 
     fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
         RedCoreGraphStore::upsert_edge(self, edge).map(|_| ())
+    }
+
+    fn append_harness_transition(
+        &mut self,
+        transition: TransitionInput,
+    ) -> Result<Value, McpError> {
+        append_harness_transition_to_store(self, transition)
+    }
+
+    fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
+        harness_run_detail_from_store(self, run_id)
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -5177,10 +5368,12 @@ mod tests {
         VectorDesignation, VerifyReport,
     };
     use serde_json::{json, Value};
+    use theorem_harness_core::TransitionInput;
 
     use super::{
-        handle_mcp_request, handle_mcp_request_with_context, McpError, McpGraphBackend,
-        McpGraphProvider, McpRequestContext, McpServerConfig,
+        append_harness_transition_to_store, handle_mcp_request, handle_mcp_request_with_context,
+        harness_run_detail_from_store, McpError, McpGraphBackend, McpGraphProvider,
+        McpRequestContext, McpServerConfig,
     };
 
     struct FixtureProvider(Rc<RefCell<InMemoryGraphStore>>);
@@ -5247,6 +5440,19 @@ mod tests {
 
         fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
             InMemoryGraphStore::upsert_edge(&mut self.0.borrow_mut(), edge).map(|_| ())
+        }
+
+        fn append_harness_transition(
+            &mut self,
+            transition: TransitionInput,
+        ) -> Result<Value, McpError> {
+            let mut store = self.0.borrow_mut();
+            append_harness_transition_to_store(&mut *store, transition)
+        }
+
+        fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
+            let store = self.0.borrow();
+            harness_run_detail_from_store(&*store, run_id)
         }
 
         fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -5440,6 +5646,26 @@ mod tests {
         response["result"]["structuredContent"].clone()
     }
 
+    fn append_harness_event(
+        provider: &FixtureProvider,
+        config: &McpServerConfig,
+        run_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) -> Value {
+        call_tool_json(
+            provider,
+            config,
+            "harness_append_transition",
+            json!({
+                "tenant": "smoke",
+                "run_id": run_id,
+                "type": event_type,
+                "payload": payload
+            }),
+        )
+    }
+
     fn has_tool(tools: &[Value], name: &str) -> bool {
         tools.iter().any(|tool| tool["name"] == name)
     }
@@ -5487,6 +5713,7 @@ mod tests {
         assert!(has_tool(tools, "read_messages_for_room"));
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
+        assert!(has_tool(tools, "harness_run"));
         assert!(has_tool(tools, "mentions"));
         assert!(tools
             .iter()
@@ -5509,6 +5736,7 @@ mod tests {
         assert!(!has_tool(tools, "coordinate"));
         assert!(!has_tool(tools, "coordination_record"));
         assert!(!has_tool(tools, "coordination_contribution"));
+        assert!(!has_tool(tools, "harness_append_transition"));
     }
 
     #[test]
@@ -5531,6 +5759,8 @@ mod tests {
         assert!(has_tool(tools, "mentions"));
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
+        assert!(has_tool(tools, "harness_run"));
+        assert!(has_tool(tools, "harness_append_transition"));
     }
 
     #[test]
@@ -5790,6 +6020,174 @@ mod tests {
         assert_eq!(
             contributions["records"][0]["metadata"]["status"],
             "validated"
+        );
+    }
+
+    #[test]
+    fn native_harness_run_transitions_round_trip_through_mcp() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        let run_id = "run-mcp-0001";
+
+        let created = append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "RUN.CREATED",
+            json!({
+                "task": "wire native harness MCP",
+                "actor": "codex",
+                "scope": {
+                    "repo": "Theorem",
+                    "branch": "main",
+                    "commit_sha": "abc123",
+                    "cwd": "/repo/Theorem",
+                    "workstream_id": "harness-rust-port",
+                    "agent_host": "codex",
+                    "agent_model": "gpt-5"
+                }
+            }),
+        );
+        assert_eq!(created["result"]["run"]["run_id"], run_id);
+        assert_eq!(created["result"]["event"]["type"], "RUN.CREATED");
+
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "HOST.OBSERVED",
+            json!({
+                "repo": "Theorem",
+                "branch": "main",
+                "commit_sha": "abc123",
+                "cwd": "/repo/Theorem"
+            }),
+        );
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "TASK.RESOLVED",
+            json!({"task_signature": "sig-native-harness-mcp"}),
+        );
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "PROFILE.SELECTED",
+            json!({
+                "profile_id": "rust-port",
+                "profile_version": "1",
+                "policy_hash": "policy-abc"
+            }),
+        );
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "TOOLKIT.COMPILED",
+            json!({
+                "selected_tools": ["harness_append_transition", "harness_run"],
+                "selected_plugins": ["rustyred-thg-mcp"],
+                "excluded_tools": [],
+                "permission_reasons": {}
+            }),
+        );
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "CONTEXT.PLANNED",
+            json!({
+                "budget_tokens": 1000,
+                "plan_hash": "plan-mcp",
+                "candidate_token_count": 500
+            }),
+        );
+        let packed = append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "CONTEXT.PACKED",
+            json!({
+                "artifact_id": "art-mcp",
+                "capsule_tokens": 200,
+                "budget_tokens": 1000,
+                "included_atom_count": 5,
+                "excluded_atom_count": 2,
+                "token_ledger": { "saved": 300 }
+            }),
+        );
+        assert_eq!(packed["result"]["run"]["status"], "context_packed");
+        assert_eq!(
+            packed["result"]["event"]["payload"]["token_ledger"]["saved"],
+            300
+        );
+
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "CONTEXT.INJECTED",
+            json!({
+                "artifact_id": "art-mcp",
+                "adapter": "mcp",
+                "target": "codex"
+            }),
+        );
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "AGENT.ACTING",
+            json!({
+                "adapter": "mcp",
+                "started_at": "2026-06-01T00:00:00Z"
+            }),
+        );
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "OUTCOME.RECORDED",
+            json!({
+                "accepted": true,
+                "tests_passed": true,
+                "validator_results": [{ "id": "cargo-test", "status": "passed" }],
+                "files_changed": ["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"],
+                "summary": "native MCP append/read path works"
+            }),
+        );
+        append_harness_event(
+            &provider,
+            &config,
+            run_id,
+            "RUN.CLOSED",
+            json!({
+                "summary": "native MCP append/read path works",
+                "closed_by": "codex"
+            }),
+        );
+
+        let detail = call_tool_json(
+            &provider,
+            &config,
+            "harness_run",
+            json!({ "tenant": "smoke", "run_id": run_id }),
+        );
+
+        assert_eq!(detail["found"], true);
+        assert_eq!(detail["detail"]["run"]["status"], "closed");
+        assert_eq!(detail["detail"]["run"]["last_event_seq"], 11);
+        assert_eq!(detail["detail"]["events"].as_array().unwrap().len(), 11);
+        assert_eq!(detail["detail"]["events"][6]["type"], "CONTEXT.PACKED");
+        assert_eq!(
+            detail["detail"]["events"][6]["payload"]["token_ledger"]["saved"],
+            300
+        );
+        assert_eq!(
+            detail["detail"]["events"][9]["payload"]["validator_results"][0]["status"],
+            "passed"
         );
     }
 

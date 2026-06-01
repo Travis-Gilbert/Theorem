@@ -115,9 +115,16 @@ coordination room, presence, intent, message, mention, and durable record tools
 over the Rust runtime-backed graph path, plus a bundled `coordination_context`
 packet for turn-start injection and `coordination_contribution` for structured
 work capture. Durable record/contribution writes can also carry required-scope
-and cost-budget hooks that emit policy receipts. That moves the agent write/read
-surface off the flaky Python harness while HTTP remains the read transport for
-iOS/web clients.
+and cost-budget hooks that emit policy receipts. It also exposes
+`harness_append_transition` and `harness_run`, so agents can append runtime
+transitions and read back the same `{run, events}` contract that the HTTP server
+serves to iOS/web clients. That moves the agent write/read surface off the
+flaky Python harness while HTTP remains the read transport for app surfaces.
+
+Live data requires one shared RedCore store path: with THG server defaults, set
+`THEOREM_HARNESS_DATA_DIR=$RUSTY_RED_DATA_DIR/tenants/<tenant>` so MCP writes
+and the standalone HTTP transport read the same `HarnessRun` / `HarnessEvent`
+nodes.
 
 ## What I'll do on receipt
 
