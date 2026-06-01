@@ -20,6 +20,9 @@ struct IslandRoomView: View {
                 .font(TheoremFonts.body(size: 15, relativeTo: .callout))
                 .foregroundStyle(theme.ink)
                 .lineLimit(2)
+            if let creditPreview {
+                roomCreditStrip(creditPreview)
+            }
             presence
             Divider().overlay(theme.hairline)
             log
@@ -60,6 +63,42 @@ struct IslandRoomView: View {
             }
         }
         .scrollClipDisabled()
+    }
+
+    private var creditPreview: CommonplaceCreditEstimate? {
+        guard let registry = room.registry else { return nil }
+        let routePlan = room.routePlan ?? CommonplaceRouter().plan(query: room.ask, registry: registry)
+        let toolBudget = CommonplaceToolUseBudget.preview(for: room.ask, features: routePlan.features)
+        return CommonplaceCreditEstimator().estimate(
+            routePlan: routePlan,
+            registry: registry,
+            toolBudget: toolBudget
+        )
+    }
+
+    private func roomCreditStrip(_ estimate: CommonplaceCreditEstimate) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: estimate.requiresConfirmation ? "exclamationmark.triangle.fill" : "creditcard")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(estimate.requiresConfirmation ? theme.signal : theme.blueprintInk)
+                .frame(width: 16)
+            Text(estimate.creditRangeLabel)
+                .font(TheoremFonts.mono(size: 11))
+                .foregroundStyle(theme.ink)
+                .monospacedDigit()
+            Spacer(minLength: 8)
+            Text(estimate.requiresConfirmation ? "CONFIRM" : "PREVIEW")
+                .font(TheoremFonts.label(size: 9))
+                .tracking(0.7)
+                .foregroundStyle(theme.textMuted)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 28)
+        .background(theme.chrome.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(theme.hairline, lineWidth: 1)
+        )
     }
 
     private var log: some View {

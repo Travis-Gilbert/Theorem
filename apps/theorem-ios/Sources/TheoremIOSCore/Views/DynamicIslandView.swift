@@ -35,21 +35,13 @@ struct DynamicIslandView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Near-white paper the island prints on. The page field is pure white; the
-    /// island is a hair cooler so it reads as a distinct surface, and so the
-    /// blueprint hexes have a near-white ground (the old-blueprint look).
+    /// island is a hair cooler so it reads as a distinct surface.
     private var islandPaper: Color { Color(red: 0.965, green: 0.976, blue: 0.988) }
-    /// Fixed seed: the island's hex texture is stable, not per-scene.
-    private static let islandSeed: UInt32 = MT19937.seed(from: "island-chrome")
 
-    /// The island's background: near-white paper + the hex-blueprint texture,
-    /// clipped to the island's shape. This is the ONLY place the hexbin lives.
-    @ViewBuilder
+    /// The island's background: clean near-white paper, clipped to the island's
+    /// shape. (The hex-blueprint texture was removed per Travis.)
     private func islandBackground<S: Shape>(_ shape: S) -> some View {
-        ZStack {
-            islandPaper
-            HexWatermarkView(seed: Self.islandSeed, theme: theme)
-        }
-        .clipShape(shape)
+        islandPaper.clipShape(shape)
     }
 
     var body: some View {
@@ -166,6 +158,10 @@ struct DynamicIslandView: View {
                     .autocorrectionDisabled()
                     .onSubmit { if mode == .search { onSubmitQuery() } }
 
+                if mode == .search, let creditPreview {
+                    CreditPreviewStrip(estimate: creditPreview, theme: theme)
+                }
+
                 // Algorithm (projection) switcher revealed only on search — the
                 // expanded search surface is where you re-project. Honest-shape
                 // gated (unavailable projections grey out).
@@ -190,6 +186,20 @@ struct DynamicIslandView: View {
         .matchedGeometryEffect(id: "island", in: namespace)
     }
 
+    private var creditPreview: CommonplaceCreditEstimate? {
+        guard let room,
+              let registry = room.registry else { return nil }
+        let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ask = clean.isEmpty ? room.ask : clean
+        let routePlan = CommonplaceRouter().plan(query: ask, registry: registry)
+        let toolBudget = CommonplaceToolUseBudget.preview(for: ask, features: routePlan.features)
+        return CommonplaceCreditEstimator().estimate(
+            routePlan: routePlan,
+            registry: registry,
+            toolBudget: toolBudget
+        )
+    }
+
     private var modeTitle: String {
         switch mode {
         case .idle:
@@ -205,4 +215,41 @@ struct DynamicIslandView: View {
         }
     }
 
+}
+
+private struct CreditPreviewStrip: View {
+    var estimate: CommonplaceCreditEstimate
+    var theme: TheoremTheme
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: estimate.requiresConfirmation ? "exclamationmark.triangle.fill" : "creditcard")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(estimate.requiresConfirmation ? theme.signal : theme.blueprintInk)
+                .frame(width: 18)
+
+            Text("CREDITS")
+                .font(TheoremFonts.label(size: 9))
+                .tracking(0.7)
+                .foregroundStyle(theme.textMuted)
+
+            Text(estimate.creditRangeLabel)
+                .font(TheoremFonts.mono(size: 11))
+                .foregroundStyle(theme.ink)
+                .monospacedDigit()
+
+            Spacer(minLength: 8)
+
+            Text("\(estimate.worstCaseParticipantIDs.count) voices")
+                .font(TheoremFonts.mono(size: 10))
+                .foregroundStyle(theme.textMuted)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 30)
+        .background(theme.chrome.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(theme.hairline, lineWidth: 1)
+        )
+    }
 }

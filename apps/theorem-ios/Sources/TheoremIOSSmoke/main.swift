@@ -47,6 +47,49 @@ precondition(
     "PPR mass should control center node selection"
 )
 
+let commonplaceRoute = CommonplaceRouter().plan(
+    query: "Can RustyWeb crawl a paper, OCR it, and let the room synthesize implementation options?",
+    registry: SampleCommonplaceRegistry.registry
+)
+let commonplaceToolPreview = CommonplaceToolUseBudget.preview(
+    for: commonplaceRoute.query,
+    features: commonplaceRoute.features
+)
+let commonplaceCreditEstimate = CommonplaceCreditEstimator().estimate(
+    routePlan: commonplaceRoute,
+    registry: SampleCommonplaceRegistry.registry,
+    toolBudget: commonplaceToolPreview
+)
+precondition(commonplaceCreditEstimate.estimatedCredits > 0, "credit preview should be nonzero")
+precondition(
+    commonplaceCreditEstimate.worstCaseCredits >= commonplaceCreditEstimate.estimatedCredits,
+    "worst-case credits should not undercut the immediate estimate"
+)
+precondition(
+    !commonplaceCreditEstimate.estimatedModelLineItems.isEmpty,
+    "credit preview should expose model-token line items"
+)
+precondition(
+    commonplaceToolPreview.ocrPages > 0 && commonplaceToolPreview.webFetches > 0 && commonplaceToolPreview.substrateSearches > 0,
+    "credit preview should infer document, web, and substrate tool budgets"
+)
+
+let fullToolCreditEstimate = CommonplaceCreditEstimator().estimate(
+    routePlan: commonplaceRoute,
+    registry: SampleCommonplaceRegistry.registry,
+    toolBudget: CommonplaceToolUseBudget(
+        ocrPages: 6,
+        speechMinutes: 1.5,
+        ttsCharacters: 1_200,
+        webFetches: 4,
+        substrateSearches: 1
+    )
+)
+precondition(
+    fullToolCreditEstimate.toolLineItems.count == 5,
+    "explicit tool budget should account for OCR, speech, TTS, web fetch, and substrate search"
+)
+
 // Omission safety: the Rust serde layer omits empty maps/arrays/None options
 // (skip_serializing_if). Decoding a real wire payload must NOT throw
 // keyNotFound on the omitted metadata/sourceRefs/params/actions/provenance —

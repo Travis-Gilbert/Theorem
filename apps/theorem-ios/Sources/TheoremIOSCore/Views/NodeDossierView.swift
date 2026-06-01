@@ -41,17 +41,25 @@ struct NodeDossierView: View {
     }
 
     enum SummaryState: Equatable {
-        case loading
+        case loading(String?)
         case loaded(String)
-        case failed(String)
+        case failed(String, fallback: String?)
     }
 
     @State private var choice: Choice = .summary
-    @State private var summary: SummaryState = .loading
+    @State private var summary: SummaryState = .loading(nil)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.openURL) private var openURL
 
     private var title: String { atom.label ?? atom.id }
+
+    private var snippet: String? {
+        let raw = atom.metadata["snippet"]?.stringValue
+            ?? atom.metadata["summary"]?.stringValue
+            ?? atom.metadata["description"]?.stringValue
+        let clean = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean?.isEmpty == false ? clean : nil
+    }
 
     private var sourceURL: URL? {
         let raw = atom.metadata["url"]?.stringValue
@@ -147,11 +155,16 @@ struct NodeDossierView: View {
 
     @ViewBuilder private var summaryContent: some View {
         switch summary {
-        case .loading:
-            HStack(spacing: 9) {
-                ProgressView().controlSize(.small).tint(theme.signal)
-                Text("The substrate is composing a summary in the context of your graph\u{2026}")
-                    .font(TheoremFonts.body(size: 13)).foregroundStyle(theme.textMuted)
+        case .loading(let fallback):
+            VStack(alignment: .leading, spacing: 9) {
+                if let fallback {
+                    snippetBlock(fallback)
+                }
+                HStack(spacing: 9) {
+                    ProgressView().controlSize(.small).tint(theme.signal)
+                    Text(fallback == nil ? "The substrate is composing a summary in the context of your graph\u{2026}" : "Composing deeper substrate context\u{2026}")
+                        .font(TheoremFonts.body(size: 13)).foregroundStyle(theme.textMuted)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .loaded(let text):
@@ -163,8 +176,11 @@ struct NodeDossierView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 220)
-        case .failed(let message):
+        case .failed(let message, let fallback):
             VStack(alignment: .leading, spacing: 8) {
+                if let fallback {
+                    snippetBlock(fallback)
+                }
                 honest(message)
                 Button("Retry") { Task { await loadSummary(force: true) } }
                     .font(TheoremFonts.label(size: 12)).foregroundStyle(theme.signal)
@@ -192,15 +208,30 @@ struct NodeDossierView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private func snippetBlock(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("SNIPPET")
+                .font(TheoremFonts.label(size: 9))
+                .tracking(0.7)
+                .foregroundStyle(theme.textMuted)
+            Text(text)
+                .font(TheoremFonts.body(size: 13, relativeTo: .body))
+                .foregroundStyle(theme.ink)
+                .lineSpacing(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func loadSummary(force: Bool) async {
         if case .loaded = summary, !force { return }
-        summary = .loading
+        let fallback = snippet
+        summary = .loading(fallback)
         do {
             let result = try await searchClient.ask(query: title)
             summary = .loaded(result.answer)
         } catch {
             let message = (error as? TheoremSearchError)?.message ?? "Summary unavailable right now."
-            summary = .failed(message)
+            summary = .failed(message, fallback: fallback)
         }
     }
 }

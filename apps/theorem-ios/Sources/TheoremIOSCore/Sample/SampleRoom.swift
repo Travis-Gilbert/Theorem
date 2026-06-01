@@ -1,17 +1,25 @@
 import Foundation
 
 public enum SampleRoom {
-    public static let room = CommonplaceRoom(
+    private static let registry = SampleCommonplaceRegistry.registry
+    private static let sampleAsk = "Where do RustyWeb search, SceneOS, and the iOS room meet?"
+    private static let routePlan = CommonplaceRouter().plan(
+        query: sampleAsk,
+        registry: registry
+    )
+
+    public static let room = baseRoom.applyingRoutePlan(routePlan)
+
+    private static let baseRoom = CommonplaceRoom(
         id: "commonplace-room-sample",
         title: "Commonplace",
-        ask: "Search the substrate",
+        ask: sampleAsk,
         participants: [
             CommonplaceParticipant(
                 id: "claude",
                 displayName: "Claude",
                 shortName: "CL",
                 origin: .visiting,
-                status: .thinking,
                 endpointLabel: "harness"
             ),
             CommonplaceParticipant(
@@ -19,24 +27,70 @@ public enum SampleRoom {
                 displayName: "Codex",
                 shortName: "CX",
                 origin: .visiting,
-                status: .contributing,
                 endpointLabel: "harness"
             ),
             CommonplaceParticipant(
-                id: "deepseek",
-                displayName: "DeepSeek",
+                id: "mistral-medium",
+                displayName: "Mistral Medium",
+                shortName: "MM",
+                origin: .roster,
+                endpointLabel: "api"
+            ),
+            CommonplaceParticipant(
+                id: "deepseek-v4-pro",
+                displayName: "DeepSeek V4 Pro",
                 shortName: "DS",
                 origin: .roster,
                 status: .idle,
                 endpointLabel: "api"
             ),
             CommonplaceParticipant(
-                id: "gemma31b",
-                displayName: "Gemma 31B",
-                shortName: "31B",
+                id: "glm-5-1",
+                displayName: "GLM 5.1",
+                shortName: "GLM",
                 origin: .roster,
                 status: .idle,
-                endpointLabel: "native"
+                endpointLabel: "api"
+            ),
+            CommonplaceParticipant(
+                id: "qwen-coder-next",
+                displayName: "Qwen Coder Next",
+                shortName: "QCN",
+                origin: .roster,
+                status: .idle,
+                endpointLabel: "api"
+            ),
+            CommonplaceParticipant(
+                id: "jamba-large",
+                displayName: "Jamba Large",
+                shortName: "JAM",
+                origin: .roster,
+                status: .idle,
+                endpointLabel: "api"
+            ),
+            CommonplaceParticipant(
+                id: "xlstm-research",
+                displayName: "xLSTM",
+                shortName: "XLS",
+                origin: .roster,
+                status: .idle,
+                endpointLabel: "research"
+            ),
+            CommonplaceParticipant(
+                id: "gemma-26b",
+                displayName: "Gemma 26B",
+                shortName: "G26",
+                origin: .roster,
+                status: .idle,
+                endpointLabel: "api"
+            ),
+            CommonplaceParticipant(
+                id: "gemma-4b",
+                displayName: "Gemma 4B",
+                shortName: "G4",
+                origin: .roster,
+                status: .idle,
+                endpointLabel: "api"
             ),
             CommonplaceParticipant(
                 id: "brought-agent",
@@ -81,6 +135,8 @@ public enum SampleRoom {
                 body: "ScenePackageV2 carries the current graph projection, provenance, and search result structure."
             ),
         ],
-        scene: SampleScene.package
+        scene: SampleScene.package,
+        registry: registry,
+        routePlan: routePlan
     )
 }

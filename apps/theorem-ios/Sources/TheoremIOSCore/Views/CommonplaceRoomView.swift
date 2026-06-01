@@ -57,6 +57,10 @@ struct CommonplaceRoomView: View {
             }
 
             RoomPresenceStrip(participants: room.participants, theme: theme)
+
+            if let registry = room.registry {
+                RoomRegistryStatus(registry: registry, routePlan: room.routePlan, theme: theme)
+            }
         }
     }
 
@@ -67,6 +71,48 @@ struct CommonplaceRoomView: View {
         case .addressBroughtAgent:
             "ADDRESS"
         }
+    }
+}
+
+private struct RoomRegistryStatus: View {
+    var registry: CommonplaceRegistry
+    var routePlan: CommonplaceRoutePlan?
+    var theme: TheoremTheme
+
+    var body: some View {
+        HStack(spacing: 8) {
+            registryToken("CHARTER", registry.charter.title)
+            registryToken("ROUTE", routeLabel)
+            registryToken("MACHINERY", "\(registry.machineryBindings.count)")
+        }
+    }
+
+    private var routeLabel: String {
+        guard let routePlan else {
+            return "\(registry.participantBindings.count)"
+        }
+        return "\(routePlan.activeParticipantIDs.count) NOW"
+    }
+
+    private func registryToken(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 5) {
+            Text(label)
+                .font(TheoremFonts.label(size: 8))
+                .tracking(0.6)
+                .foregroundStyle(theme.textMuted)
+            Text(value)
+                .font(TheoremFonts.mono(size: 9))
+                .foregroundStyle(theme.ink)
+                .lineLimit(1)
+                .minimumScaleFactor(0.76)
+        }
+        .padding(.horizontal, 7)
+        .frame(height: 24)
+        .background(theme.field, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(theme.hairline, lineWidth: 1)
+        )
     }
 }
 

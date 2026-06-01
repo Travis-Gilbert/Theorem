@@ -8,6 +8,8 @@ public struct CommonplaceRoom: Equatable, Sendable, Identifiable {
     public var participants: [CommonplaceParticipant]
     public var contributions: [CommonplaceContribution]
     public var scene: ScenePackageV2
+    public var registry: CommonplaceRegistry?
+    public var routePlan: CommonplaceRoutePlan?
     public var updatedAt: Date
 
     public init(
@@ -18,6 +20,8 @@ public struct CommonplaceRoom: Equatable, Sendable, Identifiable {
         participants: [CommonplaceParticipant],
         contributions: [CommonplaceContribution],
         scene: ScenePackageV2,
+        registry: CommonplaceRegistry? = nil,
+        routePlan: CommonplaceRoutePlan? = nil,
         updatedAt: Date = Date()
     ) {
         self.id = id
@@ -27,6 +31,8 @@ public struct CommonplaceRoom: Equatable, Sendable, Identifiable {
         self.participants = participants
         self.contributions = contributions
         self.scene = scene
+        self.registry = registry
+        self.routePlan = routePlan
         self.updatedAt = updatedAt
     }
 
@@ -39,21 +45,20 @@ public struct CommonplaceRoom: Equatable, Sendable, Identifiable {
         return participants.first { $0.id == id }
     }
 
+    public func applyingRoutePlan(_ routePlan: CommonplaceRoutePlan?) -> CommonplaceRoom {
+        var next = self
+        next.routePlan = routePlan
+        next.participants = routeAwareParticipants(routePlan: routePlan)
+        return next
+    }
+
     public func replacingScene(_ scene: ScenePackageV2, ask: String) -> CommonplaceRoom {
         var next = self
         next.ask = ask
         next.scene = scene
         next.updatedAt = Date()
-        next.participants = participants.map { participant in
-            switch participant.id {
-            case "codex":
-                participant.withStatus(.contributing)
-            case "claude", "deepseek":
-                participant.withStatus(.thinking)
-            default:
-                participant.withStatus(.idle)
-            }
-        }
+        next.routePlan = registry.map { CommonplaceRouter().plan(query: ask, registry: $0) }
+        next.participants = routeAwareParticipants(routePlan: next.routePlan)
         let refreshID = "\(scene.id)-graph-refresh-\(Int(next.updatedAt.timeIntervalSince1970 * 1000))"
         next.contributions = Array((contributions + [
             CommonplaceContribution(
@@ -66,6 +71,32 @@ public struct CommonplaceRoom: Equatable, Sendable, Identifiable {
             )
         ]).suffix(6))
         return next
+    }
+
+    private func routeAwareParticipants(routePlan: CommonplaceRoutePlan?) -> [CommonplaceParticipant] {
+        guard let routePlan else {
+            return participants.map { participant in
+                switch participant.id {
+                case "codex":
+                    participant.withStatus(.contributing)
+                case "claude", "mistral-medium", "deepseek-v4-pro":
+                    participant.withStatus(.thinking)
+                default:
+                    participant.withStatus(.idle)
+                }
+            }
+        }
+        let active = Set(routePlan.activeParticipantIDs)
+        let planned = Set(routePlan.plannedParticipantIDs)
+        return participants.map { participant in
+            if active.contains(participant.id) {
+                participant.withStatus(.contributing)
+            } else if planned.contains(participant.id) {
+                participant.withStatus(.thinking)
+            } else {
+                participant.withStatus(.idle)
+            }
+        }
     }
 }
 
