@@ -285,7 +285,8 @@ public struct TheoremSearchClient: Sendable {
         atoms.append(contentsOf: substrate.hits.map { hit in
             atom(
                 id: hit.nodeID, url: hit.url, title: hit.title, snippet: hit.snippet,
-                ring: hit.ring, ringLabel: hit.ringLabel, score: hit.matchScore)
+                ring: hit.ring, ringLabel: hit.ringLabel, score: hit.matchScore,
+                provenance: hit.provenance)
         })
 
         let ids = Set(atoms.map(\.id))
@@ -329,20 +330,28 @@ public struct TheoremSearchClient: Sendable {
 
     private static func atom(
         id: String, url: String, title: String, snippet: String,
-        ring: Int, ringLabel: String, score: Double
+        ring: Int, ringLabel: String, score: Double, provenance: String? = nil
     ) -> SceneAtom {
-        SceneAtom(
+        var metadata: [String: JSONValue] = [
+            "url": .string(url),
+            "snippet": .string(snippet),
+            "ring": .double(Double(ring)),
+            "ring_label": .string(ringLabel),
+            "match_score": .double(score),
+            "matchScore": .double(score),
+        ]
+        // Frontier-map provenance: "corpus" = a fetched, known page (the user's
+        // relevant corpus); "frontier" = a discovered-but-unfetched link target
+        // (new, past the frontier). Only the substrate backend supplies it; the
+        // Index-API path leaves it nil, and the view falls back to degree.
+        if let provenance, !provenance.isEmpty {
+            metadata["provenance"] = .string(provenance)
+        }
+        return SceneAtom(
             id: id, kind: "source",
             label: title.isEmpty ? (url.isEmpty ? id : url) : title,
             weight: max(score, 0.05), lifecycle: "present",
-            metadata: [
-                "url": .string(url),
-                "snippet": .string(snippet),
-                "ring": .double(Double(ring)),
-                "ring_label": .string(ringLabel),
-                "match_score": .double(score),
-                "matchScore": .double(score),
-            ],
+            metadata: metadata,
             sourceRefs: [SourceRef(kind: "WebDoc", id: id, label: title, metadata: ["url": .string(url)])])
     }
 
@@ -648,12 +657,17 @@ struct RustyRedSearchHit: Codable, Hashable, Sendable {
     let ring: Int
     let ringLabel: String
     let matchScore: Double
+    /// "corpus" (fetched/known) or "frontier" (discovered-but-unfetched/new).
+    /// Optional: decodes nil against a backend that predates the field, so the
+    /// view falls back to degree-based hollow/filled.
+    let provenance: String?
 
     enum CodingKeys: String, CodingKey {
         case nodeID = "node_id"
         case url, title, snippet, ring
         case ringLabel = "ring_label"
         case matchScore = "match_score"
+        case provenance
     }
 }
 
