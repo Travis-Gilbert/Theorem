@@ -1,6 +1,7 @@
 pub mod affordances;
 pub mod context_web;
 pub mod federated_signals;
+pub mod map_artifacts;
 pub mod replay;
 pub mod session_metrics;
 pub mod state_hash;
@@ -23,6 +24,10 @@ pub use federated_signals::{
     assert_no_raw_content, extract_structural_signal, observed_count_bucket,
     receive_federated_signal, success_rate_bucket, FederatedSignal, PrivacyViolation,
     StructuralSignalInput,
+};
+pub use map_artifacts::{
+    compile_map_artifact, describe_map_artifact, scope_for_map_kind, stable_map_id,
+    MapArtifactCompileInput, MapArtifactState, MapDeltaState, MapEntry,
 };
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};
 pub use session_metrics::{

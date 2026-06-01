@@ -205,15 +205,29 @@ cross the federation boundary. The Django-coupled `EvolutionPatch` extractor
 remains runtime-side, but the structural projection helper is native and
 test-covered.
 
+## Phase 2.11
+
+Done from the MapArtifact slice: the pure compiler in `map_artifacts.py` has
+been ported as `theorem_harness_core::map_artifacts`. The Rust module exposes
+`MapArtifactState`, `MapDeltaState`, `MapArtifactCompileInput`,
+`compile_map_artifact`, `describe_map_artifact`, `stable_map_id`, and
+`scope_for_map_kind`. It covers baseline entries for CodebaseMap/SpecMap,
+ToolMap, RuleMap, UserMemoryMap, PostmortemMap, DomainMap, and generic maps;
+applied delta upsert/remove; markdown/json export; state hashing; hydration
+handles; and summary descriptors. Repository materialization and delta proposal
+writes remain runtime-side because the Python functions call
+`apps.notebook.graph_store.repository`.
+
 ## Phase 3+ (sequenced, not committed here)
 
-Next pure-logic candidates: `map_artifacts` and `memory_contracts`. The context
-compiler's pure pack core, affordance registry/receipt contract, Pairformer
-metrics helpers, and federated signal privacy helpers are now in Rust; context IO
-retrieval, substrate adapters, and affordance execution wrappers remain later
-runtime rewrites. The next runtime candidates from the build spec are the map
-compiler, direct coordination channel, charter compiler, budget governor,
-compaction, and trace exports. Each gets its own plan slice when reached.
+Next pure-logic candidate: `memory_contracts`. The context compiler's pure pack
+core, affordance registry/receipt contract, Pairformer metrics helpers,
+federated signal privacy helpers, and MapArtifact compiler are now in Rust;
+context IO retrieval, substrate adapters, map repository writes, and affordance
+execution wrappers remain later runtime rewrites. The next runtime candidates
+from the build spec are direct coordination channel, charter compiler, budget
+governor, compaction, and trace exports. Each gets its own plan slice when
+reached.
 
 ## Coordination (hybrid -> git remains durable)
 
