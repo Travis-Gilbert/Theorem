@@ -155,21 +155,35 @@ Rust parity test consumes
 compares both the full catalog and all compiled toolkit scenarios byte-for-byte
 against the Python reference output.
 
+## Phase 2.7
+
+Done from the next context-compiler slice: the pure `context_web` pack core
+(`Index-API/apps/orchestrate/context_web/{contracts,policy}.py`) has been ported
+into `theorem_harness_core::context_web`. The Rust code exposes
+`ContextWebPack::bounded`, `ContextWebBudget::capped_for_mode`,
+`normalize_context_web_node_id`, `is_generated_artifact`, and the typed context
+pack receipts needed by spec step 4. The parity test consumes
+`docs/plans/harness-rust-port/parity-context/context_fixtures.json` and compares
+bounded pack output, generated-artifact quarantine, token ledgers, source mix,
+edge/path filtering, validation summaries, and evaluation summaries against the
+Python reference corpus.
+
 ## Phase 3+ (sequenced, not committed here)
 
 Next pure-logic candidates: `map_artifacts`, `memory_contracts`,
-`session_metrics`, `federated_signals`. The next runtime candidates from the
-build spec are the context compiler, map compiler, direct coordination channel,
-charter compiler, budget governor, compaction, and trace exports. Each gets its
-own plan slice when reached.
+`session_metrics`, `federated_signals`. The context compiler's pure pack core is
+now in Rust; its IO retriever / substrate adapter remains a later runtime
+rewrite. The next runtime candidates from the build spec are the map compiler,
+direct coordination channel, charter compiler, budget governor, compaction, and
+trace exports. Each gets its own plan slice when reached.
 
-## Coordination (substrate down -> git is the channel)
+## Coordination (hybrid -> git remains durable)
 
-The harness `coordinate`/`presence` endpoints are returning 500 / not responding
-as of 2026-06-01 (verified this session). The gossip protocol is unavailable, so
-coordination is via git commit messages + this plan doc, per the project's
-documented fallback. Lane claims are recorded in `CLAIMS.md` beside this file and
-in commit messages. When the substrate returns, move claims to live intents.
+The harness room/mentions/presence/intent endpoints responded on the context-pack
+slice, but direct THG mirror writes still reported tenant resolution degradation.
+Use live intents for turn-shaped coordination when available, and keep lane
+claims in `CLAIMS.md` plus path-scoped commit messages as the durable fallback
+until substrate mirroring is clean.
 
 ## Honest scope note
 
