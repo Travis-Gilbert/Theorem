@@ -10,7 +10,7 @@ coordination fallback until substrate mirroring is clean.
 
 | Actor | Status | Files | Notes |
 |---|---|---|---|
-| Codex | done for current slice | `rustyredcore_THG/crates/theorem-harness-core/**`; `rustyredcore_THG/crates/theorem-harness-runtime/**`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-context/**` | Rust `theorem-harness-core` now ports the pure state machine, replay/fork helpers, toolgraph toolkit selector, context-web bounded pack compiler/policy core, pure affordance registry/receipt contract, Pairformer session metrics, federated structural-signal privacy helpers, the pure MapArtifact compiler, and memory preparation contracts. `theorem-harness-runtime` adds the spec's GraphStore-backed event-log seam while keeping persistence out of the parity kernel. |
+| Codex | done for current slice | `rustyredcore_THG/crates/theorem-harness-core/**`; `rustyredcore_THG/crates/theorem-harness-runtime/**`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-context/**` | Rust `theorem-harness-core` now ports the pure state machine, replay/fork helpers, toolgraph toolkit selector, context-web bounded pack compiler/policy core, pure affordance registry/receipt contract, Pairformer session metrics, federated structural-signal privacy helpers, the pure MapArtifact compiler, and memory preparation contracts. `theorem-harness-runtime` adds the spec's GraphStore-backed event-log seam and starts the native direct-coordination substrate with room membership, live intents, and durable presence. |
 | Claude Code | done for slice | `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-toolgraph/**`; `docs/plans/harness-rust-port/parity-context/**` | Generated Python reference fixtures from `Index-API/apps/orchestrate/runtime/state_machine.py`, `toolgraph.py`, and `context_web/{contracts,policy}.py`; Codex extended the state-machine corpus to 25 scenarios / 260 steps and consumed the toolgraph/context corpora read-only for the Rust ports. |
 
 ## Git Protocol
@@ -56,3 +56,7 @@ coordination fallback until substrate mirroring is clean.
 - The Rust memory-contract tests cover typed hydration handles, recall policy
   normalization, nested recall previews, full contract parsing, Python-style
   immutable/editable truthiness, active status defaults, and serialization shape.
+- The Rust runtime coordination tests cover room membership persistence,
+  `COORDINATION_MEMBER_OF` graph edges, live intent replacement and filtering,
+  durable presence heartbeat/end records, and `RedCoreGraphStore` reopen
+  behavior for all three coordination primitives.

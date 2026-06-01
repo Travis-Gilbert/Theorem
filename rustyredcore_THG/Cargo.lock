@@ -2996,6 +2996,7 @@ name = "theorem-harness-runtime"
 version = "0.1.0"
 dependencies = [
  "rustyred-thg-core",
+ "serde",
  "serde_json",
  "theorem-harness-core",
 ]

@@ -234,11 +234,25 @@ contract without importing Django or storage.
 ## Phase 3+ (sequenced, not committed here)
 
 The pure straight-port candidates from the original list are now covered in
-Rust. Remaining work is runtime/substrate rewrite work: context IO retrieval,
-substrate adapters, map repository writes, affordance execution wrappers, the
-direct coordination channel, charter compiler, budget governor, compaction,
-trace exports, adapter bridges, and Pairformer control. Each gets its own plan
-slice when reached.
+Rust. Runtime/substrate rewrite work is underway.
+
+## Phase 3.1
+
+Started the direct coordination channel in
+`theorem_harness_runtime::coordination`. This first substrate slice persists
+coordination-room membership, one live intent per `(room, actor)`, and durable
+presence records directly into `GraphStore`, with `RedCoreGraphStore`
+reopen-tests. It mirrors the currently useful room/intent/presence shape while
+removing Django/cache as the only durable path.
+
+Not covered yet: direct messages/mentions, event/decision/tension/reflection
+records, context injection into the channel, contribution capture, and
+permission/cost hooks. Those remain the rest of the direct-coordination module.
+
+Remaining runtime/substrate work beyond that: context IO retrieval, substrate
+adapters, map repository writes, affordance execution wrappers, charter
+compiler, budget governor, compaction, trace exports, adapter bridges, and
+Pairformer control. Each gets its own plan slice when reached.
 
 ## Coordination (hybrid -> git remains durable)
 
