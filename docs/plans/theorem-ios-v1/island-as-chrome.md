@@ -69,6 +69,11 @@ the box**:
 - **Endpoint URLs -> config.** The existing UserDefaults `searchBaseURL` path is
   fine for non-secret URLs.
 
+Implemented in `apps/theorem-ios` as the Credentials surface:
+`UserCredentialsView` + `UserCredentialsViewModel`. Provider API keys go through
+`KeychainTheoremAPIKeyStore`; search/provider endpoint URLs go through
+`UserDefaultsCredentialConfigStore`.
+
 ## Credit / CONFIRM stays user-facing
 
 The credit estimate + CONFIRM gate is a **read + a consent**, not config: the user

@@ -15,6 +15,16 @@ public struct TheoremRootView: View {
     private let theme = TheoremTheme.defaultPalette
     private let searchClient = TheoremSearchClient()
 
+    /// The run data source. `-remote <url>` points the Runs surface at a live
+    /// harness HTTP server (theorem-harness-server); default is the recorded sample.
+    private var runStore: HarnessRunStore {
+        if let raw = UserDefaults.standard.string(forKey: "remote"),
+           let url = URL(string: raw) {
+            return RemoteHarnessRunStore(baseURL: url)
+        }
+        return SampleRunStore()
+    }
+
     private var package: ScenePackageV2 {
         room.scene
     }
@@ -91,7 +101,7 @@ public struct TheoremRootView: View {
                 )
                 .tag(AppSurface.home)
 
-                RunsListView(theme: theme)
+                RunsListView(theme: theme, store: runStore)
                     .tag(AppSurface.runs)
 
                 MapsView(theme: theme)
@@ -102,6 +112,9 @@ public struct TheoremRootView: View {
 
                 ParticipantPresenceView(theme: theme)
                     .tag(AppSurface.models)
+
+                UserCredentialsView(theme: theme)
+                    .tag(AppSurface.credentials)
 
                 SurfacePlaceholder(surface: .build, theme: theme)
                     .tag(AppSurface.build)
@@ -247,6 +260,7 @@ public enum AppSurface: String, CaseIterable, Identifiable {
     case maps = "Maps"
     case projects = "Projects"
     case models = "Participants"
+    case credentials = "Credentials"
     case build = "Build"
     case artifacts = "Artifacts"
 
@@ -264,6 +278,8 @@ public enum AppSurface: String, CaseIterable, Identifiable {
             "folder"
         case .models:
             "person.2"
+        case .credentials:
+            "key"
         case .build:
             "hammer"
         case .artifacts:
@@ -307,6 +323,8 @@ struct SurfacePlaceholder: View {
             "Scoped containers and file-glyph workspaces."
         case .models:
             "Team presence and brought-agent endpoints."
+        case .credentials:
+            "Provider endpoints and user-held keys."
         case .build:
             "Agent, skill, and plugin scaffolds."
         case .artifacts:
