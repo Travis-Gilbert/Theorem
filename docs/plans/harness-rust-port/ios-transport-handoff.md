@@ -112,9 +112,9 @@ live with the same one-line swap.
 
 The bigger win is not iOS. `rustyred-thg-mcp` now exposes the native
 coordination room, presence, intent, message, mention, and durable record tools
-over the Rust runtime-backed graph path. That moves the agent write/read surface
-off the flaky Python harness while HTTP remains the read transport for iOS/web
-clients.
+over the Rust runtime-backed graph path, plus a bundled `coordination_context`
+packet for turn-start injection. That moves the agent write/read surface off the
+flaky Python harness while HTTP remains the read transport for iOS/web clients.
 
 ## What I'll do on receipt
 

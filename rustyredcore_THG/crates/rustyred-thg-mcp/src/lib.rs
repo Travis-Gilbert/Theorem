@@ -892,6 +892,9 @@ fn call_tool<P: McpGraphProvider>(
         "read_records_for_room" | "theorem_harness_read_records_for_room" => {
             read_records_payload(&tenant, &backend, &arguments)?
         }
+        "coordination_context" | "theorem_harness_coordination_context" => {
+            coordination_context_payload(&tenant, &mut backend, &arguments)?
+        }
         "rustyred_thg_fulltext_search" | "rustyred_thg_graph_fulltext_search" => {
             let property = required_str(&arguments, "property", name)?;
             let query = required_str(&arguments, "query", name)?;
@@ -2300,6 +2303,66 @@ fn read_records_payload(
         "record_types": record_types,
         "records": records,
         "count": records.len()
+    }))
+}
+
+fn coordination_context_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let actor_id = argument_text(arguments, &["actor", "actor_id", "actorId"]);
+    let message_limit = argument_u64(arguments, &["message_limit", "messageLimit"])
+        .or_else(|| argument_u64(arguments, &["limit"]))
+        .unwrap_or(20) as usize;
+    let record_limit = argument_u64(arguments, &["record_limit", "recordLimit"])
+        .or_else(|| argument_u64(arguments, &["limit"]))
+        .unwrap_or(20) as usize;
+    let mention_limit = argument_u64(arguments, &["mention_limit", "mentionLimit"])
+        .or_else(|| argument_u64(arguments, &["limit"]))
+        .unwrap_or(20) as usize;
+    let statuses = string_array_any(arguments, &["statuses", "status"]);
+    let record_types = string_array_any(
+        arguments,
+        &["record_types", "recordTypes", "record_type", "recordType"],
+    );
+
+    let room = load_coordination_room(backend, tenant, &room_id)?
+        .unwrap_or_else(|| empty_coordination_room(tenant, &room_id, ""));
+    let presence = list_coordination_presence(backend, tenant)?;
+    let intents = read_coordination_intents(backend, tenant, &room_id, &statuses)?;
+    let messages = read_coordination_messages(backend, tenant, &room_id, message_limit)?;
+    let records =
+        read_coordination_records(backend, tenant, &room_id, &record_types, record_limit)?;
+    let pending_mentions = if let Some(actor_id) = actor_id.as_ref() {
+        read_coordination_mentions(backend, tenant, actor_id, false, mention_limit)?
+    } else {
+        Vec::new()
+    };
+    let presence_count = presence.len();
+    let intent_count = intents.len();
+    let message_count = messages.len();
+    let record_count = records.len();
+    let pending_mention_count = pending_mentions.len();
+
+    Ok(json!({
+        "tenant": tenant,
+        "room_id": room_id,
+        "actor_id": actor_id.unwrap_or_default(),
+        "room": room,
+        "presence": presence,
+        "intents": intents,
+        "messages": messages,
+        "records": records,
+        "pending_mentions": pending_mentions,
+        "counts": {
+            "presence": presence_count,
+            "intents": intent_count,
+            "messages": message_count,
+            "records": record_count,
+            "pending_mentions": pending_mention_count
+        }
     }))
 }
 
@@ -4037,6 +4100,27 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "coordination_context",
+            "Read a bundled native Theorem harness coordination context packet for turn-start injection.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "statuses": { "type": "array", "items": { "type": "string" } },
+                    "record_type": { "type": "string", "enum": ["event", "decision", "tension", "reflection"] },
+                    "record_types": { "type": "array", "items": { "type": "string", "enum": ["event", "decision", "tension", "reflection"] } },
+                    "limit": { "type": "integer", "default": 20 },
+                    "message_limit": { "type": "integer", "default": 20 },
+                    "record_limit": { "type": "integer", "default": 20 },
+                    "mention_limit": { "type": "integer", "default": 20 }
+                }
+            }),
+        ),
+        tool(
             "mentions",
             "Read pending native Theorem harness mentions for an actor. consume=true requires write mode.",
             json!({
@@ -5114,6 +5198,7 @@ mod tests {
         assert!(has_tool(tools, "read_intents_for_room"));
         assert!(has_tool(tools, "read_messages_for_room"));
         assert!(has_tool(tools, "read_records_for_room"));
+        assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "mentions"));
         assert!(tools
             .iter()
@@ -5155,6 +5240,7 @@ mod tests {
         assert!(has_tool(tools, "coordination_record"));
         assert!(has_tool(tools, "mentions"));
         assert!(has_tool(tools, "read_records_for_room"));
+        assert!(has_tool(tools, "coordination_context"));
     }
 
     #[test]
@@ -5357,6 +5443,23 @@ mod tests {
             }),
         );
         assert_eq!(empty_records["count"], 0);
+
+        let context = call_tool_json(
+            &provider,
+            &config,
+            "coordination_context",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "record_type": "decision"
+            }),
+        );
+        assert_eq!(context["room"]["room_id"], "harness-rust-port");
+        assert_eq!(context["counts"]["presence"], 1);
+        assert_eq!(context["counts"]["intents"], 1);
+        assert_eq!(context["counts"]["messages"], 1);
+        assert_eq!(context["counts"]["records"], 1);
     }
 
     #[test]
