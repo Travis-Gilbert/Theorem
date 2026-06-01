@@ -91,6 +91,9 @@ public struct TheoremRootView: View {
                 )
                 .tag(AppSurface.home)
 
+                RunsListView(theme: theme)
+                    .tag(AppSurface.runs)
+
                 SurfacePlaceholder(surface: .projects, theme: theme)
                     .tag(AppSurface.projects)
 
@@ -237,6 +240,7 @@ private extension View {
 
 public enum AppSurface: String, CaseIterable, Identifiable {
     case home = "Home"
+    case runs = "Runs"
     case projects = "Projects"
     case models = "Participants"
     case build = "Build"
@@ -248,6 +252,8 @@ public enum AppSurface: String, CaseIterable, Identifiable {
         switch self {
         case .home:
             "network"
+        case .runs:
+            "clock.arrow.circlepath"
         case .projects:
             "folder"
         case .models:
@@ -287,6 +293,8 @@ struct SurfacePlaceholder: View {
         switch surface {
         case .home:
             "Ask over the substrate room."
+        case .runs:
+            "Recorded runs, each a governed state machine."
         case .projects:
             "Scoped containers and file-glyph workspaces."
         case .models:
