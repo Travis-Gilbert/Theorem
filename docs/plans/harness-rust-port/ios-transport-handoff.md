@@ -64,6 +64,39 @@ pick and I'll match the decoder.
 Either is fine; the JSON contract above is what matters. The `RedCoreGraphStore`
 (durable, file-backed) is the natural store to read from.
 
+## Coordination + presence (added 2026-06-01, after the native substrate landed)
+
+`theorem-harness-runtime::coordination` now persists rooms, intents, durable
+presence, messages, and `@actor` mentions to the same GraphStore. The same
+transport should expose these so the Participants surface (UI spec Part 4) can go
+from honest-idle to live status, and so agents can coordinate over the reliable
+native path instead of git. Read endpoints, wrapping the existing functions:
+
+### `GET /harness/rooms/{room_id}/presence`
+
+`list_presence` -> who is fresh right now. Response: `{ "presence": [ { <CoordinationPresenceState serde> }, ... ] }`. Drives the participant status dots (idle / engaged / contributing / unreachable).
+
+### `GET /harness/rooms/{room_id}/intents`
+
+`read_intents_for_room` -> live intents (actor, summary, claimed_files, status). Response: `{ "intents": [ { <CoordinationIntentState serde> }, ... ] }`.
+
+### `GET /harness/rooms/{room_id}` and `GET /harness/actors/{actor}/mentions`
+
+`room_status` and `read_mentions_for_actor` -> membership/task and the @mention
+inbox. Lower priority for the iOS surface; useful for the coordination view.
+
+I'll add a `RemoteParticipantStore` that decodes the presence/intent contract the
+same way `RemoteHarnessRunStore` decodes runs, so the Participants surface goes
+live with the same one-line swap.
+
+### Separately: wire native coordination into the MCP server
+
+The bigger win is not iOS. Wiring `theorem-harness-runtime::coordination` into
+`rustyred-thg-mcp` (back the `coordinate` / `presence` / `mentions` tools with the
+native Rust impl) would move cross-agent coordination off the flaky Python harness
+that 500-ed all session onto the reliable native substrate. That is the reliability
+thesis of this whole port, and it is now one wiring step away. Rust lane, yours.
+
 ## What I'll do on receipt
 
 Add `RemoteHarnessRunStore: HarnessRunStore` that GETs these two endpoints and
