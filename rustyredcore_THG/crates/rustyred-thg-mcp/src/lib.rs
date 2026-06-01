@@ -14,11 +14,13 @@ use serde_json::{json, Map, Value};
 use theorem_harness_runtime::{
     coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
     coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
-    coordination_message_node_id, coordination_presence_node_id, coordination_room_node_id,
-    infer_coordination_room_id, normalize_coordination_urgency, parse_coordination_mentions,
-    stable_coordination_message_id, CoordinationIntentState, CoordinationMessageState,
-    CoordinationPresenceState, CoordinationRoomMember, CoordinationRoomState, JoinRoomInput,
-    PresenceInput, WriteIntentInput, WriteMessageInput,
+    coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
+    coordination_record_node_id, coordination_room_node_id, infer_coordination_room_id,
+    normalize_coordination_urgency, parse_coordination_mentions, stable_coordination_message_id,
+    stable_coordination_record_id, CoordinationIntentState, CoordinationMessageState,
+    CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
+    CoordinationRoomState, JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
+    WriteRecordInput,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -877,6 +879,18 @@ fn call_tool<P: McpGraphProvider>(
         }
         "read_messages_for_room" | "theorem_harness_read_messages_for_room" => {
             read_messages_payload(&tenant, &backend, &arguments)?
+        }
+        "coordination_record" | "write_coordination_record" | "theorem_harness_write_record" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native coordination record writes are unavailable while read-only mode is active."
+                })));
+            }
+            write_record_payload(&tenant, &mut backend, &arguments)?
+        }
+        "read_records_for_room" | "theorem_harness_read_records_for_room" => {
+            read_records_payload(&tenant, &backend, &arguments)?
         }
         "rustyred_thg_fulltext_search" | "rustyred_thg_graph_fulltext_search" => {
             let property = required_str(&arguments, "property", name)?;
@@ -2232,6 +2246,63 @@ fn read_messages_payload(
     }))
 }
 
+fn write_record_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let record = write_coordination_record(
+        backend,
+        WriteRecordInput {
+            tenant_slug: tenant.to_string(),
+            room_id: room_id.clone(),
+            actor_id: required_text_any(
+                arguments,
+                &["actor", "actor_id", "actorId"],
+                "coordination_record",
+            )?,
+            record_id: argument_text(arguments, &["record_id", "recordId"]).unwrap_or_default(),
+            record_type: required_text_any(
+                arguments,
+                &["record_type", "recordType", "type"],
+                "coordination_record",
+            )?,
+            title: argument_text(arguments, &["title"]).unwrap_or_default(),
+            summary: required_text_any(arguments, &["summary"], "coordination_record")?,
+            body: argument_text(arguments, &["body"]).unwrap_or_default(),
+            metadata: argument_object(arguments, "metadata"),
+            created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+        },
+    )?;
+    Ok(json!({
+        "tenant": tenant,
+        "room_id": room_id,
+        "record": record
+    }))
+}
+
+fn read_records_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let record_types = string_array_any(
+        arguments,
+        &["record_types", "recordTypes", "record_type", "recordType"],
+    );
+    let limit = argument_u64(arguments, &["limit"]).unwrap_or(50) as usize;
+    let records = read_coordination_records(backend, tenant, &room_id, &record_types, limit)?;
+    Ok(json!({
+        "tenant": tenant,
+        "room_id": room_id,
+        "record_types": record_types,
+        "records": records,
+        "count": records.len()
+    }))
+}
+
 fn instant_kg_view_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
@@ -2536,6 +2607,54 @@ fn write_coordination_message(
     Ok(message)
 }
 
+fn write_coordination_record(
+    backend: &mut impl McpGraphBackend,
+    input: WriteRecordInput,
+) -> Result<CoordinationRecordState, McpError> {
+    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let room_id = if input.room_id.trim().is_empty() {
+        "room:ungrouped".to_string()
+    } else {
+        input.room_id.trim().to_string()
+    };
+    let actor_id = require_nonempty(input.actor_id.trim(), "coordination_record requires actor")?;
+    let record_type = normalize_coordination_record_type(&input.record_type)?;
+    let summary = require_nonempty(input.summary.trim(), "coordination_record requires summary")?;
+    let created_at = timestamp_or_now(&input.created_at);
+    let record_id = if input.record_id.trim().is_empty() {
+        stable_coordination_record_id(
+            &tenant_slug,
+            &room_id,
+            &record_type,
+            &actor_id,
+            &summary,
+            &created_at,
+        )
+    } else {
+        input.record_id.trim().to_string()
+    };
+    if load_coordination_room(backend, &tenant_slug, &room_id)?.is_none() {
+        persist_coordination_room(
+            backend,
+            &empty_coordination_room(&tenant_slug, &room_id, &created_at),
+        )?;
+    }
+    let record = CoordinationRecordState {
+        tenant_slug,
+        room_id,
+        record_id,
+        record_type,
+        actor_id,
+        title: input.title.trim().to_string(),
+        summary,
+        body: input.body.trim().to_string(),
+        metadata: input.metadata,
+        created_at,
+    };
+    persist_coordination_record(backend, &record)?;
+    Ok(record)
+}
+
 fn read_coordination_intents(
     backend: &impl McpGraphBackend,
     tenant: &str,
@@ -2596,6 +2715,45 @@ fn read_coordination_messages(
         messages.truncate(limit);
     }
     Ok(messages)
+}
+
+fn read_coordination_records(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+    record_types: &[String],
+    limit: usize,
+) -> Result<Vec<CoordinationRecordState>, McpError> {
+    let filters = normalize_string_vec(record_types.to_vec())
+        .into_iter()
+        .map(|record_type| record_type.to_lowercase())
+        .collect::<Vec<_>>();
+    let mut records = backend
+        .query_nodes(
+            NodeQuery::label("CoordinationRecord")
+                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant)))
+                .with_property("room_id", Value::String(room_id.to_string())),
+        )?
+        .into_iter()
+        .map(|node| parse_node_properties::<CoordinationRecordState>(node.properties))
+        .filter_map(|result| match result {
+            Ok(record) if filters.is_empty() || filters.contains(&record.record_type) => {
+                Some(Ok(record))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    records.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.record_id.cmp(&left.record_id))
+    });
+    if limit > 0 {
+        records.truncate(limit);
+    }
+    Ok(records)
 }
 
 fn read_coordination_mentions(
@@ -2757,6 +2915,15 @@ fn persist_coordination_message(
     Ok(())
 }
 
+fn persist_coordination_record(
+    backend: &mut impl McpGraphBackend,
+    state: &CoordinationRecordState,
+) -> Result<(), McpError> {
+    upsert_node_if_changed(backend, coordination_record_node(state)?)?;
+    upsert_edge_if_changed(backend, coordination_record_room_edge(state))?;
+    Ok(())
+}
+
 fn coordination_room_node(state: &CoordinationRoomState) -> Result<NodeRecord, McpError> {
     Ok(NodeRecord::new(
         coordination_room_node_id(&state.tenant_slug, &state.room_id),
@@ -2793,6 +2960,14 @@ fn coordination_message_node(state: &CoordinationMessageState) -> Result<NodeRec
     Ok(NodeRecord::new(
         coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
         ["HarnessCoordination", "CoordinationMessage"],
+        serde_json::to_value(state).map_err(|error| McpError::internal(error.to_string()))?,
+    ))
+}
+
+fn coordination_record_node(state: &CoordinationRecordState) -> Result<NodeRecord, McpError> {
+    Ok(NodeRecord::new(
+        coordination_record_node_id(&state.tenant_slug, &state.room_id, &state.record_id),
+        ["HarnessCoordination", "CoordinationRecord"],
         serde_json::to_value(state).map_err(|error| McpError::internal(error.to_string()))?,
     ))
 }
@@ -2841,6 +3016,23 @@ fn coordination_message_room_edge(state: &CoordinationMessageState) -> EdgeRecor
             "message_id": state.message_id,
             "actor_id": state.actor_id,
             "urgency": state.urgency,
+            "created_at": state.created_at,
+        }),
+    )
+}
+
+fn coordination_record_room_edge(state: &CoordinationRecordState) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_record_edge_id(&state.tenant_slug, &state.room_id, &state.record_id),
+        coordination_record_node_id(&state.tenant_slug, &state.room_id, &state.record_id),
+        "COORDINATION_RECORD_OF",
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "room_id": state.room_id,
+            "record_id": state.record_id,
+            "record_type": state.record_type,
+            "actor_id": state.actor_id,
             "created_at": state.created_at,
         }),
     )
@@ -2946,6 +3138,16 @@ fn normalize_coordination_status(status: &str) -> Result<String, McpError> {
         "working" | "paused" | "done" => Ok(status),
         _ => Err(McpError::invalid_params(
             "coordination intent status must be working, paused, or done",
+        )),
+    }
+}
+
+fn normalize_coordination_record_type(record_type: &str) -> Result<String, McpError> {
+    let record_type = record_type.trim().to_lowercase();
+    match record_type.as_str() {
+        "event" | "decision" | "tension" | "reflection" => Ok(record_type),
+        _ => Err(McpError::invalid_params(
+            "coordination record type must be event, decision, tension, or reflection",
         )),
     }
 }
@@ -3820,6 +4022,21 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "read_records_for_room",
+            "Read durable native Theorem harness coordination records for a room.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "record_type": { "type": "string", "enum": ["event", "decision", "tension", "reflection"] },
+                    "record_types": { "type": "array", "items": { "type": "string", "enum": ["event", "decision", "tension", "reflection"] } },
+                    "limit": { "type": "integer", "default": 50 }
+                }
+            }),
+        ),
+        tool(
             "mentions",
             "Read pending native Theorem harness mentions for an actor. consume=true requires write mode.",
             json!({
@@ -4024,6 +4241,27 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "metadata": { "type": "object" }
                 },
                 "required": ["actor", "message"]
+            }),
+        ));
+        tools.push(tool_write(
+            "coordination_record",
+            "Write a durable native Theorem harness coordination record.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "record_id": { "type": "string" },
+                    "record_type": { "type": "string", "enum": ["event", "decision", "tension", "reflection"] },
+                    "title": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "body": { "type": "string" },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["actor", "record_type", "summary"]
             }),
         ));
         tools.push(tool_write(
@@ -4875,6 +5113,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "harness_kg_status"));
         assert!(has_tool(tools, "read_intents_for_room"));
         assert!(has_tool(tools, "read_messages_for_room"));
+        assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "mentions"));
         assert!(tools
             .iter()
@@ -4895,6 +5134,7 @@ mod tests {
         assert!(!has_tool(tools, "presence"));
         assert!(!has_tool(tools, "coordination_intent"));
         assert!(!has_tool(tools, "coordinate"));
+        assert!(!has_tool(tools, "coordination_record"));
     }
 
     #[test]
@@ -4912,7 +5152,9 @@ mod tests {
         assert!(has_tool(tools, "presence"));
         assert!(has_tool(tools, "coordination_intent"));
         assert!(has_tool(tools, "coordinate"));
+        assert!(has_tool(tools, "coordination_record"));
         assert!(has_tool(tools, "mentions"));
+        assert!(has_tool(tools, "read_records_for_room"));
     }
 
     #[test]
@@ -5068,6 +5310,53 @@ mod tests {
             messages["messages"][0]["message"],
             "@claude-code please test native MCP"
         );
+
+        let record = call_tool_json(
+            &provider,
+            &config,
+            "coordination_record",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "record_type": "decision",
+                "title": "Expose records over MCP",
+                "summary": "Capture durable coordination records through the native MCP path",
+                "body": "The runtime record contract is now available to MCP clients.",
+                "metadata": { "commit": "pending" },
+                "created_at": "2026-06-01T00:04:00Z"
+            }),
+        );
+        assert_eq!(record["record"]["actor_id"], "codex");
+        assert_eq!(record["record"]["record_type"], "decision");
+
+        let records = call_tool_json(
+            &provider,
+            &config,
+            "read_records_for_room",
+            json!({
+                "tenant": "smoke",
+                "room_id": "harness-rust-port",
+                "record_type": "decision"
+            }),
+        );
+        assert_eq!(records["count"], 1);
+        assert_eq!(
+            records["records"][0]["summary"],
+            "Capture durable coordination records through the native MCP path"
+        );
+
+        let empty_records = call_tool_json(
+            &provider,
+            &config,
+            "read_records_for_room",
+            json!({
+                "tenant": "smoke",
+                "room_id": "harness-rust-port",
+                "record_type": "reflection"
+            }),
+        );
+        assert_eq!(empty_records["count"], 0);
     }
 
     #[test]

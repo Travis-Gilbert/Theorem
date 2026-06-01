@@ -108,13 +108,13 @@ I'll add a `RemoteParticipantStore` that decodes the presence/intent contract th
 same way `RemoteHarnessRunStore` decodes runs, so the Participants surface goes
 live with the same one-line swap.
 
-### Separately: wire native coordination into the MCP server
+### Separately: native coordination in the MCP server
 
-The bigger win is not iOS. Wiring `theorem-harness-runtime::coordination` into
-`rustyred-thg-mcp` (back the `coordinate` / `presence` / `mentions` tools with the
-native Rust impl) would move cross-agent coordination off the flaky Python harness
-that 500-ed all session onto the reliable native substrate. That is the reliability
-thesis of this whole port, and it is now one wiring step away. Rust lane, yours.
+The bigger win is not iOS. `rustyred-thg-mcp` now exposes the native
+coordination room, presence, intent, message, mention, and durable record tools
+over the Rust runtime-backed graph path. That moves the agent write/read surface
+off the flaky Python harness while HTTP remains the read transport for iOS/web
+clients.
 
 ## What I'll do on receipt
 

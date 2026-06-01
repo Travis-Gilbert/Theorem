@@ -250,19 +250,22 @@ durable path.
 
 The first exposure step is implemented in `rustyred-thg-mcp`: native
 `coordination_room`, `presence`, `coordination_intent`, `coordinate`,
-`mentions`, `read_intents_for_room`, and `read_messages_for_room` tools now use
-the Rust runtime coordination data model and persist through the MCP backend
-GraphStore. Read tools are listed in read-only mode; write tools appear only
-when MCP read/write mode is enabled. The MCP test suite covers a full
-room/presence/intent/message/mention-consume/readback round trip against a
-shared fixture store.
+`coordination_record`, `mentions`, `read_intents_for_room`,
+`read_messages_for_room`, and `read_records_for_room` tools now use the Rust
+runtime coordination data model and persist through the MCP backend GraphStore.
+Read tools are listed in read-only mode; write tools appear only when MCP
+read/write mode is enabled. The MCP test suite covers a full
+room/presence/intent/message/mention-consume/record/readback round trip against
+a shared fixture store.
 
 The next native substrate slice adds durable coordination records for
 `event`, `decision`, `tension`, and `reflection`. They share one
 `CoordinationRecordState` graph contract, persist as `CoordinationRecord` nodes,
 and attach to rooms through `COORDINATION_RECORD_OF` edges. Tests cover record
 type validation, filtering, limit ordering, graph IDs/edges, and
-`RedCoreGraphStore` reopen behavior.
+`RedCoreGraphStore` reopen behavior. The record contract is exposed through MCP
+for agent write/read workflows and over HTTP as a read surface for iOS/web
+clients.
 
 Not covered yet: context injection into the channel, contribution capture, and
 permission/cost hooks. Those remain the rest of the direct-coordination module.

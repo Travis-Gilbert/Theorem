@@ -9,10 +9,11 @@ pub use coordination::{
     infer_coordination_room_id, join_room, list_presence, load_presence,
     normalize_coordination_urgency, parse_coordination_mentions, read_intents_for_room,
     read_mentions_for_actor, read_messages_for_room, read_records_for_room, room_status,
-    stable_coordination_message_id, write_intent, write_message, write_record, CoordinationError,
-    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
-    CoordinationRecordState, CoordinationResult, CoordinationRoomMember, CoordinationRoomState,
-    JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
+    stable_coordination_message_id, stable_coordination_record_id, write_intent, write_message,
+    write_record, CoordinationError, CoordinationIntentState, CoordinationMessageState,
+    CoordinationPresenceState, CoordinationRecordState, CoordinationResult, CoordinationRoomMember,
+    CoordinationRoomState, JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
+    WriteRecordInput,
 };
 pub use event_log::{
     append_transition, append_transition_from_store, event_node_id, load_events, load_run,

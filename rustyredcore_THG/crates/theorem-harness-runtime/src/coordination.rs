@@ -1267,6 +1267,24 @@ fn stable_record_id(
     format!("record_{}", &hash[..16])
 }
 
+pub fn stable_coordination_record_id(
+    tenant_slug: &str,
+    room_id: &str,
+    record_type: &str,
+    actor_id: &str,
+    summary: &str,
+    created_at: &str,
+) -> String {
+    stable_record_id(
+        tenant_slug,
+        room_id,
+        record_type,
+        actor_id,
+        summary,
+        created_at,
+    )
+}
+
 fn resolve_room_id(
     room_id: &str,
     repo: &str,
