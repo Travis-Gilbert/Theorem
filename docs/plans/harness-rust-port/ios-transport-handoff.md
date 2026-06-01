@@ -93,6 +93,13 @@ Implemented in `apps/theorem-harness-server`. `room_status` and
 `read_mentions_for_actor` -> membership/task and the @mention inbox. Mentions
 accept optional `limit` and `consume=true` query parameters.
 
+### `GET /harness/rooms/{room_id}/records`
+
+Implemented in `apps/theorem-harness-server`. `read_records_for_room` -> durable
+room events, decisions, tensions, and reflections. Optional `record_type` or
+comma-separated `record_types` filters the timeline, and optional `limit`
+controls the response length.
+
 All coordination endpoints accept `tenant` or `tenant_slug` as a query parameter;
 omitting it uses `default`, which is appropriate for local smoke stores but not
 hosted tenant routing.

@@ -13,7 +13,7 @@ use rustyred_thg_core::{GraphStore, NodeQuery};
 use serde_json::{json, Value};
 use theorem_harness_runtime::{
     list_presence, load_events, load_run, read_intents_for_room, read_mentions_for_actor,
-    room_status, CoordinationError, HarnessRuntimeError,
+    read_records_for_room, room_status, CoordinationError, HarnessRuntimeError,
 };
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
@@ -108,6 +108,23 @@ pub fn mentions_json<S: GraphStore>(
     }))
 }
 
+/// Durable room records: events, decisions, tensions, and reflections.
+pub fn records_json<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    room_id: &str,
+    record_types: &[String],
+    limit: usize,
+) -> Result<Value, CoordinationError> {
+    let records = read_records_for_room(store, tenant_slug, room_id, record_types, limit)?;
+    Ok(json!({
+        "tenant": tenant_slug,
+        "room_id": room_id,
+        "records": records,
+        "count": records.len()
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,7 +133,8 @@ mod tests {
     use theorem_harness_core::TransitionInput;
     use theorem_harness_runtime::{
         append_transition_from_store, heartbeat_presence, join_room, write_intent, write_message,
-        JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
+        write_record, JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
+        WriteRecordInput,
     };
 
     fn payload(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -204,6 +222,20 @@ mod tests {
             },
         )
         .expect("message");
+        write_record(
+            store,
+            WriteRecordInput {
+                tenant_slug: "smoke".to_string(),
+                room_id: "repo:theorem:branch:main".to_string(),
+                actor_id: "codex".to_string(),
+                record_type: "decision".to_string(),
+                title: "Expose read endpoints".to_string(),
+                summary: "Use HTTP for participant state".to_string(),
+                created_at: "2026-06-01T16:04:00Z".to_string(),
+                ..WriteRecordInput::default()
+            },
+        )
+        .expect("record");
     }
 
     #[test]
@@ -263,5 +295,20 @@ mod tests {
         let empty_after_consume =
             mentions_json(&mut store, "smoke", "claude-code", false, 20).expect("mentions empty");
         assert_eq!(empty_after_consume["count"], json!(0));
+
+        let records =
+            records_json(&store, "smoke", "repo:theorem:branch:main", &[], 20).expect("records");
+        assert_eq!(records["count"], json!(1));
+        assert_eq!(records["records"][0]["record_type"], json!("decision"));
+
+        let filtered = records_json(
+            &store,
+            "smoke",
+            "repo:theorem:branch:main",
+            &["reflection".to_string()],
+            20,
+        )
+        .expect("filtered records");
+        assert_eq!(filtered["count"], json!(0));
     }
 }

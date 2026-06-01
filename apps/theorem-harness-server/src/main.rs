@@ -7,6 +7,7 @@
 //!   GET /harness/rooms/{room_id}          -> { "room": {...} }
 //!   GET /harness/rooms/{room_id}/presence -> { "presence": [...] }
 //!   GET /harness/rooms/{room_id}/intents  -> { "intents": [...] }
+//!   GET /harness/rooms/{room_id}/records  -> { "records": [...] }
 //!   GET /harness/actors/{actor}/mentions  -> { "mentions": [...] }
 //!   GET /healthz                 -> "ok"
 //!
@@ -27,7 +28,7 @@ use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use serde::Deserialize;
 use serde_json::Value;
 use theorem_harness_server::{
-    intents_json, mentions_json, presence_json, room_json, run_json, runs_json,
+    intents_json, mentions_json, presence_json, records_json, room_json, run_json, runs_json,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
@@ -38,6 +39,8 @@ struct CoordinationQuery {
     tenant_slug: Option<String>,
     status: Option<String>,
     statuses: Option<String>,
+    record_type: Option<String>,
+    record_types: Option<String>,
     consume: Option<bool>,
     limit: Option<usize>,
 }
@@ -57,6 +60,14 @@ impl CoordinationQuery {
         self.statuses
             .as_deref()
             .or(self.status.as_deref())
+            .map(split_csv)
+            .unwrap_or_default()
+    }
+
+    fn record_types(&self) -> Vec<String> {
+        self.record_types
+            .as_deref()
+            .or(self.record_type.as_deref())
             .map(split_csv)
             .unwrap_or_default()
     }
@@ -84,6 +95,7 @@ async fn main() {
         .route("/harness/rooms/:room_id", get(get_room))
         .route("/harness/rooms/:room_id/presence", get(get_room_presence))
         .route("/harness/rooms/:room_id/intents", get(get_room_intents))
+        .route("/harness/rooms/:room_id/records", get(get_room_records))
         .route(
             "/harness/actors/:actor_id/mentions",
             get(get_actor_mentions),
@@ -165,6 +177,23 @@ async fn get_actor_mentions(
         &actor_id,
         query.consume.unwrap_or(false),
         query.limit.unwrap_or(20),
+    )
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_room_records(
+    State(store): State<SharedStore>,
+    Path(room_id): Path<String>,
+    Query(query): Query<CoordinationQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let store = store.lock().expect("store lock");
+    records_json(
+        &*store,
+        &query.tenant_slug(),
+        &room_id,
+        &query.record_types(),
+        query.limit.unwrap_or(50),
     )
     .map(Json)
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)

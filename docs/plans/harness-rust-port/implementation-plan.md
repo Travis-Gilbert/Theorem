@@ -276,6 +276,9 @@ coordination read contracts:
 - `GET /harness/rooms/{room_id}/intents` for live actor claims.
 - `GET /harness/actors/{actor}/mentions` for the actor inbox, with optional
   `consume=true`.
+- `GET /harness/rooms/{room_id}/records` for durable events, decisions,
+  tensions, and reflections, with optional `record_type` / `record_types`
+  filtering.
 
 Each endpoint accepts `tenant` or `tenant_slug` as a query parameter and reads
 from the same `RedCoreGraphStore` as the run transport.
