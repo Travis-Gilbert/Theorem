@@ -33,6 +33,26 @@ the request path**, and the **write** verbs are live (not just the reads).
 Every base verb below gets a checklist item or an explicitly-surfaced,
 consent-required deferral. No silent MVP cut.
 
+### Confirmed target state (Travis, 2026-06-01)
+
+V2 (`rustyredcore-theorem-production`) must serve, all native over the RedCore
+`GraphStore`, no Python/Django: **graph + coordination reads + coordination
+writes + memory.** Those four pillars are the definition of done for the base:
+
+- graph: already live.
+- coordination reads: already live (`coordination_context`, `mentions`,
+  `read_*`).
+- coordination writes: coded in `225f3e2`; blocked only on deploy + write-mode
+  (Lane O), with completeness gaps in Lane C (`mentions_wait`,
+  `resolve_tension`, typed `read_*_since`).
+- memory: the build (Lane M) — memory atoms become RedCore `GraphStore` nodes
+  on this same server.
+
+Travis also accepted the broader `theorem_*` product surface (Lane T) on top of
+that base. Verified live on 2026-06-01: V2 exposes 40 tools, all reads (graph +
+coordination reads); zero memory verbs and zero coordination writes are live
+yet. That probe is the before-state this plan moves off.
+
 ## Why this is mostly an extension, not a greenfield build
 
 Grounded in the live tree on 2026-06-01 (`git show 225f3e2`, the MCP
