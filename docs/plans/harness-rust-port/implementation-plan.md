@@ -180,15 +180,28 @@ the core/runtime split. Actual engine execution wrappers remain later
 runtime/native-engine work because they touch symbolic-engine implementations and
 Python fallback semantics.
 
+## Phase 2.9
+
+Done from the remaining pure-logic list: `session_metrics.py` has been ported as
+`theorem_harness_core::session_metrics`. The Rust module exposes
+`SessionMetricsState`, `load_jsonl_metrics`, `summarize_pairformer_ab`, and
+`compare_modes`, preserving the Python contract for Pairformer A/B measurement:
+mode normalization (`off`/`gate`/`full`), non-negative token/tool counts,
+completed-session grouping, mean/median token summaries, token-reduction
+comparison, and the Welch-z confidence gate. This gives the later budget governor
+and Pairformer learning-controller work a native measurement contract without
+waiting for runtime IO.
+
 ## Phase 3+ (sequenced, not committed here)
 
-Next pure-logic candidates: `map_artifacts`, `memory_contracts`,
-`session_metrics`, `federated_signals`. The context compiler's pure pack core
-and affordance registry/receipt contract are now in Rust; context IO retrieval,
-substrate adapters, and affordance execution wrappers remain later runtime
-rewrites. The next runtime candidates from the build spec are the map compiler,
-direct coordination channel, charter compiler, budget governor, compaction, and
-trace exports. Each gets its own plan slice when reached.
+Next pure-logic candidates: `map_artifacts`, `memory_contracts`, and the pure
+privacy helpers inside `federated_signals`. The context compiler's pure pack
+core, affordance registry/receipt contract, and Pairformer metrics helpers are
+now in Rust; context IO retrieval, substrate adapters, and affordance execution
+wrappers remain later runtime rewrites. The next runtime candidates from the
+build spec are the map compiler, direct coordination channel, charter compiler,
+budget governor, compaction, and trace exports. Each gets its own plan slice
+when reached.
 
 ## Coordination (hybrid -> git remains durable)
 

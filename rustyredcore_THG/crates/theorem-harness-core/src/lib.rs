@@ -1,6 +1,7 @@
 pub mod affordances;
 pub mod context_web;
 pub mod replay;
+pub mod session_metrics;
 pub mod state_hash;
 pub mod state_machine;
 pub mod toolgraph;
@@ -18,6 +19,10 @@ pub use context_web::{
     ContextWebValidatorFinding,
 };
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};
+pub use session_metrics::{
+    compare_modes, load_jsonl_metrics, summarize_pairformer_ab, PairformerSummaryRow,
+    SessionMetricsState, PAIRFORMER_MODES,
+};
 pub use state_hash::{empty_state_hash, hash_run_state, stable_value_hash};
 pub use state_machine::{apply_transition, HarnessError};
 pub use toolgraph::{
