@@ -11,6 +11,7 @@ pub mod catalogs;
 pub mod compile;
 pub mod mobile;
 pub mod package;
+pub mod patent;
 pub mod select;
 
 pub use atoms::{
@@ -33,6 +34,7 @@ pub use package::{
     ActionDescriptor, ChromeBinding, ProjectionBinding, ScenePackageV2, TerminalStateArtifact,
     TransitionDescriptor,
 };
+pub use patent::{lift_patent_scene_payload, PatentSceneLiftInput};
 pub use select::{
     classify_goal, detect_shape, select_chrome, select_projection, ChromeSelection,
     ChromeSelectionRefusal, DataShape, DataShapeDetection, Goal, GoalDetection,

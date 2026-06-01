@@ -117,11 +117,14 @@ The biggest immediate visual shift; replaces the dark theme. No backend dependen
 - [x] **D7.2** Node tap / "how does X work" answer → lay a patent plate over the
   field; callouts drill into deeper plates per the resolved A/B decision. Backref:
   same + acceptance.
-- [ ] **D7.3 [Codex / backend dependency]** Scene OS must emit patent-register
+- [x] **D7.3 [Codex / backend dependency]** Scene OS must emit patent-register
   scene packages (`ScenePackageV2` with a patent projection + callout/figure/
   legend structure) for the iOS renderer to draw. Coordinate: this is the content
   side of the patent plate; the native renderer (D7.1) draws what Scene OS
-  produces. Backref: "Platform split".
+  produces. Backref: "Platform split". Implemented in `scene-os-core` via
+  `lift_patent_scene_payload`, which emits stable `patent-node` atoms,
+  `patent-edge` relations, patent projection/chrome bindings, and full register
+  JSON in terminal state.
 
 ---
 
