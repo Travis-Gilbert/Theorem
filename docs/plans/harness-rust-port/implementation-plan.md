@@ -238,7 +238,7 @@ Rust. Runtime/substrate rewrite work is underway.
 
 ## Phase 3.1
 
-Started the direct coordination channel in
+Started, then exposed, the direct coordination channel in
 `theorem_harness_runtime::coordination`. This first substrate slice persists
 coordination-room membership, one live intent per `(room, actor)`, and durable
 presence records directly into `GraphStore`, with `RedCoreGraphStore`
@@ -248,9 +248,22 @@ consume-on-read inbox semantics. It mirrors the currently useful
 room/intent/presence/messages shape while removing Django/cache as the only
 durable path.
 
+The first exposure step is implemented in `rustyred-thg-mcp`: native
+`coordination_room`, `presence`, `coordination_intent`, `coordinate`,
+`mentions`, `read_intents_for_room`, and `read_messages_for_room` tools now use
+the Rust runtime coordination data model and persist through the MCP backend
+GraphStore. Read tools are listed in read-only mode; write tools appear only
+when MCP read/write mode is enabled. The MCP test suite covers a full
+room/presence/intent/message/mention-consume/readback round trip against a
+shared fixture store.
+
 Not covered yet: event/decision/tension/reflection records, context injection
 into the channel, contribution capture, and permission/cost hooks. Those remain
 the rest of the direct-coordination module.
+
+The HTTP transport exposure is a separate non-overlapping lane owned by Claude
+Code as `apps/theorem-harness-server` over `theorem-harness-runtime`. Do not
+start that server crate from the MCP lane.
 
 Remaining runtime/substrate work beyond that: context IO retrieval, substrate
 adapters, map repository writes, affordance execution wrappers, charter

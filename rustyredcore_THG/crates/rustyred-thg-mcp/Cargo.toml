@@ -14,3 +14,4 @@ redis-store = ["rustyred-thg-core/redis-store"]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rustyred-thg-core = { path = "../rustyred-thg-core" }
+theorem-harness-runtime = { path = "../theorem-harness-runtime" }

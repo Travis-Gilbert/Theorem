@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
@@ -9,11 +10,21 @@ use rustyred_thg_core::{
     SessionDelta, VectorDesignation, VerifyReport,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use theorem_harness_runtime::{
+    coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
+    coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
+    coordination_message_node_id, coordination_presence_node_id, coordination_room_node_id,
+    infer_coordination_room_id, normalize_coordination_urgency, parse_coordination_mentions,
+    stable_coordination_message_id, CoordinationIntentState, CoordinationMessageState,
+    CoordinationPresenceState, CoordinationRoomMember, CoordinationRoomState, JoinRoomInput,
+    PresenceInput, WriteIntentInput, WriteMessageInput,
+};
 
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+#[allow(clippy::too_many_arguments)]
 pub trait McpGraphBackend {
     fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>>;
     fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>>;
@@ -799,6 +810,73 @@ fn call_tool<P: McpGraphProvider>(
         "rustyred_thg_symbolic_probabilistic_expected_value"
         | "rustyred_thg.symbolic.probabilistic_expected_value" => {
             symbolic_probabilistic_expected_value_payload(&arguments)?
+        }
+        "coordination_room" | "theorem_harness_coordination_room" => {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status")
+                .trim()
+                .to_lowercase();
+            if matches!(action.as_str(), "join" | "start") && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native coordination-room writes are unavailable while read-only mode is active."
+                })));
+            }
+            coordination_room_payload(&tenant, &mut backend, &arguments)?
+        }
+        "presence" | "theorem_harness_presence" => {
+            let mode = arguments
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("heartbeat")
+                .trim()
+                .to_lowercase();
+            if mode != "get" && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native presence writes are unavailable while read-only mode is active."
+                })));
+            }
+            presence_payload(&tenant, &mut backend, &arguments)?
+        }
+        "coordination_intent" | "write_intent" | "theorem_harness_write_intent" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native coordination intent writes are unavailable while read-only mode is active."
+                })));
+            }
+            write_intent_payload(&tenant, &mut backend, &arguments)?
+        }
+        "read_intents_for_room" | "theorem_harness_read_intents_for_room" => {
+            read_intents_payload(&tenant, &backend, &arguments)?
+        }
+        "coordinate" | "theorem_harness_coordinate" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native coordination messages are unavailable while read-only mode is active."
+                })));
+            }
+            coordinate_payload(&tenant, &mut backend, &arguments)?
+        }
+        "mentions" | "theorem_harness_mentions" => {
+            let consume = arguments
+                .get("consume")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if consume && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Consuming native mentions is unavailable while read-only mode is active."
+                })));
+            }
+            mentions_payload(&tenant, &mut backend, &arguments)?
+        }
+        "read_messages_for_room" | "theorem_harness_read_messages_for_room" => {
+            read_messages_payload(&tenant, &backend, &arguments)?
         }
         "rustyred_thg_fulltext_search" | "rustyred_thg_graph_fulltext_search" => {
             let property = required_str(&arguments, "property", name)?;
@@ -1901,6 +1979,259 @@ fn symbolic_probabilistic_expected_value_payload(arguments: &Value) -> Result<Va
     rustyred_thg_core::probabilistic_expected_value(arguments).map_err(McpError::invalid_params)
 }
 
+fn coordination_room_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let action = argument_text(arguments, &["action"])
+        .unwrap_or_else(|| "status".to_string())
+        .to_lowercase();
+    let room_id = resolved_coordination_room_id(arguments);
+    let room = match action.as_str() {
+        "status" => load_coordination_room(backend, tenant, &room_id)?
+            .unwrap_or_else(|| empty_coordination_room(tenant, &room_id, "")),
+        "join" | "start" => {
+            let actor_id = required_text_any(
+                arguments,
+                &["actor", "actor_id", "actorId"],
+                "coordination_room",
+            )?;
+            join_coordination_room(
+                backend,
+                JoinRoomInput {
+                    tenant_slug: tenant.to_string(),
+                    actor_id,
+                    room_id,
+                    session_id: argument_text(arguments, &["session_id", "sessionId"])
+                        .unwrap_or_default(),
+                    surface: argument_text(arguments, &["surface"]).unwrap_or_default(),
+                    repo: argument_text(arguments, &["repo"]).unwrap_or_default(),
+                    branch: argument_text(arguments, &["branch"]).unwrap_or_default(),
+                    task: argument_text(arguments, &["task"]).unwrap_or_default(),
+                    worktree: argument_text(arguments, &["worktree"]).unwrap_or_default(),
+                    head: argument_text(arguments, &["head"]).unwrap_or_default(),
+                    changed_files: string_array_any(arguments, &["changed_files", "changedFiles"]),
+                    lane: argument_text(arguments, &["lane"]).unwrap_or_default(),
+                    updated_at: argument_text(arguments, &["updated_at", "updatedAt"])
+                        .unwrap_or_default(),
+                },
+            )?
+        }
+        other => {
+            return Err(McpError::invalid_params(format!(
+                "coordination_room action must be status, join, or start, got {other}"
+            )))
+        }
+    };
+    Ok(json!({ "tenant": tenant, "room": room }))
+}
+
+fn presence_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mode = argument_text(arguments, &["mode"])
+        .unwrap_or_else(|| "heartbeat".to_string())
+        .to_lowercase();
+    match mode.as_str() {
+        "get" => {
+            if let Some(actor_id) = argument_text(arguments, &["actor", "actor_id", "actorId"]) {
+                Ok(json!({
+                    "tenant": tenant,
+                    "presence": load_coordination_presence(backend, tenant, &actor_id)?
+                }))
+            } else {
+                Ok(json!({
+                    "tenant": tenant,
+                    "presence": list_coordination_presence(backend, tenant)?
+                }))
+            }
+        }
+        "heartbeat" | "active" => {
+            let presence = write_coordination_presence(
+                backend,
+                PresenceInput {
+                    tenant_slug: tenant.to_string(),
+                    actor_id: required_text_any(
+                        arguments,
+                        &["actor", "actor_id", "actorId"],
+                        "presence",
+                    )?,
+                    session_id: argument_text(arguments, &["session_id", "sessionId"])
+                        .unwrap_or_default(),
+                    surface: argument_text(arguments, &["surface"]).unwrap_or_default(),
+                    status: argument_text(arguments, &["status"])
+                        .unwrap_or_else(|| "active".to_string()),
+                    worktree: argument_text(arguments, &["worktree"]).unwrap_or_default(),
+                    branch: argument_text(arguments, &["branch"]).unwrap_or_default(),
+                    head: argument_text(arguments, &["head"]).unwrap_or_default(),
+                    changed_files: string_array_any(arguments, &["changed_files", "changedFiles"]),
+                    ttl_seconds: argument_u64(arguments, &["ttl_seconds", "ttlSeconds"])
+                        .unwrap_or(60),
+                    refreshed_at: argument_text(arguments, &["refreshed_at", "refreshedAt"])
+                        .unwrap_or_default(),
+                    expires_at: argument_text(arguments, &["expires_at", "expiresAt"])
+                        .unwrap_or_default(),
+                },
+            )?;
+            Ok(json!({ "tenant": tenant, "presence": presence }))
+        }
+        "end" | "inactive" => {
+            let presence = write_coordination_presence(
+                backend,
+                PresenceInput {
+                    tenant_slug: tenant.to_string(),
+                    actor_id: required_text_any(
+                        arguments,
+                        &["actor", "actor_id", "actorId"],
+                        "presence",
+                    )?,
+                    session_id: argument_text(arguments, &["session_id", "sessionId"])
+                        .unwrap_or_default(),
+                    surface: argument_text(arguments, &["surface"]).unwrap_or_default(),
+                    status: "inactive".to_string(),
+                    worktree: argument_text(arguments, &["worktree"]).unwrap_or_default(),
+                    branch: argument_text(arguments, &["branch"]).unwrap_or_default(),
+                    head: argument_text(arguments, &["head"]).unwrap_or_default(),
+                    changed_files: string_array_any(arguments, &["changed_files", "changedFiles"]),
+                    ttl_seconds: 1,
+                    refreshed_at: argument_text(arguments, &["refreshed_at", "refreshedAt"])
+                        .unwrap_or_default(),
+                    expires_at: argument_text(arguments, &["expires_at", "expiresAt"])
+                        .unwrap_or_default(),
+                },
+            )?;
+            Ok(json!({ "tenant": tenant, "presence": presence }))
+        }
+        other => Err(McpError::invalid_params(format!(
+            "presence mode must be get, heartbeat, or end, got {other}"
+        ))),
+    }
+}
+
+fn write_intent_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let intent = write_coordination_intent(
+        backend,
+        WriteIntentInput {
+            tenant_slug: tenant.to_string(),
+            room_id: resolved_coordination_room_id(arguments),
+            actor_id: required_text_any(
+                arguments,
+                &["actor", "actor_id", "actorId"],
+                "write_intent",
+            )?,
+            status: argument_text(arguments, &["status"]).unwrap_or_else(|| "working".to_string()),
+            summary: required_text_any(arguments, &["summary"], "write_intent")?,
+            claimed_files: string_array_any(arguments, &["claimed_files", "claimedFiles"]),
+            expected_completion: argument_text(
+                arguments,
+                &["expected_completion", "expectedCompletion"],
+            )
+            .unwrap_or_default(),
+            repo: argument_text(arguments, &["repo"]).unwrap_or_default(),
+            branch: argument_text(arguments, &["branch"]).unwrap_or_default(),
+            task: argument_text(arguments, &["task"]).unwrap_or_default(),
+            updated_at: argument_text(arguments, &["updated_at", "updatedAt"]).unwrap_or_default(),
+        },
+    )?;
+    Ok(json!({ "tenant": tenant, "intent": intent }))
+}
+
+fn read_intents_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let statuses = string_array_any(arguments, &["statuses", "status"]);
+    let intents = read_coordination_intents(backend, tenant, &room_id, &statuses)?;
+    Ok(json!({
+        "tenant": tenant,
+        "room_id": room_id,
+        "intents": intents,
+        "count": intents.len()
+    }))
+}
+
+fn coordinate_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let message = write_coordination_message(
+        backend,
+        WriteMessageInput {
+            tenant_slug: tenant.to_string(),
+            room_id: room_id.clone(),
+            actor_id: required_text_any(
+                arguments,
+                &["actor", "actor_id", "actorId"],
+                "coordinate",
+            )?,
+            message_id: argument_text(arguments, &["message_id", "messageId"]).unwrap_or_default(),
+            urgency: argument_text(arguments, &["urgency"]).unwrap_or_else(|| "info".to_string()),
+            message: required_text_any(arguments, &["message"], "coordinate")?,
+            mentions: string_array_any(arguments, &["mentions"]),
+            metadata: argument_object(arguments, "metadata"),
+            created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+        },
+    )?;
+    Ok(json!({
+        "tenant": tenant,
+        "ok": true,
+        "room_id": room_id,
+        "message_id": message.message_id,
+        "mentions": message.mentions,
+        "unread_count": message.mentions.len(),
+        "urgency": message.urgency,
+        "created_at": message.created_at
+    }))
+}
+
+fn mentions_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let actor_id = required_text_any(arguments, &["actor", "actor_id", "actorId"], "mentions")?;
+    let consume = arguments
+        .get("consume")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let limit = argument_u64(arguments, &["limit"]).unwrap_or(20) as usize;
+    let mentions = read_coordination_mentions(backend, tenant, &actor_id, consume, limit)?;
+    Ok(json!({
+        "tenant": tenant,
+        "actor_id": actor_id,
+        "mentions": mentions,
+        "count": mentions.len(),
+        "consumed": consume
+    }))
+}
+
+fn read_messages_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let limit = argument_u64(arguments, &["limit"]).unwrap_or(50) as usize;
+    let messages = read_coordination_messages(backend, tenant, &room_id, limit)?;
+    Ok(json!({
+        "tenant": tenant,
+        "room_id": room_id,
+        "messages": messages,
+        "count": messages.len()
+    }))
+}
+
 fn instant_kg_view_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
@@ -2024,11 +2355,731 @@ fn neighbor_query_from_value(value: &Value) -> Result<NeighborQuery, McpError> {
     })
 }
 
+fn join_coordination_room(
+    backend: &mut impl McpGraphBackend,
+    input: JoinRoomInput,
+) -> Result<CoordinationRoomState, McpError> {
+    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let actor_id = require_nonempty(input.actor_id.trim(), "coordination_room requires actor")?;
+    let room_id = if input.room_id.trim().is_empty() {
+        infer_coordination_room_id(&input.repo, &input.branch, &input.task, &input.session_id)
+    } else {
+        input.room_id.trim().to_string()
+    };
+    let now = timestamp_or_now(&input.updated_at);
+    let mut state = load_coordination_room(backend, &tenant_slug, &room_id)?
+        .unwrap_or_else(|| empty_coordination_room(&tenant_slug, &room_id, &now));
+    let existing = state.members.get(&actor_id);
+    let joined_at = existing
+        .map(|member| member.joined_at.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| now.clone());
+    let member = CoordinationRoomMember {
+        tenant_slug: tenant_slug.clone(),
+        room_id: room_id.clone(),
+        actor_id: actor_id.clone(),
+        status: "joined".to_string(),
+        session_id: choose_text(
+            &input.session_id,
+            existing.map(|member| member.session_id.as_str()),
+        ),
+        surface: choose_text(
+            &input.surface,
+            existing.map(|member| member.surface.as_str()),
+        ),
+        repo: choose_text(&input.repo, existing.map(|member| member.repo.as_str())),
+        branch: choose_text(&input.branch, existing.map(|member| member.branch.as_str())),
+        task: choose_text(&input.task, existing.map(|member| member.task.as_str())),
+        worktree: choose_text(
+            &input.worktree,
+            existing.map(|member| member.worktree.as_str()),
+        ),
+        head: choose_text(&input.head, existing.map(|member| member.head.as_str())),
+        changed_files: choose_strings(
+            &input.changed_files,
+            existing.map(|member| member.changed_files.as_slice()),
+        ),
+        lane: choose_text(&input.lane, existing.map(|member| member.lane.as_str())),
+        joined_at,
+        updated_at: now.clone(),
+    };
+    state.status = "active".to_string();
+    state.mode = "collaborating".to_string();
+    state.repo = choose_text(&input.repo, Some(state.repo.as_str()));
+    state.branch = choose_text(&input.branch, Some(state.branch.as_str()));
+    state.task = choose_text(&input.task, Some(state.task.as_str()));
+    state.updated_at = now;
+    state.members.insert(actor_id, member);
+    persist_coordination_room(backend, &state)?;
+    Ok(state)
+}
+
+fn write_coordination_intent(
+    backend: &mut impl McpGraphBackend,
+    input: WriteIntentInput,
+) -> Result<CoordinationIntentState, McpError> {
+    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let room_id = if input.room_id.trim().is_empty() {
+        "room:ungrouped".to_string()
+    } else {
+        input.room_id.trim().to_string()
+    };
+    let actor_id = require_nonempty(input.actor_id.trim(), "write_intent requires actor")?;
+    let summary = require_nonempty(input.summary.trim(), "write_intent requires summary")?;
+    let status = normalize_coordination_status(&input.status)?;
+    let now = timestamp_or_now(&input.updated_at);
+    if load_coordination_room(backend, &tenant_slug, &room_id)?.is_none() {
+        persist_coordination_room(
+            backend,
+            &empty_coordination_room(&tenant_slug, &room_id, &now),
+        )?;
+    }
+    let prior = load_coordination_intent(backend, &tenant_slug, &room_id, &actor_id)?;
+    let started_at = prior
+        .as_ref()
+        .map(|intent| intent.started_at.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| now.clone());
+    let intent = CoordinationIntentState {
+        tenant_slug,
+        room_id,
+        actor_id,
+        status,
+        summary,
+        claimed_files: normalize_string_vec(input.claimed_files),
+        expected_completion: input.expected_completion.trim().to_string(),
+        repo: input.repo.trim().to_string(),
+        branch: input.branch.trim().to_string(),
+        task: input.task.trim().to_string(),
+        started_at,
+        updated_at: now,
+    };
+    persist_coordination_intent(backend, &intent)?;
+    Ok(intent)
+}
+
+fn write_coordination_presence(
+    backend: &mut impl McpGraphBackend,
+    input: PresenceInput,
+) -> Result<CoordinationPresenceState, McpError> {
+    let refreshed_at = timestamp_or_now(&input.refreshed_at);
+    let expires_at = if input.expires_at.trim().is_empty() {
+        refreshed_at.clone()
+    } else {
+        input.expires_at.trim().to_string()
+    };
+    let presence = CoordinationPresenceState {
+        tenant_slug: normalize_tenant_slug(&input.tenant_slug),
+        actor_id: require_nonempty(input.actor_id.trim(), "presence requires actor")?,
+        session_id: input.session_id.trim().to_string(),
+        surface: input.surface.trim().to_string(),
+        status: if input.status.trim().is_empty() {
+            "active".to_string()
+        } else {
+            input.status.trim().to_string()
+        },
+        worktree: input.worktree.trim().to_string(),
+        branch: input.branch.trim().to_string(),
+        head: input.head.trim().to_string(),
+        changed_files: normalize_string_vec(input.changed_files),
+        refreshed_at,
+        expires_at,
+        ttl_seconds: input.ttl_seconds.max(1),
+    };
+    upsert_node_if_changed(backend, coordination_presence_node(&presence)?)?;
+    Ok(presence)
+}
+
+fn write_coordination_message(
+    backend: &mut impl McpGraphBackend,
+    input: WriteMessageInput,
+) -> Result<CoordinationMessageState, McpError> {
+    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let room_id = if input.room_id.trim().is_empty() {
+        "room:ungrouped".to_string()
+    } else {
+        input.room_id.trim().to_string()
+    };
+    let actor_id = require_nonempty(input.actor_id.trim(), "coordinate requires actor")?;
+    let message = require_nonempty(input.message.trim(), "coordinate requires message")?;
+    let urgency = normalize_coordination_urgency(&input.urgency)
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+    let created_at = timestamp_or_now(&input.created_at);
+    let mentions = merge_string_vecs(
+        parse_coordination_mentions(&message),
+        normalize_string_vec(input.mentions),
+    );
+    let message_id = if input.message_id.trim().is_empty() {
+        stable_coordination_message_id(&tenant_slug, &room_id, &actor_id, &message, &created_at)
+    } else {
+        input.message_id.trim().to_string()
+    };
+    if load_coordination_room(backend, &tenant_slug, &room_id)?.is_none() {
+        persist_coordination_room(
+            backend,
+            &empty_coordination_room(&tenant_slug, &room_id, &created_at),
+        )?;
+    }
+    let message = CoordinationMessageState {
+        tenant_slug,
+        room_id,
+        message_id,
+        actor_id,
+        urgency,
+        message,
+        mentions,
+        metadata: input.metadata,
+        consumed_by: Vec::new(),
+        created_at,
+    };
+    persist_coordination_message(backend, &message)?;
+    Ok(message)
+}
+
+fn read_coordination_intents(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+    statuses: &[String],
+) -> Result<Vec<CoordinationIntentState>, McpError> {
+    let filters = normalize_string_vec(statuses.to_vec())
+        .into_iter()
+        .map(|status| status.to_lowercase())
+        .collect::<Vec<_>>();
+    let mut intents = backend
+        .query_nodes(
+            NodeQuery::label("CoordinationIntent")
+                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant)))
+                .with_property("room_id", Value::String(room_id.to_string())),
+        )?
+        .into_iter()
+        .map(|node| parse_node_properties::<CoordinationIntentState>(node.properties))
+        .filter_map(|result| match result {
+            Ok(intent) if filters.is_empty() || filters.contains(&intent.status) => {
+                Some(Ok(intent))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    intents.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.actor_id.cmp(&right.actor_id))
+    });
+    Ok(intents)
+}
+
+fn read_coordination_messages(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+    limit: usize,
+) -> Result<Vec<CoordinationMessageState>, McpError> {
+    let mut messages = backend
+        .query_nodes(
+            NodeQuery::label("CoordinationMessage")
+                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant)))
+                .with_property("room_id", Value::String(room_id.to_string())),
+        )?
+        .into_iter()
+        .map(|node| parse_node_properties::<CoordinationMessageState>(node.properties))
+        .collect::<Result<Vec<_>, _>>()?;
+    messages.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.message_id.cmp(&left.message_id))
+    });
+    if limit > 0 {
+        messages.truncate(limit);
+    }
+    Ok(messages)
+}
+
+fn read_coordination_mentions(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    actor_id: &str,
+    consume: bool,
+    limit: usize,
+) -> Result<Vec<CoordinationMessageState>, McpError> {
+    let actor_id = require_nonempty(actor_id.trim(), "mentions requires actor")?;
+    let mut messages = backend
+        .query_nodes(
+            NodeQuery::label("CoordinationMessage")
+                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant))),
+        )?
+        .into_iter()
+        .map(|node| parse_node_properties::<CoordinationMessageState>(node.properties))
+        .filter_map(|result| match result {
+            Ok(message)
+                if message.mentions.iter().any(|mention| mention == &actor_id)
+                    && !message
+                        .consumed_by
+                        .iter()
+                        .any(|consumer| consumer == &actor_id) =>
+            {
+                Some(Ok(message))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    messages.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    if limit > 0 {
+        messages.truncate(limit);
+    }
+    if consume {
+        for message in &messages {
+            let mut consumed = message.clone();
+            consumed.consumed_by = merge_string_vecs(consumed.consumed_by, vec![actor_id.clone()]);
+            persist_coordination_message(backend, &consumed)?;
+        }
+    }
+    Ok(messages)
+}
+
+fn list_coordination_presence(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+) -> Result<Vec<CoordinationPresenceState>, McpError> {
+    let mut presence = backend
+        .query_nodes(
+            NodeQuery::label("CoordinationPresence")
+                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant))),
+        )?
+        .into_iter()
+        .map(|node| parse_node_properties::<CoordinationPresenceState>(node.properties))
+        .collect::<Result<Vec<_>, _>>()?;
+    presence.sort_by(|left, right| {
+        (left.status != "active")
+            .cmp(&(right.status != "active"))
+            .then_with(|| left.actor_id.cmp(&right.actor_id))
+    });
+    Ok(presence)
+}
+
+fn load_coordination_room(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+) -> Result<Option<CoordinationRoomState>, McpError> {
+    backend
+        .get_node(&coordination_room_node_id(tenant, room_id))?
+        .map(|node| parse_node_properties::<CoordinationRoomState>(node.properties))
+        .transpose()
+}
+
+fn load_coordination_intent(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+    actor_id: &str,
+) -> Result<Option<CoordinationIntentState>, McpError> {
+    backend
+        .get_node(&coordination_intent_node_id(tenant, room_id, actor_id))?
+        .map(|node| parse_node_properties::<CoordinationIntentState>(node.properties))
+        .transpose()
+}
+
+fn load_coordination_presence(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    actor_id: &str,
+) -> Result<Option<CoordinationPresenceState>, McpError> {
+    backend
+        .get_node(&coordination_presence_node_id(tenant, actor_id))?
+        .map(|node| parse_node_properties::<CoordinationPresenceState>(node.properties))
+        .transpose()
+}
+
+fn persist_coordination_room(
+    backend: &mut impl McpGraphBackend,
+    state: &CoordinationRoomState,
+) -> Result<(), McpError> {
+    upsert_node_if_changed(backend, coordination_room_node(state)?)?;
+    for member in state.members.values() {
+        upsert_node_if_changed(backend, coordination_member_node(member)?)?;
+        upsert_edge_if_changed(backend, coordination_member_edge(member))?;
+    }
+    Ok(())
+}
+
+fn persist_coordination_intent(
+    backend: &mut impl McpGraphBackend,
+    state: &CoordinationIntentState,
+) -> Result<(), McpError> {
+    upsert_node_if_changed(backend, coordination_intent_node(state)?)?;
+    upsert_edge_if_changed(backend, coordination_intent_edge(state))?;
+    Ok(())
+}
+
+fn persist_coordination_message(
+    backend: &mut impl McpGraphBackend,
+    state: &CoordinationMessageState,
+) -> Result<(), McpError> {
+    upsert_node_if_changed(backend, coordination_message_node(state)?)?;
+    upsert_edge_if_changed(backend, coordination_message_room_edge(state))?;
+    for actor_id in &state.mentions {
+        if backend
+            .get_node(&coordination_member_node_id(&state.tenant_slug, actor_id))?
+            .is_none()
+        {
+            upsert_node_if_changed(
+                backend,
+                coordination_member_node(&CoordinationRoomMember {
+                    tenant_slug: state.tenant_slug.clone(),
+                    room_id: state.room_id.clone(),
+                    actor_id: actor_id.clone(),
+                    status: "mentioned".to_string(),
+                    session_id: String::new(),
+                    surface: String::new(),
+                    repo: String::new(),
+                    branch: String::new(),
+                    task: String::new(),
+                    worktree: String::new(),
+                    head: String::new(),
+                    changed_files: Vec::new(),
+                    lane: String::new(),
+                    joined_at: String::new(),
+                    updated_at: state.created_at.clone(),
+                })?,
+            )?;
+        }
+        upsert_edge_if_changed(backend, coordination_mention_edge(state, actor_id))?;
+    }
+    Ok(())
+}
+
+fn coordination_room_node(state: &CoordinationRoomState) -> Result<NodeRecord, McpError> {
+    Ok(NodeRecord::new(
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        ["HarnessCoordination", "CoordinationRoom"],
+        serde_json::to_value(state).map_err(|error| McpError::internal(error.to_string()))?,
+    ))
+}
+
+fn coordination_member_node(member: &CoordinationRoomMember) -> Result<NodeRecord, McpError> {
+    Ok(NodeRecord::new(
+        coordination_member_node_id(&member.tenant_slug, &member.actor_id),
+        ["HarnessCoordination", "CoordinationMember"],
+        serde_json::to_value(member).map_err(|error| McpError::internal(error.to_string()))?,
+    ))
+}
+
+fn coordination_intent_node(state: &CoordinationIntentState) -> Result<NodeRecord, McpError> {
+    Ok(NodeRecord::new(
+        coordination_intent_node_id(&state.tenant_slug, &state.room_id, &state.actor_id),
+        ["HarnessCoordination", "CoordinationIntent"],
+        serde_json::to_value(state).map_err(|error| McpError::internal(error.to_string()))?,
+    ))
+}
+
+fn coordination_presence_node(state: &CoordinationPresenceState) -> Result<NodeRecord, McpError> {
+    Ok(NodeRecord::new(
+        coordination_presence_node_id(&state.tenant_slug, &state.actor_id),
+        ["HarnessCoordination", "CoordinationPresence"],
+        serde_json::to_value(state).map_err(|error| McpError::internal(error.to_string()))?,
+    ))
+}
+
+fn coordination_message_node(state: &CoordinationMessageState) -> Result<NodeRecord, McpError> {
+    Ok(NodeRecord::new(
+        coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
+        ["HarnessCoordination", "CoordinationMessage"],
+        serde_json::to_value(state).map_err(|error| McpError::internal(error.to_string()))?,
+    ))
+}
+
+fn coordination_member_edge(member: &CoordinationRoomMember) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_member_edge_id(&member.tenant_slug, &member.room_id, &member.actor_id),
+        coordination_member_node_id(&member.tenant_slug, &member.actor_id),
+        "COORDINATION_MEMBER_OF",
+        coordination_room_node_id(&member.tenant_slug, &member.room_id),
+        json!({
+            "tenant_slug": member.tenant_slug,
+            "room_id": member.room_id,
+            "actor_id": member.actor_id,
+            "status": member.status,
+            "updated_at": member.updated_at,
+        }),
+    )
+}
+
+fn coordination_intent_edge(state: &CoordinationIntentState) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_intent_edge_id(&state.tenant_slug, &state.room_id, &state.actor_id),
+        coordination_intent_node_id(&state.tenant_slug, &state.room_id, &state.actor_id),
+        "COORDINATION_INTENT_OF",
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "room_id": state.room_id,
+            "actor_id": state.actor_id,
+            "status": state.status,
+            "updated_at": state.updated_at,
+        }),
+    )
+}
+
+fn coordination_message_room_edge(state: &CoordinationMessageState) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_message_edge_id(&state.tenant_slug, &state.room_id, &state.message_id),
+        coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
+        "COORDINATION_MESSAGE_OF",
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "room_id": state.room_id,
+            "message_id": state.message_id,
+            "actor_id": state.actor_id,
+            "urgency": state.urgency,
+            "created_at": state.created_at,
+        }),
+    )
+}
+
+fn coordination_mention_edge(state: &CoordinationMessageState, actor_id: &str) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_mention_edge_id(
+            &state.tenant_slug,
+            &state.room_id,
+            &state.message_id,
+            actor_id,
+        ),
+        coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
+        "COORDINATION_MENTIONS",
+        coordination_member_node_id(&state.tenant_slug, actor_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "room_id": state.room_id,
+            "message_id": state.message_id,
+            "actor_id": actor_id,
+            "urgency": state.urgency,
+            "created_at": state.created_at,
+        }),
+    )
+}
+
+fn upsert_node_if_changed(
+    backend: &mut impl McpGraphBackend,
+    node: NodeRecord,
+) -> Result<(), McpError> {
+    let unchanged = backend
+        .get_node(&node.id)?
+        .map(|existing| {
+            !existing.tombstone
+                && existing.labels == node.labels
+                && existing.properties == node.properties
+        })
+        .unwrap_or(false);
+    if !unchanged {
+        backend.upsert_node(node)?;
+    }
+    Ok(())
+}
+
+fn upsert_edge_if_changed(
+    backend: &mut impl McpGraphBackend,
+    edge: EdgeRecord,
+) -> Result<(), McpError> {
+    let unchanged = backend
+        .get_edge(&edge.id)?
+        .map(|existing| {
+            !existing.tombstone
+                && existing.from_id == edge.from_id
+                && existing.to_id == edge.to_id
+                && existing.edge_type == edge.edge_type
+                && existing.properties == edge.properties
+        })
+        .unwrap_or(false);
+    if !unchanged {
+        backend.upsert_edge(edge)?;
+    }
+    Ok(())
+}
+
+fn empty_coordination_room(tenant: &str, room_id: &str, now: &str) -> CoordinationRoomState {
+    CoordinationRoomState {
+        tenant_slug: normalize_tenant_slug(tenant),
+        room_id: room_id.to_string(),
+        status: "active".to_string(),
+        mode: "collaborating".to_string(),
+        repo: String::new(),
+        branch: String::new(),
+        task: String::new(),
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        members: std::collections::BTreeMap::new(),
+        last_packet_at: String::new(),
+        last_packet_doc_id: String::new(),
+        degraded: false,
+        degraded_reason: String::new(),
+    }
+}
+
+fn resolved_coordination_room_id(arguments: &Value) -> String {
+    argument_text(arguments, &["room_id", "roomId"]).unwrap_or_else(|| {
+        infer_coordination_room_id(
+            &argument_text(arguments, &["repo"]).unwrap_or_default(),
+            &argument_text(arguments, &["branch"]).unwrap_or_default(),
+            &argument_text(arguments, &["task"]).unwrap_or_default(),
+            &argument_text(arguments, &["session_id", "sessionId"]).unwrap_or_default(),
+        )
+    })
+}
+
+fn normalize_coordination_status(status: &str) -> Result<String, McpError> {
+    let status = if status.trim().is_empty() {
+        "working".to_string()
+    } else {
+        status.trim().to_lowercase()
+    };
+    match status.as_str() {
+        "working" | "paused" | "done" => Ok(status),
+        _ => Err(McpError::invalid_params(
+            "coordination intent status must be working, paused, or done",
+        )),
+    }
+}
+
+fn normalize_tenant_slug(tenant: &str) -> String {
+    let tenant = tenant.trim().to_lowercase();
+    if tenant.is_empty() {
+        "default".to_string()
+    } else {
+        tenant
+    }
+}
+
+fn choose_text(value: &str, existing: Option<&str>) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        existing.unwrap_or("").trim().to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn choose_strings(value: &[String], existing: Option<&[String]>) -> Vec<String> {
+    let value = normalize_string_vec(value.to_vec());
+    if value.is_empty() {
+        existing
+            .map(|items| normalize_string_vec(items.to_vec()))
+            .unwrap_or_default()
+    } else {
+        value
+    }
+}
+
+fn normalize_string_vec(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || !seen.insert(value.to_string()) {
+            continue;
+        }
+        normalized.push(value.to_string());
+    }
+    normalized
+}
+
+fn merge_string_vecs(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    normalize_string_vec(left.into_iter().chain(right).collect())
+}
+
+fn timestamp_or_now(value: &str) -> String {
+    let value = value.trim();
+    if !value.is_empty() {
+        return value.to_string();
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("unix_ms:{millis}")
+}
+
+fn argument_text(arguments: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn argument_u64(arguments: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_u64))
+}
+
+fn argument_object(arguments: &Value, key: &str) -> Map<String, Value> {
+    arguments
+        .get(key)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn string_array_any(arguments: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| {
+            arguments.get(*key).map(|value| match value {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                Value::String(text) if !text.trim().is_empty() => {
+                    vec![text.trim().to_string()]
+                }
+                _ => Vec::new(),
+            })
+        })
+        .map(normalize_string_vec)
+        .unwrap_or_default()
+}
+
+fn required_text_any(
+    arguments: &Value,
+    keys: &[&str],
+    tool_name: &str,
+) -> Result<String, McpError> {
+    argument_text(arguments, keys).ok_or_else(|| {
+        McpError::invalid_params(format!("{tool_name} requires {}", keys.join(" or ")))
+    })
+}
+
+fn require_nonempty(value: &str, message: &str) -> Result<String, McpError> {
+    if value.trim().is_empty() {
+        Err(McpError::invalid_params(message))
+    } else {
+        Ok(value.trim().to_string())
+    }
+}
+
+fn parse_node_properties<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, McpError> {
+    serde_json::from_value(value)
+        .map_err(|error| McpError::internal(format!("coordination node decode failed: {error}")))
+}
+
 fn tenant_from_args(arguments: &Value, config: &McpServerConfig) -> String {
     arguments
         .get("tenant")
         .or_else(|| arguments.get("tenant_id"))
         .or_else(|| arguments.get("tenantId"))
+        .or_else(|| arguments.get("tenant_slug"))
+        .or_else(|| arguments.get("tenantSlug"))
         .and_then(Value::as_str)
         .filter(|tenant| !tenant.trim().is_empty())
         .map(str::to_string)
@@ -2742,6 +3793,47 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "required": ["current_uncertainty", "expected_uncertainty_after"]
             }),
         ),
+        tool(
+            "read_intents_for_room",
+            "Read native Theorem harness coordination intents for a room.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "statuses": { "type": "array", "items": { "type": "string" } }
+                }
+            }),
+        ),
+        tool(
+            "read_messages_for_room",
+            "Read native Theorem harness direct-coordination messages for a room.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "limit": { "type": "integer", "default": 50 }
+                }
+            }),
+        ),
+        tool(
+            "mentions",
+            "Read pending native Theorem harness mentions for an actor. consume=true requires write mode.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "consume": { "type": "boolean", "default": false },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }),
+        ),
     ];
     tools.push(tool(
         "rustyred_thg_fulltext_search",
@@ -2847,6 +3939,93 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         }),
     ));
     if !config.read_only {
+        tools.push(tool_write(
+            "coordination_room",
+            "Join or inspect a native Theorem harness coordination room backed by THG GraphStore.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "action": { "type": "string", "enum": ["status", "join", "start"], "default": "status" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "surface": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "task": { "type": "string" },
+                    "worktree": { "type": "string" },
+                    "head": { "type": "string" },
+                    "changed_files": { "type": "array", "items": { "type": "string" } },
+                    "lane": { "type": "string" }
+                }
+            }),
+        ));
+        tools.push(tool_write(
+            "presence",
+            "Read, refresh, or end native Theorem harness actor presence.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["get", "heartbeat", "end"], "default": "heartbeat" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "surface": { "type": "string" },
+                    "status": { "type": "string" },
+                    "worktree": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "head": { "type": "string" },
+                    "changed_files": { "type": "array", "items": { "type": "string" } },
+                    "ttl_seconds": { "type": "integer", "default": 60 }
+                }
+            }),
+        ));
+        tools.push(tool_write(
+            "coordination_intent",
+            "Write this actor's native Theorem harness room intent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["working", "paused", "done"], "default": "working" },
+                    "summary": { "type": "string" },
+                    "claimed_files": { "type": "array", "items": { "type": "string" } },
+                    "expected_completion": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "task": { "type": "string" }
+                },
+                "required": ["actor", "summary"]
+            }),
+        ));
+        tools.push(tool_write(
+            "coordinate",
+            "Write a native Theorem harness direct-coordination message and queue @actor mentions.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "urgency": { "type": "string", "enum": ["info", "ask", "block"], "default": "info" },
+                    "message": { "type": "string" },
+                    "mentions": { "type": "array", "items": { "type": "string" } },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["actor", "message"]
+            }),
+        ));
         tools.push(tool_write(
             "rustyred_thg_fulltext_designate",
             "Designate a node property for full-text search.",
@@ -3406,21 +4585,173 @@ impl McpGraphBackend for rustyred_thg_core::RedisGraphStore {
 
 #[cfg(test)]
 mod tests {
-    use rustyred_thg_core::{EdgeRecord, InMemoryGraphStore, NodeRecord};
-    use serde_json::json;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use rustyred_thg_core::{
+        EdgeRecord, EpistemicType, GraphSnapshot, GraphStats, GraphStoreResult,
+        HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+        VectorDesignation, VerifyReport,
+    };
+    use serde_json::{json, Value};
 
     use super::{
         handle_mcp_request, handle_mcp_request_with_context, McpError, McpGraphBackend,
         McpGraphProvider, McpRequestContext, McpServerConfig,
     };
 
-    struct FixtureProvider(InMemoryGraphStore);
+    struct FixtureProvider(Rc<RefCell<InMemoryGraphStore>>);
+
+    #[derive(Clone)]
+    struct SharedFixtureBackend(Rc<RefCell<InMemoryGraphStore>>);
 
     impl McpGraphProvider for FixtureProvider {
-        type Backend = InMemoryGraphStore;
+        type Backend = SharedFixtureBackend;
 
         fn backend_for_tenant(&self, _tenant: &str) -> Result<Self::Backend, McpError> {
-            Ok(self.0.clone())
+            Ok(SharedFixtureBackend(self.0.clone()))
+        }
+    }
+
+    impl McpGraphBackend for SharedFixtureBackend {
+        fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+            Ok(InMemoryGraphStore::get_node(&self.0.borrow(), id).cloned())
+        }
+
+        fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+            Ok(InMemoryGraphStore::get_edge(&self.0.borrow(), id).cloned())
+        }
+
+        fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+            Ok(InMemoryGraphStore::query_nodes(&self.0.borrow(), query))
+        }
+
+        fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+            Ok(InMemoryGraphStore::neighbors(&self.0.borrow(), query))
+        }
+
+        fn stats(&self) -> GraphStoreResult<GraphStats> {
+            Ok(InMemoryGraphStore::stats(&self.0.borrow()))
+        }
+
+        fn verify(&self) -> GraphStoreResult<VerifyReport> {
+            Ok(InMemoryGraphStore::verify(&self.0.borrow()))
+        }
+
+        fn labels(&self) -> GraphStoreResult<Vec<String>> {
+            Ok(InMemoryGraphStore::labels(&self.0.borrow()))
+        }
+
+        fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
+            Ok(InMemoryGraphStore::edge_types(&self.0.borrow()))
+        }
+
+        fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+            Ok(InMemoryGraphStore::property_keys(&self.0.borrow()))
+        }
+
+        fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+            Ok(self.0.borrow().snapshot().edges)
+        }
+
+        fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+            Ok(self.0.borrow().snapshot())
+        }
+
+        fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+            InMemoryGraphStore::upsert_node(&mut self.0.borrow_mut(), node).map(|_| ())
+        }
+
+        fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+            InMemoryGraphStore::upsert_edge(&mut self.0.borrow_mut(), edge).map(|_| ())
+        }
+
+        fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+            Ok(InMemoryGraphStore::vector_designations(&self.0.borrow()))
+        }
+
+        fn designate_vector_property(
+            &mut self,
+            label: &str,
+            property_name: &str,
+            dimension: usize,
+        ) -> GraphStoreResult<()> {
+            InMemoryGraphStore::designate_vector_property(
+                &mut self.0.borrow_mut(),
+                label,
+                property_name,
+                dimension,
+            )
+        }
+
+        fn vector_search(
+            &self,
+            label: Option<&str>,
+            property_name: &str,
+            query: &[f32],
+            k: usize,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            InMemoryGraphStore::vector_search(&self.0.borrow(), label, property_name, query, k)
+        }
+
+        fn hybrid_search(
+            &self,
+            label: Option<&str>,
+            property_name: &str,
+            query: &[f32],
+            k: usize,
+            graph_seeds: &[String],
+            max_hops: usize,
+            alpha: f32,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            InMemoryGraphStore::hybrid_search(
+                &self.0.borrow(),
+                label,
+                property_name,
+                query,
+                k,
+                graph_seeds,
+                max_hops,
+                alpha,
+            )
+        }
+
+        fn hybrid_search_with_config(
+            &self,
+            label: Option<&str>,
+            property_name: &str,
+            query: &[f32],
+            k: usize,
+            graph_seeds: &[String],
+            max_hops: usize,
+            config: &HybridScoringConfig,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            InMemoryGraphStore::hybrid_search_with_config(
+                &self.0.borrow(),
+                label,
+                property_name,
+                query,
+                k,
+                graph_seeds,
+                max_hops,
+                config,
+            )
+        }
+
+        fn epistemic_neighbors(
+            &self,
+            node_id: &str,
+            epistemic_types: Option<&[EpistemicType]>,
+            min_confidence: Option<f64>,
+            max_depth: Option<usize>,
+        ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+            Ok(InMemoryGraphStore::epistemic_neighbors(
+                &self.0.borrow(),
+                node_id,
+                epistemic_types,
+                min_confidence,
+                max_depth,
+            ))
         }
     }
 
@@ -3466,12 +4797,41 @@ mod tests {
             ))
             .unwrap();
         (
-            FixtureProvider(store),
+            FixtureProvider(Rc::new(RefCell::new(store))),
             McpServerConfig {
                 default_tenant: "smoke".to_string(),
                 ..McpServerConfig::default()
             },
         )
+    }
+
+    fn call_tool_json(
+        provider: &FixtureProvider,
+        config: &McpServerConfig,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let response = handle_mcp_request(
+            provider,
+            config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": name,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }),
+        );
+        if let Some(error) = response.get("error") {
+            panic!("tool call failed for {name}: {error}");
+        }
+        response["result"]["structuredContent"].clone()
+    }
+
+    fn has_tool(tools: &[Value], name: &str) -> bool {
+        tools.iter().any(|tool| tool["name"] == name)
     }
 
     #[test]
@@ -3513,6 +4873,9 @@ mod tests {
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_graph_version_merge"));
         assert!(tools.iter().any(|tool| tool["name"] == "harness_kg_status"));
+        assert!(has_tool(tools, "read_intents_for_room"));
+        assert!(has_tool(tools, "read_messages_for_room"));
+        assert!(has_tool(tools, "mentions"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_symbolic_datalog_derive"));
@@ -3528,6 +4891,183 @@ mod tests {
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_bulk_nodes"));
+        assert!(!has_tool(tools, "coordination_room"));
+        assert!(!has_tool(tools, "presence"));
+        assert!(!has_tool(tools, "coordination_intent"));
+        assert!(!has_tool(tools, "coordinate"));
+    }
+
+    #[test]
+    fn tools_list_exposes_native_coordination_write_tools_when_enabled() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(has_tool(tools, "coordination_room"));
+        assert!(has_tool(tools, "presence"));
+        assert!(has_tool(tools, "coordination_intent"));
+        assert!(has_tool(tools, "coordinate"));
+        assert!(has_tool(tools, "mentions"));
+    }
+
+    #[test]
+    fn native_coordination_tools_round_trip_through_mcp() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let room = call_tool_json(
+            &provider,
+            &config,
+            "coordination_room",
+            json!({
+                "tenant": "smoke",
+                "action": "join",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "repo": "Theorem",
+                "branch": "main",
+                "task": "wire native MCP",
+                "updated_at": "2026-06-01T00:00:00Z"
+            }),
+        );
+        assert_eq!(room["room"]["room_id"], "harness-rust-port");
+        assert_eq!(room["room"]["members"]["codex"]["status"], "joined");
+
+        let presence = call_tool_json(
+            &provider,
+            &config,
+            "presence",
+            json!({
+                "tenant": "smoke",
+                "mode": "heartbeat",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "status": "active",
+                "refreshed_at": "2026-06-01T00:01:00Z",
+                "ttl_seconds": 120
+            }),
+        );
+        assert_eq!(presence["presence"]["actor_id"], "codex");
+        assert_eq!(presence["presence"]["status"], "active");
+
+        let presence_read = call_tool_json(
+            &provider,
+            &config,
+            "presence",
+            json!({
+                "tenant": "smoke",
+                "mode": "get",
+                "actor": "codex"
+            }),
+        );
+        assert_eq!(presence_read["presence"]["actor_id"], "codex");
+
+        let intent = call_tool_json(
+            &provider,
+            &config,
+            "coordination_intent",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "summary": "Wire native coordination into MCP",
+                "claimed_files": ["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"],
+                "updated_at": "2026-06-01T00:02:00Z"
+            }),
+        );
+        assert_eq!(intent["intent"]["actor_id"], "codex");
+        assert_eq!(intent["intent"]["status"], "working");
+
+        let receipt = call_tool_json(
+            &provider,
+            &config,
+            "coordinate",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "urgency": "ask",
+                "message": "@claude-code please test native MCP",
+                "metadata": { "commit": "pending" },
+                "created_at": "2026-06-01T00:03:00Z"
+            }),
+        );
+        assert_eq!(receipt["ok"], true);
+        assert_eq!(receipt["mentions"], json!(["claude-code"]));
+        assert_eq!(receipt["unread_count"], 1);
+        assert_eq!(receipt["urgency"], "ask");
+
+        let mentions = call_tool_json(
+            &provider,
+            &config,
+            "mentions",
+            json!({
+                "tenant": "smoke",
+                "actor": "claude-code",
+                "consume": false
+            }),
+        );
+        assert_eq!(mentions["count"], 1);
+        assert_eq!(mentions["mentions"][0]["actor_id"], "codex");
+
+        let consumed = call_tool_json(
+            &provider,
+            &config,
+            "mentions",
+            json!({
+                "tenant": "smoke",
+                "actor": "claude-code",
+                "consume": true
+            }),
+        );
+        assert_eq!(consumed["count"], 1);
+
+        let empty_after_consume = call_tool_json(
+            &provider,
+            &config,
+            "mentions",
+            json!({
+                "tenant": "smoke",
+                "actor": "claude-code",
+                "consume": false
+            }),
+        );
+        assert_eq!(empty_after_consume["count"], 0);
+
+        let intents = call_tool_json(
+            &provider,
+            &config,
+            "read_intents_for_room",
+            json!({
+                "tenant": "smoke",
+                "room_id": "harness-rust-port"
+            }),
+        );
+        assert_eq!(intents["count"], 1);
+        assert_eq!(
+            intents["intents"][0]["summary"],
+            "Wire native coordination into MCP"
+        );
+
+        let messages = call_tool_json(
+            &provider,
+            &config,
+            "read_messages_for_room",
+            json!({
+                "tenant": "smoke",
+                "room_id": "harness-rust-port"
+            }),
+        );
+        assert_eq!(messages["count"], 1);
+        assert_eq!(
+            messages["messages"][0]["message"],
+            "@claude-code please test native MCP"
+        );
     }
 
     #[test]
@@ -3721,7 +5261,11 @@ mod tests {
     #[test]
     fn version_tools_support_refs_checkout_and_merge() {
         let (provider, config) = fixture();
-        let base = provider.0.graph_snapshot().expect("fixture snapshot");
+        let base = provider
+            .0
+            .borrow()
+            .graph_snapshot()
+            .expect("fixture snapshot");
         let ref_update = handle_mcp_request(
             &provider,
             &config,

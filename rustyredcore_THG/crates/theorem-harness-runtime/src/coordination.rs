@@ -725,6 +725,15 @@ pub fn coordination_intent_node_id(tenant_slug: &str, room_id: &str, actor_id: &
     )
 }
 
+pub fn coordination_intent_edge_id(tenant_slug: &str, room_id: &str, actor_id: &str) -> String {
+    format!(
+        "harness:coordination:edge:intent:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(actor_id).if_empty("unknown")
+    )
+}
+
 pub fn coordination_presence_node_id(tenant_slug: &str, actor_id: &str) -> String {
     format!(
         "harness:coordination:presence:{}:{}",
@@ -736,6 +745,15 @@ pub fn coordination_presence_node_id(tenant_slug: &str, actor_id: &str) -> Strin
 pub fn coordination_message_node_id(tenant_slug: &str, room_id: &str, message_id: &str) -> String {
     format!(
         "harness:coordination:message:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(message_id).if_empty("unknown")
+    )
+}
+
+pub fn coordination_message_edge_id(tenant_slug: &str, room_id: &str, message_id: &str) -> String {
+    format!(
+        "harness:coordination:edge:message:{}:{}:{}",
         normalize_tenant_slug(tenant_slug),
         slugify_room_part(room_id).if_empty("ungrouped"),
         slugify_room_part(message_id).if_empty("unknown")
@@ -898,12 +916,7 @@ fn intent_node(state: &CoordinationIntentState) -> CoordinationResult<NodeRecord
 
 fn intent_room_edge(state: &CoordinationIntentState) -> CoordinationResult<EdgeRecord> {
     Ok(EdgeRecord::new(
-        format!(
-            "harness:coordination:edge:intent:{}:{}:{}",
-            normalize_tenant_slug(&state.tenant_slug),
-            slugify_room_part(&state.room_id).if_empty("ungrouped"),
-            slugify_room_part(&state.actor_id).if_empty("unknown")
-        ),
+        coordination_intent_edge_id(&state.tenant_slug, &state.room_id, &state.actor_id),
         coordination_intent_node_id(&state.tenant_slug, &state.room_id, &state.actor_id),
         "COORDINATION_INTENT_OF",
         coordination_room_node_id(&state.tenant_slug, &state.room_id),
@@ -939,12 +952,7 @@ fn message_node(state: &CoordinationMessageState) -> CoordinationResult<NodeReco
 
 fn message_room_edge(state: &CoordinationMessageState) -> CoordinationResult<EdgeRecord> {
     Ok(EdgeRecord::new(
-        format!(
-            "harness:coordination:edge:message:{}:{}:{}",
-            normalize_tenant_slug(&state.tenant_slug),
-            slugify_room_part(&state.room_id).if_empty("ungrouped"),
-            slugify_room_part(&state.message_id).if_empty("unknown")
-        ),
+        coordination_message_edge_id(&state.tenant_slug, &state.room_id, &state.message_id),
         coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
         "COORDINATION_MESSAGE_OF",
         coordination_room_node_id(&state.tenant_slug, &state.room_id),
@@ -1033,6 +1041,10 @@ fn normalize_urgency(urgency: &str) -> CoordinationResult<String> {
             message: format!("must be one of {:?}", MESSAGE_URGENCIES),
         })
     }
+}
+
+pub fn normalize_coordination_urgency(urgency: &str) -> CoordinationResult<String> {
+    normalize_urgency(urgency)
 }
 
 fn resolve_room_id(
@@ -1170,6 +1182,10 @@ fn parse_mentions(message: &str) -> Vec<String> {
     mentions
 }
 
+pub fn parse_coordination_mentions(message: &str) -> Vec<String> {
+    parse_mentions(message)
+}
+
 fn stable_message_id(
     tenant_slug: &str,
     room_id: &str,
@@ -1185,6 +1201,16 @@ fn stable_message_id(
         "created_at": created_at,
     }));
     format!("msg_{}", &hash[..16])
+}
+
+pub fn stable_coordination_message_id(
+    tenant_slug: &str,
+    room_id: &str,
+    actor_id: &str,
+    message: &str,
+    created_at: &str,
+) -> String {
+    stable_message_id(tenant_slug, room_id, actor_id, message, created_at)
 }
 
 fn slugify_room_part(value: &str) -> String {
