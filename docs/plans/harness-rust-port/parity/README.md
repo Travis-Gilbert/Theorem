@@ -1,4 +1,4 @@
-# Harness parity corpus (Claude-Code lane)
+# Harness parity corpus
 
 Authoritative reference fixtures for the `theorem-harness-core` Rust port. The
 Python reference state machine (`Index-API/apps/orchestrate/runtime/`) is the
@@ -7,14 +7,14 @@ Phase 1 when it reproduces every `state_hash_after` and every guard code here.
 
 ## Files
 
-- `generate_fixtures.py` — drives the live Python `apply_transition` through 11
+- `generate_fixtures.py` - drives the live Python `apply_transition` through 25
   scenarios and records real output. Re-runnable; reads Index-API directly.
-- `fixtures.json` — the generated corpus (do not hand-edit; re-run the script).
+- `fixtures.json` - the generated corpus (do not hand-edit; re-run the script).
 
 ## Regenerate
 
 ```bash
-python3 generate_fixtures.py --check   # --check asserts two runs are byte-identical
+python3 docs/plans/harness-rust-port/parity/generate_fixtures.py --check
 ```
 
 `--check` guards determinism: if a `now()` or random value ever leaks into a
@@ -51,37 +51,24 @@ recorded `guard_code`; the scenario ends there.
 
 ## How the Rust parity test consumes this
 
-Suggested shape (Codex owns the crate, so the exact wiring is Codex's call):
+`rustyredcore_THG/crates/theorem-harness-core/tests/parity.rs` loads
+`fixtures.json` directly from this docs directory with `include_str!`. For each
+scenario it threads an `Option<RunState>` through `apply_transition`, then
+compares `state_hash_before`, `state_hash_after`, status, event sequence, and
+guard code against the Python-recorded output.
 
-```rust
-// tests/parity.rs in theorem-harness-core
-// load fixtures.json (copy into tests/fixtures/ or read via a path const)
-for scenario in corpus.scenarios {
-    let mut state: Option<RunState> = None;
-    for step in scenario.steps {
-        let input = TransitionInput::from(step.input);
-        match apply_transition(state.as_ref(), &input) {
-            Ok(result) => {
-                assert_eq!(step.expect, "ok");
-                assert_eq!(result.state_hash_after, step.state_hash_after);
-                assert_eq!(result.run.status, step.status);
-                state = Some(result.run);
-            }
-            Err(HarnessError::Guard(v)) => {
-                assert_eq!(step.expect, "guard");
-                assert_eq!(v.code, step.guard_code);
-                break;
-            }
-        }
-    }
-}
-```
-
-## Coverage (11 scenarios, 114 steps)
+## Coverage (25 scenarios, 260 steps)
 
 Legal: `full_lifecycle_to_closed` (created -> ... -> closed),
 `memory_patch_branch` (learning_proposed -> memory_patched -> maps_updated ->
-closed).
+closed), `cache_hit_validated`, `cache_miss`, `oracle_status_preserving`,
+`cua_status_preserving`, `cmh_handoff_branch`,
+`cmh_canonicalization_to_close`, `run_forked_from_closed`, and
+`run_replayed_from_closed`,
+`domain_toolpack_context_compiled_validation`,
+`cache_rejected_reuse_store_invalidate`,
+`cua_device_session_terminal_observations`, `run_failed_then_forked`,
+`run_cancelled_rejects_followup`, and `cmh_session_event_self_loop`.
 
 Guards (code captured from the Python reference, not hand-asserted):
 `invalid_context_budget`, `context_budget_exceeded`,
@@ -89,13 +76,6 @@ Guards (code captured from the Python reference, not hand-asserted):
 `terminal_run_state`, `missing_payload_fields`, `federation_consent_required`,
 `federation_raw_content_blocked`.
 
-Guard-parity review (2026-06-01): all 11 codes are present in the Rust
-`state_machine.rs`. The remaining acceptance step is wiring the replay test so
-the hashes are compared byte-for-byte, not just the codes.
-
-## Not yet covered (next corpus passes)
-
-cache events (CACHE.CHECKED/HIT/...), oracle events (ORACLE.REQUESTED/...), CUA
-device events, the CMH chain (MEMORY.SYNCED/HANDOFF.*), replay/fork
-(RUN.REPLAYED/RUN.FORKED). These are status-preserving or parallel-graph
-transitions; add them once the linear-lifecycle gate is green in Rust.
+Guard-parity review (2026-06-01): the codes above are present in Rust
+`state_machine.rs`, and the parity test compares both hashes and guard codes
+byte-for-byte.

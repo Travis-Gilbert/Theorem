@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate harness parity fixtures from the canonical Python state machine.
 
-This is the Claude-Code lane of the harness Rust port (see ../CLAIMS.md): the
-authoritative reference corpus that `theorem-harness-core`'s Rust parity test
-validates against. It drives the LIVE Theseus executor
+This is the authoritative reference corpus for the harness Rust port (see
+../CLAIMS.md): the shared acceptance artifact that `theorem-harness-core`'s
+Rust parity test validates against. It drives the LIVE Theseus executor
 (`Index-API/apps/orchestrate/runtime/state_machine.py`) through legal and
 illegal transition sequences and records, per step, the real `state_hash_after`,
 the resulting status, and (for illegal steps) the guard code Python actually
@@ -141,8 +141,11 @@ def _legal_prefix(through: str) -> list:
         ("RUN.CLOSED", {"summary": "harness kernel ported", "closed_by": "claude-code"}),
     ]
     checkpoints = {
+        "created": 1,
+        "resolved": 3,
         "maps_loaded": 6, "context_planned": 7, "context_packed": 8,
-        "context_injected": 9, "learning_proposed": 12, "review_queued": 13,
+        "context_injected": 9, "agent_acting": 10, "outcome_recorded": 11,
+        "learning_proposed": 12, "review_queued": 13,
         "closed": 16,
     }
     return steps[: checkpoints[through]]
@@ -285,6 +288,272 @@ def _scenarios() -> list:
     scenarios.append({
         "name": "federation_raw_content_blocked",
         "description": "Federation signals cannot include raw content.",
+        "steps": s,
+    })
+
+    # 12. Cache hit validated chain off TASK.RESOLVED.
+    s = [ok(et, p) for et, p in _legal_prefix("resolved")]
+    s += [
+        ok("CACHE.CHECKED", {"backend": "rustyred", "outcome": "candidate"}),
+        ok("CACHE.HIT", {"cache_entry_id": "cache-1", "backend": "rustyred"}),
+        ok("CACHE.HIT_VALIDATED", {
+            "cache_entry_id": "cache-1",
+            "graph_state_hash": "graph-hash-1",
+        }),
+    ]
+    scenarios.append({
+        "name": "cache_hit_validated",
+        "description": "Cache side-events advance through checked -> hit -> hit_validated.",
+        "steps": s,
+    })
+
+    # 13. Cache miss chain off TASK.RESOLVED.
+    s = [ok(et, p) for et, p in _legal_prefix("resolved")]
+    s += [
+        ok("CACHE.CHECKED", {"backend": "rustyred", "outcome": "candidate"}),
+        ok("CACHE.MISS", {"backend": "rustyred", "outcome": "miss"}),
+    ]
+    scenarios.append({
+        "name": "cache_miss",
+        "description": "Cache side-events advance through checked -> miss.",
+        "steps": s,
+    })
+
+    # 14. Oracle observation events are status-preserving.
+    s = [ok(et, p) for et, p in _legal_prefix("agent_acting")]
+    s += [
+        ok("ORACLE.REQUESTED", {"tool_name": "deepseek_reason", "request_id": "oracle-1"}),
+        ok("ORACLE.RETURNED", {
+            "tool_name": "deepseek_reason",
+            "request_id": "oracle-1",
+            "oracle_packet": {"status": "ok"},
+        }),
+        ok("STATE.PATCHED", {
+            "request_id": "oracle-1",
+            "applied_patch_ids": ["patch-a"],
+            "rejected_patch_ids": [],
+        }),
+        ok("ADAPTER.SELECTED", {
+            "adapter_id": "deepseek-mcp",
+            "role": "reasoning",
+        }),
+    ]
+    scenarios.append({
+        "name": "oracle_status_preserving",
+        "description": "Oracle events are recorded without advancing the run lifecycle status.",
+        "steps": s,
+    })
+
+    # 15. CUA / device timeline observation events are status-preserving.
+    s = [ok(et, p) for et, p in _legal_prefix("agent_acting")]
+    s += [
+        ok("DEVICE.SESSION.STARTED", {"device_session_id": "dev-1", "provider": "cua"}),
+        ok("CUA.SANDBOX.OPENED", {"device_session_id": "dev-1", "sandbox_id": "sbx-1"}),
+        ok("CUA.ACTION.OBSERVED", {
+            "sandbox_id": "sbx-1",
+            "action_id": "act-1",
+            "kind": "click",
+            "seq": 1,
+        }),
+        ok("CUA.OBSERVATION.RECORDED", {
+            "sandbox_id": "sbx-1",
+            "observation_id": "obs-1",
+            "kind": "screenshot",
+            "seq": 2,
+        }),
+        ok("CUA.SANDBOX.CLOSED", {"sandbox_id": "sbx-1"}),
+        ok("CUA.TRAJECTORY.EXPORTED", {
+            "sandbox_id": "sbx-1",
+            "trajectory_id": "traj-1",
+            "action_count": 1,
+            "observation_count": 1,
+        }),
+    ]
+    scenarios.append({
+        "name": "cua_status_preserving",
+        "description": "CUA device timeline events are recorded without advancing lifecycle status.",
+        "steps": s,
+    })
+
+    # 16. CMH handoff branch starts from created state.
+    s = [ok(et, p) for et, p in _legal_prefix("created")]
+    s += [
+        ok("MEMORY.SYNCED", {"workstream_id": "ws-harness"}),
+        ok("HANDOFF.COMPILED", {"handoff_id": "handoff-1", "token_estimate": 512}),
+        ok("HANDOFF.INJECTED", {"delivered_to": "codex", "delivered_at": TS}),
+    ]
+    scenarios.append({
+        "name": "cmh_handoff_branch",
+        "description": "Continuous Agent Memory handoff transitions advance their own branch.",
+        "steps": s,
+    })
+
+    # 17. CMH canonicalization branch can close after an outcome exists.
+    s = [ok(et, p) for et, p in _legal_prefix("outcome_recorded")]
+    s += [
+        ok("MEMORY.CANONICALIZED", {
+            "atoms_created": 2,
+            "atoms_updated": 1,
+            "atoms_superseded": 0,
+        }),
+        ok("WORKSTREAM.UPDATED", {
+            "workstream_id": "ws-harness",
+            "new_task_state": "validating",
+        }),
+        ok("NEXT_AGENT.READY", {"next_handoff_id": "handoff-next"}),
+        ok("RUN.CLOSED", {"summary": "closed after cmh", "closed_by": "claude-code"}),
+    ]
+    scenarios.append({
+        "name": "cmh_canonicalization_to_close",
+        "description": "CMH memory canonicalization can lead to NEXT_AGENT.READY and close.",
+        "steps": s,
+    })
+
+    # 18. RUN.FORKED is allowed from closed and resets the state to created.
+    s = [ok(et, p) for et, p in _legal_prefix("closed")]
+    s.append(ok("RUN.FORKED", {
+        "source_run_id": RUN_ID,
+        "through_event_seq": 9,
+    }))
+    scenarios.append({
+        "name": "run_forked_from_closed",
+        "description": "RUN.FORKED is permitted from closed and resets mutable run state.",
+        "steps": s,
+    })
+
+    # 19. RUN.REPLAYED is allowed from closed and resets the state to created.
+    s = [ok(et, p) for et, p in _legal_prefix("closed")]
+    s.append(ok("RUN.REPLAYED", {"source_run_id": RUN_ID}))
+    scenarios.append({
+        "name": "run_replayed_from_closed",
+        "description": "RUN.REPLAYED is permitted from closed and resets mutable run state.",
+        "steps": s,
+    })
+
+    # 20. Domain/toolpack/context-compiled/validation alternate legal path.
+    s = [ok(et, p) for et, p in _legal_prefix("resolved")]
+    s += [
+        ok("DOMAIN.RESOLVED", {
+            "domain": "harness-port",
+            "domain_version": "1",
+            "policy_hash": "domain-policy-1",
+        }),
+        ok("TOOLPACK.COMPILED", {
+            "selected_tools": ["read", "edit"],
+            "selected_plugins": ["theorems-harness"],
+            "excluded_tools": [],
+            "permission_reasons": {},
+        }),
+        ok("MAPS.LOADED", {"maps": [{"id": "domain", "version": "1"}]}),
+        ok("CONTEXT.PLANNED", {
+            "budget_tokens": 1200,
+            "plan_hash": "plan-domain",
+            "candidate_token_count": 700,
+        }),
+        ok("CONTEXT.COMPILED", {
+            "artifact_id": "art-domain",
+            "capsule_tokens": 400,
+            "budget_tokens": 1200,
+            "included_atom_count": 7,
+            "excluded_atom_count": 3,
+            "token_ledger": {"saved": 300},
+        }),
+        ok("CONTEXT.INJECTED", {
+            "artifact_id": "art-domain",
+            "adapter": "stdio",
+            "target": "codex",
+        }),
+        ok("AGENT.ACTING", {"adapter": "stdio", "started_at": TS}),
+        ok("VALIDATION.STARTED", {"validator_id": "cargo-test", "command": "cargo test"}),
+        ok("VALIDATION.RUNNING", {"validator_id": "cargo-test", "command": "cargo test"}),
+        ok("VALIDATION.FINISHED", {
+            "validator_id": "cargo-test",
+            "status": "passed",
+            "exit_code": 0,
+            "summary": "ok",
+        }),
+        ok("OUTCOME.RECORDED", {
+            "accepted": True,
+            "tests_passed": True,
+            "validator_results": [{"id": "cargo-test", "status": "passed"}],
+            "files_changed": ["state_machine.rs"],
+            "summary": "alternate path ported",
+        }),
+        ok("RUN.CLOSED", {"summary": "closed alternate path", "closed_by": "claude-code"}),
+    ]
+    scenarios.append({
+        "name": "domain_toolpack_context_compiled_validation",
+        "description": "Alternate profile/toolpack/context-compiled path with validation events.",
+        "steps": s,
+    })
+
+    # 21. Remaining cache events: rejected, stage reused, entry stored, invalidated.
+    s = [ok(et, p) for et, p in _legal_prefix("resolved")]
+    s += [
+        ok("CACHE.CHECKED", {"backend": "rustyred", "outcome": "candidate"}),
+        ok("CACHE.HIT", {"cache_entry_id": "cache-2", "backend": "rustyred"}),
+        ok("CACHE.HIT_REJECTED", {
+            "cache_entry_id": "cache-2",
+            "rejection_reason": "stale_graph_state",
+        }),
+        ok("CACHE.STAGE_REUSED", {"stage": "context", "cache_entry_id": "cache-3"}),
+        ok("CACHE.ENTRY_STORED", {"cache_entry_id": "cache-4", "backend": "rustyred"}),
+        ok("CACHE.INVALIDATED", {"cache_entry_id": "cache-4", "reason": "new_evidence"}),
+    ]
+    scenarios.append({
+        "name": "cache_rejected_reuse_store_invalidate",
+        "description": "Covers cache rejection and ungated cache bookkeeping events.",
+        "steps": s,
+    })
+
+    # 22. Remaining CUA device-session events.
+    s = [ok(et, p) for et, p in _legal_prefix("agent_acting")]
+    s += [
+        ok("DEVICE.SESSION.STARTED", {"device_session_id": "dev-2", "provider": "cua"}),
+        ok("DEVICE.SESSION.CLOSED", {"device_session_id": "dev-2"}),
+        ok("DEVICE.SESSION.ERRORED", {
+            "device_session_id": "dev-2",
+            "error_code": "sandbox_exit",
+        }),
+    ]
+    scenarios.append({
+        "name": "cua_device_session_terminal_observations",
+        "description": "Device session close/error events remain status-preserving.",
+        "steps": s,
+    })
+
+    # 23. RUN.FAILED is terminal, and RUN.FORKED may recover from failed.
+    s = [ok(et, p) for et, p in _legal_prefix("created")]
+    s += [
+        ok("RUN.FAILED", {"error_code": "validation_failed", "message": "tests failed"}),
+        ok("RUN.FORKED", {"source_run_id": RUN_ID, "through_event_seq": 1}),
+    ]
+    scenarios.append({
+        "name": "run_failed_then_forked",
+        "description": "RUN.FAILED creates failure outcome; RUN.FORKED resets from failed.",
+        "steps": s,
+    })
+
+    # 24. RUN.CANCELLED is terminal and rejects further transitions.
+    s = [ok(et, p) for et, p in _legal_prefix("created")]
+    s += [
+        ok("RUN.CANCELLED", {"reason": "user_requested", "cancelled_by": "travis"}),
+        guard("HOST.OBSERVED", {
+            "repo": "Theorem", "branch": "main", "commit_sha": "x", "cwd": "/r",
+        }),
+    ]
+    scenarios.append({
+        "name": "run_cancelled_rejects_followup",
+        "description": "RUN.CANCELLED creates cancellation outcome and becomes terminal.",
+        "steps": s,
+    })
+
+    # 25. SESSION.EVENT_RECORDED is a CMH self-loop from agent_acting.
+    s = [ok(et, p) for et, p in _legal_prefix("agent_acting")]
+    s.append(ok("SESSION.EVENT_RECORDED", {"event_subtype": "handoff_note"}))
+    scenarios.append({
+        "name": "cmh_session_event_self_loop",
+        "description": "SESSION.EVENT_RECORDED records CMH activity without leaving agent_acting.",
         "steps": s,
     })
 
