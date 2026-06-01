@@ -1,0 +1,2050 @@
+{
+  "meta": {
+    "consumer": "theorem-harness-core context pack port (spec step 4)",
+    "note": "Generated; do not hand-edit. Re-run generate_context_fixtures.py.",
+    "purpose": "Context-compiler pack-core parity: Python reference -> Rust port.",
+    "reference_source": "Index-API/apps/orchestrate/context_web/{contracts,policy}.py"
+  },
+  "pack_scenarios": [
+    {
+      "description": "Three atoms, all fit; ranked by (-score, id).",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 100,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 100,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "c",
+            "kind": "file",
+            "labels": [],
+            "score": 0.7,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 100,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "b",
+            "kind": "file",
+            "labels": [],
+            "score": 0.5,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 1.0,
+          "context_web_tokens": 300,
+          "graph_overhead": 0,
+          "naive_tokens": 300,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {
+            "a": "ranked_within_budget",
+            "b": "ranked_within_budget",
+            "c": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 3,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 300,
+          "raw_candidate_tokens": 300,
+          "saved_tokens": 0,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.3333333333333333,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 100,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 100,
+            "id": "b",
+            "labels": [],
+            "score": 0.5
+          },
+          {
+            "estimated_tokens": 100,
+            "id": "c",
+            "labels": [],
+            "score": 0.7
+          }
+        ]
+      },
+      "name": "basic_all_fit"
+    },
+    {
+      "description": "Mid-rank atom skipped on token budget; later smaller atom fits.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 200,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "c",
+            "kind": "file",
+            "labels": [],
+            "score": 0.7,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 250,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 1.8,
+          "context_web_tokens": 250,
+          "graph_overhead": 0,
+          "naive_tokens": 450,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {
+            "b": "token_budget_exhausted"
+          },
+          "why_included": {
+            "a": "ranked_within_budget",
+            "c": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 2,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 250,
+          "raw_candidate_tokens": 450,
+          "saved_tokens": 200,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.5,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 200,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 200,
+            "id": "b",
+            "labels": [],
+            "score": 0.8
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "c",
+            "labels": [],
+            "score": 0.7
+          }
+        ],
+        "budget": {
+          "max_tokens": 250
+        }
+      },
+      "name": "token_budget_exhausted"
+    },
+    {
+      "description": "max_atoms=2 drops the tail.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 10,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 10,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "b",
+            "kind": "file",
+            "labels": [],
+            "score": 0.8,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 2,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 2.0,
+          "context_web_tokens": 20,
+          "graph_overhead": 0,
+          "naive_tokens": 40,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {
+            "c": "atom_budget_exhausted",
+            "d": "atom_budget_exhausted"
+          },
+          "why_included": {
+            "a": "ranked_within_budget",
+            "b": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 2,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 20,
+          "raw_candidate_tokens": 40,
+          "saved_tokens": 20,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.5,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 10,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 10,
+            "id": "b",
+            "labels": [],
+            "score": 0.8
+          },
+          {
+            "estimated_tokens": 10,
+            "id": "c",
+            "labels": [],
+            "score": 0.7
+          },
+          {
+            "estimated_tokens": 10,
+            "id": "d",
+            "labels": [],
+            "score": 0.6
+          }
+        ],
+        "budget": {
+          "max_atoms": 2
+        }
+      },
+      "name": "atom_budget_exhausted"
+    },
+    {
+      "description": "A high-score generated artifact is quarantined.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 2.0,
+          "context_web_tokens": 50,
+          "graph_overhead": 0,
+          "naive_tokens": 100,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": true,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {
+            "file:dist/bundle.js": "generated_artifact_quarantined"
+          },
+          "why_included": {
+            "a": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 1,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 50,
+          "raw_candidate_tokens": 100,
+          "saved_tokens": 50,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 1.0,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 50,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "file:dist/bundle.js",
+            "labels": [],
+            "score": 0.95
+          }
+        ]
+      },
+      "name": "generated_artifact_quarantined"
+    },
+    {
+      "description": "allow_generated_artifacts lets the artifact in.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "file:dist/bundle.js",
+            "kind": "file",
+            "labels": [],
+            "score": 0.95,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 1.0,
+          "context_web_tokens": 100,
+          "graph_overhead": 0,
+          "naive_tokens": 100,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {
+            "a": "ranked_within_budget",
+            "file:dist/bundle.js": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 2,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 100,
+          "raw_candidate_tokens": 100,
+          "saved_tokens": 0,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.5,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 50,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "file:dist/bundle.js",
+            "labels": [],
+            "score": 0.95
+          }
+        ],
+        "policy": {
+          "allow_generated_artifacts": true
+        }
+      },
+      "name": "policy_allows_generated"
+    },
+    {
+      "description": "An explicit target overrides quarantine.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "file:dist/bundle.js",
+            "kind": "file",
+            "labels": [],
+            "score": 0.95,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 1.0,
+          "context_web_tokens": 100,
+          "graph_overhead": 0,
+          "naive_tokens": 100,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {
+            "a": "ranked_within_budget",
+            "file:dist/bundle.js": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 2,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 100,
+          "raw_candidate_tokens": 100,
+          "saved_tokens": 0,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.5,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 50,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "file:dist/bundle.js",
+            "labels": [],
+            "score": 0.95
+          }
+        ],
+        "policy": {
+          "explicit_targets": [
+            "file:dist/bundle.js"
+          ]
+        }
+      },
+      "name": "policy_explicit_target_allows"
+    },
+    {
+      "description": "mini mode caps max_atoms to 6.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 40,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 40,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "b",
+            "kind": "file",
+            "labels": [],
+            "score": 0.89,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 40,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "c",
+            "kind": "file",
+            "labels": [],
+            "score": 0.88,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 40,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "d",
+            "kind": "file",
+            "labels": [],
+            "score": 0.87,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 40,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "e",
+            "kind": "file",
+            "labels": [],
+            "score": 0.86,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 40,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "f",
+            "kind": "file",
+            "labels": [],
+            "score": 0.85,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 6,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 300,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 1.333,
+          "context_web_tokens": 240,
+          "graph_overhead": 0,
+          "naive_tokens": 320,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "mini",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {
+            "g": "atom_budget_exhausted",
+            "h": "atom_budget_exhausted"
+          },
+          "why_included": {
+            "a": "ranked_within_budget",
+            "b": "ranked_within_budget",
+            "c": "ranked_within_budget",
+            "d": "ranked_within_budget",
+            "e": "ranked_within_budget",
+            "f": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 6,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 240,
+          "raw_candidate_tokens": 320,
+          "saved_tokens": 80,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.16666666666666666,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 40,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 40,
+            "id": "b",
+            "labels": [],
+            "score": 0.89
+          },
+          {
+            "estimated_tokens": 40,
+            "id": "c",
+            "labels": [],
+            "score": 0.88
+          },
+          {
+            "estimated_tokens": 40,
+            "id": "d",
+            "labels": [],
+            "score": 0.87
+          },
+          {
+            "estimated_tokens": 40,
+            "id": "e",
+            "labels": [],
+            "score": 0.86
+          },
+          {
+            "estimated_tokens": 40,
+            "id": "f",
+            "labels": [],
+            "score": 0.85
+          },
+          {
+            "estimated_tokens": 40,
+            "id": "g",
+            "labels": [],
+            "score": 0.8400000000000001
+          },
+          {
+            "estimated_tokens": 40,
+            "id": "h",
+            "labels": [],
+            "score": 0.8300000000000001
+          }
+        ],
+        "mode": "mini"
+      },
+      "name": "mini_mode_caps_atoms"
+    },
+    {
+      "description": "Edges with an unselected endpoint are dropped.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "b",
+            "kind": "file",
+            "labels": [],
+            "score": 0.8,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "c",
+            "kind": "file",
+            "labels": [],
+            "score": 0.7,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [
+          {
+            "from_id": "a",
+            "reason": "",
+            "relation": "calls",
+            "score": 0.0,
+            "to_id": "b"
+          }
+        ],
+        "evaluation": {
+          "compression_ratio": 1.0,
+          "context_web_tokens": 150,
+          "graph_overhead": 12,
+          "naive_tokens": 150,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 12,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {
+            "a": "ranked_within_budget",
+            "b": "ranked_within_budget",
+            "c": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 3,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 150,
+          "raw_candidate_tokens": 150,
+          "saved_tokens": 0,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.3333333333333333,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 50,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "b",
+            "labels": [],
+            "score": 0.8
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "c",
+            "labels": [],
+            "score": 0.7
+          }
+        ],
+        "edges": [
+          {
+            "from_id": "a",
+            "relation": "calls",
+            "to_id": "b"
+          },
+          {
+            "from_id": "a",
+            "relation": "calls",
+            "to_id": "z"
+          }
+        ]
+      },
+      "name": "edges_filtered_to_selected"
+    },
+    {
+      "description": "Paths with an unselected node are dropped.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "b",
+            "kind": "file",
+            "labels": [],
+            "score": 0.8,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 50,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "c",
+            "kind": "file",
+            "labels": [],
+            "score": 0.7,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 1.0,
+          "context_web_tokens": 150,
+          "graph_overhead": 24,
+          "naive_tokens": 150,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 24,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [
+          {
+            "edge_relations": [],
+            "node_ids": [
+              "a",
+              "b"
+            ],
+            "score": 0.0
+          }
+        ],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {
+            "a": "ranked_within_budget",
+            "b": "ranked_within_budget",
+            "c": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 3,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 150,
+          "raw_candidate_tokens": 150,
+          "saved_tokens": 0,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.3333333333333333,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 50,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "b",
+            "labels": [],
+            "score": 0.8
+          },
+          {
+            "estimated_tokens": 50,
+            "id": "c",
+            "labels": [],
+            "score": 0.7
+          }
+        ],
+        "paths": [
+          {
+            "node_ids": [
+              "a",
+              "b"
+            ]
+          },
+          {
+            "node_ids": [
+              "a",
+              "z"
+            ]
+          }
+        ]
+      },
+      "name": "paths_filtered_to_selected"
+    },
+    {
+      "description": "Equal scores break ties by ascending id.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 10,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.5,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 10,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "b",
+            "kind": "file",
+            "labels": [],
+            "score": 0.5,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          },
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 10,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "c",
+            "kind": "file",
+            "labels": [],
+            "score": 0.5,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 1.0,
+          "context_web_tokens": 30,
+          "graph_overhead": 0,
+          "naive_tokens": 30,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {
+            "a": "ranked_within_budget",
+            "b": "ranked_within_budget",
+            "c": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 3,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 30,
+          "raw_candidate_tokens": 30,
+          "saved_tokens": 0,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.3333333333333333,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 10,
+            "id": "c",
+            "labels": [],
+            "score": 0.5
+          },
+          {
+            "estimated_tokens": 10,
+            "id": "a",
+            "labels": [],
+            "score": 0.5
+          },
+          {
+            "estimated_tokens": 10,
+            "id": "b",
+            "labels": [],
+            "score": 0.5
+          }
+        ]
+      },
+      "name": "tie_break_by_id"
+    },
+    {
+      "description": "token_ledger.raw_candidate_tokens overrides the atom sum.",
+      "expected": {
+        "atoms": [
+          {
+            "channels": [],
+            "citations": [],
+            "estimated_tokens": 100,
+            "hydration_handle": "",
+            "hydration_level": "summary",
+            "id": "a",
+            "kind": "file",
+            "labels": [],
+            "score": 0.9,
+            "source_ref": "",
+            "summary": "",
+            "title": "",
+            "trigger_description": "",
+            "why_relevant": ""
+          }
+        ],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 10.0,
+          "context_web_tokens": 100,
+          "graph_overhead": 0,
+          "naive_tokens": 1000,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {
+            "a": "ranked_within_budget"
+          }
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 1,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 100,
+          "raw_candidate_tokens": 1000,
+          "saved_tokens": 900,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 1.0,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": [
+          {
+            "estimated_tokens": 100,
+            "id": "a",
+            "labels": [],
+            "score": 0.9
+          }
+        ],
+        "ledger": {
+          "raw_candidate_tokens": 1000
+        }
+      },
+      "name": "ledger_raw_override"
+    },
+    {
+      "description": "No atoms; ledger zeros.",
+      "expected": {
+        "atoms": [],
+        "budget": {
+          "max_atoms": 24,
+          "max_edges": 48,
+          "max_paths": 8,
+          "max_tokens": 4000,
+          "max_tools": 5
+        },
+        "deferred_ingestion": [],
+        "edges": [],
+        "evaluation": {
+          "compression_ratio": 0.0,
+          "context_web_tokens": 0,
+          "graph_overhead": 0,
+          "naive_tokens": 0,
+          "not_useful_when": [
+            "tiny_one_file_edit"
+          ],
+          "trivial_change_penalty": 0,
+          "useful_when": [
+            "multi_file",
+            "cross_module",
+            "risky_change"
+          ]
+        },
+        "index": {
+          "changed_files": [],
+          "commit_sha": "",
+          "file_hashes": {},
+          "graph_state_hash": "",
+          "index_state_hash": "",
+          "last_incremental_update": "",
+          "repo_id": "",
+          "symbol_hashes": {},
+          "update_strategy": "incremental"
+        },
+        "mode": "standard",
+        "paths": [],
+        "provenance": {
+          "external_content_quarantined": false,
+          "policies_applied": [
+            "generated_artifact_quarantine",
+            "token_budget"
+          ],
+          "why_excluded": {},
+          "why_included": {}
+        },
+        "query": "fixture query",
+        "run_id": "run-context-fixture",
+        "solution_cards": [],
+        "source_mix": {
+          "artifact": 0,
+          "claim": 0,
+          "code": 0,
+          "postmortem": 0,
+          "skill": 0,
+          "web": 0
+        },
+        "spend_plan": {
+          "budget_allocation": {},
+          "cache_keys": {},
+          "degradations": [],
+          "expected_savings": {},
+          "hydration_policy": {},
+          "spend_plan_id": ""
+        },
+        "state_hash": "",
+        "structural_bank": [],
+        "token_ledger": {
+          "cache_hits": 0,
+          "hydration_tokens_avoided": 0,
+          "packed_tokens": 0,
+          "raw_candidate_tokens": 0,
+          "saved_tokens": 0,
+          "tool_schema_tokens_avoided": 0
+        },
+        "tools_used": [],
+        "validation": {
+          "findings": [],
+          "passed": true,
+          "scores": {
+            "context_clash_detector": 0.05,
+            "context_distraction_score": 0.0,
+            "context_poisoning_risk": 0.08,
+            "lost_in_middle_risk": 0.12
+          }
+        }
+      },
+      "input": {
+        "atoms": []
+      },
+      "name": "empty_pack"
+    }
+  ],
+  "policy_cases": [
+    {
+      "expected": {
+        "is_generated": false,
+        "normalized": "file:apps/foo.py"
+      },
+      "input": {
+        "id": "file:apps/foo.py",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": true,
+        "normalized": "generated:dist/bundle.js"
+      },
+      "input": {
+        "id": "file:dist/bundle.js",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": false,
+        "normalized": "file:apps/foo.py"
+      },
+      "input": {
+        "id": "file/foo.py",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": true,
+        "normalized": "generated:dist/x.js"
+      },
+      "input": {
+        "id": "file/dist/x.js",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": true,
+        "normalized": "generated:dist/x.js"
+      },
+      "input": {
+        "id": "dist/x.js",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": true,
+        "normalized": "generated:node_modules/lib/x.js"
+      },
+      "input": {
+        "id": "node_modules/lib/x.js",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": false,
+        "normalized": "plain-id"
+      },
+      "input": {
+        "id": "plain-id",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": true,
+        "normalized": "anything"
+      },
+      "input": {
+        "id": "anything",
+        "labels": [
+          "GeneratedArtifact"
+        ]
+      }
+    },
+    {
+      "expected": {
+        "is_generated": true,
+        "normalized": "generated:already"
+      },
+      "input": {
+        "id": "generated:already",
+        "labels": []
+      }
+    },
+    {
+      "expected": {
+        "is_generated": false,
+        "normalized": ""
+      },
+      "input": {
+        "id": "",
+        "labels": []
+      }
+    }
+  ]
+}
