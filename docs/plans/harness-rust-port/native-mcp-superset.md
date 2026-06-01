@@ -198,52 +198,54 @@ compose the native search the server already ships." No new index engine.
 
 ### Checklist (each item backreferences the canonical contract)
 
-- [ ] **M0** Create `theorem-harness-runtime/src/memory.rs`; declare node-id /
+- [x] **M0** Create `theorem-harness-runtime/src/memory.rs`; declare node-id /
   edge-id helpers, `MemoryError`, and the typed input/result structs. Wire into
   `lib.rs` exports. (Mirrors the `coordination.rs` shape.)
-- [ ] **M1 `remember`** — kind-routed write. `claim`/`finding` -> `MemoryNode`;
+- [x] **M1 `remember`** — kind-routed write. `claim`/`finding` -> `MemoryNode`;
   document kinds -> `MemoryDocument`. Inputs: `kind, content, title, tags,
   links, project_slug`. Output: `{saved_type, node|document}`.
   Ref `verbs.py:820`.
-- [ ] **M2 `recall`** — cross-surface retrieval over documents + nodes + runs
-  (+ context artifacts later). Inputs: `query, actor, since, kind, surface,
+- [x] **M2 `recall`** — native retrieval over memory documents + memory nodes;
+  run/context-artifact recall stays in Lane T/context IO. Inputs: `query, actor, since, kind, surface,
   limit, include_low_fitness, include_consolidation_sources`; `kind=="handoff"`
   consumes handoffs. Output: `{results[], count}`, each result carries
   `actor/surface/session` provenance. Ref `verbs.py:665`.
-- [ ] **M3 `relate`** — connected things for a seed doc/node. Inputs: `seed_id,
+- [x] **M3 `relate`** — connected things for a seed doc/node. Inputs: `seed_id,
   edge_types, max_hops`. Output: `{seed_id, results[], count}`.
-  Ref `verbs.py:861`. Build on `harness_kg_related_objects`.
-- [ ] **M4 `self_note`** — typed agent-memory document with
+  Ref `verbs.py:861`. Implemented over native memory graph neighbor edges.
+- [x] **M4 `self_note`** — typed agent-memory document with
   `metadata.memory_node_type` + `source="self_note"`. Inputs: `content, kind,
   title, tags, links, memory_node_type, summary`. Ref `verbs.py:925`.
-- [ ] **M5 `self_revise`** — revision-tracked replacement; new active atom,
+- [x] **M5 `self_revise`** — revision-tracked replacement; new active atom,
   prior atom -> `superseded`, `MEMORY_SUPERSEDES` edge, plus `MEMORY_CITES` /
   `MEMORY_DERIVED_FROM` edges. Inputs: `doc_id, content, title, summary, reason,
   memory_node_type, cites_doc_ids, derived_from_doc_ids`. Output:
   `{revised, superseded}`. Ref `verbs.py:954`.
-- [ ] **M6 `self_archive`** — move atom to cold tier; status -> `archived`,
+- [x] **M6 `self_archive`** — move atom to cold tier; status -> `archived`,
   `MEMORY_ARCHIVED_AS` edge to an archive record. Inputs: `doc_id, reason,
   title`. Output `{archived, archive}`. Ref `verbs.py:983`.
-- [ ] **M7 `self_recall_archive`** — query the archived tier only; archived
+- [x] **M7 `self_recall_archive`** — query the archived tier only; archived
   atoms must NOT appear in M2 default recall. Inputs: `query, actor, limit`.
   Ref `verbs.py:1007`.
-- [ ] **M8 `encode`** — feedback/solution/postmortem with `outcome` + fitness
+- [x] **M8 `encode`** — feedback/solution/postmortem with `outcome` + fitness
   `signal` + optional `event_id` linkage. Inputs: `content, title, kind,
   outcome, signal, reason, event_id, tags, links, summary, metadata, context,
-  auto_triggered`. Writes `fitness` onto the atom and links to the harness event
-  when `event_id` is given. Ref `verbs.py:1034` / `encode_memory_entry`.
-- [ ] **M9 `forget`** — soft-delete a document OR memory node by `id`, with an
+  auto_triggered`. Writes `fitness` onto the atom and stores `event_id` in that
+  fitness envelope; a direct event edge is a follow-up. Ref `verbs.py:1034` /
+  `encode_memory_entry`.
+- [x] **M9 `forget`** — soft-delete a document OR memory node by `id`, with an
   audit `reason`. Inputs: `id, reason`. Output `{forgotten_type:
   document|node, document|node}`. Set status -> `deleted` (+ `deleted_reason` /
-  `deleted_at` provenance), remove from recall + fulltext designation, preserve
-  audit history. Ref `verbs.py:1727`.
-- [ ] **M10 `observe`** — composite read: actor/tenant identity + coordination
+  `deleted_at` provenance), remove from recall by status filtering, preserve
+  audit history. Fulltext de-designation is a follow-up once the deployed memory
+  index is designated. Ref `verbs.py:1727`.
+- [x] **M10 `observe`** — composite read: actor/tenant identity + coordination
   room status + pending mentions + latest continuity pack + active orchestrate
   notes + optional `recall` for a query. No writes, no consume. Inputs: `actor,
   room_id, query, limit, include_low_fitness, include_consolidation_sources`.
   Ref `verbs.py:699`. Composes existing native `room_status` + `mentions` (read)
   + M2.
-- [ ] **M11 `handoff`** — cross-surface handoff as a pending `handoff`-kind
+- [x] **M11 `handoff`** — cross-surface handoff as a pending `handoff`-kind
   document targeted at `to_actor` with `expires_at`; consumed by M2 with
   `kind="handoff"`. Inputs: `to_actor, payload, title, expires_in`. Output
   `{handoff}`. Ref `verbs.py:895`.
@@ -253,6 +255,15 @@ compose the native search the server already ships." No new index engine.
   (`scratch`, `markdown`, `insight`, `handoff`, `solution`, `postmortem`); the
   store lands them in M1/M4, so exposing read/history/link is incremental.
   Ref `verbs.py:646` (`theorem_document_history`) + the document helpers.
+
+Implementation note (Codex, 2026-06-01): M0-M11 are now implemented in code
+over `theorem-harness-runtime::memory` and exposed through `rustyred-thg-mcp`
+with read-only/write-mode gating. Runtime tests cover document/node recall,
+revision, archive, handoff consume, relate, encode, forget, and RedCore reopen
+persistence. MCP tests cover tool listing plus a full JSON-RPC memory
+round-trip. Remaining before Lane M can be called deployment-complete: P1
+parity-memory fixtures, the clippy/acceptance gates, and Lane O live deploy
+with bearer-auth write mode.
 
 ## Lane R: run-lifecycle ergonomic verbs
 

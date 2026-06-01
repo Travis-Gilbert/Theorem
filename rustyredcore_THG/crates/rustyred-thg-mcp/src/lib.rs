@@ -13,15 +13,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{TransitionInput, TransitionResult};
 use theorem_harness_runtime::{
-    append_transition_from_store, coordination_intent_edge_id, coordination_intent_node_id,
-    coordination_member_edge_id, coordination_member_node_id, coordination_mention_edge_id,
-    coordination_message_edge_id, coordination_message_node_id, coordination_presence_node_id,
-    coordination_record_edge_id, coordination_record_node_id, coordination_room_node_id,
+    append_transition_from_store, archive_memory_document, coordination_intent_edge_id,
+    coordination_intent_node_id, coordination_member_edge_id, coordination_member_node_id,
+    coordination_mention_edge_id, coordination_message_edge_id, coordination_message_node_id,
+    coordination_presence_node_id, coordination_record_edge_id, coordination_record_node_id,
+    coordination_room_node_id, encode_memory, forget_memory, handoff_memory,
     infer_coordination_room_id, load_events, load_run, normalize_coordination_urgency,
-    parse_coordination_mentions, stable_coordination_message_id, stable_coordination_record_id,
-    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
-    CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, HarnessRuntimeError,
-    JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
+    parse_coordination_mentions, recall_archived_memory, recall_memory, relate_memory,
+    remember_memory, revise_memory_document, self_note_memory, stable_coordination_message_id,
+    stable_coordination_record_id, ArchiveMemoryInput, CoordinationIntentState,
+    CoordinationMessageState, CoordinationPresenceState, CoordinationRecordState,
+    CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput,
+    HandoffMemoryInput, HarnessRuntimeError, JoinRoomInput, MemoryError, MemoryGraphStore,
+    MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput,
+    WriteIntentInput, WriteMessageInput, WriteRecordInput,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -937,6 +942,98 @@ fn call_tool<P: McpGraphProvider>(
         }
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
+        }
+        "remember" | "theorem_harness_remember" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native memory writes are unavailable while read-only mode is active."
+                })));
+            }
+            remember_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "recall" | "theorem_harness_recall" => {
+            let consume_handoffs = arguments
+                .get("consume_handoffs")
+                .or_else(|| arguments.get("consumeHandoffs"))
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    arguments
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(|kind| kind.trim().eq_ignore_ascii_case("handoff"))
+                        .unwrap_or(false)
+                });
+            if consume_handoffs && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Consuming native memory handoffs is unavailable while read-only mode is active."
+                })));
+            }
+            recall_memory_payload(&tenant, &mut backend, &arguments, consume_handoffs)?
+        }
+        "relate" | "theorem_harness_relate" => {
+            relate_memory_payload(&tenant, &backend, &arguments)?
+        }
+        "self_note" | "theorem_harness_self_note" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native self-note writes are unavailable while read-only mode is active."
+                })));
+            }
+            self_note_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "self_revise" | "theorem_harness_self_revise" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native memory revision writes are unavailable while read-only mode is active."
+                })));
+            }
+            revise_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "self_archive" | "theorem_harness_self_archive" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native memory archive writes are unavailable while read-only mode is active."
+                })));
+            }
+            archive_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "self_recall_archive" | "theorem_harness_self_recall_archive" => {
+            recall_archived_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "encode" | "theorem_harness_encode" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native encode memory writes are unavailable while read-only mode is active."
+                })));
+            }
+            encode_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "forget" | "theorem_harness_forget" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native forget writes are unavailable while read-only mode is active."
+                })));
+            }
+            forget_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "handoff" | "theorem_harness_handoff" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native handoff writes are unavailable while read-only mode is active."
+                })));
+            }
+            handoff_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "observe" | "theorem_harness_observe" => {
+            observe_payload(&tenant, &mut backend, &arguments)?
         }
         "rustyred_thg_fulltext_search" | "rustyred_thg_graph_fulltext_search" => {
             let property = required_str(&arguments, "property", name)?;
@@ -2518,6 +2615,318 @@ fn harness_run_payload(
     }))
 }
 
+fn remember_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mut store = McpMemoryStore { backend };
+    let receipt = remember_memory(
+        &mut store,
+        memory_write_input(tenant, arguments, "remember")?,
+    )
+    .map_err(mcp_memory_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "saved_type": receipt.saved_type,
+        "document": receipt.document,
+        "node": receipt.node
+    }))
+}
+
+fn recall_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    consume_handoffs: bool,
+) -> Result<Value, McpError> {
+    let mut store = McpMemoryStore { backend };
+    let input = RecallMemoryInput {
+        tenant_slug: tenant.to_string(),
+        query: argument_text(arguments, &["query"]).unwrap_or_default(),
+        surface: argument_text(arguments, &["surface"]).unwrap_or_default(),
+        actor: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        since: argument_text(arguments, &["since"]).unwrap_or_default(),
+        kind: argument_text(arguments, &["kind"]).unwrap_or_default(),
+        limit: argument_u64(arguments, &["limit"]).unwrap_or(10) as usize,
+        include_low_fitness: arguments
+            .get("include_low_fitness")
+            .or_else(|| arguments.get("includeLowFitness"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        include_consolidation_sources: arguments
+            .get("include_consolidation_sources")
+            .or_else(|| arguments.get("includeConsolidationSources"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        consume_handoffs,
+    };
+    let results = recall_memory(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "results": results,
+        "count": results.len()
+    }))
+}
+
+fn relate_memory_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let store = McpMemoryReadStore { backend };
+    let seed_id = required_text_any(arguments, &["seed_id", "seedId"], "relate")?;
+    let input = RelateMemoryInput {
+        tenant_slug: tenant.to_string(),
+        seed_id: seed_id.clone(),
+        edge_types: string_array_any(arguments, &["edge_types", "edgeTypes"]),
+        max_hops: argument_u64(arguments, &["max_hops", "maxHops"]).unwrap_or(1) as usize,
+    };
+    let results = relate_memory(&store, input).map_err(mcp_memory_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "seed_id": seed_id,
+        "results": results,
+        "count": results.len()
+    }))
+}
+
+fn self_note_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mut input = memory_write_input(tenant, arguments, "self_note")?;
+    if input.kind.trim().is_empty() {
+        input.kind = "self_note".to_string();
+    }
+    input.memory_node_type = argument_text(arguments, &["memory_node_type", "memoryNodeType"])
+        .unwrap_or_else(|| "belief".to_string());
+    let mut store = McpMemoryStore { backend };
+    let document = self_note_memory(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({ "tenant": tenant, "document": document }))
+}
+
+fn revise_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let input = ReviseMemoryInput {
+        tenant_slug: tenant.to_string(),
+        actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        session_id: argument_text(arguments, &["session_id", "sessionId"]).unwrap_or_default(),
+        origin_surface: argument_text(arguments, &["origin_surface", "originSurface", "surface"])
+            .unwrap_or_default(),
+        doc_id: required_text_any(arguments, &["doc_id", "docId"], "self_revise")?,
+        content: required_text_any(arguments, &["content"], "self_revise")?,
+        title: argument_text(arguments, &["title"]).unwrap_or_default(),
+        summary: argument_text(arguments, &["summary"]).unwrap_or_default(),
+        reason: argument_text(arguments, &["reason"]).unwrap_or_default(),
+        memory_node_type: argument_text(arguments, &["memory_node_type", "memoryNodeType"])
+            .unwrap_or_default(),
+        cites_doc_ids: string_array_any(arguments, &["cites_doc_ids", "citesDocIds"]),
+        derived_from_doc_ids: string_array_any(
+            arguments,
+            &["derived_from_doc_ids", "derivedFromDocIds"],
+        ),
+        updated_at: argument_text(arguments, &["updated_at", "updatedAt"]).unwrap_or_default(),
+    };
+    let mut store = McpMemoryStore { backend };
+    let receipt = revise_memory_document(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "revised": receipt.revised,
+        "superseded": receipt.superseded
+    }))
+}
+
+fn archive_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let input = ArchiveMemoryInput {
+        tenant_slug: tenant.to_string(),
+        actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        doc_id: required_text_any(arguments, &["doc_id", "docId"], "self_archive")?,
+        reason: argument_text(arguments, &["reason"]).unwrap_or_default(),
+        title: argument_text(arguments, &["title"]).unwrap_or_default(),
+        archived_at: argument_text(arguments, &["archived_at", "archivedAt"]).unwrap_or_default(),
+    };
+    let mut store = McpMemoryStore { backend };
+    let receipt = archive_memory_document(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "archived": receipt.archived,
+        "archive": receipt.archive
+    }))
+}
+
+fn recall_archived_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let input = RecallMemoryInput {
+        tenant_slug: tenant.to_string(),
+        query: argument_text(arguments, &["query"]).unwrap_or_default(),
+        actor: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        limit: argument_u64(arguments, &["limit"]).unwrap_or(10) as usize,
+        ..RecallMemoryInput::default()
+    };
+    let mut store = McpMemoryStore { backend };
+    let results = recall_archived_memory(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "results": results,
+        "count": results.len()
+    }))
+}
+
+fn encode_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mut input = memory_write_input(tenant, arguments, "encode")?;
+    if input.kind.trim().is_empty() {
+        input.kind = "encode".to_string();
+    }
+    let outcome = argument_text(arguments, &["outcome"]).unwrap_or_else(|| "neutral".to_string());
+    let signal = argument_text(arguments, &["signal"]).unwrap_or_default();
+    let reason = argument_text(arguments, &["reason"]).unwrap_or_default();
+    let event_id = argument_text(arguments, &["event_id", "eventId"]).unwrap_or_default();
+    let context = arguments
+        .get("context")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let auto_triggered = arguments
+        .get("auto_triggered")
+        .or_else(|| arguments.get("autoTriggered"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    input.metadata = argument_object(arguments, "metadata");
+    let mut store = McpMemoryStore { backend };
+    let document = encode_memory(
+        &mut store,
+        input,
+        EncodeMemoryInput {
+            outcome,
+            signal,
+            reason,
+            event_id,
+            context,
+            auto_triggered,
+        },
+    )
+    .map_err(mcp_memory_error)?;
+    Ok(json!({ "tenant": tenant, "memory": document }))
+}
+
+fn forget_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let input = ForgetMemoryInput {
+        tenant_slug: tenant.to_string(),
+        actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        id: required_text_any(arguments, &["id"], "forget")?,
+        reason: required_text_any(arguments, &["reason"], "forget")?,
+        deleted_at: argument_text(arguments, &["deleted_at", "deletedAt"]).unwrap_or_default(),
+    };
+    let mut store = McpMemoryStore { backend };
+    let receipt = forget_memory(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "forgotten_type": receipt.forgotten_type,
+        "document": receipt.document,
+        "node": receipt.node
+    }))
+}
+
+fn handoff_memory_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let payload = arguments
+        .get("payload")
+        .cloned()
+        .ok_or_else(|| McpError::invalid_params("handoff requires payload"))?;
+    let input = HandoffMemoryInput {
+        tenant_slug: tenant.to_string(),
+        actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        session_id: argument_text(arguments, &["session_id", "sessionId"]).unwrap_or_default(),
+        origin_surface: argument_text(arguments, &["origin_surface", "originSurface", "surface"])
+            .unwrap_or_default(),
+        to_actor: required_text_any(arguments, &["to_actor", "toActor"], "handoff")?,
+        payload,
+        title: argument_text(arguments, &["title"]).unwrap_or_default(),
+        expires_at: argument_text(
+            arguments,
+            &["expires_at", "expiresAt", "expires_in", "expiresIn"],
+        )
+        .unwrap_or_default(),
+        created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+    };
+    let mut store = McpMemoryStore { backend };
+    let handoff = handoff_memory(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({ "tenant": tenant, "handoff": handoff }))
+}
+
+fn observe_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let actor_id = argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default();
+    let room_id = resolved_coordination_room_id(arguments);
+    let room = load_coordination_room(backend, tenant, &room_id)?
+        .unwrap_or_else(|| empty_coordination_room(tenant, &room_id, ""));
+    let pending_mentions = if actor_id.is_empty() {
+        Vec::new()
+    } else {
+        read_coordination_mentions(backend, tenant, &actor_id, false, 20)?
+    };
+    let recall_results = if argument_text(arguments, &["query"]).is_some() {
+        let mut store = McpMemoryStore { backend };
+        recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: tenant.to_string(),
+                query: argument_text(arguments, &["query"]).unwrap_or_default(),
+                actor: actor_id.clone(),
+                limit: argument_u64(arguments, &["limit"]).unwrap_or(10) as usize,
+                include_low_fitness: arguments
+                    .get("include_low_fitness")
+                    .or_else(|| arguments.get("includeLowFitness"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                include_consolidation_sources: arguments
+                    .get("include_consolidation_sources")
+                    .or_else(|| arguments.get("includeConsolidationSources"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ..RecallMemoryInput::default()
+            },
+        )
+        .map_err(mcp_memory_error)?
+    } else {
+        Vec::new()
+    };
+    Ok(json!({
+        "actor": { "actor_id": actor_id },
+        "tenant": { "slug": tenant },
+        "coordination_room": room,
+        "pending_mentions": pending_mentions,
+        "continuity_pack": {},
+        "orchestrate_notes": [],
+        "recall_results": recall_results
+    }))
+}
+
 fn instant_kg_view_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
@@ -3487,6 +3896,49 @@ fn transition_from_arguments(
     Ok(transition)
 }
 
+fn memory_write_input(
+    tenant: &str,
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<MemoryWriteInput, McpError> {
+    let kind = argument_text(arguments, &["kind"]).unwrap_or_else(|| match tool_name {
+        "self_note" => "self_note".to_string(),
+        "encode" => "encode".to_string(),
+        _ => String::new(),
+    });
+    if kind.trim().is_empty() {
+        return Err(McpError::invalid_params(format!(
+            "{tool_name} requires kind"
+        )));
+    }
+    Ok(MemoryWriteInput {
+        tenant_slug: tenant.to_string(),
+        actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        session_id: argument_text(arguments, &["session_id", "sessionId"]).unwrap_or_default(),
+        origin_surface: argument_text(arguments, &["origin_surface", "originSurface", "surface"])
+            .unwrap_or_default(),
+        project_slug: argument_text(arguments, &["project_slug", "projectSlug"])
+            .unwrap_or_default(),
+        doc_id: argument_text(arguments, &["doc_id", "docId"]).unwrap_or_default(),
+        node_id: argument_text(arguments, &["node_id", "nodeId"]).unwrap_or_default(),
+        kind,
+        title: argument_text(arguments, &["title"]).unwrap_or_default(),
+        content: required_text_any(arguments, &["content"], tool_name)?,
+        summary: argument_text(arguments, &["summary"]).unwrap_or_default(),
+        tags: string_array_any(arguments, &["tags"]),
+        links: string_array_any(arguments, &["links"]),
+        status: argument_text(arguments, &["status"]).unwrap_or_default(),
+        memory_node_type: argument_text(arguments, &["memory_node_type", "memoryNodeType"])
+            .unwrap_or_default(),
+        target_actor_id: argument_text(arguments, &["target_actor_id", "targetActorId"])
+            .unwrap_or_default(),
+        expires_at: argument_text(arguments, &["expires_at", "expiresAt"]).unwrap_or_default(),
+        metadata: argument_object(arguments, "metadata"),
+        fitness: arguments.get("fitness").cloned(),
+        created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+    })
+}
+
 fn coordination_policy_receipt(
     context: &McpRequestContext,
     arguments: &Value,
@@ -3865,6 +4317,78 @@ fn mcp_harness_runtime_error(error: HarnessRuntimeError) -> McpError {
         code: -32603,
         message: error.to_string(),
         data: Some(json!({ "code": "harness_runtime_error" })),
+    }
+}
+
+fn mcp_memory_error(error: MemoryError) -> McpError {
+    let code = match &error {
+        MemoryError::InvalidInput { .. } | MemoryError::NotFound { .. } => -32602,
+        MemoryError::Store(_) | MemoryError::Serialization(_) | MemoryError::Deserialization(_) => {
+            -32603
+        }
+    };
+    McpError {
+        code,
+        message: error.to_string(),
+        data: Some(json!({ "code": "harness_memory_error" })),
+    }
+}
+
+struct McpMemoryStore<'a, B: McpGraphBackend> {
+    backend: &'a mut B,
+}
+
+struct McpMemoryReadStore<'a, B: McpGraphBackend> {
+    backend: &'a B,
+}
+
+impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryStore<'_, B> {
+    fn memory_upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        self.backend.upsert_node(node)
+    }
+
+    fn memory_upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.backend.upsert_edge(edge)
+    }
+
+    fn memory_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.backend.get_node(id)
+    }
+
+    fn memory_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.backend.query_nodes(query)
+    }
+
+    fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        self.backend.neighbors(query)
+    }
+}
+
+impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryReadStore<'_, B> {
+    fn memory_upsert_node(&mut self, _node: NodeRecord) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "read_only_memory_adapter",
+            "read-only memory adapter cannot upsert nodes",
+        ))
+    }
+
+    fn memory_upsert_edge(&mut self, _edge: EdgeRecord) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "read_only_memory_adapter",
+            "read-only memory adapter cannot upsert edges",
+        ))
+    }
+
+    fn memory_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.backend.get_node(id)
+    }
+
+    fn memory_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.backend.query_nodes(query)
+    }
+
+    fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        self.backend.neighbors(query)
     }
 }
 
@@ -4497,6 +5021,79 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 }
             }),
         ),
+        tool(
+            "recall",
+            "Recall native Theorem harness memory documents and graph-node memories from the tenant GraphStore.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "query": { "type": "string" },
+                    "surface": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "since": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 },
+                    "include_low_fitness": { "type": "boolean", "default": false },
+                    "include_consolidation_sources": { "type": "boolean", "default": false },
+                    "consume_handoffs": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
+        tool(
+            "relate",
+            "Find native graph neighbors connected to a saved memory document or memory node.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "seed_id": { "type": "string" },
+                    "seedId": { "type": "string" },
+                    "edge_types": { "type": "array", "items": { "type": "string" } },
+                    "max_hops": { "type": "integer", "default": 1 }
+                },
+                "anyOf": [
+                    { "required": ["seed_id"] },
+                    { "required": ["seedId"] }
+                ]
+            }),
+        ),
+        tool(
+            "self_recall_archive",
+            "Recall archived native memory atoms without returning them in default recall.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "query": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 }
+                }
+            }),
+        ),
+        tool(
+            "observe",
+            "Observe native harness context without writing or consuming memory state.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 },
+                    "include_low_fitness": { "type": "boolean", "default": false },
+                    "include_consolidation_sources": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
     ];
     tools.push(tool(
         "rustyred_thg_fulltext_search",
@@ -4742,6 +5339,164 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "budget_units": { "type": "number" }
                 },
                 "required": ["actor", "summary"]
+            }),
+        ));
+        tools.push(tool_write(
+            "remember",
+            "Write a native Theorem harness memory document or typed memory node.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "surface": { "type": "string" },
+                    "project_slug": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "links": { "type": "array", "items": { "type": "string" } },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["kind", "content"]
+            }),
+        ));
+        tools.push(tool_write(
+            "self_note",
+            "Write a typed native self-memory document for the current actor.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "kind": { "type": "string", "default": "self_note" },
+                    "memory_node_type": { "type": "string", "default": "belief" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "links": { "type": "array", "items": { "type": "string" } },
+                    "summary": { "type": "string" }
+                },
+                "required": ["content"]
+            }),
+        ));
+        tools.push(tool_write(
+            "self_revise",
+            "Create a revision-tracked replacement for a native memory document.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "doc_id": { "type": "string" },
+                    "docId": { "type": "string" },
+                    "content": { "type": "string" },
+                    "title": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "memory_node_type": { "type": "string" },
+                    "cites_doc_ids": { "type": "array", "items": { "type": "string" } },
+                    "derived_from_doc_ids": { "type": "array", "items": { "type": "string" } }
+                },
+                "anyOf": [
+                    { "required": ["doc_id", "content"] },
+                    { "required": ["docId", "content"] }
+                ]
+            }),
+        ));
+        tools.push(tool_write(
+            "self_archive",
+            "Archive a native memory document into the cold memory tier.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "doc_id": { "type": "string" },
+                    "docId": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "title": { "type": "string" }
+                },
+                "anyOf": [
+                    { "required": ["doc_id"] },
+                    { "required": ["docId"] }
+                ]
+            }),
+        ));
+        tools.push(tool_write(
+            "encode",
+            "Record a native feedback, solution, or postmortem memory with fitness metadata.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["encode", "feedback", "solution", "postmortem"], "default": "encode" },
+                    "outcome": { "type": "string", "enum": ["positive", "negative", "mixed", "neutral"], "default": "neutral" },
+                    "signal": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "event_id": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "links": { "type": "array", "items": { "type": "string" } },
+                    "summary": { "type": "string" },
+                    "metadata": { "type": "object" },
+                    "context": { "type": "object" },
+                    "auto_triggered": { "type": "boolean", "default": false }
+                },
+                "required": ["content"]
+            }),
+        ));
+        tools.push(tool_write(
+            "forget",
+            "Soft-delete a native memory document or typed memory node with an audit reason.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "id": { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["id", "reason"]
+            }),
+        ));
+        tools.push(tool_write(
+            "handoff",
+            "Create a native cross-actor handoff memory document.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "to_actor": { "type": "string" },
+                    "toActor": { "type": "string" },
+                    "payload": {},
+                    "expires_in": { "type": "string" },
+                    "expires_at": { "type": "string" },
+                    "title": { "type": "string" }
+                },
+                "anyOf": [
+                    { "required": ["to_actor", "payload"] },
+                    { "required": ["toActor", "payload"] }
+                ]
             }),
         ));
         tools.push(tool_write(
@@ -5715,6 +6470,10 @@ mod tests {
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
         assert!(has_tool(tools, "mentions"));
+        assert!(has_tool(tools, "recall"));
+        assert!(has_tool(tools, "relate"));
+        assert!(has_tool(tools, "self_recall_archive"));
+        assert!(has_tool(tools, "observe"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_symbolic_datalog_derive"));
@@ -5737,6 +6496,13 @@ mod tests {
         assert!(!has_tool(tools, "coordination_record"));
         assert!(!has_tool(tools, "coordination_contribution"));
         assert!(!has_tool(tools, "harness_append_transition"));
+        assert!(!has_tool(tools, "remember"));
+        assert!(!has_tool(tools, "self_note"));
+        assert!(!has_tool(tools, "self_revise"));
+        assert!(!has_tool(tools, "self_archive"));
+        assert!(!has_tool(tools, "encode"));
+        assert!(!has_tool(tools, "forget"));
+        assert!(!has_tool(tools, "handoff"));
     }
 
     #[test]
@@ -5761,6 +6527,17 @@ mod tests {
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
         assert!(has_tool(tools, "harness_append_transition"));
+        assert!(has_tool(tools, "remember"));
+        assert!(has_tool(tools, "recall"));
+        assert!(has_tool(tools, "relate"));
+        assert!(has_tool(tools, "self_note"));
+        assert!(has_tool(tools, "self_revise"));
+        assert!(has_tool(tools, "self_archive"));
+        assert!(has_tool(tools, "self_recall_archive"));
+        assert!(has_tool(tools, "encode"));
+        assert!(has_tool(tools, "forget"));
+        assert!(has_tool(tools, "handoff"));
+        assert!(has_tool(tools, "observe"));
     }
 
     #[test]
@@ -6021,6 +6798,210 @@ mod tests {
             contributions["records"][0]["metadata"]["status"],
             "validated"
         );
+    }
+
+    #[test]
+    fn native_memory_tools_round_trip_through_mcp() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let first = call_tool_json(
+            &provider,
+            &config,
+            "remember",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "surface": "codex",
+                "kind": "insight",
+                "title": "Native memory",
+                "content": "RedCore memory atoms now live inside the MCP.",
+                "tags": ["memory", "rust"],
+                "created_at": "2026-06-01T00:00:00Z"
+            }),
+        );
+        assert_eq!(first["saved_type"], "document");
+        let first_doc_id = first["document"]["doc_id"].as_str().unwrap().to_string();
+
+        let second = call_tool_json(
+            &provider,
+            &config,
+            "remember",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "kind": "insight",
+                "title": "Linked memory",
+                "content": "This entry links to the first memory atom.",
+                "links": [first_doc_id.clone()],
+                "created_at": "2026-06-01T00:01:00Z"
+            }),
+        );
+        let second_doc_id = second["document"]["doc_id"].as_str().unwrap().to_string();
+
+        let claim = call_tool_json(
+            &provider,
+            &config,
+            "remember",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "kind": "claim",
+                "title": "Memory claim",
+                "content": "Recall includes typed graph nodes.",
+                "created_at": "2026-06-01T00:02:00Z"
+            }),
+        );
+        assert_eq!(claim["saved_type"], "node");
+
+        let recall = call_tool_json(
+            &provider,
+            &config,
+            "recall",
+            json!({
+                "tenant": "smoke",
+                "query": "memory",
+                "limit": 10
+            }),
+        );
+        assert_eq!(recall["count"], 3);
+        assert!(recall["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["item_type"] == "node"));
+
+        let related = call_tool_json(
+            &provider,
+            &config,
+            "relate",
+            json!({
+                "tenant": "smoke",
+                "seed_id": second_doc_id,
+                "edge_types": ["MEMORY_RELATES"],
+                "max_hops": 1
+            }),
+        );
+        assert_eq!(related["count"], 1);
+
+        let note = call_tool_json(
+            &provider,
+            &config,
+            "self_note",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "title": "Self note",
+                "content": "Remember this implementation choice.",
+                "memory_node_type": "decision",
+                "created_at": "2026-06-01T00:03:00Z"
+            }),
+        );
+        assert_eq!(note["document"]["kind"], "self_note");
+        let note_doc_id = note["document"]["doc_id"].as_str().unwrap().to_string();
+
+        let revised = call_tool_json(
+            &provider,
+            &config,
+            "self_revise",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "doc_id": note_doc_id,
+                "content": "Remember the adapter-based implementation choice.",
+                "reason": "sharpened wording",
+                "updated_at": "2026-06-01T00:04:00Z"
+            }),
+        );
+        assert_eq!(revised["superseded"]["status"], "superseded");
+        let revised_doc_id = revised["revised"]["doc_id"].as_str().unwrap().to_string();
+
+        let archived = call_tool_json(
+            &provider,
+            &config,
+            "self_archive",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "doc_id": revised_doc_id,
+                "reason": "move to cold tier",
+                "archived_at": "2026-06-01T00:05:00Z"
+            }),
+        );
+        assert_eq!(archived["archived"]["status"], "archived");
+
+        let archive_recall = call_tool_json(
+            &provider,
+            &config,
+            "self_recall_archive",
+            json!({
+                "tenant": "smoke",
+                "query": "adapter"
+            }),
+        );
+        assert_eq!(archive_recall["count"], 2);
+
+        let encoded = call_tool_json(
+            &provider,
+            &config,
+            "encode",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "kind": "solution",
+                "title": "Useful outcome",
+                "content": "The native memory path round-trips through MCP.",
+                "outcome": "positive",
+                "signal": "test",
+                "event_id": "event-1",
+                "context": { "run_id": "run-1" },
+                "created_at": "2026-06-01T00:06:00Z"
+            }),
+        );
+        assert_eq!(encoded["memory"]["fitness"]["outcome"], "positive");
+
+        let handoff = call_tool_json(
+            &provider,
+            &config,
+            "handoff",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "to_actor": "claude-code",
+                "payload": { "next": "deploy write mode" },
+                "created_at": "2026-06-01T00:07:00Z"
+            }),
+        );
+        assert_eq!(handoff["handoff"]["kind"], "handoff");
+
+        let observe = call_tool_json(
+            &provider,
+            &config,
+            "observe",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "query": "native",
+                "limit": 5
+            }),
+        );
+        assert_eq!(observe["tenant"]["slug"], "smoke");
+        assert!(!observe["recall_results"].as_array().unwrap().is_empty());
+
+        let forgotten = call_tool_json(
+            &provider,
+            &config,
+            "forget",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "id": first_doc_id,
+                "reason": "test cleanup",
+                "deleted_at": "2026-06-01T00:08:00Z"
+            }),
+        );
+        assert_eq!(forgotten["forgotten_type"], "document");
+        assert_eq!(forgotten["document"]["status"], "deleted");
     }
 
     #[test]

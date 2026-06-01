@@ -1,5 +1,6 @@
 pub mod coordination;
 pub mod event_log;
+pub mod memory;
 
 pub use coordination::{
     coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
@@ -19,4 +20,14 @@ pub use event_log::{
     append_transition, append_transition_from_store, event_node_id, load_events, load_run,
     persist_transition_result, replay_persisted_run, run_node_id, HarnessRuntimeError,
     RuntimeResult,
+};
+pub use memory::{
+    archive_memory_document, create_memory_document, create_memory_node, encode_memory,
+    forget_memory, handoff_memory, load_memory_document, load_memory_node, memory_document_node_id,
+    memory_edge_id, memory_node_node_id, recall_archived_memory, recall_memory, relate_memory,
+    remember_memory, revise_memory_document, self_note_memory, ArchiveMemoryInput,
+    ArchiveMemoryReceipt, EncodeMemoryInput, ForgetMemoryInput, ForgetMemoryReceipt,
+    HandoffMemoryInput, MemoryDocumentState, MemoryError, MemoryGraphStore, MemoryNodeState,
+    MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput, RecallMemoryInput,
+    RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput, ReviseMemoryReceipt,
 };
