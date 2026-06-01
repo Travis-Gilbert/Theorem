@@ -218,16 +218,27 @@ handles; and summary descriptors. Repository materialization and delta proposal
 writes remain runtime-side because the Python functions call
 `apps.notebook.graph_store.repository`.
 
+## Phase 2.12
+
+Done from the final pure straight-port candidate: `memory_contracts.py` has been
+ported as `theorem_harness_core::memory_contracts`. The Rust module exposes
+`PrepareMemoryHydrationHandle`, `PrepareMemoryBank`,
+`PrepareMemoryRecallPolicy`, `PrepareMemoryRecallPreview`,
+`PrepareMemoryEvidence`, `PrepareMemoryPolicy`, and
+`PrepareMemoryContract`, plus JSON-object constructors that preserve the Python
+defaults for active statuses, immutable/editable truthiness, object payload
+defaults, nested hydration handles, and normalized bank weights. This gives the
+native context compiler and recall surfaces their typed memory preparation
+contract without importing Django or storage.
+
 ## Phase 3+ (sequenced, not committed here)
 
-Next pure-logic candidate: `memory_contracts`. The context compiler's pure pack
-core, affordance registry/receipt contract, Pairformer metrics helpers,
-federated signal privacy helpers, and MapArtifact compiler are now in Rust;
-context IO retrieval, substrate adapters, map repository writes, and affordance
-execution wrappers remain later runtime rewrites. The next runtime candidates
-from the build spec are direct coordination channel, charter compiler, budget
-governor, compaction, and trace exports. Each gets its own plan slice when
-reached.
+The pure straight-port candidates from the original list are now covered in
+Rust. Remaining work is runtime/substrate rewrite work: context IO retrieval,
+substrate adapters, map repository writes, affordance execution wrappers, the
+direct coordination channel, charter compiler, budget governor, compaction,
+trace exports, adapter bridges, and Pairformer control. Each gets its own plan
+slice when reached.
 
 ## Coordination (hybrid -> git remains durable)
 
@@ -240,9 +251,9 @@ until substrate mirroring is clean.
 ## Honest scope note
 
 The full harness is ~900KB / ~48 modules. This slice ports the pure-logic spine
-(Units 1-2, ~110KB of the 900KB) with parity gates, and explicitly defers the
-Django/Memgraph-coupled body (coordination, cross_surface_memory, orchestrate,
-service, the memory/oracle/handoff/toolgraph/cua IO modules) as rewrites against
-the Rust substrate, not straight ports. "Port the harness" is a multi-phase
-effort; the completed kernel proves the approach end-to-end with a green parity
-gate.
+(Units 1-2 plus the small pure helpers, ~123KB of the 900KB) with parity gates,
+and explicitly defers the Django/Memgraph-coupled body (coordination,
+cross_surface_memory, orchestrate, service, the memory/oracle/handoff/toolgraph/
+cua IO modules) as rewrites against the Rust substrate, not straight ports.
+"Port the harness" is a multi-phase effort; the completed kernel proves the
+approach end-to-end with a green parity gate.

@@ -2,6 +2,7 @@ pub mod affordances;
 pub mod context_web;
 pub mod federated_signals;
 pub mod map_artifacts;
+pub mod memory_contracts;
 pub mod replay;
 pub mod session_metrics;
 pub mod state_hash;
@@ -28,6 +29,10 @@ pub use federated_signals::{
 pub use map_artifacts::{
     compile_map_artifact, describe_map_artifact, scope_for_map_kind, stable_map_id,
     MapArtifactCompileInput, MapArtifactState, MapDeltaState, MapEntry,
+};
+pub use memory_contracts::{
+    PrepareMemoryBank, PrepareMemoryContract, PrepareMemoryEvidence, PrepareMemoryHydrationHandle,
+    PrepareMemoryPolicy, PrepareMemoryRecallPolicy, PrepareMemoryRecallPreview,
 };
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};
 pub use session_metrics::{
