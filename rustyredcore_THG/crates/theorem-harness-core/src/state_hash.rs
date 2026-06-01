@@ -3,7 +3,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub fn empty_state_hash() -> String {
-    stable_hash(&json!({ "run": null }))
+    stable_value_hash(&json!({ "run": null }))
 }
 
 pub fn hash_run_state(run: &RunState) -> String {
@@ -15,10 +15,10 @@ pub fn hash_run_state(run: &RunState) -> String {
             data.get(*field).cloned().unwrap_or(Value::Null),
         );
     }
-    stable_hash(&Value::Object(state))
+    stable_value_hash(&Value::Object(state))
 }
 
-fn stable_hash(value: &Value) -> String {
+pub fn stable_value_hash(value: &Value) -> String {
     let encoded = canonical_json(value);
     let mut hasher = Sha256::new();
     hasher.update(encoded.as_bytes());

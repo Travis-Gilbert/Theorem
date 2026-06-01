@@ -10,7 +10,7 @@ coordination fallback until substrate mirroring is clean.
 
 | Actor | Status | Files | Notes |
 |---|---|---|---|
-| Codex | done for current slice | `rustyredcore_THG/crates/theorem-harness-core/**`; `rustyredcore_THG/crates/theorem-harness-runtime/**`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-context/**` | Rust `theorem-harness-core` now ports the pure state machine, replay/fork helpers, toolgraph toolkit selector, and context-web bounded pack compiler/policy core. `theorem-harness-runtime` adds the spec's GraphStore-backed event-log seam while keeping persistence out of the parity kernel. |
+| Codex | done for current slice | `rustyredcore_THG/crates/theorem-harness-core/**`; `rustyredcore_THG/crates/theorem-harness-runtime/**`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-context/**` | Rust `theorem-harness-core` now ports the pure state machine, replay/fork helpers, toolgraph toolkit selector, context-web bounded pack compiler/policy core, and the pure affordance registry/receipt contract. `theorem-harness-runtime` adds the spec's GraphStore-backed event-log seam while keeping persistence out of the parity kernel. |
 | Claude Code | done for slice | `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-toolgraph/**`; `docs/plans/harness-rust-port/parity-context/**` | Generated Python reference fixtures from `Index-API/apps/orchestrate/runtime/state_machine.py`, `toolgraph.py`, and `context_web/{contracts,policy}.py`; Codex extended the state-machine corpus to 25 scenarios / 260 steps and consumed the toolgraph/context corpora read-only for the Rust ports. |
 
 ## Git Protocol
@@ -42,3 +42,6 @@ coordination fallback until substrate mirroring is clean.
 - The Rust context-web parity test compares bounded pack output, generated
   artifact policy, token ledger, source mix, edge/path filtering, validation,
   and evaluation output against the Python reference corpus.
+- The Rust affordance registry test covers the eleven Python projection
+  affordance IDs and the content-addressed `AffordanceReceipt` envelope. Engine
+  execution wrappers remain runtime/native-engine work, not core-crate IO.

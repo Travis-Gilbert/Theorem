@@ -168,12 +168,25 @@ bounded pack output, generated-artifact quarantine, token ledgers, source mix,
 edge/path filtering, validation summaries, and evaluation summaries against the
 Python reference corpus.
 
+## Phase 2.8
+
+Started the spec's affordance step without pulling execution into the pure core:
+`theorem_harness_core::affordances` now exposes the complete Python projection
+surface as an eleven-entry registry (`datalog.derive`, the two probabilistic
+operations, and the eight `affordances_engines.py` projections), plus the
+content-addressed `AffordanceReceipt` envelope. This gives the charter/toolkit
+layers a zero-silent-capability list and a stable receipt shape while preserving
+the core/runtime split. Actual engine execution wrappers remain later
+runtime/native-engine work because they touch symbolic-engine implementations and
+Python fallback semantics.
+
 ## Phase 3+ (sequenced, not committed here)
 
 Next pure-logic candidates: `map_artifacts`, `memory_contracts`,
-`session_metrics`, `federated_signals`. The context compiler's pure pack core is
-now in Rust; its IO retriever / substrate adapter remains a later runtime
-rewrite. The next runtime candidates from the build spec are the map compiler,
+`session_metrics`, `federated_signals`. The context compiler's pure pack core
+and affordance registry/receipt contract are now in Rust; context IO retrieval,
+substrate adapters, and affordance execution wrappers remain later runtime
+rewrites. The next runtime candidates from the build spec are the map compiler,
 direct coordination channel, charter compiler, budget governor, compaction, and
 trace exports. Each gets its own plan slice when reached.
 
