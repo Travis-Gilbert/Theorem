@@ -299,6 +299,57 @@ C5-C9 are typed projections over the existing `read_records_for_room` +
 record-type filter; the work is the named verbs and `since`/cursor semantics,
 not a new store.
 
+## Lane T: theorem_* product surface (accepted scope, Travis 2026-06-01)
+
+The broader Theorem product verbs, ported native over the same RedCore
+`GraphStore` substrate as Lane M. **Naming: register Form-B (drop the
+`theorem_` prefix)** to match the existing native convention
+(`harness_begin`, not `theorem_harness_begin`); the MCP framework already
+namespaces as `mcp__<server>__<tool>`. Most of these sit directly on the Lane M
+atom store + the existing `context_web` / `event_log` / `map_artifacts` /
+`replay` core, so they are incremental once Lane M lands.
+
+Clean GraphStore ports (no Python):
+
+- [ ] **T1-T5 document CRUD** — `document_read` / `document_write` /
+  `document_search` / `document_history` / `document_link` over the Lane M
+  `MemoryDocument` store. Supersedes M12 (fold M12 here).
+- [ ] **T6-T13 context IO** — `context_compile` / `context_recall` /
+  `context_remember` / `context_audit` / `search_context` / `hydrate_context` /
+  `enrich_context` / `explain_context` over `theorem_harness_core::context_web`
+  + the Lane M store. This is the full context IO retrieval the base-plan body
+  listed as later runtime work; it lands here.
+- [ ] **T14-T17 memory lifecycle** — `memory` (read a memory item),
+  `memory_promote`, `memory_signal` (fitness signal; ref `verbs.py:1774`),
+  `review_memory` over the Lane M atoms + `fitness` field.
+- [ ] **T18-T19** — `consolidate`, `reflect` as durable records over the
+  coordination record store + Lane M.
+- [ ] **T20-T22 trajectory** — `record_step`, `record_outcome`,
+  `record_trajectory` over `event_log`.
+- [ ] **T23-T25 expansion** — `expand`, `explore_neighborhood`,
+  `fractal_expansion` over native PPR (share impl with R10; do not duplicate).
+- [ ] **T26-T27 artifacts** — `export_artifact`, `compiler_artifact_search`
+  over the graph + content-addressed packs (`rustyred_thg_graph_version_compile`
+  already exists).
+- [ ] **T28** — `tension_resolve`: alias/shared impl with C4 `resolve_tension`.
+- [ ] **T29-T30 graph passthrough** — `thg_command`, `thg_cypher` over the
+  native graph ops.
+- [ ] **T31** — `check`: health/consistency read.
+- [ ] **T32** — `prepare_agent`: agent context prep over
+  `theorem_harness_core::memory_contracts` (the prep contract already exists).
+- [ ] **T33-T34 session** — `session_offload`, `session_recall` over the store.
+
+Open sub-question (the only non-GraphStore part):
+
+- [ ] **T35 `runner_launch_claude_code` / T36 `runner_fetch_session`** — these
+  spawn and fetch a Claude Code agent **process**, not graph state. "Native"
+  here means a Rust runner service (extend `apps/theorem-harness-server`) that
+  owns process spawn, NOT the MCP graph layer. **Sub-decision D4:** keep
+  T35/T36 on the existing Python runner, or build a Rust runner. Default
+  proposal: keep on Python runner short-term (process orchestration is the one
+  place Python is not a reliability liability), expose T35/T36 as thin proxies
+  until a Rust runner exists. Confirm.
+
 ## Lane O: ops (deploy + write mode + auth)
 
 This lane is what makes the user's observation ("the deployed server doesn't
@@ -341,15 +392,18 @@ deploy carries the full superset.
 - [ ] **P4** `cargo clippy -p theorem-harness-runtime --all-targets --no-deps
   -- -D warnings` and `cargo clippy -p rustyred-thg-mcp --all-targets --no-deps
   -- -D warnings` clean.
-- [ ] **P5** Correct the harness skill docs. The
-  `theorem-harness`/`theorems-harness` skill still claims the harness "is
-  connected as the rustyred-thg and theseus MCP servers" and that you
-  recall/remember "against it." After this lands, the truthful statement is:
-  Theorems-Harness V2 (`rustyredcore-theorem-production`) is the single native
-  server for the harness base surface incl. memory + coordination writes; the
-  Python `theseus-mcp` remains only for the heavy engine tools
-  (`theseus_code_agent`, `theseus_frontend_check`, the `theseus_*` epistemic
-  engine). Update the skill `When to use` + tool tables to match.
+- [ ] **P5** Make the harness skill docs true, do NOT repoint them at Python.
+  The `theorem-harness`/`theorems-harness` skill already claims memory lives on
+  the native server ("recall/remember against it"). That claim is *premature*
+  today (memory actually executes on Python `theseus-mcp`), but it is the goal:
+  memory lives in rustyred. Sequencing P5 AFTER Lane M + Lane O is what makes
+  the existing claim true. Then sharpen the doc to: Theorems-Harness V2
+  (`rustyredcore-theorem-production`) is the single native home for the harness
+  base + product surface incl. **memory + coordination writes** over the RedCore
+  GraphStore; Python `theseus-mcp` remains only for the heavy `theseus_*` engine
+  (code agent, frontend check, epistemic/scorer/Modal). Do not write "memory is
+  on Python" into the doc; land the port so "memory is native" stops being a
+  lie.
 
 ## Proposed deferrals (consent required, surfaced individually)
 
@@ -361,13 +415,12 @@ as out of scope:
   scorer/IQ/training, Modal dispatch). Justification: these are the heavy
   Theseus *engine*, not the harness base; they legitimately stay on the Python
   `theseus-mcp` (they invoke PyTorch / spaCy / Modal). Proposed: keep on Python.
-- **D2 — `theorem_context_*` full IO retrieval, `theorem_session_*`,
-  `theorem_runner_*`, `theorem_memory_promote` / `_signal` / `_review`,
-  `theorem_record_trajectory` / `_outcome`, `theorem_reflect`,
-  `theorem_consolidate`, artifact export.** Justification: broader Theorem
-  product surface beyond the harness base; depends on context-IO + session +
-  runner substrate not yet in Rust. Proposed: Phase 2, after the base superset
-  is live and stable.
+- **D2 — ACCEPTED INTO SCOPE (Travis, 2026-06-01).** The broader `theorem_*`
+  product surface (document CRUD, context IO, memory lifecycle/signals,
+  consolidate/reflect, trajectory recording, expansion, artifacts, session) is
+  now in scope as **Lane T** below. Only the `theorem_runner_*` process-spawn
+  verbs carry an open sub-question (T35/T36); everything else is a clean
+  GraphStore port. No longer deferred.
 - **D3 — `code_search` native (R11) IF code symbols are not yet in THG.**
   Justification: the CodeCrawler ingest that populates code-symbol nodes may be
   Python-only; native `code_search` is trivial once the symbols are in the
@@ -380,11 +433,14 @@ plan rather than disappearing.
 
 ## Sequencing
 
-1. Lane M (M0 -> M1..M11, then M12) — the centerpiece; unblocks the user's ask.
-2. Lane R + Lane C in parallel with M (independent surfaces; share only the
-   read/write gating pattern).
-3. Lane P parity gates land per-lane as each verb is implemented.
-4. Lane O last, as one deploy carrying the whole superset, with O3 auth as a
+1. Lane M (M0 -> M1..M11) — the centerpiece atom store + recall; unblocks the
+   user's ask and is the substrate Lane T sits on.
+2. Lane T (T1-T34) after M, since document/context/memory-lifecycle verbs ride
+   the Lane M store. T35/T36 wait on sub-decision D4.
+3. Lane R + Lane C in parallel with M/T (independent surfaces; share only the
+   read/write gating pattern). M12 is folded into T1-T5.
+4. Lane P parity gates land per-lane as each verb is implemented.
+5. Lane O last, as one deploy carrying the whole superset, with O3 auth as a
    hard gate before O2 write-mode on the public URL.
 
 ## Acceptance (the floor)
@@ -413,8 +469,9 @@ fixtures + the HTTP transport).
 ### Ownership proposal
 
 - **Codex:** Lane M (`theorem-harness-runtime/src/memory.rs` + MCP exposure in
-  `rustyred-thg-mcp/src/lib.rs`), Lane R, Lane C, Lane O. These are the runtime
-  + MCP lanes Codex already owns per `CLAIMS.md`.
+  `rustyred-thg-mcp/src/lib.rs`), Lane T (the `theorem_*` product surface,
+  Form-B names, on the Lane M store), Lane R, Lane C, Lane O. These are the
+  runtime + MCP lanes Codex already owns per `CLAIMS.md`.
 - **Claude Code (offer):** Lane P parity-memory fixtures
   (`docs/plans/harness-rust-port/parity-memory/`), matching the
   `parity`/`parity-toolgraph`/`parity-context` corpora it already generated. P5
