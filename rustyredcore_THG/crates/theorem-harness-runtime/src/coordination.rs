@@ -17,6 +17,7 @@ const DEFAULT_MODE: &str = "collaborating";
 const DEFAULT_PRESENCE_TTL_SECONDS: u64 = 60;
 const INTENT_STATUSES: &[&str] = &["working", "paused", "done"];
 const MESSAGE_URGENCIES: &[&str] = &["info", "ask", "block"];
+const RECORD_TYPES: &[&str] = &["event", "decision", "tension", "reflection"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoordinationError {
@@ -147,6 +148,30 @@ pub struct WriteMessageInput {
     pub message: String,
     #[serde(default)]
     pub mentions: Vec<String>,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct WriteRecordInput {
+    #[serde(default)]
+    pub tenant_slug: String,
+    #[serde(default)]
+    pub room_id: String,
+    #[serde(default)]
+    pub actor_id: String,
+    #[serde(default)]
+    pub record_id: String,
+    #[serde(default)]
+    pub record_type: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub body: String,
     #[serde(default)]
     pub metadata: Map<String, Value>,
     #[serde(default)]
@@ -291,6 +316,25 @@ pub struct CoordinationMessageState {
     pub metadata: Map<String, Value>,
     #[serde(default)]
     pub consumed_by: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationRecordState {
+    pub tenant_slug: String,
+    pub room_id: String,
+    pub record_id: String,
+    pub record_type: String,
+    pub actor_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -665,6 +709,97 @@ pub fn read_mentions_for_actor<S: GraphStore>(
     Ok(messages)
 }
 
+pub fn write_record<S: GraphStore>(
+    store: &mut S,
+    input: WriteRecordInput,
+) -> CoordinationResult<CoordinationRecordState> {
+    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let room_id = normalize_room_id(&input.room_id);
+    let actor_id = require_text("actor_id", &input.actor_id)?;
+    let record_type = normalize_record_type(&input.record_type)?;
+    let summary = require_text("summary", &input.summary)?;
+    let created_at = timestamp_or_now(&input.created_at);
+    let record_id = if input.record_id.trim().is_empty() {
+        stable_record_id(
+            &tenant_slug,
+            &room_id,
+            &record_type,
+            &actor_id,
+            &summary,
+            &created_at,
+        )
+    } else {
+        input.record_id.trim().to_string()
+    };
+
+    if load_room(store, &tenant_slug, &room_id)?.is_none() {
+        persist_room_state(
+            store,
+            &empty_room_state(&tenant_slug, &room_id, &created_at),
+        )?;
+    }
+
+    let state = CoordinationRecordState {
+        tenant_slug,
+        room_id,
+        record_id,
+        record_type,
+        actor_id,
+        title: input.title.trim().to_string(),
+        summary,
+        body: input.body.trim().to_string(),
+        metadata: input.metadata,
+        created_at,
+    };
+    persist_record_state(store, &state)?;
+    Ok(state)
+}
+
+pub fn read_records_for_room<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    room_id: &str,
+    record_types: &[String],
+    limit: usize,
+) -> CoordinationResult<Vec<CoordinationRecordState>> {
+    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let room_id = normalize_room_id(room_id);
+    let type_filter = record_types
+        .iter()
+        .map(|record_type| record_type.trim().to_lowercase())
+        .filter(|record_type| !record_type.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut records = store
+        .query_nodes(
+            NodeQuery::label("CoordinationRecord")
+                .with_property("tenant_slug", Value::String(tenant_slug))
+                .with_property("room_id", Value::String(room_id)),
+        )
+        .into_iter()
+        .map(|node| {
+            serde_json::from_value::<CoordinationRecordState>(node.properties)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
+        })
+        .filter_map(|result| match result {
+            Ok(record) if type_filter.is_empty() || type_filter.contains(&record.record_type) => {
+                Some(Ok(record))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<CoordinationResult<Vec<_>>>()?;
+    records.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.record_id.cmp(&left.record_id))
+    });
+    if limit > 0 {
+        records.truncate(limit);
+    }
+    Ok(records)
+}
+
 pub fn infer_coordination_room_id(
     repo: &str,
     branch: &str,
@@ -775,6 +910,24 @@ pub fn coordination_mention_edge_id(
     )
 }
 
+pub fn coordination_record_node_id(tenant_slug: &str, room_id: &str, record_id: &str) -> String {
+    format!(
+        "harness:coordination:record:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(record_id).if_empty("unknown")
+    )
+}
+
+pub fn coordination_record_edge_id(tenant_slug: &str, room_id: &str, record_id: &str) -> String {
+    format!(
+        "harness:coordination:edge:record:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(record_id).if_empty("unknown")
+    )
+}
+
 fn persist_room_state<S: GraphStore>(
     store: &mut S,
     state: &CoordinationRoomState,
@@ -836,6 +989,15 @@ fn persist_message_state<S: GraphStore>(
         }
         upsert_edge_if_changed(store, message_mention_edge(state, actor_id)?)?;
     }
+    Ok(())
+}
+
+fn persist_record_state<S: GraphStore>(
+    store: &mut S,
+    state: &CoordinationRecordState,
+) -> CoordinationResult<()> {
+    upsert_node_if_changed(store, record_node(state)?)?;
+    upsert_edge_if_changed(store, record_room_edge(state)?)?;
     Ok(())
 }
 
@@ -992,6 +1154,33 @@ fn message_mention_edge(
     ))
 }
 
+fn record_node(state: &CoordinationRecordState) -> CoordinationResult<NodeRecord> {
+    let properties = serde_json::to_value(state)
+        .map_err(|error| CoordinationError::Serialization(error.to_string()))?;
+    Ok(NodeRecord::new(
+        coordination_record_node_id(&state.tenant_slug, &state.room_id, &state.record_id),
+        ["HarnessCoordination", "CoordinationRecord"],
+        properties,
+    ))
+}
+
+fn record_room_edge(state: &CoordinationRecordState) -> CoordinationResult<EdgeRecord> {
+    Ok(EdgeRecord::new(
+        coordination_record_edge_id(&state.tenant_slug, &state.room_id, &state.record_id),
+        coordination_record_node_id(&state.tenant_slug, &state.room_id, &state.record_id),
+        "COORDINATION_RECORD_OF",
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "room_id": state.room_id,
+            "record_id": state.record_id,
+            "record_type": state.record_type,
+            "actor_id": state.actor_id,
+            "created_at": state.created_at,
+        }),
+    ))
+}
+
 fn empty_room_state(tenant_slug: &str, room_id: &str, now: &str) -> CoordinationRoomState {
     CoordinationRoomState {
         tenant_slug: normalize_tenant_slug(tenant_slug),
@@ -1045,6 +1234,37 @@ fn normalize_urgency(urgency: &str) -> CoordinationResult<String> {
 
 pub fn normalize_coordination_urgency(urgency: &str) -> CoordinationResult<String> {
     normalize_urgency(urgency)
+}
+
+fn normalize_record_type(record_type: &str) -> CoordinationResult<String> {
+    let record_type = record_type.trim().to_lowercase();
+    if RECORD_TYPES.contains(&record_type.as_str()) {
+        Ok(record_type)
+    } else {
+        Err(CoordinationError::InvalidInput {
+            field: "record_type".to_string(),
+            message: format!("must be one of {:?}", RECORD_TYPES),
+        })
+    }
+}
+
+fn stable_record_id(
+    tenant_slug: &str,
+    room_id: &str,
+    record_type: &str,
+    actor_id: &str,
+    summary: &str,
+    created_at: &str,
+) -> String {
+    let hash = stable_value_hash(&json!({
+        "tenant_slug": normalize_tenant_slug(tenant_slug),
+        "room_id": normalize_room_id(room_id),
+        "record_type": record_type,
+        "actor_id": actor_id,
+        "summary": summary,
+        "created_at": created_at,
+    }));
+    format!("record_{}", &hash[..16])
 }
 
 fn resolve_room_id(
@@ -1539,6 +1759,86 @@ mod tests {
     }
 
     #[test]
+    fn write_record_persists_decisions_tensions_reflections_and_events() {
+        let mut store = InMemoryGraphStore::new();
+        let decision = write_record(
+            &mut store,
+            WriteRecordInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                record_type: "decision".to_string(),
+                title: "Use native transport".to_string(),
+                summary: "Keep coordination in Rust over GraphStore".to_string(),
+                body: "Python harness remains a compatibility fallback.".to_string(),
+                created_at: T1.to_string(),
+                ..WriteRecordInput::default()
+            },
+        )
+        .unwrap();
+        let tension = write_record(
+            &mut store,
+            WriteRecordInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "claude-code".to_string(),
+                record_type: "tension".to_string(),
+                summary: "HTTP and MCP expose different write surfaces".to_string(),
+                created_at: T2.to_string(),
+                ..WriteRecordInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(decision.record_type, "decision");
+        assert!(decision.record_id.starts_with("record_"));
+        assert!(store
+            .get_node(&coordination_record_node_id(
+                TENANT,
+                ROOM,
+                &decision.record_id
+            ))
+            .is_some());
+        assert!(store
+            .get_edge(&coordination_record_edge_id(
+                TENANT,
+                ROOM,
+                &decision.record_id
+            ))
+            .is_some());
+
+        let all = read_records_for_room(&store, TENANT, ROOM, &[], 10).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|record| record.record_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tension", "decision"]
+        );
+        let decisions =
+            read_records_for_room(&store, TENANT, ROOM, &["decision".to_string()], 10).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].title, "Use native transport");
+
+        let limited = read_records_for_room(&store, TENANT, ROOM, &[], 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].record_id, tension.record_id);
+
+        let invalid = write_record(
+            &mut store,
+            WriteRecordInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                record_type: "note".to_string(),
+                summary: "not accepted".to_string(),
+                ..WriteRecordInput::default()
+            },
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("record_type"));
+    }
+
+    #[test]
     fn redcore_reopens_coordination_room_intent_and_presence() {
         let data_dir = std::env::temp_dir().join(format!(
             "theorem-harness-coordination-{}",
@@ -1598,6 +1898,20 @@ mod tests {
                 },
             )
             .unwrap();
+            write_record(
+                &mut store,
+                WriteRecordInput {
+                    tenant_slug: TENANT.to_string(),
+                    room_id: ROOM.to_string(),
+                    actor_id: "codex".to_string(),
+                    record_id: "r-redcore".to_string(),
+                    record_type: "reflection".to_string(),
+                    summary: "native records persist".to_string(),
+                    created_at: T1.to_string(),
+                    ..WriteRecordInput::default()
+                },
+            )
+            .unwrap();
         }
 
         {
@@ -1612,6 +1926,9 @@ mod tests {
             let messages = read_messages_for_room(&store, TENANT, ROOM, 10).unwrap();
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].message_id, "m-redcore");
+            let records = read_records_for_room(&store, TENANT, ROOM, &[], 10).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].record_id, "r-redcore");
         }
 
         let _ = fs::remove_dir_all(data_dir);

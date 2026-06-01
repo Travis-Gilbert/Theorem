@@ -257,9 +257,15 @@ when MCP read/write mode is enabled. The MCP test suite covers a full
 room/presence/intent/message/mention-consume/readback round trip against a
 shared fixture store.
 
-Not covered yet: event/decision/tension/reflection records, context injection
-into the channel, contribution capture, and permission/cost hooks. Those remain
-the rest of the direct-coordination module.
+The next native substrate slice adds durable coordination records for
+`event`, `decision`, `tension`, and `reflection`. They share one
+`CoordinationRecordState` graph contract, persist as `CoordinationRecord` nodes,
+and attach to rooms through `COORDINATION_RECORD_OF` edges. Tests cover record
+type validation, filtering, limit ordering, graph IDs/edges, and
+`RedCoreGraphStore` reopen behavior.
+
+Not covered yet: context injection into the channel, contribution capture, and
+permission/cost hooks. Those remain the rest of the direct-coordination module.
 
 The HTTP transport exposure now lives in `apps/theorem-harness-server` over
 `theorem-harness-runtime`. It serves run list/detail plus the native

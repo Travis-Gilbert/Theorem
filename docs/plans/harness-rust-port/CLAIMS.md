@@ -10,6 +10,7 @@ coordination fallback until substrate mirroring is clean.
 
 | Actor | Status | Files | Notes |
 |---|---|---|---|
+| Codex | done for native coordination record substrate | `rustyredcore_THG/crates/theorem-harness-runtime/**`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/implementation-plan.md`; `CLAUDE.md` | Added `event`, `decision`, `tension`, and `reflection` records as a shared `CoordinationRecordState` graph contract with `CoordinationRecord` nodes and `COORDINATION_RECORD_OF` room edges. Runtime tests cover writes, filtering, limits, invalid type rejection, graph IDs/edges, and RedCore reopen persistence. |
 | Codex | done for MCP exposure slice | `rustyredcore_THG/crates/theorem-harness-core/**`; `rustyredcore_THG/crates/theorem-harness-runtime/**`; `rustyredcore_THG/crates/rustyred-thg-mcp/**`; `rustyredcore_THG/Cargo.lock`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-context/**` | Rust `theorem-harness-core` now ports the pure state machine, replay/fork helpers, toolgraph toolkit selector, context-web bounded pack compiler/policy core, pure affordance registry/receipt contract, Pairformer session metrics, federated structural-signal privacy helpers, the pure MapArtifact compiler, and memory preparation contracts. `theorem-harness-runtime` adds the spec's GraphStore-backed event-log seam and native direct-coordination substrate with room membership, live intents, durable presence, direct messages, and mentions. `rustyred-thg-mcp` now exposes those native coordination tools over MCP with read-only/write-mode gating and GraphStore-backed round-trip coverage. |
 | Codex | done for HTTP coordination-read exposure | `apps/theorem-harness-server/**`; `docs/plans/harness-rust-port/ios-transport-handoff.md`; `CLAUDE.md` | Extended the standalone Axum transport over `theorem-harness-runtime` with native coordination read endpoints: room status, room presence, room intents, and actor mentions. The server keeps write/consume semantics only for mention consumption and reads the same `RedCoreGraphStore` as the run transport. |
 | Claude Code | done for HTTP run exposure | `apps/theorem-harness-server/**`; `docs/plans/harness-rust-port/ios-transport-handoff.md` | Added the standalone Axum run transport over `theorem-harness-runtime`, including run listing/detail endpoints for the iOS handoff. |
@@ -73,7 +74,9 @@ coordination fallback until substrate mirroring is clean.
   `COORDINATION_MEMBER_OF` graph edges, live intent replacement and filtering,
   durable presence heartbeat/end records, direct message persistence,
   `COORDINATION_MENTIONS` graph edges, consume-on-read mention inbox behavior,
-  and `RedCoreGraphStore` reopen behavior for all coordination primitives.
+  durable event/decision/tension/reflection records,
+  `COORDINATION_RECORD_OF` graph edges, and `RedCoreGraphStore` reopen behavior
+  for all coordination primitives.
 - The Rust MCP coordination tests cover native tool listing, read-only/write
   gating, room join, presence heartbeat/readback, intent write/readback,
   coordinate receipt shape, pending mention reads, consume-on-read semantics,
