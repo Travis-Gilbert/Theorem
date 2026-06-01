@@ -9,22 +9,26 @@ import SwiftUI
 /// list is honest about its single recorded run rather than padded with fakes.
 struct RunsListView: View {
     var theme: TheoremTheme
+    /// The data source. Defaults to the recorded sample; swap for a runtime-backed
+    /// store once the harness exposes a transport.
+    var store: HarnessRunStore = SampleRunStore()
 
     @State private var path: [String] = []
+    @State private var runs: [HarnessRun] = []
+    @State private var state: LoadState = .loading
 
-    private let runs: [HarnessRun] = [SampleRun.fullLifecycle]
+    enum LoadState: Equatable {
+        case loading
+        case loaded
+        case failed(String)
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header
-                    ForEach(runs) { run in
-                        NavigationLink(value: run.runID) {
-                            runRow(run)
-                        }
-                        .buttonStyle(.plain)
-                    }
+                    content
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -36,13 +40,55 @@ struct RunsListView: View {
                 }
             }
         }
-        .task {
-            // -runDetail 1 opens the first recorded run's detail directly
-            // (deep-link + screenshot capture), consistent with the app's
-            // -patent / -autoSearch launch arguments.
+        .task { await load() }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch state {
+        case .loading:
+            HStack(spacing: 9) {
+                ProgressView().controlSize(.small).tint(theme.signal)
+                Text("Loading runs\u{2026}")
+                    .font(TheoremFonts.body(size: 13)).foregroundStyle(theme.textMuted)
+            }
+            .padding(.top, 8)
+        case .failed(let message):
+            honest(message)
+        case .loaded:
+            if runs.isEmpty {
+                honest("No runs yet. Runs appear here when the harness records one.")
+            } else {
+                ForEach(runs) { run in
+                    NavigationLink(value: run.runID) {
+                        runRow(run)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func honest(_ message: String) -> some View {
+        Text(message)
+            .font(TheoremFonts.body(size: 13)).foregroundStyle(theme.textMuted)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+    }
+
+    @MainActor
+    private func load() async {
+        state = .loading
+        do {
+            runs = try await store.runs()
+            state = .loaded
+            // -runDetail 1 opens the first run's detail directly (deep-link +
+            // screenshot capture), consistent with the app's -patent / -autoSearch
+            // launch arguments. Set after runs load so the destination resolves.
             if UserDefaults.standard.bool(forKey: "runDetail"), let first = runs.first {
                 path = [first.runID]
             }
+        } catch {
+            state = .failed("Couldn't load runs.")
         }
     }
 
