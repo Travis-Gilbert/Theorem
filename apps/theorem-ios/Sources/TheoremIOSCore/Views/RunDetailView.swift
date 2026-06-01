@@ -13,6 +13,8 @@ struct RunDetailView: View {
     let run: HarnessRun
     var theme: TheoremTheme
 
+    @State private var showTrace = false
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -25,6 +27,13 @@ struct RunDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(theme.field.ignoresSafeArea())
+        .navigationDestination(isPresented: $showTrace) {
+            TraceView(run: run, theme: theme)
+        }
+        .onAppear {
+            // -trace 1 pushes the trace surface directly (deep-link + capture).
+            if UserDefaults.standard.bool(forKey: "trace") { showTrace = true }
+        }
     }
 
     // MARK: Header
@@ -221,8 +230,8 @@ struct RunDetailView: View {
     // MARK: Trace link
 
     private var traceLink: some View {
-        NavigationLink {
-            TraceView(run: run, theme: theme)
+        Button {
+            showTrace = true
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "list.bullet.indent").font(.system(size: 12, weight: .semibold))
