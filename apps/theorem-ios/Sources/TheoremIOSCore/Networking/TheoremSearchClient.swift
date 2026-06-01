@@ -33,16 +33,46 @@ public struct TheoremSearchClient: Sendable {
     /// Run a substrate search and return a scene the renderer can draw. Throws
     /// `TheoremSearchError` on a bad query, HTTP failure, or empty result (so the
     /// UI shows an honest error / empty state, never a fabricated graph).
-    public func search(query: String, topK: Int = 12) async throws -> ScenePackageV2 {
+    public func search(query: String, topK: Int = 10) async throws -> ScenePackageV2 {
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw TheoremSearchError.emptyQuery }
 
+        let scene: ScenePackageV2
         switch backend {
         case .indexAPI:
-            return try await searchIndexAPI(query: clean, topK: topK)
+            scene = try await searchIndexAPI(query: clean, topK: topK)
         case .rustyRed:
-            return try await searchRustyRed(query: clean)
+            scene = try await searchRustyRed(query: clean)
         }
+        // A person should never face more than ~10 result nodes at once.
+        return Self.cap(scene, to: 10)
+    }
+
+    /// Cap a result scene to at most `limit` atoms (the hub, then the strongest
+    /// matches) and the relations among them. Keeps the highest-degree node so
+    /// the query/center survives, then fills by match score.
+    static func cap(_ scene: ScenePackageV2, to limit: Int) -> ScenePackageV2 {
+        guard scene.atoms.count > limit else { return scene }
+        var degree: [String: Int] = [:]
+        for relation in scene.relations {
+            degree[relation.sourceId, default: 0] += 1
+            degree[relation.targetId, default: 0] += 1
+        }
+        let ranked = scene.atoms.sorted { a, b in
+            let da = degree[a.id] ?? 0, db = degree[b.id] ?? 0
+            if da != db { return da > db }
+            let sa = a.metadata["matchScore"]?.doubleValue ?? a.weight ?? 0
+            let sb = b.metadata["matchScore"]?.doubleValue ?? b.weight ?? 0
+            return sa > sb
+        }
+        let kept = Array(ranked.prefix(limit))
+        let keptIDs = Set(kept.map(\.id))
+        var next = scene
+        next.atoms = kept
+        next.relations = scene.relations.filter {
+            keptIDs.contains($0.sourceId) && keptIDs.contains($0.targetId)
+        }
+        return next
     }
 
     /// Ask the substrate for a graph-grounded summary of a focus (a node, in the

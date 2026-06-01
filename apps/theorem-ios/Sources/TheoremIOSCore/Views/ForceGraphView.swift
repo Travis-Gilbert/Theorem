@@ -1,54 +1,61 @@
 import SwiftUI
 import Grape
 
-/// The hero projection (spec algo 1): a live force simulation via Grape, rather
-/// than the static Canvas seed the other projections draw. Node radius scales
-/// with `matchScore` (PPR mass); native drag / pan / zoom via Grape's gesture
-/// overlay. Colors and radii mirror `TheoremSceneView` so switching to/from this
-/// projection is visually continuous — only the layout becomes live.
-///
-/// Ported in during the Swift-lane convergence (Travis: "include grape"). The
-/// other three projections stay on the Canvas renderer, which honours the
-/// sliver's exact positions.
+/// The search-results graph, rendered in the spirit of d3's force-directed tree
+/// (Travis's @d3/force-directed-tree reference). Internal nodes (degree >= 2)
+/// are hollow rings, leaves (degree 1) are filled dots — the d3
+/// `d.children ? hollow : filled` rule as a degree test — with thin grey edges
+/// and native drag. Two deliberate departures from d3: search caps at ~10 nodes
+/// (more overwhelms a person), and the nodes are larger and more tappable than
+/// d3's tiny r=3.5-over-150. The force config is loosened to suit ~10 big nodes.
 struct ForceGraphView: View {
     var package: ScenePackageV2
     var theme: TheoremTheme
 
     @State private var graphState = ForceDirectedGraphState(initialIsRunning: true)
 
+    /// Node radius. Deliberately larger than d3's r=3.5: search returns at most
+    /// ~10 nodes, so they can be big and tappable rather than a dense field.
+    private let nodeRadius: CGFloat = 9
+
     var body: some View {
-        let maxMag = max(package.atoms.map(magnitude).max() ?? 1, 1)
-        // A labeled graph is the product; an unlabeled one is decoration. Above
-        // ~14 nodes the labels would crowd the live layout, so they drop out.
+        let degree = degreeMap()
+        // The d3 reference is unlabeled; keep labels only for sparse graphs where
+        // they help, and let dense trees speak as pure structure.
         let showLabels = package.atoms.count <= 14
 
         ForceDirectedGraph(states: graphState) {
             Series(package.atoms) { atom in
-                let r = 6 + (magnitude(atom) / maxMag) * 16
-                // Monochrome instrument node: field fill, ink outline (mirrors
-                // TheoremSceneView's Canvas renderer so switching is continuous).
-                // The label offset scales with radius so it clears the node
-                // regardless of size (Grape's annotation anchors near center).
+                let leaf = (degree[atom.id] ?? 0) <= 1
+                // d3 force-directed-tree node: internal = hollow ring (field fill,
+                // ink stroke 1.5); leaf = filled ink dot with a thin field halo
+                // (the halo separates leaves where clusters overlap).
                 NodeMark(id: atom.id)
                     .symbol(.circle)
-                    .symbolSize(radius: r)
-                    .foregroundStyle(theme.field)
-                    .stroke(theme.ink, StrokeStyle(lineWidth: 1.2))
+                    .symbolSize(radius: nodeRadius)
+                    .foregroundStyle(leaf ? theme.ink : theme.field)
+                    .stroke(
+                        leaf ? theme.field : theme.ink,
+                        StrokeStyle(lineWidth: leaf ? 1.5 : 2)
+                    )
                     .annotation(
                         showLabels ? labelText(atom) : nil,
                         alignment: .bottom,
-                        offset: SIMD2(0, r + 5)
+                        offset: SIMD2(0, Double(nodeRadius) + 5)
                     )
             }
             Series(package.relations) { relation in
+                // Thin grey edges (d3 #999 at 0.6 opacity reads as a light-mid grey).
                 LinkMark(from: relation.sourceId, to: relation.targetId)
-                    .stroke(theme.rule, StrokeStyle(lineWidth: 1.2))
+                    .stroke(theme.ink.opacity(0.30), StrokeStyle(lineWidth: 1))
             }
         } force: {
-            // Charge / link tuning carried from the proven SERP force graph.
-            .manyBody(strength: -230)
+            // ~10 large nodes want a comfortable radial, not d3's tight 150-node
+            // clustering. Stronger charge + longer spokes spread the hub-and-leaf
+            // result across the canvas; the hollow/filled + drag stay d3-faithful.
+            .manyBody(strength: -150)
             .center()
-            .link(originalLength: 62.0, stiffness: .weightedByDegree { _, _ in 1.0 })
+            .link(originalLength: 44.0, stiffness: .weightedByDegree { _, _ in 1.0 })
         }
         .graphOverlay { proxy in
             Rectangle()
@@ -57,13 +64,17 @@ struct ForceGraphView: View {
                 .withGraphDragGesture(proxy, of: String.self)
                 .withGraphMagnifyGesture(proxy)
         }
-        // No opaque background: the hex-blueprint watermark behind the graph
-        // (mounted by TheoremSceneView) reads through.
     }
 
-    /// PPR mass for radius (matches TheoremSceneView's `radius(for:)`).
-    private func magnitude(_ atom: SceneAtom) -> Double {
-        atom.metadata["matchScore"]?.doubleValue ?? atom.weight ?? 0.1
+    /// Undirected degree per node. Leaf = degree <= 1 (filled); internal = degree
+    /// >= 2 (hollow), mirroring d3's parent/child distinction on a tree.
+    private func degreeMap() -> [String: Int] {
+        var degree: [String: Int] = [:]
+        for relation in package.relations {
+            degree[relation.sourceId, default: 0] += 1
+            degree[relation.targetId, default: 0] += 1
+        }
+        return degree
     }
 
     /// Node label (atom.label, else id), in the instrument label face. Returns a
