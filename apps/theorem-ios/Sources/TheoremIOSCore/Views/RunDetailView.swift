@@ -75,14 +75,48 @@ struct RunDetailView: View {
 
     private func evidenceRail(_ ledger: HarnessRunLedger) -> some View {
         railCard(title: "EVIDENCE") {
-            HStack(spacing: 6) {
-                readout("\(ledger.includedAtoms)", "included")
-                railDot
-                readout("\(ledger.excludedAtoms)", "excluded")
-                Spacer()
-                Text(ledger.artifactID)
-                    .font(TheoremFonts.mono(size: 11)).foregroundStyle(theme.textMuted)
-                    .padding(.horizontal, 7).padding(.vertical, 3)
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 6) {
+                    readout("\(ledger.includedAtoms)", "included")
+                    railDot
+                    readout("\(ledger.excludedAtoms)", "excluded")
+                    Spacer()
+                    Text(ledger.artifactID)
+                        .font(TheoremFonts.mono(size: 11)).foregroundStyle(theme.textMuted)
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(theme.chrome, in: Capsule())
+                }
+                if !run.contextAtoms.isEmpty {
+                    Divider().overlay(theme.hairline)
+                    VStack(spacing: 6) {
+                        ForEach(run.contextAtoms) { atom in
+                            atomRow(atom)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func atomRow(_ atom: HarnessContextAtom) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: atom.isIncluded ? "circle.fill" : "slash.circle")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(atom.isIncluded ? theme.ruleStrong : theme.textMuted)
+            Text(atom.title)
+                .font(TheoremFonts.body(size: 12))
+                .foregroundStyle(atom.isIncluded ? theme.ink : theme.textMuted)
+                .lineLimit(1)
+                .strikethrough(!atom.isIncluded, color: theme.hairline)
+            Spacer(minLength: 6)
+            if atom.isIncluded {
+                Text("\(atom.tokens)t")
+                    .font(TheoremFonts.mono(size: 10)).foregroundStyle(theme.textMuted)
+            } else {
+                Text(atom.reasonLabel)
+                    .font(TheoremFonts.label(size: 9))
+                    .foregroundStyle(theme.textMuted)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(theme.chrome, in: Capsule())
             }
         }

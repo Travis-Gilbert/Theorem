@@ -49,6 +49,19 @@ public enum SampleRun {
             filesChanged: ["state_machine.rs"],
             validators: [HarnessRunValidator(id: "v1", status: "passed")],
             summary: "ported"
-        )
+        ),
+        // The `art-1` context pack, computed through the live Python
+        // ContextWebPack.bounded: 5 atoms ranked within budget, 2 generated
+        // artifacts quarantined. raw 500 / packed 200 / saved 300 matches the
+        // run's CONTEXT.PACKED ledger exactly.
+        contextAtoms: [
+            HarnessContextAtom(id: "atom-1", title: "kernel state machine", tokens: 40, decision: .included, reason: "ranked_within_budget"),
+            HarnessContextAtom(id: "atom-2", title: "guard table", tokens: 40, decision: .included, reason: "ranked_within_budget"),
+            HarnessContextAtom(id: "atom-3", title: "parity corpus", tokens: 40, decision: .included, reason: "ranked_within_budget"),
+            HarnessContextAtom(id: "atom-4", title: "state hash", tokens: 40, decision: .included, reason: "ranked_within_budget"),
+            HarnessContextAtom(id: "atom-5", title: "replay/fork", tokens: 40, decision: .included, reason: "ranked_within_budget"),
+            HarnessContextAtom(id: "file:dist/bundle.js", title: "generated bundle", tokens: 150, decision: .excluded, reason: "generated_artifact_quarantined"),
+            HarnessContextAtom(id: "file:build/out.js", title: "generated build", tokens: 150, decision: .excluded, reason: "generated_artifact_quarantined"),
+        ]
     )
 }

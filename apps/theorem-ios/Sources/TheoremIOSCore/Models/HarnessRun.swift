@@ -105,6 +105,45 @@ public struct HarnessRunOutcome: Equatable, Sendable {
     }
 }
 
+public enum HarnessContextDecision: String, Sendable {
+    case included
+    case excluded
+}
+
+/// One atom's inclusion decision inside the context pack (the Evidence rail's
+/// per-atom detail: "what did it read, and why"). Mirrors the `why_included` /
+/// `why_excluded` provenance the context compiler records.
+public struct HarnessContextAtom: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let tokens: Int
+    public let decision: HarnessContextDecision
+    /// The raw provenance reason, e.g. `ranked_within_budget`,
+    /// `generated_artifact_quarantined`, `token_budget_exhausted`.
+    public let reason: String
+
+    public init(id: String, title: String, tokens: Int, decision: HarnessContextDecision, reason: String) {
+        self.id = id
+        self.title = title
+        self.tokens = tokens
+        self.decision = decision
+        self.reason = reason
+    }
+
+    public var isIncluded: Bool { decision == .included }
+
+    /// A short human label for an exclusion reason.
+    public var reasonLabel: String {
+        switch reason {
+        case "generated_artifact_quarantined": "quarantined"
+        case "token_budget_exhausted": "over budget"
+        case "atom_budget_exhausted": "atom cap"
+        case "ranked_within_budget": "in budget"
+        default: reason.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+}
+
 public struct HarnessRun: Identifiable, Equatable, Sendable {
     public let runID: String
     public let task: String
@@ -112,6 +151,9 @@ public struct HarnessRun: Identifiable, Equatable, Sendable {
     public let events: [HarnessRunEvent]
     public let ledger: HarnessRunLedger?
     public let outcome: HarnessRunOutcome?
+    /// The context pack's per-atom inclusion decisions (the artifact the run's
+    /// `CONTEXT.PACKED` references). Empty when the run carries only counts.
+    public let contextAtoms: [HarnessContextAtom]
 
     public var id: String { runID }
 
@@ -121,7 +163,8 @@ public struct HarnessRun: Identifiable, Equatable, Sendable {
         actor: String,
         events: [HarnessRunEvent],
         ledger: HarnessRunLedger?,
-        outcome: HarnessRunOutcome?
+        outcome: HarnessRunOutcome?,
+        contextAtoms: [HarnessContextAtom] = []
     ) {
         self.runID = runID
         self.task = task
@@ -129,6 +172,7 @@ public struct HarnessRun: Identifiable, Equatable, Sendable {
         self.events = events
         self.ledger = ledger
         self.outcome = outcome
+        self.contextAtoms = contextAtoms
     }
 
     /// The run's current status (the last event's status, or `created`).
