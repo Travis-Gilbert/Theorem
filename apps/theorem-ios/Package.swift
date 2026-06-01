@@ -51,5 +51,9 @@ let package = Package(
             name: "TheoremIOSSmoke",
             dependencies: ["TheoremIOSCore"]
         ),
+        .testTarget(
+            name: "TheoremIOSCoreTests",
+            dependencies: ["TheoremIOSCore"]
+        ),
     ]
 )
