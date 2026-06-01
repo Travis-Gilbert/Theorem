@@ -6,6 +6,7 @@ public enum DynamicIslandMode: String {
     case search
     case ask
     case detail
+    case room
 }
 
 struct DynamicIslandView: View {
@@ -20,6 +21,8 @@ struct DynamicIslandView: View {
     var focusedAtom: SceneAtom?
     /// Drives the dossier's real substrate summary (the /ask/ compose stream).
     var searchClient: TheoremSearchClient
+    /// The room conversation, shown when the island morphs into .room.
+    var room: CommonplaceRoom?
     /// Called when the user submits a query in search mode. Wired to the live
     /// substrate search in `TheoremRootView`.
     var onSubmitQuery: () -> Void = {}
@@ -66,12 +69,16 @@ struct DynamicIslandView: View {
 
     private var collapsed: some View {
         HStack(spacing: 0) {
+            // The pill's main area opens the room (the conversation). A node tap
+            // opens that node's dossier; the search half opens search. All three
+            // are the same box changing shape and context.
             Button {
-                mode = .detail
+                mode = .room
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: "sparkles")
-                    Text(centerTitle)
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                        .font(.system(size: 12))
+                    Text(room?.ask ?? centerTitle)
                         .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -128,6 +135,16 @@ struct DynamicIslandView: View {
                         .foregroundStyle(theme.textMuted)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+            } else if mode == .room {
+                if let room {
+                    // The room conversation lives in the island now, not a slab.
+                    IslandRoomView(room: room, theme: theme, onClose: { mode = .idle })
+                } else {
+                    Text("No room.")
+                        .font(TheoremFonts.body(size: 13))
+                        .foregroundStyle(theme.textMuted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             } else {
                 HStack {
                     Text(modeTitle)
@@ -163,7 +180,7 @@ struct DynamicIslandView: View {
         }
         .padding(18)
         .frame(width: 356)
-        .frame(minHeight: mode == .detail ? 300 : (mode == .ask ? 96 : 150))
+        .frame(minHeight: (mode == .detail || mode == .room) ? 300 : (mode == .ask ? 96 : 150))
         .background(islandBackground(RoundedRectangle(cornerRadius: 28, style: .continuous)))
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
@@ -183,6 +200,8 @@ struct DynamicIslandView: View {
             "Ask"
         case .detail:
             "Center node"
+        case .room:
+            "Room"
         }
     }
 

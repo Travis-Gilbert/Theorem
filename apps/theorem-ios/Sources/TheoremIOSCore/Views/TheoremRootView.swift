@@ -80,9 +80,12 @@ public struct TheoremRootView: View {
             theme.background.ignoresSafeArea()
 
             TabView(selection: $surface) {
-                CommonplaceRoomView(
-                    room: room,
-                    projection: $projection,
+                // The graph is the canvas; ALL chrome (room, dossier, search)
+                // lives in the Dynamic Island, which changes shape and context.
+                // The room is no longer a slab below the graph.
+                TheoremSceneView(
+                    package: room.scene,
+                    projection: projection,
                     selectedNodeID: $selectedNodeID,
                     theme: theme
                 )
@@ -118,6 +121,7 @@ public struct TheoremRootView: View {
                 theme: theme,
                 focusedAtom: focusedAtom,
                 searchClient: searchClient,
+                room: room,
                 onSubmitQuery: { Task { await runSearch() } },
                 onSceneOS: { patentFocus = focusedAtom?.id ?? patentFocusID },
                 onDeeperSearch: { label in
