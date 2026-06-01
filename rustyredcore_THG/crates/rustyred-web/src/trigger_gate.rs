@@ -154,6 +154,8 @@ mod tests {
             ring: 0,
             ring_label: "match".to_string(),
             match_score: score,
+            // empty snippet => past the frontier, by provenance_of's rule.
+            provenance: "frontier".to_string(),
         }
     }
 
