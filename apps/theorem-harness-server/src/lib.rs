@@ -4,13 +4,17 @@
 //! docs/plans/harness-rust-port/ios-transport-handoff.md):
 //!   - `runs_json`  -> { "runs":   [ <run node properties> ] }
 //!   - `run_json`   -> { "run": <RunState>, "events": [ <EventState> ] }
+//!   - coordination read helpers -> presence, intents, room status, mentions
 //!
 //! Kept as pure functions over `GraphStore` so they are unit-testable without a
 //! live server; `main.rs` is a thin Axum shell that calls them.
 
 use rustyred_thg_core::{GraphStore, NodeQuery};
 use serde_json::{json, Value};
-use theorem_harness_runtime::{load_events, load_run, HarnessRuntimeError};
+use theorem_harness_runtime::{
+    list_presence, load_events, load_run, read_intents_for_room, read_mentions_for_actor,
+    room_status, CoordinationError, HarnessRuntimeError,
+};
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
 pub const RUN_LABEL: &str = "HarnessRun";
@@ -44,13 +48,76 @@ pub fn run_json<S: GraphStore>(
     }
 }
 
+/// Room membership/task state for the coordination view.
+pub fn room_json<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    room_id: &str,
+) -> Result<Value, CoordinationError> {
+    Ok(json!({
+        "tenant": tenant_slug,
+        "room_id": room_id,
+        "room": room_status(store, tenant_slug, room_id)?
+    }))
+}
+
+/// Fresh actor presence for the Participants surface.
+pub fn presence_json<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+) -> Result<Value, CoordinationError> {
+    let presence = list_presence(store, tenant_slug)?;
+    Ok(json!({
+        "tenant": tenant_slug,
+        "presence": presence,
+        "count": presence.len()
+    }))
+}
+
+/// Live room intents. Empty `statuses` means all statuses.
+pub fn intents_json<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    room_id: &str,
+    statuses: &[String],
+) -> Result<Value, CoordinationError> {
+    let intents = read_intents_for_room(store, tenant_slug, room_id, statuses)?;
+    Ok(json!({
+        "tenant": tenant_slug,
+        "room_id": room_id,
+        "intents": intents,
+        "count": intents.len()
+    }))
+}
+
+/// Actor mention inbox. `consume=true` updates the underlying message records.
+pub fn mentions_json<S: GraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    actor_id: &str,
+    consume: bool,
+    limit: usize,
+) -> Result<Value, CoordinationError> {
+    let mentions = read_mentions_for_actor(store, tenant_slug, actor_id, consume, limit)?;
+    Ok(json!({
+        "tenant": tenant_slug,
+        "actor_id": actor_id,
+        "mentions": mentions,
+        "count": mentions.len(),
+        "consumed": consume
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustyred_thg_core::InMemoryGraphStore;
     use serde_json::Map;
     use theorem_harness_core::TransitionInput;
-    use theorem_harness_runtime::append_transition_from_store;
+    use theorem_harness_runtime::{
+        append_transition_from_store, heartbeat_presence, join_room, write_intent, write_message,
+        JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
+    };
 
     fn payload(pairs: &[(&str, Value)]) -> Map<String, Value> {
         let mut map = Map::new();
@@ -63,7 +130,10 @@ mod tests {
     fn seed_run(store: &mut InMemoryGraphStore) {
         let created = TransitionInput::new(
             "RUN.CREATED",
-            payload(&[("task", json!("port harness")), ("actor", json!("claude-code"))]),
+            payload(&[
+                ("task", json!("port harness")),
+                ("actor", json!("claude-code")),
+            ]),
         )
         .with_run_id("run-http-test");
         append_transition_from_store(store, created).expect("RUN.CREATED");
@@ -79,6 +149,61 @@ mod tests {
         )
         .with_run_id("run-http-test");
         append_transition_from_store(store, observed).expect("HOST.OBSERVED");
+    }
+
+    fn seed_coordination(store: &mut InMemoryGraphStore) {
+        join_room(
+            store,
+            JoinRoomInput {
+                tenant_slug: "smoke".to_string(),
+                actor_id: "codex".to_string(),
+                room_id: "repo:theorem:branch:main".to_string(),
+                repo: "Theorem".to_string(),
+                branch: "main".to_string(),
+                task: "transport coordination".to_string(),
+                updated_at: "2026-06-01T16:00:00Z".to_string(),
+                ..JoinRoomInput::default()
+            },
+        )
+        .expect("join room");
+        heartbeat_presence(
+            store,
+            PresenceInput {
+                tenant_slug: "smoke".to_string(),
+                actor_id: "codex".to_string(),
+                status: "active".to_string(),
+                refreshed_at: "2026-06-01T16:01:00Z".to_string(),
+                ..PresenceInput::default()
+            },
+        )
+        .expect("presence");
+        write_intent(
+            store,
+            WriteIntentInput {
+                tenant_slug: "smoke".to_string(),
+                room_id: "repo:theorem:branch:main".to_string(),
+                actor_id: "codex".to_string(),
+                status: "working".to_string(),
+                summary: "Expose coordination HTTP endpoints".to_string(),
+                claimed_files: vec!["apps/theorem-harness-server/src/lib.rs".to_string()],
+                updated_at: "2026-06-01T16:02:00Z".to_string(),
+                ..WriteIntentInput::default()
+            },
+        )
+        .expect("intent");
+        write_message(
+            store,
+            WriteMessageInput {
+                tenant_slug: "smoke".to_string(),
+                room_id: "repo:theorem:branch:main".to_string(),
+                actor_id: "codex".to_string(),
+                urgency: "ask".to_string(),
+                message: "@claude-code please verify the HTTP transport".to_string(),
+                created_at: "2026-06-01T16:03:00Z".to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .expect("message");
     }
 
     #[test]
@@ -103,5 +228,40 @@ mod tests {
         assert!(events[1]["state_hash_after"].as_str().is_some());
 
         assert!(run_json(&store, "unknown-run").expect("load ok").is_none());
+    }
+
+    #[test]
+    fn serves_coordination_contracts() {
+        let mut store = InMemoryGraphStore::default();
+        seed_coordination(&mut store);
+
+        let room =
+            room_json(&store, "smoke", "repo:theorem:branch:main").expect("room status json");
+        assert_eq!(room["room"]["members"]["codex"]["status"], json!("joined"));
+
+        let presence = presence_json(&store, "smoke").expect("presence json");
+        assert_eq!(presence["count"], json!(1));
+        assert_eq!(presence["presence"][0]["actor_id"], json!("codex"));
+
+        let intents =
+            intents_json(&store, "smoke", "repo:theorem:branch:main", &[]).expect("intents json");
+        assert_eq!(intents["count"], json!(1));
+        assert_eq!(
+            intents["intents"][0]["summary"],
+            json!("Expose coordination HTTP endpoints")
+        );
+
+        let mentions =
+            mentions_json(&mut store, "smoke", "claude-code", false, 20).expect("mentions json");
+        assert_eq!(mentions["count"], json!(1));
+        assert_eq!(mentions["mentions"][0]["actor_id"], json!("codex"));
+
+        let consumed =
+            mentions_json(&mut store, "smoke", "claude-code", true, 20).expect("consume mentions");
+        assert_eq!(consumed["count"], json!(1));
+
+        let empty_after_consume =
+            mentions_json(&mut store, "smoke", "claude-code", false, 20).expect("mentions empty");
+        assert_eq!(empty_after_consume["count"], json!(0));
     }
 }

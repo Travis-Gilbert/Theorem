@@ -261,9 +261,18 @@ Not covered yet: event/decision/tension/reflection records, context injection
 into the channel, contribution capture, and permission/cost hooks. Those remain
 the rest of the direct-coordination module.
 
-The HTTP transport exposure is a separate non-overlapping lane owned by Claude
-Code as `apps/theorem-harness-server` over `theorem-harness-runtime`. Do not
-start that server crate from the MCP lane.
+The HTTP transport exposure now lives in `apps/theorem-harness-server` over
+`theorem-harness-runtime`. It serves run list/detail plus the native
+coordination read contracts:
+
+- `GET /harness/rooms/{room_id}` for room membership/task state.
+- `GET /harness/rooms/{room_id}/presence` for participant freshness.
+- `GET /harness/rooms/{room_id}/intents` for live actor claims.
+- `GET /harness/actors/{actor}/mentions` for the actor inbox, with optional
+  `consume=true`.
+
+Each endpoint accepts `tenant` or `tenant_slug` as a query parameter and reads
+from the same `RedCoreGraphStore` as the run transport.
 
 Remaining runtime/substrate work beyond that: context IO retrieval, substrate
 adapters, map repository writes, affordance execution wrappers, charter

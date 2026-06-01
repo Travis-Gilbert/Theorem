@@ -68,22 +68,34 @@ Either is fine; the JSON contract above is what matters. The `RedCoreGraphStore`
 
 `theorem-harness-runtime::coordination` now persists rooms, intents, durable
 presence, messages, and `@actor` mentions to the same GraphStore. The same
-transport should expose these so the Participants surface (UI spec Part 4) can go
-from honest-idle to live status, and so agents can coordinate over the reliable
+transport exposes these so the Participants surface (UI spec Part 4) can go from
+honest-idle to live status, and so agents can coordinate over the reliable
 native path instead of git. Read endpoints, wrapping the existing functions:
 
 ### `GET /harness/rooms/{room_id}/presence`
 
-`list_presence` -> who is fresh right now. Response: `{ "presence": [ { <CoordinationPresenceState serde> }, ... ] }`. Drives the participant status dots (idle / engaged / contributing / unreachable).
+Implemented in `apps/theorem-harness-server`. `list_presence` -> who is fresh
+right now. Response:
+`{ "tenant": "...", "presence": [ { <CoordinationPresenceState serde> }, ... ], "count": 0 }`.
+Drives the participant status dots (idle / engaged / contributing /
+unreachable).
 
 ### `GET /harness/rooms/{room_id}/intents`
 
-`read_intents_for_room` -> live intents (actor, summary, claimed_files, status). Response: `{ "intents": [ { <CoordinationIntentState serde> }, ... ] }`.
+Implemented in `apps/theorem-harness-server`. `read_intents_for_room` -> live
+intents (actor, summary, claimed_files, status). Response:
+`{ "tenant": "...", "room_id": "...", "intents": [ { <CoordinationIntentState serde> }, ... ], "count": 0 }`.
+Optional `status` or comma-separated `statuses` filters the live claim list.
 
 ### `GET /harness/rooms/{room_id}` and `GET /harness/actors/{actor}/mentions`
 
-`room_status` and `read_mentions_for_actor` -> membership/task and the @mention
-inbox. Lower priority for the iOS surface; useful for the coordination view.
+Implemented in `apps/theorem-harness-server`. `room_status` and
+`read_mentions_for_actor` -> membership/task and the @mention inbox. Mentions
+accept optional `limit` and `consume=true` query parameters.
+
+All coordination endpoints accept `tenant` or `tenant_slug` as a query parameter;
+omitting it uses `default`, which is appropriate for local smoke stores but not
+hosted tenant routing.
 
 I'll add a `RemoteParticipantStore` that decodes the presence/intent contract the
 same way `RemoteHarnessRunStore` decodes runs, so the Participants surface goes

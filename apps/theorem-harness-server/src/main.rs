@@ -4,6 +4,10 @@
 //! contract the Theorem clients consume:
 //!   GET /harness/runs            -> { "runs": [...] }
 //!   GET /harness/runs/{run_id}   -> { "run": {...}, "events": [...] }  (404 if unknown)
+//!   GET /harness/rooms/{room_id}          -> { "room": {...} }
+//!   GET /harness/rooms/{room_id}/presence -> { "presence": [...] }
+//!   GET /harness/rooms/{room_id}/intents  -> { "intents": [...] }
+//!   GET /harness/actors/{actor}/mentions  -> { "mentions": [...] }
 //!   GET /healthz                 -> "ok"
 //!
 //! Reads the same store the runtime persists runs to. Set the data dir with
@@ -14,16 +18,49 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
     Json, Router,
 };
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
+use serde::Deserialize;
 use serde_json::Value;
-use theorem_harness_server::{run_json, runs_json};
+use theorem_harness_server::{
+    intents_json, mentions_json, presence_json, room_json, run_json, runs_json,
+};
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
+
+#[derive(Debug, Default, Deserialize)]
+struct CoordinationQuery {
+    tenant: Option<String>,
+    tenant_slug: Option<String>,
+    status: Option<String>,
+    statuses: Option<String>,
+    consume: Option<bool>,
+    limit: Option<usize>,
+}
+
+impl CoordinationQuery {
+    fn tenant_slug(&self) -> String {
+        self.tenant_slug
+            .as_deref()
+            .or(self.tenant.as_deref())
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty())
+            .unwrap_or("default")
+            .to_string()
+    }
+
+    fn statuses(&self) -> Vec<String> {
+        self.statuses
+            .as_deref()
+            .or(self.status.as_deref())
+            .map(split_csv)
+            .unwrap_or_default()
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -44,6 +81,13 @@ async fn main() {
         .route("/healthz", get(healthz))
         .route("/harness/runs", get(list_runs))
         .route("/harness/runs/:run_id", get(get_run))
+        .route("/harness/rooms/:room_id", get(get_room))
+        .route("/harness/rooms/:room_id/presence", get(get_room_presence))
+        .route("/harness/rooms/:room_id/intents", get(get_room_intents))
+        .route(
+            "/harness/actors/:actor_id/mentions",
+            get(get_actor_mentions),
+        )
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "50080".to_string());
@@ -74,4 +118,63 @@ async fn get_run(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+async fn get_room(
+    State(store): State<SharedStore>,
+    Path(room_id): Path<String>,
+    Query(query): Query<CoordinationQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let store = store.lock().expect("store lock");
+    room_json(&*store, &query.tenant_slug(), &room_id)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_room_presence(
+    State(store): State<SharedStore>,
+    Path(_room_id): Path<String>,
+    Query(query): Query<CoordinationQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let store = store.lock().expect("store lock");
+    presence_json(&*store, &query.tenant_slug())
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_room_intents(
+    State(store): State<SharedStore>,
+    Path(room_id): Path<String>,
+    Query(query): Query<CoordinationQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let store = store.lock().expect("store lock");
+    intents_json(&*store, &query.tenant_slug(), &room_id, &query.statuses())
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_actor_mentions(
+    State(store): State<SharedStore>,
+    Path(actor_id): Path<String>,
+    Query(query): Query<CoordinationQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut store = store.lock().expect("store lock");
+    mentions_json(
+        &mut *store,
+        &query.tenant_slug(),
+        &actor_id,
+        query.consume.unwrap_or(false),
+        query.limit.unwrap_or(20),
+    )
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }

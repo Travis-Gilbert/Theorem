@@ -987,6 +987,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "rustyred-thg-core",
+ "serde",
  "serde_json",
  "theorem-harness-core",
  "theorem-harness-runtime",
