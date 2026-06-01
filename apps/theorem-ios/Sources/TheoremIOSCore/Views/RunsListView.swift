@@ -10,17 +10,17 @@ import SwiftUI
 struct RunsListView: View {
     var theme: TheoremTheme
 
+    @State private var path: [String] = []
+
     private let runs: [HarnessRun] = [SampleRun.fullLifecycle]
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header
                     ForEach(runs) { run in
-                        NavigationLink {
-                            RunDetailView(run: run, theme: theme)
-                        } label: {
+                        NavigationLink(value: run.runID) {
                             runRow(run)
                         }
                         .buttonStyle(.plain)
@@ -30,6 +30,19 @@ struct RunsListView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .background(theme.field.ignoresSafeArea())
+            .navigationDestination(for: String.self) { runID in
+                if let run = runs.first(where: { $0.runID == runID }) {
+                    RunDetailView(run: run, theme: theme)
+                }
+            }
+        }
+        .task {
+            // -runDetail 1 opens the first recorded run's detail directly
+            // (deep-link + screenshot capture), consistent with the app's
+            // -patent / -autoSearch launch arguments.
+            if UserDefaults.standard.bool(forKey: "runDetail"), let first = runs.first {
+                path = [first.runID]
+            }
         }
     }
 
