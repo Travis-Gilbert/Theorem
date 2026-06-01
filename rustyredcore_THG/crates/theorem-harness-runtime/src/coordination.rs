@@ -2,11 +2,12 @@ use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
+use theorem_harness_core::stable_value_hash;
 
 pub type CoordinationResult<T> = Result<T, CoordinationError>;
 
@@ -15,6 +16,7 @@ const DEFAULT_ROOM: &str = "room:ungrouped";
 const DEFAULT_MODE: &str = "collaborating";
 const DEFAULT_PRESENCE_TTL_SECONDS: u64 = 60;
 const INTENT_STATUSES: &[&str] = &["working", "paused", "done"];
+const MESSAGE_URGENCIES: &[&str] = &["info", "ask", "block"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoordinationError {
@@ -127,6 +129,28 @@ pub struct PresenceInput {
     pub refreshed_at: String,
     #[serde(default)]
     pub expires_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct WriteMessageInput {
+    #[serde(default)]
+    pub tenant_slug: String,
+    #[serde(default)]
+    pub room_id: String,
+    #[serde(default)]
+    pub actor_id: String,
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub urgency: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 impl Default for PresenceInput {
@@ -251,6 +275,24 @@ pub struct CoordinationPresenceState {
     #[serde(default)]
     pub expires_at: String,
     pub ttl_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationMessageState {
+    pub tenant_slug: String,
+    pub room_id: String,
+    pub message_id: String,
+    pub actor_id: String,
+    pub urgency: String,
+    pub message: String,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    #[serde(default)]
+    pub consumed_by: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 pub fn join_room<S: GraphStore>(
@@ -500,6 +542,129 @@ pub fn list_presence<S: GraphStore>(
     Ok(records)
 }
 
+pub fn write_message<S: GraphStore>(
+    store: &mut S,
+    input: WriteMessageInput,
+) -> CoordinationResult<CoordinationMessageState> {
+    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let room_id = normalize_room_id(&input.room_id);
+    let actor_id = require_text("actor_id", &input.actor_id)?;
+    let message = require_text("message", &input.message)?;
+    let urgency = normalize_urgency(&input.urgency)?;
+    let created_at = timestamp_or_now(&input.created_at);
+    let mentions = merge_mentions(parse_mentions(&message), normalize_files(&input.mentions));
+    let message_id = if input.message_id.trim().is_empty() {
+        stable_message_id(&tenant_slug, &room_id, &actor_id, &message, &created_at)
+    } else {
+        input.message_id.trim().to_string()
+    };
+
+    if load_room(store, &tenant_slug, &room_id)?.is_none() {
+        persist_room_state(
+            store,
+            &empty_room_state(&tenant_slug, &room_id, &created_at),
+        )?;
+    }
+
+    let state = CoordinationMessageState {
+        tenant_slug,
+        room_id,
+        message_id,
+        actor_id,
+        urgency,
+        message,
+        mentions,
+        metadata: input.metadata,
+        consumed_by: Vec::new(),
+        created_at,
+    };
+    persist_message_state(store, &state)?;
+    Ok(state)
+}
+
+pub fn read_messages_for_room<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    room_id: &str,
+    limit: usize,
+) -> CoordinationResult<Vec<CoordinationMessageState>> {
+    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let room_id = normalize_room_id(room_id);
+    let mut messages = store
+        .query_nodes(
+            NodeQuery::label("CoordinationMessage")
+                .with_property("tenant_slug", Value::String(tenant_slug))
+                .with_property("room_id", Value::String(room_id)),
+        )
+        .into_iter()
+        .map(|node| {
+            serde_json::from_value::<CoordinationMessageState>(node.properties)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
+        })
+        .collect::<CoordinationResult<Vec<_>>>()?;
+    messages.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.message_id.cmp(&left.message_id))
+    });
+    if limit > 0 {
+        messages.truncate(limit);
+    }
+    Ok(messages)
+}
+
+pub fn read_mentions_for_actor<S: GraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    actor_id: &str,
+    consume: bool,
+    limit: usize,
+) -> CoordinationResult<Vec<CoordinationMessageState>> {
+    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let actor_id = require_text("actor_id", actor_id)?;
+    let mut messages = store
+        .query_nodes(
+            NodeQuery::label("CoordinationMessage")
+                .with_property("tenant_slug", Value::String(tenant_slug.clone())),
+        )
+        .into_iter()
+        .map(|node| {
+            serde_json::from_value::<CoordinationMessageState>(node.properties)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
+        })
+        .filter_map(|result| match result {
+            Ok(message)
+                if message.mentions.iter().any(|mention| mention == &actor_id)
+                    && !message
+                        .consumed_by
+                        .iter()
+                        .any(|consumer| consumer == &actor_id) =>
+            {
+                Some(Ok(message))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<CoordinationResult<Vec<_>>>()?;
+    messages.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    if limit > 0 {
+        messages.truncate(limit);
+    }
+    if consume {
+        for message in &messages {
+            let mut consumed = message.clone();
+            consumed.consumed_by = merge_mentions(consumed.consumed_by, vec![actor_id.clone()]);
+            persist_message_state(store, &consumed)?;
+        }
+    }
+    Ok(messages)
+}
+
 pub fn infer_coordination_room_id(
     repo: &str,
     branch: &str,
@@ -568,6 +733,30 @@ pub fn coordination_presence_node_id(tenant_slug: &str, actor_id: &str) -> Strin
     )
 }
 
+pub fn coordination_message_node_id(tenant_slug: &str, room_id: &str, message_id: &str) -> String {
+    format!(
+        "harness:coordination:message:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(message_id).if_empty("unknown")
+    )
+}
+
+pub fn coordination_mention_edge_id(
+    tenant_slug: &str,
+    room_id: &str,
+    message_id: &str,
+    actor_id: &str,
+) -> String {
+    format!(
+        "harness:coordination:edge:mention:{}:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(message_id).if_empty("unknown"),
+        slugify_room_part(actor_id).if_empty("unknown")
+    )
+}
+
 fn persist_room_state<S: GraphStore>(
     store: &mut S,
     state: &CoordinationRoomState,
@@ -594,6 +783,41 @@ fn persist_presence_state<S: GraphStore>(
     state: &CoordinationPresenceState,
 ) -> CoordinationResult<()> {
     upsert_node_if_changed(store, presence_node(state)?)?;
+    Ok(())
+}
+
+fn persist_message_state<S: GraphStore>(
+    store: &mut S,
+    state: &CoordinationMessageState,
+) -> CoordinationResult<()> {
+    upsert_node_if_changed(store, message_node(state)?)?;
+    upsert_edge_if_changed(store, message_room_edge(state)?)?;
+    for actor_id in &state.mentions {
+        let member = CoordinationRoomMember {
+            tenant_slug: state.tenant_slug.clone(),
+            room_id: state.room_id.clone(),
+            actor_id: actor_id.clone(),
+            status: "mentioned".to_string(),
+            session_id: String::new(),
+            surface: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            task: String::new(),
+            worktree: String::new(),
+            head: String::new(),
+            changed_files: Vec::new(),
+            lane: String::new(),
+            joined_at: String::new(),
+            updated_at: state.created_at.clone(),
+        };
+        if store
+            .get_node(&coordination_member_node_id(&state.tenant_slug, actor_id))
+            .is_none()
+        {
+            upsert_node_if_changed(store, member_node(&member)?)?;
+        }
+        upsert_edge_if_changed(store, message_mention_edge(state, actor_id)?)?;
+    }
     Ok(())
 }
 
@@ -703,6 +927,63 @@ fn presence_node(state: &CoordinationPresenceState) -> CoordinationResult<NodeRe
     ))
 }
 
+fn message_node(state: &CoordinationMessageState) -> CoordinationResult<NodeRecord> {
+    let properties = serde_json::to_value(state)
+        .map_err(|error| CoordinationError::Serialization(error.to_string()))?;
+    Ok(NodeRecord::new(
+        coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
+        ["HarnessCoordination", "CoordinationMessage"],
+        properties,
+    ))
+}
+
+fn message_room_edge(state: &CoordinationMessageState) -> CoordinationResult<EdgeRecord> {
+    Ok(EdgeRecord::new(
+        format!(
+            "harness:coordination:edge:message:{}:{}:{}",
+            normalize_tenant_slug(&state.tenant_slug),
+            slugify_room_part(&state.room_id).if_empty("ungrouped"),
+            slugify_room_part(&state.message_id).if_empty("unknown")
+        ),
+        coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
+        "COORDINATION_MESSAGE_OF",
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "room_id": state.room_id,
+            "message_id": state.message_id,
+            "actor_id": state.actor_id,
+            "urgency": state.urgency,
+            "created_at": state.created_at,
+        }),
+    ))
+}
+
+fn message_mention_edge(
+    state: &CoordinationMessageState,
+    actor_id: &str,
+) -> CoordinationResult<EdgeRecord> {
+    Ok(EdgeRecord::new(
+        coordination_mention_edge_id(
+            &state.tenant_slug,
+            &state.room_id,
+            &state.message_id,
+            actor_id,
+        ),
+        coordination_message_node_id(&state.tenant_slug, &state.room_id, &state.message_id),
+        "COORDINATION_MENTIONS",
+        coordination_member_node_id(&state.tenant_slug, actor_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "room_id": state.room_id,
+            "message_id": state.message_id,
+            "actor_id": actor_id,
+            "urgency": state.urgency,
+            "created_at": state.created_at,
+        }),
+    ))
+}
+
 fn empty_room_state(tenant_slug: &str, room_id: &str, now: &str) -> CoordinationRoomState {
     CoordinationRoomState {
         tenant_slug: normalize_tenant_slug(tenant_slug),
@@ -734,6 +1015,22 @@ fn normalize_status(status: &str) -> CoordinationResult<String> {
         Err(CoordinationError::InvalidInput {
             field: "status".to_string(),
             message: format!("must be one of {:?}", INTENT_STATUSES),
+        })
+    }
+}
+
+fn normalize_urgency(urgency: &str) -> CoordinationResult<String> {
+    let urgency = if urgency.trim().is_empty() {
+        "info".to_string()
+    } else {
+        urgency.trim().to_lowercase()
+    };
+    if MESSAGE_URGENCIES.contains(&urgency.as_str()) {
+        Ok(urgency)
+    } else {
+        Err(CoordinationError::InvalidInput {
+            field: "urgency".to_string(),
+            message: format!("must be one of {:?}", MESSAGE_URGENCIES),
         })
     }
 }
@@ -810,6 +1107,84 @@ fn normalize_files(values: &[String]) -> Vec<String> {
         files.push(value.to_string());
     }
     files
+}
+
+fn merge_mentions(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut merged = Vec::new();
+    for value in left.into_iter().chain(right) {
+        let value = value.trim();
+        if value.is_empty() || !seen.insert(value.to_string()) {
+            continue;
+        }
+        merged.push(value.to_string());
+    }
+    merged
+}
+
+fn parse_mentions(message: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut seen = BTreeSet::new();
+    let bytes = message.as_bytes();
+    let mut index = 0;
+    let mut in_code = false;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            in_code = !in_code;
+            index += 1;
+            continue;
+        }
+        if in_code || bytes[index] != b'@' {
+            index += 1;
+            continue;
+        }
+        let previous_is_word = index > 0
+            && (bytes[index - 1].is_ascii_alphanumeric()
+                || bytes[index - 1] == b'_'
+                || bytes[index - 1] == b'-');
+        if previous_is_word {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        if start >= bytes.len() || !bytes[start].is_ascii_alphanumeric() {
+            index += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len()
+            && end - start < 120
+            && (bytes[end].is_ascii_alphanumeric()
+                || matches!(bytes[end], b'_' | b'.' | b':' | b'-'))
+        {
+            end += 1;
+        }
+        if let Some(actor_id) = message.get(start..end) {
+            let actor_id = actor_id.trim();
+            if !actor_id.is_empty() && seen.insert(actor_id.to_string()) {
+                mentions.push(actor_id.to_string());
+            }
+        }
+        index = end;
+    }
+    mentions
+}
+
+fn stable_message_id(
+    tenant_slug: &str,
+    room_id: &str,
+    actor_id: &str,
+    message: &str,
+    created_at: &str,
+) -> String {
+    let hash = stable_value_hash(&json!({
+        "tenant_slug": tenant_slug,
+        "room_id": room_id,
+        "actor_id": actor_id,
+        "message": message,
+        "created_at": created_at,
+    }));
+    format!("msg_{}", &hash[..16])
 }
 
 fn slugify_room_part(value: &str) -> String {
@@ -1038,6 +1413,106 @@ mod tests {
     }
 
     #[test]
+    fn write_message_parses_mentions_and_persists_edges() {
+        let mut store = InMemoryGraphStore::new();
+        let message = write_message(
+            &mut store,
+            WriteMessageInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                urgency: "ask".to_string(),
+                message: "@claude-code please review `@ignored` and @claude-ai".to_string(),
+                mentions: vec!["claude-code".to_string(), "deepseek".to_string()],
+                metadata: Map::from_iter([(
+                    "commit".to_string(),
+                    Value::String("abc123".to_string()),
+                )]),
+                created_at: T1.to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            message.mentions,
+            vec!["claude-code", "claude-ai", "deepseek"]
+        );
+        assert_eq!(message.urgency, "ask");
+        assert!(store
+            .get_node(&coordination_message_node_id(
+                TENANT,
+                ROOM,
+                &message.message_id
+            ))
+            .is_some());
+        assert!(store
+            .get_edge(&coordination_mention_edge_id(
+                TENANT,
+                ROOM,
+                &message.message_id,
+                "claude-code"
+            ))
+            .is_some());
+
+        let room_messages = read_messages_for_room(&store, TENANT, ROOM, 10).unwrap();
+        assert_eq!(room_messages.len(), 1);
+        assert_eq!(room_messages[0].metadata["commit"], "abc123");
+    }
+
+    #[test]
+    fn read_mentions_can_consume_target_actor_inbox() {
+        let mut store = InMemoryGraphStore::new();
+        write_message(
+            &mut store,
+            WriteMessageInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                message_id: "m1".to_string(),
+                message: "@claude-code first".to_string(),
+                created_at: T1.to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .unwrap();
+        write_message(
+            &mut store,
+            WriteMessageInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                message_id: "m2".to_string(),
+                message: "@claude-code second and @codex copied".to_string(),
+                created_at: T2.to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .unwrap();
+
+        let peek = read_mentions_for_actor(&mut store, TENANT, "claude-code", false, 10).unwrap();
+        assert_eq!(
+            peek.iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+
+        let consumed =
+            read_mentions_for_actor(&mut store, TENANT, "claude-code", true, 10).unwrap();
+        assert_eq!(consumed.len(), 2);
+        assert!(
+            read_mentions_for_actor(&mut store, TENANT, "claude-code", false, 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let codex = read_mentions_for_actor(&mut store, TENANT, "codex", false, 10).unwrap();
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].message_id, "m2");
+    }
+
+    #[test]
     fn redcore_reopens_coordination_room_intent_and_presence() {
         let data_dir = std::env::temp_dir().join(format!(
             "theorem-harness-coordination-{}",
@@ -1084,6 +1559,19 @@ mod tests {
                 },
             )
             .unwrap();
+            write_message(
+                &mut store,
+                WriteMessageInput {
+                    tenant_slug: TENANT.to_string(),
+                    room_id: ROOM.to_string(),
+                    actor_id: "codex".to_string(),
+                    message_id: "m-redcore".to_string(),
+                    message: "@claude-code persisted message".to_string(),
+                    created_at: T1.to_string(),
+                    ..WriteMessageInput::default()
+                },
+            )
+            .unwrap();
         }
 
         {
@@ -1095,6 +1583,9 @@ mod tests {
             assert_eq!(intents.len(), 1);
             let presence = load_presence(&store, TENANT, "codex").unwrap().unwrap();
             assert_eq!(presence.status, "active");
+            let messages = read_messages_for_room(&store, TENANT, ROOM, 10).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].message_id, "m-redcore");
         }
 
         let _ = fs::remove_dir_all(data_dir);

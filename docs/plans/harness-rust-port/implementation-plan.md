@@ -242,12 +242,15 @@ Started the direct coordination channel in
 `theorem_harness_runtime::coordination`. This first substrate slice persists
 coordination-room membership, one live intent per `(room, actor)`, and durable
 presence records directly into `GraphStore`, with `RedCoreGraphStore`
-reopen-tests. It mirrors the currently useful room/intent/presence shape while
-removing Django/cache as the only durable path.
+reopen-tests. The second slice adds append-only direct messages, `@actor`
+mention parsing, `COORDINATION_MENTIONS` graph edges, room message reads, and
+consume-on-read inbox semantics. It mirrors the currently useful
+room/intent/presence/messages shape while removing Django/cache as the only
+durable path.
 
-Not covered yet: direct messages/mentions, event/decision/tension/reflection
-records, context injection into the channel, contribution capture, and
-permission/cost hooks. Those remain the rest of the direct-coordination module.
+Not covered yet: event/decision/tension/reflection records, context injection
+into the channel, contribution capture, and permission/cost hooks. Those remain
+the rest of the direct-coordination module.
 
 Remaining runtime/substrate work beyond that: context IO retrieval, substrate
 adapters, map repository writes, affordance execution wrappers, charter
