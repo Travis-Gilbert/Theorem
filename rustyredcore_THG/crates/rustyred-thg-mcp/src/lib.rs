@@ -887,7 +887,11 @@ fn call_tool<P: McpGraphProvider>(
                     "message": "Native coordination record writes are unavailable while read-only mode is active."
                 })));
             }
-            write_record_payload(&tenant, &mut backend, &arguments)?
+            let policy_receipt = coordination_policy_receipt(context, &arguments, name);
+            if let Some(error) = coordination_policy_error(&policy_receipt) {
+                return Ok(tool_result_error(error));
+            }
+            write_record_payload(&tenant, &mut backend, &arguments, Some(policy_receipt))?
         }
         "coordination_contribution" | "theorem_harness_coordination_contribution" => {
             if config.read_only {
@@ -896,7 +900,11 @@ fn call_tool<P: McpGraphProvider>(
                     "message": "Native coordination contribution writes are unavailable while read-only mode is active."
                 })));
             }
-            write_contribution_payload(&tenant, &mut backend, &arguments)?
+            let policy_receipt = coordination_policy_receipt(context, &arguments, name);
+            if let Some(error) = coordination_policy_error(&policy_receipt) {
+                return Ok(tool_result_error(error));
+            }
+            write_contribution_payload(&tenant, &mut backend, &arguments, Some(policy_receipt))?
         }
         "read_records_for_room" | "theorem_harness_read_records_for_room" => {
             read_records_payload(&tenant, &backend, &arguments)?
@@ -2262,8 +2270,13 @@ fn write_record_payload(
     tenant: &str,
     backend: &mut impl McpGraphBackend,
     arguments: &Value,
+    policy_receipt: Option<Value>,
 ) -> Result<Value, McpError> {
     let room_id = resolved_coordination_room_id(arguments);
+    let mut metadata = argument_object(arguments, "metadata");
+    if let Some(policy_receipt) = policy_receipt.clone() {
+        metadata.insert("policy_receipt".to_string(), policy_receipt);
+    }
     let record = write_coordination_record(
         backend,
         WriteRecordInput {
@@ -2283,21 +2296,24 @@ fn write_record_payload(
             title: argument_text(arguments, &["title"]).unwrap_or_default(),
             summary: required_text_any(arguments, &["summary"], "coordination_record")?,
             body: argument_text(arguments, &["body"]).unwrap_or_default(),
-            metadata: argument_object(arguments, "metadata"),
+            metadata,
             created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
         },
     )?;
-    Ok(json!({
+    let mut payload = json!({
         "tenant": tenant,
         "room_id": room_id,
         "record": record
-    }))
+    });
+    insert_policy_receipt(&mut payload, policy_receipt);
+    Ok(payload)
 }
 
 fn write_contribution_payload(
     tenant: &str,
     backend: &mut impl McpGraphBackend,
     arguments: &Value,
+    policy_receipt: Option<Value>,
 ) -> Result<Value, McpError> {
     let room_id = resolved_coordination_room_id(arguments);
     let actor_id = required_text_any(
@@ -2337,6 +2353,9 @@ fn write_contribution_payload(
     {
         metadata.insert("validation_receipts".to_string(), Value::Array(receipts));
     }
+    if let Some(policy_receipt) = policy_receipt.clone() {
+        metadata.insert("policy_receipt".to_string(), policy_receipt);
+    }
 
     let record = write_coordination_record(
         backend,
@@ -2354,11 +2373,13 @@ fn write_contribution_payload(
             created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
         },
     )?;
-    Ok(json!({
+    let mut payload = json!({
         "tenant": tenant,
         "room_id": room_id,
         "contribution": record
-    }))
+    });
+    insert_policy_receipt(&mut payload, policy_receipt);
+    Ok(payload)
 }
 
 fn read_records_payload(
@@ -3379,6 +3400,124 @@ fn argument_array(arguments: &Value, keys: &[&str]) -> Option<Vec<Value>> {
 fn insert_if_present(metadata: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         metadata.insert(key.to_string(), Value::String(value));
+    }
+}
+
+fn insert_policy_receipt(payload: &mut Value, policy_receipt: Option<Value>) {
+    if let (Value::Object(map), Some(policy_receipt)) = (payload, policy_receipt) {
+        map.insert("policy_receipt".to_string(), policy_receipt);
+    }
+}
+
+fn coordination_policy_receipt(
+    context: &McpRequestContext,
+    arguments: &Value,
+    tool_name: &str,
+) -> Value {
+    let required_scopes = string_array_any(
+        arguments,
+        &[
+            "required_scopes",
+            "requiredScopes",
+            "required_scope",
+            "requiredScope",
+        ],
+    );
+    let missing_scopes = required_scopes
+        .iter()
+        .filter(|scope| !context.allows(scope))
+        .cloned()
+        .collect::<Vec<_>>();
+    let estimated_cost_units = argument_f64_any(
+        arguments,
+        &[
+            "estimated_cost_units",
+            "estimatedCostUnits",
+            "estimated_cost",
+            "cost_units",
+            "costUnits",
+        ],
+    )
+    .unwrap_or(0.0)
+    .max(0.0);
+    let budget_units = argument_f64_any(
+        arguments,
+        &[
+            "budget_units",
+            "budgetUnits",
+            "max_cost_units",
+            "maxCostUnits",
+        ],
+    )
+    .or_else(|| {
+        arguments.get("budget").and_then(|budget| {
+            value_as_f64(budget.get("max_units").or_else(|| budget.get("maxUnits"))?)
+        })
+    });
+    let budget_allowed = budget_units
+        .map(|budget| estimated_cost_units <= budget.max(0.0))
+        .unwrap_or(true);
+    let scope_allowed = missing_scopes.is_empty();
+    let decision = if scope_allowed && budget_allowed {
+        "allow"
+    } else {
+        "deny"
+    };
+    json!({
+        "tool": tool_name,
+        "decision": decision,
+        "required_scopes": required_scopes,
+        "granted_scopes": context.scopes.clone(),
+        "missing_scopes": missing_scopes,
+        "scope_allowed": scope_allowed,
+        "estimated_cost_units": estimated_cost_units,
+        "budget_units": budget_units,
+        "budget_allowed": budget_allowed
+    })
+}
+
+fn coordination_policy_error(policy_receipt: &Value) -> Option<Value> {
+    if policy_receipt
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("allow")
+        == "allow"
+    {
+        return None;
+    }
+    let missing_scopes = policy_receipt
+        .get("missing_scopes")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    let budget_allowed = policy_receipt
+        .get("budget_allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let code = if missing_scopes {
+        "coordination_scope_denied"
+    } else if !budget_allowed {
+        "coordination_budget_exceeded"
+    } else {
+        "coordination_policy_denied"
+    };
+    Some(json!({
+        "error": code,
+        "message": "Native coordination policy denied this write.",
+        "policy_receipt": policy_receipt
+    }))
+}
+
+fn argument_f64_any(arguments: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(value_as_f64))
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
     }
 }
 
@@ -4431,7 +4570,11 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "title": { "type": "string" },
                     "summary": { "type": "string" },
                     "body": { "type": "string" },
-                    "metadata": { "type": "object" }
+                    "metadata": { "type": "object" },
+                    "required_scope": { "type": "string" },
+                    "required_scopes": { "type": "array", "items": { "type": "string" } },
+                    "estimated_cost_units": { "type": "number", "default": 0.0 },
+                    "budget_units": { "type": "number" }
                 },
                 "required": ["actor", "record_type", "summary"]
             }),
@@ -4457,7 +4600,11 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "changed_files": { "type": "array", "items": { "type": "string" } },
                     "artifacts": { "type": "array", "items": { "type": "object" } },
                     "validation_receipts": { "type": "array", "items": { "type": "object" } },
-                    "metadata": { "type": "object" }
+                    "metadata": { "type": "object" },
+                    "required_scope": { "type": "string" },
+                    "required_scopes": { "type": "array", "items": { "type": "string" } },
+                    "estimated_cost_units": { "type": "number", "default": 0.0 },
+                    "budget_units": { "type": "number" }
                 },
                 "required": ["actor", "summary"]
             }),
@@ -5266,6 +5413,33 @@ mod tests {
         response["result"]["structuredContent"].clone()
     }
 
+    fn call_tool_json_with_context(
+        provider: &FixtureProvider,
+        config: &McpServerConfig,
+        context: &McpRequestContext,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let response = handle_mcp_request_with_context(
+            provider,
+            config,
+            context,
+            json!({
+                "jsonrpc": "2.0",
+                "id": name,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }),
+        );
+        if let Some(error) = response.get("error") {
+            panic!("tool call failed for {name}: {error}");
+        }
+        response["result"]["structuredContent"].clone()
+    }
+
     fn has_tool(tools: &[Value], name: &str) -> bool {
         tools.iter().any(|tool| tool["name"] == name)
     }
@@ -5616,6 +5790,73 @@ mod tests {
         assert_eq!(
             contributions["records"][0]["metadata"]["status"],
             "validated"
+        );
+    }
+
+    #[test]
+    fn coordination_record_policy_hooks_gate_scope_and_budget() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        let no_write_scope = call_tool_json_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["graph:read"]),
+            "coordination_record",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "record_type": "decision",
+                "summary": "Requires coordination write scope",
+                "required_scope": "coordination:write",
+                "created_at": "2026-06-01T00:06:00Z"
+            }),
+        );
+        assert_eq!(no_write_scope["error"], "coordination_scope_denied");
+        assert_eq!(
+            no_write_scope["policy_receipt"]["missing_scopes"],
+            json!(["coordination:write"])
+        );
+
+        let budget_denied = call_tool_json_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["coordination:write"]),
+            "coordination_contribution",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "summary": "Too expensive for this budget",
+                "required_scope": "coordination:write",
+                "estimated_cost_units": 5.0,
+                "budget_units": 1.0,
+                "created_at": "2026-06-01T00:07:00Z"
+            }),
+        );
+        assert_eq!(budget_denied["error"], "coordination_budget_exceeded");
+        assert_eq!(budget_denied["policy_receipt"]["budget_allowed"], false);
+
+        let allowed = call_tool_json_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["coordination:write"]),
+            "coordination_contribution",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "summary": "Within budget and scope",
+                "required_scope": "coordination:write",
+                "estimated_cost_units": 1.0,
+                "budget_units": 5.0,
+                "created_at": "2026-06-01T00:08:00Z"
+            }),
+        );
+        assert_eq!(allowed["policy_receipt"]["decision"], "allow");
+        assert_eq!(
+            allowed["contribution"]["metadata"]["policy_receipt"]["required_scopes"],
+            json!(["coordination:write"])
         );
     }
 

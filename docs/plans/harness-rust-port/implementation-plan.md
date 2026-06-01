@@ -271,8 +271,11 @@ The MCP `coordination_context` tool now covers the first turn-start injection
 shape by bundling room state, presence, intents, messages, records, and optional
 actor mentions into one native read packet. `coordination_contribution` captures
 agent work as structured durable `event` records with changed files, validation
-receipts, artifact refs, status, and commit metadata. Not covered yet:
-permission/cost hooks. Full context IO retrieval remains part of the broader
+receipts, artifact refs, status, and commit metadata. Durable record and
+contribution writes now accept optional required-scope and cost-budget fields,
+return a `policy_receipt`, reject missing-scope or over-budget writes, and
+persist the receipt into successful record metadata. Full context IO retrieval
+and the user/run-level budget governor remain part of the broader
 runtime/substrate backlog below.
 
 The HTTP transport exposure now lives in `apps/theorem-harness-server` over
