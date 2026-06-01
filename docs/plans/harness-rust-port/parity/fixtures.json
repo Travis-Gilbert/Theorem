@@ -1,0 +1,2388 @@
+{
+  "anchors": {
+    "empty_state_hash": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6"
+  },
+  "meta": {
+    "consumer": "rustyredcore_THG/crates/theorem-harness-core parity test",
+    "note": "Generated; do not hand-edit. Re-run generate_fixtures.py.",
+    "pinned_created_at": "2026-06-01T00:00:00+00:00",
+    "pinned_run_id": "run-fixture-0001",
+    "purpose": "Harness parity corpus: Python reference -> Rust port acceptance.",
+    "reference_source": "Index-API/apps/orchestrate/runtime/state_machine.py"
+  },
+  "scenarios": [
+    {
+      "description": "Canonical legal chain created -> ... -> closed.",
+      "name": "full_lifecycle_to_closed",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-1",
+              "budget_tokens": 1000,
+              "capsule_tokens": 200,
+              "excluded_atom_count": 2,
+              "included_atom_count": 5,
+              "token_ledger": {
+                "saved": 300
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          },
+          "seq": 8,
+          "state_hash_after": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "state_hash_before": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "status": "context_packed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "artifact_id": "art-1",
+              "target": "claude"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.INJECTED"
+          },
+          "seq": 9,
+          "state_hash_after": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "state_hash_before": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "status": "context_injected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "started_at": "2026-06-01T00:00:00+00:00"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "AGENT.ACTING"
+          },
+          "seq": 10,
+          "state_hash_after": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "state_hash_before": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "status": "agent_acting"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "accepted": true,
+              "files_changed": [
+                "state_machine.rs"
+              ],
+              "summary": "ported",
+              "tests_passed": true,
+              "validator_results": [
+                {
+                  "id": "v1",
+                  "status": "passed"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "OUTCOME.RECORDED"
+          },
+          "seq": 11,
+          "state_hash_after": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "state_hash_before": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "status": "outcome_recorded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "confidence": 0.8,
+              "patch_type": "memory",
+              "payload_hash": "patch-1",
+              "review_required": true
+            },
+            "run_id": "run-fixture-0001",
+            "type": "LEARNING.PROPOSED"
+          },
+          "seq": 12,
+          "state_hash_after": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "state_hash_before": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "status": "learning_proposed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "review_target_id": "patch-1",
+              "review_type": "memory"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "REVIEW.QUEUED"
+          },
+          "seq": 13,
+          "state_hash_after": "f880bc1255485c4ac7c9b5abf82c160a7f7e9ab9e8e7f34dd00dd30b7f1a8edc",
+          "state_hash_before": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "status": "review_queued"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "consent": true,
+              "context_shape_hash": "csh-1",
+              "outcome_bucket": "accepted",
+              "plugin_id": "core",
+              "profile_id": "rust-port",
+              "raw_content_included": false,
+              "task_signature_hash": "tsh-1",
+              "task_type": "port",
+              "token_bucket": "small"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "FEDERATION.SIGNAL_PREPARED"
+          },
+          "seq": 14,
+          "state_hash_after": "9e6c10531578a32ca6ea1d041ccd33b2b488ac59298779defa6b9ee3cbd83b42",
+          "state_hash_before": "f880bc1255485c4ac7c9b5abf82c160a7f7e9ab9e8e7f34dd00dd30b7f1a8edc",
+          "status": "federation_signal_prepared"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "closed_by": "claude-code",
+              "summary": "harness kernel ported"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CLOSED"
+          },
+          "seq": 15,
+          "state_hash_after": "1c2cd8b2f06b83ea469b24ec6a8ae663e490772e86e33bfb079319666abe421f",
+          "state_hash_before": "9e6c10531578a32ca6ea1d041ccd33b2b488ac59298779defa6b9ee3cbd83b42",
+          "status": "closed"
+        }
+      ]
+    },
+    {
+      "description": "learning_proposed -> memory_patched -> maps_updated -> closed.",
+      "name": "memory_patch_branch",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-1",
+              "budget_tokens": 1000,
+              "capsule_tokens": 200,
+              "excluded_atom_count": 2,
+              "included_atom_count": 5,
+              "token_ledger": {
+                "saved": 300
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          },
+          "seq": 8,
+          "state_hash_after": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "state_hash_before": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "status": "context_packed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "artifact_id": "art-1",
+              "target": "claude"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.INJECTED"
+          },
+          "seq": 9,
+          "state_hash_after": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "state_hash_before": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "status": "context_injected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "started_at": "2026-06-01T00:00:00+00:00"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "AGENT.ACTING"
+          },
+          "seq": 10,
+          "state_hash_after": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "state_hash_before": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "status": "agent_acting"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "accepted": true,
+              "files_changed": [
+                "state_machine.rs"
+              ],
+              "summary": "ported",
+              "tests_passed": true,
+              "validator_results": [
+                {
+                  "id": "v1",
+                  "status": "passed"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "OUTCOME.RECORDED"
+          },
+          "seq": 11,
+          "state_hash_after": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "state_hash_before": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "status": "outcome_recorded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "confidence": 0.8,
+              "patch_type": "memory",
+              "payload_hash": "patch-1",
+              "review_required": true
+            },
+            "run_id": "run-fixture-0001",
+            "type": "LEARNING.PROPOSED"
+          },
+          "seq": 12,
+          "state_hash_after": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "state_hash_before": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "status": "learning_proposed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "patch_id": "patch-1",
+              "payload_hash": "patch-1",
+              "review_required": true,
+              "status": "queued"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MEMORY.PATCHED"
+          },
+          "seq": 13,
+          "state_hash_after": "2577dba9d9d0623bd10dd87920494f1f50b46e84901838c1fe55e0b482c40fe2",
+          "state_hash_before": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "status": "memory_patched"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "2"
+                }
+              ],
+              "state_hash": "sh-x"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.UPDATED"
+          },
+          "seq": 14,
+          "state_hash_after": "447ef9269a44e047445b9914cf7ed7bccdd6c25d267dd7b0968eaa0a3b8186ba",
+          "state_hash_before": "2577dba9d9d0623bd10dd87920494f1f50b46e84901838c1fe55e0b482c40fe2",
+          "status": "maps_updated"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "closed_by": "claude-code",
+              "summary": "closed via memory branch"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CLOSED"
+          },
+          "seq": 15,
+          "state_hash_after": "99d968ff9996925e6aa3ae27654c4e9a99de314f0f4a89c1191111b79844f24f",
+          "state_hash_before": "447ef9269a44e047445b9914cf7ed7bccdd6c25d267dd7b0968eaa0a3b8186ba",
+          "status": "closed"
+        }
+      ]
+    },
+    {
+      "description": "CONTEXT.PLANNED requires a positive token budget.",
+      "name": "invalid_context_budget",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "invalid_context_budget",
+          "guard_message": "CONTEXT.PLANNED requires a positive token budget",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 0,
+              "candidate_token_count": 10,
+              "plan_hash": "plan-bad"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "A capsule cannot exceed its token budget.",
+      "name": "context_budget_exceeded",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "context_budget_exceeded",
+          "guard_message": "Context capsule exceeds the requested token budget.",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-big",
+              "budget_tokens": 1000,
+              "capsule_tokens": 5000,
+              "excluded_atom_count": 0,
+              "included_atom_count": 9,
+              "token_ledger": {
+                "saved": -4000
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Injected artifact_id must match the packed one.",
+      "name": "context_artifact_mismatch",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-1",
+              "budget_tokens": 1000,
+              "capsule_tokens": 200,
+              "excluded_atom_count": 2,
+              "included_atom_count": 5,
+              "token_ledger": {
+                "saved": 300
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          },
+          "seq": 8,
+          "state_hash_after": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "state_hash_before": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "status": "context_packed"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "context_artifact_mismatch",
+          "guard_message": "CONTEXT.INJECTED artifact_id must match the packed artifact.",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "artifact_id": "art-OTHER",
+              "target": "claude"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.INJECTED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Memory patches require review before promotion.",
+      "name": "memory_patch_review_required",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-1",
+              "budget_tokens": 1000,
+              "capsule_tokens": 200,
+              "excluded_atom_count": 2,
+              "included_atom_count": 5,
+              "token_ledger": {
+                "saved": 300
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          },
+          "seq": 8,
+          "state_hash_after": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "state_hash_before": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "status": "context_packed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "artifact_id": "art-1",
+              "target": "claude"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.INJECTED"
+          },
+          "seq": 9,
+          "state_hash_after": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "state_hash_before": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "status": "context_injected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "started_at": "2026-06-01T00:00:00+00:00"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "AGENT.ACTING"
+          },
+          "seq": 10,
+          "state_hash_after": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "state_hash_before": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "status": "agent_acting"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "accepted": true,
+              "files_changed": [
+                "state_machine.rs"
+              ],
+              "summary": "ported",
+              "tests_passed": true,
+              "validator_results": [
+                {
+                  "id": "v1",
+                  "status": "passed"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "OUTCOME.RECORDED"
+          },
+          "seq": 11,
+          "state_hash_after": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "state_hash_before": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "status": "outcome_recorded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "confidence": 0.8,
+              "patch_type": "memory",
+              "payload_hash": "patch-1",
+              "review_required": true
+            },
+            "run_id": "run-fixture-0001",
+            "type": "LEARNING.PROPOSED"
+          },
+          "seq": 12,
+          "state_hash_after": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "state_hash_before": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "status": "learning_proposed"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "memory_patch_review_required",
+          "guard_message": "Memory patches must require review before promotion.",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "patch_id": "patch-x",
+              "payload_hash": "patch-x",
+              "review_required": false,
+              "status": "queued"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MEMORY.PATCHED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Event run_id must match the run's id.",
+      "name": "run_id_mismatch",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "branch": "main",
+                "commit_sha": "x",
+                "repo": "Theorem"
+              },
+              "task": "t"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "run_id_mismatch",
+          "guard_message": "event run_id run-SOMEONE-ELSE does not match run-fixture-0001",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "x",
+              "cwd": "/r",
+              "repo": "Theorem"
+            },
+            "run_id": "run-SOMEONE-ELSE",
+            "type": "HOST.OBSERVED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Terminal runs reject further transitions.",
+      "name": "terminal_run_rejected",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-1",
+              "budget_tokens": 1000,
+              "capsule_tokens": 200,
+              "excluded_atom_count": 2,
+              "included_atom_count": 5,
+              "token_ledger": {
+                "saved": 300
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          },
+          "seq": 8,
+          "state_hash_after": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "state_hash_before": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "status": "context_packed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "artifact_id": "art-1",
+              "target": "claude"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.INJECTED"
+          },
+          "seq": 9,
+          "state_hash_after": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "state_hash_before": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "status": "context_injected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "started_at": "2026-06-01T00:00:00+00:00"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "AGENT.ACTING"
+          },
+          "seq": 10,
+          "state_hash_after": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "state_hash_before": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "status": "agent_acting"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "accepted": true,
+              "files_changed": [
+                "state_machine.rs"
+              ],
+              "summary": "ported",
+              "tests_passed": true,
+              "validator_results": [
+                {
+                  "id": "v1",
+                  "status": "passed"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "OUTCOME.RECORDED"
+          },
+          "seq": 11,
+          "state_hash_after": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "state_hash_before": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "status": "outcome_recorded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "confidence": 0.8,
+              "patch_type": "memory",
+              "payload_hash": "patch-1",
+              "review_required": true
+            },
+            "run_id": "run-fixture-0001",
+            "type": "LEARNING.PROPOSED"
+          },
+          "seq": 12,
+          "state_hash_after": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "state_hash_before": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "status": "learning_proposed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "review_target_id": "patch-1",
+              "review_type": "memory"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "REVIEW.QUEUED"
+          },
+          "seq": 13,
+          "state_hash_after": "f880bc1255485c4ac7c9b5abf82c160a7f7e9ab9e8e7f34dd00dd30b7f1a8edc",
+          "state_hash_before": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "status": "review_queued"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "consent": true,
+              "context_shape_hash": "csh-1",
+              "outcome_bucket": "accepted",
+              "plugin_id": "core",
+              "profile_id": "rust-port",
+              "raw_content_included": false,
+              "task_signature_hash": "tsh-1",
+              "task_type": "port",
+              "token_bucket": "small"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "FEDERATION.SIGNAL_PREPARED"
+          },
+          "seq": 14,
+          "state_hash_after": "9e6c10531578a32ca6ea1d041ccd33b2b488ac59298779defa6b9ee3cbd83b42",
+          "state_hash_before": "f880bc1255485c4ac7c9b5abf82c160a7f7e9ab9e8e7f34dd00dd30b7f1a8edc",
+          "status": "federation_signal_prepared"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "closed_by": "claude-code",
+              "summary": "harness kernel ported"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CLOSED"
+          },
+          "seq": 15,
+          "state_hash_after": "1c2cd8b2f06b83ea469b24ec6a8ae663e490772e86e33bfb079319666abe421f",
+          "state_hash_before": "9e6c10531578a32ca6ea1d041ccd33b2b488ac59298779defa6b9ee3cbd83b42",
+          "status": "closed"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "terminal_run_state",
+          "guard_message": "HOST.OBSERVED cannot be applied to terminal run closed.",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "x",
+              "cwd": "/r",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "RUN.CREATED requires task and actor.",
+      "name": "missing_required_field",
+      "steps": [
+        {
+          "expect": "guard",
+          "guard_code": "missing_payload_fields",
+          "guard_message": "RUN.CREATED missing required payload fields: actor",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task": "t"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Federation signal preparation requires explicit consent.",
+      "name": "federation_consent_required",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-1",
+              "budget_tokens": 1000,
+              "capsule_tokens": 200,
+              "excluded_atom_count": 2,
+              "included_atom_count": 5,
+              "token_ledger": {
+                "saved": 300
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          },
+          "seq": 8,
+          "state_hash_after": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "state_hash_before": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "status": "context_packed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "artifact_id": "art-1",
+              "target": "claude"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.INJECTED"
+          },
+          "seq": 9,
+          "state_hash_after": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "state_hash_before": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "status": "context_injected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "started_at": "2026-06-01T00:00:00+00:00"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "AGENT.ACTING"
+          },
+          "seq": 10,
+          "state_hash_after": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "state_hash_before": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "status": "agent_acting"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "accepted": true,
+              "files_changed": [
+                "state_machine.rs"
+              ],
+              "summary": "ported",
+              "tests_passed": true,
+              "validator_results": [
+                {
+                  "id": "v1",
+                  "status": "passed"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "OUTCOME.RECORDED"
+          },
+          "seq": 11,
+          "state_hash_after": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "state_hash_before": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "status": "outcome_recorded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "confidence": 0.8,
+              "patch_type": "memory",
+              "payload_hash": "patch-1",
+              "review_required": true
+            },
+            "run_id": "run-fixture-0001",
+            "type": "LEARNING.PROPOSED"
+          },
+          "seq": 12,
+          "state_hash_after": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "state_hash_before": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "status": "learning_proposed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "review_target_id": "patch-1",
+              "review_type": "memory"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "REVIEW.QUEUED"
+          },
+          "seq": 13,
+          "state_hash_after": "f880bc1255485c4ac7c9b5abf82c160a7f7e9ab9e8e7f34dd00dd30b7f1a8edc",
+          "state_hash_before": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "status": "review_queued"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "federation_consent_required",
+          "guard_message": "Federation signal preparation requires explicit consent.",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "context_shape_hash": "csh-1",
+              "outcome_bucket": "accepted",
+              "plugin_id": "core",
+              "profile_id": "rust-port",
+              "raw_content_included": false,
+              "task_signature_hash": "tsh-1",
+              "task_type": "port",
+              "token_bucket": "small"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "FEDERATION.SIGNAL_PREPARED"
+          }
+        }
+      ]
+    },
+    {
+      "description": "Federation signals cannot include raw content.",
+      "name": "federation_raw_content_blocked",
+      "steps": [
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "actor": "claude-code",
+              "scope": {
+                "agent_host": "claude-code",
+                "agent_model": "opus",
+                "branch": "main",
+                "commit_sha": "deadbeef",
+                "repo": "Theorem",
+                "workstream_id": "ws-harness"
+              },
+              "task": "port harness to rust"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "RUN.CREATED"
+          },
+          "seq": 1,
+          "state_hash_after": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "state_hash_before": "82fa09fc2e7aed5e143d95b3059d2dde20fb5780a5d43edf8ffa7adf575636f6",
+          "status": "created"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "branch": "main",
+              "commit_sha": "deadbeef",
+              "cwd": "/repo/Theorem",
+              "repo": "Theorem"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "HOST.OBSERVED"
+          },
+          "seq": 2,
+          "state_hash_after": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "state_hash_before": "d6f5e8d0636d5e859ea8528e09b11e751de24800d46b9f90a93c4e2d9883c434",
+          "status": "observed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "task_signature": "sig-port-harness"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TASK.RESOLVED"
+          },
+          "seq": 3,
+          "state_hash_after": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "state_hash_before": "e2b0dd9d5c907fcc0884e5bd65b60a7d2b90c274d296df2e29b7761dca53e9ef",
+          "status": "resolved"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "policy_hash": "policy-abc",
+              "profile_id": "rust-port",
+              "profile_version": "1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "PROFILE.SELECTED"
+          },
+          "seq": 4,
+          "state_hash_after": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "state_hash_before": "d58797f7185a5ada00491477c2684835378734ec3fc1b2240becd6d7d780912f",
+          "status": "profile_selected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "excluded_tools": [
+                "network"
+              ],
+              "permission_reasons": {
+                "network": "policy:no-egress"
+              },
+              "selected_plugins": [],
+              "selected_tools": [
+                "read",
+                "edit"
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "TOOLKIT.COMPILED"
+          },
+          "seq": 5,
+          "state_hash_after": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "state_hash_before": "d16c705e500b88597852d5d52b5f11c53debbce68305877a257b9209e1594eed",
+          "status": "toolkit_compiled"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "maps": [
+                {
+                  "id": "codebase",
+                  "version": "1"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "MAPS.LOADED"
+          },
+          "seq": 6,
+          "state_hash_after": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "state_hash_before": "c2f65651cd3ac0889c11b06618fb1fdbb44a3737da0dc66d4e08c2a3d41d019f",
+          "status": "maps_loaded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "budget_tokens": 1000,
+              "candidate_token_count": 500,
+              "plan_hash": "plan-1"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PLANNED"
+          },
+          "seq": 7,
+          "state_hash_after": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "state_hash_before": "4d7a4a1ad9d6d5f028c6cfdcd1850d3fcacebafc3328da36b228195e54aa9888",
+          "status": "context_planned"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "artifact_id": "art-1",
+              "budget_tokens": 1000,
+              "capsule_tokens": 200,
+              "excluded_atom_count": 2,
+              "included_atom_count": 5,
+              "token_ledger": {
+                "saved": 300
+              }
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.PACKED"
+          },
+          "seq": 8,
+          "state_hash_after": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "state_hash_before": "3343c7796eeeb4581dd88faed7c19e46b2d94eb9727c21d53e413f734d47a208",
+          "status": "context_packed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "artifact_id": "art-1",
+              "target": "claude"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "CONTEXT.INJECTED"
+          },
+          "seq": 9,
+          "state_hash_after": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "state_hash_before": "7253285019dfe48e0563671117233f7c70ff459b560c353a62ab33fc58c0fe5a",
+          "status": "context_injected"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "adapter": "mcp",
+              "started_at": "2026-06-01T00:00:00+00:00"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "AGENT.ACTING"
+          },
+          "seq": 10,
+          "state_hash_after": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "state_hash_before": "1913561aa2653f5cbeb3ffa99b01ef69fb8adad84f6ad9ece5f460d8a50660a5",
+          "status": "agent_acting"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "accepted": true,
+              "files_changed": [
+                "state_machine.rs"
+              ],
+              "summary": "ported",
+              "tests_passed": true,
+              "validator_results": [
+                {
+                  "id": "v1",
+                  "status": "passed"
+                }
+              ]
+            },
+            "run_id": "run-fixture-0001",
+            "type": "OUTCOME.RECORDED"
+          },
+          "seq": 11,
+          "state_hash_after": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "state_hash_before": "aa49cf6a030a0f51ce3b60dc485bef939a0b4e45dab48bee0bca144a77aa1279",
+          "status": "outcome_recorded"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "confidence": 0.8,
+              "patch_type": "memory",
+              "payload_hash": "patch-1",
+              "review_required": true
+            },
+            "run_id": "run-fixture-0001",
+            "type": "LEARNING.PROPOSED"
+          },
+          "seq": 12,
+          "state_hash_after": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "state_hash_before": "c79cfbec2d41e25a6f68822ff8e7072d2d717b67101656b6c17e4c75d51fb195",
+          "status": "learning_proposed"
+        },
+        {
+          "expect": "ok",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "review_target_id": "patch-1",
+              "review_type": "memory"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "REVIEW.QUEUED"
+          },
+          "seq": 13,
+          "state_hash_after": "f880bc1255485c4ac7c9b5abf82c160a7f7e9ab9e8e7f34dd00dd30b7f1a8edc",
+          "state_hash_before": "2baa8745cfe467c8cae5a2b62ed63be23590dbeaff78f4f62bf66b8e56d9518f",
+          "status": "review_queued"
+        },
+        {
+          "expect": "guard",
+          "guard_code": "federation_raw_content_blocked",
+          "guard_message": "Federation signals cannot include raw content.",
+          "input": {
+            "actor": "claude-code",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "payload": {
+              "consent": true,
+              "context_shape_hash": "csh-1",
+              "outcome_bucket": "accepted",
+              "plugin_id": "core",
+              "profile_id": "rust-port",
+              "raw_content_included": true,
+              "task_signature_hash": "tsh-1",
+              "task_type": "port",
+              "token_bucket": "small"
+            },
+            "run_id": "run-fixture-0001",
+            "type": "FEDERATION.SIGNAL_PREPARED"
+          }
+        }
+      ]
+    }
+  ]
+}
