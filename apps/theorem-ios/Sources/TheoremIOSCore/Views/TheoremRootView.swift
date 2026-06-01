@@ -97,7 +97,7 @@ public struct TheoremRootView: View {
                 SurfacePlaceholder(surface: .projects, theme: theme)
                     .tag(AppSurface.projects)
 
-                SurfacePlaceholder(surface: .models, theme: theme)
+                ParticipantPresenceView(theme: theme)
                     .tag(AppSurface.models)
 
                 SurfacePlaceholder(surface: .build, theme: theme)
