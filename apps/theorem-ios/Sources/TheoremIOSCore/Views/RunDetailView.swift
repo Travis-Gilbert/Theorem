@@ -19,6 +19,7 @@ struct RunDetailView: View {
                 header
                 rails
                 timeline
+                traceLink
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -215,6 +216,30 @@ struct RunDetailView: View {
             }
         }
         .padding(.bottom, isLast ? 0 : 14)
+    }
+
+    // MARK: Trace link
+
+    private var traceLink: some View {
+        NavigationLink {
+            TraceView(run: run, theme: theme)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "list.bullet.indent").font(.system(size: 12, weight: .semibold))
+                Text("Full trace & export").font(TheoremFonts.label(size: 13))
+                Spacer()
+                Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.pebble)
+            }
+            .foregroundStyle(theme.ink)
+            .padding(14)
+            .frame(maxWidth: .infinity)
+            .background(theme.chrome.opacity(0.5), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.hairline, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: Building blocks

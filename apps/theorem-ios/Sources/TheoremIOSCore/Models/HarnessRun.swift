@@ -185,4 +185,15 @@ public struct HarnessRun: Identifiable, Equatable, Sendable {
 
     /// The content-addressed digest of the final run state.
     public var finalStateHash: String { events.last?.stateHashAfter ?? "" }
+
+    /// The run's event stream serialized as `trace.jsonl` (one JSON object per
+    /// line): the V1 export format from the trace surface (Part 5). Real data,
+    /// the user's own record. Event types, statuses, and hashes contain no
+    /// characters that need JSON escaping, so this is a faithful line protocol.
+    public func traceJSONL() -> String {
+        events.map { event in
+            "{\"seq\":\(event.seq),\"type\":\"\(event.type)\",\"status\":\"\(event.status)\",\"state_hash_after\":\"\(event.stateHashAfter)\"}"
+        }
+        .joined(separator: "\n")
+    }
 }
