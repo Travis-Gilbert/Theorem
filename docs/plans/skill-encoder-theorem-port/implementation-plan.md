@@ -47,14 +47,19 @@ layers that do NOT both belong in Rust:
 Recommended split (the pattern this codebase already uses for Modal training and
 the `theseus_*` engine D1 deferral in the harness-superset plan):
 
-- **Native on Theorem:** the content-addressed pack store (Prolly/versioned
-  graph, exists), `skill_list`/`skill_get`/`skill_apply`, UseReceipt capture, and
-  tree-sitter **Rust ingestion** (the Skill Encoder spec §4 explicitly wants this
-  RustyRed-native; tree-sitter has Rust bindings). No Python in any agent path.
-- **Python, dispatched by a native `skill_encode` verb (Modal pattern):** the
-  heavy GNN clustering + codegen + benchmark validation. The harness fires a
-  native verb; a Python batch worker compiles; the pack lands back in Theorem by
-  `pack_content_hash`.
+- **Theorem (the harness side, fully native, zero Python):** the
+  content-addressed pack store (Prolly/versioned graph, exists),
+  `skill_list`/`skill_get`/`skill_apply`, native gRPC code search,
+  `RecordUseReceipt` capture, and running the pack's Rust validators in-process.
+  This is the agent's entire runtime path; nothing here touches Python. "Move the
+  whole harness-side tool with no Python dependency."
+- **Theseus (a SEPARATE offline process, stays Python, decoupled):** the entire
+  encode/compile/ingest pipeline (corpus ingest -> tree-sitter lower -> GNN
+  cluster -> codegen -> validate). Runs occasionally, like training. It
+  PUBLISHES finished packs + lowered code atoms to Theorem by content hash, out
+  of band. It is NOT a harness runtime dependency and is NOT triggered as an
+  agent runtime tool (any kickoff is admin/batch, separate from the agent path).
+  Ingest is "a separate process mostly," not a dependency.
 
 Why not a full Rust rewrite of layer 2: it means porting the Pairformer GNN
 (PyTorch) and the LLM-driven validation gate into a language with no ML
@@ -62,12 +67,17 @@ ecosystem - the exact category kept in Python everywhere else here (Modal
 training; `theseus_*` engine). The "no Python = reliable" win is about the
 request path, not an occasional batch compiler.
 
-**RESOLVED (Travis 2026-06-01): split confirmed.** "The harness is going to be
-moved fully to Theorem soon so it's just a matter of the connection points. I
-think it should work better for everything." So the encoder is NOT rewritten;
-the runtime + ingestion go native, the heavy compile stays Python and is reached
-through a connection point (a native dispatch verb). The work is the connection
-points, not a port of `encode/`.
+**RESOLVED (Travis 2026-06-01): split confirmed, framing corrected.** "We have
+to move the whole harness side tool with no python dependency. I don't consider
+ingesting to be a dependency, it's a separate process mostly. The compile is a
+different layer that should remain Theseus and we can port the skills over." So:
+the harness USE side moves to Theorem fully native, zero Python in the agent
+path. The compile/ingest stays Theseus as a SEPARATE offline process - NOT a
+runtime dependency reached via live dispatch. The seam is a content-addressed
+PUBLISH (encoder -> Theorem store, out of band), not a harness->Python call. The
+encoder is not rewritten; the compiled skills are ported (served) in Theorem.
+"Connection points" = the harness is in Theorem, so usage must connect there;
+it does not mean the harness calls Python at runtime.
 
 ## What already exists (grounded 2026-06-01)
 
@@ -217,12 +227,15 @@ encoder never moves to Rust; only the serving does.
     they are in Memgraph (Python ingest). Landing them in RustyRed is shared
     work with Lane G's `code_repo` ingest + the content-addressed `skill_pack`.
 
-Connection-point framing (Travis: "just a matter of the connection points"):
-S2 (`skill_*` MCP verbs) serve the compiled artifacts; S4 (native code-search
-gRPC) serves queries over the ingested Rust corpus graph; both point at the same
-RustyRed substrate. Neither requires porting `encode/`. The Python encoder
-publishes packs + code atoms by content hash; Theorem serves them. That is the
-"it should work better for everything" the full-harness-on-Theorem move buys.
+Connection-point framing (corrected per Travis): "connection points" means the
+harness is IN Theorem, so to be USED a skill must be served there - the whole
+harness-side toolset is native with zero Python dependency. It does NOT mean the
+harness dispatches to a Python encoder at runtime. S2 (`skill_*` verbs) + S4
+(native gRPC code search) are the native use surface; the ONLY cross-boundary
+link is `skill_publish` - the offline Theseus encoder pushing a finished,
+content-addressed pack into Theorem, out of band. Ingest is a separate process,
+not a harness runtime dependency. That decoupling is what makes the
+full-harness-on-Theorem move "work better for everything."
 
 ### Lane H - harness agents actually use it (ties to harness-superset Lane T)
 
