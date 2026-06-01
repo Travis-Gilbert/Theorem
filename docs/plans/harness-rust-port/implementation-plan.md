@@ -255,8 +255,8 @@ The first exposure step is implemented in `rustyred-thg-mcp`: native
 tools now use the Rust runtime coordination data model and persist through the
 MCP backend GraphStore. Read tools are listed in read-only mode; write tools
 appear only when MCP read/write mode is enabled. The MCP test suite covers a
-full room/presence/intent/message/mention-consume/record/readback/context-packet
-round trip against a shared fixture store.
+full room/presence/intent/message/mention-consume/record/readback/context-packet/
+contribution-capture round trip against a shared fixture store.
 
 The next native substrate slice adds durable coordination records for
 `event`, `decision`, `tension`, and `reflection`. They share one
@@ -269,9 +269,11 @@ clients.
 
 The MCP `coordination_context` tool now covers the first turn-start injection
 shape by bundling room state, presence, intents, messages, records, and optional
-actor mentions into one native read packet. Not covered yet: contribution
-capture and permission/cost hooks. Full context IO retrieval remains part of the
-broader runtime/substrate backlog below.
+actor mentions into one native read packet. `coordination_contribution` captures
+agent work as structured durable `event` records with changed files, validation
+receipts, artifact refs, status, and commit metadata. Not covered yet:
+permission/cost hooks. Full context IO retrieval remains part of the broader
+runtime/substrate backlog below.
 
 The HTTP transport exposure now lives in `apps/theorem-harness-server` over
 `theorem-harness-runtime`. It serves run list/detail plus the native

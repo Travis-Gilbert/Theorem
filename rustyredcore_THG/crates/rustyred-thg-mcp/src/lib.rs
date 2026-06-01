@@ -889,6 +889,15 @@ fn call_tool<P: McpGraphProvider>(
             }
             write_record_payload(&tenant, &mut backend, &arguments)?
         }
+        "coordination_contribution" | "theorem_harness_coordination_contribution" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native coordination contribution writes are unavailable while read-only mode is active."
+                })));
+            }
+            write_contribution_payload(&tenant, &mut backend, &arguments)?
+        }
         "read_records_for_room" | "theorem_harness_read_records_for_room" => {
             read_records_payload(&tenant, &backend, &arguments)?
         }
@@ -2285,6 +2294,73 @@ fn write_record_payload(
     }))
 }
 
+fn write_contribution_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let actor_id = required_text_any(
+        arguments,
+        &["actor", "actor_id", "actorId"],
+        "coordination_contribution",
+    )?;
+    let summary = required_text_any(arguments, &["summary"], "coordination_contribution")?;
+    let mut metadata = argument_object(arguments, "metadata");
+    insert_if_present(
+        &mut metadata,
+        "contribution_kind",
+        argument_text(
+            arguments,
+            &["contribution_kind", "contributionKind", "kind"],
+        ),
+    );
+    insert_if_present(
+        &mut metadata,
+        "status",
+        argument_text(arguments, &["status"]),
+    );
+    insert_if_present(
+        &mut metadata,
+        "commit",
+        argument_text(arguments, &["commit", "commit_sha", "commitSha"]),
+    );
+    let changed_files = string_array_any(arguments, &["changed_files", "changedFiles"]);
+    if !changed_files.is_empty() {
+        metadata.insert("changed_files".to_string(), json!(changed_files));
+    }
+    if let Some(artifacts) = argument_array(arguments, &["artifacts"]) {
+        metadata.insert("artifacts".to_string(), Value::Array(artifacts));
+    }
+    if let Some(receipts) =
+        argument_array(arguments, &["validation_receipts", "validationReceipts"])
+    {
+        metadata.insert("validation_receipts".to_string(), Value::Array(receipts));
+    }
+
+    let record = write_coordination_record(
+        backend,
+        WriteRecordInput {
+            tenant_slug: tenant.to_string(),
+            room_id: room_id.clone(),
+            actor_id,
+            record_id: argument_text(arguments, &["record_id", "recordId"]).unwrap_or_default(),
+            record_type: "event".to_string(),
+            title: argument_text(arguments, &["title"])
+                .unwrap_or_else(|| "Coordination contribution".to_string()),
+            summary,
+            body: argument_text(arguments, &["body"]).unwrap_or_default(),
+            metadata,
+            created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+        },
+    )?;
+    Ok(json!({
+        "tenant": tenant,
+        "room_id": room_id,
+        "contribution": record
+    }))
+}
+
 fn read_records_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
@@ -3292,6 +3368,18 @@ fn argument_object(arguments: &Value, key: &str) -> Map<String, Value> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default()
+}
+
+fn argument_array(arguments: &Value, keys: &[&str]) -> Option<Vec<Value>> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_array))
+        .cloned()
+}
+
+fn insert_if_present(metadata: &mut Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        metadata.insert(key.to_string(), Value::String(value));
+    }
 }
 
 fn string_array_any(arguments: &Value, keys: &[&str]) -> Vec<String> {
@@ -4349,6 +4437,32 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ));
         tools.push(tool_write(
+            "coordination_contribution",
+            "Capture an agent contribution as a durable native coordination event record.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "record_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "body": { "type": "string" },
+                    "contribution_kind": { "type": "string" },
+                    "status": { "type": "string" },
+                    "commit": { "type": "string" },
+                    "changed_files": { "type": "array", "items": { "type": "string" } },
+                    "artifacts": { "type": "array", "items": { "type": "object" } },
+                    "validation_receipts": { "type": "array", "items": { "type": "object" } },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["actor", "summary"]
+            }),
+        ));
+        tools.push(tool_write(
             "rustyred_thg_fulltext_designate",
             "Designate a node property for full-text search.",
             json!({
@@ -5220,6 +5334,7 @@ mod tests {
         assert!(!has_tool(tools, "coordination_intent"));
         assert!(!has_tool(tools, "coordinate"));
         assert!(!has_tool(tools, "coordination_record"));
+        assert!(!has_tool(tools, "coordination_contribution"));
     }
 
     #[test]
@@ -5238,6 +5353,7 @@ mod tests {
         assert!(has_tool(tools, "coordination_intent"));
         assert!(has_tool(tools, "coordinate"));
         assert!(has_tool(tools, "coordination_record"));
+        assert!(has_tool(tools, "coordination_contribution"));
         assert!(has_tool(tools, "mentions"));
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
@@ -5460,6 +5576,47 @@ mod tests {
         assert_eq!(context["counts"]["intents"], 1);
         assert_eq!(context["counts"]["messages"], 1);
         assert_eq!(context["counts"]["records"], 1);
+
+        let contribution = call_tool_json(
+            &provider,
+            &config,
+            "coordination_contribution",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "summary": "Added native coordination record exposure",
+                "contribution_kind": "code",
+                "status": "validated",
+                "commit": "80271e1",
+                "changed_files": ["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"],
+                "validation_receipts": [
+                    {"kind": "cargo-test", "status": "passed", "summary": "MCP round trip"}
+                ],
+                "created_at": "2026-06-01T00:05:00Z"
+            }),
+        );
+        assert_eq!(contribution["contribution"]["record_type"], "event");
+        assert_eq!(
+            contribution["contribution"]["metadata"]["contribution_kind"],
+            "code"
+        );
+
+        let contributions = call_tool_json(
+            &provider,
+            &config,
+            "read_records_for_room",
+            json!({
+                "tenant": "smoke",
+                "room_id": "harness-rust-port",
+                "record_type": "event"
+            }),
+        );
+        assert_eq!(contributions["count"], 1);
+        assert_eq!(
+            contributions["records"][0]["metadata"]["status"],
+            "validated"
+        );
     }
 
     #[test]
