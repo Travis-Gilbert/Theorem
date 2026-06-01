@@ -10,7 +10,7 @@ coordination fallback until substrate mirroring is clean.
 
 | Actor | Status | Files | Notes |
 |---|---|---|---|
-| Codex | done for current slice | `rustyredcore_THG/crates/theorem-harness-core/**`; `rustyredcore_THG/crates/theorem-harness-runtime/**`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-context/**` | Rust `theorem-harness-core` now ports the pure state machine, replay/fork helpers, toolgraph toolkit selector, context-web bounded pack compiler/policy core, pure affordance registry/receipt contract, and Pairformer session metrics. `theorem-harness-runtime` adds the spec's GraphStore-backed event-log seam while keeping persistence out of the parity kernel. |
+| Codex | done for current slice | `rustyredcore_THG/crates/theorem-harness-core/**`; `rustyredcore_THG/crates/theorem-harness-runtime/**`; `docs/plans/harness-rust-port/CLAIMS.md`; `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-context/**` | Rust `theorem-harness-core` now ports the pure state machine, replay/fork helpers, toolgraph toolkit selector, context-web bounded pack compiler/policy core, pure affordance registry/receipt contract, Pairformer session metrics, and federated structural-signal privacy helpers. `theorem-harness-runtime` adds the spec's GraphStore-backed event-log seam while keeping persistence out of the parity kernel. |
 | Claude Code | done for slice | `docs/plans/harness-rust-port/parity/**`; `docs/plans/harness-rust-port/parity-toolgraph/**`; `docs/plans/harness-rust-port/parity-context/**` | Generated Python reference fixtures from `Index-API/apps/orchestrate/runtime/state_machine.py`, `toolgraph.py`, and `context_web/{contracts,policy}.py`; Codex extended the state-machine corpus to 25 scenarios / 260 steps and consumed the toolgraph/context corpora read-only for the Rust ports. |
 
 ## Git Protocol
@@ -47,3 +47,6 @@ coordination fallback until substrate mirroring is clean.
   execution wrappers remain runtime/native-engine work, not core-crate IO.
 - The Rust session-metrics tests cover Pairformer mode normalization, JSONL
   loading, completed-session summaries, and Welch-z mode comparison.
+- The Rust federated-signal tests cover recursive raw-content rejection, receive
+  normalization, coarse privacy buckets, and structural patch projection without
+  importing Django.

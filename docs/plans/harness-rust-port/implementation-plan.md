@@ -192,16 +192,28 @@ comparison, and the Welch-z confidence gate. This gives the later budget governo
 and Pairformer learning-controller work a native measurement contract without
 waiting for runtime IO.
 
+## Phase 2.10
+
+Done from the structural federation slice: the pure privacy helpers inside
+`federated_signals.py` have been ported as
+`theorem_harness_core::federated_signals`. The Rust module exposes
+`assert_no_raw_content`, `receive_federated_signal`,
+`extract_structural_signal`, `success_rate_bucket`, and
+`observed_count_bucket`, preserving the core cross-tenant invariant: no raw
+prompts, code, tenant identifiers, precise timestamps, or explanatory prose may
+cross the federation boundary. The Django-coupled `EvolutionPatch` extractor
+remains runtime-side, but the structural projection helper is native and
+test-covered.
+
 ## Phase 3+ (sequenced, not committed here)
 
-Next pure-logic candidates: `map_artifacts`, `memory_contracts`, and the pure
-privacy helpers inside `federated_signals`. The context compiler's pure pack
-core, affordance registry/receipt contract, and Pairformer metrics helpers are
-now in Rust; context IO retrieval, substrate adapters, and affordance execution
-wrappers remain later runtime rewrites. The next runtime candidates from the
-build spec are the map compiler, direct coordination channel, charter compiler,
-budget governor, compaction, and trace exports. Each gets its own plan slice
-when reached.
+Next pure-logic candidates: `map_artifacts` and `memory_contracts`. The context
+compiler's pure pack core, affordance registry/receipt contract, Pairformer
+metrics helpers, and federated signal privacy helpers are now in Rust; context IO
+retrieval, substrate adapters, and affordance execution wrappers remain later
+runtime rewrites. The next runtime candidates from the build spec are the map
+compiler, direct coordination channel, charter compiler, budget governor,
+compaction, and trace exports. Each gets its own plan slice when reached.
 
 ## Coordination (hybrid -> git remains durable)
 

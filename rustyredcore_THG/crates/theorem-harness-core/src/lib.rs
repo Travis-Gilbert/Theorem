@@ -1,5 +1,6 @@
 pub mod affordances;
 pub mod context_web;
+pub mod federated_signals;
 pub mod replay;
 pub mod session_metrics;
 pub mod state_hash;
@@ -17,6 +18,11 @@ pub use context_web::{
     ContextWebPackInput, ContextWebPath, ContextWebPolicy, ContextWebSpendPlan,
     ContextWebStructuralBankResult, ContextWebTokenLedger, ContextWebValidationSummary,
     ContextWebValidatorFinding,
+};
+pub use federated_signals::{
+    assert_no_raw_content, extract_structural_signal, observed_count_bucket,
+    receive_federated_signal, success_rate_bucket, FederatedSignal, PrivacyViolation,
+    StructuralSignalInput,
 };
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};
 pub use session_metrics::{
