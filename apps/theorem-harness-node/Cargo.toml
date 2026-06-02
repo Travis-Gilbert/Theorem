@@ -1,0 +1,26 @@
+[package]
+name = "theorem-harness-node"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js (NAPI-RS) binding over the theorem-harness Rust SDK. A thin idiomatic shell so the Node surface cannot drift from the Rust core. THPS-012 slice 1."
+license = "MIT"
+rust-version = "1.85"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+serde_json = "1.0"
+theorem-harness = { path = "../../rustyredcore_THG/crates/theorem-harness" }
+theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+
+[build-dependencies]
+napi-build = "2"
+
+# Standalone single-crate workspace: kept OUT of the rustyredcore_THG workspace
+# so the napi dependency tree does not couple the main build/CI (the apps/browser
+# isolation convention).
+[workspace]

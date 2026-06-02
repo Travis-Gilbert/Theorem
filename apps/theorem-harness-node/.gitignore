@@ -1,0 +1,9 @@
+# Rust build output (standalone workspace target dir).
+/target
+
+# The compiled native addon is a platform-specific build artifact, not source.
+# Build it with `npm run build:debug` (or the cp command in smoke.mjs).
+*.node
+
+# Node tooling, if a consumer adds it.
+node_modules
