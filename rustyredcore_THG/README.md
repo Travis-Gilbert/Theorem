@@ -1,10 +1,6 @@
 # RustyRed GraphDB — Technical Documentation
 
 ## Technical reference for RustyRed GraphDB 0.6.0, derived from the source tree rather than
-marketing copy. Two audiences are covered:
-
-Integration developers — building against the HTTP, gRPC, or MCP surfaces.
-Operators — deploying, configuring, and running the release.
 
 RustyRed is an in-memory graph and vector database with append-only-file/snapshot
 persistence, multi-tenant isolation, confidence-weighted epistemic edges, HNSW vector search,
