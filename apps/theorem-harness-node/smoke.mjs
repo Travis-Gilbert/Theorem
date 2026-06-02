@@ -10,15 +10,20 @@
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { mkdtempSync } from "fs";
+import { tmpdir } from "os";
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const { Harness } = require(join(here, "theorem_harness_node.node"));
 
-const harness = new Harness();
+const dataDir = process.argv[2] || mkdtempSync(join(tmpdir(), "theorem-harness-"));
+console.log("data dir:", dataDir);
+const harness = new Harness(dataDir);
 
 const runId = harness.startRun("demo from node", "node-smoke", "k-create");
 console.log("started run:", runId);
+console.log("RUNID=" + runId);
 
 let events = JSON.parse(harness.eventsJson(runId));
 console.log("after start:", events.length, events.map((e) => e.kind));

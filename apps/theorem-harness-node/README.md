@@ -24,15 +24,16 @@ A `Harness` class over an in-process graph store:
 
 | JS method | Delegates to | Returns |
 |---|---|---|
-| `new Harness()` | a fresh `InMemoryGraphStore` | the harness |
+| `new Harness(dataDir)` | `RedCoreGraphStore::open(dataDir)` (durable, AOF) | the harness |
 | `startRun(task, actor, idempotencyKey)` | `RunHandle::start` | run id (string) |
 | `cancel(runId, reason, idempotencyKey)` | `RunHandle::cancel` | void |
 | `eventsJson(runId)` | `RunHandle::events` + `export_run_trace` | JSON array string |
 | `pollText(runId, afterSeq)` | `RunStream::resume_from(..).poll_text` | new text (string) |
 
-Slice 1 uses `InMemoryGraphStore`. The production swap to a durable
-`RedCoreGraphStore` (from a data directory) is a one-type change to the struct
-field and constructor, because the SDK surface is store-agnostic.
+The harness is durable: state persists to a `RedCoreGraphStore` opened from
+`dataDir` (AOF-backed, recovered on open). A run written in one process is visible
+to the next, as the two-process durability test below proves. The store type
+appears only in this binding; the SDK surface is store-agnostic.
 
 ## Build and smoke
 
@@ -51,8 +52,17 @@ node apps/theorem-harness-node/smoke.mjs   # prints SMOKE PASS
 npm run build:debug && npm run smoke
 ```
 
-The smoke test proves the round-trip JS -> Rust SDK -> GraphStore -> JS:
-start a run, read its events, cancel it, and read the text projection back.
+The smoke test proves the round-trip JS -> Rust SDK -> GraphStore -> JS: start a
+run, read its events, cancel it, and read the text projection back (`SMOKE PASS`).
+
+Durability is proven across two processes (process 1 writes and exits, process 2
+recovers from the AOF):
+
+```bash
+DIR=$(mktemp -d)
+RUNID=$(node smoke.mjs "$DIR" | grep '^RUNID=' | cut -d= -f2)
+node recover.mjs "$DIR" "$RUNID"   # fresh process: RECOVER PASS
+```
 
 ## Deferred (named, not stubbed)
 
@@ -62,7 +72,6 @@ start a run, read its events, cancel it, and read the text projection back.
 - The live async stream: `pollText` / `eventsJson` are the synchronous cursor;
   wrapping them in a Node async iterator (a tokio-backed push stream) is the next
   binding slice.
-- The `RedCoreGraphStore` constructor (durable persistence from a data dir).
 - The remaining SDK surface (`Session`, full `Event` objects rather than JSON).
 
 ## Cross-agent note

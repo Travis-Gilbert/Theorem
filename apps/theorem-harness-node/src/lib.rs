@@ -7,36 +7,40 @@
 //! marshalling. This is what retires the plugin's hand-written JS clients: the
 //! plugin calls these native methods instead of re-implementing run logic in JS.
 //!
-//! Slice 1 binds the run lifecycle against an in-process [`InMemoryGraphStore`].
-//! The production swap to a durable `RedCoreGraphStore` (constructed from a data
-//! directory) is a one-type change to the field and constructor, because the SDK
-//! surface is store-agnostic by design.
+//! The harness is durable: it binds the run lifecycle against a
+//! [`RedCoreGraphStore`] opened from a data directory (AOF-backed, recovered on
+//! open). Because the SDK surface is store-agnostic, this is the only place the
+//! store type appears; swapping to any other `GraphStore` is a one-line change
+//! here, not a rewrite of the harness logic.
 
 use std::sync::Mutex;
 
 use napi_derive::napi;
-use rustyred_thg_core::InMemoryGraphStore;
+use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use theorem_harness::{export_run_trace, IdempotencyToken, RunHandle, RunStream, SdkError};
 use theorem_harness_core::types::Payload;
 
-/// A harness bound to an in-process graph store, exposed to Node.
+/// A harness bound to a durable RedCore graph store, exposed to Node.
 ///
 /// The store is held behind a `Mutex` so the JS object can be shared and called
 /// from the event loop while the SDK takes `&mut` for state-changing calls.
 #[napi]
 pub struct Harness {
-    store: Mutex<InMemoryGraphStore>,
+    store: Mutex<RedCoreGraphStore>,
 }
 
 #[napi]
 impl Harness {
-    /// Create a harness over a fresh in-process store.
+    /// Open a harness over a durable RedCore store at `data_dir`. The directory
+    /// is created if absent; existing harness state is recovered from the AOF on
+    /// open, so a run started in one process is visible to the next.
     #[napi(constructor)]
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self {
-            store: Mutex::new(InMemoryGraphStore::default()),
-        }
+    pub fn new(data_dir: String) -> napi::Result<Self> {
+        let store = RedCoreGraphStore::open(data_dir, RedCoreOptions::default())
+            .map_err(|error| napi::Error::from_reason(format!("{error:?}")))?;
+        Ok(Self {
+            store: Mutex::new(store),
+        })
     }
 
     /// Start a run and return its id. Mirrors `RunHandle::start`.
@@ -96,7 +100,7 @@ impl Harness {
         stream.poll_text(&*store).map_err(to_napi)
     }
 
-    fn lock(&self) -> napi::Result<std::sync::MutexGuard<'_, InMemoryGraphStore>> {
+    fn lock(&self) -> napi::Result<std::sync::MutexGuard<'_, RedCoreGraphStore>> {
         self.store
             .lock()
             .map_err(|error| napi::Error::from_reason(error.to_string()))
