@@ -74,8 +74,10 @@ Remaining external steps:
 1. Assign the Apple Developer Team in the generated Xcode project or through
    XcodeGen settings.
 2. Confirm the Bundle ID `me.travisgilbert.theorem` in the developer account.
-3. Add production entitlements only when the product surface needs them. The
-   current Dynamic Island is in-app chrome, not an ActivityKit Live Activity.
+3. Add production entitlements only when the product surface needs them. This is
+   complete for the current surface: no production entitlements are configured,
+   and the current Dynamic Island is in-app chrome, not an ActivityKit Live
+   Activity.
 4. Build a signed Release archive:
 
 ```bash
@@ -88,12 +90,23 @@ xcodebuild \
   archive
 ```
 
-5. Upload through Xcode Organizer after archive validation, then start internal
-   TestFlight before external review.
+5. Upload after archive validation with `apps/theorem-ios/App/ExportOptions.plist`,
+   then start internal TestFlight before external review:
+
+```bash
+xcodebuild \
+  -exportArchive \
+  -archivePath /tmp/Theorem.xcarchive \
+  -exportPath /tmp/Theorem-export \
+  -exportOptionsPlist apps/theorem-ios/App/ExportOptions.plist \
+  -allowProvisioningUpdates
+```
 
 ## Current blockers
 
 - Apple Developer Team and provisioning are not configured in the repo.
 - App Store Connect metadata, privacy answers, and review notes still need owner
   choices.
+- Actual App Store Connect upload still requires a signed archive and either an
+  Xcode account session or App Store Connect API key flags.
 - Live hosted search readiness is separate from native app packaging readiness.

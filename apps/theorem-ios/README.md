@@ -65,3 +65,16 @@ The app target is validated with Xcode 26.5 against the iOS 26.5 simulator. The 
 The v1 app ships with Swift-native reprojection. A Rust UniFFI `.xcframework` remains a future parity or performance lane, not a TestFlight blocker.
 
 Debug keeps signing disabled for local simulator builds. Release leaves signing enabled and automatic, so TestFlight requires an Apple Developer Team, provisioning, and App Store Connect setup before archive upload.
+
+No production entitlements are configured yet. The current Dynamic Island is in-app chrome, not an ActivityKit Live Activity, so adding ActivityKit would be premature.
+
+`App/ExportOptions.plist` is the internal TestFlight upload recipe. After a signed archive exists, upload with:
+
+```bash
+xcodebuild \
+  -exportArchive \
+  -archivePath /tmp/Theorem.xcarchive \
+  -exportPath /tmp/Theorem-export \
+  -exportOptionsPlist apps/theorem-ios/App/ExportOptions.plist \
+  -allowProvisioningUpdates
+```
