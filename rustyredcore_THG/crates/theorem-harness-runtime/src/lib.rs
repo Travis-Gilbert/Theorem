@@ -1,6 +1,14 @@
+pub mod binding_store;
 pub mod coordination;
 pub mod event_log;
 pub mod memory;
+
+pub use binding_store::{
+    append_binding_transition, binding_event_node_id, binding_node_id, load_binding,
+    load_binding_events, load_scratchpad_revisions, persist_binding,
+    persist_binding_transition_result, scratchpad_revision_node_id, BindingRuntimeError,
+    BindingRuntimeResult,
+};
 
 pub use coordination::{
     coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
