@@ -194,7 +194,12 @@ pub fn evolution_archive(payload: Value) -> Result<Value, String> {
         selected.extend(ranked.clone());
         elites_by_niche.insert(
             niche,
-            Value::Array(ranked.iter().map(EvolutionCandidateRecord::to_value).collect()),
+            Value::Array(
+                ranked
+                    .iter()
+                    .map(EvolutionCandidateRecord::to_value)
+                    .collect(),
+            ),
         );
     }
 
@@ -498,9 +503,13 @@ fn code_symbol_touched_by_failing_postmortem_pattern(
         if attr_string(atom, "kind") != "code_symbol" {
             continue;
         }
-        if !["failing_postmortem_pattern", "postmortem_failure", "failed_tests"]
-            .iter()
-            .any(|key| metadata.get(*key).is_some_and(truthy))
+        if ![
+            "failing_postmortem_pattern",
+            "postmortem_failure",
+            "failed_tests",
+        ]
+        .iter()
+        .any(|key| metadata.get(*key).is_some_and(truthy))
         {
             continue;
         }
@@ -594,9 +603,11 @@ fn demolition_window(index: &RelationIndex) -> Result<Vec<Value>, String> {
         };
         let present_years: BTreeSet<i64> = present_obs.iter().map(|(year, _)| *year).collect();
         let absent_years: BTreeSet<i64> = absent_obs.iter().map(|(year, _)| *year).collect();
-        let earliest_absent = absent_years
-            .into_iter()
-            .find(|absent_year| present_years.iter().any(|present_year| present_year < absent_year));
+        let earliest_absent = absent_years.into_iter().find(|absent_year| {
+            present_years
+                .iter()
+                .any(|present_year| present_year < absent_year)
+        });
         let Some(earliest_absent) = earliest_absent else {
             continue;
         };
@@ -678,7 +689,10 @@ fn conflict_set(index: &RelationIndex) -> Result<Vec<Value>, String> {
         if parcel.is_empty() || field.is_empty() {
             continue;
         }
-        grouped.entry((parcel, field)).or_default().push(fact.clone());
+        grouped
+            .entry((parcel, field))
+            .or_default()
+            .push(fact.clone());
     }
 
     let mut out = Vec::new();
@@ -778,7 +792,8 @@ fn vacancy_duration(index: &RelationIndex, min_years: i64) -> Result<Vec<Value>,
     let mut out = Vec::new();
     for (parcel, mut observations) in by_parcel {
         observations.sort_by(|left, right| {
-            (left.0, object_field(&left.2, "fact_id")).cmp(&(right.0, object_field(&right.2, "fact_id")))
+            (left.0, object_field(&left.2, "fact_id"))
+                .cmp(&(right.0, object_field(&right.2, "fact_id")))
         });
 
         let mut best_run: Vec<(i64, String, Value)> = Vec::new();
@@ -889,7 +904,10 @@ fn ownership_chain(index: &RelationIndex) -> Result<Vec<Value>, String> {
             let owner_type = object_field(link, "owner_type");
             if owner_type == "tax_foreclosure" && foreclosure_year.is_none() {
                 foreclosure_year = link.get("from_year").and_then(coerce_year);
-            } else if owner_type == "land_bank" && foreclosure_year.is_some() && land_bank_year.is_none() {
+            } else if owner_type == "land_bank"
+                && foreclosure_year.is_some()
+                && land_bank_year.is_none()
+            {
                 land_bank_year = link.get("from_year").and_then(coerce_year);
             }
         }
@@ -897,10 +915,14 @@ fn ownership_chain(index: &RelationIndex) -> Result<Vec<Value>, String> {
         let owners_label = chain
             .iter()
             .map(|link| {
-                let label = [object_field(link, "owner"), object_field(link, "owner_type"), "unknown"]
-                    .into_iter()
-                    .find(|value| !value.is_empty())
-                    .unwrap_or("unknown");
+                let label = [
+                    object_field(link, "owner"),
+                    object_field(link, "owner_type"),
+                    "unknown",
+                ]
+                .into_iter()
+                .find(|value| !value.is_empty())
+                .unwrap_or("unknown");
                 match link.get("from_year").and_then(coerce_year) {
                     Some(year) => format!("{label} ({year})"),
                     None => label.to_string(),
@@ -962,12 +984,17 @@ impl EvolutionCandidateRecord {
     }
 }
 
-fn evolution_candidates_from_payload(payload: &Value) -> Result<Vec<EvolutionCandidateRecord>, String> {
+fn evolution_candidates_from_payload(
+    payload: &Value,
+) -> Result<Vec<EvolutionCandidateRecord>, String> {
     let candidates = payload
         .get("candidates")
         .and_then(Value::as_array)
         .ok_or_else(|| "evolution archive payload expected candidates array".to_string())?;
-    candidates.iter().map(evolution_candidate_from_value).collect()
+    candidates
+        .iter()
+        .map(evolution_candidate_from_value)
+        .collect()
 }
 
 fn evolution_candidate_from_value(value: &Value) -> Result<EvolutionCandidateRecord, String> {
@@ -1031,7 +1058,10 @@ fn evolution_archive_hash(candidates: &[EvolutionCandidateRecord]) -> Result<Str
     let mut sorted = candidates.to_vec();
     sorted.sort_by(compare_evolution_hash_rank);
     stable_hash_value(&Value::Array(
-        sorted.iter().map(EvolutionCandidateRecord::to_value).collect(),
+        sorted
+            .iter()
+            .map(EvolutionCandidateRecord::to_value)
+            .collect(),
     ))
 }
 
@@ -1053,21 +1083,29 @@ fn datalog_payload_parts(payload: &Value) -> Result<(&Vec<Value>, Option<Vec<Str
     let facts = payload
         .get("facts")
         .and_then(Value::as_array)
-        .ok_or_else(|| "datalog payload expected a JSON array or an object with facts array".to_string())?;
-    let rule_ids = payload.get("rule_ids").and_then(Value::as_array).map(|items| {
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    });
+        .ok_or_else(|| {
+            "datalog payload expected a JSON array or an object with facts array".to_string()
+        })?;
+    let rule_ids = payload
+        .get("rule_ids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
     Ok((facts, rule_ids))
 }
 
 fn selected_rule_ids(requested_rule_ids: Option<Vec<String>>) -> Vec<String> {
     match requested_rule_ids {
         Some(ids) if !ids.is_empty() => ids,
-        _ => DATALOG_RULE_IDS.iter().map(|rule_id| (*rule_id).to_string()).collect(),
+        _ => DATALOG_RULE_IDS
+            .iter()
+            .map(|rule_id| (*rule_id).to_string())
+            .collect(),
     }
 }
 
@@ -1125,7 +1163,9 @@ fn facts_by_relation(facts: &[Value]) -> RelationIndex {
             .push(fact.clone());
     }
     for facts in index.values_mut() {
-        facts.sort_by(|left, right| object_field(left, "fact_id").cmp(object_field(right, "fact_id")));
+        facts.sort_by(|left, right| {
+            object_field(left, "fact_id").cmp(object_field(right, "fact_id"))
+        });
     }
     index
 }
@@ -1176,7 +1216,10 @@ fn structure_observations_by_parcel(
             continue;
         };
         if !parcel.is_empty() {
-            grouped.entry(parcel).or_default().push((year, fact.clone()));
+            grouped
+                .entry(parcel)
+                .or_default()
+                .push((year, fact.clone()));
         }
     }
     grouped
@@ -1374,7 +1417,10 @@ fn first_four_digit_year(value: &str) -> Option<i64> {
 }
 
 fn object_value_lower(value: Option<&Value>) -> String {
-    value.map(value_to_string).unwrap_or_default().to_lowercase()
+    value
+        .map(value_to_string)
+        .unwrap_or_default()
+        .to_lowercase()
 }
 
 fn truthy(value: &Value) -> bool {
@@ -1440,7 +1486,10 @@ mod tests {
         assert!(relations.contains("claim_has_no_independent_support"));
         assert!(relations.contains("private_source_reaches_export_candidate"));
         assert_eq!(receipt["engine"], "python-reference-datalog");
-        assert_eq!(receipt["rule_ids"].as_array().unwrap().len(), DATALOG_RULE_IDS.len());
+        assert_eq!(
+            receipt["rule_ids"].as_array().unwrap().len(),
+            DATALOG_RULE_IDS.len()
+        );
     }
 
     #[test]

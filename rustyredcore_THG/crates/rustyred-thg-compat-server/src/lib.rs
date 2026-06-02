@@ -3,8 +3,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use serde_json::{json, Value};
 use rustyred_thg_core::{ThgExecutor, ThgRequest};
+use serde_json::{json, Value};
 
 pub type SharedExecutor = Arc<Mutex<Box<dyn ThgExecutor + Send>>>;
 
@@ -189,14 +189,15 @@ fn json_response(status: u16, body: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{handle_http_request, SharedExecutor};
+    use rustyred_thg_core::{InMemoryThgExecutor, ThgExecutor, ThgRequest};
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
-    use rustyred_thg_core::{InMemoryThgExecutor, ThgExecutor, ThgRequest};
 
     #[test]
     fn command_endpoint_executes_core_command() {
         let executor: SharedExecutor = Arc::new(Mutex::new(Box::new(InMemoryThgExecutor::new())));
-        let body = r#"{"command":"RUSTYRED_THG.RUN.BEGIN","args":{"run_id":"run:1","task":"server"}}"#;
+        let body =
+            r#"{"command":"RUSTYRED_THG.RUN.BEGIN","args":{"run_id":"run:1","task":"server"}}"#;
         let raw = format!(
             "POST /v1/command HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),

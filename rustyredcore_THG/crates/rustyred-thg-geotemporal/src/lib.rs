@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 
+use rustyred_thg_core::{NodeRecord, SpatialDesignation, SpatialIndex, TimeInterval};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use rustyred_thg_core::{NodeRecord, SpatialDesignation, SpatialIndex, TimeInterval};
 
 pub type NodeId = String;
 
@@ -200,8 +200,8 @@ fn numeric_property(properties: &Value, key: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use rustyred_thg_core::{GraphStore, InMemoryGraphStore};
+    use serde_json::json;
 
     use super::*;
 

@@ -22,12 +22,13 @@ pub fn upsert_adapter<S: AdapterGraphStore>(
         .get_node(&adapter.node_id())
         .map_err(thg_error_from_store)?;
     let mut extra_properties = preserved_adapter_properties(existing.as_ref());
-    if !extra_properties.get("fitness_half_life_days").is_some() {
-        extra_properties["fitness_half_life_days"] = json!(adapter
-            .tenant_id
-            .eq_ignore_ascii_case("theseus")
-            .then_some(14.0)
-            .unwrap_or(30.0));
+    if extra_properties.get("fitness_half_life_days").is_none() {
+        let half_life_days = if adapter.tenant_id.eq_ignore_ascii_case("theseus") {
+            14.0
+        } else {
+            30.0
+        };
+        extra_properties["fitness_half_life_days"] = json!(half_life_days);
     }
     if let Some(embedding) = adapter_training_centroid(store, &adapter.training_object_ids)? {
         extra_properties["embedding"] = json!(embedding);

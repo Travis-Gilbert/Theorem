@@ -2905,10 +2905,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-affordances"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "theorem-harness-core",
+]
+
+[[package]]
 name = "rustyred-thg-compat-server"
 version = "0.5.0"
 dependencies = [
  "rustyred-thg-core",
+ "serde_json",
+]
+
+[[package]]
+name = "rustyred-thg-connectors"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-affordances",
+ "rustyred-thg-core",
+ "serde",
  "serde_json",
 ]
 
@@ -2943,6 +2963,8 @@ dependencies = [
  "rustyred-thg-core",
  "serde",
  "serde_json",
+ "theorem-harness-core",
+ "theorem-harness-runtime",
 ]
 
 [[package]]
@@ -3567,6 +3589,26 @@ dependencies = [
  "regex",
  "thiserror 1.0.69",
  "url",
+]
+
+[[package]]
+name = "theorem-harness-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "theorem-harness-runtime"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "theorem-harness-core",
 ]
 
 [[package]]

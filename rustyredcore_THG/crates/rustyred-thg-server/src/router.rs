@@ -113,6 +113,35 @@ pub struct CrawlRouteBody {
     pub scope: Option<CrawlScope>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct LiveSearchRequest {
+    #[serde(default, alias = "query")]
+    pub q: Option<String>,
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub budget: Option<CrawlBudget>,
+    #[serde(default)]
+    pub scope: Option<CrawlScope>,
+    #[serde(default)]
+    pub crawl: Option<bool>,
+    #[serde(default)]
+    pub min_hits: Option<usize>,
+    #[serde(default)]
+    pub min_links: Option<usize>,
+    #[serde(default)]
+    pub max_pages: Option<usize>,
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
 #[derive(Debug, Deserialize)]
 pub struct FederateSubmitBody {
     #[serde(default, alias = "tenant_id")]
@@ -282,12 +311,25 @@ fn default_k() -> usize {
 fn default_max_hops() -> usize {
     3
 }
+const LIVE_SEARCH_DEFAULT_MIN_HITS: usize = 3;
+const LIVE_SEARCH_DEFAULT_MIN_LINKS: usize = 1;
+const LIVE_SEARCH_DEFAULT_MAX_PAGES: usize = 8;
+const LIVE_SEARCH_DEFAULT_MAX_SECONDS: u64 = 20;
+const LIVE_SEARCH_DEFAULT_MAX_DEPTH: usize = 1;
+const LIVE_SEARCH_DEFAULT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const LIVE_SEARCH_HARD_MAX_PAGES: usize = 25;
+const LIVE_SEARCH_HARD_MAX_SECONDS: u64 = 30;
+const LIVE_SEARCH_HARD_MAX_DEPTH: usize = 2;
+const LIVE_SEARCH_HARD_MAX_BYTES: usize = 5 * 1024 * 1024;
+
 pub fn build_router(state: AppState) -> Router {
     let cors = cors_layer(&state);
     Router::new()
         .route("/", get(search_home))
         .route("/search", get(search_html))
         .route("/search.json", get(search_json))
+        .route("/search/live", get(search_live))
+        .route("/search/answer", post(search_answer))
         .route("/crawl", post(crawl_submit))
         .route("/federate/submit", post(federate_submit))
         .route("/health", get(health))
@@ -584,6 +626,293 @@ async fn search_json(
     }
 }
 
+async fn search_live(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveSearchRequest>,
+) -> axum::response::Response {
+    execute_live_search(&state, &headers, query).await
+}
+
+async fn search_answer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LiveSearchRequest>,
+) -> axum::response::Response {
+    execute_live_search(&state, &headers, body).await
+}
+
+async fn execute_live_search(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: LiveSearchRequest,
+) -> axum::response::Response {
+    let search_query = SearchQuery {
+        q: request.q.clone(),
+        tenant: request.tenant.clone(),
+    };
+    let (tenant_id, initial) = match execute_search(state, headers, &search_query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+
+    let query_text = request.q.as_deref().unwrap_or_default().trim();
+    let min_hits = request.min_hits.unwrap_or(LIVE_SEARCH_DEFAULT_MIN_HITS);
+    let min_links = request.min_links.unwrap_or(LIVE_SEARCH_DEFAULT_MIN_LINKS);
+    let crawl_enabled = request.crawl.unwrap_or(true);
+    if !crawl_enabled
+        || query_text.is_empty()
+        || !live_search_is_sparse(&initial, min_hits, min_links)
+    {
+        let reason = if !crawl_enabled {
+            "crawl_disabled"
+        } else if query_text.is_empty() {
+            "empty_query"
+        } else {
+            "substrate_dense_enough"
+        };
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": initial.query,
+            "phase": "search_only",
+            "initial": live_search_summary(&initial),
+            "crawl": {
+                "attempted": false,
+                "reason": reason,
+                "min_hits": min_hits,
+                "min_links": min_links
+            },
+            "search": initial
+        }))
+        .into_response();
+    }
+
+    if let Err(status) = require_scope(
+        headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let (seeds, seed_strategy) = derive_live_search_seeds(query_text, &request.seeds);
+    if seeds.is_empty() {
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": initial.query,
+            "phase": "search_only",
+            "initial": live_search_summary(&initial),
+            "crawl": {
+                "attempted": false,
+                "reason": "no_crawl_seed",
+                "seed_strategy": seed_strategy,
+                "min_hits": min_hits,
+                "min_links": min_links
+            },
+            "search": initial
+        }))
+        .into_response();
+    }
+
+    let crawl_budget = live_search_budget(&request);
+    let scope_was_supplied = request.scope.is_some();
+    let mut crawl_request = CrawlRequest::new(
+        request.run_id.clone().unwrap_or_else(default_crawl_run_id),
+        seeds.clone(),
+    );
+    crawl_request.budget = crawl_budget.clone();
+    crawl_request.scope = request.scope.clone().unwrap_or_default();
+    if federation_enabled() && !scope_was_supplied {
+        crawl_request.scope.federable = true;
+    }
+
+    let federation_request = crawl_request.clone();
+    let output = match run_live_crawl(crawl_request).await {
+        Ok(output) => output,
+        Err(error) => {
+            return Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "query": initial.query,
+                "phase": "crawl_failed",
+                "initial": live_search_summary(&initial),
+                "crawl": {
+                    "attempted": true,
+                    "seed_strategy": seed_strategy,
+                    "seeds": seeds,
+                    "budget": crawl_budget,
+                    "error": "rustyweb_crawl_error",
+                    "message": error.to_string()
+                },
+                "search": initial
+            }))
+            .into_response();
+        }
+    };
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let transaction = match store.commit_batch(output.graph.batch.clone()) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let federation =
+        submit_web_commons_fragment(state, &tenant_id, &federation_request, &output).await;
+    let (_tenant_id, search) = match execute_search(state, headers, &search_query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "query": search.query,
+        "phase": "crawled",
+        "initial": live_search_summary(&initial),
+        "crawl": {
+            "attempted": true,
+            "seed_strategy": seed_strategy,
+            "seeds": seeds,
+            "receipt": output.receipt,
+            "transaction": transaction,
+            "federation": federation,
+            "min_hits": min_hits,
+            "min_links": min_links
+        },
+        "search": search
+    }))
+    .into_response()
+}
+
+fn live_search_is_sparse(
+    search: &rustyred_web::SubstrateSearch,
+    min_hits: usize,
+    min_links: usize,
+) -> bool {
+    search.matched_count < min_hits || search.links.len() < min_links
+}
+
+fn live_search_summary(search: &rustyred_web::SubstrateSearch) -> Value {
+    json!({
+        "matched_count": search.matched_count,
+        "kept_count": search.kept_count,
+        "hits": search.hits.len(),
+        "links": search.links.len()
+    })
+}
+
+fn live_search_budget(request: &LiveSearchRequest) -> CrawlBudget {
+    let mut budget = request.budget.clone().unwrap_or(CrawlBudget {
+        max_pages: LIVE_SEARCH_DEFAULT_MAX_PAGES,
+        max_seconds: LIVE_SEARCH_DEFAULT_MAX_SECONDS,
+        max_depth: LIVE_SEARCH_DEFAULT_MAX_DEPTH,
+        max_bytes: LIVE_SEARCH_DEFAULT_MAX_BYTES,
+    });
+    if let Some(max_pages) = request.max_pages {
+        budget.max_pages = max_pages;
+    }
+    if let Some(max_seconds) = request.max_seconds {
+        budget.max_seconds = max_seconds;
+    }
+    if let Some(max_depth) = request.max_depth {
+        budget.max_depth = max_depth;
+    }
+    if let Some(max_bytes) = request.max_bytes {
+        budget.max_bytes = max_bytes;
+    }
+    budget.max_pages = budget.max_pages.clamp(1, LIVE_SEARCH_HARD_MAX_PAGES);
+    budget.max_seconds = budget.max_seconds.clamp(1, LIVE_SEARCH_HARD_MAX_SECONDS);
+    budget.max_depth = budget.max_depth.min(LIVE_SEARCH_HARD_MAX_DEPTH);
+    budget.max_bytes = budget.max_bytes.clamp(1, LIVE_SEARCH_HARD_MAX_BYTES);
+    budget
+}
+
+fn derive_live_search_seeds(query: &str, supplied: &[String]) -> (Vec<String>, &'static str) {
+    let mut seeds = Vec::new();
+    let mut seen = BTreeSet::new();
+    for seed in supplied {
+        push_live_search_seed(&mut seeds, &mut seen, seed.trim().to_string());
+    }
+    if !seeds.is_empty() {
+        return (seeds, "provided");
+    }
+    if let Some(seed) = direct_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "direct_url");
+    }
+    if let Some(seed) = domain_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "domain_guess");
+    }
+    if let Some(seed) = wikipedia_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "wikipedia_title_guess");
+    }
+    (seeds, "none")
+}
+
+fn push_live_search_seed(seeds: &mut Vec<String>, seen: &mut BTreeSet<String>, seed: String) {
+    let trimmed = seed.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if seen.insert(trimmed.to_string()) {
+        seeds.push(trimmed.to_string());
+    }
+}
+
+fn direct_live_search_seed(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn domain_live_search_seed(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.chars().any(char::is_whitespace) || trimmed.contains("://") {
+        return None;
+    }
+    let host_like = trimmed
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('.');
+    if host_like.contains('.') && host_like.chars().any(|c| c.is_ascii_alphabetic()) {
+        Some(format!("https://{trimmed}"))
+    } else {
+        None
+    }
+}
+
+fn wikipedia_live_search_seed(query: &str) -> Option<String> {
+    let title: Vec<String> = query
+        .split_whitespace()
+        .filter_map(wikipedia_title_token)
+        .collect();
+    if title.is_empty() {
+        None
+    } else {
+        Some(format!("https://en.wikipedia.org/wiki/{}", title.join("_")))
+    }
+}
+
+fn wikipedia_title_token(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut chars = cleaned.chars();
+    let first = chars.next()?.to_ascii_uppercase();
+    let rest = chars.as_str().to_ascii_lowercase();
+    Some(format!("{first}{rest}"))
+}
 fn render_search_response(
     state: &AppState,
     headers: &HeaderMap,
@@ -4755,6 +5084,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use axum::body::{to_bytes, Body};
+    use axum::extract::{Query, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use axum::Json;
@@ -4762,24 +5092,25 @@ mod tests {
 
     use super::{
         default_ppr_alpha, default_ppr_epsilon, default_ppr_max_pushes, default_pr_damping,
-        default_pr_max_iter, default_pr_tolerance, execute_graph_store_command,
-        execute_tenant_cache_command, execute_tenant_command, graph_algorithm_communities,
-        graph_algorithm_components, graph_algorithm_pagerank, graph_algorithm_ppr,
-        graph_bulk_edges, graph_bulk_nodes, graph_error_status, graph_fulltext_search,
-        graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge, instant_kg_impact,
-        instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command, is_graph_command,
-        mcp_origin_allowed, public_cypher, required_scope_for_command, transaction_begin,
+        default_pr_max_iter, default_pr_tolerance, derive_live_search_seeds,
+        execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
+        graph_algorithm_communities, graph_algorithm_components, graph_algorithm_pagerank,
+        graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes, graph_error_status,
+        graph_fulltext_search, graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge,
+        instant_kg_impact, instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command,
+        is_graph_command, live_search_budget, live_search_is_sparse, mcp_origin_allowed,
+        public_cypher, required_scope_for_command, search_live, transaction_begin,
         transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
         FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
-        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, PageRankBody, PprBody,
-        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, PageRankBody,
+        PprBody, PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         config::{Config, StorageMode, TenantConfigOverride},
         metrics::diagnostics_config,
         state::AppState,
     };
-    use rustyred_thg_core::RedCoreDurability;
+    use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
 
     async fn response_payload_json(response: axum::response::Response) -> Value {
         serde_json::from_slice(
@@ -4826,6 +5157,106 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             ttl_sweep_ms: 1000,
         })
+    }
+
+    #[test]
+    fn live_search_derives_bounded_crawl_inputs() {
+        let (seeds, strategy) = derive_live_search_seeds("knowledge graph", &[]);
+        assert_eq!(strategy, "wikipedia_title_guess");
+        assert_eq!(
+            seeds,
+            vec!["https://en.wikipedia.org/wiki/Knowledge_Graph".to_string()]
+        );
+
+        let (seeds, strategy) = derive_live_search_seeds("example.com/docs", &[]);
+        assert_eq!(strategy, "domain_guess");
+        assert_eq!(seeds, vec!["https://example.com/docs".to_string()]);
+
+        let budget = live_search_budget(&LiveSearchRequest {
+            max_pages: Some(100),
+            max_seconds: Some(100),
+            max_depth: Some(10),
+            max_bytes: Some(100 * 1024 * 1024),
+            ..LiveSearchRequest::default()
+        });
+        assert_eq!(budget.max_pages, 25);
+        assert_eq!(budget.max_seconds, 30);
+        assert_eq!(budget.max_depth, 2);
+        assert_eq!(budget.max_bytes, 5 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn search_live_returns_existing_connected_substrate_without_crawl() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("tenant-live").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:knowledge",
+                    [rustyred_web::LABEL_PAGE],
+                    json!({ "url": "https://example.test/knowledge-graph" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:rustyweb",
+                    [rustyred_web::LABEL_PAGE],
+                    json!({ "url": "https://example.test/rustyweb" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "snapshot:knowledge",
+                    ["ContentSnapshot"],
+                    json!({ "text": "A knowledge graph connects concepts through typed links." }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:knowledge:snapshot",
+                    "page:knowledge",
+                    rustyred_web::EDGE_HAS_SNAPSHOT,
+                    "snapshot:knowledge",
+                    json!({}),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:knowledge:rustyweb",
+                    "page:knowledge",
+                    rustyred_web::EDGE_LINKS_TO,
+                    "page:rustyweb",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+
+        let response = search_live(
+            State(state),
+            HeaderMap::new(),
+            Query(LiveSearchRequest {
+                q: Some("knowledge graph".to_string()),
+                tenant: Some("tenant-live".to_string()),
+                min_hits: Some(1),
+                min_links: Some(1),
+                ..LiveSearchRequest::default()
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["phase"], "search_only");
+        assert_eq!(payload["crawl"]["attempted"], false);
+        assert_eq!(payload["crawl"]["reason"], "substrate_dense_enough");
+        assert_eq!(payload["initial"]["matched_count"], 1);
+        assert_eq!(payload["initial"]["links"], 1);
+        assert_eq!(payload["search"]["links"].as_array().unwrap().len(), 1);
+
+        let sparse = serde_json::from_value(payload["search"].clone()).unwrap();
+        assert!(!live_search_is_sparse(&sparse, 1, 1));
     }
 
     #[test]

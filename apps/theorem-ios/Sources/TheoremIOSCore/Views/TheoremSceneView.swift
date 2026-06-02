@@ -11,13 +11,18 @@ struct TheoremSceneView: View {
     }
 
     var body: some View {
-        Group {
-            if projection == .forceGraph {
-                // Live force simulation (Grape) for the hero projection; the
-                // other three draw the sliver's exact positions on the Canvas.
-                ForceGraphView(package: package, theme: theme)
-            } else {
-                canvasBody
+        ZStack {
+            // Pure-white field. The hex-blueprint texture lives in the Dynamic
+            // Island chrome now (pill + expanded), not behind the graph.
+            theme.field
+            Group {
+                if projection == .forceGraph {
+                    // Live force simulation (Grape) for the hero projection; the
+                    // other three draw the sliver's exact positions on the Canvas.
+                    ForceGraphView(package: package, theme: theme)
+                } else {
+                    canvasBody
+                }
             }
         }
         .overlay(alignment: .topLeading) {
@@ -44,25 +49,35 @@ struct TheoremSceneView: View {
     }
 
     private var sceneHeader: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(projection.title)
-                .font(TheoremFonts.mono(size: 11))
-                .textCase(.uppercase)
-                .foregroundStyle(theme.textSecondary)
-            Text(selectedTitle)
-                .font(TheoremFonts.display(size: 30, relativeTo: .title))
-                .foregroundStyle(theme.textPrimary)
-                .lineLimit(2)
+        VStack(alignment: .leading, spacing: 5) {
+            // The query / center-node name is the headline, kept subtle. The
+            // "FORCE · N NODES" caption was cut per Travis.
+            if let headline = sceneHeadline {
+                Text(headline)
+                    .font(TheoremFonts.display(size: 22, relativeTo: .title2))
+                    .foregroundStyle(theme.ink)
+                    .lineLimit(2)
+            }
         }
-        .frame(maxWidth: 250, alignment: .leading)
+        .frame(maxWidth: 280, alignment: .leading)
     }
 
-    private var selectedTitle: String {
-        guard let selectedNodeID,
-              let atom = package.atoms.first(where: { $0.id == selectedNodeID }) else {
-            return "Substrate Scene"
+    /// The prominent type: the selected node, else the search query, else the
+    /// center node (highest match_score) — never a generic screen title.
+    private var sceneHeadline: String? {
+        if let selectedNodeID,
+           let atom = package.atoms.first(where: { $0.id == selectedNodeID }) {
+            return atom.label ?? atom.id
         }
-        return atom.label ?? atom.id
+        if let query = package.provenance["query"]?.stringValue,
+           !query.trimmingCharacters(in: .whitespaces).isEmpty {
+            return query
+        }
+        if let center = TheoremProjectionEngine.centerNodeID(in: package, mode: .pprMass),
+           let atom = package.atoms.first(where: { $0.id == center }) {
+            return atom.label ?? atom.id
+        }
+        return nil
     }
 
     private func positionMap(in size: CGSize) -> [String: CGPoint] {
@@ -102,6 +117,24 @@ struct TheoremSceneView: View {
             path.move(to: source)
             path.addLine(to: target)
             context.stroke(path, with: .color(theme.edge), lineWidth: 1.2)
+
+            // Edge-kind label (relation.kind) in the data face. Gated by the
+            // >12-node rule: dense graphs only label the selected node's edges.
+            guard showEdgeLabel(for: relation), !relation.kind.isEmpty else { continue }
+            let mid = CGPoint(x: (source.x + target.x) / 2, y: (source.y + target.y) / 2)
+            let resolved = context.resolve(
+                Text(relation.kind)
+                    .font(TheoremFonts.mono(size: 8))
+                    .foregroundStyle(theme.textMuted)
+            )
+            let sz = resolved.measure(in: size)
+            // Field chip behind the label so the rule line doesn't strike through.
+            let chip = CGRect(
+                x: mid.x - sz.width / 2 - 3, y: mid.y - sz.height / 2 - 1,
+                width: sz.width + 6, height: sz.height + 2
+            )
+            context.fill(Path(roundedRect: chip, cornerRadius: 2), with: .color(theme.field))
+            context.draw(resolved, at: mid, anchor: .center)
         }
     }
 
@@ -112,13 +145,27 @@ struct TheoremSceneView: View {
             }
             let radius = radius(for: atom)
             let rect = CGRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2)
-            let color = color(for: atom)
-            context.fill(Path(ellipseIn: rect), with: .color(color))
+            // Monochrome instrument node: field fill, ink outline. Selection is the
+            // only hue — the node flips to oxblood at a heavier stroke.
+            let selected = atom.id == selectedNodeID
+            context.fill(Path(ellipseIn: rect), with: .color(theme.field))
             context.stroke(
-                Path(ellipseIn: rect.insetBy(dx: -3, dy: -3)),
-                with: .color(atom.id == selectedNodeID ? theme.ringMatch : theme.surface.opacity(0.72)),
-                lineWidth: atom.id == selectedNodeID ? 3 : 1
+                Path(ellipseIn: rect),
+                with: .color(selected ? theme.signal : theme.ink),
+                lineWidth: selected ? 2 : 1.2
             )
+
+            // Node label (atom.label) below the node, in the instrument label
+            // face. Shown for sparse graphs, or the selected node when dense.
+            if (package.atoms.count <= 14 || selected), let label = nodeLabel(atom) {
+                context.draw(
+                    Text(label)
+                        .font(TheoremFonts.label(size: 9))
+                        .foregroundStyle(selected ? theme.signal : theme.ink),
+                    at: CGPoint(x: point.x, y: point.y + radius + 7),
+                    anchor: .top
+                )
+            }
         }
     }
 
@@ -140,23 +187,18 @@ struct TheoremSceneView: View {
         return 8 + min(max(score, 0.05), 1.0) * 18
     }
 
-    private func color(for atom: SceneAtom) -> Color {
-        switch atom.kind {
-        case "core":
-            theme.nodeCore
-        case "web":
-            theme.nodeWeb
-        case "tool":
-            theme.nodeTool
-        default:
-            switch atom.metadata["ring"]?.intValue {
-            case 0:
-                theme.ringMatch
-            case 1:
-                theme.ringAdjacent
-            default:
-                theme.ringNearby
-            }
-        }
+    /// >12-node gate (addendum): sparse graphs label every edge; dense graphs
+    /// label only the selected node's edges (others would crowd the field).
+    private func showEdgeLabel(for relation: SceneRelation) -> Bool {
+        package.atoms.count <= 12
+            || relation.sourceId == selectedNodeID
+            || relation.targetId == selectedNodeID
+    }
+
+    /// Node label text (atom.label, else id), truncated for the canvas.
+    private func nodeLabel(_ atom: SceneAtom) -> String? {
+        let raw = atom.label ?? atom.id
+        guard !raw.isEmpty else { return nil }
+        return raw.count > 18 ? String(raw.prefix(17)) + "\u{2026}" : raw
     }
 }

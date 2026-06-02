@@ -1,0 +1,64 @@
+pub mod affordances;
+pub mod agent_binding;
+pub mod alignment;
+pub mod budget;
+pub mod context_web;
+pub mod federated_signals;
+pub mod map_artifacts;
+pub mod memory_contracts;
+pub mod replay;
+pub mod session_metrics;
+pub mod state_hash;
+pub mod state_machine;
+pub mod toolgraph;
+pub mod types;
+
+pub use affordances::{
+    affordance_by_id, affordance_ids, default_affordance_registry, validate_affordance_registry,
+    AffordanceContract, AffordanceReceipt,
+};
+pub use agent_binding::{
+    apply_binding_transition, composition_hash, hash_agent_binding, ActionTierPolicy, AgentBinding,
+    AgentHead, BindingBudgetScope, BindingCapabilityScope, BindingComposition, BindingError,
+    BindingEventState, BindingIdentity, BindingLifecycleState, BindingMemoryScope,
+    BindingTraceScope, BindingTransitionInput, BindingTransitionResult, HeadBudgetLimit,
+    HeadContributionRecord, HeadCostProfile, HeadKind, HeadReliabilityProfile, HeadTransport,
+    MemoryZone, MemoryZoneKind, PublishedScope, ScratchpadDocument, ScratchpadRevision, TraceTier,
+};
+pub use alignment::{evaluate_publication, MIN_CONSENSUS_HEADS};
+pub use budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
+pub use context_web::{
+    is_generated_artifact, normalize_context_web_node_id, ContextWebAtom, ContextWebBudget,
+    ContextWebCitation, ContextWebEdge, ContextWebEvaluation, ContextWebIndex, ContextWebPack,
+    ContextWebPackInput, ContextWebPath, ContextWebPolicy, ContextWebSpendPlan,
+    ContextWebStructuralBankResult, ContextWebTokenLedger, ContextWebValidationSummary,
+    ContextWebValidatorFinding,
+};
+pub use federated_signals::{
+    assert_no_raw_content, extract_structural_signal, observed_count_bucket,
+    receive_federated_signal, success_rate_bucket, FederatedSignal, PrivacyViolation,
+    StructuralSignalInput,
+};
+pub use map_artifacts::{
+    compile_map_artifact, describe_map_artifact, scope_for_map_kind, stable_map_id,
+    MapArtifactCompileInput, MapArtifactState, MapDeltaState, MapEntry,
+};
+pub use memory_contracts::{
+    PrepareMemoryBank, PrepareMemoryContract, PrepareMemoryEvidence, PrepareMemoryHydrationHandle,
+    PrepareMemoryPolicy, PrepareMemoryRecallPolicy, PrepareMemoryRecallPreview,
+};
+pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};
+pub use session_metrics::{
+    compare_modes, load_jsonl_metrics, summarize_pairformer_ab, PairformerSummaryRow,
+    SessionMetricsState, PAIRFORMER_MODES,
+};
+pub use state_hash::{empty_state_hash, hash_run_state, stable_value_hash};
+pub use state_machine::{apply_transition, HarnessError};
+pub use toolgraph::{
+    catalog_as_dicts, compile_task_toolkit, normalize_permissions, select_tools, BlockedTool,
+    CompiledToolkit, ToolContract, ToolSelectionState, DEFAULT_PERMISSIONS,
+};
+pub use types::{
+    AgentRunState, AgentStepState, EventState, GuardViolation, Payload, RunState, TransitionInput,
+    TransitionResult,
+};

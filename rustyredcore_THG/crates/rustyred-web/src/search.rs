@@ -102,6 +102,23 @@ pub struct SearchHit {
     /// Graph-aware relevance score. Direct matches seed native PPR; linked
     /// neighbours can receive non-zero score when the link graph supports them.
     pub match_score: f64,
+    /// Where the hit sits relative to the user's knowledge frontier:
+    /// `"corpus"` = a page the substrate has fetched (its content is known),
+    /// `"frontier"` = a discovered-but-unfetched link target (new, not yet
+    /// explored). Drives the iOS hollow (corpus) / filled (frontier) treatment.
+    pub provenance: String,
+}
+
+/// Classify a hit by whether the substrate has actually captured the page's
+/// content. A non-empty snapshot text means the page was fetched and is part of
+/// the user's known corpus; an empty one is a discovered-but-unfetched link
+/// target, i.e. new frontier the user has not explored yet.
+pub fn provenance_of(snapshot_text: &str) -> &'static str {
+    if snapshot_text.trim().is_empty() {
+        "frontier"
+    } else {
+        "corpus"
+    }
 }
 
 /// A `LINKS_TO` edge that survives inside the result neighbourhood.
@@ -470,6 +487,7 @@ pub fn search_substrate(
                     node_id: page.id.clone(),
                     url,
                     title,
+                    provenance: provenance_of(&snippet).to_string(),
                     snippet: snippet_of(&snippet),
                     ring: 0,
                     ring_label: "browse".to_string(),
@@ -572,6 +590,7 @@ pub fn search_substrate(
                 node_id: id,
                 url,
                 title,
+                provenance: provenance_of(&snippet).to_string(),
                 snippet: snippet_of(&snippet),
                 ring,
                 ring_label: ring_label(ring).to_string(),

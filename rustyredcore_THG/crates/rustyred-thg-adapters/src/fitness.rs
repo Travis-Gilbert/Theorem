@@ -228,7 +228,7 @@ pub fn effective_fitness_from_node(
 
 pub fn is_superseded<S: AdapterGraphStore>(store: &S, adapter: &LoraAdapter) -> ThgResult<bool> {
     let hits = store
-        .neighbors(NeighborQuery::in_(&adapter.node_id()).with_edge_type(SUPERSEDES))
+        .neighbors(NeighborQuery::in_(adapter.node_id()).with_edge_type(SUPERSEDES))
         .map_err(thg_error_from_store)?;
     Ok(!hits.is_empty())
 }
@@ -240,8 +240,8 @@ pub fn is_shared_with_tenant<S: AdapterGraphStore>(
 ) -> ThgResult<bool> {
     let tenant_node = tenant_node_id(tenant_id);
     for query in [
-        NeighborQuery::out(&adapter.node_id()).with_edge_type(SHARED_WITH),
-        NeighborQuery::in_(&adapter.node_id()).with_edge_type(SHARED_WITH),
+        NeighborQuery::out(adapter.node_id()).with_edge_type(SHARED_WITH),
+        NeighborQuery::in_(adapter.node_id()).with_edge_type(SHARED_WITH),
     ] {
         let hits = store.neighbors(query).map_err(thg_error_from_store)?;
         if hits.iter().any(|hit| hit.node_id == tenant_node) {

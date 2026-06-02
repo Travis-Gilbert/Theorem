@@ -20,6 +20,10 @@ members = [
     "crates/rustyred-web",
     "crates/scene-os-core",
     "crates/scene-os-web",
+    "crates/theorem-harness-core",
+    "crates/theorem-harness-runtime",
+    "crates/rustyred-thg-affordances",
+    "crates/rustyred-thg-connectors",
 ]
 resolver = "2"
 

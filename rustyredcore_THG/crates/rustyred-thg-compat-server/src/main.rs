@@ -2,10 +2,10 @@ use std::env;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
+use rustyred_thg_compat_server::{serve, SharedExecutor};
 use rustyred_thg_core::executor::StoreBackedThgExecutor;
 use rustyred_thg_core::store::RedisThgStore;
 use rustyred_thg_core::InMemoryThgExecutor;
-use rustyred_thg_compat_server::{serve, SharedExecutor};
 
 fn main() -> std::io::Result<()> {
     let config = Config::from_env_and_args();
@@ -50,8 +50,8 @@ impl Config {
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(7379);
         let store = env::var("RUSTYRED_THG_STORE").unwrap_or_else(|_| "memory".to_string());
-        let redis_key =
-            env::var("RUSTYRED_THG_REDIS_KEY").unwrap_or_else(|_| "theseus:rustyred_thg:tenant:state:v1".to_string());
+        let redis_key = env::var("RUSTYRED_THG_REDIS_KEY")
+            .unwrap_or_else(|_| "theseus:rustyred_thg:tenant:state:v1".to_string());
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {

@@ -27,12 +27,17 @@ let package = Package(
         // from the converged Swift lane so force_graph runs a live force sim
         // instead of a static Canvas seed.
         .package(url: "https://github.com/swiftgraphs/Grape", from: "1.1.0"),
+        // Pow: SwiftUI transition + change effects (addendum D5). Used sparingly
+        // for restrained feedback moments; the bulk of chrome motion stays on
+        // crisp SwiftUI timing curves, not Pow's springier effects.
+        .package(url: "https://github.com/movingparts-io/Pow.git", from: "0.3.1"),
     ],
     targets: [
         .target(
             name: "TheoremIOSCore",
             dependencies: [
                 .product(name: "Grape", package: "Grape"),
+                .product(name: "Pow", package: "Pow"),
             ],
             resources: [
                 .process("Resources"),
@@ -44,6 +49,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "TheoremIOSSmoke",
+            dependencies: ["TheoremIOSCore"]
+        ),
+        .testTarget(
+            name: "TheoremIOSCoreTests",
             dependencies: ["TheoremIOSCore"]
         ),
     ]

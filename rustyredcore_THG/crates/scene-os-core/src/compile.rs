@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::atoms::SceneScene;
-use crate::catalogs::{production_chrome_catalog, production_projection_catalog};
+use crate::catalogs::{
+    mobile_projection_catalog, production_chrome_catalog, production_projection_catalog,
+};
 use crate::package::{ChromeBinding, ProjectionBinding, ScenePackageV2, SCENE_PACKAGE_V2_VERSION};
 use crate::select::{
     classify_goal, detect_shape, select_chrome, select_projection, ChromeSelection, DataShape,
@@ -66,21 +68,20 @@ pub fn compile_scene_package(
         shape_detection.shape,
     );
 
-    let projection_catalog = production_projection_catalog();
-    let projection_selection = if let Some(projection_id) =
-        explicit_projection_hint(input.answer_type.as_deref())
-    {
-        explicit_projection_selection(projection_id, &projection_catalog)?
-    } else {
-        select_projection(goal_for_select, shape_for_select, &projection_catalog).map_err(
-            |refusal| {
-                SceneCompileError::new(
-                    "projection_select_failed",
-                    format!("{}: {}", refusal.code, refusal.message),
-                )
-            },
-        )?
-    };
+    let projection_catalog = projection_catalog_for_answer_type(input.answer_type.as_deref());
+    let projection_selection =
+        if let Some(projection_id) = explicit_projection_hint(input.answer_type.as_deref()) {
+            explicit_projection_selection(projection_id, &projection_catalog)?
+        } else {
+            select_projection(goal_for_select, shape_for_select, &projection_catalog).map_err(
+                |refusal| {
+                    SceneCompileError::new(
+                        "projection_select_failed",
+                        format!("{}: {}", refusal.code, refusal.message),
+                    )
+                },
+            )?
+        };
     let selected_projection = projection_catalog
         .iter()
         .find(|projection| projection.id == projection_selection.projection_id)
@@ -134,12 +135,10 @@ pub fn compile_scene_package(
         version: SCENE_PACKAGE_V2_VERSION.to_string(),
         id: package_id,
         manifest_ref: input.manifest_ref.unwrap_or_else(|| {
-            input
-                .trace_id
-                .as_ref()
-                .map_or_else(|| "theorem-rust-scene".to_string(), |trace_id| {
-                    format!("manifest-{trace_id}")
-                })
+            input.trace_id.as_ref().map_or_else(
+                || "theorem-rust-scene".to_string(),
+                |trace_id| format!("manifest-{trace_id}"),
+            )
         }),
         atoms: input.scene.atoms,
         relations: input.scene.relations,
@@ -164,7 +163,11 @@ pub fn compile_scene_package(
     })
 }
 
-fn selector_overrides(answer_type: Option<&str>, goal: Goal, shape: DataShape) -> (Goal, DataShape) {
+fn selector_overrides(
+    answer_type: Option<&str>,
+    goal: Goal,
+    shape: DataShape,
+) -> (Goal, DataShape) {
     match answer_type {
         Some("patent_diagram") | Some("patent_scene") => (Goal::ExplainProcess, DataShape::Dag),
         Some("tree_hierarchy") | Some("reconstruction_node_tree") => {
@@ -173,19 +176,34 @@ fn selector_overrides(answer_type: Option<&str>, goal: Goal, shape: DataShape) -
         Some("numeric_series") => (Goal::Rank, DataShape::NumericSeries),
         Some("categorical_set") => (Goal::Summarize, DataShape::CategoricalSet),
         Some("flow_layered") | Some("sankey_flow") => (Goal::ExplainProcess, DataShape::Dag),
+        Some("force_graph") | Some("fractal_expansion") => {
+            (Goal::InspectEvidence, DataShape::DocumentSet)
+        }
+        Some("radial_rings") => (Goal::InspectEvidence, DataShape::DocumentSet),
+        Some("tree_layout") => (Goal::ExplainProcess, DataShape::Tree),
         _ => (goal, shape),
     }
+}
+
+fn projection_catalog_for_answer_type(
+    answer_type: Option<&str>,
+) -> Vec<crate::capabilities::ProjectionCapability> {
+    let mut catalog = production_projection_catalog();
+    if matches!(
+        answer_type,
+        Some("force_graph" | "radial_rings" | "tree_layout" | "fractal_expansion")
+    ) {
+        catalog.extend(mobile_projection_catalog());
+    }
+    catalog
 }
 
 fn explicit_projection_hint(answer_type: Option<&str>) -> Option<&str> {
     match answer_type {
         Some(
-            id @ ("patent_diagram"
-            | "tree_hierarchy"
-            | "numeric_series"
-            | "categorical_set"
-            | "flow_layered"
-            | "sankey_flow"),
+            id @ ("patent_diagram" | "tree_hierarchy" | "numeric_series" | "categorical_set"
+            | "flow_layered" | "sankey_flow" | "force_graph" | "radial_rings" | "tree_layout"
+            | "fractal_expansion"),
         ) => Some(id),
         Some("patent_scene") => Some("patent_diagram"),
         Some("reconstruction_node_tree") => Some("tree_hierarchy"),
@@ -197,7 +215,10 @@ fn explicit_projection_selection(
     projection_id: &str,
     catalog: &[crate::capabilities::ProjectionCapability],
 ) -> Result<ProjectionSelection, SceneCompileError> {
-    if !catalog.iter().any(|projection| projection.id == projection_id) {
+    if !catalog
+        .iter()
+        .any(|projection| projection.id == projection_id)
+    {
         return Err(SceneCompileError::new(
             "projection_hint_missing",
             format!("answer_type requested unknown projection {projection_id:?}"),
@@ -286,16 +307,35 @@ mod tests {
         assert_eq!(package.chrome.id, "document_rail");
 
         let value = serde_json::to_value(package).expect("serialize package");
-        assert_eq!(
-            value["provenance"]["compileTrace"]["selectedShape"],
-            "tree"
-        );
+        assert_eq!(value["provenance"]["compileTrace"]["selectedShape"], "tree");
         assert!(
             value["provenance"]["compileTrace"]["projectionSelect"]["rationale"]
                 .as_str()
                 .unwrap()
                 .contains("explicit projection hint")
         );
+    }
+
+    #[test]
+    fn explicit_mobile_projection_selects_dynamic_island_shell() {
+        let scene = SceneScene {
+            atoms: vec![atom("root"), atom("child")],
+            relations: vec![relation("root", "child")],
+        };
+        let package = compile_scene_package(SceneCompileInput {
+            query: "Find the substrate center.".to_string(),
+            answer_type: Some("force_graph".to_string()),
+            title: None,
+            scene,
+            trace_id: Some("force-1".to_string()),
+            manifest_ref: None,
+            provenance: BTreeMap::new(),
+        })
+        .expect("compile mobile force graph scene");
+
+        assert_eq!(package.projection.id, "force_graph");
+        assert_eq!(package.chrome.id, "dynamic_island_shell");
+        assert_eq!(package.projection.params["coordinateSpace"], "graph");
     }
 
     fn atom(id: &str) -> SceneAtom {

@@ -1,0 +1,1248 @@
+{
+  "catalog": [
+    {
+      "cost": "low",
+      "failure_modes": [
+        "disabled",
+        "empty_index",
+        "redis_unavailable"
+      ],
+      "inputs": [
+        "query",
+        "scope",
+        "budget"
+      ],
+      "name": "Native Search",
+      "outputs": [
+        "ranked_results",
+        "search_trace_id",
+        "graph_candidates"
+      ],
+      "permissions": [
+        "web_browse",
+        "graph_read"
+      ],
+      "skills": [
+        "local_webdoc_search",
+        "redis_priors",
+        "graph_candidates"
+      ],
+      "task_types": [
+        "search",
+        "research",
+        "plan",
+        "fix",
+        "review",
+        "design"
+      ],
+      "tool_id": "native_search",
+      "validator": "ranked_results_json"
+    },
+    {
+      "cost": "medium",
+      "failure_modes": [
+        "rust_ppr_unavailable",
+        "insufficient_communities",
+        "no_ppr_frontier"
+      ],
+      "inputs": [
+        "query",
+        "scope",
+        "budget"
+      ],
+      "name": "Fractal Expansion",
+      "outputs": [
+        "ranked_results",
+        "search_trace_id",
+        "gap_walk_metadata"
+      ],
+      "permissions": [
+        "graph_read"
+      ],
+      "skills": [
+        "fractal_expansion",
+        "gap_frontier_search",
+        "rust_ppr"
+      ],
+      "task_types": [
+        "search",
+        "research",
+        "plan",
+        "review",
+        "design"
+      ],
+      "tool_id": "fractal_expansion",
+      "validator": "gap_walk_results_json"
+    },
+    {
+      "cost": "low",
+      "failure_modes": [
+        "empty_run",
+        "thg_unavailable"
+      ],
+      "inputs": [
+        "run_id",
+        "query",
+        "budget_tokens"
+      ],
+      "name": "Context-Web Mini",
+      "outputs": [
+        "context_web_pack",
+        "token_ledger",
+        "provenance"
+      ],
+      "permissions": [
+        "graph_read"
+      ],
+      "skills": [
+        "minimal_context_probe",
+        "generated_artifact_quarantine"
+      ],
+      "task_types": [
+        "search",
+        "research",
+        "plan",
+        "fix",
+        "review",
+        "design",
+        "other"
+      ],
+      "tool_id": "context_web.mini",
+      "validator": "context_web_pack_bounded"
+    },
+    {
+      "cost": "medium",
+      "failure_modes": [
+        "budget_exhausted",
+        "thg_unavailable"
+      ],
+      "inputs": [
+        "run_id",
+        "query",
+        "mode",
+        "budget_tokens"
+      ],
+      "name": "Context-Web Pack",
+      "outputs": [
+        "context_web_pack",
+        "spend_plan",
+        "token_ledger"
+      ],
+      "permissions": [
+        "graph_read"
+      ],
+      "skills": [
+        "bounded_context_packing",
+        "thg_graph_algorithms"
+      ],
+      "task_types": [
+        "research",
+        "review",
+        "plan",
+        "design"
+      ],
+      "tool_id": "context_web.pack",
+      "validator": "context_web_pack_bounded"
+    },
+    {
+      "cost": "medium",
+      "failure_modes": [
+        "network_unavailable",
+        "capture_denied"
+      ],
+      "inputs": [
+        "query",
+        "mode",
+        "capture"
+      ],
+      "name": "Theseus Browser Search",
+      "outputs": [
+        "context_atoms",
+        "captured_webdocs",
+        "source_quality"
+      ],
+      "permissions": [
+        "web_browse"
+      ],
+      "skills": [
+        "browser_search",
+        "webdoc_capture_policy"
+      ],
+      "task_types": [],
+      "tool_id": "theseus_browser.search",
+      "validator": "external_content_advisory"
+    },
+    {
+      "cost": "medium",
+      "failure_modes": [
+        "fetch_failed",
+        "capture_denied"
+      ],
+      "inputs": [
+        "url",
+        "capture",
+        "extract_claims"
+      ],
+      "name": "Theseus Browser Read",
+      "outputs": [
+        "webdoc_id",
+        "page_snapshot_id",
+        "extracted_atoms"
+      ],
+      "permissions": [
+        "web_browse"
+      ],
+      "skills": [
+        "browser_read",
+        "claim_extraction_policy"
+      ],
+      "task_types": [],
+      "tool_id": "theseus_browser.read",
+      "validator": "external_content_advisory"
+    },
+    {
+      "cost": "medium",
+      "failure_modes": [
+        "index_unavailable",
+        "heavy_runtime_disabled"
+      ],
+      "inputs": [
+        "query",
+        "spaces",
+        "top_k",
+        "hydrate"
+      ],
+      "name": "Neural Search",
+      "outputs": [
+        "candidates",
+        "embedding_scores",
+        "graph_scores"
+      ],
+      "permissions": [
+        "graph_read"
+      ],
+      "skills": [
+        "hybrid_neural_search",
+        "graph_score_fusion"
+      ],
+      "task_types": [],
+      "tool_id": "neural_search.search",
+      "validator": "context_candidate_shape"
+    },
+    {
+      "cost": "low",
+      "failure_modes": [
+        "pack_missing"
+      ],
+      "inputs": [
+        "run_id",
+        "pack_id",
+        "atom_id"
+      ],
+      "name": "Context-Web Explain Inclusion",
+      "outputs": [
+        "why_included",
+        "why_excluded",
+        "policies_applied"
+      ],
+      "permissions": [
+        "graph_read"
+      ],
+      "skills": [
+        "context_provenance",
+        "why_included"
+      ],
+      "task_types": [],
+      "tool_id": "context_web.explain_inclusion",
+      "validator": "context_web_provenance_present"
+    },
+    {
+      "cost": "medium",
+      "failure_modes": [
+        "budget_exhausted",
+        "empty_run"
+      ],
+      "inputs": [
+        "run_id",
+        "task",
+        "budget_tokens"
+      ],
+      "name": "Context Artifact Compile",
+      "outputs": [
+        "context_artifact",
+        "token_ledger",
+        "provenance"
+      ],
+      "permissions": [
+        "graph_read"
+      ],
+      "skills": [
+        "capsule_packing",
+        "token_ledger",
+        "artifact_export"
+      ],
+      "task_types": [
+        "search",
+        "research",
+        "plan",
+        "fix",
+        "review",
+        "design",
+        "remember",
+        "other"
+      ],
+      "tool_id": "context_artifact_compile",
+      "validator": "context_artifact_compiled"
+    },
+    {
+      "cost": "low",
+      "failure_modes": [
+        "missing_patch",
+        "unsafe_canonical_write"
+      ],
+      "inputs": [
+        "run_id",
+        "patch"
+      ],
+      "name": "Memory Patch Validation",
+      "outputs": [
+        "validation_result"
+      ],
+      "permissions": [
+        "graph_read"
+      ],
+      "skills": [
+        "proposal_review",
+        "provenance_check"
+      ],
+      "task_types": [
+        "remember",
+        "memory"
+      ],
+      "tool_id": "memory_patch_validation",
+      "validator": "human_review_required"
+    }
+  ],
+  "meta": {
+    "consumer": "theorem-harness-core toolgraph port (spec step 6)",
+    "note": "Generated; do not hand-edit. Re-run generate_toolkit_fixtures.py.",
+    "purpose": "Toolkit-selection parity: Python reference -> Rust port acceptance.",
+    "reference_source": "Index-API/apps/orchestrate/runtime/toolgraph.py"
+  },
+  "scenarios": [
+    {
+      "description": "All research-candidate tools selected with full perms.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Native Search",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "graph_candidates"
+            ],
+            "permissions": [
+              "web_browse",
+              "graph_read"
+            ],
+            "reason": "research benefits from fresh evidence acquisition.",
+            "tool_id": "native_search"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Fractal Expansion",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "gap_walk_metadata"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Fractal expansion uses gap-frontier search with Rust PPR.",
+            "tool_id": "fractal_expansion"
+          },
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "query",
+              "mode",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Pack",
+            "outputs": [
+              "context_web_pack",
+              "spend_plan",
+              "token_ledger"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.pack"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "research"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "research"
+      },
+      "name": "research_full"
+    },
+    {
+      "description": "Search task type, full perms.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Native Search",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "graph_candidates"
+            ],
+            "permissions": [
+              "web_browse",
+              "graph_read"
+            ],
+            "reason": "search benefits from fresh evidence acquisition.",
+            "tool_id": "native_search"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Fractal Expansion",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "gap_walk_metadata"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Fractal expansion uses gap-frontier search with Rust PPR.",
+            "tool_id": "fractal_expansion"
+          },
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "search benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "search"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "search"
+      },
+      "name": "search_full"
+    },
+    {
+      "description": "Fix task type has a narrower candidate set.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Native Search",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "graph_candidates"
+            ],
+            "permissions": [
+              "web_browse",
+              "graph_read"
+            ],
+            "reason": "fix benefits from fresh evidence acquisition.",
+            "tool_id": "native_search"
+          },
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "fix benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "fix"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "fix"
+      },
+      "name": "fix_full"
+    },
+    {
+      "description": "Remember selects memory_patch_validation + artifact compile.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          },
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "patch"
+            ],
+            "name": "Memory Patch Validation",
+            "outputs": [
+              "validation_result"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Memory changes must stay proposals until validated.",
+            "tool_id": "memory_patch_validation"
+          }
+        ],
+        "task_type": "remember"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "remember"
+      },
+      "name": "remember_full"
+    },
+    {
+      "description": "Memory task type (alias) keeps memory_patch_validation.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "patch"
+            ],
+            "name": "Memory Patch Validation",
+            "outputs": [
+              "validation_result"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Memory changes must stay proposals until validated.",
+            "tool_id": "memory_patch_validation"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "memory"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "memory"
+      },
+      "name": "memory_full"
+    },
+    {
+      "description": "Other selects only the always-on tools.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "other benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "other"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "other"
+      },
+      "name": "other_full"
+    },
+    {
+      "description": "Unknown task types normalize to 'other'.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "other benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "other"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "frobnicate"
+      },
+      "name": "unknown_task_normalizes_to_other"
+    },
+    {
+      "description": "graph_read-only blocks web_browse tools (native_search).",
+      "expected": {
+        "blocked_tools": [
+          {
+            "missing_permissions": [
+              "web_browse"
+            ],
+            "name": "Native Search",
+            "reason": "Tool permissions are not available for this run.",
+            "tool_id": "native_search"
+          }
+        ],
+        "selected_tools": [
+          {
+            "cost": "medium",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Fractal Expansion",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "gap_walk_metadata"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Fractal expansion uses gap-frontier search with Rust PPR.",
+            "tool_id": "fractal_expansion"
+          },
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "query",
+              "mode",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Pack",
+            "outputs": [
+              "context_web_pack",
+              "spend_plan",
+              "token_ledger"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.pack"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "research"
+      },
+      "input": {
+        "permissions": [
+          "graph_read"
+        ],
+        "scope": {},
+        "task_type": "research"
+      },
+      "name": "research_graph_read_only"
+    },
+    {
+      "description": "Empty permission set blocks every tool.",
+      "expected": {
+        "blocked_tools": [
+          {
+            "missing_permissions": [
+              "graph_read",
+              "web_browse"
+            ],
+            "name": "Native Search",
+            "reason": "Tool permissions are not available for this run.",
+            "tool_id": "native_search"
+          },
+          {
+            "missing_permissions": [
+              "graph_read"
+            ],
+            "name": "Fractal Expansion",
+            "reason": "Tool permissions are not available for this run.",
+            "tool_id": "fractal_expansion"
+          },
+          {
+            "missing_permissions": [
+              "graph_read"
+            ],
+            "name": "Context-Web Mini",
+            "reason": "Tool permissions are not available for this run.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "missing_permissions": [
+              "graph_read"
+            ],
+            "name": "Context-Web Pack",
+            "reason": "Tool permissions are not available for this run.",
+            "tool_id": "context_web.pack"
+          },
+          {
+            "missing_permissions": [
+              "graph_read"
+            ],
+            "name": "Context Artifact Compile",
+            "reason": "Tool permissions are not available for this run.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "selected_tools": [],
+        "task_type": "research"
+      },
+      "input": {
+        "permissions": [],
+        "scope": {},
+        "task_type": "research"
+      },
+      "name": "research_no_permissions"
+    },
+    {
+      "description": "permissions=None falls through to catalog default.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Native Search",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "graph_candidates"
+            ],
+            "permissions": [
+              "web_browse",
+              "graph_read"
+            ],
+            "reason": "research benefits from fresh evidence acquisition.",
+            "tool_id": "native_search"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Fractal Expansion",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "gap_walk_metadata"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Fractal expansion uses gap-frontier search with Rust PPR.",
+            "tool_id": "fractal_expansion"
+          },
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "query",
+              "mode",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Pack",
+            "outputs": [
+              "context_web_pack",
+              "spend_plan",
+              "token_ledger"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.pack"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          }
+        ],
+        "task_type": "research"
+      },
+      "input": {
+        "permissions": null,
+        "scope": {},
+        "task_type": "research"
+      },
+      "name": "research_default_permissions"
+    },
+    {
+      "description": "scope.tool_scope pulls in a tool whose task_types is empty.",
+      "expected": {
+        "blocked_tools": [],
+        "selected_tools": [
+          {
+            "cost": "low",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Native Search",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "graph_candidates"
+            ],
+            "permissions": [
+              "web_browse",
+              "graph_read"
+            ],
+            "reason": "research benefits from fresh evidence acquisition.",
+            "tool_id": "native_search"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "query",
+              "scope",
+              "budget"
+            ],
+            "name": "Fractal Expansion",
+            "outputs": [
+              "ranked_results",
+              "search_trace_id",
+              "gap_walk_metadata"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Fractal expansion uses gap-frontier search with Rust PPR.",
+            "tool_id": "fractal_expansion"
+          },
+          {
+            "cost": "low",
+            "inputs": [
+              "run_id",
+              "query",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Mini",
+            "outputs": [
+              "context_web_pack",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.mini"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "query",
+              "mode",
+              "budget_tokens"
+            ],
+            "name": "Context-Web Pack",
+            "outputs": [
+              "context_web_pack",
+              "spend_plan",
+              "token_ledger"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "research benefits from bounded context-web packing.",
+            "tool_id": "context_web.pack"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "run_id",
+              "task",
+              "budget_tokens"
+            ],
+            "name": "Context Artifact Compile",
+            "outputs": [
+              "context_artifact",
+              "token_ledger",
+              "provenance"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Harness runs should produce a reusable artifact.",
+            "tool_id": "context_artifact_compile"
+          },
+          {
+            "cost": "medium",
+            "inputs": [
+              "query",
+              "spaces",
+              "top_k",
+              "hydrate"
+            ],
+            "name": "Neural Search",
+            "outputs": [
+              "candidates",
+              "embedding_scores",
+              "graph_scores"
+            ],
+            "permissions": [
+              "graph_read"
+            ],
+            "reason": "Neural retrieval can rank candidate atoms before hydration.",
+            "tool_id": "neural_search.search"
+          }
+        ],
+        "task_type": "research"
+      },
+      "input": {
+        "permissions": [
+          "web_browse",
+          "graph_read"
+        ],
+        "scope": {
+          "tool_scope": [
+            "neural_search.search"
+          ]
+        },
+        "task_type": "research"
+      },
+      "name": "research_tool_scope_pull_in"
+    }
+  ]
+}

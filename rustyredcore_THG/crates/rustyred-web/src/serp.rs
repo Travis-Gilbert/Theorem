@@ -96,6 +96,7 @@ mod tests {
             }
             .to_string(),
             match_score: score,
+            provenance: "corpus".to_string(),
         }
     }
 

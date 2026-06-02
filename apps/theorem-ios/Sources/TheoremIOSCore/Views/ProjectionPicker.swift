@@ -48,11 +48,12 @@ struct ProjectionPicker: View {
     private func symbol(for projection: ProjectionID) -> String {
         switch projection {
         case .forceGraph:
-            "circle.hexagongrid"
+            // Branching-tree glyph: the force-tree is the hero projection now.
+            "point.3.connected.trianglepath.dotted"
         case .radialRings:
             "circle.dashed"
         case .treeLayout:
-            "point.3.connected.trianglepath.dotted"
+            "rectangle.stack"
         case .fractalExpansion:
             "wave.3.forward"
         }

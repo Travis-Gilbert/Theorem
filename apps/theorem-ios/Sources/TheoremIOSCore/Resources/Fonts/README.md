@@ -1,16 +1,21 @@
 # Bundled fonts
 
-Two faces ship in the binary, both under the SIL Open Font License (OFL), so
-they are committed here with their license files:
+The instrument-register stack (SPEC-THEOREM-IOS-V1-ADDENDUM-DESIGN.md) ships in
+the binary. All faces are under the SIL Open Font License (OFL), so each is
+committed here with its license file:
 
 | File | Family | Role | License |
 |------|--------|------|---------|
-| `ArchivoBlack-Regular.ttf` | Archivo Black | display (headers, Dynamic Island, surface titles) | `OFL-ArchivoBlack.txt` |
-| `IBMPlexSans.ttf` | IBM Plex Sans (variable `wght`/`wdth`) | body | `OFL-IBMPlexSans.txt` |
+| `Karrik-Regular.ttf` | Karrik | display (hero, section headers, surface titles) | `OFL-Karrik.txt` |
+| `IBMPlexSans.ttf` | IBM Plex Sans (variable `wght`/`wdth`) | body + instrument labels | `OFL-IBMPlexSans.txt` |
+| `JetBrainsMono-Regular.ttf` | JetBrains Mono | data readouts (numbers, IDs, edge values) | `OFL-JetBrainsMono.txt` |
+| `TerminalGrotesque-Regular.ttf` | Terminal Grotesque | code/flavor labels, scramble-text | `OFL-TerminalGrotesque.txt` |
+| `jgs9.ttf` | jgs | patent-frame ornament (optional texture) | `OFL-jgs.txt` |
 
-Archivo Black is the free stand-in for Berthold Akzidenz-Grotesk, which has no
-embedding license available and is therefore NOT shipped (the spec forbids
-shipping it without the license). `mono` uses the system monospaced face.
+Karrik replaces Archivo Black (and, before it, Berthold Akzidenz-Grotesk): it
+carries the display + header sizes without the heaviness the instrument register
+rejects. The family/PostScript names above match the `TheoremFonts` tokens
+exactly, which is what `.custom(name:)` resolves against.
 
 The faces are registered at launch via `TheoremFonts.registerBundledFonts()`
 (SwiftPM resources are not auto-registered the way an app target's `UIAppFonts`
