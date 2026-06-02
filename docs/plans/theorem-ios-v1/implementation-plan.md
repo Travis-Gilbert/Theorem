@@ -12,13 +12,13 @@ four-projection set ships whole (spec "Spec discipline notes": shipping only
 
 ## The seam (where the two lanes meet)
 
-Two seams, both already typed in the repo, plus one new FFI surface:
+Two required seams, both already typed in the repo, plus one optional FFI surface:
 
 1. **Network JSON** (already exists, do not invent fields):
    - `SubstrateSearch` ← `rustyred-web/src/search.rs` (snake_case JSON)
    - `ScenePackageV2` ← `scene-os-core/src/{package,atoms}.rs` (camelCase JSON,
      kebab-case `lifecycle`/`space` enums)
-2. **UniFFI surface** (new, Rust lane builds, Swift lane consumes):
+2. **UniFFI surface** (optional post-simulator ship lane):
    ```
    namespace theorem {
      ReprojectResult reproject(scene_package_json: string, projection_id: string);
@@ -27,9 +27,10 @@ Two seams, both already typed in the repo, plus one new FFI surface:
    }
    ```
    Spec "The Rust ↔ Swift bridge (UniFFI)". The Swift lane codes against a
-   `ReprojectionEngine` protocol; the UniFFI-generated client is one impl, a
-   pure-Swift stub is the dev impl until the `.xcframework` lands. This is what
-   lets both lanes build in parallel.
+   reprojection seam; the UniFFI-generated client can become one impl if Rust
+   projection parity or performance requires it. Native shipping now uses the
+   Swift-native `TheoremProjectionEngine`, so TestFlight does not wait on the
+   `.xcframework`.
 3. **Projection catalog** (`scene-os-core/catalogs.rs` + `select.rs`): the Rust
    lane adds 4 `ProjectionCapability` entries + 4 `detect_shape` arms; the Swift
    renderers read `interactions` off the catalog entry to wire taps.
@@ -43,6 +44,7 @@ Backref: spec build-sequence steps 1 (Rust half) + 2; "The algorithms to ship in
   `uniffi` feature on scene-os-core) with `crate-type = ["staticlib", "cdylib"]`.
   `reproject` is layout-only: runs a projection's placement over the CURRENT
   scene's atoms, never fabricates shape. Backref: "UniFFI surface for v1".
+  Post-v1 optional unless Rust parity or performance is required on-device.
 - [ ] **A2** Four projection triples, Rust half = `detect_shape` arm
   (`select.rs`) + `ProjectionCapability` (`catalogs.rs`), honest-shape rule:
   - `force_graph` — accepts ≥2 atoms ∧ ≥1 relation. Backref: algo 1.
@@ -53,7 +55,8 @@ Backref: spec build-sequence steps 1 (Rust half) + 2; "The algorithms to ship in
     `push_ppr` push-trace. Backref: algo 4.
   Unit-test detect_shape honesty (tree rejects cycles). Servo-free, fast.
 - [ ] **A3** `.xcframework` build: `aarch64-apple-ios` + `aarch64-apple-ios-sim`,
-  `xcodebuild -create-xcframework`. Backref: "Crate work".
+  `xcodebuild -create-xcframework`. Backref: "Crate work". Post-v1 optional
+  unless profiling or parity proves Swift-native reprojection is insufficient.
 
 ## Lane B — Swift (Claude Code)
 
@@ -124,18 +127,22 @@ Backref: spec "The reader (host_handoff)", "Theming", IA "Models".
 
 ### B6 — App target + ship
 Backref: spec steps 1 (app shell) + 8.
-- [ ] **B6.1** Xcode app target hosting TheoremKit + the `.xcframework`
-  (integrates A3). `@main App`, Info.plist, asset catalog, ActivityKit
-  entitlement for the Island.
+- [x] **B6.1** Xcode app target hosting TheoremKit
+  (integrates A3 only if the optional Rust bridge lands). `@main App`,
+  generated Info.plist, and SwiftPM package dependency are in place. The
+  current Island is in-app chrome; add ActivityKit only if this becomes a Live
+  Activity surface.
 - [ ] **B6.2** Archive → TestFlight → review (Apple Developer account). Backref:
-  step 8.
+  step 8. Blocked only by Apple Developer Team/provisioning/App Store Connect
+  setup, not by local simulator readiness.
 
 ## Build order (critical path)
 
-1. **B0** (TheoremKit) + **A1/A2** (Rust FFI + algos) in parallel — neither
-   blocks the other; B0 codes against the protocol, A1 against the same JSON.
-2. **B2** renderers (against `StubReprojectionEngine`) ∥ **A3** xcframework.
-3. **B6.1** swaps the stub for the real UniFFI client once A3 lands.
+1. **B0** (TheoremKit) + **A2** (Rust projection catalog) in parallel; **A1**
+   can run later if the Rust bridge is reopened.
+2. **B2** renderers against the Swift-native reprojection engine; **A3** stays
+   optional unless Rust parity/performance is required on-device.
+3. **B6.1** Xcode app target builds now; swap in UniFFI only if A3 lands.
 4. **B1**, **B3**, **B4**, **B5** layer on.
 
 ## Verification
@@ -143,7 +150,8 @@ Backref: spec steps 1 (app shell) + 8.
 - `swift build` + `swift test` on TheoremKit (models round-trip vs Rust serde
   fixtures; layout honesty: tree-BFS rejects cycles; radial places by ring).
 - `cargo test` on the Rust lane (detect_shape honesty).
-- Xcode/simulator build of the app target once B6.1 lands (XcodeBuildMCP).
+- Xcode/simulator build of the app target once B6.1 lands.
+- Native shipping receipt: `docs/plans/theorem-ios-v1/native-app-shipping.md`.
 - The honest-shape feature is itself a test: a cyclic scene must grey out
   `tree_layout` with a reason, never fabricate a hierarchy.
 
