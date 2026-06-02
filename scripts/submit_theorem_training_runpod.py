@@ -64,13 +64,13 @@ def main() -> int:
         return 2
 
     payload = json.loads(Path(args.input).read_text())
-    remote_files = {}
+    remote_files = dict(payload.get('remote_files') or {})
     if args.manifest_uri:
         remote_files['manifest_json'] = args.manifest_uri
     if args.snapshot_uri:
         remote_files['graph_snapshot_json'] = args.snapshot_uri
 
-    if remote_files:
+    if remote_files.get('manifest_json') and remote_files.get('graph_snapshot_json'):
         payload['remote_files'] = remote_files
     elif not args.allow_local_paths:
         print(

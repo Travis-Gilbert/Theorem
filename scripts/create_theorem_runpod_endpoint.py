@@ -26,6 +26,10 @@ def main() -> int:
         '--image',
         default='ghcr.io/travis-gilbert/theorem-rustyred-training-worker:latest',
     )
+    parser.add_argument(
+        '--template-id',
+        help='Use an existing RunPod template id instead of creating a template.',
+    )
     parser.add_argument('--template-name', default='theorem-rustyred-training-worker')
     parser.add_argument('--endpoint-name', default='theorem-rustyred-training')
     parser.add_argument('--workers-min', type=int, default=0)
@@ -79,19 +83,23 @@ def main() -> int:
     if not args.create:
         print(json.dumps({
             'dry_run': True,
+            'template_id': args.template_id,
             'template_body': redact(template_body),
             'endpoint_body': endpoint_body,
         }, indent=2, sort_keys=True))
         return 0
 
-    template = post_json(args.rest_base, '/templates', api_key, template_body)
-    template_id = str(template.get('id') or template.get('templateId') or '')
+    template = None
+    template_id = str(args.template_id or '')
     if not template_id:
-        print(json.dumps({'template_response': redact(template)}, indent=2), file=sys.stderr)
-        return 1
+        template = post_json(args.rest_base, '/templates', api_key, template_body)
+        template_id = str(template.get('id') or template.get('templateId') or '')
+        if not template_id:
+            print(json.dumps({'template_response': redact(template)}, indent=2), file=sys.stderr)
+            return 1
     endpoint = post_json(
         args.rest_base,
-        '/endpoints/serverless',
+        '/endpoints',
         api_key,
         {**endpoint_body, 'templateId': template_id},
     )
@@ -99,7 +107,7 @@ def main() -> int:
         'ok': True,
         'template_id': template_id,
         'endpoint_id': endpoint.get('id') or endpoint.get('endpointId'),
-        'template': redact(template),
+        'template': redact(template) if template is not None else {'id': template_id},
         'endpoint': redact(endpoint),
     }, indent=2, sort_keys=True))
     return 0
