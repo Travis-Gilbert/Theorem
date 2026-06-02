@@ -150,13 +150,14 @@ encoder never moves to Rust; only the serving does.
 
 ### Lane G - full Rust corpus + ingest worker (Index-API, MINE, started this session)
 
-- [ ] **G0** Author the full-corpus definition (the "bunch of Rust repos"):
+- [x] **G0** (DONE 2026-06-01, Index-API `043bf1c6`) Author the full-corpus definition (the "bunch of Rust repos"):
   `rust-lang/rust` + top-20 crates by quality + RustyRed in-repo crates +
   postmortem source strategy. Built this session into
   `apps/notebook/domain_packs/manifests/rust.yaml` (corpus section), kept
   `is_active: false` (gated on G1 + Lane E).
-- [ ] **G1** Build the `code_repo` ingest worker in
-  `apps/notebook/domain_packs/workers.py` + register in `WORKER_REGISTRY`.
+- [x] **G1** (DONE 2026-06-01, Index-API `996c7cb2`; 5 tests green, verified
+  807 atoms from 15 files of rustyred-thg-core) Build the `code_repo` ingest
+  worker in `apps/notebook/domain_packs/workers.py` + register in `WORKER_REGISTRY`.
   Contract: for each repo (git clone or local root) -> walk `*.rs` (bounded by
   `max_files`) -> build a `code_corpus_v1` `source_packet` (`root`+`paths`,
   `language='rust'`) -> `lower_code_corpus_source_packet(plan, packet)` ->
