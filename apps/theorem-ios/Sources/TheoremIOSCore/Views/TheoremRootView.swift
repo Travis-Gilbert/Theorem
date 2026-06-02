@@ -39,6 +39,19 @@ public struct TheoremRootView: View {
         return SampleParticipantStore()
     }
 
+    /// The connector data source. The same `-remote <url>` that drives Runs and
+    /// Participants points the Connectors surface at theorem-harness-server's
+    /// connector registry; `-tenant` overrides the scope. Default is an honest
+    /// empty listing (no connectors until one is registered).
+    private var connectorStore: ConnectorStore {
+        if let raw = UserDefaults.standard.string(forKey: "remote"),
+           let url = URL(string: raw) {
+            let tenant = UserDefaults.standard.string(forKey: "tenant") ?? "default"
+            return RemoteConnectorStore(baseURL: url, tenantSlug: tenant)
+        }
+        return SampleConnectorStore()
+    }
+
     private var package: ScenePackageV2 {
         room.scene
     }
@@ -129,6 +142,9 @@ public struct TheoremRootView: View {
 
                 UserCredentialsView(theme: theme)
                     .tag(AppSurface.credentials)
+
+                ConnectorsView(theme: theme, store: connectorStore)
+                    .tag(AppSurface.connectors)
 
                 SurfacePlaceholder(surface: .build, theme: theme)
                     .tag(AppSurface.build)
@@ -275,6 +291,7 @@ public enum AppSurface: String, CaseIterable, Identifiable {
     case projects = "Projects"
     case models = "Participants"
     case credentials = "Credentials"
+    case connectors = "Connectors"
     case build = "Build"
     case artifacts = "Artifacts"
 
@@ -294,6 +311,8 @@ public enum AppSurface: String, CaseIterable, Identifiable {
             "person.2"
         case .credentials:
             "key"
+        case .connectors:
+            "powerplug"
         case .build:
             "hammer"
         case .artifacts:
@@ -339,6 +358,8 @@ struct SurfacePlaceholder: View {
             "Team presence and brought-agent endpoints."
         case .credentials:
             "Provider endpoints and user-held keys."
+        case .connectors:
+            "Registered MCP servers and their learnable tools."
         case .build:
             "Agent, skill, and plugin scaffolds."
         case .artifacts:
