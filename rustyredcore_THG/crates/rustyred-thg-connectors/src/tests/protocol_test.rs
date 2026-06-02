@@ -42,6 +42,7 @@ fn descriptor_maps_to_tool_manifest_with_no_embedding() {
         name: "search".into(),
         description: "Search".into(),
         input_schema: json!({ "type": "object" }),
+        ..Default::default()
     };
     let manifest = tool_manifest_from_descriptor(&descriptor);
     assert_eq!(manifest.name, "search");
@@ -53,17 +54,48 @@ fn descriptor_maps_to_tool_manifest_with_no_embedding() {
 }
 
 #[test]
+fn annotations_map_to_writeback_policy() {
+    let result = json!({
+        "tools": [
+            { "name": "read_file", "annotations": { "readOnlyHint": true } },
+            { "name": "delete_file", "annotations": { "destructiveHint": true } },
+            { "name": "write_file", "annotations": { "readOnlyHint": false } },
+            { "name": "mystery" }
+        ]
+    });
+    let d = parse_tools_list(&result).expect("parse");
+    assert_eq!(d.len(), 4);
+    assert_eq!(
+        tool_manifest_from_descriptor(&d[0]).writeback_policy,
+        "read-only"
+    );
+    assert_eq!(
+        tool_manifest_from_descriptor(&d[1]).writeback_policy,
+        "destructive"
+    );
+    assert_eq!(tool_manifest_from_descriptor(&d[2]).writeback_policy, "write");
+    // No annotation maps to "unknown", NOT "read-only": the firing gate must not
+    // assume a tool with no declared side-effect profile is safe to auto-fire.
+    assert_eq!(
+        tool_manifest_from_descriptor(&d[3]).writeback_policy,
+        "unknown"
+    );
+}
+
+#[test]
 fn connector_manifest_assembles_full_catalog() {
     let descriptors = vec![
         ToolDescriptor {
             name: "a".into(),
             description: String::new(),
             input_schema: json!({}),
+            ..Default::default()
         },
         ToolDescriptor {
             name: "b".into(),
             description: String::new(),
             input_schema: json!({}),
+            ..Default::default()
         },
     ];
     let manifest = connector_manifest("acme", "websearch", "Web Search", &descriptors);

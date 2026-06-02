@@ -68,11 +68,17 @@ pub fn parse_initialize(result: &Value) -> InitializeInfo {
 
 /// One tool as described by an MCP server's `tools/list` (MCP uses camelCase
 /// `inputSchema`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolDescriptor {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// MCP tool annotation `readOnlyHint` (the tool does not modify its
+    /// environment), when the server declared it. `None` = not declared.
+    pub read_only_hint: Option<bool>,
+    /// MCP tool annotation `destructiveHint` (the tool may perform destructive
+    /// updates), when the server declared it. `None` = not declared.
+    pub destructive_hint: Option<bool>,
 }
 
 /// Parse a `tools/list` result (`{ "tools": [ {name, description, inputSchema} ] }`)
@@ -102,10 +108,19 @@ pub fn parse_tools_list(result: &Value) -> ConnectorResult<Vec<ToolDescriptor>> 
             .unwrap_or("")
             .to_string();
         let input_schema = tool.get("inputSchema").cloned().unwrap_or_else(|| json!({}));
+        let annotations = tool.get("annotations");
+        let read_only_hint = annotations
+            .and_then(|a| a.get("readOnlyHint"))
+            .and_then(Value::as_bool);
+        let destructive_hint = annotations
+            .and_then(|a| a.get("destructiveHint"))
+            .and_then(Value::as_bool);
         out.push(ToolDescriptor {
             name,
             description,
             input_schema,
+            read_only_hint,
+            destructive_hint,
         });
     }
     Ok(out)
@@ -123,10 +138,34 @@ pub fn tool_manifest_from_descriptor(descriptor: &ToolDescriptor) -> ToolManifes
         input_schema: descriptor.input_schema.clone(),
         permissions: Vec::new(),
         cost: json!({}),
-        writeback_policy: String::new(),
+        writeback_policy: writeback_policy_from_hints(
+            descriptor.read_only_hint,
+            descriptor.destructive_hint,
+        ),
         tags: Vec::new(),
         description_embedding: None,
     }
+}
+
+/// Map MCP tool annotations to a writeback policy the affordance layer can gate
+/// on. Crucially, an un-annotated tool maps to "unknown", NOT "read-only": the
+/// MCP catalog gives no side-effect guarantee, so a writeback-keyed firing gate
+/// must treat unknown tools as unsafe-to-auto-fire (only an explicit
+/// `readOnlyHint` marks a tool safe). `destructiveHint` and an explicit
+/// non-read-only both escalate above "unknown".
+pub fn writeback_policy_from_hints(
+    read_only_hint: Option<bool>,
+    destructive_hint: Option<bool>,
+) -> String {
+    match (read_only_hint, destructive_hint) {
+        (Some(true), _) => "read-only",
+        (_, Some(true)) => "destructive",
+        (Some(false), _) => "write",
+        // Anything without an explicit readOnlyHint=true (including no annotation
+        // at all, or only a non-destructive hint) is unknown: not safe to auto-fire.
+        _ => "unknown",
+    }
+    .to_string()
 }
 
 /// Assemble a `ConnectorManifest` (the contract boundary into the affordance
