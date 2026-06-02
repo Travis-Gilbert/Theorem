@@ -145,4 +145,17 @@ update `CLAUDE.md` + `AGENTS.md` crate tables.
 - **Embeddings.** Tool-description embeddings are not produced here (no Rust text embedder in
   core, per the affordances plan). Affordances register with `embedding = None`; selection
   degrades to structural PPR + fitness, which is functional day one.
+- **Transport robustness (read timeout).** `StdioTransport::read_response` blocks until a
+  matching response arrives, so a server that hangs would hang the client; slice 1 relies on an
+  outer timeout / the process lifetime. A read deadline (a reader thread + `recv_timeout`, since
+  `std` cannot time out `BufRead::read_line` on a pipe) is the robustness follow-up.
+
+## Status: slice 1 shipped
+
+Committed `617c7c2`. 14 unit tests green (protocol parsing, transport framing/correlation/error
+mapping, and the end-to-end `FakeTransport` bridge), plus a real-server smoke
+(`examples/connect_real_server.rs`) that connected `@modelcontextprotocol/server-everything`
+v2.0.0 over stdio (protocol `2025-06-18`) and registered its 13 tools as `Affordance` nodes. The
+affordances crate is untouched; its 15 tests still pass. Next: the invoke bridge (slice 2) or the
+driving surface (slice 3).
 ```
