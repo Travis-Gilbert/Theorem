@@ -2399,6 +2399,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-connectors"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-affordances",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-core"
 version = "0.5.0"
 dependencies = [
