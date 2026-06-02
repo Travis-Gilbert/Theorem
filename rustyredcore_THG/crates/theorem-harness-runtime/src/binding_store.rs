@@ -731,7 +731,11 @@ mod tests {
             ),
             (
                 "POLICY.CHECKED",
-                json!({ "policy_receipt_id": "policy:1", "allowed": true }),
+                json!({
+                    "policy_receipt_id": "policy:1",
+                    "allowed": true,
+                    "claims": [{ "text": "grounded", "provenance": "src:1" }]
+                }),
             ),
             (
                 "PUBLISHED_TO_SUBSTRATE",

@@ -1352,7 +1352,8 @@ mod tests {
             "POLICY.CHECKED",
             json!({
                 "policy_receipt_id": "policy:1",
-                "allowed": true
+                "allowed": true,
+                "claims": [{ "text": "Theorem published a grounded answer", "provenance": "src:1" }]
             }),
         );
         let binding = apply(
@@ -1552,6 +1553,20 @@ mod tests {
         .unwrap_err();
 
         assert_guard(error, "consensus_below_threshold");
+    }
+
+    #[test]
+    fn claimless_publication_is_blocked_at_policy_check() {
+        let error = apply_binding_transition(
+            ready_for_publication(),
+            transition(
+                "POLICY.CHECKED",
+                json!({ "policy_receipt_id": "policy:1", "allowed": true }),
+            ),
+        )
+        .unwrap_err();
+
+        assert_guard(error, "grounding_missing");
     }
 
     #[test]

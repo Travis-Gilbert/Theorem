@@ -11,16 +11,17 @@
 //! 1. Critic consensus (Part 5.3): a publication requires at least
 //!    `MIN_CONSENSUS_HEADS` distinct heads recorded at `DRAFTS.SYNTHESIZED`, so
 //!    heterogeneous review demonstrably happened.
-//! 2. Grounding (Part 5.2): when the payload carries `claims`, every claim must
-//!    carry non-empty `provenance`; ungrounded output is refused.
-//! 3. Action tier (Part 5.4): when the payload names an `action_tier` that the
+//! 2. Action tier (Part 5.4): when the payload names an `action_tier` that the
 //!    binding marks as requiring human authorization, `human_authorized` must be
 //!    true; autonomy is bounded inversely to irreversibility.
+//! 3. Grounding (Part 5.2): a publication must declare at least one claim, and
+//!    every claim must carry non-empty `provenance`. A claimless or ungrounded
+//!    publication is refused, so ungroundedness breaks loudly instead of passing.
 //!
-//! Checks 2 and 3 are enforced only when the payload supplies the relevant data
-//! (`claims` / `action_tier`); strict-always-grounding is a follow-up once every
-//! publication path supplies its claims. Consensus is always enforced. This is
-//! recorded honestly rather than presented as full Part 5 closure.
+//! All three are unconditional (the action-tier check is inherently scoped to
+//! publications that name a tier). Grounding is strict: no flag, no
+//! enforce-if-present escape hatch. A publication that does not ground itself
+//! cannot reach `PUBLISHED_TO_SUBSTRATE`.
 
 use crate::agent_binding::{ActionTierPolicy, BindingError};
 use crate::types::{GuardViolation, Payload};
@@ -56,18 +57,6 @@ pub fn evaluate_publication(
         ));
     }
 
-    if let Some(Value::Array(claims)) = payload.get("claims") {
-        for (index, claim) in claims.iter().enumerate() {
-            if !claim_is_grounded(claim) {
-                return Err(guard(
-                    "grounding_missing",
-                    "every published claim must carry provenance",
-                    json!({ "claim_index": index }),
-                ));
-            }
-        }
-    }
-
     if let Some(tier_id) = payload.get("action_tier").and_then(Value::as_str) {
         if let Some(policy) = action_tiers.iter().find(|tier| tier.tier_id == tier_id) {
             let authorized = payload
@@ -81,6 +70,27 @@ pub fn evaluate_publication(
                     json!({ "action_tier": tier_id }),
                 ));
             }
+        }
+    }
+
+    match payload.get("claims") {
+        Some(Value::Array(claims)) if !claims.is_empty() => {
+            for (index, claim) in claims.iter().enumerate() {
+                if !claim_is_grounded(claim) {
+                    return Err(guard(
+                        "grounding_missing",
+                        "every published claim must carry provenance",
+                        json!({ "claim_index": index }),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(guard(
+                "grounding_missing",
+                "a publication must declare at least one grounded claim",
+                json!({}),
+            ));
         }
     }
 
@@ -137,9 +147,10 @@ mod tests {
     }
 
     #[test]
-    fn two_distinct_heads_with_no_extra_payload_passes() {
+    fn claimless_publication_is_refused() {
         let heads = vec!["claude".to_string(), "deepseek".to_string()];
-        evaluate_publication(&heads, &tiers(), &payload(json!({}))).unwrap();
+        let error = evaluate_publication(&heads, &tiers(), &payload(json!({}))).unwrap_err();
+        assert_eq!(err_code(error), "grounding_missing");
     }
 
     #[test]
@@ -187,12 +198,16 @@ mod tests {
     }
 
     #[test]
-    fn tier_three_with_authorization_passes() {
+    fn tier_three_with_authorization_and_grounded_claims_passes() {
         let heads = vec!["claude".to_string(), "deepseek".to_string()];
         evaluate_publication(
             &heads,
             &tiers(),
-            &payload(json!({ "action_tier": "tier_three", "human_authorized": true })),
+            &payload(json!({
+                "action_tier": "tier_three",
+                "human_authorized": true,
+                "claims": [{ "provenance": "src:1" }]
+            })),
         )
         .unwrap();
     }
