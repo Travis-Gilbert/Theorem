@@ -134,9 +134,16 @@ update `CLAUDE.md` + `AGENTS.md` crate tables.
   lands; deferred now to keep slice 1 zero-touch on the affordances crate). **Not a silent
   cut:** slice 1 deliberately stops at registration so the learning loop can be exercised
   against real tool catalogs before wiring live invocation.
-- **Driving surface.** Nothing yet exposes "connect this server" to an operator or the app.
-  The home is an admin MCP tool on `rustyred-thg-mcp` (`connector/register`) or an HTTP route
-  on `theorem-harness-server`. Slice 3.
+- **Driving surface (slice 3, shipped on `theorem-harness-server`).** `GET /connectors?tenant=`
+  lists registered connectors + tool affordances (read-only, fast, no server contacted);
+  `POST /connectors/register` takes `{ server_id, label?, target }`, spawns the server +
+  handshakes + `tools/list` in `spawn_blocking` OUTSIDE the store lock, then locks only for the
+  `register_connector_with_target` write (so a slow server cannot freeze the read endpoints).
+  Verified end-to-end against `server-everything` over HTTP (13 tools registered + listed, durable
+  in RedCore). Deferred: a `POST /connectors/invoke` route (live tool execution over HTTP is a
+  larger safety surface; the dry-run-gated operator path already exists via
+  `examples/connect_and_invoke`). The home is the HTTP server the iOS app already consumes, so
+  slice 4 (the app Connectors surface) GETs/POSTs here.
 - **iOS consumption.** The Connectors surface in the app stays an honest empty state until a
   driving surface + at least one registered connector exist. No connector UI ships before the
   backend is real (No-Fake-UI rule).

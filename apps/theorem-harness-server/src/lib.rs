@@ -15,6 +15,7 @@ use theorem_harness_runtime::{
     list_presence, load_events, load_run, read_intents_for_room, read_mentions_for_actor,
     read_records_for_room, room_status, CoordinationError, HarnessRuntimeError,
 };
+use rustyred_thg_affordances::{affordance_nodes, AffordanceGraphStore};
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
 pub const RUN_LABEL: &str = "HarnessRun";
@@ -123,6 +124,43 @@ pub fn records_json<S: GraphStore>(
         "records": records,
         "count": records.len()
     }))
+}
+
+/// Registered connectors and their tool affordances for the Connectors surface.
+/// Read-only and fast (no subprocess, no network): lists the tenant's `Affordance`
+/// nodes (one per registered tool) plus the distinct owning servers. Safe to serve
+/// under the shared store lock, unlike the register path which spawns a server.
+/// Errors degrade to an empty listing (a fresh store legitimately has none).
+pub fn connectors_json<S: AffordanceGraphStore>(store: &S, tenant_slug: &str) -> Value {
+    let affordances: Vec<Value> = affordance_nodes(store)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|node| node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_slug))
+        .map(|node| {
+            let p = node.properties;
+            json!({
+                "affordance_id": p.get("affordance_id"),
+                "server_id": p.get("server_id"),
+                "tool_name": p.get("tool_name"),
+                "label": p.get("label"),
+                "description": p.get("description"),
+                "writeback_policy": p.get("writeback_policy"),
+                "fitness": p.get("fitness"),
+            })
+        })
+        .collect();
+    let mut servers: Vec<String> = affordances
+        .iter()
+        .filter_map(|a| a.get("server_id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    servers.sort();
+    servers.dedup();
+    json!({
+        "tenant": tenant_slug,
+        "connectors": servers,
+        "affordances": affordances,
+        "count": affordances.len(),
+    })
 }
 
 #[cfg(test)]
@@ -310,5 +348,33 @@ mod tests {
         )
         .expect("filtered records");
         assert_eq!(filtered["count"], json!(0));
+    }
+
+    #[test]
+    fn serves_connectors_contract() {
+        use rustyred_thg_affordances::{register_connector, ConnectorManifest};
+
+        let mut store = InMemoryGraphStore::default();
+        // Build the manifest via JSON so the test does not break if the charter
+        // work adds serde-defaulted fields to the manifest structs.
+        let manifest: ConnectorManifest = serde_json::from_value(json!({
+            "tenant_id": "smoke",
+            "server_id": "websearch",
+            "label": "Web Search",
+            "tools": [
+                { "name": "search", "description": "Search the web", "input_schema": {} }
+            ]
+        }))
+        .expect("manifest");
+        register_connector(&mut store, manifest, Some("operator")).expect("register");
+
+        let listing = connectors_json(&store, "smoke");
+        assert_eq!(listing["count"], json!(1));
+        assert_eq!(listing["connectors"][0], json!("websearch"));
+        assert_eq!(listing["affordances"][0]["tool_name"], json!("search"));
+        assert_eq!(listing["affordances"][0]["server_id"], json!("websearch"));
+
+        // A different tenant sees nothing (tenant scoping).
+        assert_eq!(connectors_json(&store, "other")["count"], json!(0));
     }
 }

@@ -9,6 +9,8 @@
 //!   GET /harness/rooms/{room_id}/intents  -> { "intents": [...] }
 //!   GET /harness/rooms/{room_id}/records  -> { "records": [...] }
 //!   GET /harness/actors/{actor}/mentions  -> { "mentions": [...] }
+//!   GET /connectors              -> { "connectors": [...], "affordances": [...] }
+//!   POST /connectors/register    -> connect an MCP server, register its tools as affordances
 //!   GET /healthz                 -> "ok"
 //!
 //! Reads the same store the runtime persists runs to. Set the data dir with
@@ -21,14 +23,20 @@ use std::sync::{Arc, Mutex};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
     Json, Router,
+};
+use rustyred_thg_affordances::registry::register_connector_with_target;
+use rustyred_thg_connectors::{
+    connector_manifest, initialize_params, parse_initialize, parse_tools_list, spawn_stdio,
+    tools_list_params, ConnectionTarget, McpTransport,
 };
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use theorem_harness_server::{
-    intents_json, mentions_json, presence_json, records_json, room_json, run_json, runs_json,
+    connectors_json, intents_json, mentions_json, presence_json, records_json, room_json, run_json,
+    runs_json,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
@@ -100,6 +108,8 @@ async fn main() {
             "/harness/actors/:actor_id/mentions",
             get(get_actor_mentions),
         )
+        .route("/connectors", get(list_connectors))
+        .route("/connectors/register", post(register_connector_route))
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "50080".to_string());
@@ -197,6 +207,104 @@ async fn get_room_records(
     )
     .map(Json)
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Request body for `POST /connectors/register`: how to reach an MCP server and
+/// what to name the connector. The server is spawned, handshaken, and its tools
+/// registered as `Affordance` nodes under `(tenant, server_id)`, with the reach
+/// (`target`) persisted so a selected tool can be invoked later.
+#[derive(Debug, Deserialize)]
+struct RegisterConnectorBody {
+    #[serde(default)]
+    tenant: Option<String>,
+    server_id: String,
+    #[serde(default)]
+    label: String,
+    target: ConnectionTarget,
+}
+
+/// `GET /connectors?tenant=...` -> the registered connectors + tool affordances.
+/// Read-only and fast; no server is contacted.
+async fn list_connectors(
+    State(store): State<SharedStore>,
+    Query(query): Query<CoordinationQuery>,
+) -> Json<Value> {
+    let store = store.lock().expect("store lock");
+    Json(connectors_json(&*store, &query.tenant_slug()))
+}
+
+/// `POST /connectors/register` -> connect to an MCP server, list its tools, and
+/// register them. The handshake + tools/list (blocking subprocess I/O) runs OFF
+/// the async runtime via `spawn_blocking` and OUTSIDE the store lock; the store is
+/// locked only for the fast register write, so a slow server cannot freeze the
+/// read endpoints. (Until the `StdioTransport` read-timeout follow-up, a hung
+/// server still ties up that one blocking task.)
+async fn register_connector_route(
+    State(store): State<SharedStore>,
+    Json(body): Json<RegisterConnectorBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = body
+        .tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let server_id = body.server_id.trim().to_string();
+    if server_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "server_id is required".to_string()));
+    }
+    let label = if body.label.trim().is_empty() {
+        server_id.clone()
+    } else {
+        body.label.trim().to_string()
+    };
+    let target = body.target;
+
+    let outcome = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        // Network OUTSIDE the store lock: spawn the server and run the handshake.
+        let mut transport = spawn_stdio(&target).map_err(|e| e.to_string())?;
+        let init = transport
+            .request("initialize", initialize_params())
+            .map_err(|e| e.to_string())?;
+        let server_info = parse_initialize(&init);
+        transport
+            .notify("notifications/initialized", json!({}))
+            .map_err(|e| e.to_string())?;
+        let tools = transport
+            .request("tools/list", tools_list_params())
+            .map_err(|e| e.to_string())?;
+        let descriptors = parse_tools_list(&tools).map_err(|e| e.to_string())?;
+        let manifest = connector_manifest(&tenant, &server_id, &label, &descriptors);
+        let target_value = serde_json::to_value(&target).map_err(|e| e.to_string())?;
+
+        // Lock the store only for the fast register write.
+        let mut store = store.lock().map_err(|_| "store lock poisoned".to_string())?;
+        let registration = register_connector_with_target(
+            &mut *store,
+            manifest,
+            Some(target_value),
+            Some("operator"),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        Ok(json!({
+            "server": {
+                "name": server_info.server_name,
+                "version": server_info.server_version,
+                "protocol": server_info.protocol_version,
+            },
+            "tenant": tenant,
+            "server_id": server_id,
+            "affordance_ids": registration.affordance_node_ids,
+            "count": registration.affordance_node_ids.len(),
+        }))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join error: {e}")))?;
+
+    outcome
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_GATEWAY, message))
 }
 
 fn split_csv(value: &str) -> Vec<String> {

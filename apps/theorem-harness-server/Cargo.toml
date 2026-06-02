@@ -30,6 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 theorem-harness-runtime = { path = "../../rustyredcore_THG/crates/theorem-harness-runtime" }
 theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
 rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+rustyred-thg-affordances = { path = "../../rustyredcore_THG/crates/rustyred-thg-affordances" }
+rustyred-thg-connectors = { path = "../../rustyredcore_THG/crates/rustyred-thg-connectors" }
 
 [lib]
 name = "theorem_harness_server"
