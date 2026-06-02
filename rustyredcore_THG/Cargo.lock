@@ -2381,6 +2381,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-affordances"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "theorem-harness-core",
+]
+
+[[package]]
 name = "rustyred-thg-compat-server"
 version = "0.5.0"
 dependencies = [
