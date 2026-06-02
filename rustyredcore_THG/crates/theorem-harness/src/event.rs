@@ -95,6 +95,35 @@ impl Event {
         &self.inner.state_hash_after
     }
 
+    /// A human-readable text projection of this event, if it carries one.
+    ///
+    /// The text stream (the default convenience view) is built from these
+    /// projections. The payload is checked for a text-bearing field in priority
+    /// order: answer/synthesis content first, then summaries, messages, and
+    /// reasons. Events that carry no text (pure structural transitions like a
+    /// toolkit compile) return `None` and contribute nothing to the text stream,
+    /// while their full typed form is always available on the typed stream.
+    pub fn text(&self) -> Option<String> {
+        const TEXT_FIELDS: [&str; 8] = [
+            "text",
+            "content",
+            "synthesis",
+            "answer",
+            "summary",
+            "message",
+            "reason",
+            "note",
+        ];
+        for field in TEXT_FIELDS {
+            if let Some(serde_json::Value::String(value)) = self.inner.payload.get(field) {
+                if !value.is_empty() {
+                    return Some(value.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Borrow the full underlying event.
     pub fn as_inner(&self) -> &EventState {
         &self.inner

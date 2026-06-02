@@ -38,9 +38,12 @@ Real and tested this slice:
 
 Deferred and named (not stubbed, with their owning step):
 - Live async push-stream (subscribe-and-await new events): the binding layer's
-  job (NAPI tokio, UniFFI RustFuture polling). The core resumable primitive
-  `RunHandle::events_since` is what each binding wraps. Keeps the core
-  runtime-free per the SDK v2 async discipline.
+  job (NAPI tokio, UniFFI RustFuture polling). The synchronous core it wraps now
+  exists as `RunStream` (THPS-005, landed): a resumable poll-based cursor over
+  `RunHandle::events_since` with a typed view (`poll`) and a text-projection view
+  (`poll_text`, the default per Travis's decision). The cursor survives reconnect
+  via `cursor()` / `resume_from(after_seq)`. Only the async push wrapper stays in
+  the binding layer, keeping the core runtime-free per the SDK v2 async discipline.
 - Idempotency short-circuit ENFORCEMENT (return the prior result for a seen
   token): a runtime delta, THPS-003. Requires the event log to persist the token
   on the event so a repeat is detectable. The token wire shape is frozen now so

@@ -15,6 +15,9 @@
 //! - [`RunHandle`]: a run as a sequence of typed events. Start it, append
 //!   transitions, read its events, resume from a sequence boundary, replay it
 //!   deterministically, and cancel it.
+//! - [`RunStream`]: a resumable, poll-based cursor over a run's typed events,
+//!   with a typed view and a text-projection view. The synchronous core that
+//!   each binding wraps into a language-native async stream.
 //! - [`Session`]: a continuity handle over an AgentBinding scope. Within-session
 //!   working memory is the versioned scratchpad; state published across sessions
 //!   is the committed graph.
@@ -52,6 +55,7 @@ pub mod export;
 pub mod idempotency;
 pub mod run;
 pub mod session;
+pub mod stream;
 
 pub use cancel::CancelToken;
 pub use event::{Event, RunEventKind};
@@ -59,3 +63,4 @@ pub use export::{export_run_trace, TraceRow};
 pub use idempotency::IdempotencyToken;
 pub use run::{RunHandle, SdkError, SdkResult};
 pub use session::Session;
+pub use stream::RunStream;
