@@ -100,6 +100,20 @@ impl Harness {
         stream.poll_text(&*store).map_err(to_napi)
     }
 
+    /// The current status of a run (`created`, `cancelled`, `closed`, ...), or
+    /// `unknown` if the run is not found. A consumer's stream loop polls this to
+    /// detect a terminal run. Mirrors reading `RunHandle::state().status`.
+    #[napi]
+    pub fn run_status(&self, run_id: String) -> napi::Result<String> {
+        let store = self.lock()?;
+        let run = RunHandle::attach(run_id, "node");
+        Ok(run
+            .state(&*store)
+            .map_err(to_napi)?
+            .map(|state| state.status)
+            .unwrap_or_else(|| "unknown".to_string()))
+    }
+
     fn lock(&self) -> napi::Result<std::sync::MutexGuard<'_, RedCoreGraphStore>> {
         self.store
             .lock()

@@ -29,6 +29,12 @@ A `Harness` class over an in-process graph store:
 | `cancel(runId, reason, idempotencyKey)` | `RunHandle::cancel` | void |
 | `eventsJson(runId)` | `RunHandle::events` + `export_run_trace` | JSON array string |
 | `pollText(runId, afterSeq)` | `RunStream::resume_from(..).poll_text` | new text (string) |
+| `runStatus(runId)` | `RunHandle::state().status` | status string |
+
+`stream.mjs` exports `streamRun(harness, runId)`, an async iterator
+(`for await (const event of streamRun(...))`) over a run's events: the consumer
+side of "runs that stream typed events," polling the durable cursor until the run
+is terminal.
 
 The harness is durable: state persists to a `RedCoreGraphStore` opened from
 `dataDir` (AOF-backed, recovered on open). A run written in one process is visible
@@ -69,9 +75,10 @@ node recover.mjs "$DIR" "$RUNID"   # fresh process: RECOVER PASS
 - `.d.ts` generation and the npm package shape via the `@napi-rs/cli` (slice 1
   ships the working addon + a hand-written method table; the CLI adds typed
   declarations and prebuilt-binary distribution).
-- The live async stream: `pollText` / `eventsJson` are the synchronous cursor;
-  wrapping them in a Node async iterator (a tokio-backed push stream) is the next
-  binding slice.
+- A napi ThreadsafeFunction push stream (a tokio-backed background emitter). The
+  consumer-facing async iterator already exists as `streamRun` in `stream.mjs`,
+  poll-based over the durable cursor; the push variant is a transport optimization
+  with the identical `for await` shape, so callers do not change when it lands.
 - The remaining SDK surface (`Session`, full `Event` objects rather than JSON).
 
 ## Cross-agent note

@@ -12,6 +12,7 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { mkdtempSync } from "fs";
 import { tmpdir } from "os";
+import { streamRun } from "./stream.mjs";
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -35,11 +36,22 @@ console.log("after cancel:", events.length, events.map((e) => e.kind));
 const text = harness.pollText(runId, 0);
 console.log("text view:", JSON.stringify(text));
 
+// Consume the async-iterator stream: it yields the two events, then stops once
+// the run reaches a terminal status (cancelled).
+const streamed = [];
+for await (const event of streamRun(harness, runId)) {
+  streamed.push(event.kind);
+}
+console.log("streamed kinds:", streamed);
+
 const ok =
   events.length === 2 &&
   events[0].kind === "Created" &&
   events[1].kind === "Cancelled" &&
-  text.includes("stopping from node");
+  text.includes("stopping from node") &&
+  streamed.length === 2 &&
+  streamed[0] === "Created" &&
+  streamed[1] === "Cancelled";
 
 if (ok) {
   console.log("SMOKE PASS");
