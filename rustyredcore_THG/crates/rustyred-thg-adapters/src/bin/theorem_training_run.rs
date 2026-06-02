@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use rustyred_thg_adapters::{
-    export_training_snapshot_files, run_local_training_smoke, seed_training_fixture,
-    writeback_model_artifact_file,
+    export_training_snapshot_files, import_gnn_export_dir, run_local_training_smoke,
+    seed_training_fixture, writeback_model_artifact_file, GnnExportImportOptions,
 };
 
 fn main() {
@@ -38,6 +38,40 @@ fn run() -> Result<(), String> {
                 "training_pack_node_id": fixture.training_pack_node_id,
                 "reasoning_trace_node_ids": fixture.reasoning_trace_node_ids,
                 "graph_version": fixture.transaction.graph_version
+            }))
+        }
+        "gnn-import" => {
+            let data_dir = required_path(&opts, "data-dir")?;
+            let export_dir = required_path(&opts, "export-dir")?;
+            let tenant = option_or(&opts, "tenant", "theorem");
+            let export_id = option_or(&opts, "export-id", "theseus-gnn-export");
+            let actor = opts.get("actor").map(String::as_str);
+            let import = import_gnn_export_dir(
+                data_dir,
+                export_dir,
+                tenant,
+                export_id,
+                GnnExportImportOptions {
+                    batch_size: option_usize(&opts, "batch-size").unwrap_or(10_000),
+                    max_entities: option_usize(&opts, "max-entities"),
+                    max_triples: option_usize(&opts, "max-triples"),
+                },
+                actor,
+            )
+            .map_err(format_thg)?;
+            print_json(json!({
+                "ok": true,
+                "command": "gnn-import",
+                "tenant_id": import.tenant_id,
+                "export_id": import.export_id,
+                "training_pack_node_id": import.training_pack_node_id,
+                "gnn_export_node_id": import.gnn_export_node_id,
+                "imported_entity_nodes": import.imported_entity_nodes,
+                "imported_triple_edges": import.imported_triple_edges,
+                "skipped_triples": import.skipped_triples,
+                "artifact_nodes": import.artifact_nodes,
+                "transaction_count": import.transaction_count,
+                "graph_version": import.graph_version
             }))
         }
         "export" => {
@@ -133,6 +167,13 @@ fn option_or<'a>(opts: &'a BTreeMap<String, String>, key: &str, default: &'a str
         .unwrap_or(default)
 }
 
+fn option_usize(opts: &BTreeMap<String, String>, key: &str) -> Option<usize> {
+    opts.get(key)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
 fn print_json(value: serde_json::Value) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
     println!("{raw}");
@@ -149,6 +190,9 @@ fn print_usage() {
 
 Commands:
   fixture   --data-dir DIR [--tenant theorem] [--actor NAME]
+  gnn-import --data-dir DIR --export-dir DIR [--tenant theorem]
+            [--export-id ID] [--batch-size N]
+            [--max-entities N] [--max-triples N] [--actor NAME]
   export    --data-dir DIR --output-dir DIR [--tenant theorem] [--export-id ID]
   writeback --data-dir DIR --input model_artifact.json [--actor NAME]
   smoke     --data-dir DIR --output-dir DIR [--tenant theorem] [--export-id ID]

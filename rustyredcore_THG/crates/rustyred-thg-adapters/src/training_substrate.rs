@@ -5,6 +5,11 @@
 //! immutable graph snapshots and write evaluated artifacts back as graph
 //! records.
 
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -21,6 +26,7 @@ use crate::types::{
 use crate::upsert_adapter;
 
 pub const OBJECT_LABEL: &str = "Object";
+pub const GNN_ENTITY_LABEL: &str = "GnnEntity";
 pub const REASONING_TRACE_LABEL: &str = "ReasoningTrace";
 pub const TRACE_STEP_LABEL: &str = "TraceStep";
 pub const POSTMORTEM_LABEL: &str = "Postmortem";
@@ -37,9 +43,12 @@ pub const USED_ARTIFACT: &str = "USED_ARTIFACT";
 pub const PART_OF_PACK: &str = "PART_OF_PACK";
 pub const HAS_TRAINING_PAIR: &str = "HAS_TRAINING_PAIR";
 pub const HAS_GNN_EXPORT: &str = "HAS_GNN_EXPORT";
+pub const HAS_ENTITY: &str = "HAS_ENTITY";
 pub const PRODUCED_ARTIFACT: &str = "PRODUCED_ARTIFACT";
 pub const EVALUATED_BY: &str = "EVALUATED_BY";
 pub const PROMOTED_TO_ACTIVE: &str = "PROMOTED_TO_ACTIVE";
+
+const DEFAULT_GNN_IMPORT_BATCH_SIZE: usize = 10_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrainingFixtureResult {
@@ -53,6 +62,37 @@ pub struct TrainingFixtureResult {
     pub gnn_export_node_id: String,
     pub adapter_node_id: String,
     pub transaction: GraphTransaction,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct GnnExportImportOptions {
+    pub batch_size: usize,
+    pub max_entities: Option<usize>,
+    pub max_triples: Option<usize>,
+}
+
+impl Default for GnnExportImportOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: DEFAULT_GNN_IMPORT_BATCH_SIZE,
+            max_entities: None,
+            max_triples: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct GnnExportImportResult {
+    pub tenant_id: String,
+    pub export_id: String,
+    pub training_pack_node_id: String,
+    pub gnn_export_node_id: String,
+    pub imported_entity_nodes: usize,
+    pub imported_triple_edges: usize,
+    pub skipped_triples: usize,
+    pub artifact_nodes: usize,
+    pub transaction_count: usize,
+    pub graph_version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -337,6 +377,237 @@ pub fn register_training_fixture<S: AdapterGraphStore>(
         gnn_export_node_id,
         adapter_node_id: adapter_result.node_id,
         transaction,
+    })
+}
+
+pub fn register_gnn_export_dir<S: AdapterGraphStore>(
+    store: &mut S,
+    export_dir: impl AsRef<Path>,
+    tenant_id: &str,
+    export_id: &str,
+    options: GnnExportImportOptions,
+    actor: Option<&str>,
+) -> ThgResult<GnnExportImportResult> {
+    let export_dir = export_dir.as_ref();
+    let tenant_id = normalize_tenant_id(tenant_id);
+    let export_id = export_id.trim().to_string();
+    if export_id.is_empty() {
+        return Err(ThgError::new("invalid_gnn_export", "export_id is required"));
+    }
+
+    let batch_size = options.batch_size.max(1);
+    let manifest =
+        read_optional_json(&export_dir.join("manifest.json"))?.unwrap_or_else(|| json!({}));
+    let training_metadata = read_optional_json(&export_dir.join("training_metadata.json"))?
+        .unwrap_or_else(|| json!({}));
+    let export_metadata =
+        read_optional_json(&export_dir.join("export_metadata.json"))?.unwrap_or_else(|| json!({}));
+    let file_manifest = manifest
+        .get("files")
+        .and_then(Value::as_object)
+        .map(|files| {
+            files
+                .iter()
+                .map(|(name, metadata)| (name.clone(), metadata.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let training_pack_node_id = training_pack_node_id(&tenant_id, &export_id);
+    let gnn_export_node_id = gnn_export_node_id(&tenant_id, &export_id);
+    let mut transactions = 0usize;
+    let mut graph_version = 0u64;
+
+    let mut metadata_mutations = vec![
+        GraphMutation::NodeUpsert(NodeRecord::new(
+            tenant_node_id(&tenant_id),
+            ["Tenant"],
+            json!({
+                "tenant_id": tenant_id,
+                "source": THG_ADAPTER_SOURCE,
+            }),
+        )),
+        GraphMutation::NodeUpsert(NodeRecord::new(
+            &training_pack_node_id,
+            [TRAINING_PACK_LABEL],
+            json!({
+                "tenant_id": tenant_id,
+                "training_pack_id": export_id,
+                "family": "theseus_gnn_export",
+                "source": "theseus_gnn_export",
+                "privacy_tier": "tier_2_structural",
+            }),
+        )),
+        GraphMutation::NodeUpsert(NodeRecord::new(
+            &gnn_export_node_id,
+            [GNN_EXPORT_LABEL, TRAINING_EXPORT_LABEL],
+            json!({
+                "tenant_id": tenant_id,
+                "export_id": export_id,
+                "source": "theseus_gnn_export",
+                "privacy_tier": "tier_2_structural",
+                "schema_version": manifest.get("schema_version").cloned().unwrap_or(Value::Null),
+                "generator": manifest.get("generator").cloned().unwrap_or(Value::Null),
+                "exported_at": manifest.get("exported_at").cloned().unwrap_or(Value::Null),
+                "graph_snapshot": manifest.get("graph_snapshot").cloned().unwrap_or(Value::Null),
+                "training_metadata": training_metadata,
+                "export_metadata": export_metadata,
+            }),
+        )),
+        GraphMutation::EdgeUpsert(edge_with_adapter_provenance(
+            edge_id(&training_pack_node_id, HAS_GNN_EXPORT, &gnn_export_node_id),
+            &training_pack_node_id,
+            HAS_GNN_EXPORT,
+            &gnn_export_node_id,
+            json!({ "tenant_id": tenant_id, "export_id": export_id }),
+            actor,
+        )),
+    ];
+
+    let mut artifact_nodes = 0usize;
+    for (file_name, metadata) in &file_manifest {
+        let artifact_node_id = gnn_export_artifact_node_id(&tenant_id, &export_id, file_name);
+        metadata_mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+            &artifact_node_id,
+            [ARTIFACT_LABEL],
+            json!({
+                "tenant_id": tenant_id,
+                "artifact_id": format!("gnn-export:{export_id}:{}", slug_segment(file_name)),
+                "export_id": export_id,
+                "file_name": file_name,
+                "local_path": export_dir.join(file_name).to_string_lossy(),
+                "metadata": metadata,
+                "artifact_family": "theseus_gnn_export_file",
+                "privacy_tier": "tier_2_structural",
+                "source": "theseus_gnn_export",
+            }),
+        )));
+        metadata_mutations.push(GraphMutation::EdgeUpsert(edge_with_adapter_provenance(
+            edge_id(&training_pack_node_id, PART_OF_PACK, &artifact_node_id),
+            &training_pack_node_id,
+            PART_OF_PACK,
+            &artifact_node_id,
+            json!({ "tenant_id": tenant_id, "export_id": export_id }),
+            actor,
+        )));
+        metadata_mutations.push(GraphMutation::EdgeUpsert(edge_with_adapter_provenance(
+            edge_id(&gnn_export_node_id, USED_ARTIFACT, &artifact_node_id),
+            &gnn_export_node_id,
+            USED_ARTIFACT,
+            &artifact_node_id,
+            json!({ "tenant_id": tenant_id, "export_id": export_id }),
+            actor,
+        )));
+        artifact_nodes += 1;
+    }
+    flush_import_batch(
+        store,
+        &mut metadata_mutations,
+        &mut transactions,
+        &mut graph_version,
+    )?;
+
+    let entity_map_path = export_dir.join("entity_map.tsv");
+    let triple_path = export_dir.join("triples.tsv");
+    let mut sha_to_node_id = HashMap::new();
+    let mut imported_entity_nodes = 0usize;
+    let mut entity_mutations = Vec::with_capacity(batch_size);
+
+    for entity in read_gnn_entities(&entity_map_path, options.max_entities)? {
+        let node_id = object_node_id(entity.object_id);
+        sha_to_node_id.insert(entity.sha_hash.clone(), node_id.clone());
+        entity_mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+            &node_id,
+            [OBJECT_LABEL, GNN_ENTITY_LABEL],
+            json!({
+                "tenant_id": tenant_id,
+                "object_id": entity.object_id,
+                "sha_hash": entity.sha_hash,
+                "title": entity.title,
+                "object_type": entity.object_type,
+                "export_id": export_id,
+                "privacy_tier": "tier_2_structural",
+                "source": "theseus_gnn_export",
+            }),
+        )));
+        imported_entity_nodes += 1;
+        if entity_mutations.len() >= batch_size {
+            flush_import_batch(
+                store,
+                &mut entity_mutations,
+                &mut transactions,
+                &mut graph_version,
+            )?;
+        }
+    }
+    flush_import_batch(
+        store,
+        &mut entity_mutations,
+        &mut transactions,
+        &mut graph_version,
+    )?;
+
+    let mut imported_triple_edges = 0usize;
+    let mut skipped_triples = 0usize;
+    let mut edge_mutations = Vec::with_capacity(batch_size);
+    for triple in read_gnn_triples(&triple_path, options.max_triples)? {
+        let Some(from_id) = sha_to_node_id.get(&triple.head).cloned() else {
+            skipped_triples += 1;
+            continue;
+        };
+        let Some(to_id) = sha_to_node_id.get(&triple.tail).cloned() else {
+            skipped_triples += 1;
+            continue;
+        };
+        let edge_type = gnn_relation_edge_type(&triple.relation);
+        let edge_id = format!(
+            "edge:gnn_export:{}:{}:triple:{}",
+            tenant_id,
+            slug_segment(&export_id),
+            triple.index
+        );
+        edge_mutations.push(GraphMutation::EdgeUpsert(edge_with_adapter_provenance(
+            edge_id,
+            from_id,
+            edge_type,
+            to_id,
+            json!({
+                "tenant_id": tenant_id,
+                "export_id": export_id,
+                "relation": triple.relation,
+                "triple_index": triple.index,
+                "source": "theseus_gnn_export",
+            }),
+            actor,
+        )));
+        imported_triple_edges += 1;
+        if edge_mutations.len() >= batch_size {
+            flush_import_batch(
+                store,
+                &mut edge_mutations,
+                &mut transactions,
+                &mut graph_version,
+            )?;
+        }
+    }
+    flush_import_batch(
+        store,
+        &mut edge_mutations,
+        &mut transactions,
+        &mut graph_version,
+    )?;
+
+    Ok(GnnExportImportResult {
+        tenant_id,
+        export_id,
+        training_pack_node_id,
+        gnn_export_node_id,
+        imported_entity_nodes,
+        imported_triple_edges,
+        skipped_triples,
+        artifact_nodes,
+        transaction_count: transactions,
+        graph_version,
     })
 }
 
@@ -658,6 +929,210 @@ fn ensure_node_exists<S: AdapterGraphStore>(store: &S, node_id: &str) -> ThgResu
             format!("training endpoint node {node_id} does not exist"),
         ))
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GnnEntityRow {
+    sha_hash: String,
+    title: String,
+    object_type: String,
+    object_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GnnTripleRow {
+    index: usize,
+    head: String,
+    relation: String,
+    tail: String,
+}
+
+fn read_gnn_entities(path: &Path, max_entities: Option<usize>) -> ThgResult<Vec<GnnEntityRow>> {
+    let mut reader = BufReader::new(File::open(path).map_err(io_thg("gnn_entity_map_open"))?);
+    let header = read_required_line(&mut reader, path, "gnn_entity_map_header")?;
+    let columns = header.split('\t').collect::<Vec<_>>();
+    let sha_idx = required_column(&columns, "sha_hash", path)?;
+    let title_idx = required_column(&columns, "title", path)?;
+    let type_idx = required_column(&columns, "object_type", path)?;
+    let object_id_idx = required_column(&columns, "object_id", path)?;
+
+    let mut rows = Vec::new();
+    for (line_idx, line) in reader.lines().enumerate() {
+        if let Some(max_entities) = max_entities {
+            if rows.len() >= max_entities {
+                break;
+            }
+        }
+        let line = line.map_err(io_thg("gnn_entity_map_read"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let object_id = field(&fields, object_id_idx, path, line_idx + 2)?
+            .parse::<i64>()
+            .map_err(|err| {
+                ThgError::new(
+                    "gnn_entity_map_parse_failed",
+                    format!(
+                        "{} line {} has invalid object_id: {err}",
+                        path.display(),
+                        line_idx + 2
+                    ),
+                )
+            })?;
+        rows.push(GnnEntityRow {
+            sha_hash: field(&fields, sha_idx, path, line_idx + 2)?.to_string(),
+            title: field(&fields, title_idx, path, line_idx + 2)?.to_string(),
+            object_type: field(&fields, type_idx, path, line_idx + 2)?.to_string(),
+            object_id,
+        });
+    }
+    Ok(rows)
+}
+
+fn read_gnn_triples(path: &Path, max_triples: Option<usize>) -> ThgResult<Vec<GnnTripleRow>> {
+    let mut reader = BufReader::new(File::open(path).map_err(io_thg("gnn_triples_open"))?);
+    let header = read_required_line(&mut reader, path, "gnn_triples_header")?;
+    let columns = header.split('\t').collect::<Vec<_>>();
+    let head_idx = required_column(&columns, "head", path)?;
+    let relation_idx = required_column(&columns, "relation", path)?;
+    let tail_idx = required_column(&columns, "tail", path)?;
+
+    let mut rows = Vec::new();
+    for (line_idx, line) in reader.lines().enumerate() {
+        if let Some(max_triples) = max_triples {
+            if rows.len() >= max_triples {
+                break;
+            }
+        }
+        let line = line.map_err(io_thg("gnn_triples_read"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        rows.push(GnnTripleRow {
+            index: line_idx + 1,
+            head: field(&fields, head_idx, path, line_idx + 2)?.to_string(),
+            relation: field(&fields, relation_idx, path, line_idx + 2)?.to_string(),
+            tail: field(&fields, tail_idx, path, line_idx + 2)?.to_string(),
+        });
+    }
+    Ok(rows)
+}
+
+fn read_required_line(
+    reader: &mut BufReader<File>,
+    path: &Path,
+    code: &'static str,
+) -> ThgResult<String> {
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line).map_err(io_thg(code))?;
+    if bytes == 0 {
+        return Err(ThgError::new(code, format!("{} is empty", path.display())));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn required_column(columns: &[&str], column: &str, path: &Path) -> ThgResult<usize> {
+    columns
+        .iter()
+        .position(|candidate| *candidate == column)
+        .ok_or_else(|| {
+            ThgError::new(
+                "gnn_export_column_missing",
+                format!("{} is missing required column {column}", path.display()),
+            )
+        })
+}
+
+fn field<'a>(fields: &'a [&str], index: usize, path: &Path, line: usize) -> ThgResult<&'a str> {
+    fields.get(index).copied().ok_or_else(|| {
+        ThgError::new(
+            "gnn_export_field_missing",
+            format!(
+                "{} line {line} is missing field index {index}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn read_optional_json(path: &Path) -> ThgResult<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(io_thg("gnn_export_json_read"))?;
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|err| ThgError::new("gnn_export_json_parse_failed", err.to_string()))
+}
+
+fn flush_import_batch<S: AdapterGraphStore>(
+    store: &mut S,
+    mutations: &mut Vec<GraphMutation>,
+    transactions: &mut usize,
+    graph_version: &mut u64,
+) -> ThgResult<()> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    let batch = GraphMutationBatch::new(std::mem::take(mutations));
+    let transaction = store.commit_batch(batch).map_err(thg_error_from_store)?;
+    *transactions += 1;
+    *graph_version = transaction.graph_version;
+    Ok(())
+}
+
+fn gnn_export_artifact_node_id(tenant_id: &str, export_id: &str, file_name: &str) -> String {
+    artifact_node_id(
+        tenant_id,
+        &format!(
+            "gnn-export:{}:{}",
+            export_id.trim(),
+            slug_segment(file_name)
+        ),
+    )
+}
+
+fn gnn_relation_edge_type(relation: &str) -> String {
+    let slug = relation
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if slug.is_empty() {
+        "GNN_RELATED".to_string()
+    } else {
+        format!("GNN_{slug}")
+    }
+}
+
+fn slug_segment(value: &str) -> String {
+    let mut slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn io_thg(code: &'static str) -> impl FnOnce(std::io::Error) -> ThgError {
+    move |err| ThgError::new(code, err.to_string())
 }
 
 fn snapshot_training_hash(snapshot: &GraphSnapshot) -> String {

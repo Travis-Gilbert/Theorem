@@ -14,8 +14,9 @@ use rustyred_thg_core::{
 };
 
 use crate::training_substrate::{
-    export_training_snapshot, register_model_artifact, register_training_fixture,
-    ModelArtifactInput, ModelWritebackResult, TrainingExportManifest, TrainingFixtureResult,
+    export_training_snapshot, register_gnn_export_dir, register_model_artifact,
+    register_training_fixture, GnnExportImportOptions, GnnExportImportResult, ModelArtifactInput,
+    ModelWritebackResult, TrainingExportManifest, TrainingFixtureResult,
 };
 use crate::{paraphrase_pair_node_id, training_pack_node_id};
 
@@ -88,6 +89,21 @@ pub fn seed_training_fixture(
     let fixture = register_training_fixture(&mut store, tenant_id, actor)?;
     snapshot_store(&mut store)?;
     Ok(fixture)
+}
+
+pub fn import_gnn_export_dir(
+    data_dir: impl AsRef<Path>,
+    export_dir: impl AsRef<Path>,
+    tenant_id: &str,
+    export_id: &str,
+    options: GnnExportImportOptions,
+    actor: Option<&str>,
+) -> ThgResult<GnnExportImportResult> {
+    let mut store = open_training_store(data_dir)?;
+    let result =
+        register_gnn_export_dir(&mut store, export_dir, tenant_id, export_id, options, actor)?;
+    snapshot_store(&mut store)?;
+    Ok(result)
 }
 
 pub fn export_training_snapshot_files(
