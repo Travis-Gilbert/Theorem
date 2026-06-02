@@ -3004,6 +3004,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "theorem-harness"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "theorem-harness-core",
+ "theorem-harness-runtime",
+]
+
+[[package]]
 name = "theorem-harness-core"
 version = "0.1.0"
 dependencies = [
