@@ -1,4 +1,5 @@
 pub mod affordances;
+pub mod agent_binding;
 pub mod context_web;
 pub mod federated_signals;
 pub mod map_artifacts;
@@ -13,6 +14,14 @@ pub mod types;
 pub use affordances::{
     affordance_by_id, affordance_ids, default_affordance_registry, validate_affordance_registry,
     AffordanceContract, AffordanceReceipt,
+};
+pub use agent_binding::{
+    apply_binding_transition, composition_hash, hash_agent_binding, ActionTierPolicy, AgentBinding,
+    AgentHead, BindingBudgetScope, BindingCapabilityScope, BindingComposition, BindingError,
+    BindingEventState, BindingIdentity, BindingLifecycleState, BindingMemoryScope,
+    BindingTraceScope, BindingTransitionInput, BindingTransitionResult, HeadBudgetLimit,
+    HeadContributionRecord, HeadCostProfile, HeadKind, HeadReliabilityProfile, HeadTransport,
+    MemoryZone, MemoryZoneKind, PublishedScope, ScratchpadDocument, ScratchpadRevision, TraceTier,
 };
 pub use context_web::{
     is_generated_artifact, normalize_context_web_node_id, ContextWebAtom, ContextWebBudget,
