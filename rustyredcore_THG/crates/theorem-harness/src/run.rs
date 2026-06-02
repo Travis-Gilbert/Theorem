@@ -6,6 +6,7 @@ use theorem_harness_core::types::{Payload, RunState};
 use theorem_harness_core::TransitionInput;
 use theorem_harness_runtime::{
     append_transition_from_store, load_events, load_run, replay_persisted_run, HarnessRuntimeError,
+    MemoryError,
 };
 
 use crate::cancel::CancelToken;
@@ -18,6 +19,8 @@ pub enum SdkError {
     /// A failure in the GraphStore-backed runtime: a guard violation, an append
     /// conflict, a missing run, or a persistence error.
     Runtime(HarnessRuntimeError),
+    /// A failure in the memory subsystem (remember / recall / encode).
+    Memory(MemoryError),
     /// The run was cancelled; the operation refused to append without touching
     /// the store.
     Cancelled,
@@ -27,6 +30,7 @@ impl std::fmt::Display for SdkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SdkError::Runtime(error) => write!(f, "harness runtime error: {error:?}"),
+            SdkError::Memory(error) => write!(f, "harness memory error: {error:?}"),
             SdkError::Cancelled => write!(f, "run was cancelled"),
         }
     }
@@ -37,6 +41,12 @@ impl std::error::Error for SdkError {}
 impl From<HarnessRuntimeError> for SdkError {
     fn from(error: HarnessRuntimeError) -> Self {
         SdkError::Runtime(error)
+    }
+}
+
+impl From<MemoryError> for SdkError {
+    fn from(error: MemoryError) -> Self {
+        SdkError::Memory(error)
     }
 }
 

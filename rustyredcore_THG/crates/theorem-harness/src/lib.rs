@@ -64,3 +64,7 @@ pub use idempotency::IdempotencyToken;
 pub use run::{RunHandle, SdkError, SdkResult};
 pub use session::Session;
 pub use stream::RunStream;
+
+// Memory DTOs returned by the session memory surface, re-exported so SDK
+// consumers can name them without depending on `theorem-harness-runtime` directly.
+pub use theorem_harness_runtime::{MemoryRecallItem, RememberMemoryReceipt};
