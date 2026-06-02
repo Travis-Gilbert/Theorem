@@ -242,22 +242,37 @@ Every SDK v2 spec section has at least one step. No silent drops.
 | Trace export as headline | THPS-013 |
 | Sequencing (stabilize core, generate once) | Phase 2 -> Phase 3 boundary |
 
-## Open decisions for Travis (only the genuine ones)
+## Resolved decisions (Travis, 2026-06-02)
 
-These cannot be inferred from source and are product calls, not implementation
-details:
+1. **`recall` semantics: collapse the duplicate, repoint `recall` at native memory
+   recall.** Grounded finding: plugin `recall` (`server.mjs:834`) and
+   `saved_context_preview_recall` (`server.mjs:1308`) have byte-identical input schemas
+   and the same description; they are one preview operation under two names. Worse,
+   neither pairs with `remember`/`encode`/`self_note`: both preview saved-context
+   INJECTION for a task, not the memory atoms a caller saved. Resolution: (a) `recall`
+   becomes native memory recall over `theorem-harness-runtime::memory` (the pair to
+   `remember`; the runtime memory round-trip tests and native `rustyred-thg recall`
+   already implement it); (b) the context-injection preview keeps one honest name
+   (`context_preview`, or the retained `saved_context_preview_recall`), and the duplicate
+   alias is removed. Net: one fewer tool AND `recall` finally returns what you remembered.
+   Feeds THPS-003. Minor sub-choice still Travis's: the exact name for the kept
+   injection-preview verb.
+2. **Default stream view: text stream default, typed stream always available.** The
+   choice is not user-only. The typed event stream is the agent/provenance/control surface
+   (tool-considered, tool-selected, receipts, run transitions) that trace export
+   (THPS-013) and any machine consumer need; the text stream is the final-answer
+   convenience. Picking a default never removes the other view. Default is the text stream;
+   typed is opt-in for provenance. Note: cross-agent coordination (the Claude<->Codex room
+   messages) rides the separate text-based coordination channel and is unaffected by the
+   run-stream default.
+3. **Bindings vs the native SDK (Travis's correction, adopted).** Rust is NOT a binding.
+   `theorem-harness` (the Rust SDK over core + runtime) IS the native SDK and the source of
+   truth, called natively by Theorem, RustyWeb, and any Rust service. The Rust SDK surface
+   is THPS-011 (core surface freeze) and comes first by definition, because the bindings are
+   generated from it. Python, Node, Swift, and wasm are GENERATED from the Rust core
+   (UniFFI / NAPI-RS / wasm-bindgen) in THPS-012. "First binding target" refers only to the
+   generated set: Node first (retires the plugin JS shim), then Swift (iOS), then Python
+   (data/ML), then wasm (web client).
 
-1. **`recall` semantics.** Codex flagged this in THPS-003's risk: plugin `recall`
-   currently points at saved-context preview recall, not native memory recall. SDK v2
-   treats memory recall as the base verb. Proposal: `recall` means native memory
-   recall; product preview moves behind `saved_context_preview_recall`. Confirm or
-   override.
-2. **Default stream view.** SDK v2 offers a raw typed-event stream and a text-only
-   convenience stream. Proposal: text stream is the default for the plugin verbs (most
-   callers want the answer), typed stream is opt-in for provenance. Confirm.
-3. **First binding target.** Proposal: Node first (it retires the plugin JS shim and
-   is the highest-leverage), then Swift (the iOS app), then Python (data/ML), then
-   wasm. Confirm or reorder.
-
-Everything else in this document is a proposal we (Claude + Codex) own under the
-creative-freedom grant and will record as joint decisions in the room.
+Everything else in this document is a proposal Claude + Codex own under the
+creative-freedom grant and record as joint decisions in the room.
