@@ -516,7 +516,12 @@ impl SelectionRequest {
         if self.k == 0 {
             self.k = 10;
         }
-        if !(0.0..1.0).contains(&self.ppr_damping) {
+        // Reset to the default when unset or out of range. The serde/Default
+        // value is 0.0, which is a degenerate damping: it makes alpha = 1.0
+        // (pure teleport) and collapses PPR onto the seed, erasing the
+        // structural signal. So 0.0 must be treated as "use the default", not
+        // as a valid choice; only a strictly-interior value is honored.
+        if self.ppr_damping <= 0.0 || self.ppr_damping >= 1.0 {
             self.ppr_damping = DEFAULT_PPR_DAMPING;
         }
         if self.ppr_max_iter == 0 {

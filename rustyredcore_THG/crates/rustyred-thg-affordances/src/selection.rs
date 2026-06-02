@@ -155,7 +155,12 @@ fn affordance_adjacency(edges: &[EdgeRecord]) -> HashMap<String, Vec<(String, f6
         }
         match edge.edge_type.as_str() {
             SERVED_TASK => {
-                let weight = edge.effective_confidence().max(0.0).max(1.0);
+                // Clamp confidence into [0,1]. effective_confidence() defaults
+                // to 1.0 when unset, so unconfidenced SERVED_TASK edges still
+                // propagate at full weight; an explicit confidence is now
+                // honored. (Was .max(0.0).max(1.0), which pinned every edge to
+                // a constant 1.0 and ignored the confidence entirely.)
+                let weight = edge.effective_confidence().clamp(0.0, 1.0);
                 adjacency
                     .entry(edge.to_id.clone())
                     .or_default()
