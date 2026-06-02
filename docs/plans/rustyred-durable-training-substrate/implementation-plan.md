@@ -25,6 +25,27 @@ training-substrate proof surface:
   forces `snapshot_now()`, reopens from disk, exports the training view, and
   writes back a fake paraphramer model.
 
+**Operator slice landed:** `rustyred-thg-adapters` now also exposes a runnable
+Theorem training seam:
+
+- `theorem_training_run fixture`: seeds the durable RedCore training fixture.
+- `theorem_training_run export`: forces a RedCore snapshot and writes
+  `manifest.json`, `graph_snapshot.json`, and `runpod_input.json`.
+- `theorem_training_run writeback`: reads a trainer-produced
+  `ModelArtifactInput` JSON and records the model artifact plus evaluation
+  receipt in the same RedCore store.
+- `theorem_training_run smoke`: runs the full local RedCore substrate loop for
+  preflight validation.
+- `scripts/submit_theorem_training_runpod.py`: submits `runpod_input.json` to a
+  configured RunPod endpoint, but refuses to launch unless remote manifest and
+  snapshot URIs are provided. This prevents accidentally sending local `/tmp`
+  paths to a serverless worker.
+
+Current RunPod account state, checked on 2026-06-02: the available endpoints are
+GL-Fusion or model-serving endpoints, not a Theorem RustyRed trainer. The next
+RunPod step is a dedicated Theorem/RustyRed training endpoint that consumes the
+snapshot contract and returns `ModelArtifactInput`.
+
 ## Direct Answer
 
 RustyRed does not need to be "trained" in the way a model is trained. It is the

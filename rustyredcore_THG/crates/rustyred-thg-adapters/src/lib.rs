@@ -7,6 +7,7 @@
 pub mod commands;
 pub mod fitness;
 pub mod routing;
+pub mod training_runner;
 pub mod training_substrate;
 pub mod types;
 pub mod upsert;
@@ -18,6 +19,13 @@ pub use fitness::{
 pub use routing::{
     adapter_training_centroid, find_adapters_by_query_embedding, find_adapters_for,
     recompute_embedding,
+};
+pub use training_runner::{
+    export_training_snapshot_files, open_training_store, redcore_training_options,
+    run_local_training_smoke, runpod_input_for_manifest, seed_training_fixture,
+    writeback_model_artifact_file, RunPodTrainingInput, TrainingExportFiles, TrainingSmokeResult,
+    TrainingSnapshotBundle, TrainingSnapshotLocalFiles, GRAPH_SNAPSHOT_FILE, MANIFEST_FILE,
+    RUNPOD_INPUT_FILE,
 };
 pub use training_substrate::{
     artifact_node_id, evaluation_receipt_node_id, export_training_snapshot, gnn_export_node_id,
@@ -55,3 +63,7 @@ mod fitness_test;
 #[cfg(test)]
 #[path = "tests/training_substrate_test.rs"]
 mod training_substrate_test;
+
+#[cfg(test)]
+#[path = "tests/training_runner_test.rs"]
+mod training_runner_test;
