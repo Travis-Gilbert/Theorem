@@ -1,5 +1,7 @@
 pub mod affordances;
 pub mod agent_binding;
+pub mod alignment;
+pub mod budget;
 pub mod context_web;
 pub mod federated_signals;
 pub mod map_artifacts;
@@ -23,6 +25,8 @@ pub use agent_binding::{
     HeadContributionRecord, HeadCostProfile, HeadKind, HeadReliabilityProfile, HeadTransport,
     MemoryZone, MemoryZoneKind, PublishedScope, ScratchpadDocument, ScratchpadRevision, TraceTier,
 };
+pub use alignment::{evaluate_publication, MIN_CONSENSUS_HEADS};
+pub use budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
 pub use context_web::{
     is_generated_artifact, normalize_context_web_node_id, ContextWebAtom, ContextWebBudget,
     ContextWebCitation, ContextWebEdge, ContextWebEvaluation, ContextWebIndex, ContextWebPack,

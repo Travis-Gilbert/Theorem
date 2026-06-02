@@ -1,3 +1,5 @@
+use crate::alignment::evaluate_publication;
+use crate::budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
 use crate::state_hash::stable_value_hash;
 use crate::types::{now_string, prefixed_id, GuardViolation, Payload};
 use serde::{Deserialize, Serialize};
@@ -377,6 +379,8 @@ pub struct BindingTraceScope {
     pub receipts_required: bool,
     #[serde(default)]
     pub contributions: Vec<HeadContributionRecord>,
+    #[serde(default)]
+    pub synthesis_heads: Vec<String>,
 }
 
 impl BindingTraceScope {
@@ -386,6 +390,7 @@ impl BindingTraceScope {
             trace_tier: TraceTier::Receipt,
             receipts_required: true,
             contributions: Vec::new(),
+            synthesis_heads: Vec::new(),
         }
     }
 }
@@ -445,6 +450,8 @@ pub struct AgentBinding {
     pub budget_scope: BindingBudgetScope,
     pub trace_scope: BindingTraceScope,
     #[serde(default)]
+    pub budget_state: BindingBudgetState,
+    #[serde(default)]
     pub lifecycle: BindingLifecycleState,
 }
 
@@ -464,6 +471,7 @@ impl AgentBinding {
             capability_scope: BindingCapabilityScope::for_agent(&agent_id),
             budget_scope,
             trace_scope: BindingTraceScope::for_agent(&agent_id),
+            budget_state: BindingBudgetState::default(),
             lifecycle: BindingLifecycleState::new(),
         };
         if binding.identity.composition_hash.trim().is_empty() {
@@ -688,6 +696,7 @@ pub fn hash_agent_binding(binding: &AgentBinding) -> String {
         "published_scope": data.get("published_scope").cloned().unwrap_or(Value::Null),
         "capability_scope": data.get("capability_scope").cloned().unwrap_or(Value::Null),
         "budget_scope": data.get("budget_scope").cloned().unwrap_or(Value::Null),
+        "budget_state": data.get("budget_state").cloned().unwrap_or(Value::Null),
         "trace_scope": data.get("trace_scope").cloned().unwrap_or(Value::Null),
         "lifecycle": data.get("lifecycle").cloned().unwrap_or(Value::Null),
     }))
@@ -829,12 +838,13 @@ fn apply_binding_payload(
                 payload_usize(transition.payload.get("max_parallel_heads"));
         }
         "HEADS.CONTRIBUTE" => {
+            let head_id = payload_to_string(transition.payload.get("head_id"));
             binding
                 .trace_scope
                 .contributions
                 .push(HeadContributionRecord {
                     contribution_id: payload_to_string(transition.payload.get("contribution_id")),
-                    head_id: payload_to_string(transition.payload.get("head_id")),
+                    head_id: head_id.clone(),
                     contribution_kind: payload_to_string(
                         transition.payload.get("contribution_kind"),
                     ),
@@ -842,6 +852,15 @@ fn apply_binding_payload(
                     receipt_hash: payload_to_string(transition.payload.get("receipt_hash")),
                     created_at: transition.created_at.clone(),
                 });
+            apply_contribution_charge(
+                &mut binding.budget_state,
+                &head_id,
+                payload_f64(transition.payload.get("cost_units")),
+            );
+        }
+        "DRAFTS.SYNTHESIZED" => {
+            binding.trace_scope.synthesis_heads =
+                payload_array_strings(transition.payload.get("contributing_heads"));
         }
         _ => {}
     }
@@ -894,6 +913,12 @@ fn apply_binding_guard(
                     Payload::new(),
                 ));
             }
+            check_contribution_budget(
+                &binding.budget_scope,
+                &binding.budget_state,
+                &head_id,
+                payload_f64(transition.payload.get("cost_units")),
+            )?;
         }
         "DRAFTS.SYNTHESIZED" => {
             let active = binding.active_head_ids();
@@ -926,6 +951,13 @@ fn apply_binding_guard(
                 Vec::new(),
                 Payload::new(),
             ));
+        }
+        "POLICY.CHECKED" => {
+            evaluate_publication(
+                &binding.trace_scope.synthesis_heads,
+                &binding.capability_scope.action_tiers,
+                &transition.payload,
+            )?;
         }
         "MEMORY_PATCHES.PROPOSED" if !payload_bool(transition.payload.get("review_required")) => {
             return Err(guard_violation(
@@ -1462,6 +1494,82 @@ mod tests {
         .unwrap_err();
 
         assert_guard(error, "binding_policy_denied");
+    }
+
+    #[test]
+    fn contribution_over_run_budget_is_blocked() {
+        let error = apply_binding_transition(
+            ready_for_contribution(),
+            transition(
+                "HEADS.CONTRIBUTE",
+                json!({
+                    "head_id": "claude",
+                    "contribution_id": "contrib:big",
+                    "contribution_kind": "proposal",
+                    "cost_units": 30.0
+                }),
+            ),
+        )
+        .unwrap_err();
+
+        assert_guard(error, "binding_budget_overspent");
+    }
+
+    #[test]
+    fn publication_below_consensus_is_blocked() {
+        let binding = apply(
+            ready_for_contribution(),
+            "HEADS.CONTRIBUTE",
+            json!({
+                "head_id": "claude",
+                "contribution_id": "contrib:1",
+                "contribution_kind": "proposal"
+            }),
+        );
+        let binding = apply(
+            binding.binding,
+            "DRAFTS.SYNTHESIZED",
+            json!({
+                "synthesis_id": "synth:1",
+                "contributing_heads": ["claude"]
+            }),
+        );
+        let binding = apply(
+            binding.binding,
+            "PUBLICATION.PROPOSED",
+            json!({
+                "publication_id": "pub:1",
+                "draft_hash": "draft:1"
+            }),
+        );
+        let error = apply_binding_transition(
+            binding.binding,
+            transition(
+                "POLICY.CHECKED",
+                json!({ "policy_receipt_id": "policy:1", "allowed": true }),
+            ),
+        )
+        .unwrap_err();
+
+        assert_guard(error, "consensus_below_threshold");
+    }
+
+    #[test]
+    fn tier_three_publication_requires_human_authorization() {
+        let error = apply_binding_transition(
+            ready_for_publication(),
+            transition(
+                "POLICY.CHECKED",
+                json!({
+                    "policy_receipt_id": "policy:1",
+                    "allowed": true,
+                    "action_tier": "tier_three"
+                }),
+            ),
+        )
+        .unwrap_err();
+
+        assert_guard(error, "tier_requires_human_authorization");
     }
 
     fn ready_for_budget() -> AgentBinding {
