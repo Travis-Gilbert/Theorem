@@ -7,6 +7,7 @@
 pub mod commands;
 pub mod fitness;
 pub mod routing;
+pub mod situation_search;
 pub mod training_runner;
 pub mod training_substrate;
 pub mod types;
@@ -19,6 +20,18 @@ pub use fitness::{
 pub use routing::{
     adapter_training_centroid, find_adapters_by_query_embedding, find_adapters_for,
     recompute_embedding,
+};
+pub use situation_search::{
+    default_situation_target_labels, record_similar_situation_search,
+    register_semantic_vector_designations, semantic_vector_designations, similar_situation_search,
+    SimilarSituationDecision, SimilarSituationHit, SimilarSituationSearchMode,
+    SimilarSituationSearchPolicy, SimilarSituationSearchReceipt, SimilarSituationSearchRequest,
+    SimilarSituationSearchResult, SituationSearchGraphStore, CODE_FILE_LABEL, CODE_OBJECT_LABEL,
+    CODE_SYMBOL_LABEL, EMBEDDING_CODEGRAPHBERT_768, EMBEDDING_CODE_UNIXCODER_768,
+    EMBEDDING_SITUATION_SBERT_384, EMBEDDING_TRAINING_SBERT_384, EMBEDDING_USER_SBERT_384,
+    ESCALATED_TO_SEARCH, HARNESS_EVENT_LABEL, HARNESS_RUN_LABEL, MATCHED_SIMILAR_SITUATION,
+    SEARCH_ESCALATION_PLAN_LABEL, SIMILAR_SITUATION_SEARCH_LABEL, USER_MODEL_LABEL,
+    USER_PREFERENCE_LABEL,
 };
 pub use training_runner::{
     export_training_snapshot_files, import_gnn_export_dir, open_training_store,
@@ -56,6 +69,10 @@ mod upsert_test;
 #[cfg(test)]
 #[path = "tests/routing_test.rs"]
 mod routing_test;
+
+#[cfg(test)]
+#[path = "tests/situation_search_test.rs"]
+mod situation_search_test;
 
 #[cfg(test)]
 #[path = "tests/fitness_test.rs"]

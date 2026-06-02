@@ -3,9 +3,9 @@ use serde_json::{json, Value};
 
 use rustyred_thg_core::{
     manifest_version_compatible, now_ms, sanitize_tenant_segment, EdgeRecord, GraphMutation,
-    GraphMutationBatch, GraphSnapshot, GraphStoreError, GraphStoreResult, GraphTransaction,
-    GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-    RedCoreGraphStore, ThgError, ThgResult, VectorDesignation,
+    GraphMutationBatch, GraphSnapshot, GraphStats, GraphStoreError, GraphStoreResult,
+    GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery,
+    NodeRecord, RedCoreGraphStore, ThgError, ThgResult, VectorDesignation,
 };
 
 pub const LORA_ADAPTER_LABEL: &str = "LoraAdapter";
@@ -31,6 +31,7 @@ pub trait AdapterGraphStore {
     fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>>;
     fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>>;
     fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>>;
+    fn stats(&self) -> GraphStoreResult<GraphStats>;
     fn snapshot(&self) -> GraphStoreResult<GraphSnapshot>;
 }
 
@@ -83,6 +84,10 @@ impl AdapterGraphStore for InMemoryGraphStore {
         Ok(InMemoryGraphStore::neighbors(self, query))
     }
 
+    fn stats(&self) -> GraphStoreResult<GraphStats> {
+        Ok(InMemoryGraphStore::stats(self))
+    }
+
     fn snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
         Ok(InMemoryGraphStore::snapshot(self))
     }
@@ -115,6 +120,10 @@ impl AdapterGraphStore for RedCoreGraphStore {
 
     fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
         RedCoreGraphStore::neighbors(self, query)
+    }
+
+    fn stats(&self) -> GraphStoreResult<GraphStats> {
+        Ok(RedCoreGraphStore::verify(self)?.stats)
     }
 
     fn snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
