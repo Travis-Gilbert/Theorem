@@ -116,6 +116,8 @@ fn gnn_export_import_materializes_entities_triples_and_artifacts() {
   "files": {
     "entity_map.tsv": {"rows": 3},
     "triples.tsv": {"rows": 3},
+    "temporal_triples.tsv": {"rows": 2},
+    "sha_to_object_id.json": {"rows": 4},
     "node_features.npy": {"shape": [3, 384], "dtype": "float32"}
   }
 }"#,
@@ -133,12 +135,22 @@ fn gnn_export_import_materializes_entities_triples_and_artifacts() {
     .unwrap();
     std::fs::write(
         export_dir.join("entity_map.tsv"),
-        "sha_hash\ttitle\tobject_type\tobject_id\nsha-a\tAlpha\tnote\t1\nsha-b\tBeta\tsource\t2\nsha-c\tGamma\tnote\t3\n",
+        "sha_hash\ttitle\tobject_type\nsha-a\tAlpha\tnote\nsha-b\tBeta\tsource\nsha-c\tGamma\tnote\n",
+    )
+    .unwrap();
+    std::fs::write(
+        export_dir.join("sha_to_object_id.json"),
+        r#"{"sha-a":1,"sha-b":2,"sha-c":3,"sha-d":4}"#,
     )
     .unwrap();
     std::fs::write(
         export_dir.join("triples.tsv"),
         "head\trelation\ttail\nsha-a\tstructural\tsha-b\nsha-b\tspatial:adjacent\tsha-c\nsha-missing\tstructural\tsha-c\n",
+    )
+    .unwrap();
+    std::fs::write(
+        export_dir.join("temporal_triples.tsv"),
+        "head\trelation\ttail\ttime_bucket\tweight\nsha-c\tcausal\tsha-d\t2026-W14\t0.8\nsha-missing\tcausal\tsha-a\t2026-W14\t0.5\n",
     )
     .unwrap();
 
@@ -157,24 +169,28 @@ fn gnn_export_import_materializes_entities_triples_and_artifacts() {
             batch_size: 2,
             max_entities: None,
             max_triples: None,
+            max_temporal_triples: None,
         },
         Some("test"),
     )
     .unwrap();
 
     assert_eq!(result.imported_entity_nodes, 3);
+    assert_eq!(result.imported_sha_map_nodes, 1);
     assert_eq!(result.imported_triple_edges, 2);
+    assert_eq!(result.imported_temporal_edges, 1);
     assert_eq!(result.skipped_triples, 1);
-    assert_eq!(result.artifact_nodes, 3);
+    assert_eq!(result.skipped_temporal_triples, 1);
+    assert_eq!(result.artifact_nodes, 5);
     assert!(result.transaction_count > 1);
 
     store.snapshot_now().unwrap();
     let snapshot = store.graph_snapshot();
     let manifest = export_training_snapshot(&snapshot, "theorem", "fixture-export").unwrap();
-    assert_eq!(manifest.counts.objects, 3);
+    assert_eq!(manifest.counts.objects, 4);
     assert_eq!(manifest.counts.gnn_exports, 1);
     assert_eq!(manifest.counts.training_packs, 1);
-    assert_eq!(manifest.counts.artifacts, 3);
+    assert_eq!(manifest.counts.artifacts, 5);
     assert!(manifest
         .selected_labels
         .iter()
@@ -187,6 +203,10 @@ fn gnn_export_import_materializes_entities_triples_and_artifacts() {
         .selected_edge_types
         .iter()
         .any(|edge_type| edge_type == "GNN_SPATIAL_ADJACENT"));
+    assert!(manifest
+        .selected_edge_types
+        .iter()
+        .any(|edge_type| edge_type == "GNN_TEMPORAL_CAUSAL"));
 
     std::fs::remove_dir_all(data_dir).ok();
     std::fs::remove_dir_all(export_dir).ok();

@@ -55,6 +55,7 @@ fn run() -> Result<(), String> {
                     batch_size: option_usize(&opts, "batch-size").unwrap_or(10_000),
                     max_entities: option_usize(&opts, "max-entities"),
                     max_triples: option_usize(&opts, "max-triples"),
+                    max_temporal_triples: option_usize(&opts, "max-temporal-triples"),
                 },
                 actor,
             )
@@ -67,8 +68,11 @@ fn run() -> Result<(), String> {
                 "training_pack_node_id": import.training_pack_node_id,
                 "gnn_export_node_id": import.gnn_export_node_id,
                 "imported_entity_nodes": import.imported_entity_nodes,
+                "imported_sha_map_nodes": import.imported_sha_map_nodes,
                 "imported_triple_edges": import.imported_triple_edges,
+                "imported_temporal_edges": import.imported_temporal_edges,
                 "skipped_triples": import.skipped_triples,
+                "skipped_temporal_triples": import.skipped_temporal_triples,
                 "artifact_nodes": import.artifact_nodes,
                 "transaction_count": import.transaction_count,
                 "graph_version": import.graph_version
@@ -192,7 +196,8 @@ Commands:
   fixture   --data-dir DIR [--tenant theorem] [--actor NAME]
   gnn-import --data-dir DIR --export-dir DIR [--tenant theorem]
             [--export-id ID] [--batch-size N]
-            [--max-entities N] [--max-triples N] [--actor NAME]
+            [--max-entities N] [--max-triples N]
+            [--max-temporal-triples N] [--actor NAME]
   export    --data-dir DIR --output-dir DIR [--tenant theorem] [--export-id ID]
   writeback --data-dir DIR --input model_artifact.json [--actor NAME]
   smoke     --data-dir DIR --output-dir DIR [--tenant theorem] [--export-id ID]

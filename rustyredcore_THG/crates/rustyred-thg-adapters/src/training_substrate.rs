@@ -5,7 +5,7 @@
 //! immutable graph snapshots and write evaluated artifacts back as graph
 //! records.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -69,6 +69,7 @@ pub struct GnnExportImportOptions {
     pub batch_size: usize,
     pub max_entities: Option<usize>,
     pub max_triples: Option<usize>,
+    pub max_temporal_triples: Option<usize>,
 }
 
 impl Default for GnnExportImportOptions {
@@ -77,6 +78,7 @@ impl Default for GnnExportImportOptions {
             batch_size: DEFAULT_GNN_IMPORT_BATCH_SIZE,
             max_entities: None,
             max_triples: None,
+            max_temporal_triples: None,
         }
     }
 }
@@ -88,8 +90,11 @@ pub struct GnnExportImportResult {
     pub training_pack_node_id: String,
     pub gnn_export_node_id: String,
     pub imported_entity_nodes: usize,
+    pub imported_sha_map_nodes: usize,
     pub imported_triple_edges: usize,
+    pub imported_temporal_edges: usize,
     pub skipped_triples: usize,
+    pub skipped_temporal_triples: usize,
     pub artifact_nodes: usize,
     pub transaction_count: usize,
     pub graph_version: u64,
@@ -402,7 +407,7 @@ pub fn register_gnn_export_dir<S: AdapterGraphStore>(
         .unwrap_or_else(|| json!({}));
     let export_metadata =
         read_optional_json(&export_dir.join("export_metadata.json"))?.unwrap_or_else(|| json!({}));
-    let file_manifest = manifest
+    let mut file_manifest = manifest
         .get("files")
         .and_then(Value::as_object)
         .map(|files| {
@@ -412,6 +417,9 @@ pub fn register_gnn_export_dir<S: AdapterGraphStore>(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    if file_manifest.is_empty() {
+        file_manifest = discover_export_files(export_dir)?;
+    }
 
     let training_pack_node_id = training_pack_node_id(&tenant_id, &export_id);
     let gnn_export_node_id = gnn_export_node_id(&tenant_id, &export_id);
@@ -509,27 +517,49 @@ pub fn register_gnn_export_dir<S: AdapterGraphStore>(
 
     let entity_map_path = export_dir.join("entity_map.tsv");
     let triple_path = export_dir.join("triples.tsv");
+    let temporal_triple_path = export_dir.join("temporal_triples.tsv");
+    let sha_to_object_id_path = export_dir.join("sha_to_object_id.json");
+    let sha_to_object_ids = read_sha_to_object_ids(&sha_to_object_id_path)?;
     let mut sha_to_node_id = HashMap::new();
+    for (sha_hash, object_id) in &sha_to_object_ids {
+        sha_to_node_id.insert(sha_hash.clone(), object_node_id(*object_id));
+    }
     let mut imported_entity_nodes = 0usize;
+    let mut detailed_entity_hashes = HashSet::new();
     let mut entity_mutations = Vec::with_capacity(batch_size);
 
     for entity in read_gnn_entities(&entity_map_path, options.max_entities)? {
-        let node_id = object_node_id(entity.object_id);
+        let object_id = entity
+            .object_id
+            .or_else(|| sha_to_object_ids.get(&entity.sha_hash).copied());
+        let node_id = object_id
+            .map(object_node_id)
+            .unwrap_or_else(|| gnn_export_entity_node_id(&tenant_id, &export_id, &entity.sha_hash));
         sha_to_node_id.insert(entity.sha_hash.clone(), node_id.clone());
-        entity_mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
-            &node_id,
-            [OBJECT_LABEL, GNN_ENTITY_LABEL],
-            json!({
-                "tenant_id": tenant_id,
-                "object_id": entity.object_id,
-                "sha_hash": entity.sha_hash,
-                "title": entity.title,
-                "object_type": entity.object_type,
-                "export_id": export_id,
-                "privacy_tier": "tier_2_structural",
-                "source": "theseus_gnn_export",
-            }),
-        )));
+        detailed_entity_hashes.insert(entity.sha_hash.clone());
+        let labels = if object_id.is_some() {
+            vec![OBJECT_LABEL.to_string(), GNN_ENTITY_LABEL.to_string()]
+        } else {
+            vec![GNN_ENTITY_LABEL.to_string()]
+        };
+        let node = merge_existing_node(
+            store,
+            NodeRecord::new(
+                &node_id,
+                labels,
+                json!({
+                    "tenant_id": tenant_id,
+                    "object_id": object_id,
+                    "sha_hash": entity.sha_hash,
+                    "title": entity.title,
+                    "object_type": entity.object_type,
+                    "export_id": export_id,
+                    "privacy_tier": "tier_2_structural",
+                    "source": "theseus_gnn_export",
+                }),
+            ),
+        )?;
+        entity_mutations.push(GraphMutation::NodeUpsert(node));
         imported_entity_nodes += 1;
         if entity_mutations.len() >= batch_size {
             flush_import_batch(
@@ -546,6 +576,54 @@ pub fn register_gnn_export_dir<S: AdapterGraphStore>(
         &mut transactions,
         &mut graph_version,
     )?;
+
+    let mut imported_sha_map_nodes = 0usize;
+    if temporal_triple_path.exists() {
+        let mut sha_map_mutations = Vec::with_capacity(batch_size);
+        for (sha_hash, object_id) in &sha_to_object_ids {
+            if detailed_entity_hashes.contains(sha_hash) {
+                continue;
+            }
+            let node_id = object_node_id(*object_id);
+            if store
+                .get_node(&node_id)
+                .map_err(thg_error_from_store)?
+                .is_some()
+            {
+                continue;
+            }
+            sha_map_mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+                &node_id,
+                [OBJECT_LABEL, GNN_ENTITY_LABEL],
+                json!({
+                    "tenant_id": tenant_id,
+                    "object_id": object_id,
+                    "sha_hash": sha_hash,
+                    "title": Value::Null,
+                    "object_type": "unknown",
+                    "export_id": export_id,
+                    "privacy_tier": "tier_2_structural",
+                    "source": "theseus_gnn_export",
+                    "materialized_from_sha_to_object_id": true,
+                }),
+            )));
+            imported_sha_map_nodes += 1;
+            if sha_map_mutations.len() >= batch_size {
+                flush_import_batch(
+                    store,
+                    &mut sha_map_mutations,
+                    &mut transactions,
+                    &mut graph_version,
+                )?;
+            }
+        }
+        flush_import_batch(
+            store,
+            &mut sha_map_mutations,
+            &mut transactions,
+            &mut graph_version,
+        )?;
+    }
 
     let mut imported_triple_edges = 0usize;
     let mut skipped_triples = 0usize;
@@ -597,14 +675,74 @@ pub fn register_gnn_export_dir<S: AdapterGraphStore>(
         &mut graph_version,
     )?;
 
+    let mut imported_temporal_edges = 0usize;
+    let mut skipped_temporal_triples = 0usize;
+    if temporal_triple_path.exists() {
+        let mut temporal_edge_mutations = Vec::with_capacity(batch_size);
+        for triple in
+            read_gnn_temporal_triples(&temporal_triple_path, options.max_temporal_triples)?
+        {
+            let Some(from_id) = sha_to_node_id.get(&triple.head).cloned() else {
+                skipped_temporal_triples += 1;
+                continue;
+            };
+            let Some(to_id) = sha_to_node_id.get(&triple.tail).cloned() else {
+                skipped_temporal_triples += 1;
+                continue;
+            };
+            let edge_type = gnn_temporal_relation_edge_type(&triple.relation);
+            let edge_id = format!(
+                "edge:gnn_export:{}:{}:temporal:{}",
+                tenant_id,
+                slug_segment(&export_id),
+                triple.index
+            );
+            temporal_edge_mutations.push(GraphMutation::EdgeUpsert(edge_with_adapter_provenance(
+                edge_id,
+                from_id,
+                edge_type,
+                to_id,
+                json!({
+                    "tenant_id": tenant_id,
+                    "export_id": export_id,
+                    "relation": triple.relation,
+                    "time_bucket": triple.time_bucket,
+                    "weight": triple.weight,
+                    "temporal_triple_index": triple.index,
+                    "source": "theseus_gnn_export",
+                    "source_file": "temporal_triples.tsv",
+                }),
+                actor,
+            )));
+            imported_temporal_edges += 1;
+            if temporal_edge_mutations.len() >= batch_size {
+                flush_import_batch(
+                    store,
+                    &mut temporal_edge_mutations,
+                    &mut transactions,
+                    &mut graph_version,
+                )?;
+            }
+        }
+        flush_import_batch(
+            store,
+            &mut temporal_edge_mutations,
+            &mut transactions,
+            &mut graph_version,
+        )?;
+    }
+
     Ok(GnnExportImportResult {
         tenant_id,
         export_id,
         training_pack_node_id,
         gnn_export_node_id,
         imported_entity_nodes,
+        imported_sha_map_nodes,
         imported_triple_edges,
+        imported_temporal_edges,
         skipped_triples,
+        skipped_temporal_triples,
         artifact_nodes,
         transaction_count: transactions,
         graph_version,
@@ -936,7 +1074,7 @@ struct GnnEntityRow {
     sha_hash: String,
     title: String,
     object_type: String,
-    object_id: i64,
+    object_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -947,6 +1085,16 @@ struct GnnTripleRow {
     tail: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct GnnTemporalTripleRow {
+    index: usize,
+    head: String,
+    relation: String,
+    tail: String,
+    time_bucket: String,
+    weight: f64,
+}
+
 fn read_gnn_entities(path: &Path, max_entities: Option<usize>) -> ThgResult<Vec<GnnEntityRow>> {
     let mut reader = BufReader::new(File::open(path).map_err(io_thg("gnn_entity_map_open"))?);
     let header = read_required_line(&mut reader, path, "gnn_entity_map_header")?;
@@ -954,7 +1102,7 @@ fn read_gnn_entities(path: &Path, max_entities: Option<usize>) -> ThgResult<Vec<
     let sha_idx = required_column(&columns, "sha_hash", path)?;
     let title_idx = required_column(&columns, "title", path)?;
     let type_idx = required_column(&columns, "object_type", path)?;
-    let object_id_idx = required_column(&columns, "object_id", path)?;
+    let object_id_idx = optional_column(&columns, "object_id");
 
     let mut rows = Vec::new();
     for (line_idx, line) in reader.lines().enumerate() {
@@ -968,18 +1116,22 @@ fn read_gnn_entities(path: &Path, max_entities: Option<usize>) -> ThgResult<Vec<
             continue;
         }
         let fields = line.split('\t').collect::<Vec<_>>();
-        let object_id = field(&fields, object_id_idx, path, line_idx + 2)?
-            .parse::<i64>()
-            .map_err(|err| {
-                ThgError::new(
-                    "gnn_entity_map_parse_failed",
-                    format!(
-                        "{} line {} has invalid object_id: {err}",
-                        path.display(),
-                        line_idx + 2
-                    ),
-                )
-            })?;
+        let object_id = object_id_idx
+            .map(|index| {
+                field(&fields, index, path, line_idx + 2)?
+                    .parse::<i64>()
+                    .map_err(|err| {
+                        ThgError::new(
+                            "gnn_entity_map_parse_failed",
+                            format!(
+                                "{} line {} has invalid object_id: {err}",
+                                path.display(),
+                                line_idx + 2
+                            ),
+                        )
+                    })
+            })
+            .transpose()?;
         rows.push(GnnEntityRow {
             sha_hash: field(&fields, sha_idx, path, line_idx + 2)?.to_string(),
             title: field(&fields, title_idx, path, line_idx + 2)?.to_string(),
@@ -1020,6 +1172,55 @@ fn read_gnn_triples(path: &Path, max_triples: Option<usize>) -> ThgResult<Vec<Gn
     Ok(rows)
 }
 
+fn read_gnn_temporal_triples(
+    path: &Path,
+    max_triples: Option<usize>,
+) -> ThgResult<Vec<GnnTemporalTripleRow>> {
+    let mut reader = BufReader::new(File::open(path).map_err(io_thg("gnn_temporal_triples_open"))?);
+    let header = read_required_line(&mut reader, path, "gnn_temporal_triples_header")?;
+    let columns = header.split('\t').collect::<Vec<_>>();
+    let head_idx = required_column(&columns, "head", path)?;
+    let relation_idx = required_column(&columns, "relation", path)?;
+    let tail_idx = required_column(&columns, "tail", path)?;
+    let time_bucket_idx = required_column(&columns, "time_bucket", path)?;
+    let weight_idx = required_column(&columns, "weight", path)?;
+
+    let mut rows = Vec::new();
+    for (line_idx, line) in reader.lines().enumerate() {
+        if let Some(max_triples) = max_triples {
+            if rows.len() >= max_triples {
+                break;
+            }
+        }
+        let line = line.map_err(io_thg("gnn_temporal_triples_read"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let weight = field(&fields, weight_idx, path, line_idx + 2)?
+            .parse::<f64>()
+            .map_err(|err| {
+                ThgError::new(
+                    "gnn_temporal_triples_parse_failed",
+                    format!(
+                        "{} line {} has invalid weight: {err}",
+                        path.display(),
+                        line_idx + 2
+                    ),
+                )
+            })?;
+        rows.push(GnnTemporalTripleRow {
+            index: line_idx + 1,
+            head: field(&fields, head_idx, path, line_idx + 2)?.to_string(),
+            relation: field(&fields, relation_idx, path, line_idx + 2)?.to_string(),
+            tail: field(&fields, tail_idx, path, line_idx + 2)?.to_string(),
+            time_bucket: field(&fields, time_bucket_idx, path, line_idx + 2)?.to_string(),
+            weight,
+        });
+    }
+    Ok(rows)
+}
+
 fn read_required_line(
     reader: &mut BufReader<File>,
     path: &Path,
@@ -1031,6 +1232,10 @@ fn read_required_line(
         return Err(ThgError::new(code, format!("{} is empty", path.display())));
     }
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn optional_column(columns: &[&str], column: &str) -> Option<usize> {
+    columns.iter().position(|candidate| *candidate == column)
 }
 
 fn required_column(columns: &[&str], column: &str, path: &Path) -> ThgResult<usize> {
@@ -1067,6 +1272,92 @@ fn read_optional_json(path: &Path) -> ThgResult<Option<Value>> {
         .map_err(|err| ThgError::new("gnn_export_json_parse_failed", err.to_string()))
 }
 
+fn read_sha_to_object_ids(path: &Path) -> ThgResult<HashMap<String, i64>> {
+    let Some(value) = read_optional_json(path)? else {
+        return Ok(HashMap::new());
+    };
+    let Some(entries) = value.as_object() else {
+        return Err(ThgError::new(
+            "gnn_export_sha_map_invalid",
+            format!("{} must be a JSON object", path.display()),
+        ));
+    };
+    let mut map = HashMap::with_capacity(entries.len());
+    for (sha_hash, object_id) in entries {
+        let parsed = object_id
+            .as_i64()
+            .or_else(|| object_id.as_str().and_then(|value| value.parse().ok()))
+            .ok_or_else(|| {
+                ThgError::new(
+                    "gnn_export_sha_map_invalid",
+                    format!(
+                        "{} maps {sha_hash} to a non-integer object id",
+                        path.display()
+                    ),
+                )
+            })?;
+        map.insert(sha_hash.clone(), parsed);
+    }
+    Ok(map)
+}
+
+fn discover_export_files(export_dir: &Path) -> ThgResult<BTreeMap<String, Value>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(export_dir).map_err(io_thg("gnn_export_dir_read"))? {
+        let entry = entry.map_err(io_thg("gnn_export_dir_read"))?;
+        if !entry
+            .file_type()
+            .map_err(io_thg("gnn_export_dir_read"))?
+            .is_file()
+        {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let metadata = entry.metadata().map_err(io_thg("gnn_export_dir_read"))?;
+        files.insert(
+            file_name,
+            json!({
+                "size_bytes": metadata.len(),
+                "discovered_from_local_export": true,
+            }),
+        );
+    }
+    Ok(files)
+}
+
+fn merge_existing_node<S: AdapterGraphStore>(
+    store: &S,
+    mut node: NodeRecord,
+) -> ThgResult<NodeRecord> {
+    let Some(existing) = store.get_node(&node.id).map_err(thg_error_from_store)? else {
+        return Ok(node);
+    };
+
+    let mut labels = existing.labels;
+    for label in node.labels {
+        if !labels.iter().any(|candidate| candidate == &label) {
+            labels.push(label);
+        }
+    }
+    node.labels = labels;
+    node.properties = merge_properties(existing.properties, node.properties);
+    Ok(node)
+}
+
+fn merge_properties(existing: Value, incoming: Value) -> Value {
+    let mut merged = existing.as_object().cloned().unwrap_or_default();
+    let Some(incoming) = incoming.as_object() else {
+        return Value::Object(merged);
+    };
+    for (key, value) in incoming {
+        if value.is_null() && merged.contains_key(key) {
+            continue;
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    Value::Object(merged)
+}
+
 fn flush_import_batch<S: AdapterGraphStore>(
     store: &mut S,
     mutations: &mut Vec<GraphMutation>,
@@ -1094,6 +1385,15 @@ fn gnn_export_artifact_node_id(tenant_id: &str, export_id: &str, file_name: &str
     )
 }
 
+fn gnn_export_entity_node_id(tenant_id: &str, export_id: &str, sha_hash: &str) -> String {
+    format!(
+        "gnn_entity:{}:{}:{}",
+        normalize_tenant_id(tenant_id),
+        slug_segment(export_id),
+        slug_segment(sha_hash)
+    )
+}
+
 fn gnn_relation_edge_type(relation: &str) -> String {
     let slug = relation
         .chars()
@@ -1112,6 +1412,13 @@ fn gnn_relation_edge_type(relation: &str) -> String {
     } else {
         format!("GNN_{slug}")
     }
+}
+
+fn gnn_temporal_relation_edge_type(relation: &str) -> String {
+    let base = gnn_relation_edge_type(relation);
+    base.strip_prefix("GNN_")
+        .map(|suffix| format!("GNN_TEMPORAL_{suffix}"))
+        .unwrap_or_else(|| "GNN_TEMPORAL_RELATED".to_string())
 }
 
 fn slug_segment(value: &str) -> String {
