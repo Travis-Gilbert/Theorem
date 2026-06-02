@@ -126,7 +126,7 @@ main() {
         -exportPath "$EXPORT_PATH" \
         -exportOptionsPlist "$EXPORT_OPTIONS" \
         -allowProvisioningUpdates \
-        "${auth_args[@]}"
+        ${auth_args[@]+"${auth_args[@]}"}
 
     log "Upload submitted. The build will appear in App Store Connect -> TestFlight"
     log "after processing. If the upload was rejected with 'no app record', create"
