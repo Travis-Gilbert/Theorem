@@ -13,10 +13,18 @@
 //! `BufRead + Write` shell. Plan: docs/plans/mcp-learning-layer/connector-transport-plan.md.
 
 pub mod bridge;
+pub mod invoke;
 pub mod protocol;
 pub mod transport;
 
-pub use bridge::{connect_and_register, ConnectAndRegisterResult};
+pub use bridge::{
+    connect_and_register, connect_and_register_with_target, connect_target,
+    ConnectAndRegisterResult,
+};
+pub use invoke::{
+    fire_over_transport, invoke_affordance, plan_invocation, InvokePolicy, InvokeReport,
+    InvokeRequest, PlannedInvocation,
+};
 pub use protocol::{
     connector_manifest, initialize_params, parse_initialize, parse_tool_call_result,
     parse_tools_list, tool_manifest_from_descriptor, tools_call_params, tools_list_params,
@@ -66,3 +74,7 @@ mod transport_test;
 #[cfg(test)]
 #[path = "tests/bridge_test.rs"]
 mod bridge_test;
+
+#[cfg(test)]
+#[path = "tests/invoke_test.rs"]
+mod invoke_test;

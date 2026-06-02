@@ -150,12 +150,26 @@ update `CLAUDE.md` + `AGENTS.md` crate tables.
   outer timeout / the process lifetime. A read deadline (a reader thread + `recv_timeout`, since
   `std` cannot time out `BufRead::read_line` on a pipe) is the robustness follow-up.
 
-## Status: slice 1 shipped
+## Status: slices 1-2 shipped
 
-Committed `617c7c2`. 14 unit tests green (protocol parsing, transport framing/correlation/error
+Slice 1 committed `617c7c2`. 14 unit tests green (protocol parsing, transport framing/correlation/error
 mapping, and the end-to-end `FakeTransport` bridge), plus a real-server smoke
 (`examples/connect_real_server.rs`) that connected `@modelcontextprotocol/server-everything`
-v2.0.0 over stdio (protocol `2025-06-18`) and registered its 13 tools as `Affordance` nodes. The
-affordances crate is untouched; its 15 tests still pass. Next: the invoke bridge (slice 2) or the
-driving surface (slice 3).
+v2.0.0 over stdio (protocol `2025-06-18`) and registered its 13 tools as `Affordance` nodes.
+
+Slice 2 (invoke bridge) shipped by claude-code: `invoke.rs` closes register -> select -> invoke ->
+learn. `register_connector_with_target` / `connector_connection_target` (affordances `registry.rs`)
+persist and read an opaque `ConnectionTarget` on the `Connector` node so a selected tool can reach its
+server again; `connect_and_register_with_target` / `connect_target` (bridge) persist it on register;
+`plan_invocation` resolves a selection to a concrete call, `fire_over_transport` sends `tools/call`
+and records the real outcome via `record_invocation`, and `invoke_affordance` orchestrates behind
+`InvokePolicy`. Dry-run is the DEFAULT (nothing fires); live firing is opt-in via `FireAllowlist`
+(explicit per-affordance ids). A writeback-policy-keyed auto-fire gate is deliberately deferred: live
+tools register with `writeback_policy` defaulting to "read-only" (tools/list carries no extracted
+side-effect annotation), so keying auto-fire off it would fire side-effecting tools; extracting MCP
+`readOnlyHint`/`destructiveHint` is the follow-up that makes that gate safe. 19 connectors tests green
+(14 + 5 invoke), clippy `-D warnings` clean; no test spawns a process or fires a real tool. The
+affordances `registry.rs` gained two additive functions; its other behavior and tests are unchanged.
+Next: the driving surface (slice 3), and before any live firing in production, the operator gate-policy
+confirmation plus MCP side-effect-annotation extraction.
 ```

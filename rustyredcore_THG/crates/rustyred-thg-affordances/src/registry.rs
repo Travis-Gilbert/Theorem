@@ -24,6 +24,21 @@ pub fn register_connector<S: AffordanceGraphStore>(
     manifest: ConnectorManifest,
     actor: Option<&str>,
 ) -> ThgResult<ConnectorRegisterResult> {
+    register_connector_with_target(store, manifest, None, actor)
+}
+
+/// Like `register_connector`, plus persist an opaque transport descriptor (how to
+/// reach the owning server again) on the `Connector` node, so a later selection
+/// can re-invoke a registered tool. The descriptor is stored verbatim and never
+/// interpreted here: the connectors crate owns its shape (it depends on this
+/// crate, not the reverse). Idempotent: a `None` target preserves any
+/// previously-persisted target rather than wiping the server's learned reach.
+pub fn register_connector_with_target<S: AffordanceGraphStore>(
+    store: &mut S,
+    manifest: ConnectorManifest,
+    connection_target: Option<Value>,
+    actor: Option<&str>,
+) -> ThgResult<ConnectorRegisterResult> {
     let tenant_id = normalize_tenant_id(&manifest.tenant_id);
     let server_id = manifest.server_id.trim().to_string();
     if server_id.is_empty() {
@@ -34,6 +49,27 @@ pub fn register_connector<S: AffordanceGraphStore>(
     }
 
     let connector_node = connector_node_id(&tenant_id, &server_id);
+
+    // Persist the connection target; when none is supplied, preserve the existing
+    // one so idempotent re-registration does not wipe the server's reach.
+    let persisted_target = connection_target.or_else(|| {
+        store
+            .get_node(&connector_node)
+            .ok()
+            .flatten()
+            .and_then(|node| node.properties.get("connection_target").cloned())
+    });
+    let mut connector_props = json!({
+        "tenant_id": tenant_id,
+        "server_id": server_id,
+        "label": manifest.label,
+        "tool_count": manifest.tools.len(),
+        "source": THG_AFFORDANCE_SOURCE,
+    });
+    if let Some(target) = persisted_target {
+        connector_props["connection_target"] = target;
+    }
+
     let mut mutations = vec![
         GraphMutation::NodeUpsert(NodeRecord::new(
             tenant_node_id(&tenant_id),
@@ -43,13 +79,7 @@ pub fn register_connector<S: AffordanceGraphStore>(
         GraphMutation::NodeUpsert(NodeRecord::new(
             &connector_node,
             [CONNECTOR_LABEL],
-            json!({
-                "tenant_id": tenant_id,
-                "server_id": server_id,
-                "label": manifest.label,
-                "tool_count": manifest.tools.len(),
-                "source": THG_AFFORDANCE_SOURCE,
-            }),
+            connector_props,
         )),
     ];
 
@@ -59,10 +89,15 @@ pub fn register_connector<S: AffordanceGraphStore>(
         affordance.validate()?;
         let node_id = affordance.node_id();
         let extra = preserved_affordance_properties(
-            store.get_node(&node_id).map_err(thg_error_from_store)?.as_ref(),
+            store
+                .get_node(&node_id)
+                .map_err(thg_error_from_store)?
+                .as_ref(),
             affordance.embedding.is_some(),
         );
-        mutations.push(GraphMutation::NodeUpsert(affordance.to_node_record(actor, extra)));
+        mutations.push(GraphMutation::NodeUpsert(
+            affordance.to_node_record(actor, extra),
+        ));
         mutations.push(GraphMutation::EdgeUpsert(edge_with_affordance_provenance(
             offers_edge_id(&connector_node, &node_id),
             &connector_node,
@@ -100,7 +135,10 @@ pub fn upsert_affordance<S: AffordanceGraphStore>(
     let connector_node = connector_node_id(&affordance.tenant_id, &affordance.server_id);
 
     let extra = preserved_affordance_properties(
-        store.get_node(&node_id).map_err(thg_error_from_store)?.as_ref(),
+        store
+            .get_node(&node_id)
+            .map_err(thg_error_from_store)?
+            .as_ref(),
         affordance.embedding.is_some(),
     );
 
@@ -134,6 +172,22 @@ pub fn upsert_affordance<S: AffordanceGraphStore>(
         edge_count: 1,
         transaction,
     })
+}
+
+/// Read the persisted opaque connection target off a `Connector` node, if any.
+/// The connectors crate's invoke bridge uses this to re-reach a selected tool's
+/// server. Returns `None` when the connector is unknown or was registered without
+/// a target.
+pub fn connector_connection_target<S: AffordanceGraphStore>(
+    store: &S,
+    tenant_id: &str,
+    server_id: &str,
+) -> ThgResult<Option<Value>> {
+    let connector_node = connector_node_id(&normalize_tenant_id(tenant_id), server_id.trim());
+    Ok(store
+        .get_node(&connector_node)
+        .map_err(thg_error_from_store)?
+        .and_then(|node| node.properties.get("connection_target").cloned()))
 }
 
 /// Project the built-in `theorem-harness-core` affordance registry (the 11
@@ -171,10 +225,15 @@ pub fn register_builtin_affordances<S: AffordanceGraphStore>(
             )));
         }
         let extra = preserved_affordance_properties(
-            store.get_node(&node_id).map_err(thg_error_from_store)?.as_ref(),
+            store
+                .get_node(&node_id)
+                .map_err(thg_error_from_store)?
+                .as_ref(),
             false,
         );
-        mutations.push(GraphMutation::NodeUpsert(affordance.to_node_record(actor, extra)));
+        mutations.push(GraphMutation::NodeUpsert(
+            affordance.to_node_record(actor, extra),
+        ));
         mutations.push(GraphMutation::EdgeUpsert(edge_with_affordance_provenance(
             offers_edge_id(&connector_node, &node_id),
             &connector_node,
@@ -244,7 +303,12 @@ fn preserved_affordance_properties(
 ) -> Value {
     let mut preserved = json!({});
     if let Some(node) = existing {
-        for key in ["fitness", "fitness_updated_at_ms", "fitness_half_life_days", "created_at_ms"] {
+        for key in [
+            "fitness",
+            "fitness_updated_at_ms",
+            "fitness_half_life_days",
+            "created_at_ms",
+        ] {
             if let Some(value) = node.properties.get(key) {
                 preserved[key] = value.clone();
             }
