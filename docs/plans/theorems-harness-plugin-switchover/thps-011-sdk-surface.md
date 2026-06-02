@@ -67,12 +67,26 @@ existing per-run `seq`; `cancel` drives the existing `RUN.CANCELLED` transition;
 - `cargo fmt -p theorem-harness -- --check`: clean.
 - `git diff --check`: clean.
 
+## Progress (this session)
+
+- THPS-011 (SDK surface freeze): SHIPPED, commit 80b6259.
+- THPS-005 (RunStream + text projection): SHIPPED, commit 9b44cd8.
+- THPS-012 (Node binding) slices 1-3: SHIPPED. Node/NAPI-RS binding at
+  `apps/theorem-harness-node`, durable over `RedCoreGraphStore`, with cross-process
+  recovery proven and an async-iterator streaming surface (`streamRun`). Commits
+  0ba160b (binding), 4309820 (durable RedCore), 1de8380 (async-iterator + runStatus).
+  The binding is the concrete successor to THPS-002's hand-written JS clients.
+
 ## Next
 
-- THPS-012: generate the Node binding (NAPI-RS) from this surface; it retires the
-  plugin's hand-written JS shim. Then Swift / Python (UniFFI), then wasm.
-- THPS-005 runtime side: persist the idempotency token on events to enable
-  enforcement; add the live push-stream in the binding layer.
+- THPS-012 binding tail (Claude lane): SDK memory surface on `Session`
+  (remember/recall/encode over runtime `memory.rs`) for the plugin's memory verbs;
+  Swift binding via UniFFI (the iOS consumer); napi ThreadsafeFunction push-stream;
+  `.d.ts` + npm packaging via `@napi-rs/cli`.
+- THPS-005 runtime side (Codex/runtime lane): persist the idempotency token on
+  events to enable short-circuit enforcement.
+- THPS-002 plugin swap (Codex lane): point `server.mjs` at the binding instead of
+  the hand-written JS clients. Fully unblocked now that the binding is durable.
 - The remaining overlay open question ("which exact Rust types are the public
   contract vs runtime internals") is answered concretely by this crate's public
-  exports.
+  exports (room decision `record_644dfc2392dac2a2`).
