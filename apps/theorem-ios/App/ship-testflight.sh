@@ -107,7 +107,8 @@ main() {
         -destination 'generic/platform=iOS' \
         -archivePath "$ARCHIVE_PATH" \
         -allowProvisioningUpdates \
-        "${auth_args[@]}" \
+        -allowProvisioningDeviceRegistration \
+        ${auth_args[@]+"${auth_args[@]}"} \
         DEVELOPMENT_TEAM="$team_id" \
         archive
     log "Archive succeeded: $ARCHIVE_PATH"
