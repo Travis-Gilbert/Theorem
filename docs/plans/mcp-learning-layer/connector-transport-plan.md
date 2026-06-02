@@ -144,9 +144,16 @@ update `CLAUDE.md` + `AGENTS.md` crate tables.
   larger safety surface; the dry-run-gated operator path already exists via
   `examples/connect_and_invoke`). The home is the HTTP server the iOS app already consumes, so
   slice 4 (the app Connectors surface) GETs/POSTs here.
-- **iOS consumption.** The Connectors surface in the app stays an honest empty state until a
-  driving surface + at least one registered connector exist. No connector UI ships before the
-  backend is real (No-Fake-UI rule).
+- **iOS consumption (slice 4, shipped on theorem-ios).** The Connectors surface (`ConnectorsView`,
+  `AppSurface.connectors` in the rail) lists registered MCP servers + their tool affordances from
+  `GET /connectors`, grouped by server, with a per-tool writeback-policy badge
+  (read-only / write / destructive / unknown, from the extracted MCP annotations). Mirrors the
+  participant quartet: `ConnectorListResponse`/`AffordanceDTO` + pure `ConnectorListingMapper` +
+  `ConnectorStore` protocol + `SampleConnectorStore` (honest empty default) + `RemoteConnectorStore`.
+  `-remote <url>` points it at theorem-harness-server; offline it renders an honest empty state with
+  real how-to-register copy, never fabricated connectors (No-Fake-UI rule). `swift build` green; 24
+  TheoremIOSCore tests pass incl. 4 `ConnectorListingDecodeTests`. Simulator/Xcode run pending per
+  the scaffold notes.
 - **HTTP/SSE transport.** Slice 1 ships stdio (the dominant local-MCP transport). The
   `McpTransport` trait makes an HTTP/SSE transport a drop-in later.
 - **Embeddings.** Tool-description embeddings are not produced here (no Rust text embedder in
