@@ -10,6 +10,12 @@ COPY apps/theorem-harness-server ./apps/theorem-harness-server
 COPY rustyredcore_THG/crates/theorem-harness-core ./rustyredcore_THG/crates/theorem-harness-core
 COPY rustyredcore_THG/crates/theorem-harness-runtime ./rustyredcore_THG/crates/theorem-harness-runtime
 COPY rustyredcore_THG/crates/rustyred-thg-core ./rustyredcore_THG/crates/rustyred-thg-core
+# Connector driving surface (slice 3) path-deps: the harness-server Cargo.toml
+# pulls in rustyred-thg-connectors + rustyred-thg-affordances, so their sources
+# must be in the build context too (connectors -> affordances -> core/harness-core,
+# the latter two already copied above).
+COPY rustyredcore_THG/crates/rustyred-thg-affordances ./rustyredcore_THG/crates/rustyred-thg-affordances
+COPY rustyredcore_THG/crates/rustyred-thg-connectors ./rustyredcore_THG/crates/rustyred-thg-connectors
 
 WORKDIR /app/apps/theorem-harness-server
 RUN cargo build --release --bin theorem-harness-server
