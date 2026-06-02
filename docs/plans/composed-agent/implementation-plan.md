@@ -49,6 +49,8 @@ These are the implementation-architecture choices made translating the spec to t
 5. The budget governor is a hard runtime guard (spec Part 3 budget plane): `HEADS.CONTRIBUTE` calls `can_wake` + `charge`; a breach returns a `GuardViolation`, so no head can act past the binding's allocation.
 6. GraphStore persistence (spec Part 6 storage mapping) mirrors the existing `coordination.rs` / `memory.rs` / `event_log.rs` patterns in `theorem-harness-runtime`: binding + scratchpad + binding-events become graph nodes and append-chain edges. The Memgraph/Redis/Postgres split in the spec is the deployment target; in Theorem the in-process `GraphStore` is the canonical durable layer.
 
+As-built note (decisions 1-3 diverged from this pre-build design; 4-6 held). The kernel Codex shipped co-locates `apply_binding_transition` in `agent_binding.rs` rather than a separate `binding_state_machine.rs` (decision 1's sibling-function principle still held: `apply_transition` is untouched and parity-stable; only the file placement differs). It uses a dedicated `BindingLifecycleState` plus a standalone `AgentBinding` rather than extending `RunState` with optionals (decision 2): cleaner full separation, persisted as its own `AgentBinding` node in `binding_store.rs`. The shared `guards.rs` refactor (decision 3) did not happen; `agent_binding.rs` kept local guard helpers and the new `budget.rs` / `alignment.rs` construct `GuardViolation` directly. Decisions 4 (alignment as `POLICY.CHECKED` guards), 5 (budget hard guard at `HEADS.CONTRIBUTE`), and 6 (persistence mirrors `event_log`) shipped as planned.
+
 ---
 
 ## LANE A checklist (claude-code)
@@ -110,7 +112,7 @@ These are the implementation-architecture choices made translating the spec to t
 - [ ] CA-B2.2 Router moderation (blackboard volunteering internally; turn-taking + selection; the Pairformer for intra-agent orchestration). Spec: Part 2 (lines 49-52). Reuse the pairformer A/B machinery already in `theorem-harness-core`.
 
 ### CA-B3: charter compiler (build-order step 7; spec Part 3, Part 4)
-- [ ] CA-B3.1 Per-binding charter compiler: stance/preferences + zero-silent-capability enumeration of every affordance/tool the binding can reach. Spec: Part 4 ("enumerated in the charter, zero silent capability"). Feeds `CHARTER.COMPILED`.
+- [x] CA-B3.1 Per-binding charter compiler: stance/preferences + zero-silent-capability enumeration of every affordance/tool the binding can reach. Implemented as the pure `rustyred-thg-affordances::compile_binding_charter(_from_store)` compiler, producing deterministic payloads for `CHARTER.COMPILED` and `CAPABILITIES.SELECTED` without resolving credentials or invoking models. Spec: Part 4 ("enumerated in the charter, zero silent capability"). Feeds `CHARTER.COMPILED`.
 
 ### CA-B4: expose Theseus ability (build-order step 8; spec Part 4)
 - [ ] CA-B4.1 Wrap the unwrapped reasoning engines as affordances (currently only datalog + probabilistic are wrapped; add causal, egraph, evolution, expression, optimizer, proof, simulation, solver + the top-level `apps/causal`). Spec: Part 4 (ten engines).
