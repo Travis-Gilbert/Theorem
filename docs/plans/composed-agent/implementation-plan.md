@@ -27,16 +27,16 @@ Lane A (the correctness-critical Rust binding kernel, everything spec Part 7 ass
 | 4 BindingScope + versioned scratchpad + 4 memory zones | done | codex (kernel) + claude-code (revision persistence) | f0b1c19, a92276c |
 | 5 intra-agent scratchpad loop (propose/critique/synthesize/publish, router) | NOT done (Lane B) | codex (proposed) | - |
 | 6 budget governor as a hard guard | done | claude-code | 1b99c85 |
-| 7 charter compiler (stance + capability enumeration) | NOT done (Lane B) | codex (proposed) | - |
-| 8 expose Theseus ability (wrap engines as affordances) | NOT done (Lane B) | codex (proposed) | - |
-| 9 alignment guards (consensus + grounding + action tiers) | done, grounding enforce-if-present | claude-code | 1b99c85 |
+| 7 charter compiler (stance + capability enumeration) | in progress | codex | rustyred-thg-affordances/charter.rs (uncommitted) |
+| 8 expose Theseus ability (wrap engines as affordances) | largely done | codex | register_builtin_affordances (datalog.derive, solver.check, proof.create_obligation, ...) |
+| 9 alignment guards (consensus + grounding + action tiers) | done, grounding strict | claude-code | 1b99c85, d3f7347 |
 | Part 6 persistence (binding + events + scratchpad to GraphStore) | done | claude-code | a92276c |
 | 10 compose-your-own-agent UI | deferred by spec | - | - |
 | 11 self-optimizing / dynamic compositions | deferred by spec | - | - |
 
-Named gap (per the no-lie-by-omission rule): step 9 grounding is enforced only when the publication payload carries `claims`; strict-always-grounding waits until every publication path supplies its claims (a Lane B concern, since Lane B produces the publications). Consensus and action-tier guards are unconditional. Verification: `cargo test -p theorem-harness-core -p theorem-harness-runtime` green (33 + 24 tests), `cargo clippy -- -D warnings` clean, single-agent `apply_transition` parity suites unchanged.
+Step 9 is now fully closed: grounding is strict (d3f7347), so a claimless or ungrounded publication is refused at `POLICY.CHECKED`; consensus and action-tier guards were already unconditional. No feature flags anywhere in the kernel (per the single-user surface-the-break stance). Verification: `cargo test -p theorem-harness-core -p theorem-harness-runtime` green (34 + 24 tests), `cargo clippy -- -D warnings` clean, single-agent `apply_transition` parity suites unchanged.
 
-Remaining real-build work = Lane B (steps 3, 5, 7, 8): the model-bearing layer (head registry/transports, the intra-agent reasoning loop, the charter compiler, and exposing the Theseus apps over theorem_grpc). It builds on the Lane A types now committed. Owned by codex per the lane split; needs provider credentials and the grpc seam.
+Remaining real-build work = Lane B. Steps 7 (charter compiler) and 8 (engine affordances) are in progress in codex's `rustyred-thg-affordances` (charter.rs + register_builtin_affordances, uncommitted as of this session); the engine affordances turned out further along than originally planned. Steps 3 (AgentHead live registry/transports) and 5 (the intra-agent reasoning loop with real model calls) remain: the genuinely model-bearing pieces, needing provider credentials + the theorem_grpc seam. All build on the committed Lane A types.
 
 ## Architecture decisions (the mini-design for the Rust translation)
 
