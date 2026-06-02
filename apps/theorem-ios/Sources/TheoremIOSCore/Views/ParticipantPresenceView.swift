@@ -2,30 +2,81 @@ import SwiftUI
 
 /// The participant presence surface (harness UI spec, Part 4: "a team working,
 /// not a menu"). Shows the roster and how each participant connects (the three
-/// access modes), addressed collectively through Ask. It is honest status, not
-/// decoration: with no active run the team is idle, and the surface says so
-/// rather than faking "thinking" activity. Live engaged / contributing status
-/// arrives with the runtime's event stream.
+/// access modes), addressed collectively through Ask. It reads through a
+/// `ParticipantStore`, so the same surface renders the recorded roster offline
+/// and live room presence when pointed at a runtime (`-remote`), with no view
+/// change.
+///
+/// Honest status, not decoration: with no active presence the team is idle and
+/// the banner says so; when the runtime reports active actors the banner and the
+/// rows go live. A transport failure surfaces the error rather than silently
+/// falling back to a faked-active roster.
 struct ParticipantPresenceView: View {
     var theme: TheoremTheme
+    /// The data source. Defaults to the recorded roster; swap for a runtime-backed
+    /// store (`RemoteParticipantStore`) to render live presence.
+    var store: ParticipantStore = SampleParticipantStore()
 
-    private let participants: [Participant] = SampleRoster.participants
+    @State private var participants: [Participant] = []
+    @State private var state: LoadState = .loading
+
+    enum LoadState: Equatable {
+        case loading
+        case loaded
+        case failed(String)
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header
-                idleBanner
-                VStack(spacing: 10) {
-                    ForEach(participants) { participant in
-                        participantRow(participant)
-                    }
-                }
+                content
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(theme.field.ignoresSafeArea())
+        .task { await load() }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch state {
+        case .loading:
+            HStack(spacing: 9) {
+                ProgressView().controlSize(.small).tint(theme.signal)
+                Text("Reading room presence\u{2026}")
+                    .font(TheoremFonts.body(size: 13)).foregroundStyle(theme.textMuted)
+            }
+            .padding(.top, 4)
+        case .failed(let message):
+            honest(message)
+        case .loaded:
+            statusBanner
+            VStack(spacing: 10) {
+                ForEach(participants) { participant in
+                    participantRow(participant)
+                }
+            }
+        }
+    }
+
+    private func honest(_ message: String) -> some View {
+        Text(message)
+            .font(TheoremFonts.body(size: 13)).foregroundStyle(theme.textMuted)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+    }
+
+    @MainActor
+    private func load() async {
+        state = .loading
+        do {
+            participants = try await store.participants()
+            state = .loaded
+        } catch {
+            let message = (error as? HarnessRunStoreError)?.message ?? "Couldn't read presence."
+            state = .failed(message)
+        }
     }
 
     private var header: some View {
@@ -42,11 +93,18 @@ struct ParticipantPresenceView: View {
         }
     }
 
-    private var idleBanner: some View {
-        HStack(spacing: 9) {
-            Image(systemName: "pause.circle")
-                .font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.textMuted)
-            Text("No active run. The team is idle; live status appears when a run engages them.")
+    /// Reflects real presence: idle when no participant is engaged or
+    /// contributing, live (with a count) when the runtime reports active actors.
+    private var statusBanner: some View {
+        let live = participants.filter { $0.status == .engaged || $0.status == .contributing }
+        let isLive = !live.isEmpty
+        return HStack(spacing: 9) {
+            Image(systemName: isLive ? "dot.radiowaves.left.and.right" : "pause.circle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(isLive ? theme.signal : theme.textMuted)
+            Text(isLive
+                ? "\(live.count) active in the room now."
+                : "No active run. The team is idle; live status appears when a run engages them.")
                 .font(TheoremFonts.body(size: 12)).foregroundStyle(theme.textMuted)
         }
         .padding(12)

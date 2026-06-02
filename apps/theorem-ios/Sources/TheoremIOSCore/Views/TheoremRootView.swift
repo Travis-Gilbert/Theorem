@@ -25,6 +25,20 @@ public struct TheoremRootView: View {
         return SampleRunStore()
     }
 
+    /// The participant data source. The same `-remote <url>` that drives the Runs
+    /// surface points Participants at the runtime's presence feed; `-tenant` and
+    /// `-room` override the coordination scope (both default to "default").
+    /// Default is the recorded roster with idle status.
+    private var participantStore: ParticipantStore {
+        if let raw = UserDefaults.standard.string(forKey: "remote"),
+           let url = URL(string: raw) {
+            let tenant = UserDefaults.standard.string(forKey: "tenant") ?? "default"
+            let room = UserDefaults.standard.string(forKey: "room") ?? "default"
+            return RemoteParticipantStore(baseURL: url, roomID: room, tenantSlug: tenant)
+        }
+        return SampleParticipantStore()
+    }
+
     private var package: ScenePackageV2 {
         room.scene
     }
@@ -110,7 +124,7 @@ public struct TheoremRootView: View {
                 SurfacePlaceholder(surface: .projects, theme: theme)
                     .tag(AppSurface.projects)
 
-                ParticipantPresenceView(theme: theme)
+                ParticipantPresenceView(theme: theme, store: participantStore)
                     .tag(AppSurface.models)
 
                 UserCredentialsView(theme: theme)
