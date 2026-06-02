@@ -1,5 +1,6 @@
-Readme · MDGoogle DriveRustyRed GraphDB — Technical Documentation
-Technical reference for RustyRed GraphDB 0.6.0, derived from the source tree rather than
+# RustyRed GraphDB — Technical Documentation
+
+## Technical reference for RustyRed GraphDB 0.6.0, derived from the source tree rather than
 marketing copy. Two audiences are covered:
 
 Integration developers — building against the HTTP, gRPC, or MCP surfaces.
