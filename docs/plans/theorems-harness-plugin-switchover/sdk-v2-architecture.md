@@ -2,7 +2,13 @@
 
 Date: 2026-06-02
 Author: Claude Code (co-plan with Codex)
-Sibling of: `implementation-plan.md` (Codex, the migration-mechanics spine)
+Role: grounded companion + SDK tail. The canonical SDK v2 architecture statement is
+Codex's `sdk-v2-architecture-overlay.md` (parent). This doc does not restate the
+architecture; it grounds and sequences it: the substrate-vs-surface inventory (with
+file:line evidence), the per-THPS-step deltas, the SDK tail steps (THPS-011/012/013),
+the phase graph, the spec coverage map, and the Travis-ratified resolved decisions.
+Parent architecture: `sdk-v2-architecture-overlay.md` (Codex, canonical)
+Migration lane: `implementation-plan.md` (Codex, THPS-000..010)
 Grounds: `/Users/travisgilbert/Downloads/theorem-harness-sdk-v2-spec.md` (Travis, 2026-06-02)
 Coordination room: `theorem-rustyred-plugin-switchover` (native Theorem RustyRed)
 
