@@ -44,6 +44,22 @@ for await (const event of streamRun(harness, runId)) {
 }
 console.log("streamed kinds:", streamed);
 
+// Memory round-trip through the binding (Session.remember -> recall).
+const receipt = JSON.parse(
+  harness.remember(
+    "node-smoke",
+    "belief",
+    "binding is durable",
+    "The Node binding persists to RedCore.",
+  ),
+);
+console.log("remember saved:", receipt.saved_type);
+const recalled = JSON.parse(harness.recall("node-smoke", "binding", 10));
+console.log("recalled:", recalled.length);
+const memOk = recalled.some(
+  (m) => (m.content || "").includes("binding") || (m.title || "").includes("binding"),
+);
+
 const ok =
   events.length === 2 &&
   events[0].kind === "Created" &&
@@ -51,7 +67,8 @@ const ok =
   text.includes("stopping from node") &&
   streamed.length === 2 &&
   streamed[0] === "Created" &&
-  streamed[1] === "Cancelled";
+  streamed[1] === "Cancelled" &&
+  memOk;
 
 if (ok) {
   console.log("SMOKE PASS");

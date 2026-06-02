@@ -17,7 +17,9 @@ use std::sync::Mutex;
 
 use napi_derive::napi;
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
-use theorem_harness::{export_run_trace, IdempotencyToken, RunHandle, RunStream, SdkError};
+use theorem_harness::{
+    export_run_trace, IdempotencyToken, RunHandle, RunStream, SdkError, Session,
+};
 use theorem_harness_core::types::Payload;
 
 /// A harness bound to a durable RedCore graph store, exposed to Node.
@@ -112,6 +114,37 @@ impl Harness {
             .map_err(to_napi)?
             .map(|state| state.status)
             .unwrap_or_else(|| "unknown".to_string()))
+    }
+
+    /// Save a durable memory attributed to `agent_id`. `kind` selects the shape
+    /// (`belief`, `feedback`, `solution`, `postmortem`, ...). Returns the receipt
+    /// as a JSON string. Mirrors `Session::remember`.
+    #[napi]
+    pub fn remember(
+        &self,
+        agent_id: String,
+        kind: String,
+        title: String,
+        content: String,
+    ) -> napi::Result<String> {
+        let mut store = self.lock()?;
+        let session = Session::open(agent_id);
+        let receipt = session
+            .remember(&mut *store, kind, title, content)
+            .map_err(to_napi)?;
+        serde_json::to_string(&receipt).map_err(|error| napi::Error::from_reason(error.to_string()))
+    }
+
+    /// Recall memories matching `query` for `agent_id`, as a JSON array string.
+    /// Mirrors `Session::recall`.
+    #[napi]
+    pub fn recall(&self, agent_id: String, query: String, limit: u32) -> napi::Result<String> {
+        let mut store = self.lock()?;
+        let session = Session::open(agent_id);
+        let hits = session
+            .recall(&mut *store, query, limit as usize)
+            .map_err(to_napi)?;
+        serde_json::to_string(&hits).map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
     fn lock(&self) -> napi::Result<std::sync::MutexGuard<'_, RedCoreGraphStore>> {

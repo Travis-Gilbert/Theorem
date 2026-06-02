@@ -30,6 +30,8 @@ A `Harness` class over an in-process graph store:
 | `eventsJson(runId)` | `RunHandle::events` + `export_run_trace` | JSON array string |
 | `pollText(runId, afterSeq)` | `RunStream::resume_from(..).poll_text` | new text (string) |
 | `runStatus(runId)` | `RunHandle::state().status` | status string |
+| `remember(agentId, kind, title, content)` | `Session::remember` | receipt JSON string |
+| `recall(agentId, query, limit)` | `Session::recall` | JSON array string |
 
 `stream.mjs` exports `streamRun(harness, runId)`, an async iterator
 (`for await (const event of streamRun(...))`) over a run's events: the consumer
