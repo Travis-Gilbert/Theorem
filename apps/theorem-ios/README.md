@@ -78,3 +78,11 @@ xcodebuild \
   -exportOptionsPlist apps/theorem-ios/App/ExportOptions.plist \
   -allowProvisioningUpdates
 ```
+
+For the full one-command finish (archive plus export plus upload), use `App/ship-testflight.sh` once you have an Apple Developer Team ID:
+
+```bash
+THEOREM_TEAM_ID=XXXXXXXXXX apps/theorem-ios/App/ship-testflight.sh
+```
+
+It fails loudly if the team or an auth session (signed-in Xcode account, or `THEOREM_ASC_*` API key vars) is missing. See `docs/plans/theorem-ios-v1/native-app-shipping.md` for the owner credential steps.

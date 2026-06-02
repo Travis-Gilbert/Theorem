@@ -110,3 +110,30 @@ xcodebuild \
 - Actual App Store Connect upload still requires a signed archive and either an
   Xcode account session or App Store Connect API key flags.
 - Live hosted search readiness is separate from native app packaging readiness.
+
+## Owner credential steps and one-command ship (2026-06-02)
+
+Re-verified at current HEAD: the Debug simulator build is green (`** BUILD SUCCEEDED **`). The Release archive fails on exactly one thing, the missing team:
+
+```
+error: Signing for "Theorem" requires a development team.
+** ARCHIVE FAILED ** (exit 65)
+```
+
+This machine has zero code-signing identities, no provisioning profiles, and no signed-in Xcode account. So there is no "deploy now, credentials later": a signed archive needs the team, and the upload needs an authenticated session. Both are owner-only.
+
+What only the account owner can provide:
+
+1. Team ID: developer.apple.com -> Membership -> Team ID (10 chars). Export as `THEOREM_TEAM_ID`.
+2. ONE auth path:
+   - A) Sign into Xcode once (Xcode -> Settings -> Accounts -> (+) -> the Developer Apple ID); then `THEOREM_TEAM_ID` alone is enough.
+   - B) App Store Connect API key for headless upload: set `THEOREM_ASC_KEY_ID`, `THEOREM_ASC_ISSUER_ID`, and `THEOREM_ASC_KEY_PATH` (the `AuthKey_XXXX.p8`).
+3. One-time: create the app record for `me.travisgilbert.theorem` in App Store Connect (My Apps -> +), or the first upload is rejected.
+
+Then the one-command finish (archive plus export plus upload to internal TestFlight) is `apps/theorem-ios/App/ship-testflight.sh`:
+
+```bash
+THEOREM_TEAM_ID=XXXXXXXXXX apps/theorem-ios/App/ship-testflight.sh
+```
+
+The script regenerates the project, archives Release with `DEVELOPMENT_TEAM` and `-allowProvisioningUpdates`, and uploads via `ExportOptions.plist` (already app-store-connect, internal-testing-only). Pass `-a` to archive-only (validate signing without uploading). It fails loudly with the exact missing-credential message rather than producing an unsigned or fake artifact.
