@@ -1,353 +1,233 @@
-# Rusty Red Graph Database
+Readme · MDGoogle DriveRustyRed GraphDB — Technical Documentation
+Technical reference for RustyRed GraphDB 0.6.0, derived from the source tree rather than
+marketing copy. Two audiences are covered:
 
-Embedded property graph database with a first-class MCP agent port,
-multi-tenancy, HNSW vector search, confidence-weighted epistemic edges,
-and a graph-version-aware AI cache. Written in Rust.
+Integration developers — building against the HTTP, gRPC, or MCP surfaces.
+Operators — deploying, configuring, and running the release.
 
-Designed for AI agents and GraphRAG workloads, not for replacing Neo4j.
+RustyRed is an in-memory graph and vector database with append-only-file/snapshot
+persistence, multi-tenant isolation, confidence-weighted epistemic edges, HNSW vector search,
+BM25 full-text, H3 spatial indexing, a bounded Cypher surface, a graph-state-aware cache, and a
+first-class MCP agent port. It is written in Rust and ships as a single service with no Redis
+sidecar required.
+Map
+DocumentForCoversArchitectureBothCrates, request flow, the RedCore storage engine, persistence & recoveryData modelDevsNodes, edges, epistemic types, properties, versioning, content addressing, tenancyHTTP APIDevsComplete REST reference with curl examples and the error modelQuery surfaceDevsStructured /v1/query, the Cypher subset, and the graph-aware cachegRPC APIDevsrustyred.v1.GraphDatabase service and RPC catalogMCP agent portDevsJSON-RPC methods, tool/resource catalog, read-only & admin gatingDeploymentOperatorsDocker, Railway, ports, volumes, format upgrades, build featuresConfigurationOperatorsEvery environment variable, auth model, scopesObservabilityOperatorsPrometheus metrics, diagnostics, health/readiness
+At a glance
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID?utm_medium=integration&utm_source=button&utm_campaign=rusty-red-graph-database)
+Latest version: 0.6.0 (workspace Cargo.toml), Rust edition 2021, MSRV 1.85.
+Default storage mode: embedded (RedCore native engine; in-memory graph + AOF + snapshots).
+Default HTTP/gRPC port: 8380 (HTTP and gRPC share one listener).
+Default RESP port: 6380 (experimental scaffold — see Architecture).
+Auth: Bearer tokens with scopes; RUSTY_RED_REQUIRE_AUTH defaults to true.
+On-disk format version: 1 (CURRENT_FORMAT_VERSION); migrate with rustyred-upgrade-format.
 
-Template ID pending: after creating or publishing the Railway template, replace `RUSTY_RED_GRAPH_DATABASE_TEMPLATE_ID` in the badge URL with the Railway template code.
 
-## What Rusty Red does
+Source of truth for configuration is crates/rustyred-server/src/config.rs; for the data model,
+crates/rustyred-core/src/graph_store.rs. Where this documentation and the README disagree, the
+code wins
 
-- **Graph storage** with AOF/snapshot persistence, per-tenant isolation, single-writer serializable commits, and committed read snapshots
-- **Stable, versioned on-disk format** with `rustyred-thg-upgrade-format` migrations between releases (no export/re-import on upgrade)
-- **HNSW vector search** on node properties via `instant-distance`, with hybrid scoring that blends vector similarity and graph proximity
-- **Inverted-index BM25 full-text search** with automatic indexing on node upserts
-- **H3 spatial index** on node lat/lon properties with radius and bounding-box queries
-- **Epistemic edge types** (Supports, Contradicts, Tension, Derives, Cites) with confidence-weighted traversal across configurable hop depth
-- **Graph algorithms over HTTP/MCP**: PPR, connected components, PageRank, and label-propagation community detection
-- **Harness Instant KG merged views**: session-fresh code deltas overlay durable tenant graph artifacts for code PPR, impact analysis, related-object lookup, search, and edge explanations
-- **MCP agent port** with scoped auth tokens, read-only and read-write modes, tool annotations, and structured tool/resource/prompt surfaces
-- **Graph-version-aware cache** (10 kinds) that detects stale entries when the underlying graph mutates
-- **Bounded Cypher surface**: single-hop and outgoing multi-hop MATCH, bounded variable-length expand, path aliases, property projections, `COUNT(*) / COUNT(binding)`, and transaction-scoped `CREATE`/`MERGE`/`SET`/`DELETE`
-- **JSONL bulk loader** for nodes and edges
-- **Observability**: Prometheus `/metrics` (17 counters), slow-query ring buffer at `/v1/diagnostics/slow_queries`
-- **HTTP transaction API**: `/v1/transactions/begin|commit|rollback` with snapshot isolation
-- **50x to 400x** faster Personalized PageRank than Python (ACL local-push algorithm, exposed via PyO3)
+# Architecture
 
-## What you can't do yet
+## Workspace layout
 
-These are on the roadmap, in roughly this priority order:
+RustyRed is a Cargo workspace. One core engine crate is shared by every network surface, so the
+HTTP server, the MCP adapter, and direct Rust callers all execute the same command logic.
 
-1. Incoming and undirected Cypher relationship patterns, plus the rest of full OpenCypher/GQL coverage
-2. `OPTIONAL MATCH`, `WITH`, `UNION`, `CALL`, `ORDER BY`, `SKIP`, `DISTINCT`
-3. `SUM` / `AVG` / `MIN` / `MAX` aggregations
-4. `REMOVE` clauses
-5. CSV/JSONL `LOAD CSV` syntactic form (JSONL bulk endpoints exist already)
-6. Per-query spatial backend selection; H3 is the default and S2 is available behind the `s2` feature plus `RUSTY_RED_SPATIAL_BACKEND=s2`
-7. Distributed snapshot replication
+| Crate | Path | Role |
+|-------|------|------|
+| `rusty_red_native` | `src/lib.rs` | Root facade. Re-exports the core graph algorithms and adds `push_ppr`, an integer-id ACL local-push Personalized PageRank helper. No Python or native-extension dependency. |
+| `rustyred-core` | `crates/rustyred-core` | The engine: command vocabulary, executor, graph store (in-memory / RedCore / Redis), vector / spatial / full-text indexes, versioning, and the Instant-KG merged views. |
+| `rustyred-server` | `crates/rustyred-server` | The product server: axum HTTP API + tonic gRPC on one port, auth, config, the Cypher surface, the graph cache, metrics, and the `rustyred-upgrade-format` tool. |
+| `rustyred-search` | `crates/rustyred-search` | Standalone RustyWeb crawl/search kernel: guarded fetching, robots handling, crawl graph emission, SERP payloads, and Web Commons fragment types. |
+| `rustyred-mcp` | `crates/rustyred-mcp` | Model Context Protocol adapter — turns the core into a JSON-RPC tool/resource server. |
+| `rustyred-compat-server` | `crates/rustyred-compat-server` | Minimal standalone HTTP command server over the core executor (compatibility / embedding). |
+| `rustyred-resp-server` | `crates/rustyred-resp-server` | Experimental Redis-RESP listener scaffold (see below). |
 
-## Crate structure
+The release binary is `rustyred-server`. The Dockerfile builds only that crate.
 
-| Crate | Purpose |
-|-------|---------|
-| `rustyred-thg-core` | Graph store engine, command executor, HNSW vector index, epistemic edges |
-| `rustyred-web` | Graph-native crawler kernel and V2 crawl receipt contract |
-| `rustyred-thg-mcp` | MCP agent port: tool dispatch, resource reads, prompt surface |
-| `rustyred-rustyred-thg-compat-server` | HTTP server, query surface, graph cache, auth, OpenAPI |
-| `rustyred-thg-compat-server` | Standalone THG command server (non-product) |
-| `rustyred-thg-resp-server` | RESP protocol shim (limited, not a Redis replacement) |
-| root crate | PyO3 bindings for `push_ppr` and `ThgCoreExecutor` |
+## Request flow
 
-## Source and release model
-
-The standalone RustyRed repository at
-`https://github.com/Travis-Gilbert/RustyRed-Graph-Database` is the upstream
-home for generic database engine work, public modules, clients, MCP/HTTP server
-behavior, release tags, and the one-image Railway deployment.
-
-This `theseus_native` tree is the Theseus downstream import of that upstream
-engine. Theseus-specific adapters, Django bridge code, harness policy, and
-private deployment wiring should live outside the public RustyRed upstream.
-Import public RustyRed releases into Theseus by pinned tag or commit using:
-
-```bash
-scripts/rustyred_upstream_sync.sh status
-scripts/rustyred_upstream_sync.sh import --ref v0.4.0 --execute
+```
+HTTP / gRPC client ─┐
+MCP client ─────────┤→ rustyred-server ─→ AppState ─→ rustyred-core
+RESP client (exp.) ─┘    (axum + tonic)    (per-tenant   (GraphStore: InMemory │ RedCore │ Redis)
+                                            stores)
 ```
 
-See `docs/adr/0002-rustyred-public-upstream.md` for the accepted sync model.
+`rustyred-server`'s `main` reads `Config::from_env()`, validates it, builds the axum router and the
+tonic gRPC routes, and **merges them onto a single TCP listener**. Content-type sniffing routes
+`application/grpc*` traffic to gRPC and everything else to the HTTP handlers, so both protocols
+answer on the same port (default `8380`). Handlers resolve the target tenant, acquire that tenant's
+graph store from `AppState`, and dispatch into `rustyred-core`.
 
-## Build (local development)
+## Storage modes
 
-Requires Rust 1.85+ and `maturin >= 1.7`.
+`RUSTY_RED_MODE` selects the backend (`crates/rustyred-server/src/config.rs`):
 
-```bash
-python3 -m pip install --user maturin
-cd theseus_native
-maturin develop --release
-```
+- **`embedded`** *(default)* — the **RedCore** native engine. The working graph lives in memory;
+  durability comes from an append-only file (AOF) plus periodic snapshots on the data volume.
+- **`memory`** — in-memory only, no persistence. For ephemeral test deployments.
+- **`redis`** — legacy compatibility backend (requires the `redis-store` build feature). Not used
+  by the Railway template and not recommended for new deployments.
 
-This builds an `abi3-py312` wheel and installs it into the active Python environment. After this, `from theseus_native import push_ppr` works in any Python 3.12+ interpreter that shares the venv.
+All three implement the same `GraphStore` trait, so the API surface is identical regardless of mode.
 
-## Product server
+## The RedCore storage engine
 
-The product server runs in `RUSTY_RED_MODE=embedded` with RedCore
-RAM-first storage and local AOF/snapshot persistence. It exposes graph
-operations, vector search, epistemic traversal, Cypher queries, and the
-graph-version cache over HTTP and MCP.
+RedCore (`crates/rustyred-core/src/graph_store.rs`) is a Redis-style durability layer implemented
+natively in Rust around an `InMemoryGraphStore`.
 
-`RUSTY_RED_MODE=redis` is available for legacy THG state commands only.
-The base Railway deployment is one RustyRed application image plus a mounted
-volume. A separate Redis-compatible service is optional compatibility
-infrastructure for the standalone template, not part of the default public
-database deployment. In Theseus, Redis remains shared operational
-infrastructure around RustyRedCore-THG.
+**Durability modes** (`RUSTY_RED_DURABILITY`):
 
-Run the product server locally:
+| Mode | Behaviour |
+|------|-----------|
+| `aof_everysec` *(default)* | Append each mutation to the AOF; fsync batched roughly once per second. |
+| `aof_always` | Synchronous fsync on every write. Required for strict-ACID mode. |
+| `snapshot_only` | No AOF; rely on periodic snapshots. |
+| `none` | No persistence (memory). |
 
-```bash
-cd theseus_native
-RUSTY_RED_MODE=embedded RUSTY_RED_DATA_DIR=data/rusty-red cargo run -p rustyred-rustyred-thg-compat-server
-```
+**Snapshots.** A full snapshot is written every `RUSTY_RED_SNAPSHOT_INTERVAL_WRITES` mutations
+(default `1000`), bounding AOF replay time on restart.
 
-Strict local durability mode is explicit:
+**On-disk artifacts.** A `manifest` records the format version, graph version, last/snapshot
+transaction ids, durability mode, and the snapshot/AOF filenames. A **directory lock** prevents two
+processes from opening the same data directory. The current on-disk format version is
+`1` (`CURRENT_FORMAT_VERSION`); a build refuses to load a snapshot whose manifest version is newer
+than it understands.
 
-```bash
-RUSTY_RED_MODE=embedded \
-RUSTY_RED_CONCURRENCY=single_writer \
-RUSTY_RED_TXN_ISOLATION=serializable \
-RUSTY_RED_STRICT_ACID=true \
-RUSTY_RED_DURABILITY=aof_always \
-RUSTY_RED_DATA_DIR=data/rusty-red \
-cargo run -p rustyred-rustyred-thg-compat-server
-```
+**Recovery.** On startup RedCore loads the latest snapshot, then replays AOF frames recorded after
+the snapshot transaction id. Each AOF frame carries a payload checksum. Recovery tolerates orphan
+edges (edges whose endpoints were not yet present) rather than aborting.
 
-Core routes:
+**Transactions.** Mutations apply as transactions with a monotonic `txn_id` and a `graph_version`.
+The HTTP transaction API (`/v1/transactions/*`) exposes begin/commit/rollback with snapshot
+isolation; strict-ACID mode (`RUSTY_RED_STRICT_ACID=true`) upgrades this to serializable,
+single-writer, `aof_always` and is only valid in `embedded` mode.
 
-```text
-GET  /health
-GET  /ready
-GET  /openapi.json
-GET  /.well-known/mcp/rustyred_thg.json
-GET  /.well-known/agent.json
-POST /mcp
-GET  /metrics
-POST /v1/command
-POST /v1/batch
-POST /v1/query
-POST /v1/cypher
-POST /v1/cypher/explain
-POST /v1/transactions/begin
-POST /v1/transactions/commit
-POST /v1/transactions/rollback
-POST /v1/cache/put
-POST /v1/cache/get
-POST /v1/cache/check
-POST /v1/cache/explain
-POST /v1/cache/invalidate
-POST /v1/cache/stats
-POST /v1/tenants/{tenant_id}/command
-POST /v1/tenants/{tenant_id}/batch
-GET  /v1/tenants/{tenant_id}/runs/{run_id}
-POST /v1/tenants/{tenant_id}/graph/query
-POST /v1/tenants/{tenant_id}/graph/nodes
-POST /v1/tenants/{tenant_id}/graph/nodes/query
-GET  /v1/tenants/{tenant_id}/graph/nodes/{node_id}
-POST /v1/tenants/{tenant_id}/graph/edges
-GET  /v1/tenants/{tenant_id}/graph/edges/{edge_id}
-POST /v1/tenants/{tenant_id}/graph/neighbors
-GET  /v1/tenants/{tenant_id}/graph/stats
-GET  /v1/tenants/{tenant_id}/graph/verify
-POST /v1/tenants/{tenant_id}/graph/rebuild-indexes
-POST /v1/tenants/{tenant_id}/graph/vector/search
-POST /v1/tenants/{tenant_id}/graph/vector/hybrid
-POST /v1/tenants/{tenant_id}/graph/vector/designate
-POST /v1/tenants/{tenant_id}/graph/epistemic-neighbors
-POST /v1/tenants/{tenant_id}/graph/algorithms/ppr
-POST /v1/tenants/{tenant_id}/graph/algorithms/components
-POST /v1/tenants/{tenant_id}/graph/algorithms/pagerank
-POST /v1/tenants/{tenant_id}/graph/algorithms/communities
-POST /v1/tenants/{tenant_id}/graph/spatial/designate
-POST /v1/tenants/{tenant_id}/graph/spatial/radius
-POST /v1/tenants/{tenant_id}/graph/spatial/bbox
-POST /v1/tenants/{tenant_id}/graph/fulltext/designate
-POST /v1/tenants/{tenant_id}/graph/fulltext/search
-POST /v1/tenants/{tenant_id}/graph/bulk/nodes
-POST /v1/tenants/{tenant_id}/graph/bulk/edges
-POST /v1/tenants/{tenant_id}/graph/version/compile
-POST /v1/tenants/{tenant_id}/graph/version/diff
-POST /v1/tenants/{tenant_id}/graph/version/ref
-POST /v1/tenants/{tenant_id}/graph/version/log
-POST /v1/tenants/{tenant_id}/graph/version/checkout
-POST /v1/tenants/{tenant_id}/graph/version/merge
-POST /v1/tenants/{tenant_id}/instant-kg/status
-POST /v1/tenants/{tenant_id}/instant-kg/ppr
-POST /v1/tenants/{tenant_id}/instant-kg/impact
-POST /v1/tenants/{tenant_id}/instant-kg/related-objects
-POST /v1/tenants/{tenant_id}/instant-kg/search
-POST /v1/tenants/{tenant_id}/instant-kg/explain-edge
-GET  /v1/diagnostics/slow_queries
-GET  /v1/diagnostics/config
-POST /v1/tenants/{tenant_id}/context/pack
-```
+## Index structures
 
-### MCP tools
+`InMemoryGraphStore` maintains, alongside the node and edge maps:
 
-The `/mcp` endpoint exposes these tools (via JSON-RPC `tools/list` and `tools/call`):
+- **Out/in adjacency** keyed by `(node_id, edge_type)` for directional neighbor lookups.
+- **Label index**, **edge-type index**, and a **property index** keyed by `(property, value)`.
+- **Vector designations and HNSW indexes** keyed by `(label, property)`.
 
-| Tool | Description |
-|------|-------------|
-| `thg.graph.query` / `thg.graph.explain` / `thg.graph.neighbors` | Bounded native graph reads and plan inspection |
-| `thg.graph.schema` / `thg.graph.index_status` | Graph schema and index-health reads |
-| `rustyred_thg_graph_version_compile` (`rustyred_thg_git_compile`) / `rustyred_thg_graph_version_diff` (`rustyred_thg_git_diff`) / `rustyred_thg_graph_version_ref` (`rustyred_thg_git_ref`) / `rustyred_thg_graph_version_log` (`rustyred_thg_git_log`) / `rustyred_thg_graph_version_checkout` (`rustyred_thg_git_checkout`) / `rustyred_thg_graph_version_merge` (`rustyred_thg_git_merge`) | Content-addressed graph pack, refs/log/checkout, and three-way merge tools |
-| `thg.algorithm.ppr` (alias: `thg.algo.ppr`) / `thg.algorithm.components` (`thg.algo.components`) / `thg.algorithm.pagerank` (`thg.algo.pagerank`) / `thg.algorithm.communities` (`thg.algo.communities`) | Graph algorithms (PPR, connected components, PageRank, label-propagation communities). §P6-B SPEC names accepted as aliases. |
-| `harness_kg_status` / `harness_kg_ppr` / `harness_kg_impact` / `harness_kg_related_objects` / `harness_kg_search` / `harness_kg_explain_edge` | Harness Instant KG tools over a RedCore tenant base graph plus an optional session delta. Legacy `RUSTY_RED_MODE=redis` returns a diagnostic because Instant KG is a native THG/RedCore capability. |
-| `harness_run` / `harness_append_transition` | Native Theorem harness runtime event-log reads and appends over the tenant `GraphStore`. `harness_run` is read-only; `harness_append_transition` appears only in read/write MCP mode and writes `HarnessRun` / `HarnessEvent` nodes for the HTTP/iOS transport to read from the same RedCore store. |
-| `thg.fulltext.search` (alias: `thg.graph.fulltext.search`) / `thg.spatial.radius` (`thg.graph.spatial.radius`) / `thg.spatial.bbox` (`thg.graph.spatial.bbox`) | Full-text and spatial read surfaces. §P6-B SPEC names accepted as aliases. |
-| `thg.vector.search` | HNSW nearest-neighbor search on vector properties |
-| `thg.vector.hybrid` | Hybrid search blending vector similarity with graph proximity |
-| `thg.vector.designate` | Register a vector property for HNSW indexing (write) |
-| `thg.epistemic.neighbors` | Confidence-weighted epistemic traversal by edge type |
-| `thg.fulltext.designate` (alias: `thg.graph.fulltext.designate`) / `thg.spatial.designate` (`thg.graph.spatial.designate`) / `thg.bulk.nodes` (`thg.graph.bulk.nodes`) / `thg.bulk.edges` (`thg.graph.bulk.edges`) | Write-mode-only designation and bulk ingest tools. §P6-B SPEC names accepted as aliases. |
-| `thg.admin.verify` | Admin-only index-integrity verification; rebuild remains on the HTTP graph route |
+Full-text (BM25) and spatial (H3) indexes are separate subsystems layered on the same store.
 
-The public query surface is now split cleanly:
+## Higher-level subsystems
 
-- `/v1/query` is the product-facing native subset for `node_match` and `neighbors`.
-- `/v1/cypher` and `/v1/cypher/explain` are the bounded OpenCypher-compatible surface for read queries plus transaction-scoped `CREATE`/`MERGE`/`SET`/`DELETE` writes.
-- `/v1/tenants/{tenant_id}/graph/query` remains the older debug bridge and should not be treated as the product route.
+- **Versioned graph** (`versioned_graph.rs`) — content-addressed node/edge objects compile into
+  Prolly-style trees with Git-like commits, refs/branches, diff, checkout, and merge. See
+  [Data model](data-model.md) and the version endpoints in [HTTP API](http-api.md).
+- **Instant-KG** (`instant_kg.rs`) — "Harness" merged views that overlay session-fresh code deltas
+  on a durable tenant graph for code PageRank, impact analysis, related-object lookup, search, and
+  edge explanations. Protocol id `harness-instant-kg-v1`.
+- **Graph cache** (`graph_cache.rs`) — a graph-state-aware result cache with ten entry kinds that
+  invalidate when the underlying graph mutates. See [Query surface](query-surface.md).
+- **RustyWeb / Web Commons federation** (`rustyred-search` + `router.rs`) — bounded crawls write
+  Page/Domain/ContentSnapshot/LINKS_TO graph fragments locally. When federation is enabled, a
+  deployment signs a bounded Web Commons fragment with Ed25519 and submits it to a hub. The hub
+  verifies the signature, checks peer trust, stores accepted pages as probationary/canonical, and
+  uses the versioned-graph merge primitive before committing the fragment batch.
 
-The graph version routes are the THG Git/provenance substrate. `/graph/version/compile` reads the current tenant graph and returns a `rustyred-versioned-graph-v1` pack with content hashes, a Prolly-style tree root, Git-like commit metadata, and declarative compiler capabilities. `/graph/version/diff` compares a supplied base snapshot against the current graph or an explicit target snapshot. `/graph/version/ref`, `/log`, and `/checkout` operate on caller-supplied graph repositories so downstream products can choose their own persistence layer; checkout returns a snapshot and does not mutate the tenant graph. `/graph/version/merge` performs a read-only three-way merge with content-hash conflict detection and confidence-weighted edge conflict resolution. Full Skill Encoder promotion, code-corpus lowering, and model-adapter policy stay in Theseus/Theorem encode surfaces rather than in the public RedCore release.
+## A note on the RESP server
 
-`GET /v1/diagnostics/config` returns the static runtime config snapshot, including
-startup-only tenant override details. Runtime mutation of tenant config is not
-supported in this slice.
+`rustyred-resp-server` is a **scaffold**, not a finished feature. Its `main` binds a TCP listener
+(default `127.0.0.1:6380`, override with `RUSTYRED_RESP_ADDR`) and currently accepts and drops
+connections without serving them. A command-mapping helper exists but is not yet wired to the
+executor and maps only the `RUSTYRED.RUN.*` / `RUSTYRED.STATE.HASH` commands. Treat RESP as
+experimental and do not depend on it in production.
 
-The OpenAPI document is served at `/openapi.json`. It exists because Rusty Red
-is exposed through HTTP and MCP even though the underlying storage engine is a
-database-style service. Its `info.version` is the `rustyred-rustyred-thg-compat-server` package
-version, and the v0.4 contract covers the router's graph, vector, epistemic,
-algorithm, spatial, full-text, bulk ingest, cache, transaction, diagnostic,
-and MCP HTTP routes. MCP tool, resource, and prompt metadata are discovered
-through the MCP endpoint and well-known manifests.
+# Data model
 
-Railway template readiness follows the public template guidance: use a GitHub
-source repo, keep the service root minimal, set `/ready` as the health check,
-wire Redis only for explicit `RUSTY_RED_MODE=redis` deployments through private
-networking/reference variables, attach persistent storage to stateful dependencies,
-set `RUSTY_RED_REQUIRE_VOLUME=true` for embedded Railway deployments so `/ready`
-fails when the mounted volume is absent, generate any public-ingress tokens with
-Railway template variable functions, and replace the badge placeholder above once
-Railway assigns the final template URL.
+The canonical types live in `crates/rustyred-core/src/graph_store.rs`. The graph is a directed
+property graph with first-class *epistemic* semantics on edges.
 
-Railway can deploy this directory directly:
+## Nodes
 
-```bash
-cd theseus_native
-railway up
-```
+`NodeRecord`:
 
-The included `Dockerfile`, `railway.toml`, and `.railwayignore` are for the
-standalone Rusty Red subtree repository. The monorepo Railway template under
-`railway-templates/rusty-red-graph-database/` remains useful when deploying
-from the full Theseus repository.
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | string | Caller-supplied unique id. |
+| `labels` | string[] | Zero or more labels; normalized on write. Backs the label index. |
+| `properties` | JSON object | Arbitrary JSON. Scalar properties back the property index. |
+| `version` | uint | Monotonic per-record version, bumped on each upsert. |
+| `tombstone` | bool | Soft-delete flag. Tombstoned nodes are retained but excluded from queries. |
+| `content_hash` | string? | Content address (see below). |
+| `parent_hashes` | string[] | Prior content hashes, for version lineage. |
 
-## Build (release wheels)
+## Edges
 
-CI builds Linux x86_64 manylinux2014 wheels via `.github/workflows/build_native_wheels.yml`. macOS arm64 is built locally for now (Travis's M1); CI build for Darwin is out of scope for the first cut.
+`EdgeRecord`:
 
-Use `scripts/verify_thg_release.sh` from the repository root for the THG
-runtime/product release check. The verifier intentionally uses package-targeted
-Cargo release builds for the THG server binaries and uses `maturin` for the root
-PyO3 extension:
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | string | Caller-supplied unique id. |
+| `from_id` / `to_id` | string | Endpoint node ids. Both must exist and be live at write time. |
+| `type` | string | Edge type (relationship name). Backs the edge-type index and adjacency. |
+| `properties` | JSON object | Arbitrary JSON. |
+| `version` | uint | Monotonic per-record version. |
+| `tombstone` | bool | Soft-delete flag. |
+| `confidence` | float? | Optional, clamped to `[0,1]`. Defaults to `1.0` when absent. |
+| `epistemic_type` | enum? | One of the epistemic types below. |
+| `provenance` | object? | `{ source_id?, timestamp?, method? }`. |
+| `content_hash` | string? | Content address. |
+| `parent_hashes` | string[] | Version lineage. |
 
-```bash
-scripts/verify_thg_release.sh
-scripts/verify_thg_release.sh --develop  # install into the active Python env
-```
+### Epistemic edge types
 
-Do not use `cargo build --manifest-path theseus_native/Cargo.toml --workspace
---release` as the native release check on macOS. That command attempts to link
-the root PyO3 `cdylib` as a plain Cargo artifact and can fail with undefined
-Python symbols even when the THG binaries and `maturin` wheel path are healthy.
+`EpistemicType` (`supports`, `contradicts`, `tension`, `derives`, `cites`) makes the graph aware of
+how claims relate. It drives two behaviours:
 
-## Public API
+- **Epistemic neighbor traversal** — filter and walk neighbors by epistemic type, minimum
+  confidence, and hop depth (`/v1/tenants/{t}/graph/epistemic-neighbors`).
+- **Hybrid scoring** — `contradicts` and `tension` edges carry negative default weights
+  (`-1.0` and `-0.5`), so contradictory paths *reduce* graph proximity rather than increasing it.
 
-```python
-def push_ppr(
-    adjacency: dict[int, list[tuple[int, float]]],
-    seeds: dict[int, float],
-    *,
-    alpha: float = 0.15,
-    epsilon: float = 1e-4,
-    max_pushes: int = 200_000,
-) -> dict[int, float]: ...
-```
+## Multi-tenancy
 
-THG exports:
+Every persistent surface is namespaced by `tenant_id`. Stored data is segregated under
+`<RUSTY_RED_KEY_PREFIX>:<tenant_id>:…` (default prefix `rusty-red:tenant`). Tenant ids are sanitized
+into safe key/path segments. HTTP routes carry the tenant explicitly
+(`/v1/tenants/{tenant_id}/…`); root convenience routes and MCP calls fall back to a default tenant
+(`RUSTY_RED_MCP_DEFAULT_TENANT`, literal `default` if unset). Per-tenant runtime overrides
+(durability, snapshot interval, strict-ACID, memory quota, hybrid scoring) can be supplied at
+startup via `RUSTY_RED_TENANT_CONFIG_JSON` / `RUSTY_RED_TENANT_CONFIG_PATH`.
 
-```python
-from theseus_native import ThgCoreExecutor
+## Content addressing & versioning
 
-executor = ThgCoreExecutor()
-executor.execute_json('{"command":"RUSTYRED_THG.RUN.BEGIN","args":{"task":"demo"}}')
-executor.state_hash()
-```
+Each record can compute a stable **content address**: a `sha256:` hash over its identifying fields
+(id, labels/type, properties, tombstone, and — for edges — confidence, epistemic type, and
+provenance). Content addressing underpins:
 
-Matches `apps/notebook/sparse_ppr.py:push_ppr` exactly. ACL local-push personalized PageRank: alpha is the restart probability (Theseus convention), epsilon is the per-node convergence threshold, max_pushes caps total iterations to prevent pathological walks.
+- **Integrity** — `checksum()` is returned on every write (`GraphWriteResult { id, version, checksum }`).
+- **Versioned graph packs** — `snapshot_content_objects`, `build_prolly_tree`, and
+  `compile_graph_pack` turn a snapshot into a content-addressed Prolly-style tree plus a Git-like
+  commit (`GraphCommit`) with author/message/parents.
+- **Refs, diff, merge** — branches default to `main` (`DEFAULT_GRAPH_BRANCH`); `diff_graph_snapshots`
+  produces `GraphDiffEntry` lists; `merge_graph_snapshots` performs three-way merges with conflict
+  reporting and selectable strategies.
 
-## Fallback semantics
+The whole graph also has a single monotonic `version` (in `GraphStats.version`) that increments with
+each mutation; the cache and verify subsystems use it to detect staleness.
 
-`apps/notebook/sparse_ppr.py` is the dispatcher. It tries `from theseus_native import push_ppr` first; on ImportError, or when `THESEUS_DISABLE_NATIVE=1` is set in the environment at call time, it routes to the pure-Python `_python_push_ppr` defined in the same file. The fallback exists indefinitely (per ADR 0001 follow-up) so dev environments without the wheel still function.
+## Indexes derived from the data
 
-The wrapper logs once at WARNING level on the first import that finds the wheel missing: `theseus_native unavailable, using Python push_ppr`. Subsequent imports do not re-log.
+| Index | Keyed by | Used for |
+|-------|----------|----------|
+| Label | label → node ids | `NodeQuery` by label |
+| Edge type | type → edge ids | edge-type filters |
+| Property | `(property, value)` → node ids | exact property match |
+| Adjacency (out/in) | `(node_id, edge_type)` → edge ids | neighbor expansion |
+| Vector | `(label, property)` → HNSW index | vector / hybrid search |
+| Full-text | `(label, property)` → BM25 index | full-text search |
+| Spatial | `(label, lat_prop, lon_prop, resolution)` → H3 cells | radius / bbox queries |
 
-## THG standalone HTTP server
+## Stats & integrity
 
-Phase 1 standalone mode lives in `crates/rustyred-thg-compat-server`:
-
-```bash
-cd theseus_native
-cargo run -p rustyred-thg-compat-server -- --host 127.0.0.1 --port 7379
-```
-
-Endpoints:
-
-```text
-GET  /health
-GET  /ready
-GET  /v1/state/hash
-GET  /v1/runs/{id}
-POST /v1/command
-POST /v1/batch
-```
-
-Django selects embedded or remote THG with:
-
-```bash
-THG_MODE=in_process
-THG_MODE=remote_http THG_HTTP_URL=http://localhost:7379
-```
-
-## Algorithm reference
-
-Andersen, R., Chung, F., and Lang, K. (2006). Local Graph Partitioning using PageRank Vectors. FOCS 2006.
-
-## Benchmarks
-
-Single-threaded, single-seed PPR queries on random sparse graphs (avg degree 4, alpha 0.15, epsilon 1e-4), captured on the developer's M1 Max via the harness in `tests/test_benchmarks.py`:
-
-| Nodes | Native | Python | Speedup |
-|-------|--------|--------|---------|
-| 50K   | 0.0024s | 0.0318s | 13.2x |
-| 200K  | 0.0034s | 0.1753s | 51.3x |
-| 1M    | 0.0023s | 0.9573s | 413.9x (acceptance gate: must be >= 20x) |
-
-To re-run:
-
-```bash
-cd theseus_native
-python3 -m pytest tests/test_benchmarks.py -v -s
-```
-
-The fixture is generated with seed 42 for reproducibility. Numbers vary across hardware; the 20x floor is enforced on whatever runner executes the test.
-
-The native impl uses lazy on-demand neighbor extraction: ACL Push typically touches ~1/(epsilon*alpha) ~ 67k nodes for production params, so converting only those (not the full adjacency dict) eliminates the dominant FFI cost.
-
-## License
-
-MIT.
+- `GraphStats` reports `version`, totals for nodes/edges/labels/edge-types/property-keys/property
+  indexes, and estimated `memory_bytes` against `memory_quota_bytes`.
+- `verify()` returns a `VerifyReport { ok, stats, problems[] }`; `rebuild_indexes()` repairs derived
+  indexes and returns before/after verify reports. Exposed at `…/graph/verify` and
+  `…/graph/rebuild-indexes`.
