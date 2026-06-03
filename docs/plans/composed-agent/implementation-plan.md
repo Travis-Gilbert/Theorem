@@ -27,8 +27,8 @@ Lane A (the correctness-critical Rust binding kernel, everything spec Part 7 ass
 | 4 BindingScope + versioned scratchpad + 4 memory zones | done | codex (kernel) + claude-code (revision persistence) | f0b1c19, a92276c |
 | 5 intra-agent scratchpad loop (propose/critique/synthesize/publish, router) | NOT done (Lane B) | codex (proposed) | - |
 | 6 budget governor as a hard guard | done | claude-code | 1b99c85 |
-| 7 charter compiler (stance + capability enumeration) | in progress | codex | rustyred-thg-affordances/charter.rs (uncommitted) |
-| 8 expose Theseus ability (wrap engines as affordances) | largely done | codex | register_builtin_affordances (datalog.derive, solver.check, proof.create_obligation, ...) |
+| 7 charter compiler (stance + capability enumeration) | in progress | codex | rustyred-thg-affordances charter slice |
+| 8 expose Theseus ability (wrap engines as affordances) | partial: app metadata done, live adapter pending | codex | register_builtin_affordances + register_theseus_app_affordances |
 | 9 alignment guards (consensus + grounding + action tiers) | done, grounding strict | claude-code | 1b99c85, d3f7347 |
 | Part 6 persistence (binding + events + scratchpad to GraphStore) | done | claude-code | a92276c |
 | 10 compose-your-own-agent UI | deferred by spec | - | - |
@@ -36,7 +36,7 @@ Lane A (the correctness-critical Rust binding kernel, everything spec Part 7 ass
 
 Step 9 is now fully closed: grounding is strict (d3f7347), so a claimless or ungrounded publication is refused at `POLICY.CHECKED`; consensus and action-tier guards were already unconditional. No feature flags anywhere in the kernel (per the single-user surface-the-break stance). Verification: `cargo test -p theorem-harness-core -p theorem-harness-runtime` green (34 + 24 tests), `cargo clippy -- -D warnings` clean, single-agent `apply_transition` parity suites unchanged.
 
-Remaining real-build work = Lane B. Steps 7 (charter compiler) and 8 (engine affordances) are in progress in codex's `rustyred-thg-affordances` (charter.rs + register_builtin_affordances, uncommitted as of this session); the engine affordances turned out further along than originally planned. Steps 3 (AgentHead live registry/transports) and 5 (the intra-agent reasoning loop with real model calls) remain: the genuinely model-bearing pieces, needing provider credentials + the theorem_grpc seam. All build on the committed Lane A types.
+Remaining real-build work = Lane B. Step 3 now has a pure `theorem-harness-core::AgentHeadRegistry` slice that resolves active heads to fake transport endpoints, emits a `HEADS.PROBED` transition payload, preserves `credential_ref` without credential values, and rejects inactive/unknown heads before invocation. Step 5 now has a deterministic `run_fake_intra_agent_loop` scaffold plus a fake-first `HeadInvoker` seam. The live runtime/provider adapter and learned/router policy are still open. Step 8 now has the remaining Theseus app surface registered as graph-visible metadata through `register_theseus_app_affordances`: explicit `theorem_grpc.*` wrappers with transport, timeout, failure receipt shape, permissions, writeback policy, and cost metadata. The live `theorem_grpc` invocation adapter and charter-surface reintegration remain open. All build on the committed Lane A types.
 
 ## Architecture decisions (the mini-design for the Rust translation)
 
@@ -115,9 +115,9 @@ As-built note (decisions 1-3 diverged from this pre-build design; 4-6 held). The
 - [x] CA-B3.1 Per-binding charter compiler: stance/preferences + zero-silent-capability enumeration of every affordance/tool the binding can reach. Implemented as the pure `rustyred-thg-affordances::compile_binding_charter(_from_store)` compiler, producing deterministic payloads for `CHARTER.COMPILED` and `CAPABILITIES.SELECTED` without resolving credentials or invoking models. Spec: Part 4 ("enumerated in the charter, zero silent capability"). Feeds `CHARTER.COMPILED`.
 
 ### CA-B4: expose Theseus ability (build-order step 8; spec Part 4)
-- [ ] CA-B4.1 Wrap the unwrapped reasoning engines as affordances (currently only datalog + probabilistic are wrapped; add causal, egraph, evolution, expression, optimizer, proof, simulation, solver + the top-level `apps/causal`). Spec: Part 4 (ten engines).
-- [ ] CA-B4.2 Enumerate the remaining Theseus apps as affordances/tools reached natively or over `theorem_grpc`: anti_misinfo_algo, corpus_surface, federation + epistemic_federation, paper_trail, public_verbs, publisher, research, user_model, memory_tensions, observability. Spec: Part 4 (the app surface).
-- [ ] CA-B4.3 Reuse the existing `rustyred-thg-affordances` registry (connector-as-substrate) so engine/app affordances are first-class graph nodes with invocation receipts. Spec: Part 4 + the deferred MCP-learning-layer hook.
+- [x] CA-B4.1 Register builtin reasoning-engine affordances as graph nodes through `rustyred-thg-affordances::register_builtin_affordances`, sourced from `theorem_harness_core::default_affordance_registry`. Spec: Part 4 (engine affordances).
+- [x] CA-B4.2 Enumerate the remaining Theseus apps as affordances/tools reached natively or over `theorem_grpc`: anti_misinfo_algo, corpus_surface, federation + epistemic_federation, paper_trail, public_verbs, publisher, research, user_model, memory_tensions, observability. Implemented locally as `register_theseus_app_affordances` metadata wrappers. Spec: Part 4 (the app surface).
+- [ ] CA-B4.3 Reuse the existing `rustyred-thg-affordances` registry for the remaining app/grpc wrappers so they are first-class graph nodes with invocation receipts, learned fitness, and charter visibility. Registry nodes and invocation receipts are implemented locally; charter visibility and live transport invocation remain later adapters. Spec: Part 4 + the deferred MCP-learning-layer hook.
 
 ---
 

@@ -4,8 +4,10 @@ use rustyred_thg_core::{InMemoryGraphStore, NeighborQuery, NodeQuery};
 
 use crate::types::{affordance_node_id, Affordance};
 use crate::{
-    record_invocation, register_builtin_affordances, register_connector, ConnectorManifest,
-    InvocationRecordRequest, ToolManifest, AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS, OFFERS,
+    record_invocation, register_builtin_affordances, register_connector,
+    register_theseus_app_affordances, ConnectorManifest, InvocationRecordRequest, ToolManifest,
+    AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS, OFFERS, THEOREM_GRPC_SERVER_ID,
+    THEOREM_GRPC_TIMEOUT_MS,
 };
 
 fn tool(name: &str, policy: &str, tags: &[&str]) -> ToolManifest {
@@ -46,9 +48,8 @@ fn register_connector_creates_one_node_per_tool() {
     let affordances = store.query_nodes(NodeQuery::label(AFFORDANCE_LABEL).with_limit(100));
     assert_eq!(affordances.len(), 3);
 
-    let offers = store.neighbors(
-        NeighborQuery::out(&result.connector_node_id).with_edge_type(OFFERS),
-    );
+    let offers =
+        store.neighbors(NeighborQuery::out(&result.connector_node_id).with_edge_type(OFFERS));
     assert_eq!(offers.len(), 3);
 
     // Tenant-scoped, deterministic node ids.
@@ -88,13 +89,20 @@ fn re_registration_is_idempotent_and_preserves_learned_fitness() {
     )
     .unwrap()
     .fitness;
-    assert!(raised > DEFAULT_BASE_FITNESS, "fitness should rise after a positive outcome");
+    assert!(
+        raised > DEFAULT_BASE_FITNESS,
+        "fitness should rise after a positive outcome"
+    );
 
     // Re-register the same connector (idempotent): node count unchanged and the
     // learned fitness is preserved, not reset to the base.
     register_connector(&mut store, github_manifest(), Some("test")).unwrap();
     let affordances = store.query_nodes(NodeQuery::label(AFFORDANCE_LABEL).with_limit(100));
-    assert_eq!(affordances.len(), 3, "re-registration must not duplicate nodes");
+    assert_eq!(
+        affordances.len(),
+        3,
+        "re-registration must not duplicate nodes"
+    );
 
     let after = Affordance::from_node_record(
         store
@@ -103,7 +111,10 @@ fn re_registration_is_idempotent_and_preserves_learned_fitness() {
     )
     .unwrap()
     .fitness;
-    assert!((after - raised).abs() < 1e-6, "re-registration must preserve learned fitness");
+    assert!(
+        (after - raised).abs() < 1e-6,
+        "re-registration must preserve learned fitness"
+    );
 }
 
 #[test]
@@ -117,4 +128,67 @@ fn builtin_affordances_become_graph_nodes() {
     assert!(result
         .affordance_node_ids
         .contains(&affordance_node_id("theorem", "datalog.derive")));
+}
+
+#[test]
+fn theseus_app_affordances_become_theorem_grpc_nodes() {
+    let mut store = InMemoryGraphStore::new();
+    let result = register_theseus_app_affordances(&mut store, "theorem", Some("test")).unwrap();
+
+    assert_eq!(result.server_id, THEOREM_GRPC_SERVER_ID);
+    assert_eq!(result.affordance_node_ids.len(), 11);
+    assert!(store.get_node(&result.connector_node_id).is_some());
+
+    let publisher_id = affordance_node_id("theorem", "theorem_grpc.publisher.publish");
+    assert!(result.affordance_node_ids.contains(&publisher_id));
+    let publisher = Affordance::from_node_record(store.get_node(&publisher_id).unwrap()).unwrap();
+
+    assert_eq!(publisher.server_id, THEOREM_GRPC_SERVER_ID);
+    assert_eq!(publisher.family, "publisher");
+    assert_eq!(publisher.writeback_policy, "confirm-before-external");
+    assert!(publisher
+        .permissions
+        .contains(&"external_action".to_string()));
+    assert_eq!(publisher.cost["transport"], "theorem_grpc");
+    assert_eq!(publisher.cost["timeout_ms"], THEOREM_GRPC_TIMEOUT_MS);
+    assert_eq!(
+        publisher.cost["failure_receipt"]["receipt_type"],
+        "THEOREM_GRPC.AFFORDANCE_FAILED"
+    );
+
+    let offers =
+        store.neighbors(NeighborQuery::out(&result.connector_node_id).with_edge_type(OFFERS));
+    assert_eq!(offers.len(), 11);
+}
+
+#[test]
+fn theseus_app_affordance_invocations_record_receipts() {
+    let mut store = InMemoryGraphStore::new();
+    register_theseus_app_affordances(&mut store, "theorem", Some("test")).unwrap();
+
+    let receipt = record_invocation(
+        &mut store,
+        InvocationRecordRequest {
+            tenant_id: "theorem".to_string(),
+            task_type: "research".to_string(),
+            candidate_affordance_ids: vec![
+                "theorem_grpc.research.expand".to_string(),
+                "theorem_grpc.observability.read_trace".to_string(),
+            ],
+            selected_affordance_id: "theorem_grpc.research.expand".to_string(),
+            outcome_value: 1.0,
+            outcome_weight: 3.0,
+            outcome_label: "evidence_found".to_string(),
+            previous_affordance_id: None,
+            query_text: "expand the research frontier".to_string(),
+            recorded_at_ms: Some(1_000),
+        },
+        Some("test"),
+    )
+    .unwrap();
+
+    assert!(!receipt.receipt_node_id.is_empty());
+    assert!(store.get_node(&receipt.receipt_node_id).is_some());
+    assert!(store.get_edge(&receipt.produced_outcome_edge_id).is_some());
+    assert!(receipt.effective_fitness > DEFAULT_BASE_FITNESS);
 }

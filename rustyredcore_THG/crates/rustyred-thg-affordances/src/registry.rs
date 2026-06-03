@@ -17,6 +17,9 @@ use crate::types::{
     DEFAULT_HALF_LIFE_DAYS, OFFERS, TENANT_LABEL, THG_AFFORDANCE_SOURCE,
 };
 
+pub const THEOREM_GRPC_SERVER_ID: &str = "theorem_grpc";
+pub const THEOREM_GRPC_TIMEOUT_MS: u64 = 30_000;
+
 /// Register an entire connector: one `Connector` node + one `Affordance` node
 /// per tool + `OFFERS` edges, in a single transaction. Idempotent.
 pub fn register_connector<S: AffordanceGraphStore>(
@@ -174,6 +177,90 @@ pub fn upsert_affordance<S: AffordanceGraphStore>(
     })
 }
 
+/// Register the remaining Theseus app surface as explicit `theorem_grpc`
+/// affordances. This is metadata only: live gRPC invocation belongs to the
+/// runtime adapter, while the registry/selection/receipt layer can see the
+/// app capabilities now.
+pub fn register_theseus_app_affordances<S: AffordanceGraphStore>(
+    store: &mut S,
+    tenant_id: &str,
+    actor: Option<&str>,
+) -> ThgResult<ConnectorRegisterResult> {
+    let tenant_id = normalize_tenant_id(tenant_id);
+    let connector_node = connector_node_id(&tenant_id, THEOREM_GRPC_SERVER_ID);
+    let affordances = theseus_app_affordances(&tenant_id);
+
+    let mut mutations = vec![
+        GraphMutation::NodeUpsert(NodeRecord::new(
+            tenant_node_id(&tenant_id),
+            [TENANT_LABEL],
+            json!({ "tenant_id": tenant_id, "source": THG_AFFORDANCE_SOURCE }),
+        )),
+        GraphMutation::NodeUpsert(NodeRecord::new(
+            &connector_node,
+            [CONNECTOR_LABEL],
+            json!({
+                "tenant_id": tenant_id,
+                "server_id": THEOREM_GRPC_SERVER_ID,
+                "label": "Theorem gRPC app surface",
+                "connection_target": {
+                    "transport": "theorem_grpc",
+                    "service": "theorem_grpc.AppAffordanceService",
+                    "method": "InvokeAffordance",
+                    "timeout_ms": THEOREM_GRPC_TIMEOUT_MS,
+                    "failure_receipt": theorem_grpc_failure_receipt_shape(),
+                },
+                "source": THG_AFFORDANCE_SOURCE,
+            }),
+        )),
+    ];
+
+    let mut affordance_node_ids = Vec::with_capacity(affordances.len());
+    for affordance in affordances {
+        affordance.validate()?;
+        let node_id = affordance.node_id();
+        let extra = preserved_affordance_properties(
+            store
+                .get_node(&node_id)
+                .map_err(thg_error_from_store)?
+                .as_ref(),
+            false,
+        );
+        mutations.push(GraphMutation::NodeUpsert(
+            affordance.to_node_record(actor, extra),
+        ));
+        mutations.push(GraphMutation::EdgeUpsert(edge_with_affordance_provenance(
+            offers_edge_id(&connector_node, &node_id),
+            &connector_node,
+            OFFERS,
+            &node_id,
+            json!({ "tenant_id": tenant_id }),
+            actor,
+        )));
+        affordance_node_ids.push(node_id);
+    }
+
+    let transaction = store
+        .commit_batch(GraphMutationBatch::new(mutations))
+        .map_err(thg_error_from_store)?;
+
+    Ok(ConnectorRegisterResult {
+        tenant_id,
+        server_id: THEOREM_GRPC_SERVER_ID.to_string(),
+        connector_node_id: connector_node,
+        affordance_node_ids,
+        transaction,
+    })
+}
+
+pub fn theseus_app_affordances(tenant_id: &str) -> Vec<Affordance> {
+    let tenant_id = normalize_tenant_id(tenant_id);
+    theseus_app_specs()
+        .iter()
+        .map(|spec| spec.to_affordance(&tenant_id))
+        .collect()
+}
+
 /// Read the persisted opaque connection target off a `Connector` node, if any.
 /// The connectors crate's invoke bridge uses this to re-reach a selected tool's
 /// server. Returns `None` when the connector is unknown or was registered without
@@ -292,6 +379,232 @@ fn affordance_from_tool(tenant_id: &str, server_id: &str, tool: &ToolManifest) -
         manifest_version: 1,
     }
     .normalized()
+}
+
+#[derive(Clone, Copy)]
+struct TheseusAppAffordanceSpec {
+    tool_name: &'static str,
+    family: &'static str,
+    label: &'static str,
+    description: &'static str,
+    permissions: &'static [&'static str],
+    writeback_policy: &'static str,
+    latency_class: &'static str,
+    cost_class: &'static str,
+    write_class: &'static str,
+    tags: &'static [&'static str],
+}
+
+impl TheseusAppAffordanceSpec {
+    fn to_affordance(self, tenant_id: &str) -> Affordance {
+        let mut tags = vec![
+            "theseus_app".to_string(),
+            "theorem_grpc".to_string(),
+            self.family.to_string(),
+        ];
+        tags.extend(self.tags.iter().map(|tag| (*tag).to_string()));
+        tags.sort();
+        tags.dedup();
+
+        Affordance {
+            affordance_id: format!("{THEOREM_GRPC_SERVER_ID}.{}", self.tool_name),
+            tenant_id: tenant_id.to_string(),
+            server_id: THEOREM_GRPC_SERVER_ID.to_string(),
+            tool_name: self.tool_name.to_string(),
+            family: self.family.to_string(),
+            label: self.label.to_string(),
+            description: self.description.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "transport": "theorem_grpc",
+                "timeout_ms": THEOREM_GRPC_TIMEOUT_MS,
+                "request": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "failure_receipt": theorem_grpc_failure_receipt_shape(),
+            }),
+            permissions: self
+                .permissions
+                .iter()
+                .map(|permission| (*permission).to_string())
+                .collect(),
+            cost: json!({
+                "execution_surface": "theorem_grpc",
+                "transport": "theorem_grpc",
+                "timeout_ms": THEOREM_GRPC_TIMEOUT_MS,
+                "latency_class": self.latency_class,
+                "cost_class": self.cost_class,
+                "write_class": self.write_class,
+                "failure_receipt": theorem_grpc_failure_receipt_shape(),
+                "source_module": "theseus_apps",
+                "parity_status": "app-wrapper-metadata",
+            }),
+            writeback_policy: self.writeback_policy.to_string(),
+            tags,
+            embedding: None,
+            fitness: 0.0,
+            version: 1,
+            created_at_ms: 0,
+            manifest_version: 1,
+        }
+        .normalized()
+    }
+}
+
+fn theseus_app_specs() -> &'static [TheseusAppAffordanceSpec] {
+    &[
+        TheseusAppAffordanceSpec {
+            tool_name: "anti_misinfo_algo.inspect_claim",
+            family: "anti_misinfo_algo",
+            label: "Inspect Claim",
+            description: "Run the Theseus anti-misinformation claim inspection pathway.",
+            permissions: &["graph_read", "receipt_write"],
+            writeback_policy: "receipt-only",
+            latency_class: "interactive",
+            cost_class: "standard",
+            write_class: "receipt",
+            tags: &["claim_check", "read", "receipt"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "corpus_surface.retrieve",
+            family: "corpus_surface",
+            label: "Retrieve Corpus Surface",
+            description: "Read candidate corpus surfaces and source packets from Theseus.",
+            permissions: &["graph_read"],
+            writeback_policy: "read-only",
+            latency_class: "interactive",
+            cost_class: "low",
+            write_class: "none",
+            tags: &["corpus", "read"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "federation.sync",
+            family: "federation",
+            label: "Sync Federation State",
+            description: "Exchange room or substrate state through the Theseus federation layer.",
+            permissions: &["graph_read", "graph_write", "receipt_write"],
+            writeback_policy: "write-graph",
+            latency_class: "background",
+            cost_class: "standard",
+            write_class: "graph",
+            tags: &["coordination", "write", "writeback"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "epistemic_federation.merge",
+            family: "epistemic_federation",
+            label: "Merge Epistemic Federation",
+            description: "Merge cross-agent epistemic records with provenance and receipts.",
+            permissions: &["graph_read", "graph_write", "receipt_write"],
+            writeback_policy: "write-graph",
+            latency_class: "background",
+            cost_class: "standard",
+            write_class: "graph",
+            tags: &["coordination", "epistemic", "write", "writeback"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "paper_trail.trace",
+            family: "paper_trail",
+            label: "Trace Paper Trail",
+            description: "Create or extend a provenance trail for a claim, artifact, or run.",
+            permissions: &["graph_read", "graph_write", "receipt_write"],
+            writeback_policy: "write-graph",
+            latency_class: "interactive",
+            cost_class: "low",
+            write_class: "graph",
+            tags: &["provenance", "receipt", "writeback"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "public_verbs.execute",
+            family: "public_verbs",
+            label: "Execute Public Verb",
+            description: "Invoke an audited public verb exposed by the Theseus app boundary.",
+            permissions: &["graph_read", "external_action", "receipt_write"],
+            writeback_policy: "confirm-before-write",
+            latency_class: "interactive",
+            cost_class: "standard",
+            write_class: "external",
+            tags: &["external_action", "public", "write"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "publisher.publish",
+            family: "publisher",
+            label: "Publish Artifact",
+            description: "Publish a Theseus artifact only through the confirmation-gated boundary.",
+            permissions: &["graph_read", "external_action", "receipt_write"],
+            writeback_policy: "confirm-before-external",
+            latency_class: "interactive",
+            cost_class: "standard",
+            write_class: "external",
+            tags: &["external_action", "publish", "write"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "research.expand",
+            family: "research",
+            label: "Expand Research Frontier",
+            description: "Run the Theseus research expansion surface and write evidence receipts.",
+            permissions: &["graph_read", "graph_write", "receipt_write"],
+            writeback_policy: "write-graph",
+            latency_class: "background",
+            cost_class: "standard",
+            write_class: "graph",
+            tags: &["research", "writeback"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "user_model.update",
+            family: "user_model",
+            label: "Update User Model",
+            description: "Update private user-model facts through a binding-private receipt.",
+            permissions: &["private_read", "private_write", "receipt_write"],
+            writeback_policy: "binding-private",
+            latency_class: "interactive",
+            cost_class: "low",
+            write_class: "private",
+            tags: &["binding_private", "private", "user_model", "writeback"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "memory_tensions.detect",
+            family: "memory_tensions",
+            label: "Detect Memory Tensions",
+            description: "Detect contradictions or tensions among active memory atoms.",
+            permissions: &["graph_read", "graph_write", "receipt_write"],
+            writeback_policy: "write-graph",
+            latency_class: "interactive",
+            cost_class: "low",
+            write_class: "graph",
+            tags: &["memory", "tension", "writeback"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "observability.read_trace",
+            family: "observability",
+            label: "Read Observability Trace",
+            description: "Read run, action, and provenance traces for inspection and debugging.",
+            permissions: &["trace_read", "graph_read"],
+            writeback_policy: "read-only",
+            latency_class: "interactive",
+            cost_class: "low",
+            write_class: "none",
+            tags: &["observability", "read", "trace"],
+        },
+    ]
+}
+
+fn theorem_grpc_failure_receipt_shape() -> Value {
+    json!({
+        "receipt_type": "THEOREM_GRPC.AFFORDANCE_FAILED",
+        "status": "failed",
+        "fields": [
+            "tenant_id",
+            "affordance_id",
+            "server_id",
+            "tool_name",
+            "transport",
+            "timeout_ms",
+            "error_code",
+            "message",
+            "elapsed_ms"
+        ],
+    })
 }
 
 /// Preserve learned state across re-registration: fitness, fitness decay
