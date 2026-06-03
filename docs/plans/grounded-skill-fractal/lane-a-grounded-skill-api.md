@@ -49,19 +49,23 @@ New (this spec, the product layer on top):
   standard (frontmatter parses, scripts run, provenance present). [spec "tested
   and runnable", "the slice that proves the output contract ... end to end"]
 
-### A2 Embedder upgrade + backfill (shared seam 1)
-- [ ] A2.1 Qwen3-Embedding-8B Modal app (code + text nodes), instruction-aware.
-  [spec "Embedding models ... Qwen3-Embedding ... instruction-aware"]
-- [ ] A2.2 Qwen3-Reranker-8B Modal app (cross-encoder); retrieve-then-rerank.
-  [spec "a reranker ... the retrieve-then-rerank pattern the whole field uses"]
-- [ ] A2.3 Backfill job: run the embedders over nodes on GPU (Modal), write
-  vectors as the designated vector properties via `rustyred_thg_vector_designate`;
-  RustyRed HNSW serves. A distinct channel from the GNN/KGE structural embeddings.
-  [spec "How to get embeddings into the graph"]
-- [ ] A2.4 Dimension contract: pin dim(s) (Qwen3-8B is MRL dimension-flexible);
-  embed hot classes at full dim, compress cold/large classes. PUBLISH the
-  contract (property name, dims, class->embedder map) to Lane B. [spec "The
-  dimension flexibility matters ... vector-tiering ... at the embedder level"]
+### A2 Embedder upgrade + backfill (shared seam 1) - RunPod, NOT Modal (Travis 2026-06-02, Modal spend cap). Client + worker + contract landed Index-API `73f01bc3`; GPU deploy + backfill pending.
+- [x] A2.1 Qwen3-Embedding-8B RunPod worker (code + text, instruction query-side
+  only, MRL truncation) `runpod_workers/qwen3-embed-8b/server.py` + dispatch
+  client `apps/notebook/qwen3_embedder_client.py`. Code + 9 tests green; GPU
+  deploy pending. [spec "Embedding models ... Qwen3-Embedding ... instruction-aware"]
+- [x] A2.2 Qwen3-Reranker-8B in the same RunPod worker (`op=rerank` cross-encoder)
+  + client `rerank()`; retrieve-then-rerank. Code; deploy pending. [spec "a
+  reranker ... the retrieve-then-rerank pattern the whole field uses"]
+- [ ] A2.3 Backfill job: run the embedder over nodes on RunPod GPU, write vectors
+  as the designated vector property via `rustyred_thg_vector_designate`; RustyRed
+  HNSW serves. A distinct channel from the GNN/KGE structural embeddings. Needs
+  the deployed endpoint. [spec "How to get embeddings into the graph"]
+- [x] A2.4 Dimension contract pinned + PUBLISHED to Lane B in
+  `qwen3_embedder_client.py`: property `semantic_vec`, tier dims hot=1024 /
+  cold=256 (MRL truncation, renormalized), `CLASS_EMBEDDER` kind+tier map,
+  normalized cosine. [spec "The dimension flexibility matters ... vector-tiering
+  ... at the embedder level"]
 - [ ] A2.5 (spec-sequenced future, not a cut) Fine-tune on the substrate corpus
   via the CoRNStack methodology (hard-negative mining, consistency filtering).
   Baseline now, finetune later. [spec "adopt a current strong open embedder ...
