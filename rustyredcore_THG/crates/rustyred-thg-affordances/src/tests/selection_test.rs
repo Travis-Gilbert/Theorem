@@ -4,8 +4,9 @@ use rustyred_thg_core::InMemoryGraphStore;
 
 use crate::types::CapabilityScope;
 use crate::{
-    record_invocation, register_connector, select_affordances, select_affordances_by_embedding,
-    ConnectorManifest, InvocationRecordRequest, SelectionRequest, ToolManifest,
+    record_invocation, register_connector, register_theseus_app_affordances, select_affordances,
+    select_affordances_by_embedding, ConnectorManifest, InvocationRecordRequest, SelectionRequest,
+    ToolManifest,
 };
 
 fn tool(name: &str, embedding: Option<Vec<f32>>) -> ToolManifest {
@@ -31,7 +32,11 @@ fn connector(server: &str, tools: Vec<ToolManifest>) -> ConnectorManifest {
     }
 }
 
-fn select(store: &InMemoryGraphStore, task: &str, scope: CapabilityScope) -> Vec<crate::AffordanceRef> {
+fn select(
+    store: &InMemoryGraphStore,
+    task: &str,
+    scope: CapabilityScope,
+) -> Vec<crate::AffordanceRef> {
     select_affordances(
         store,
         &SelectionRequest {
@@ -50,14 +55,25 @@ fn unprimed_affordances_are_reachable_forwarding_fallback() {
     let mut store = InMemoryGraphStore::new();
     register_connector(
         &mut store,
-        connector("github", vec![tool("create_issue", None), tool("search_code", None), tool("get_file", None)]),
+        connector(
+            "github",
+            vec![
+                tool("create_issue", None),
+                tool("search_code", None),
+                tool("get_file", None),
+            ],
+        ),
         Some("test"),
     )
     .unwrap();
 
     // With no recorded outcomes, every scoped affordance is still reachable.
     let refs = select(&store, "anything", CapabilityScope::unrestricted("agent"));
-    assert_eq!(refs.len(), 3, "freshly connected tools are reachable (forwarding fallback)");
+    assert_eq!(
+        refs.len(),
+        3,
+        "freshly connected tools are reachable (forwarding fallback)"
+    );
 }
 
 #[test]
@@ -65,7 +81,10 @@ fn positive_outcome_changes_rank_order_compounding() {
     let mut store = InMemoryGraphStore::new();
     register_connector(
         &mut store,
-        connector("github", vec![tool("create_issue", None), tool("search_code", None)]),
+        connector(
+            "github",
+            vec![tool("create_issue", None), tool("search_code", None)],
+        ),
         Some("test"),
     )
     .unwrap();
@@ -109,7 +128,10 @@ fn capability_scope_excludes_out_of_scope_affordances() {
     let mut store = InMemoryGraphStore::new();
     register_connector(
         &mut store,
-        connector("github", vec![tool("create_issue", None), tool("search_code", None)]),
+        connector(
+            "github",
+            vec![tool("create_issue", None), tool("search_code", None)],
+        ),
         Some("test"),
     )
     .unwrap();
@@ -126,8 +148,35 @@ fn capability_scope_excludes_out_of_scope_affordances() {
         ..Default::default()
     };
     let refs = select(&store, "anything", scope);
-    assert_eq!(refs.len(), 2, "only the two github affordances are in scope");
+    assert_eq!(
+        refs.len(),
+        2,
+        "only the two github affordances are in scope"
+    );
     assert!(refs.iter().all(|r| r.affordance.server_id == "github"));
+}
+
+#[test]
+fn capability_scope_can_select_theseus_app_families() {
+    let mut store = InMemoryGraphStore::new();
+    register_theseus_app_affordances(&mut store, "theorem", Some("test")).unwrap();
+
+    let refs = select(
+        &store,
+        "publish",
+        CapabilityScope {
+            agent_id: "agent".to_string(),
+            allow_families: vec!["publisher".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(refs.len(), 1);
+    assert_eq!(
+        refs[0].affordance.affordance_id,
+        "theorem_grpc.publisher.publish"
+    );
+    assert_eq!(refs[0].affordance.server_id, "theorem_grpc");
 }
 
 #[test]

@@ -19,16 +19,17 @@ pub mod selection;
 pub mod training;
 pub mod types;
 
-pub use outcomes::{
-    affordance_nodes, effective_affordance_fitness_from_node, record_invocation,
+pub use outcomes::{affordance_nodes, effective_affordance_fitness_from_node, record_invocation};
+pub use registry::{
+    register_builtin_affordances, register_connector, register_theseus_app_affordances,
+    theseus_app_affordances, upsert_affordance, THEOREM_GRPC_SERVER_ID, THEOREM_GRPC_TIMEOUT_MS,
 };
-pub use registry::{register_builtin_affordances, register_connector, upsert_affordance};
 pub use selection::{select_affordances, select_affordances_by_embedding};
 pub use training::{
     export_affordance_training_view, pairformer_eval_node_id, pairformer_model_node_id,
     pairformer_validation_gate, register_pairformer_artifact, AffordanceRankingPair,
-    AffordanceTrainingExport, PairformerArtifactInput, PairformerWritebackResult,
-    EVALUATED_BY, EVALUATION_RECEIPT_LABEL, MODEL_ARTIFACT_LABEL, PROMOTED_TO_ACTIVE, TRAINED_ON,
+    AffordanceTrainingExport, PairformerArtifactInput, PairformerWritebackResult, EVALUATED_BY,
+    EVALUATION_RECEIPT_LABEL, MODEL_ARTIFACT_LABEL, PROMOTED_TO_ACTIVE, TRAINED_ON,
 };
 pub use types::{
     affordance_node_id, affordance_vector_designation, connector_node_id,
