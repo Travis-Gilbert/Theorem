@@ -1828,6 +1828,10 @@ impl rustyred_thg_adapters::AdapterGraphStore for TenantGraphStore {
     fn snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
         TenantGraphStore::snapshot(self)
     }
+
+    fn stats(&self) -> GraphStoreResult<GraphStats> {
+        TenantGraphStore::stats(self)
+    }
 }
 
 impl McpGraphProvider for AppState {
