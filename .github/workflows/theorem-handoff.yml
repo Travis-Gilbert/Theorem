@@ -6,10 +6,24 @@ name: Theorem Handoff
 # fires the dispatch; this workflow runs Claude Code on GitHub's runner with
 # the intent as an explicit prompt and lets the action push its work / open a PR.
 #
+# Auth: this uses CLAUDE_CODE_OAUTH_TOKEN so spawned sessions bill against a
+# Claude subscription (flat rate) rather than metered API usage. The action
+# runs `claude -p` under the hood; from 2026-06-15 that draws a separate
+# monthly Agent SDK credit on subscription plans, distinct from interactive use.
+#
 # Prerequisites (one-time):
 #   1. Run `/install-github-app` from Claude Code to install the Anthropic GitHub App.
-#   2. Add ANTHROPIC_API_KEY to this repo's Actions secrets.
+#   2. Run `claude setup-token` locally; it prints a one-year token. Add that as a
+#      repo Actions secret named CLAUDE_CODE_OAUTH_TOKEN.
 # Until both exist this workflow is inert (no dispatch will be sent / it will no-op).
+#
+# IMPORTANT precedence note: do NOT also set ANTHROPIC_API_KEY as a secret/env here.
+# Claude Code prefers the API key over the OAuth token, so if both are present the
+# runs silently bill API rates instead of the subscription. Use exactly one.
+#
+# Multi-user boundary: the OAuth token is for the owner's individual use only.
+# When Theorem executes another user's task, that run must use that user's own
+# API key (BYO key), never this personal subscription token.
 
 on:
   repository_dispatch:
@@ -31,5 +45,5 @@ jobs:
       - name: Run Claude Code on the handoff intent
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: ${{ github.event.client_payload.intent }}
