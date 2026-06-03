@@ -76,6 +76,26 @@ slice for arm64 device + arm64/x86_64 simulator). The xcframework (80M) and the
 generated `Sources/TheoremHarness/` are build artifacts (gitignored); regenerate
 with `./build-xcframework.sh`.
 
+## Python binding (same crate, third language)
+
+UniFFI generates from one annotated facade, so this **same crate** also produces a
+Python binding (snake_case, idiomatic) with no extra Rust. Despite the `-swift`
+crate name (its primary packaging target is iOS), it is the UniFFI binding crate.
+
+```bash
+cargo build --release --lib
+cargo run --release --bin uniffi-bindgen -- generate \
+  --library target/release/libtheorem_harness_swift.dylib --language python \
+  --out-dir generated-python
+cp target/release/libtheorem_harness_swift.dylib generated-python/   # next to the .py
+python3 smoke.py   # prints SMOKE PASS
+```
+
+The Python module loads the dylib via `ctypes` (no extra Python deps). Verified:
+`python3 smoke.py` => **SMOKE PASS** (start, events, cancel, status=cancelled,
+remember+recall). So one Rust core now drives **Node (NAPI) + Swift + Python (both
+UniFFI)**, all passing the identical lifecycle, none re-implementing harness logic.
+
 ## Deferred (named, not stubbed)
 
 - The async streaming surface (a Swift `AsyncSequence` over the run event cursor),
