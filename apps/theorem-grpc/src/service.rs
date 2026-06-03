@@ -3,7 +3,7 @@
 //! Four RPCs. NONE fabricate:
 //!   - Search:     REAL graph rank via `rustyred_web::search_substrate`.
 //!   - GapWalk:    REAL single-round PPR over the existing substrate via
-//!                 `rustyred_thg_core::personalized_pagerank`.
+//!     `rustyred_thg_core::personalized_pagerank`.
 //!   - SourcePair: honest-EMPTY (no source/web bipartite anchoring layer yet).
 //!   - Provenance: the REAL single node if it resolves, else honest-empty.
 //!
@@ -66,8 +66,7 @@ impl pb::SearchService for TheoremSearchService {
         // SpatialBackend::bbox_search + TimeInterval::overlaps is a named
         // follow-up, NOT slice 1.
         let started = Instant::now();
-        let result: SubstrateSearch =
-            search_substrate(store, &req.query, SearchOptions::default());
+        let result: SubstrateSearch = search_substrate(store, &req.query, SearchOptions::default());
         let latency_ms = started.elapsed().as_millis() as u64;
 
         let response = map::to_search_response(req.query, result, latency_ms);
@@ -255,8 +254,11 @@ mod map {
         search: &SubstrateSearch,
         ppr: &HashMap<String, f64>,
     ) -> Vec<pb::SearchResult> {
-        let hit_by_id: HashMap<&str, &SearchHit> =
-            search.hits.iter().map(|h| (h.node_id.as_str(), h)).collect();
+        let hit_by_id: HashMap<&str, &SearchHit> = search
+            .hits
+            .iter()
+            .map(|h| (h.node_id.as_str(), h))
+            .collect();
 
         let mut scored: Vec<(&SearchHit, f64)> = ppr
             .iter()
@@ -316,7 +318,11 @@ mod map {
             .properties
             .get("url")
             .and_then(|v| v.as_str())
-            .or_else(|| node.properties.get("canonical_url").and_then(|v| v.as_str()))
+            .or_else(|| {
+                node.properties
+                    .get("canonical_url")
+                    .and_then(|v| v.as_str())
+            })
             .unwrap_or("");
         if url.is_empty() {
             return node.id.clone();

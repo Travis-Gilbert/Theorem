@@ -10,6 +10,13 @@ proto package + message shapes (copied byte-identical from
 `RustyRed-Graph-Database/proto/theseus_search/v1/search.proto`), so the civic
 backend dials it by setting `THEOREM_SEARCH_URL` with no code change.
 
+It also serves `theorem_grpc.AppAffordanceService`, the first live transport
+boundary for metadata-registered `theorem_grpc.*` Theseus app affordances. This
+initial path validates affordance ids, confirmation gates, timeout policy, and
+content-addressed receipt shape. Concrete app-family handlers are not live yet:
+confirmed non-dry-run calls return `HANDLER_NOT_IMPLEMENTED` receipts instead of
+fabricating success.
+
 Build: `cargo build -p theorem-grpc` (run from this dir; standalone Cargo root,
 not a member of `rustyredcore_THG`).
 

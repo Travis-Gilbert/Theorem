@@ -7,6 +7,7 @@
 //! civic-atlas-server dials this by setting THEOREM_SEARCH_URL (or the legacy
 //! THESEUS_BRIDGE_URL).
 
+mod app_affordance;
 mod engine;
 mod pb;
 mod service;
@@ -14,8 +15,9 @@ mod service;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use app_affordance::TheoremAppAffordanceService;
 use engine::Engine;
-use pb::SearchServiceServer;
+use pb::{AppAffordanceServiceServer, SearchServiceServer};
 use service::TheoremSearchService;
 
 #[tokio::main]
@@ -35,12 +37,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the engine (empty substrate is the honest slice-1 default) and wrap
     // it in an Arc so the owned store outlives every borrowing handler call.
     let engine = Arc::new(Engine::new());
-    let svc = SearchServiceServer::new(TheoremSearchService::new(engine));
+    let search_svc = SearchServiceServer::new(TheoremSearchService::new(engine));
+    let app_affordance_svc = AppAffordanceServiceServer::new(TheoremAppAffordanceService);
 
     tracing::info!("THEOREM_GRPC_READY {}", addr);
 
     tonic::transport::Server::builder()
-        .add_service(svc)
+        .add_service(search_svc)
+        .add_service(app_affordance_svc)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 

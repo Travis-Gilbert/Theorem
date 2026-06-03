@@ -44,6 +44,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # #[pyfunction] wrappers in rustyredcore_THG/src/*.rs.
 rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web" }
 rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+rustyred-thg-affordances = { path = "../../rustyredcore_THG/crates/rustyred-thg-affordances" }
+theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
 
 [build-dependencies]
 tonic-build = "0.12"

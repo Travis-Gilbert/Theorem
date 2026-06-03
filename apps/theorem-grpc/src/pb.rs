@@ -8,12 +8,20 @@ pub mod search {
     tonic::include_proto!("theseus_search.v1");
 }
 
+pub mod app_affordance {
+    tonic::include_proto!("theorem_grpc");
+}
+
 // Re-export the trait + server type the service module implements/mounts, plus
 // the message types the handlers reference by short name. The trait name is the
 // proto service name (`SearchService`); the generated server wrapper is
 // `SearchServiceServer`. (Message types only constructed via the `pb::search::`
 // path, e.g. ProvenanceEdge/GapClosure, are reachable through `search::*` and
 // are not re-exported here to keep the surface to what's actually named.)
+pub use app_affordance::app_affordance_service_server::{
+    AppAffordanceService, AppAffordanceServiceServer,
+};
+pub use app_affordance::{InvokeAffordanceRequest, InvokeAffordanceResponse};
 pub use search::search_service_server::{SearchService, SearchServiceServer};
 pub use search::{
     GapWalkRequest, GapWalkResponse, ProvenanceGraph, ProvenanceNode, ProvenanceRequest,
