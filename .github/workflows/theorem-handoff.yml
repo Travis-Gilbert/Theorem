@@ -1,0 +1,35 @@
+name: Theorem Handoff
+
+# Phase 1 of the GitHub-App session-spawning spec.
+# Triggered by a repository_dispatch event (type: theorem-handoff) carrying
+# { intent, branch } in client_payload. A spawn tool (e.g. on github-mcp)
+# fires the dispatch; this workflow runs Claude Code on GitHub's runner with
+# the intent as an explicit prompt and lets the action push its work / open a PR.
+#
+# Prerequisites (one-time):
+#   1. Run `/install-github-app` from Claude Code to install the Anthropic GitHub App.
+#   2. Add ANTHROPIC_API_KEY to this repo's Actions secrets.
+# Until both exist this workflow is inert (no dispatch will be sent / it will no-op).
+
+on:
+  repository_dispatch:
+    types: [theorem-handoff]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.branch || github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Run Claude Code on the handoff intent
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ github.event.client_payload.intent }}
