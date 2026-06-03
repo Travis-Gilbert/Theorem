@@ -6,6 +6,7 @@
 
 pub mod commands;
 pub mod fitness;
+pub mod grounded_skill;
 pub mod routing;
 pub mod situation_search;
 pub mod training_runner;
@@ -16,6 +17,11 @@ pub mod upsert;
 pub use commands::{execute_adapter_command, AdapterCommandResponse};
 pub use fitness::{
     effective_fitness, find_adapter_by_id, list_adapters, record_fitness, supersede_adapter,
+};
+pub use grounded_skill::{
+    build_grounded_skill_folder, GroundedSkillBuildInput, GroundedSkillFile, GroundedSkillFolder,
+    GroundedSkillProvenance, GroundedSkillScript, GroundedSkillScriptLanguage,
+    GroundedSkillSourceRef, AGENT_SKILL_STANDARD, DEFAULT_GROUNDED_SKILL_EMBEDDER_MODEL,
 };
 pub use routing::{
     adapter_training_centroid, find_adapters_by_query_embedding, find_adapters_for,
@@ -69,6 +75,10 @@ mod upsert_test;
 #[cfg(test)]
 #[path = "tests/routing_test.rs"]
 mod routing_test;
+
+#[cfg(test)]
+#[path = "tests/grounded_skill_test.rs"]
+mod grounded_skill_test;
 
 #[cfg(test)]
 #[path = "tests/situation_search_test.rs"]

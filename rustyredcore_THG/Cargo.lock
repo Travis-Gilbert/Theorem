@@ -2948,6 +2948,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-fractal"
+version = "0.5.0"
+dependencies = [
+ "rustyred-thg-core",
+ "rustyred-web",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-geotemporal"
 version = "0.5.0"
 dependencies = [

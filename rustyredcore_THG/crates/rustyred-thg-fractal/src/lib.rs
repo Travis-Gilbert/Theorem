@@ -1,0 +1,432 @@
+//! Native Rust fractal expansion over RustyRed and RustyWeb.
+//!
+//! A fractal expansion run is corpus growth, not graph-only retrieval. The
+//! public runner in this crate always builds a web crawl request and ingests
+//! admitted web graph state as a lower-trust, quarantined tier.
+
+use std::collections::BTreeSet;
+
+use rustyred_thg_core::{GraphMutation, GraphStore, NodeQuery, ThgError, ThgResult};
+use rustyred_web::{
+    build_v2_fixture_crawl, search_substrate, CrawlRequest, FetchedPage, SearchOptions, LABEL_PAGE,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+pub const DEFAULT_FRACTAL_EMBEDDER_MODEL: &str = "qwen3-embedding-8b";
+pub const OPEN_WEB_UNVERIFIED_TRUST_TIER: &str = "open_web_unverified";
+pub const DEFAULT_OPEN_WEB_CONFIDENCE_CEILING: f32 = 0.35;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FractalExpansionRequest {
+    pub run_id: String,
+    pub tenant_id: String,
+    pub query: String,
+    pub web_seed_urls: Vec<String>,
+    pub top_k: usize,
+    pub frontier_limit: usize,
+    pub web_seed_limit: usize,
+    pub embedder_model: Option<String>,
+    pub actor_id: Option<String>,
+}
+
+impl FractalExpansionRequest {
+    pub fn normalized(mut self) -> Self {
+        self.run_id = self.run_id.trim().to_string();
+        self.tenant_id = self.tenant_id.trim().to_string();
+        self.query = self.query.trim().to_string();
+        self.web_seed_urls = self
+            .web_seed_urls
+            .into_iter()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+            .collect();
+        self.top_k = self.top_k.max(1);
+        self.frontier_limit = self.frontier_limit.max(1);
+        self.web_seed_limit = self.web_seed_limit.max(1);
+        self.embedder_model = self
+            .embedder_model
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .or_else(|| Some(DEFAULT_FRACTAL_EMBEDDER_MODEL.to_string()));
+        self.actor_id = self
+            .actor_id
+            .map(|actor| actor.trim().to_string())
+            .filter(|actor| !actor.is_empty());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FractalFrontierHit {
+    pub node_id: String,
+    pub url: String,
+    pub title: String,
+    pub score: f64,
+    pub ring: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FractalExpansionReceipt {
+    pub run_id: String,
+    pub tenant_id: String,
+    pub query: String,
+    pub embedder_model: String,
+    pub graph_exhausted: bool,
+    pub web_reached: bool,
+    pub web_seed_urls: Vec<String>,
+    pub frontier: Vec<FractalFrontierHit>,
+    pub crawl_receipt_id: String,
+    pub admitted_pages: usize,
+    pub applied_writes: usize,
+}
+
+pub fn run_fixture_fractal_expansion<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    fetched_pages: &[FetchedPage],
+) -> ThgResult<FractalExpansionReceipt> {
+    let request = request.normalized();
+    validate_request(&request)?;
+
+    let frontier = graph_frontier(store, &request);
+    let web_seed_urls = web_seeds_from_frontier(&request, &frontier);
+    if web_seed_urls.is_empty() {
+        return Err(ThgError::new(
+            "fractal_web_seed_required",
+            "fractal expansion cannot terminate at the graph frontier",
+        ));
+    }
+
+    let admitted_pages = rank_and_sanitize_pages(&request.query, fetched_pages, request.top_k);
+    let mut crawl_request = CrawlRequest::new(request.run_id.clone(), web_seed_urls.clone());
+    crawl_request.scope.namespace = format!("fractal:{}", request.tenant_id);
+    crawl_request.scope.source_graph = "rustyred_fractal_expansion".to_string();
+    crawl_request.scope.source_license = OPEN_WEB_UNVERIFIED_TRUST_TIER.to_string();
+    crawl_request.scope.actor_id = request.actor_id.clone().unwrap_or_default();
+
+    let mut output = build_v2_fixture_crawl(crawl_request, &admitted_pages)
+        .map_err(|error| ThgError::new("fractal_web_crawl_failed", error.to_string()))?;
+    annotate_open_web_batch(&mut output.graph.batch.mutations, &request);
+    let writes = output
+        .graph
+        .apply_to_store(store)
+        .map_err(|error| ThgError::new(error.code, error.message))?;
+
+    Ok(FractalExpansionReceipt {
+        run_id: request.run_id,
+        tenant_id: request.tenant_id,
+        query: request.query,
+        embedder_model: request
+            .embedder_model
+            .unwrap_or_else(|| DEFAULT_FRACTAL_EMBEDDER_MODEL.to_string()),
+        graph_exhausted: true,
+        web_reached: true,
+        web_seed_urls,
+        frontier,
+        crawl_receipt_id: output.receipt.receipt_id,
+        admitted_pages: output.receipt.counters.fetched_pages,
+        applied_writes: writes.len(),
+    })
+}
+
+pub fn open_web_pages_for_tenant<S: GraphStore>(store: &S, tenant_id: &str) -> Vec<String> {
+    let mut pages = store.query_nodes(NodeQuery::label(LABEL_PAGE).with_limit(10_000));
+    pages.sort_by(|a, b| a.id.cmp(&b.id));
+    pages
+        .into_iter()
+        .filter(|node| prop_str(&node.properties, "tenant_id") == Some(tenant_id))
+        .filter(|node| {
+            prop_str(&node.properties, "trust_tier") == Some(OPEN_WEB_UNVERIFIED_TRUST_TIER)
+        })
+        .filter_map(|node| prop_str(&node.properties, "url").map(str::to_string))
+        .collect()
+}
+
+fn validate_request(request: &FractalExpansionRequest) -> ThgResult<()> {
+    if request.run_id.is_empty() {
+        return Err(ThgError::new(
+            "invalid_fractal_expansion",
+            "run_id is required",
+        ));
+    }
+    if request.tenant_id.is_empty() {
+        return Err(ThgError::new(
+            "invalid_fractal_expansion",
+            "tenant_id is required",
+        ));
+    }
+    if request.query.is_empty() {
+        return Err(ThgError::new(
+            "invalid_fractal_expansion",
+            "query is required",
+        ));
+    }
+    Ok(())
+}
+
+fn graph_frontier<S: GraphStore>(
+    store: &S,
+    request: &FractalExpansionRequest,
+) -> Vec<FractalFrontierHit> {
+    let search = search_substrate(store, &request.query, SearchOptions::default());
+    search
+        .hits
+        .into_iter()
+        .filter(|hit| {
+            store
+                .get_node(&hit.node_id)
+                .and_then(|node| prop_str(&node.properties, "tenant_id"))
+                == Some(request.tenant_id.as_str())
+        })
+        .take(request.frontier_limit)
+        .map(|hit| FractalFrontierHit {
+            node_id: hit.node_id,
+            url: hit.url,
+            title: hit.title,
+            score: hit.match_score,
+            ring: hit.ring,
+        })
+        .collect()
+}
+
+fn web_seeds_from_frontier(
+    request: &FractalExpansionRequest,
+    frontier: &[FractalFrontierHit],
+) -> Vec<String> {
+    let mut seeds = BTreeSet::new();
+    for seed in &request.web_seed_urls {
+        seeds.insert(seed.clone());
+    }
+    for hit in frontier {
+        if !hit.url.trim().is_empty() {
+            seeds.insert(hit.url.clone());
+        }
+    }
+    seeds.into_iter().take(request.web_seed_limit).collect()
+}
+
+fn rank_and_sanitize_pages(query: &str, pages: &[FetchedPage], top_k: usize) -> Vec<FetchedPage> {
+    let terms = query
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut scored = pages
+        .iter()
+        .cloned()
+        .map(|mut page| {
+            page.body = sanitize_web_body(&page.body);
+            let haystack = format!("{} {}", page.url, page.body).to_ascii_lowercase();
+            let score = terms
+                .iter()
+                .filter(|term| !term.is_empty() && haystack.contains(term.as_str()))
+                .count();
+            (score, page.url.clone(), page)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .filter(|(score, _, page)| *score > 0 || page.status == 200)
+        .take(top_k.max(1))
+        .map(|(_, _, page)| page)
+        .collect()
+}
+
+fn sanitize_web_body(body: &str) -> String {
+    body.replace("<script", "&lt;script")
+        .replace("</script>", "&lt;/script&gt;")
+}
+
+fn annotate_open_web_batch(mutations: &mut [GraphMutation], request: &FractalExpansionRequest) {
+    for mutation in mutations {
+        match mutation {
+            GraphMutation::NodeUpsert(node) => {
+                let props = object_props(&mut node.properties);
+                props.insert("tenant_id".to_string(), json!(request.tenant_id));
+                props.insert(
+                    "trust_tier".to_string(),
+                    json!(OPEN_WEB_UNVERIFIED_TRUST_TIER),
+                );
+                props.insert("quarantine".to_string(), json!(true));
+                props.insert(
+                    "confidence_ceiling".to_string(),
+                    json!(DEFAULT_OPEN_WEB_CONFIDENCE_CEILING),
+                );
+                props.insert(
+                    "fractal_expansion_run_id".to_string(),
+                    json!(request.run_id),
+                );
+                props.insert(
+                    "embedder_model".to_string(),
+                    json!(request
+                        .embedder_model
+                        .as_deref()
+                        .unwrap_or(DEFAULT_FRACTAL_EMBEDDER_MODEL)),
+                );
+            }
+            GraphMutation::EdgeUpsert(edge) => {
+                let props = object_props(&mut edge.properties);
+                props.insert("tenant_id".to_string(), json!(request.tenant_id));
+                props.insert(
+                    "fractal_expansion_run_id".to_string(),
+                    json!(request.run_id),
+                );
+            }
+        }
+    }
+}
+
+fn object_props(value: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value.as_object_mut().expect("object value just created")
+}
+
+fn prop_str<'a>(properties: &'a Value, key: &str) -> Option<&'a str> {
+    properties.get(key).and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use rustyred_thg_core::InMemoryGraphStore;
+    use rustyred_web::{build_v2_fixture_crawl, CrawlRequest, FetchedPage};
+
+    use super::*;
+
+    #[test]
+    fn fixture_fractal_expansion_reaches_web_and_quarantines_ingest() {
+        let mut store = InMemoryGraphStore::new();
+        let mut initial = build_v2_fixture_crawl(
+            CrawlRequest::new(
+                "initial",
+                vec!["https://example.com/rustyweb-skill".to_string()],
+            ),
+            &[FetchedPage::html(
+                "https://example.com/rustyweb-skill",
+                "<html><body>RustyWeb skill generation source</body></html>",
+            )],
+        )
+        .unwrap();
+        let initial_request = FractalExpansionRequest {
+            run_id: "initial-fractal".to_string(),
+            tenant_id: "theorem".to_string(),
+            query: "rustyweb skill".to_string(),
+            web_seed_urls: Vec::new(),
+            top_k: 2,
+            frontier_limit: 4,
+            web_seed_limit: 4,
+            embedder_model: None,
+            actor_id: None,
+        }
+        .normalized();
+        annotate_open_web_batch(&mut initial.graph.batch.mutations, &initial_request);
+        initial.graph.apply_to_store(&mut store).unwrap();
+
+        let receipt = run_fixture_fractal_expansion(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "fractal-fixture".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "rustyweb skill".to_string(),
+                web_seed_urls: vec!["https://example.com/new-grounding".to_string()],
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 4,
+                embedder_model: None,
+                actor_id: Some("test".to_string()),
+            },
+            &[FetchedPage::html(
+                "https://example.com/new-grounding",
+                "<html><body>RustyWeb skill grounding with executable scripts</body></html>",
+            )],
+        )
+        .unwrap();
+
+        assert!(receipt.graph_exhausted);
+        assert!(receipt.web_reached);
+        assert_eq!(receipt.embedder_model, DEFAULT_FRACTAL_EMBEDDER_MODEL);
+        assert!(!receipt.frontier.is_empty());
+        assert!(receipt
+            .web_seed_urls
+            .contains(&"https://example.com/new-grounding".to_string()));
+        assert_eq!(receipt.admitted_pages, 1);
+        assert!(receipt.applied_writes > 0);
+
+        let open_web_pages = open_web_pages_for_tenant(&store, "theorem");
+        assert!(open_web_pages.contains(&"https://example.com/new-grounding".to_string()));
+    }
+
+    #[test]
+    fn fixture_fractal_expansion_refuses_graph_only_terminal_state() {
+        let mut store = InMemoryGraphStore::new();
+        let error = run_fixture_fractal_expansion(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "fractal-no-web".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "missing frontier".to_string(),
+                web_seed_urls: Vec::new(),
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 4,
+                embedder_model: None,
+                actor_id: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "fractal_web_seed_required");
+    }
+
+    #[test]
+    fn fixture_fractal_expansion_ignores_cross_tenant_frontier() {
+        let mut store = InMemoryGraphStore::new();
+        let mut other_tenant = build_v2_fixture_crawl(
+            CrawlRequest::new(
+                "other-initial",
+                vec!["https://example.com/other-tenant-skill".to_string()],
+            ),
+            &[FetchedPage::html(
+                "https://example.com/other-tenant-skill",
+                "<html><body>RustyWeb skill generation source</body></html>",
+            )],
+        )
+        .unwrap();
+        let other_request = FractalExpansionRequest {
+            run_id: "other-fractal".to_string(),
+            tenant_id: "other".to_string(),
+            query: "rustyweb skill".to_string(),
+            web_seed_urls: Vec::new(),
+            top_k: 2,
+            frontier_limit: 4,
+            web_seed_limit: 4,
+            embedder_model: None,
+            actor_id: None,
+        }
+        .normalized();
+        annotate_open_web_batch(&mut other_tenant.graph.batch.mutations, &other_request);
+        other_tenant.graph.apply_to_store(&mut store).unwrap();
+
+        let error = run_fixture_fractal_expansion(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "theorem-fractal".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "rustyweb skill".to_string(),
+                web_seed_urls: Vec::new(),
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 4,
+                embedder_model: None,
+                actor_id: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "fractal_web_seed_required");
+    }
+}

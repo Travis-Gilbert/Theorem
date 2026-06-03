@@ -12,6 +12,7 @@ members = [
     ".",
     "crates/rustyred-thg-core",
     "crates/rustyred-thg-adapters",
+    "crates/rustyred-thg-fractal",
     "crates/rustyred-thg-geotemporal",
     "crates/rustyred-thg-mcp",
     "crates/rustyred-thg-compat-server",
