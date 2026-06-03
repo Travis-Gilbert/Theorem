@@ -10,6 +10,22 @@ from the Rust core. This is the binding that retires the plugin's hand-written J
 clients: the plugin calls these native methods instead of re-implementing run
 logic in JavaScript.
 
+## Typed import
+
+The package vends a typed entry point (`index.js` + `index.d.ts`), so a consumer
+imports it with full TypeScript types instead of loading the raw `.node` by path:
+
+```ts
+import { Harness } from "@theorem/harness-node";
+const h = new Harness(dataDir);
+const runId = h.startRun(task, "node", crypto.randomUUID());
+```
+
+Build the native addon first (`npm run build:debug`); `index.js` loads it. The
+hand-written `index.d.ts` mirrors the napi surface (the `@napi-rs/cli` can
+auto-generate it once wired). Verified: the typed import loads and runs
+(`PACKAGE OK`), and `tsc --strict` accepts the declarations.
+
 ## Why standalone
 
 This is a standalone single-crate workspace (its own `[workspace]` table), kept

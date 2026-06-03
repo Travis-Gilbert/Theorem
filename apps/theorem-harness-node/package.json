@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "description": "Node.js binding over the theorem-harness Rust SDK (NAPI-RS). THPS-012 slice 1.",
   "type": "commonjs",
-  "main": "theorem_harness_node.node",
+  "main": "index.js",
+  "types": "index.d.ts",
   "files": [
+    "index.js",
+    "index.d.ts",
     "theorem_harness_node.node"
   ],
   "scripts": {
