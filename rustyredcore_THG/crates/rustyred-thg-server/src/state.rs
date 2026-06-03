@@ -15,7 +15,9 @@ use rustyred_thg_core::{
     NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
     SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
-use rustyred_thg_mcp::{McpError, McpGraphBackend, McpGraphProvider, McpServerConfig};
+use rustyred_thg_mcp::{
+    HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider, McpServerConfig,
+};
 use serde_json::json;
 
 use crate::config::{Config, StorageMode};
@@ -1793,6 +1795,63 @@ impl McpGraphBackend for ProductMcpBackend {
     ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
         self.store
             .epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+    }
+
+    fn dispatch_handoff(&self, dispatch: HandoffDispatch) -> Result<(), McpError> {
+        let token = std::env::var("THEOREM_HANDOFF_GITHUB_TOKEN")
+            .or_else(|_| std::env::var("GITHUB_TOKEN"))
+            .map_err(|_| {
+                McpError::internal(
+                    "session handoff dispatch requires THEOREM_HANDOFF_GITHUB_TOKEN or GITHUB_TOKEN",
+                )
+            })?;
+        // Run the GitHub repository_dispatch POST on a dedicated thread with its own
+        // current-thread runtime, so the blocking call never nests inside the server's async
+        // runtime regardless of how the handler is scheduled.
+        std::thread::spawn(move || -> Result<(), McpError> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    McpError::internal(format!("dispatch runtime build failed: {error}"))
+                })?;
+            runtime.block_on(async move {
+                let url = format!(
+                    "https://api.github.com/repos/{}/{}/dispatches",
+                    dispatch.owner, dispatch.repo
+                );
+                let body = json!({
+                    "event_type": dispatch.event_type,
+                    "client_payload": {
+                        "intent": dispatch.intent,
+                        "branch": dispatch.branch,
+                    },
+                });
+                let response = reqwest::Client::new()
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Accept", "application/vnd.github+json")
+                    .header("User-Agent", "theorem-harness")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        McpError::internal(format!("dispatch POST failed: {error}"))
+                    })?;
+                let status = response.status();
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    let detail = response.text().await.unwrap_or_default();
+                    Err(McpError::internal(format!(
+                        "dispatch rejected ({status}): {detail}"
+                    )))
+                }
+            })
+        })
+        .join()
+        .map_err(|_| McpError::internal("dispatch thread panicked"))?
     }
 }
 

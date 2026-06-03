@@ -33,6 +33,19 @@ const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[allow(clippy::too_many_arguments)]
+/// Request to fire a GitHub Actions `repository_dispatch` that spawns a session. The MCP crate
+/// stays sync and HTTP-free; a concrete backend (the harness server, which owns reqwest) makes the
+/// actual POST. `event_type` is normally "theorem-handoff". This is the executor seam the harness
+/// direct-pathway spec routes through GitHub Actions instead of the Railway runner.
+#[derive(Debug, Clone)]
+pub struct HandoffDispatch {
+    pub owner: String,
+    pub repo: String,
+    pub event_type: String,
+    pub intent: String,
+    pub branch: String,
+}
+
 pub trait McpGraphBackend {
     fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>>;
     fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>>;
@@ -85,6 +98,14 @@ pub trait McpGraphBackend {
     fn harness_run_detail(&self, _run_id: &str) -> Result<Option<Value>, McpError> {
         Err(McpError::internal(
             "harness run reads are not supported by this MCP backend",
+        ))
+    }
+    /// Fire a session-spawn dispatch (GitHub Actions `repository_dispatch`). Defaults to
+    /// unsupported; the harness server backend overrides this with the real reqwest POST so the
+    /// MCP crate never needs an HTTP client.
+    fn dispatch_handoff(&self, _dispatch: HandoffDispatch) -> Result<(), McpError> {
+        Err(McpError::internal(
+            "session handoff dispatch is not supported by this MCP backend",
         ))
     }
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>>;
@@ -924,6 +945,19 @@ fn call_tool<P: McpGraphProvider>(
                 return Ok(tool_result_error(error));
             }
             write_contribution_payload(&tenant, &mut backend, &arguments, Some(policy_receipt))?
+        }
+        "spawn_session" | "theorem_harness_spawn_session" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Spawning native Theorem harness sessions is unavailable while read-only mode is active."
+                })));
+            }
+            let policy_receipt = coordination_policy_receipt(context, &arguments, name);
+            if let Some(error) = coordination_policy_error(&policy_receipt) {
+                return Ok(tool_result_error(error));
+            }
+            spawn_session_payload(&tenant, &mut backend, &arguments, Some(policy_receipt))?
         }
         "read_records_for_room" | "theorem_harness_read_records_for_room" => {
             read_records_payload(&tenant, &backend, &arguments)?
@@ -2430,6 +2464,140 @@ fn write_record_payload(
     });
     insert_policy_receipt(&mut payload, policy_receipt);
     Ok(payload)
+}
+
+/// Spawn a Claude Code session that is visible in the coordination room and runs via the committed
+/// GitHub Actions `theorem-handoff` workflow (`repository_dispatch`), not the Railway runner.
+/// Writes the room-visible CoordinationRecord first (so the session appears as a participant
+/// regardless of the dispatch outcome), then fires the dispatch through the injected backend.
+fn spawn_session_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    policy_receipt: Option<Value>,
+) -> Result<Value, McpError> {
+    let room_id = resolved_coordination_room_id(arguments);
+    let actor_id =
+        required_text_any(arguments, &["actor", "actor_id", "actorId"], "spawn_session")?;
+    let intent = required_text_any(arguments, &["intent", "prompt", "message"], "spawn_session")?;
+    let owner = argument_text(arguments, &["owner", "repo_owner", "repoOwner"])
+        .unwrap_or_else(|| "Travis-Gilbert".to_string());
+    let repo =
+        argument_text(arguments, &["repo", "repository"]).unwrap_or_else(|| "theorem".to_string());
+    let branch = argument_text(arguments, &["branch", "ref"]).unwrap_or_default();
+    let event_type = argument_text(arguments, &["event_type", "eventType"])
+        .unwrap_or_else(|| "theorem-handoff".to_string());
+    let created_at = timestamp_or_now(
+        &argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+    );
+    let tenant_slug = normalize_tenant_slug(tenant);
+    let dispatch_id = stable_coordination_record_id(
+        &tenant_slug,
+        &room_id,
+        "spawn",
+        &actor_id,
+        &intent,
+        &created_at,
+    );
+    let summary = intent
+        .lines()
+        .next()
+        .unwrap_or(intent.as_str())
+        .chars()
+        .take(160)
+        .collect::<String>();
+
+    // (1) write the room-visible CoordinationRecord first, reusing the existing write machinery.
+    let mut metadata = argument_object(arguments, "metadata");
+    metadata.insert("dispatch_id".to_string(), json!(dispatch_id));
+    metadata.insert("owner".to_string(), json!(owner));
+    metadata.insert("repo".to_string(), json!(repo));
+    metadata.insert("branch".to_string(), json!(branch));
+    metadata.insert("surface".to_string(), json!("spawned"));
+    metadata.insert("kind".to_string(), json!("spawn"));
+    metadata.insert("status".to_string(), json!("running"));
+    metadata.insert("executor".to_string(), json!("github_actions"));
+    metadata.insert("event_type".to_string(), json!(event_type));
+    metadata.insert("intent".to_string(), json!(intent));
+
+    let record = write_coordination_record(
+        backend,
+        WriteRecordInput {
+            tenant_slug: tenant.to_string(),
+            room_id: room_id.clone(),
+            actor_id: actor_id.clone(),
+            record_id: dispatch_id.clone(),
+            record_type: "event".to_string(),
+            title: format!("spawned session: {summary}"),
+            summary: summary.clone(),
+            body: intent.clone(),
+            metadata,
+            created_at,
+        },
+    )?;
+
+    // (2) fire the GitHub Actions repository_dispatch via the injected backend (not the runner).
+    let (status, dispatch_error) = match backend.dispatch_handoff(HandoffDispatch {
+        owner: owner.clone(),
+        repo: repo.clone(),
+        event_type,
+        intent,
+        branch: branch.clone(),
+    }) {
+        Ok(()) => ("running", None),
+        Err(error) => {
+            let _ = update_spawn_record_status(
+                backend,
+                tenant,
+                &room_id,
+                &dispatch_id,
+                "dispatch_failed",
+                None,
+            );
+            ("dispatch_failed", Some(error.message))
+        }
+    };
+
+    let mut payload = json!({
+        "tenant": tenant,
+        "room_id": room_id,
+        "dispatch_id": dispatch_id,
+        "status": status,
+        "executor": "github_actions",
+        "repo": format!("{owner}/{repo}"),
+        "branch": branch,
+        "record": record,
+        "dispatch_error": dispatch_error,
+    });
+    insert_policy_receipt(&mut payload, policy_receipt);
+    Ok(payload)
+}
+
+/// Update a spawn CoordinationRecord by dispatch id. This is the seam the PR-opened webhook calls
+/// to close the loop with status "done"/"failed" and the PR URL; the webhook HTTP route on the
+/// harness service is the explicit follow-up per the spec sequencing.
+fn update_spawn_record_status(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+    dispatch_id: &str,
+    status: &str,
+    pr_url: Option<&str>,
+) -> Result<Option<CoordinationRecordState>, McpError> {
+    let records =
+        read_coordination_records(&*backend, tenant, room_id, &["event".to_string()], 200)?;
+    let Some(mut record) = records.into_iter().find(|record| {
+        record.record_id == dispatch_id
+            || record.metadata.get("dispatch_id").and_then(Value::as_str) == Some(dispatch_id)
+    }) else {
+        return Ok(None);
+    };
+    record.metadata.insert("status".to_string(), json!(status));
+    if let Some(url) = pr_url {
+        record.metadata.insert("pr_url".to_string(), json!(url));
+    }
+    persist_coordination_record(backend, &record)?;
+    Ok(Some(record))
 }
 
 fn write_contribution_payload(
@@ -5336,6 +5504,31 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ));
         tools.push(tool_write(
+            "spawn_session",
+            "Spawn a Claude Code session that is room-visible and runs via the committed GitHub Actions theorem-handoff workflow (repository_dispatch), not the Railway runner.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "intent": { "type": "string" },
+                    "owner": { "type": "string", "default": "Travis-Gilbert" },
+                    "repo": { "type": "string", "default": "theorem" },
+                    "branch": { "type": "string" },
+                    "event_type": { "type": "string", "default": "theorem-handoff" },
+                    "metadata": { "type": "object" },
+                    "required_scope": { "type": "string" },
+                    "required_scopes": { "type": "array", "items": { "type": "string" } },
+                    "estimated_cost_units": { "type": "number", "default": 0.0 },
+                    "budget_units": { "type": "number" }
+                },
+                "required": ["actor", "intent"]
+            }),
+        ));
+        tools.push(tool_write(
             "remember",
             "Write a native Theorem harness memory document or typed memory node.",
             json!({
@@ -6190,6 +6383,10 @@ mod tests {
             harness_run_detail_from_store(&*store, run_id)
         }
 
+        fn dispatch_handoff(&self, _dispatch: super::HandoffDispatch) -> Result<(), McpError> {
+            Ok(())
+        }
+
         fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
             Ok(InMemoryGraphStore::vector_designations(&self.0.borrow()))
         }
@@ -6997,6 +7194,58 @@ mod tests {
         );
         assert_eq!(forgotten["forgotten_type"], "document");
         assert_eq!(forgotten["document"]["status"], "deleted");
+    }
+
+    #[test]
+    fn spawn_session_writes_room_visible_coordination_record() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let room_id = "repo:theorem:branch:handoff-demo";
+        let spawned = call_tool_json(
+            &provider,
+            &config,
+            "spawn_session",
+            json!({
+                "actor": "claude-code",
+                "room_id": room_id,
+                "intent": "Implement the foo widget and open a PR\nwith full coverage",
+                "repo": "theorem",
+                "branch": "handoff-demo"
+            }),
+        );
+
+        assert_eq!(spawned["status"], "running");
+        assert_eq!(spawned["executor"], "github_actions");
+        let dispatch_id = spawned["dispatch_id"]
+            .as_str()
+            .expect("dispatch_id string")
+            .to_string();
+        assert!(!dispatch_id.is_empty());
+        assert_eq!(spawned["record"]["record_type"], "event");
+        assert_eq!(spawned["record"]["metadata"]["surface"], "spawned");
+        assert_eq!(spawned["record"]["metadata"]["status"], "running");
+        // summary is the first line of the intent, not the whole prompt
+        assert_eq!(
+            spawned["record"]["summary"],
+            "Implement the foo widget and open a PR"
+        );
+
+        // the spawned session is retrievable from the room exactly like any participant record
+        let records = call_tool_json(
+            &provider,
+            &config,
+            "read_records_for_room",
+            json!({ "room_id": room_id, "record_types": ["event"] }),
+        );
+        let list = records["records"].as_array().expect("records array");
+        assert!(
+            list.iter().any(|record| {
+                record["metadata"]["dispatch_id"] == json!(dispatch_id)
+                    && record["metadata"]["surface"] == json!("spawned")
+            }),
+            "spawn record should be retrievable from the room: {records}"
+        );
     }
 
     #[test]
