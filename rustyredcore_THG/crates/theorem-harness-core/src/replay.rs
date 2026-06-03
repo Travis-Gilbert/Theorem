@@ -163,7 +163,7 @@ pub fn replay_events(events: &[EventState]) -> Result<Option<RunState>, HarnessE
             event_type: event.event_type,
             payload: event.payload,
             actor: String::new(),
-            idempotency_key: String::new(),
+            idempotency_key: event.idempotency_key,
             created_at: event.created_at,
         };
         state = Some(apply_transition(state, transition)?.run);
