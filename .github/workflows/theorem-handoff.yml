@@ -6,6 +6,11 @@ name: Theorem Handoff
 # fires the dispatch; this workflow runs Claude Code on GitHub's runner with
 # the intent as an explicit prompt and lets the action push its work / open a PR.
 #
+# Also triggered by a push touching .handoff/** (the claude.ai bootstrap path):
+# committing .handoff/intent.md fires this workflow and the intent is read from
+# that file. This lets a surface that can write files but cannot send a
+# repository_dispatch (e.g. claude.ai's curated github-mcp subset) still hand off.
+#
 # Auth: this uses CLAUDE_CODE_OAUTH_TOKEN so spawned sessions bill against a
 # Claude subscription (flat rate) rather than metered API usage. The action
 # runs `claude -p` under the hood; from 2026-06-15 that draws a separate
@@ -28,6 +33,9 @@ name: Theorem Handoff
 on:
   repository_dispatch:
     types: [theorem-handoff]
+  push:
+    paths:
+      - '.handoff/**'
 
 jobs:
   run:
@@ -42,8 +50,22 @@ jobs:
           ref: ${{ github.event.client_payload.branch || github.event.repository.default_branch }}
           fetch-depth: 0
 
+      - name: Read file intent (push handoff)
+        id: file_intent
+        if: github.event_name == 'push'
+        run: |
+          if [ ! -f .handoff/intent.md ]; then
+            echo "push touched .handoff/** but .handoff/intent.md is missing" >&2
+            exit 1
+          fi
+          {
+            echo 'prompt<<THEOREM_HANDOFF_EOF'
+            cat .handoff/intent.md
+            echo 'THEOREM_HANDOFF_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code on the handoff intent
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: ${{ github.event.client_payload.intent }}
+          prompt: ${{ github.event.client_payload.intent || steps.file_intent.outputs.prompt }}
