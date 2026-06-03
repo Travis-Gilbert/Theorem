@@ -8,3 +8,8 @@
 # Compiled Swift smoke and any native library copy: build artifacts.
 smoke_swift
 *.dylib
+
+# xcframework build artifacts (80M): regenerate with ./build-xcframework.sh.
+/TheoremHarnessFFI.xcframework
+/headers
+/Sources/TheoremHarness

@@ -54,14 +54,34 @@ RedCore -> Swift: start a run, read its events, cancel it, read the status, then
 `remember` and `recall` a memory. The generated `generated/` dir and the compiled
 `smoke_swift` are build artifacts (gitignored); `src/lib.rs` is the source of truth.
 
+## iOS app consumption (xcframework + SwiftPM)
+
+`./build-xcframework.sh` builds the Rust core for iOS device + simulator and
+produces `TheoremHarnessFFI.xcframework` plus the generated Swift API under
+`Sources/TheoremHarness/`. The package (`Package.swift`) vends a `TheoremHarness`
+library: the iOS app (`apps/theorem-ios`) depends on this directory as a local
+SwiftPM package and uses it:
+
+```swift
+import TheoremHarness
+
+let harness = try Harness(dataDir: appSupportDir)
+let runId = try harness.startRun(task: "...", actor: "ios", idempotencyKey: UUID().uuidString)
+let events = try harness.eventsJson(runId: runId)
+```
+
+Verified: `xcodebuild -scheme TheoremHarness -destination 'generic/platform=iOS Simulator' build`
+=> **BUILD SUCCEEDED** (the generated Swift links against the xcframework's iOS
+slice for arm64 device + arm64/x86_64 simulator). The xcframework (80M) and the
+generated `Sources/TheoremHarness/` are build artifacts (gitignored); regenerate
+with `./build-xcframework.sh`.
+
 ## Deferred (named, not stubbed)
 
-- An `.xcframework` + Swift Package wrapper for direct Xcode/SwiftPM consumption
-  (this slice generates the bindings and proves they run; packaging for the iOS
-  target is the next step). It needs a multi-arch build (device + simulator) and
-  `xcodebuild -create-xcframework`.
-- The async streaming surface (the Swift `AsyncSequence` over the run event
-  cursor), mirroring the Node `streamRun`.
+- The async streaming surface (a Swift `AsyncSequence` over the run event cursor),
+  mirroring the Node `streamRun`.
+- Hosting the xcframework as a remote binary target (url + checksum) instead of a
+  local build, for distribution beyond this repo.
 
 ## Cross-agent note
 
