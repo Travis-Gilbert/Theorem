@@ -34,16 +34,19 @@ tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-# The pure-Rust engine. rustyred-web::search_substrate is the real search
+# The pure-Rust search engine. rustyred-web::search_substrate is the real search
 # kernel; rustyred-thg-core::{InMemoryGraphStore, personalized_pagerank} are
 # the substrate + PPR primitive. Neither crate has any Python/PyO3 dep
 # (verified against their Cargo.toml). This binary NEVER touches the PyO3
 # #[pyfunction] wrappers in rustyredcore_THG/src/*.rs.
 rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web" }
 rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+# AppAffordanceService uses RedCoreGraphStore for durable invocation receipts
+# and rustyred-thg-affordances for registry, selection, and learning writes.
 rustyred-thg-affordances = { path = "../../rustyredcore_THG/crates/rustyred-thg-affordances" }
 theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
 

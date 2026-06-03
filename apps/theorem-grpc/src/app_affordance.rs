@@ -6,17 +6,18 @@
 //! invocation outcomes into the affordance graph, and returns the same
 //! content-addressed receipt envelope the harness already understands.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustyred_thg_affordances::{
     record_invocation, register_theseus_app_affordances, select_affordances,
     theseus_app_affordances, Affordance, AffordanceGraphStore, CapabilityScope,
     InvocationRecordRequest, InvocationRecordResult, SelectionRequest, THEOREM_GRPC_TIMEOUT_MS,
 };
-use rustyred_thg_core::{stable_hash, InMemoryGraphStore};
+use rustyred_thg_core::{stable_hash, RedCoreDurability, RedCoreGraphStore, RedCoreOptions};
 use serde_json::{json, Map, Value};
-use theorem_harness_core::AffordanceReceipt;
+use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
 
 use crate::pb;
@@ -27,10 +28,14 @@ pub struct TheoremAppAffordanceService {
 }
 
 impl TheoremAppAffordanceService {
+    pub fn try_new() -> Result<Self, String> {
+        Ok(Self {
+            runtime: AppAffordanceRuntime::try_new()?,
+        })
+    }
+
     pub fn new() -> Self {
-        Self {
-            runtime: AppAffordanceRuntime::new(),
-        }
+        Self::try_new().expect("theorem_grpc RedCore app affordance runtime must open")
     }
 }
 
@@ -58,17 +63,32 @@ impl pb::AppAffordanceService for TheoremAppAffordanceService {
 
 #[derive(Clone)]
 struct AppAffordanceRuntime {
-    store: Arc<Mutex<InMemoryGraphStore>>,
+    store: Arc<Mutex<RedCoreGraphStore>>,
+    adapter: TheseusAppAdapter,
 }
 
 impl AppAffordanceRuntime {
-    fn new() -> Self {
-        let mut store = InMemoryGraphStore::new();
+    fn try_new() -> Result<Self, String> {
+        Self::try_new_at(
+            redcore_data_dir(),
+            redcore_options(),
+            TheseusAppAdapter::from_env(),
+        )
+    }
+
+    fn try_new_at(
+        data_dir: impl AsRef<Path>,
+        options: RedCoreOptions,
+        adapter: TheseusAppAdapter,
+    ) -> Result<Self, String> {
+        let mut store = RedCoreGraphStore::open(data_dir.as_ref(), options)
+            .map_err(|err| format!("open theorem_grpc RedCore store failed: {err:?}"))?;
         register_theseus_app_affordances(&mut store, "theorem", Some("theorem-grpc"))
-            .expect("built-in theorem_grpc affordance registry must validate");
-        Self {
+            .map_err(|err| format!("register theorem_grpc affordances failed: {err:?}"))?;
+        Ok(Self {
             store: Arc::new(Mutex::new(store)),
-        }
+            adapter,
+        })
     }
 
     fn invoke(
@@ -80,12 +100,18 @@ impl AppAffordanceRuntime {
             .store
             .lock()
             .map_err(|_| "app affordance graph store lock poisoned".to_string())?;
-        Ok(invoke_registered_affordance(&mut *store, req, started))
+        Ok(invoke_registered_affordance(
+            &mut *store,
+            &self.adapter,
+            req,
+            started,
+        ))
     }
 }
 
 fn invoke_registered_affordance<S: AffordanceGraphStore>(
     store: &mut S,
+    adapter: &TheseusAppAdapter,
     req: pb::InvokeAffordanceRequest,
     started: Instant,
 ) -> pb::InvokeAffordanceResponse {
@@ -223,7 +249,15 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
         });
     }
 
-    let outcome = handle_affordance(&affordance, &request_value, req.confirmed, timeout_ms);
+    let outcome = handle_affordance(
+        &affordance,
+        &request_value,
+        req.confirmed,
+        timeout_ms,
+        adapter,
+        &tenant_id,
+        actor.as_str(),
+    );
     let feedback = record_feedback(
         store,
         &tenant_id,
@@ -269,14 +303,33 @@ fn handle_affordance(
     request: &Value,
     confirmed: bool,
     timeout_ms: u64,
+    adapter: &TheseusAppAdapter,
+    tenant_id: &str,
+    actor: &str,
 ) -> HandlerOutcome {
     let request_hash = stable_hash(request.clone());
-    let adapter = AppAffordanceHeadAdapter::from_request(affordance, request);
+    let provider_context = ProviderHeadExecutionContext::from_request_head(
+        "theorem_grpc.AppAffordanceService",
+        affordance.tool_name.clone(),
+        request.get("head"),
+    );
+    if uses_live_theseus_adapter(affordance) {
+        return adapter.invoke(TheseusAppCall {
+            tenant_id: tenant_id.to_string(),
+            actor: actor.to_string(),
+            affordance: affordance.clone(),
+            request: request.clone(),
+            confirmed,
+            timeout_ms,
+            provider_context,
+        });
+    }
+
     let base = json!({
         "handler": affordance.tool_name,
         "request_hash": request_hash,
         "timeout_ms": timeout_ms,
-        "provider_head_adapter": adapter.execution_context(),
+        "provider_head_adapter": provider_context.to_payload(),
     });
 
     let output = match affordance.tool_name.as_str() {
@@ -407,50 +460,174 @@ fn handle_affordance(
     }
 }
 
-#[derive(Clone, Debug)]
-struct AppAffordanceHeadAdapter {
-    head_id: String,
-    provider: String,
-    model: String,
-    transport: String,
+#[derive(Clone)]
+struct TheseusAppAdapter {
+    endpoint: Option<String>,
+    bearer_token: Option<String>,
+    client: reqwest::blocking::Client,
 }
 
-impl AppAffordanceHeadAdapter {
-    fn from_request(affordance: &Affordance, request: &Value) -> Self {
-        let head = request.get("head").and_then(Value::as_object);
+impl TheseusAppAdapter {
+    fn from_env() -> Self {
+        Self::new(
+            std::env::var("THESEUS_APP_ADAPTER_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("THESEUS_APP_BASE_URL")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|base| {
+                            format!(
+                                "{}/api/v2/theorem/app-affordances/invoke/",
+                                base.trim_end_matches('/')
+                            )
+                        })
+                }),
+            std::env::var("THESEUS_APP_ADAPTER_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+        )
+    }
+
+    fn new(endpoint: Option<String>, bearer_token: Option<String>) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(THEOREM_GRPC_TIMEOUT_MS))
+            .build()
+            .expect("reqwest blocking client should build");
         Self {
-            head_id: head
-                .and_then(|value| value.get("head_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("theorem-grpc-local")
-                .to_string(),
-            provider: head
-                .and_then(|value| value.get("provider"))
-                .and_then(Value::as_str)
-                .unwrap_or("theorem_grpc")
-                .to_string(),
-            model: head
-                .and_then(|value| value.get("model"))
-                .and_then(Value::as_str)
-                .unwrap_or(affordance.tool_name.as_str())
-                .to_string(),
-            transport: head
-                .and_then(|value| value.get("transport"))
-                .and_then(Value::as_str)
-                .unwrap_or("local")
-                .to_string(),
+            endpoint,
+            bearer_token,
+            client,
         }
     }
 
-    fn execution_context(&self) -> Value {
-        json!({
-            "adapter": "AppAffordanceHeadAdapter",
-            "head_id": self.head_id,
-            "provider": self.provider,
-            "model": self.model,
-            "transport": self.transport,
-        })
+    fn invoke(&self, call: TheseusAppCall) -> HandlerOutcome {
+        let Some(endpoint) = self.endpoint.as_deref() else {
+            return HandlerOutcome {
+                status: "failed".to_string(),
+                executed: false,
+                output: json!({
+                    "handler": call.affordance.tool_name,
+                    "request_hash": stable_hash(call.request),
+                    "timeout_ms": call.timeout_ms,
+                    "provider_head_adapter": call.provider_context.to_payload(),
+                    "theseus_app_adapter": {
+                        "configured": false,
+                        "env": "THESEUS_APP_ADAPTER_ENDPOINT",
+                    }
+                }),
+                error_code: "THESEUS_APP_ADAPTER_UNCONFIGURED".to_string(),
+                message: "confirmed side-effecting affordance requires a configured Theseus app adapter endpoint".to_string(),
+                outcome_value: 0.0,
+                outcome_label: "theseus_adapter_unconfigured".to_string(),
+            };
+        };
+
+        let payload = json!({
+            "tenant_id": call.tenant_id,
+            "actor": call.actor,
+            "affordance_id": call.affordance.affordance_id,
+            "tool_name": call.affordance.tool_name,
+            "family": call.affordance.family,
+            "writeback_policy": call.affordance.writeback_policy,
+            "request": call.request,
+            "confirmed": call.confirmed,
+            "timeout_ms": call.timeout_ms,
+            "provider_head_adapter": call.provider_context.to_payload(),
+        });
+
+        let mut request = self
+            .client
+            .post(endpoint)
+            .timeout(Duration::from_millis(call.timeout_ms))
+            .json(&payload);
+        if let Some(token) = self.bearer_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(err) => {
+                return HandlerOutcome {
+                    status: "failed".to_string(),
+                    executed: false,
+                    output: json!({
+                        "theseus_app_adapter": {
+                            "configured": true,
+                            "endpoint": endpoint,
+                            "request_hash": stable_hash(payload),
+                            "error": err.to_string(),
+                        }
+                    }),
+                    error_code: "THESEUS_APP_ADAPTER_SEND_FAILED".to_string(),
+                    message: "Theseus app adapter request failed before a response was received"
+                        .to_string(),
+                    outcome_value: 0.0,
+                    outcome_label: "theseus_adapter_send_failed".to_string(),
+                };
+            }
+        };
+
+        let status_code = response.status().as_u16();
+        let response_json = response
+            .json::<Value>()
+            .unwrap_or_else(|err| json!({ "decode_error": err.to_string() }));
+        let status = response_json
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(if status_code < 400 { "ok" } else { "failed" })
+            .to_string();
+        let executed = response_json
+            .get("executed")
+            .and_then(Value::as_bool)
+            .unwrap_or(status_code < 400);
+        let error_code = response_json
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or(if status_code < 400 {
+                ""
+            } else {
+                "THESEUS_APP_ADAPTER_HTTP_FAILED"
+            })
+            .to_string();
+        let message = response_json
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Theseus app adapter responded")
+            .to_string();
+        let ok = status_code < 400 && status == "ok" && executed;
+
+        HandlerOutcome {
+            status,
+            executed,
+            output: json!({
+                "theseus_app_adapter": {
+                    "configured": true,
+                    "endpoint": endpoint,
+                    "http_status": status_code,
+                    "response": response_json,
+                }
+            }),
+            error_code,
+            message,
+            outcome_value: if ok { 1.0 } else { 0.0 },
+            outcome_label: if ok {
+                "theseus_adapter_ok".to_string()
+            } else {
+                "theseus_adapter_failed".to_string()
+            },
+        }
     }
+}
+
+struct TheseusAppCall {
+    tenant_id: String,
+    actor: String,
+    affordance: Affordance,
+    request: Value,
+    confirmed: bool,
+    timeout_ms: u64,
+    provider_context: ProviderHeadExecutionContext,
 }
 
 struct FeedbackRecord {
@@ -677,6 +854,32 @@ fn normalized_timeout(raw: u64) -> u64 {
     }
 }
 
+fn redcore_data_dir() -> PathBuf {
+    std::env::var("THEOREM_GRPC_REDCORE_DIR")
+        .or_else(|_| std::env::var("THEOREM_GRPC_DATA_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/theorem-grpc/redcore"))
+}
+
+fn redcore_options() -> RedCoreOptions {
+    let mut options = RedCoreOptions::default();
+    if let Ok(raw) = std::env::var("THEOREM_GRPC_REDCORE_DURABILITY") {
+        options.durability = RedCoreDurability::parse(&raw);
+    }
+    if let Ok(raw) = std::env::var("THEOREM_GRPC_REDCORE_SNAPSHOT_INTERVAL") {
+        if let Ok(value) = raw.parse::<u64>() {
+            options.snapshot_interval_writes = value;
+        }
+    }
+    if let Ok(raw) = std::env::var("THEOREM_GRPC_REDCORE_STRICT_ACID") {
+        options.strict_acid = matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    options
+}
+
 fn requires_confirmation(affordance: &Affordance) -> bool {
     if !matches!(
         affordance.writeback_policy.as_str(),
@@ -694,6 +897,10 @@ fn requires_confirmation(affordance: &Affordance) -> bool {
                 "external_action" | "private_write" | "write" | "writeback"
             )
         })
+}
+
+fn uses_live_theseus_adapter(affordance: &Affordance) -> bool {
+    requires_confirmation(affordance)
 }
 
 fn affordance_metadata(affordance: &Affordance) -> Value {
@@ -782,22 +989,52 @@ fn merge_json(mut left: Value, right: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use rustyred_thg_affordances::INVOCATION_RECEIPT_LABEL;
     use rustyred_thg_core::NodeQuery;
 
     use super::*;
 
+    fn test_options() -> RedCoreOptions {
+        RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: true,
+        }
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "theorem-grpc-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn runtime_with_adapter(adapter: TheseusAppAdapter) -> (AppAffordanceRuntime, PathBuf) {
+        let data_dir = unique_test_dir("redcore");
+        let runtime = AppAffordanceRuntime::try_new_at(&data_dir, test_options(), adapter).unwrap();
+        (runtime, data_dir)
+    }
+
     fn invoke(
         req: pb::InvokeAffordanceRequest,
-    ) -> (AppAffordanceRuntime, pb::InvokeAffordanceResponse) {
-        let runtime = AppAffordanceRuntime::new();
+    ) -> (AppAffordanceRuntime, pb::InvokeAffordanceResponse, PathBuf) {
+        let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
         let response = runtime.invoke(req, Instant::now()).unwrap();
-        (runtime, response)
+        (runtime, response, data_dir)
     }
 
     #[test]
     fn dry_run_returns_registered_affordance_receipt() {
-        let (_, response) = invoke(pb::InvokeAffordanceRequest {
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
             tenant_id: "theorem".to_string(),
             affordance_id: "theorem_grpc.publisher.publish".to_string(),
             actor: "test".to_string(),
@@ -815,11 +1052,13 @@ mod tests {
         assert!(response
             .receipt_json
             .contains("theorem_grpc.publisher.publish"));
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]
     fn external_write_requires_confirmation_and_records_failure() {
-        let (runtime, response) = invoke(pb::InvokeAffordanceRequest {
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
             tenant_id: "theorem".to_string(),
             affordance_id: "theorem_grpc.publisher.publish".to_string(),
             actor: "test".to_string(),
@@ -835,22 +1074,28 @@ mod tests {
         assert!(response.output_json.contains("\"graph_invocation\""));
 
         let store = runtime.store.lock().unwrap();
-        let receipts = store.query_nodes(NodeQuery::label(INVOCATION_RECEIPT_LABEL));
+        let receipts = store
+            .query_nodes(NodeQuery::label(INVOCATION_RECEIPT_LABEL))
+            .unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(
             receipts[0].properties["outcome_label"],
             "confirmation_required"
         );
+        drop(store);
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]
-    fn confirmed_known_affordance_runs_concrete_handler_and_records_feedback() {
-        let (_, response) = invoke(pb::InvokeAffordanceRequest {
+    fn read_only_affordance_runs_local_handler_and_records_feedback() {
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
             tenant_id: "theorem".to_string(),
-            affordance_id: "theorem_grpc.research.expand".to_string(),
+            affordance_id: "theorem_grpc.observability.read_trace".to_string(),
             actor: "test".to_string(),
-            request_json: r#"{"query":"substrate browsers","head":{"provider":"fake-provider","model":"fake-model"}}"#
-                .to_string(),
+            request_json:
+                r#"{"run_id":"run:1","head":{"provider":"fake-provider","model":"fake-model"}}"#
+                    .to_string(),
             dry_run: false,
             confirmed: true,
             timeout_ms: 42_000,
@@ -859,18 +1104,90 @@ mod tests {
         assert_eq!(response.status, "ok");
         assert!(response.executed);
         assert_eq!(response.error_code, "");
-        assert!(response.output_json.contains("\"frontier_receipted\""));
+        assert!(response.output_json.contains("\"empty_trace_local\""));
         assert!(response.output_json.contains("\"timeout_ms\":30000"));
         assert!(response
             .output_json
-            .contains("\"AppAffordanceHeadAdapter\""));
+            .contains("\"theorem_grpc.AppAffordanceService\""));
         assert!(response.output_json.contains("\"fake-provider\""));
         assert!(response.output_json.contains("\"capability_selection\""));
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn confirmed_side_effecting_affordance_requires_live_adapter_configuration() {
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
+            tenant_id: "theorem".to_string(),
+            affordance_id: "theorem_grpc.publisher.publish".to_string(),
+            actor: "test".to_string(),
+            request_json: r#"{"artifact_id":"a1"}"#.to_string(),
+            dry_run: false,
+            confirmed: true,
+            timeout_ms: 0,
+        });
+
+        assert_eq!(response.status, "failed");
+        assert_eq!(response.error_code, "THESEUS_APP_ADAPTER_UNCONFIGURED");
+        assert!(!response.executed);
+        assert!(response
+            .output_json
+            .contains("\"theseus_adapter_unconfigured\""));
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn confirmed_side_effecting_affordance_calls_configured_theseus_adapter() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.contains("theorem_grpc.publisher.publish"));
+            let body = r#"{"status":"ok","executed":true,"message":"published via test adapter","output":{"publication_id":"pub:test"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let (runtime, data_dir) =
+            runtime_with_adapter(TheseusAppAdapter::new(Some(endpoint), None));
+        let response = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.publisher.publish".to_string(),
+                    actor: "test".to_string(),
+                    request_json: r#"{"artifact_id":"a1"}"#.to_string(),
+                    dry_run: false,
+                    confirmed: true,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+
+        assert_eq!(response.status, "ok");
+        assert!(response.executed);
+        assert!(response
+            .output_json
+            .contains("\"publication_id\":\"pub:test\""));
+        assert!(response.output_json.contains("\"theseus_adapter_ok\""));
+        handle.join().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]
     fn invalid_json_is_receipted_as_failure_and_graph_outcome() {
-        let (runtime, response) = invoke(pb::InvokeAffordanceRequest {
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
             tenant_id: "theorem".to_string(),
             affordance_id: "theorem_grpc.research.expand".to_string(),
             actor: "test".to_string(),
@@ -886,8 +1203,49 @@ mod tests {
         assert!(response.output_json.contains("\"invalid_request_json\""));
 
         let store = runtime.store.lock().unwrap();
-        let receipts = store.query_nodes(NodeQuery::label(INVOCATION_RECEIPT_LABEL));
+        let receipts = store
+            .query_nodes(NodeQuery::label(INVOCATION_RECEIPT_LABEL))
+            .unwrap();
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].properties["outcome_value"], 0.0);
+        drop(store);
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_runtime_recovers_invocation_receipts() {
+        let data_dir = unique_test_dir("recover");
+        {
+            let runtime = AppAffordanceRuntime::try_new_at(
+                &data_dir,
+                test_options(),
+                TheseusAppAdapter::new(None, None),
+            )
+            .unwrap();
+            let response = runtime
+                .invoke(
+                    pb::InvokeAffordanceRequest {
+                        tenant_id: "theorem".to_string(),
+                        affordance_id: "theorem_grpc.observability.read_trace".to_string(),
+                        actor: "test".to_string(),
+                        request_json: r#"{"run_id":"run:1"}"#.to_string(),
+                        dry_run: false,
+                        confirmed: false,
+                        timeout_ms: 0,
+                    },
+                    Instant::now(),
+                )
+                .unwrap();
+            assert_eq!(response.status, "ok");
+        }
+
+        let recovered = RedCoreGraphStore::open(&data_dir, test_options()).unwrap();
+        let receipts = recovered
+            .query_nodes(NodeQuery::label(INVOCATION_RECEIPT_LABEL))
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].properties["outcome_label"], "handler_ok");
+        std::fs::remove_dir_all(data_dir).ok();
     }
 }

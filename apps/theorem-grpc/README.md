@@ -14,11 +14,25 @@ It also serves `theorem_grpc.AppAffordanceService`, the live transport boundary
 for metadata-registered `theorem_grpc.*` Theseus app affordances. The service
 validates affordance ids, confirmation gates, timeout policy, and
 content-addressed receipt shape, then dispatches local receipt-first handlers for
-the Theseus app families. Each non-dry-run invocation records an affordance
-outcome into the service GraphStore and returns charter-scoped capability
-recommendations from the same selection path. Confirmed external actions record
-the confirmed intent and learning receipt; the local handler still reports that
-the external side effect was not performed locally.
+read-only Theseus app families. Each non-dry-run invocation records an
+affordance outcome into the service RedCore store and returns charter-scoped
+capability recommendations from the same selection path. Confirmed side-effecting
+actions call a configured Theseus app adapter endpoint; without one they fail
+safely and still record the failed attempt as a learning receipt.
+
+Durability and live adapter knobs:
+
+- `THEOREM_GRPC_REDCORE_DIR`: RedCore data directory for app affordance receipts
+  (default: `data/theorem-grpc/redcore`).
+- `THEOREM_GRPC_REDCORE_DURABILITY`: `aof_everysec` default; also supports
+  `aof_always`, `snapshot_only`, or `none`.
+- `THEOREM_GRPC_REDCORE_STRICT_ACID`: set to `true` with `aof_always` when every
+  receipt write must fsync before success.
+- `THESEUS_APP_ADAPTER_ENDPOINT`: full HTTP endpoint for confirmed
+  side-effecting app affordance calls.
+- `THESEUS_APP_BASE_URL`: alternate base URL; the service appends
+  `/api/v2/theorem/app-affordances/invoke/`.
+- `THESEUS_APP_ADAPTER_TOKEN`: optional bearer token for that adapter endpoint.
 
 Build: `cargo build -p theorem-grpc` (run from this dir; standalone Cargo root,
 not a member of `rustyredcore_THG`).

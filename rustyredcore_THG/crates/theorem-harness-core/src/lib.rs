@@ -6,6 +6,7 @@ pub mod context_web;
 pub mod federated_signals;
 pub mod map_artifacts;
 pub mod memory_contracts;
+pub mod provider_head_adapter;
 pub mod replay;
 pub mod session_metrics;
 pub mod state_hash;
@@ -47,6 +48,7 @@ pub use memory_contracts::{
     PrepareMemoryBank, PrepareMemoryContract, PrepareMemoryEvidence, PrepareMemoryHydrationHandle,
     PrepareMemoryPolicy, PrepareMemoryRecallPolicy, PrepareMemoryRecallPreview,
 };
+pub use provider_head_adapter::ProviderHeadExecutionContext;
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};
 pub use session_metrics::{
     compare_modes, load_jsonl_metrics, summarize_pairformer_ab, PairformerSummaryRow,

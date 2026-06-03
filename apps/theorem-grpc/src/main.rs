@@ -38,7 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it in an Arc so the owned store outlives every borrowing handler call.
     let engine = Arc::new(Engine::new());
     let search_svc = SearchServiceServer::new(TheoremSearchService::new(engine));
-    let app_affordance_svc = AppAffordanceServiceServer::new(TheoremAppAffordanceService::new());
+    let app_affordance_svc = AppAffordanceServiceServer::new(
+        TheoremAppAffordanceService::try_new().map_err(std::io::Error::other)?,
+    );
 
     tracing::info!("THEOREM_GRPC_READY {}", addr);
 
