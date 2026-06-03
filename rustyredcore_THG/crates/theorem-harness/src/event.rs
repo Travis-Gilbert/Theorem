@@ -95,6 +95,13 @@ impl Event {
         &self.inner.state_hash_after
     }
 
+    /// The client idempotency token recorded with this event (empty if none). A
+    /// retry carrying the same token short-circuits to this event rather than
+    /// appending again.
+    pub fn idempotency_key(&self) -> &str {
+        &self.inner.idempotency_key
+    }
+
     /// A human-readable text projection of this event, if it carries one.
     ///
     /// The text stream (the default convenience view) is built from these

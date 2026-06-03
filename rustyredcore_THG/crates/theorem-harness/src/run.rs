@@ -115,6 +115,20 @@ impl RunHandle {
         self.cancel.handle()
     }
 
+    /// Idempotent-retry lookup: if a non-empty `token` already produced an event
+    /// on this run, return it. Empty tokens never match, so they never
+    /// short-circuit. Backed by the `idempotency_key` THPS-003 persists on every
+    /// event.
+    fn event_for_token<S: GraphStore>(&self, store: &S, token: &str) -> SdkResult<Option<Event>> {
+        if token.is_empty() {
+            return Ok(None);
+        }
+        Ok(load_events(store, &self.run_id)?
+            .into_iter()
+            .find(|event| event.idempotency_key == token)
+            .map(Event::new))
+    }
+
     /// Append a transition to the run and return the typed event.
     ///
     /// Returns [`SdkError::Cancelled`] without touching the store if the run has
@@ -126,6 +140,11 @@ impl RunHandle {
         payload: Payload,
         idempotency: IdempotencyToken,
     ) -> SdkResult<Event> {
+        // Idempotent retry: a seen token returns its prior event without
+        // re-appending, so a flaky-network retry never double-writes.
+        if let Some(existing) = self.event_for_token(store, idempotency.as_str())? {
+            return Ok(existing);
+        }
         if self.cancel.is_cancelled() {
             return Err(SdkError::Cancelled);
         }
@@ -181,6 +200,10 @@ impl RunHandle {
         idempotency: IdempotencyToken,
     ) -> SdkResult<Event> {
         self.cancel.cancel();
+        // Idempotent retry: a seen token returns the prior cancellation event.
+        if let Some(existing) = self.event_for_token(store, idempotency.as_str())? {
+            return Ok(existing);
+        }
         let mut payload = Payload::new();
         payload.insert("reason".to_string(), Value::String(reason.into()));
         payload.insert(
@@ -272,5 +295,36 @@ mod tests {
         let events = attached.events(&store).expect("events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind(), RunEventKind::Created);
+    }
+
+    #[test]
+    fn idempotent_retry_returns_prior_event_not_a_duplicate() {
+        let mut store = InMemoryGraphStore::default();
+        let run = RunHandle::start(
+            &mut store,
+            "task",
+            "claude-code",
+            Payload::new(),
+            IdempotencyToken::new("k-create"),
+        )
+        .expect("start");
+
+        let first = run
+            .cancel(&mut store, "stop", IdempotencyToken::new("k-cancel"))
+            .expect("cancel");
+        // A retry with the SAME token returns the prior event, not a second append.
+        let retry = run
+            .cancel(&mut store, "stop again", IdempotencyToken::new("k-cancel"))
+            .expect("cancel retry");
+        assert_eq!(first.seq(), retry.seq());
+
+        // Exactly one cancellation event exists.
+        let cancels = run
+            .events(&store)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind() == RunEventKind::Cancelled)
+            .count();
+        assert_eq!(cancels, 1);
     }
 }
