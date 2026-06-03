@@ -5000,10 +5000,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "run_id": { "type": "string" },
                     "runId": { "type": "string" }
                 },
-                "anyOf": [
-                    { "required": ["run_id"] },
-                    { "required": ["runId"] }
-                ]
+                "required": ["run_id"]
             }),
         ),
         tool(
@@ -5055,10 +5052,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "edge_types": { "type": "array", "items": { "type": "string" } },
                     "max_hops": { "type": "integer", "default": 1 }
                 },
-                "anyOf": [
-                    { "required": ["seed_id"] },
-                    { "required": ["seedId"] }
-                ]
+                "required": ["seed_id"]
             }),
         ),
         tool(
@@ -5406,10 +5400,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "cites_doc_ids": { "type": "array", "items": { "type": "string" } },
                     "derived_from_doc_ids": { "type": "array", "items": { "type": "string" } }
                 },
-                "anyOf": [
-                    { "required": ["doc_id", "content"] },
-                    { "required": ["docId", "content"] }
-                ]
+                "required": ["doc_id", "content"]
             }),
         ));
         tools.push(tool_write(
@@ -5427,10 +5418,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "reason": { "type": "string" },
                     "title": { "type": "string" }
                 },
-                "anyOf": [
-                    { "required": ["doc_id"] },
-                    { "required": ["docId"] }
-                ]
+                "required": ["doc_id"]
             }),
         ));
         tools.push(tool_write(
@@ -5493,10 +5481,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "expires_at": { "type": "string" },
                     "title": { "type": "string" }
                 },
-                "anyOf": [
-                    { "required": ["to_actor", "payload"] },
-                    { "required": ["toActor", "payload"] }
-                ]
+                "required": ["to_actor", "payload"]
             }),
         ));
         tools.push(tool_write(
@@ -5525,12 +5510,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "created_at": { "type": "string" },
                     "createdAt": { "type": "string" }
                 },
-                "anyOf": [
-                    { "required": ["transition"] },
-                    { "required": ["type"] },
-                    { "required": ["event_type"] },
-                    { "required": ["eventType"] }
-                ]
+                "required": ["type"]
             }),
         ));
         tools.push(tool_write(
@@ -6425,6 +6405,19 @@ mod tests {
         tools.iter().any(|tool| tool["name"] == name)
     }
 
+    fn assert_no_top_level_schema_combinators(tools: &[Value]) {
+        for (index, tool) in tools.iter().enumerate() {
+            let schema = &tool["inputSchema"];
+            for keyword in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    schema.get(keyword).is_none(),
+                    "tool {index} ({}) has unsupported top-level {keyword}",
+                    tool["name"]
+                );
+            }
+        }
+    }
+
     #[test]
     fn initialize_returns_mcp_capabilities() {
         let (provider, config) = fixture();
@@ -6448,6 +6441,7 @@ mod tests {
         );
 
         let tools = response["result"]["tools"].as_array().unwrap();
+        assert_no_top_level_schema_combinators(tools);
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_graph_neighbors"));
@@ -6516,6 +6510,7 @@ mod tests {
         );
 
         let tools = response["result"]["tools"].as_array().unwrap();
+        assert_no_top_level_schema_combinators(tools);
         assert!(has_tool(tools, "coordination_room"));
         assert!(has_tool(tools, "presence"));
         assert!(has_tool(tools, "coordination_intent"));
