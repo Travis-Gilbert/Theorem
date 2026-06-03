@@ -59,7 +59,9 @@ pub mod stream;
 
 pub use cancel::CancelToken;
 pub use event::{Event, RunEventKind};
-pub use export::{export_run_trace, TraceRow};
+pub use export::{
+    export_preference_pair, export_run_sft, export_run_trace, PreferencePair, SftRecord, TraceRow,
+};
 pub use idempotency::IdempotencyToken;
 pub use run::{RunHandle, SdkError, SdkResult};
 pub use session::Session;
