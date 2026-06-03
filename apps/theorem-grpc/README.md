@@ -10,12 +10,15 @@ proto package + message shapes (copied byte-identical from
 `RustyRed-Graph-Database/proto/theseus_search/v1/search.proto`), so the civic
 backend dials it by setting `THEOREM_SEARCH_URL` with no code change.
 
-It also serves `theorem_grpc.AppAffordanceService`, the first live transport
-boundary for metadata-registered `theorem_grpc.*` Theseus app affordances. This
-initial path validates affordance ids, confirmation gates, timeout policy, and
-content-addressed receipt shape. Concrete app-family handlers are not live yet:
-confirmed non-dry-run calls return `HANDLER_NOT_IMPLEMENTED` receipts instead of
-fabricating success.
+It also serves `theorem_grpc.AppAffordanceService`, the live transport boundary
+for metadata-registered `theorem_grpc.*` Theseus app affordances. The service
+validates affordance ids, confirmation gates, timeout policy, and
+content-addressed receipt shape, then dispatches local receipt-first handlers for
+the Theseus app families. Each non-dry-run invocation records an affordance
+outcome into the service GraphStore and returns charter-scoped capability
+recommendations from the same selection path. Confirmed external actions record
+the confirmed intent and learning receipt; the local handler still reports that
+the external side effect was not performed locally.
 
 Build: `cargo build -p theorem-grpc` (run from this dir; standalone Cargo root,
 not a member of `rustyredcore_THG`).
