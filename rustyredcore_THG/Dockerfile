@@ -41,7 +41,8 @@ ENV RUSTY_RED_HOST="[::]" \
     RUSTY_RED_API_TITLE="Rusty Red Graph Database API" \
     RUSTY_RED_MCP_ENABLED=true \
     RUSTY_RED_MCP_READ_ONLY=true \
-    RUSTY_RED_MCP_ALLOW_ADMIN=false
+    RUSTY_RED_MCP_ALLOW_ADMIN=false \
+    THEOREM_APP_AFFORDANCE_GRPC_URL="http://theorem-grpc.railway.internal:8080"
 
 EXPOSE 8380
 

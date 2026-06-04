@@ -541,6 +541,19 @@ fn theseus_app_specs() -> &'static [TheseusAppAffordanceSpec] {
             tags: &["code", "explain", "graph", "read"],
         },
         TheseusAppAffordanceSpec {
+            tool_name: "code_search.record_use_receipt",
+            family: "code_search",
+            label: "Record Code Use Receipt",
+            description:
+                "Record that an agent used a code-search result and capture outcome metadata.",
+            permissions: &["code_read", "graph_read", "receipt_write"],
+            writeback_policy: "receipt-only",
+            latency_class: "interactive",
+            cost_class: "low",
+            write_class: "receipt",
+            tags: &["code", "receipt", "learning", "read"],
+        },
+        TheseusAppAffordanceSpec {
             tool_name: "anti_misinfo_algo.inspect_claim",
             family: "anti_misinfo_algo",
             label: "Inspect Claim",

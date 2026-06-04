@@ -136,17 +136,19 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
     let result = register_theseus_app_affordances(&mut store, "theorem", Some("test")).unwrap();
 
     assert_eq!(result.server_id, THEOREM_GRPC_SERVER_ID);
-    assert_eq!(result.affordance_node_ids.len(), 18);
+    assert_eq!(result.affordance_node_ids.len(), 19);
     assert!(store.get_node(&result.connector_node_id).is_some());
 
     let publisher_id = affordance_node_id("theorem", "theorem_grpc.publisher.publish");
     let code_search_id = affordance_node_id("theorem", "theorem_grpc.code_search.search");
     let code_explore_id = affordance_node_id("theorem", "theorem_grpc.code_search.explore");
     let code_explain_id = affordance_node_id("theorem", "theorem_grpc.code_search.explain");
+    let code_use_id = affordance_node_id("theorem", "theorem_grpc.code_search.record_use_receipt");
     assert!(result.affordance_node_ids.contains(&publisher_id));
     assert!(result.affordance_node_ids.contains(&code_search_id));
     assert!(result.affordance_node_ids.contains(&code_explore_id));
     assert!(result.affordance_node_ids.contains(&code_explain_id));
+    assert!(result.affordance_node_ids.contains(&code_use_id));
     let publisher = Affordance::from_node_record(store.get_node(&publisher_id).unwrap()).unwrap();
     let code_search =
         Affordance::from_node_record(store.get_node(&code_search_id).unwrap()).unwrap();
@@ -169,7 +171,7 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
 
     let offers =
         store.neighbors(NeighborQuery::out(&result.connector_node_id).with_edge_type(OFFERS));
-    assert_eq!(offers.len(), 18);
+    assert_eq!(offers.len(), 19);
 }
 
 #[test]

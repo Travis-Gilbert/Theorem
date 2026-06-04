@@ -16,9 +16,10 @@ use rustyred_thg_core::{
     SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
-    HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider, McpServerConfig,
+    AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
+    McpServerConfig,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
@@ -1578,6 +1579,52 @@ pub struct ProductMcpBackend {
     store: TenantGraphStore,
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct InvokeAppAffordanceGrpcRequest {
+    #[prost(string, tag = "1")]
+    tenant_id: String,
+    #[prost(string, tag = "2")]
+    affordance_id: String,
+    #[prost(string, tag = "3")]
+    actor: String,
+    #[prost(string, tag = "4")]
+    request_json: String,
+    #[prost(bool, tag = "5")]
+    dry_run: bool,
+    #[prost(bool, tag = "6")]
+    confirmed: bool,
+    #[prost(uint64, tag = "7")]
+    timeout_ms: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct InvokeAppAffordanceGrpcResponse {
+    #[prost(string, tag = "1")]
+    tenant_id: String,
+    #[prost(string, tag = "2")]
+    affordance_id: String,
+    #[prost(string, tag = "3")]
+    server_id: String,
+    #[prost(string, tag = "4")]
+    tool_name: String,
+    #[prost(string, tag = "5")]
+    status: String,
+    #[prost(bool, tag = "6")]
+    executed: bool,
+    #[prost(string, tag = "7")]
+    receipt_hash: String,
+    #[prost(string, tag = "8")]
+    receipt_json: String,
+    #[prost(string, tag = "9")]
+    output_json: String,
+    #[prost(string, tag = "10")]
+    error_code: String,
+    #[prost(string, tag = "11")]
+    message: String,
+    #[prost(uint64, tag = "12")]
+    elapsed_ms: u64,
+}
+
 impl McpGraphBackend for ProductMcpBackend {
     fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
         self.store.get_node(id)
@@ -1797,6 +1844,26 @@ impl McpGraphBackend for ProductMcpBackend {
             .epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
     }
 
+    fn invoke_app_affordance(
+        &mut self,
+        invocation: AppAffordanceInvocation,
+    ) -> Result<Value, McpError> {
+        let endpoint = theorem_app_affordance_grpc_endpoint()?;
+        let request_json = serde_json::to_string(&invocation.request)
+            .map_err(|error| McpError::invalid_params(format!("request JSON failed: {error}")))?;
+        let request = InvokeAppAffordanceGrpcRequest {
+            tenant_id: invocation.tenant_id,
+            affordance_id: invocation.affordance_id,
+            actor: invocation.actor,
+            request_json,
+            dry_run: invocation.dry_run,
+            confirmed: invocation.confirmed,
+            timeout_ms: invocation.timeout_ms,
+        };
+        let response = invoke_app_affordance_grpc_blocking(endpoint, request)?;
+        Ok(app_affordance_response_json(response))
+    }
+
     fn dispatch_handoff(&self, dispatch: HandoffDispatch) -> Result<(), McpError> {
         let token = std::env::var("THEOREM_HANDOFF_GITHUB_TOKEN")
             .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -1852,6 +1919,123 @@ impl McpGraphBackend for ProductMcpBackend {
         })
         .join()
         .map_err(|_| McpError::internal("dispatch thread panicked"))?
+    }
+}
+
+fn theorem_app_affordance_grpc_endpoint() -> Result<String, McpError> {
+    for key in [
+        "THEOREM_APP_AFFORDANCE_GRPC_URL",
+        "THEOREM_GRPC_URL",
+        "THEOREM_SEARCH_URL",
+        "THESEUS_BRIDGE_URL",
+    ] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return Ok(normalize_grpc_endpoint(trimmed));
+            }
+        }
+    }
+    Err(McpError::internal(
+        "code_search app affordance gRPC endpoint is not configured; set THEOREM_APP_AFFORDANCE_GRPC_URL or THEOREM_GRPC_URL",
+    ))
+}
+
+fn normalize_grpc_endpoint(raw: &str) -> String {
+    if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    }
+}
+
+fn invoke_app_affordance_grpc_blocking(
+    endpoint: String,
+    request: InvokeAppAffordanceGrpcRequest,
+) -> Result<InvokeAppAffordanceGrpcResponse, McpError> {
+    std::thread::spawn(
+        move || -> Result<InvokeAppAffordanceGrpcResponse, McpError> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    McpError::internal(format!("app affordance runtime build failed: {error}"))
+                })?;
+            runtime.block_on(invoke_app_affordance_grpc(endpoint, request))
+        },
+    )
+    .join()
+    .map_err(|_| McpError::internal("app affordance gRPC thread panicked"))?
+}
+
+async fn invoke_app_affordance_grpc(
+    endpoint: String,
+    request: InvokeAppAffordanceGrpcRequest,
+) -> Result<InvokeAppAffordanceGrpcResponse, McpError> {
+    let timeout_ms = if request.timeout_ms == 0 {
+        30_000
+    } else {
+        request.timeout_ms.min(30_000)
+    };
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let channel = tonic::transport::Channel::from_shared(endpoint.clone())
+        .map_err(|error| {
+            McpError::internal(format!(
+                "invalid app affordance gRPC endpoint `{endpoint}`: {error}"
+            ))
+        })?
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .connect()
+        .await
+        .map_err(|error| {
+            McpError::internal(format!(
+                "app affordance gRPC connection failed for `{endpoint}`: {error}"
+            ))
+        })?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client.ready().await.map_err(|error| {
+        McpError::internal(format!("app affordance gRPC client not ready: {error}"))
+    })?;
+    let path =
+        http::uri::PathAndQuery::from_static("/theorem_grpc.AppAffordanceService/InvokeAffordance");
+    let response = client
+        .unary(
+            tonic::Request::new(request),
+            path,
+            tonic::codec::ProstCodec::default(),
+        )
+        .await
+        .map_err(|error| McpError::internal(format!("app affordance gRPC call failed: {error}")))?;
+    Ok(response.into_inner())
+}
+
+fn app_affordance_response_json(response: InvokeAppAffordanceGrpcResponse) -> Value {
+    let receipt = parse_json_or_raw(&response.receipt_json);
+    let output = parse_json_or_raw(&response.output_json);
+    json!({
+        "tenant_id": response.tenant_id,
+        "affordance_id": response.affordance_id,
+        "server_id": response.server_id,
+        "tool_name": response.tool_name,
+        "status": response.status,
+        "executed": response.executed,
+        "receipt_hash": response.receipt_hash,
+        "receipt_json": response.receipt_json,
+        "receipt": receipt,
+        "output_json": response.output_json,
+        "output": output,
+        "error_code": response.error_code,
+        "message": response.message,
+        "elapsed_ms": response.elapsed_ms,
+    })
+}
+
+fn parse_json_or_raw(raw: &str) -> Value {
+    if raw.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(raw).unwrap_or_else(|_| json!(raw))
     }
 }
 
@@ -1912,7 +2096,10 @@ impl McpGraphProvider for AppState {
 mod tests {
     use crate::config::{Config, StorageMode};
 
-    use super::{AppState, RedCoreTenantExecutor};
+    use super::{
+        app_affordance_response_json, normalize_grpc_endpoint, AppState,
+        InvokeAppAffordanceGrpcResponse, RedCoreTenantExecutor,
+    };
     use rustyred_thg_core::{
         EdgeRecord, GraphMutation, GraphMutationBatch, NeighborQuery, NodeRecord,
         RedCoreDurability, RedCoreGraphStore,
@@ -1921,6 +2108,46 @@ mod tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn app_affordance_endpoint_normalization_adds_scheme() {
+        assert_eq!(
+            normalize_grpc_endpoint("theorem-grpc.railway.internal:50071"),
+            "http://theorem-grpc.railway.internal:50071"
+        );
+        assert_eq!(
+            normalize_grpc_endpoint("http://127.0.0.1:50071"),
+            "http://127.0.0.1:50071"
+        );
+    }
+
+    #[test]
+    fn app_affordance_response_json_parses_receipt_and_output() {
+        let response = InvokeAppAffordanceGrpcResponse {
+            tenant_id: "theorem".to_string(),
+            affordance_id: "theorem_grpc.code_search.search".to_string(),
+            server_id: "theorem_grpc".to_string(),
+            tool_name: "code_search.search".to_string(),
+            status: "ok".to_string(),
+            executed: true,
+            receipt_hash: "sha256:test".to_string(),
+            receipt_json: r#"{"kind":"receipt"}"#.to_string(),
+            output_json: r#"{"matches":[{"symbol":"native_code_search"}]}"#.to_string(),
+            error_code: String::new(),
+            message: "ok".to_string(),
+            elapsed_ms: 7,
+        };
+
+        let payload = app_affordance_response_json(response);
+
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["receipt"]["kind"], "receipt");
+        assert_eq!(
+            payload["output"]["matches"][0]["symbol"],
+            "native_code_search"
+        );
+        assert_eq!(payload["receipt_json"], r#"{"kind":"receipt"}"#);
+    }
 
     #[test]
     fn tenant_state_keys_use_graph_store_tenant_normalization() {

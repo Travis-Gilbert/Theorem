@@ -6,7 +6,8 @@ use crate::code_index::{
     CodeContextInput, CodeContextOutput, CodeGraphEdgeRecord, CodeHitRecord, CodeIndexError,
     CodeIndexRuntime, CodeSymbolRecord, ExplainCodeInput, ExplainCodeOutput, ExploreCodeInput,
     ExploreCodeOutput, IngestCodebaseInput, IngestCodebaseOutput, RecognizeCodeInput,
-    RecognizeCodeOutput, SearchCodeInput, SearchCodeOutput,
+    RecognizeCodeOutput, RecordUseReceiptInput, RecordUseReceiptOutput, SearchCodeInput,
+    SearchCodeOutput,
 };
 use crate::pb;
 
@@ -137,6 +138,27 @@ impl pb::CodeCrawlerService for TheoremCodeCrawlerService {
             .map_err(status_from_code_error)?;
         Ok(Response::new(explain_to_pb(output)))
     }
+
+    async fn record_use_receipt(
+        &self,
+        request: Request<pb::RecordUseReceiptRequest>,
+    ) -> Result<Response<pb::RecordUseReceiptResponse>, Status> {
+        let req = request.into_inner();
+        let output = self
+            .runtime
+            .record_use_receipt(RecordUseReceiptInput {
+                tenant_id: req.tenant_id,
+                node_id: req.node_id,
+                repo_id: req.repo_id,
+                query: req.query,
+                action: req.action,
+                outcome: req.outcome,
+                actor: req.actor,
+                use_json: req.use_json,
+            })
+            .map_err(status_from_code_error)?;
+        Ok(Response::new(record_use_to_pb(output)))
+    }
 }
 
 fn input_from_ingest(req: pb::IngestCodebaseRequest) -> IngestCodebaseInput {
@@ -249,6 +271,18 @@ fn explain_to_pb(output: ExplainCodeOutput) -> pb::ExplainCodeResponse {
     }
 }
 
+fn record_use_to_pb(output: RecordUseReceiptOutput) -> pb::RecordUseReceiptResponse {
+    pb::RecordUseReceiptResponse {
+        tenant_id: output.tenant_id,
+        node_id: output.node_id,
+        repo_id: output.repo_id,
+        receipt_hash: output.receipt_hash,
+        receipt_json: output.receipt_json,
+        status: output.status,
+        message: output.message,
+    }
+}
+
 fn hit_to_pb(hit: CodeHitRecord) -> pb::CodeHit {
     pb::CodeHit {
         node_id: hit.node_id,
@@ -282,6 +316,8 @@ fn symbol_to_pb(symbol: CodeSymbolRecord) -> pb::CodeSymbol {
         community_id: symbol.community_id,
         callers: symbol.callers,
         callees: symbol.callees,
+        dependencies: symbol.dependencies,
+        dependents: symbol.dependents,
     }
 }
 

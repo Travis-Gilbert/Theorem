@@ -31,7 +31,8 @@ pub use code::{
     CodeContextRequest, CodeContextResponse, CodeGraphEdge, CodeHit, CodeSymbol,
     ExplainCodeRequest, ExplainCodeResponse, ExploreCodeRequest, ExploreCodeResponse,
     IngestCodebaseRequest, IngestCodebaseResponse, RecognizeCodeRequest, RecognizeCodeResponse,
-    ReindexCodebaseRequest, SearchCodeRequest, SearchCodeResponse,
+    RecordUseReceiptRequest, RecordUseReceiptResponse, ReindexCodebaseRequest, SearchCodeRequest,
+    SearchCodeResponse,
 };
 pub use search::search_service_server::{SearchService, SearchServiceServer};
 pub use search::{

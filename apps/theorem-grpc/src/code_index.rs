@@ -14,6 +14,7 @@ use rustyred_thg_core::{
     NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
 };
 use serde_json::{json, Value};
+use syn::visit::Visit;
 
 const CODE_REPO_LABEL: &str = "CodeRepository";
 const CODE_FILE_LABEL: &str = "CodeFile";
@@ -23,6 +24,7 @@ const SOURCE: &str = "theorem_grpc_code_index";
 const CONTAINS_FILE: &str = "CONTAINS_FILE";
 const DECLARES_SYMBOL: &str = "DECLARES_SYMBOL";
 const CALLS_SYMBOL: &str = "CALLS_SYMBOL";
+const DEPENDS_ON_SYMBOL: &str = "DEPENDS_ON_SYMBOL";
 const DEFAULT_TRUST_TIER: &str = "advisory";
 const DEFAULT_MAX_FILES: usize = 2_500;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
@@ -102,6 +104,14 @@ impl CodeIndexRuntime {
     ) -> Result<ExplainCodeOutput, CodeIndexError> {
         let mut store = self.lock_store()?;
         explain_code_with_store(&mut store, input)
+    }
+
+    pub fn record_use_receipt(
+        &self,
+        input: RecordUseReceiptInput,
+    ) -> Result<RecordUseReceiptOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        record_use_receipt_with_store(&mut store, input)
     }
 
     fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, RedCoreGraphStore>, CodeIndexError> {
@@ -333,6 +343,42 @@ impl ExplainCodeOutput {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RecordUseReceiptInput {
+    pub tenant_id: String,
+    pub node_id: String,
+    pub repo_id: String,
+    pub query: String,
+    pub action: String,
+    pub outcome: String,
+    pub actor: String,
+    pub use_json: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordUseReceiptOutput {
+    pub tenant_id: String,
+    pub node_id: String,
+    pub repo_id: String,
+    pub receipt_hash: String,
+    pub receipt_json: String,
+    pub status: String,
+    pub message: String,
+}
+
+impl RecordUseReceiptOutput {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tenant_id": self.tenant_id,
+            "node_id": self.node_id,
+            "repo_id": self.repo_id,
+            "receipt_hash": self.receipt_hash,
+            "status": self.status,
+            "message": self.message,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CodeHitRecord {
     pub node_id: String,
@@ -384,6 +430,8 @@ pub struct CodeSymbolRecord {
     pub community_id: String,
     pub callers: Vec<String>,
     pub callees: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub dependents: Vec<String>,
 }
 
 impl CodeSymbolRecord {
@@ -403,6 +451,8 @@ impl CodeSymbolRecord {
             community_id: symbol.community_id,
             callers: Vec::new(),
             callees: Vec::new(),
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
         }
     }
 
@@ -422,6 +472,8 @@ impl CodeSymbolRecord {
             "community_id": self.community_id,
             "callers": self.callers,
             "callees": self.callees,
+            "dependencies": self.dependencies,
+            "dependents": self.dependents,
         })
     }
 }
@@ -524,6 +576,9 @@ struct IndexedSymbol {
     body: String,
     trust_tier: String,
     community_id: String,
+    call_names: BTreeSet<String>,
+    dependency_names: BTreeSet<String>,
+    parser_backed: bool,
 }
 
 fn ingest_codebase_with_store(
@@ -603,6 +658,9 @@ fn ingest_codebase_with_store(
                     "snippet": symbol.snippet,
                     "trust_tier": symbol.trust_tier,
                     "community_id": symbol.community_id,
+                    "call_names": symbol.call_names.iter().cloned().collect::<Vec<_>>(),
+                    "dependency_names": symbol.dependency_names.iter().cloned().collect::<Vec<_>>(),
+                    "parser_backed": symbol.parser_backed,
                     "search_text": format!("{} {} {} {}", symbol.name, symbol.kind, symbol.signature, symbol.file_path),
                     "generation": config.generation,
                     "indexed_at_ms": config.generation,
@@ -1013,14 +1071,15 @@ fn explain_code_with_store(
         &mut edges,
     )?;
     let summary = format!(
-        "{} `{}` is a {} in `{}`. Trust tier: {}. It calls {} symbol(s) and is called by {} symbol(s).",
+        "{} `{}` is a {} in `{}`. Trust tier: {}. It calls {} symbol(s), is called by {} symbol(s), and depends on {} symbol(s).",
         symbol.language,
         symbol.name,
         symbol.kind,
         symbol.file_path,
         symbol.trust_tier,
         symbol.callees.len(),
-        symbol.callers.len()
+        symbol.callers.len(),
+        symbol.dependencies.len()
     );
     let payload = json!({
         "tenant_id": tenant_id,
@@ -1037,6 +1096,61 @@ fn explain_code_with_store(
         edges,
         receipt_hash: receipt.receipt_hash,
         receipt_json: receipt.receipt_json,
+    })
+}
+
+fn record_use_receipt_with_store(
+    store: &mut RedCoreGraphStore,
+    input: RecordUseReceiptInput,
+) -> Result<RecordUseReceiptOutput, CodeIndexError> {
+    let tenant_id = normalize_tenant(&input.tenant_id);
+    let node_id = input.node_id.trim().to_string();
+    if node_id.is_empty() {
+        return Err(CodeIndexError::invalid(
+            "node_id is required to record code use",
+        ));
+    }
+    let node = store
+        .get_node(&node_id)
+        .map_err(CodeIndexError::from_store)?
+        .ok_or_else(|| CodeIndexError::invalid(format!("code node {node_id} was not found")))?;
+    if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id.as_str()) {
+        return Err(CodeIndexError::invalid(
+            "code node belongs to a different tenant",
+        ));
+    }
+    let repo_id =
+        property_string(&node.properties, "repo_id").unwrap_or_else(|| input.repo_id.clone());
+    if !input.repo_id.trim().is_empty() && input.repo_id.trim() != repo_id {
+        return Err(CodeIndexError::invalid(
+            "code node belongs to a different repository",
+        ));
+    }
+    let use_payload = parse_optional_json(&input.use_json)?;
+    let payload = json!({
+        "tenant_id": tenant_id,
+        "operation": "code_use",
+        "node_id": node_id,
+        "repo_id": repo_id,
+        "file_path": property_string(&node.properties, "file_path")
+            .or_else(|| property_string(&node.properties, "path"))
+            .unwrap_or_default(),
+        "symbol_name": property_string(&node.properties, "name").unwrap_or_default(),
+        "query": input.query,
+        "action": input.action,
+        "outcome": input.outcome,
+        "actor": input.actor,
+        "use": use_payload,
+    });
+    let receipt = record_receipt(store, &tenant_id, "code_use", &payload)?;
+    Ok(RecordUseReceiptOutput {
+        tenant_id,
+        node_id,
+        repo_id,
+        receipt_hash: receipt.receipt_hash,
+        receipt_json: receipt.receipt_json,
+        status: "ok".to_string(),
+        message: "code use receipt recorded".to_string(),
     })
 }
 
@@ -1176,6 +1290,27 @@ fn extract_symbols(
     language: &str,
     text: &str,
 ) -> Vec<IndexedSymbol> {
+    let mut symbols = extract_line_symbols(repo_id, file_id, file_path, language, text);
+    if language == "rust" {
+        let references = rust_reference_index(text);
+        for symbol in &mut symbols {
+            if let Some(reference) = references.get(&symbol.name) {
+                symbol.call_names = reference.call_names.clone();
+                symbol.dependency_names = reference.dependency_names.clone();
+                symbol.parser_backed = true;
+            }
+        }
+    }
+    symbols
+}
+
+fn extract_line_symbols(
+    repo_id: &str,
+    file_id: &str,
+    file_path: &str,
+    language: &str,
+    text: &str,
+) -> Vec<IndexedSymbol> {
     let lines = text.lines().collect::<Vec<_>>();
     let mut raw_symbols = Vec::new();
     for (idx, raw_line) in text.lines().enumerate() {
@@ -1209,6 +1344,9 @@ fn extract_symbols(
             body,
             trust_tier: DEFAULT_TRUST_TIER.to_string(),
             community_id: community_id(repo_id, language, kind),
+            call_names: BTreeSet::new(),
+            dependency_names: BTreeSet::new(),
+            parser_backed: false,
         });
     }
     symbols
@@ -1226,39 +1364,95 @@ fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<
     let mut edges = Vec::new();
     let mut seen = BTreeSet::new();
     for symbol in files.iter().flat_map(|file| file.symbols.iter()) {
-        for (name, targets) in &symbols_by_name {
-            if *name == symbol.name.as_str() || !body_references_name(&symbol.body, name) {
-                continue;
-            }
-            for target in targets {
-                if target.symbol_id == symbol.symbol_id {
-                    continue;
-                }
-                let call_edge_id = edge_id(
-                    "code:edge:symbol_call",
-                    &symbol.symbol_id,
-                    &target.symbol_id,
-                );
-                if !seen.insert(call_edge_id.clone()) {
-                    continue;
-                }
-                edges.push(EdgeRecord::new(
-                    call_edge_id,
-                    &symbol.symbol_id,
+        if symbol.parser_backed {
+            for name in &symbol.call_names {
+                push_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    &symbols_by_name,
+                    symbol,
+                    name,
                     CALLS_SYMBOL,
-                    &target.symbol_id,
-                    json!({
-                        "tenant_id": config.tenant_id,
-                        "repo_id": config.repo_id,
-                        "generation": config.generation,
-                        "evidence": format!("{} body references {}", symbol.name, target.name),
-                        "source": SOURCE,
-                    }),
-                ));
+                    "code:edge:symbol_call",
+                    "rust_ast_call",
+                    config,
+                );
+            }
+            for name in &symbol.dependency_names {
+                push_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    &symbols_by_name,
+                    symbol,
+                    name,
+                    DEPENDS_ON_SYMBOL,
+                    "code:edge:symbol_dependency",
+                    "rust_ast_dependency",
+                    config,
+                );
+            }
+        } else {
+            for (name, _) in &symbols_by_name {
+                if *name == symbol.name.as_str() || !body_references_name(&symbol.body, name) {
+                    continue;
+                }
+                push_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    &symbols_by_name,
+                    symbol,
+                    name,
+                    CALLS_SYMBOL,
+                    "code:edge:symbol_call",
+                    "text_body_reference",
+                    config,
+                );
             }
         }
     }
     edges
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_symbol_edges(
+    edges: &mut Vec<EdgeRecord>,
+    seen: &mut BTreeSet<String>,
+    symbols_by_name: &HashMap<&str, Vec<&IndexedSymbol>>,
+    symbol: &IndexedSymbol,
+    name: &str,
+    edge_type: &str,
+    edge_prefix: &str,
+    evidence_kind: &str,
+    config: &IngestConfig,
+) {
+    if name == symbol.name {
+        return;
+    }
+    let Some(targets) = symbols_by_name.get(name) else {
+        return;
+    };
+    for target in targets {
+        if target.symbol_id == symbol.symbol_id {
+            continue;
+        }
+        let symbol_edge_id = edge_id(edge_prefix, &symbol.symbol_id, &target.symbol_id);
+        if !seen.insert(symbol_edge_id.clone()) {
+            continue;
+        }
+        edges.push(EdgeRecord::new(
+            symbol_edge_id,
+            &symbol.symbol_id,
+            edge_type,
+            &target.symbol_id,
+            json!({
+                "tenant_id": config.tenant_id,
+                "repo_id": config.repo_id,
+                "generation": config.generation,
+                "evidence": format!("{evidence_kind}: {} references {}", symbol.name, target.name),
+                "source": SOURCE,
+            }),
+        ));
+    }
 }
 
 fn symbol_from_line(line: &str, language: &str) -> Option<(String, String)> {
@@ -1340,6 +1534,163 @@ fn symbol_name(rest: &str) -> Option<String> {
         None
     } else {
         Some(name)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RustSymbolReferences {
+    call_names: BTreeSet<String>,
+    dependency_names: BTreeSet<String>,
+}
+
+fn rust_reference_index(text: &str) -> HashMap<String, RustSymbolReferences> {
+    let Ok(file) = syn::parse_file(text) else {
+        return HashMap::new();
+    };
+    let mut index = HashMap::new();
+    for item in &file.items {
+        match item {
+            syn::Item::Fn(item_fn) => {
+                index.insert(
+                    item_fn.sig.ident.to_string(),
+                    rust_references_for_signature(&item_fn.sig, Some(&item_fn.block)),
+                );
+            }
+            syn::Item::Struct(item_struct) => {
+                let mut refs = RustSymbolReferences::default();
+                collect_field_dependencies(&item_struct.fields, &mut refs.dependency_names);
+                index.insert(item_struct.ident.to_string(), refs);
+            }
+            syn::Item::Enum(item_enum) => {
+                let mut refs = RustSymbolReferences::default();
+                for variant in &item_enum.variants {
+                    collect_field_dependencies(&variant.fields, &mut refs.dependency_names);
+                }
+                index.insert(item_enum.ident.to_string(), refs);
+            }
+            syn::Item::Trait(item_trait) => {
+                let mut refs = RustSymbolReferences::default();
+                for item in &item_trait.items {
+                    if let syn::TraitItem::Fn(function) = item {
+                        refs.dependency_names.extend(
+                            rust_references_for_signature(&function.sig, None).dependency_names,
+                        );
+                    }
+                }
+                index.insert(item_trait.ident.to_string(), refs);
+            }
+            syn::Item::Impl(item_impl) => {
+                let impl_name = item_impl
+                    .trait_
+                    .as_ref()
+                    .and_then(|(_, path, _)| path.segments.last())
+                    .map(|segment| segment.ident.to_string())
+                    .or_else(|| type_tail_name(&item_impl.self_ty));
+                if let Some(name) = impl_name {
+                    let mut refs = RustSymbolReferences::default();
+                    collect_type_names(&item_impl.self_ty, &mut refs.dependency_names);
+                    for item in &item_impl.items {
+                        if let syn::ImplItem::Fn(function) = item {
+                            let method_refs =
+                                rust_references_for_signature(&function.sig, Some(&function.block));
+                            refs.call_names.extend(method_refs.call_names.clone());
+                            refs.dependency_names
+                                .extend(method_refs.dependency_names.clone());
+                            index.insert(function.sig.ident.to_string(), method_refs);
+                        }
+                    }
+                    index.entry(name).or_insert(refs);
+                }
+            }
+            _ => {}
+        }
+    }
+    index
+}
+
+fn rust_references_for_signature(
+    signature: &syn::Signature,
+    block: Option<&syn::Block>,
+) -> RustSymbolReferences {
+    let mut refs = RustSymbolReferences::default();
+    for input in &signature.inputs {
+        if let syn::FnArg::Typed(arg) = input {
+            collect_type_names(&arg.ty, &mut refs.dependency_names);
+        }
+    }
+    if let syn::ReturnType::Type(_, ty) = &signature.output {
+        collect_type_names(ty, &mut refs.dependency_names);
+    }
+    if let Some(block) = block {
+        let mut collector = RustCallCollector::default();
+        collector.visit_block(block);
+        refs.call_names = collector.call_names;
+    }
+    refs.dependency_names.remove(&signature.ident.to_string());
+    refs
+}
+
+fn collect_field_dependencies(fields: &syn::Fields, out: &mut BTreeSet<String>) {
+    for field in fields {
+        collect_type_names(&field.ty, out);
+    }
+}
+
+fn collect_type_names(ty: &syn::Type, out: &mut BTreeSet<String>) {
+    let mut collector = RustTypeCollector { names: out };
+    collector.visit_type(ty);
+}
+
+fn type_tail_name(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct RustCallCollector {
+    call_names: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for RustCallCollector {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = node.func.as_ref() {
+            insert_path_tail_name(&path.path, &mut self.call_names);
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.call_names.insert(node.method.to_string());
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+struct RustTypeCollector<'a> {
+    names: &'a mut BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for RustTypeCollector<'_> {
+    fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+        insert_path_tail_name(&node.path, self.names);
+        syn::visit::visit_type_path(self, node);
+    }
+}
+
+fn insert_path_tail_name(path: &syn::Path, out: &mut BTreeSet<String>) {
+    if let Some(segment) = path.segments.last() {
+        let name = segment.ident.to_string();
+        if !matches!(
+            name.as_str(),
+            "Self" | "str" | "usize" | "u64" | "u32" | "i64" | "i32" | "bool"
+        ) {
+            out.insert(name);
+        }
     }
 }
 
@@ -1523,29 +1874,31 @@ fn expand_symbol_edges(
         if depth >= max_depth || related_ids.len() >= limit.saturating_add(1) {
             continue;
         }
-        for direction in [Direction::Out, Direction::In] {
-            let neighbors = store
-                .neighbors(NeighborQuery {
-                    node_id: node_id.clone(),
-                    direction,
-                    edge_type: Some(CALLS_SYMBOL.to_string()),
-                    include_expired: false,
-                })
-                .map_err(CodeIndexError::from_store)?;
-            for neighbor in neighbors {
-                if !seen_edges.insert(neighbor.edge_id.clone()) {
-                    continue;
-                }
-                if let Some(edge) = store
-                    .get_edge(&neighbor.edge_id)
-                    .map_err(CodeIndexError::from_store)?
-                {
-                    if let Some(record) = graph_edge_record(store, &edge)? {
-                        edges.push(record);
+        for edge_type in [CALLS_SYMBOL, DEPENDS_ON_SYMBOL] {
+            for direction in [Direction::Out, Direction::In] {
+                let neighbors = store
+                    .neighbors(NeighborQuery {
+                        node_id: node_id.clone(),
+                        direction,
+                        edge_type: Some(edge_type.to_string()),
+                        include_expired: false,
+                    })
+                    .map_err(CodeIndexError::from_store)?;
+                for neighbor in neighbors {
+                    if !seen_edges.insert(neighbor.edge_id.clone()) {
+                        continue;
                     }
-                }
-                if related_ids.insert(neighbor.node_id.clone()) && related_ids.len() <= limit {
-                    frontier.push((neighbor.node_id, depth + 1));
+                    if let Some(edge) = store
+                        .get_edge(&neighbor.edge_id)
+                        .map_err(CodeIndexError::from_store)?
+                    {
+                        if let Some(record) = graph_edge_record(store, &edge)? {
+                            edges.push(record);
+                        }
+                    }
+                    if related_ids.insert(neighbor.node_id.clone()) && related_ids.len() <= limit {
+                        frontier.push((neighbor.node_id, depth + 1));
+                    }
                 }
             }
         }
@@ -1562,8 +1915,12 @@ fn enrich_symbol_graph(
     store: &RedCoreGraphStore,
     symbol: &mut CodeSymbolRecord,
 ) -> Result<(), CodeIndexError> {
-    symbol.callees = neighbor_symbol_names(store, &symbol.node_id, Direction::Out)?;
-    symbol.callers = neighbor_symbol_names(store, &symbol.node_id, Direction::In)?;
+    symbol.callees = neighbor_symbol_names(store, &symbol.node_id, Direction::Out, CALLS_SYMBOL)?;
+    symbol.callers = neighbor_symbol_names(store, &symbol.node_id, Direction::In, CALLS_SYMBOL)?;
+    symbol.dependencies =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, DEPENDS_ON_SYMBOL)?;
+    symbol.dependents =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::In, DEPENDS_ON_SYMBOL)?;
     Ok(())
 }
 
@@ -1571,12 +1928,13 @@ fn neighbor_symbol_names(
     store: &RedCoreGraphStore,
     node_id: &str,
     direction: Direction,
+    edge_type: &str,
 ) -> Result<Vec<String>, CodeIndexError> {
     let mut names = store
         .neighbors(NeighborQuery {
             node_id: node_id.to_string(),
             direction,
-            edge_type: Some(CALLS_SYMBOL.to_string()),
+            edge_type: Some(edge_type.to_string()),
             include_expired: false,
         })
         .map_err(CodeIndexError::from_store)?
@@ -1651,6 +2009,8 @@ fn symbol_record_from_node(node: &NodeRecord) -> Option<CodeSymbolRecord> {
         community_id: property_string(&node.properties, "community_id").unwrap_or_default(),
         callers: Vec::new(),
         callees: Vec::new(),
+        dependencies: Vec::new(),
+        dependents: Vec::new(),
     })
 }
 
@@ -1976,6 +2336,17 @@ fn property_u64(properties: &Value, key: &str) -> Option<u64> {
     })
 }
 
+fn parse_optional_json(raw: &str) -> Result<Value, CodeIndexError> {
+    if raw.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(raw).map_err(|error| {
+        CodeIndexError::invalid(format!(
+            "use_json must be valid JSON when provided: {error}"
+        ))
+    })
+}
+
 trait IfEmptyThen {
     fn if_empty_then(self, fallback: impl FnOnce() -> String) -> String;
 }
@@ -2020,7 +2391,7 @@ mod tests {
         fs::create_dir_all(repo_dir.join("src")).unwrap();
         fs::write(
             repo_dir.join("src/lib.rs"),
-            "pub struct SearchKernel {}\n\npub fn helper_len(query: &str) -> usize {\n    query.len()\n}\n\npub fn search_code(query: &str) -> usize {\n    helper_len(query)\n}\n",
+            "pub struct SearchKernel {}\n\npub struct QueryPlan {\n    kernel: SearchKernel,\n}\n\npub fn helper_len(query: &str) -> usize {\n    query.len()\n}\n\npub fn search_code(query: &str) -> usize {\n    helper_len(query)\n}\n\npub fn build_plan(kernel: SearchKernel) -> QueryPlan {\n    QueryPlan { kernel }\n}\n",
         )
         .unwrap();
         fs::write(
@@ -2095,6 +2466,23 @@ mod tests {
                 && edge.to_name == "helper_len"
         }));
 
+        let dependency_graph = runtime
+            .explore_code(ExploreCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "QueryPlan".to_string(),
+                repo_id: ingest.repo_id.clone(),
+                max_depth: 1,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(dependency_graph.edges.iter().any(|edge| {
+            edge.edge_type == DEPENDS_ON_SYMBOL
+                && edge.from_name == "QueryPlan"
+                && edge.to_name == "SearchKernel"
+                && edge.evidence.contains("rust_ast_dependency")
+        }));
+
         let explained = runtime
             .explain_code(ExplainCodeInput {
                 tenant_id: "theorem".to_string(),
@@ -2109,6 +2497,21 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.to_name == "helper_len"));
+
+        let use_receipt = runtime
+            .record_use_receipt(RecordUseReceiptInput {
+                tenant_id: "theorem".to_string(),
+                node_id: search.hits[0].node_id.clone(),
+                repo_id: ingest.repo_id.clone(),
+                query: "search_code".to_string(),
+                action: "explain".to_string(),
+                outcome: "useful".to_string(),
+                actor: "codex-test".to_string(),
+                use_json: r#"{"selected":true}"#.to_string(),
+            })
+            .unwrap();
+        assert_eq!(use_receipt.status, "ok");
+        assert!(!use_receipt.receipt_hash.is_empty());
 
         let context = runtime
             .code_context(CodeContextInput {

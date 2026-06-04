@@ -46,6 +46,17 @@ pub struct HandoffDispatch {
     pub branch: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppAffordanceInvocation {
+    pub tenant_id: String,
+    pub affordance_id: String,
+    pub actor: String,
+    pub request: Value,
+    pub dry_run: bool,
+    pub confirmed: bool,
+    pub timeout_ms: u64,
+}
+
 pub trait McpGraphBackend {
     fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>>;
     fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>>;
@@ -106,6 +117,14 @@ pub trait McpGraphBackend {
     fn dispatch_handoff(&self, _dispatch: HandoffDispatch) -> Result<(), McpError> {
         Err(McpError::internal(
             "session handoff dispatch is not supported by this MCP backend",
+        ))
+    }
+    fn invoke_app_affordance(
+        &mut self,
+        _invocation: AppAffordanceInvocation,
+    ) -> Result<Value, McpError> {
+        Err(McpError::internal(
+            "app affordance invocation is not supported by this MCP backend",
         ))
     }
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>>;
@@ -976,6 +995,16 @@ fn call_tool<P: McpGraphProvider>(
         }
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
+        }
+        "code_search" | "theorem_harness_code_search" => {
+            let operation = code_search_operation(&arguments)?;
+            if operation == "record_use_receipt" && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Recording code use receipts is unavailable while read-only mode is active."
+                })));
+            }
+            code_search_payload(&tenant, &mut backend, &arguments, &operation)?
         }
         "remember" | "theorem_harness_remember" => {
             if config.read_only {
@@ -2477,8 +2506,11 @@ fn spawn_session_payload(
     policy_receipt: Option<Value>,
 ) -> Result<Value, McpError> {
     let room_id = resolved_coordination_room_id(arguments);
-    let actor_id =
-        required_text_any(arguments, &["actor", "actor_id", "actorId"], "spawn_session")?;
+    let actor_id = required_text_any(
+        arguments,
+        &["actor", "actor_id", "actorId"],
+        "spawn_session",
+    )?;
     let intent = required_text_any(arguments, &["intent", "prompt", "message"], "spawn_session")?;
     let owner = argument_text(arguments, &["owner", "repo_owner", "repoOwner"])
         .unwrap_or_else(|| "Travis-Gilbert".to_string());
@@ -2781,6 +2813,82 @@ fn harness_run_payload(
         "detail": detail,
         "found": found
     }))
+}
+
+fn code_search_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    let affordance_id = format!("theorem_grpc.code_search.{operation}");
+    let actor = arguments
+        .get("actor")
+        .or_else(|| arguments.get("actor_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("theorem-harness-mcp")
+        .to_string();
+    let timeout_ms = arguments
+        .get("timeout_ms")
+        .or_else(|| arguments.get("timeoutMs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let dry_run = arguments
+        .get("dry_run")
+        .or_else(|| arguments.get("dryRun"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let confirmed = arguments
+        .get("confirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut request = arguments.clone();
+    if let Some(object) = request.as_object_mut() {
+        object.remove("operation");
+        object.remove("mode");
+        object.remove("verb");
+        object.remove("tenant");
+        object.remove("tenant_slug");
+        object.remove("timeout_ms");
+        object.remove("timeoutMs");
+        object.remove("dry_run");
+        object.remove("dryRun");
+        object.remove("confirmed");
+    }
+    let response = backend.invoke_app_affordance(AppAffordanceInvocation {
+        tenant_id: tenant.to_string(),
+        affordance_id: affordance_id.clone(),
+        actor,
+        request,
+        dry_run,
+        confirmed,
+        timeout_ms,
+    })?;
+    Ok(json!({
+        "tenant": tenant,
+        "operation": operation,
+        "affordance_id": affordance_id,
+        "app_affordance": response,
+    }))
+}
+
+fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
+    let raw = arguments
+        .get("operation")
+        .or_else(|| arguments.get("mode"))
+        .or_else(|| arguments.get("verb"))
+        .and_then(Value::as_str)
+        .unwrap_or("search")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    match raw.as_str() {
+        "search" | "context" | "recognize" | "explore" | "explain" => Ok(raw),
+        "record_use" | "use_receipt" | "record_use_receipt" => Ok("record_use_receipt".to_string()),
+        _ => Err(McpError::invalid_params(format!(
+            "unsupported code_search operation `{raw}`"
+        ))),
+    }
 }
 
 fn remember_memory_payload(
@@ -5172,6 +5280,38 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "code_search",
+            "Route the native harness code_search verb through theorem_grpc CodeCrawler app affordances.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["search", "context", "recognize", "explore", "explain", "record_use_receipt"],
+                        "default": "search"
+                    },
+                    "query": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "repo_id": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "path_prefix": { "type": "string" },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "limit": { "type": "integer", "default": 20 },
+                    "max_depth": { "type": "integer", "default": 1 },
+                    "max_chars": { "type": "integer" },
+                    "text": { "type": "string" },
+                    "action": { "type": "string" },
+                    "outcome": { "type": "string" },
+                    "use": { "type": "object" },
+                    "actor": { "type": "string" },
+                    "timeout_ms": { "type": "integer" },
+                    "dry_run": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
+        tool(
             "mentions",
             "Read pending native Theorem harness mentions for an actor. consume=true requires write mode.",
             json!({
@@ -6300,8 +6440,8 @@ mod tests {
 
     use super::{
         append_harness_transition_to_store, handle_mcp_request, handle_mcp_request_with_context,
-        harness_run_detail_from_store, McpError, McpGraphBackend, McpGraphProvider,
-        McpRequestContext, McpServerConfig,
+        harness_run_detail_from_store, AppAffordanceInvocation, McpError, McpGraphBackend,
+        McpGraphProvider, McpRequestContext, McpServerConfig,
     };
 
     struct FixtureProvider(Rc<RefCell<InMemoryGraphStore>>);
@@ -6385,6 +6525,23 @@ mod tests {
 
         fn dispatch_handoff(&self, _dispatch: super::HandoffDispatch) -> Result<(), McpError> {
             Ok(())
+        }
+
+        fn invoke_app_affordance(
+            &mut self,
+            invocation: AppAffordanceInvocation,
+        ) -> Result<Value, McpError> {
+            Ok(json!({
+                "tenant_id": invocation.tenant_id,
+                "affordance_id": invocation.affordance_id,
+                "actor": invocation.actor,
+                "request": invocation.request,
+                "dry_run": invocation.dry_run,
+                "confirmed": invocation.confirmed,
+                "timeout_ms": invocation.timeout_ms,
+                "status": "ok",
+                "receipt_hash": "fixture-code-search-receipt",
+            }))
         }
 
         fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -6665,6 +6822,7 @@ mod tests {
         assert!(has_tool(tools, "relate"));
         assert!(has_tool(tools, "self_recall_archive"));
         assert!(has_tool(tools, "observe"));
+        assert!(has_tool(tools, "code_search"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_symbolic_datalog_derive"));
@@ -6694,6 +6852,38 @@ mod tests {
         assert!(!has_tool(tools, "encode"));
         assert!(!has_tool(tools, "forget"));
         assert!(!has_tool(tools, "handoff"));
+    }
+
+    #[test]
+    fn code_search_routes_named_harness_verb_to_app_affordance() {
+        let (provider, config) = fixture();
+        let routed = call_tool_json(
+            &provider,
+            &config,
+            "code_search",
+            json!({
+                "tenant": "smoke",
+                "operation": "explain",
+                "query": "native_code_search",
+                "repo_id": "repo:test",
+                "actor": "codex",
+            }),
+        );
+
+        assert_eq!(routed["operation"], "explain");
+        assert_eq!(routed["affordance_id"], "theorem_grpc.code_search.explain");
+        assert_eq!(
+            routed["app_affordance"]["affordance_id"],
+            "theorem_grpc.code_search.explain"
+        );
+        assert_eq!(
+            routed["app_affordance"]["request"]["query"],
+            "native_code_search"
+        );
+        assert_eq!(routed["app_affordance"]["request"]["repo_id"], "repo:test");
+        assert!(routed["app_affordance"]["request"]
+            .get("operation")
+            .is_none());
     }
 
     #[test]

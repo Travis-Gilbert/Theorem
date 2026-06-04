@@ -14,11 +14,12 @@ It also serves `theorem_code.v1.CodeCrawlerService`, a native internal code
 index lane. `IngestCodebase` and `ReindexCodebase` crawl local repo files into a
 durable RedCore code graph; `SearchCode` ranks indexed symbols; `RecognizeCode`
 extracts symbols from indexed files or inline source; `ExploreCode` expands
-heuristic call graph edges; `CodeContext` expands a file or symbol hit into
-surrounding source context; `ExplainCode` returns a compact symbol summary with
-context, trust tier, and graph evidence. Every operation returns a
-content-addressed receipt, and read receipt writes are separate from the code
-graph mutations.
+Rust AST-backed call/dependency edges; `CodeContext` expands a file or symbol
+hit into surrounding source context; `ExplainCode` returns a compact symbol
+summary with context, trust tier, and graph evidence; `RecordUseReceipt` records
+agent use/outcome metadata for the learning loop. Every operation returns a
+content-addressed receipt, and read/use receipt writes are separate from the
+code graph mutations.
 
 The app surface serves `theorem_grpc.AppAffordanceService`, the live transport
 boundary for metadata-registered `theorem_grpc.*` Theseus app affordances. The
@@ -26,9 +27,10 @@ service validates affordance ids, confirmation gates, timeout policy, and
 content-addressed receipt shape, then dispatches local receipt-first handlers.
 Code affordances (`code_search.ingest`, `code_search.reindex`,
 `code_search.search`, `code_search.recognize`, `code_search.explore`,
-`code_search.context`, `code_search.explain`) call the native CodeCrawler
-runtime directly, so app/harness callers and direct gRPC callers share the same
-code index. Each non-dry-run invocation records an affordance outcome into the
+`code_search.context`, `code_search.explain`,
+`code_search.record_use_receipt`) call the native CodeCrawler runtime directly,
+so app/harness callers and direct gRPC callers share the same code index. Each
+non-dry-run invocation records an affordance outcome into the
 service RedCore store and returns charter-scoped capability recommendations from
 the same selection path. Confirmed non-code side-effecting actions call a
 configured Theseus app adapter endpoint; without one they fail safely and still
@@ -53,6 +55,12 @@ Durability and live adapter knobs:
 - `THESEUS_APP_BASE_URL`: alternate base URL; the service appends
   `/api/v2/theorem/app-affordances/invoke/`.
 - `THESEUS_APP_ADAPTER_TOKEN`: optional bearer token for that adapter endpoint.
+- RustyRed MCP `code_search` callers dial this service's
+  `AppAffordanceService` by setting `THEOREM_APP_AFFORDANCE_GRPC_URL`
+  (fallbacks: `THEOREM_GRPC_URL`, `THEOREM_SEARCH_URL`, `THESEUS_BRIDGE_URL`).
+  The RustyRed product Docker image defaults this to
+  `http://theorem-grpc.railway.internal:8080`; bare `host:port` values are
+  normalized to `http://host:port`.
 
 Build: `cargo build -p theorem-grpc` (run from this dir; standalone Cargo root,
 not a member of `rustyredcore_THG`).

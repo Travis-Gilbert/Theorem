@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status};
 
 use crate::code_index::{
     CodeContextInput, CodeIndexRuntime, ExplainCodeInput, ExploreCodeInput, IngestCodebaseInput,
-    RecognizeCodeInput, SearchCodeInput,
+    RecognizeCodeInput, RecordUseReceiptInput, SearchCodeInput,
 };
 use crate::pb;
 
@@ -369,6 +369,9 @@ fn handle_affordance(
         }
         "code_search.explain" => {
             return code_explain_handler(base, code_index, request, tenant_id);
+        }
+        "code_search.record_use_receipt" => {
+            return code_record_use_handler(base, code_index, request, tenant_id, actor);
         }
         "anti_misinfo_algo.inspect_claim" => merge_json(
             base,
@@ -721,6 +724,49 @@ fn code_explain_handler(
             message: "native code explanation failed".to_string(),
             outcome_value: 0.0,
             outcome_label: "code_explain_failed".to_string(),
+        },
+    }
+}
+
+fn code_record_use_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+    actor: &str,
+) -> HandlerOutcome {
+    let result = code_index.record_use_receipt(RecordUseReceiptInput {
+        tenant_id: tenant_id.to_string(),
+        node_id: request_string(request, &["node_id", "symbol_id"]).unwrap_or_default(),
+        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        query: request_string(request, &["query", "text"]).unwrap_or_default(),
+        action: request_string(request, &["action", "use_action"]).unwrap_or_default(),
+        outcome: request_string(request, &["outcome", "result"]).unwrap_or_default(),
+        actor: request_string(request, &["actor", "actor_id"]).unwrap_or_else(|| actor.to_string()),
+        use_json: request
+            .get("use")
+            .or_else(|| request.get("metadata"))
+            .map(Value::to_string)
+            .unwrap_or_default(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code use receipt recorded in RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_use_receipt_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code use receipt failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_use_receipt_failed".to_string(),
         },
     }
 }
@@ -1532,6 +1578,30 @@ mod tests {
         let explain_output: Value = serde_json::from_str(&explain.output_json).unwrap();
         let summary = explain_output["summary"].as_str().unwrap_or_default();
         assert!(summary.contains("Trust tier: advisory"), "{summary}");
+
+        let use_receipt = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.record_use_receipt".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "node_id": node_id,
+                        "query": "native_code_search",
+                        "action": "explain",
+                        "outcome": "useful",
+                        "use": { "selected": true }
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(use_receipt.status, "ok");
+        assert!(use_receipt.output_json.contains("\"code_use_receipt_ok\""));
 
         drop(runtime);
         std::fs::remove_dir_all(repo_dir).ok();

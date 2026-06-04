@@ -2679,6 +2679,7 @@ dependencies = [
  "rustyred-thg-core",
  "rustyred-web",
  "serde_json",
+ "syn",
  "theorem-harness-core",
  "tokio",
  "tonic",

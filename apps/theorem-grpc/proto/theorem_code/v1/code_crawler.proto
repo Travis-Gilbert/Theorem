@@ -16,6 +16,7 @@ service CodeCrawlerService {
   rpc RecognizeCode(RecognizeCodeRequest) returns (RecognizeCodeResponse);
   rpc ExploreCode(ExploreCodeRequest) returns (ExploreCodeResponse);
   rpc ExplainCode(ExplainCodeRequest) returns (ExplainCodeResponse);
+  rpc RecordUseReceipt(RecordUseReceiptRequest) returns (RecordUseReceiptResponse);
 }
 
 message IngestCodebaseRequest {
@@ -152,6 +153,27 @@ message ExplainCodeResponse {
   string receipt_json = 7;
 }
 
+message RecordUseReceiptRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string repo_id = 3;
+  string query = 4;
+  string action = 5;
+  string outcome = 6;
+  string actor = 7;
+  string use_json = 8;
+}
+
+message RecordUseReceiptResponse {
+  string tenant_id = 1;
+  string node_id = 2;
+  string repo_id = 3;
+  string receipt_hash = 4;
+  string receipt_json = 5;
+  string status = 6;
+  string message = 7;
+}
+
 message CodeHit {
   string node_id = 1;
   string repo_id = 2;
@@ -182,6 +204,8 @@ message CodeSymbol {
   string community_id = 12;
   repeated string callers = 13;
   repeated string callees = 14;
+  repeated string dependencies = 15;
+  repeated string dependents = 16;
 }
 
 message CodeGraphEdge {

@@ -206,10 +206,10 @@ encoder never moves to Rust; only the serving does.
   Theorem now has a native first lane in `apps/theorem-grpc`:
   `theorem_code.v1.CodeCrawlerService` exposes `IngestCodebase`,
   `ReindexCodebase`, `SearchCode`, `RecognizeCode`, `ExploreCode`,
-  `CodeContext`, and `ExplainCode`; it stores repo/file/symbol nodes, heuristic
-  call graph edges, trust tiers, community ids, and operation receipts in
-  RedCore and is also reachable through `theorem_grpc.code_search.*` app
-  affordances.
+  `CodeContext`, `ExplainCode`, and `RecordUseReceipt`; it stores
+  repo/file/symbol nodes, Rust AST-backed call/dependency graph edges, trust
+  tiers, community ids, and operation/use receipts in RedCore and is also
+  reachable through `theorem_grpc.code_search.*` app affordances.
 - [ ] **S4b** Bring the native lane to full CodeCrawler parity:
   - Contract: `Index-API/protos/theorem/v1/code_crawler.proto`
     (`CodeCrawlerService`): `Search`, `Recognize`, `Explore`, `Context`,
@@ -222,14 +222,16 @@ encoder never moves to Rust; only the serving does.
   - Native precedent exists: `Theorem/apps/theorem-grpc` already serves
     `theseus_search.v1.SearchService` in pure Rust over the RustyRed substrate
     (the URL-swap connection-point pattern via `THEOREM_SEARCH_URL`).
-  - **Shipped native subset:** `Recognize`, `Explore`, `Explain`, advisory
-    trust tiers, community ids, and heuristic call graph edges now live on top
-    of the native RedCore code graph and the `theorem_grpc.code_search.*`
-    affordance path. Harness agents can query symbols, context, graph
-    neighborhoods, and explanations without calling the Python CodeCrawler.
-  - **Remaining parity:** add `RecordUseReceipt` and replace heuristic
-    dependency/call graph expansion with parser-grade semantics where the
-    Python CodeCrawler contract requires it.
+  - **Shipped native subset:** `Recognize`, `Explore`, `Explain`,
+    `RecordUseReceipt`, advisory trust tiers, community ids, and Rust
+    AST-backed call/dependency graph edges now live on top of the native RedCore
+    code graph and the `theorem_grpc.code_search.*` affordance path. Harness
+    agents can query symbols, context, graph neighborhoods, explanations, and
+    use receipts without calling the Python CodeCrawler.
+  - **Remaining parity:** wire the deployed MCP product backend to the live
+    theorem-grpc app-affordance transport and add parser-grade dependency/call
+    graph extraction for non-Rust languages where the Python CodeCrawler
+    contract requires it.
   - `RecordUseReceipt` over this gRPC IS the self-improvement connection point
     (Lane F): every agent code query/use emits a receipt that drives
     fitness/promotion. The seam already exists in the proto.

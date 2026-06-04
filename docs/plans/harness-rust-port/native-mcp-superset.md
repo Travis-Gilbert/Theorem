@@ -156,7 +156,7 @@ state-machine and toolgraph ports.
 | `harness_compare` | read | core (`replay::compare_*`) exists; not surfaced | R8 |
 | `harness_toolkit` | read/compile | core (`toolgraph`) exists; not surfaced | R9 |
 | `harness_fractal_expansion` | read/write | composes native PPR; not surfaced | R10 |
-| `code_search` | read | first native RedCore lane exists in `apps/theorem-grpc`; harness verb routing still needs to call it | R11 |
+| `code_search` | read | native MCP routes to `theorem_grpc.code_search.*` app affordances through the product backend gRPC hook | R11 |
 | `mentions_wait` | read (long-poll) | GAP | C1 |
 | `resolve_tension` | write | GAP (records have `tension` type; no resolve verb) | C4 |
 | `next` | read (action rail) | GAP | C3 |
@@ -299,11 +299,13 @@ work is the tool schema, the run-id threading, and the read/write gating.
 - [ ] **R11 `code_search`** — search ingested code symbols. First native lane
   now exists in `apps/theorem-grpc`: `CodeCrawlerService` can ingest/reindex a
   repo into a RedCore code graph, search symbols, recognize symbols from indexed
-  files or inline source, expand heuristic call graph edges, read context,
-  explain symbols with trust tiers, and record receipts; the same runtime is
-  exposed as `theorem_grpc.code_search.*` affordances. Remaining R11 work: route
-  the harness verb to this service and replace heuristic call/dependency
-  expansion with deeper parser-grade parity where needed.
+  files or inline source, expand Rust AST-backed call/dependency edges, read
+  context, explain symbols with trust tiers, and record search/use receipts; the
+  same runtime is exposed as `theorem_grpc.code_search.*` affordances. The named
+  MCP `code_search` harness verb now routes through the product backend's live
+  app-affordance gRPC hook to those ids. Remaining R11 work: configure the
+  deployment endpoint env and add parser-grade parity for non-Rust languages
+  where needed.
 
 ## Lane C: coordination completeness
 
@@ -457,11 +459,12 @@ as out of scope:
   verbs carry an open sub-question (T35/T36); everything else is a clean
   GraphStore port. No longer deferred.
 - **D3 — closed for first richer lane.** Native code-symbol
-  ingestion/search/recognition/exploration/context/explanation is no longer
-  blocked on the Python CodeCrawler path. The remaining deferral is parity
-  depth, not basic availability: harness callers still need to route to the
-  gRPC/app affordance lane, and parser-grade dependency/call graph semantics
-  still need native parity.
+  ingestion/search/recognition/exploration/context/explanation/use-receipting is
+  no longer blocked on the Python CodeCrawler path. The remaining deferral is
+  production rollout depth, not basic availability: the MCP verb has a live
+  app-affordance gRPC backend path, Rust has AST-backed call/dependency
+  semantics, and the remaining parser-grade dependency/call parity is beyond
+  Rust.
 
 If the answer is "no, do all of it," D1-D3 fold into a Phase 2 of this same
 plan rather than disappearing.
