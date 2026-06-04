@@ -20,6 +20,7 @@ use serde_json::{json, Map, Value};
 use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
 
+use crate::code_index::{CodeContextInput, CodeIndexRuntime, IngestCodebaseInput, SearchCodeInput};
 use crate::pb;
 
 #[derive(Clone)]
@@ -29,8 +30,12 @@ pub struct TheoremAppAffordanceService {
 
 impl TheoremAppAffordanceService {
     pub fn try_new() -> Result<Self, String> {
+        Self::try_new_with_code_index(CodeIndexRuntime::try_new().map_err(|err| err.to_string())?)
+    }
+
+    pub fn try_new_with_code_index(code_index: CodeIndexRuntime) -> Result<Self, String> {
         Ok(Self {
-            runtime: AppAffordanceRuntime::try_new()?,
+            runtime: AppAffordanceRuntime::try_new(code_index)?,
         })
     }
 
@@ -65,14 +70,16 @@ impl pb::AppAffordanceService for TheoremAppAffordanceService {
 struct AppAffordanceRuntime {
     store: Arc<Mutex<RedCoreGraphStore>>,
     adapter: TheseusAppAdapter,
+    code_index: CodeIndexRuntime,
 }
 
 impl AppAffordanceRuntime {
-    fn try_new() -> Result<Self, String> {
+    fn try_new(code_index: CodeIndexRuntime) -> Result<Self, String> {
         Self::try_new_at(
             redcore_data_dir(),
             redcore_options(),
             TheseusAppAdapter::from_env(),
+            code_index,
         )
     }
 
@@ -80,6 +87,7 @@ impl AppAffordanceRuntime {
         data_dir: impl AsRef<Path>,
         options: RedCoreOptions,
         adapter: TheseusAppAdapter,
+        code_index: CodeIndexRuntime,
     ) -> Result<Self, String> {
         let mut store = RedCoreGraphStore::open(data_dir.as_ref(), options)
             .map_err(|err| format!("open theorem_grpc RedCore store failed: {err:?}"))?;
@@ -88,6 +96,7 @@ impl AppAffordanceRuntime {
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             adapter,
+            code_index,
         })
     }
 
@@ -103,6 +112,7 @@ impl AppAffordanceRuntime {
         Ok(invoke_registered_affordance(
             &mut *store,
             &self.adapter,
+            &self.code_index,
             req,
             started,
         ))
@@ -112,6 +122,7 @@ impl AppAffordanceRuntime {
 fn invoke_registered_affordance<S: AffordanceGraphStore>(
     store: &mut S,
     adapter: &TheseusAppAdapter,
+    code_index: &CodeIndexRuntime,
     req: pb::InvokeAffordanceRequest,
     started: Instant,
 ) -> pb::InvokeAffordanceResponse {
@@ -255,6 +266,7 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
         req.confirmed,
         timeout_ms,
         adapter,
+        code_index,
         &tenant_id,
         actor.as_str(),
     );
@@ -304,6 +316,7 @@ fn handle_affordance(
     confirmed: bool,
     timeout_ms: u64,
     adapter: &TheseusAppAdapter,
+    code_index: &CodeIndexRuntime,
     tenant_id: &str,
     actor: &str,
 ) -> HandlerOutcome {
@@ -333,6 +346,18 @@ fn handle_affordance(
     });
 
     let output = match affordance.tool_name.as_str() {
+        "code_search.ingest" => {
+            return code_ingest_handler(base, code_index, request, tenant_id, actor, false);
+        }
+        "code_search.reindex" => {
+            return code_ingest_handler(base, code_index, request, tenant_id, actor, true);
+        }
+        "code_search.search" => {
+            return code_search_handler(base, code_index, request, tenant_id);
+        }
+        "code_search.context" => {
+            return code_context_handler(base, code_index, request, tenant_id);
+        }
         "anti_misinfo_algo.inspect_claim" => merge_json(
             base,
             json!({
@@ -457,6 +482,128 @@ fn handle_affordance(
             .to_string(),
         outcome_value: 1.0,
         outcome_label: "handler_ok".to_string(),
+    }
+}
+
+fn code_ingest_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+    actor: &str,
+    reindex: bool,
+) -> HandlerOutcome {
+    let input = IngestCodebaseInput {
+        tenant_id: tenant_id.to_string(),
+        repo_path: request_string(request, &["repo_path", "path"]).unwrap_or_default(),
+        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        include_extensions: request_string_array(request, "include_extensions"),
+        exclude_dirs: request_string_array(request, "exclude_dirs"),
+        max_files: request_u64(request, "max_files").unwrap_or_default(),
+        max_file_bytes: request_u64(request, "max_file_bytes").unwrap_or_default(),
+        actor: actor.to_string(),
+    };
+    let result = if reindex {
+        code_index.reindex_codebase(input)
+    } else {
+        code_index.ingest_codebase(input)
+    };
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code index wrote codebase data into RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: if reindex {
+                "code_reindex_ok".to_string()
+            } else {
+                "code_ingest_ok".to_string()
+            },
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code index failed to ingest codebase".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_ingest_failed".to_string(),
+        },
+    }
+}
+
+fn code_search_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let result = code_index.search_code(SearchCodeInput {
+        tenant_id: tenant_id.to_string(),
+        query: request_string(request, &["query", "text", "symbol"]).unwrap_or_default(),
+        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        path_prefix: request_string(request, &["path_prefix", "file_prefix"]).unwrap_or_default(),
+        kinds: request_string_array(request, "kinds"),
+        limit: request_u64(request, "limit").unwrap_or_default(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code search completed over RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_search_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code search failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_search_failed".to_string(),
+        },
+    }
+}
+
+fn code_context_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let result = code_index.code_context(CodeContextInput {
+        tenant_id: tenant_id.to_string(),
+        node_id: request_string(request, &["node_id", "symbol_id", "file_id"]).unwrap_or_default(),
+        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        file_path: request_string(request, &["file_path", "path"]).unwrap_or_default(),
+        before_lines: request_u64(request, "before_lines").unwrap_or_default(),
+        after_lines: request_u64(request, "after_lines").unwrap_or_default(),
+        max_chars: request_u64(request, "max_chars").unwrap_or_default(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code context completed over RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_context_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code context failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_context_failed".to_string(),
+        },
     }
 }
 
@@ -900,6 +1047,9 @@ fn requires_confirmation(affordance: &Affordance) -> bool {
 }
 
 fn uses_live_theseus_adapter(affordance: &Affordance) -> bool {
+    if affordance.tool_name.starts_with("code_search.") {
+        return false;
+    }
     requires_confirmation(affordance)
 }
 
@@ -967,6 +1117,31 @@ fn request_string(request: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
+fn request_string_array(request: &Value, key: &str) -> Vec<String> {
+    request
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn request_u64(request: &Value, key: &str) -> Option<u64> {
+    request.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
+            .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
+    })
+}
+
 fn request_array_or_empty(request: &Value, key: &str) -> Value {
     request
         .get(key)
@@ -991,6 +1166,7 @@ fn merge_json(mut left: Value, right: Value) -> Value {
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -998,6 +1174,8 @@ mod tests {
     use rustyred_thg_core::NodeQuery;
 
     use super::*;
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn test_options() -> RedCoreOptions {
         RedCoreOptions {
@@ -1012,15 +1190,20 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "theorem-grpc-{name}-{}-{nanos}",
+            "theorem-grpc-{name}-{}-{nanos}-{counter}",
             std::process::id()
         ))
     }
 
     fn runtime_with_adapter(adapter: TheseusAppAdapter) -> (AppAffordanceRuntime, PathBuf) {
         let data_dir = unique_test_dir("redcore");
-        let runtime = AppAffordanceRuntime::try_new_at(&data_dir, test_options(), adapter).unwrap();
+        let code_dir = data_dir.join("code-index");
+        let code_index = CodeIndexRuntime::try_new_at(&code_dir, test_options()).unwrap();
+        let runtime =
+            AppAffordanceRuntime::try_new_at(&data_dir, test_options(), adapter, code_index)
+                .unwrap();
         (runtime, data_dir)
     }
 
@@ -1030,6 +1213,17 @@ mod tests {
         let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
         let response = runtime.invoke(req, Instant::now()).unwrap();
         (runtime, response, data_dir)
+    }
+
+    fn fixture_code_repo() -> PathBuf {
+        let repo_dir = unique_test_dir("code-repo");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn native_code_search(query: &str) -> usize {\n    query.len()\n}\n",
+        )
+        .unwrap();
+        repo_dir
     }
 
     #[test]
@@ -1112,6 +1306,55 @@ mod tests {
         assert!(response.output_json.contains("\"fake-provider\""));
         assert!(response.output_json.contains("\"capability_selection\""));
         drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn code_search_affordance_ingests_and_searches_redcore_index() {
+        let repo_dir = fixture_code_repo();
+        let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
+        let ingest = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.ingest".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_path": repo_dir.display().to_string(),
+                        "include_extensions": ["rs"],
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: true,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ingest.status, "ok");
+        assert!(ingest.output_json.contains("\"files_indexed\":1"));
+        assert!(ingest.output_json.contains("\"graph_invocation\""));
+
+        let search = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.search".to_string(),
+                    actor: "test".to_string(),
+                    request_json: r#"{"query":"native_code_search"}"#.to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(search.status, "ok");
+        assert!(search.output_json.contains("\"native_code_search\""));
+        assert!(search.output_json.contains("\"capability_selection\""));
+
+        drop(runtime);
+        std::fs::remove_dir_all(repo_dir).ok();
         std::fs::remove_dir_all(data_dir).ok();
     }
 
@@ -1217,10 +1460,13 @@ mod tests {
     fn redcore_runtime_recovers_invocation_receipts() {
         let data_dir = unique_test_dir("recover");
         {
+            let code_index =
+                CodeIndexRuntime::try_new_at(data_dir.join("code-index"), test_options()).unwrap();
             let runtime = AppAffordanceRuntime::try_new_at(
                 &data_dir,
                 test_options(),
                 TheseusAppAdapter::new(None, None),
+                code_index,
             )
             .unwrap();
             let response = runtime

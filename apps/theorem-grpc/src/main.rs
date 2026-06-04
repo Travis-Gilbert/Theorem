@@ -8,6 +8,8 @@
 //! THESEUS_BRIDGE_URL).
 
 mod app_affordance;
+mod code_index;
+mod code_service;
 mod engine;
 mod pb;
 mod service;
@@ -16,8 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use app_affordance::TheoremAppAffordanceService;
+use code_index::CodeIndexRuntime;
+use code_service::TheoremCodeCrawlerService;
 use engine::Engine;
-use pb::{AppAffordanceServiceServer, SearchServiceServer};
+use pb::{AppAffordanceServiceServer, CodeCrawlerServiceServer, SearchServiceServer};
 use service::TheoremSearchService;
 
 #[tokio::main]
@@ -37,15 +41,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the engine (empty substrate is the honest slice-1 default) and wrap
     // it in an Arc so the owned store outlives every borrowing handler call.
     let engine = Arc::new(Engine::new());
+    let code_index = CodeIndexRuntime::try_new().map_err(std::io::Error::other)?;
     let search_svc = SearchServiceServer::new(TheoremSearchService::new(engine));
+    let code_svc =
+        CodeCrawlerServiceServer::new(TheoremCodeCrawlerService::new(code_index.clone()));
     let app_affordance_svc = AppAffordanceServiceServer::new(
-        TheoremAppAffordanceService::try_new().map_err(std::io::Error::other)?,
+        TheoremAppAffordanceService::try_new_with_code_index(code_index)
+            .map_err(std::io::Error::other)?,
     );
 
     tracing::info!("THEOREM_GRPC_READY {}", addr);
 
     tonic::transport::Server::builder()
         .add_service(search_svc)
+        .add_service(code_svc)
         .add_service(app_affordance_svc)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;

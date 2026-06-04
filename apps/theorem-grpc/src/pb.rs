@@ -1,4 +1,4 @@
-//! Generated-proto include module for theseus_search.v1.
+//! Generated-proto include module for Theorem gRPC services.
 //!
 //! `tonic::include_proto!` pulls in the code `tonic-build` emitted from
 //! `proto/theseus_search/v1/search.proto` at compile time (see build.rs).
@@ -12,6 +12,10 @@ pub mod app_affordance {
     tonic::include_proto!("theorem_grpc");
 }
 
+pub mod code {
+    tonic::include_proto!("theorem_code.v1");
+}
+
 // Re-export the trait + server type the service module implements/mounts, plus
 // the message types the handlers reference by short name. The trait name is the
 // proto service name (`SearchService`); the generated server wrapper is
@@ -22,6 +26,11 @@ pub use app_affordance::app_affordance_service_server::{
     AppAffordanceService, AppAffordanceServiceServer,
 };
 pub use app_affordance::{InvokeAffordanceRequest, InvokeAffordanceResponse};
+pub use code::code_crawler_service_server::{CodeCrawlerService, CodeCrawlerServiceServer};
+pub use code::{
+    CodeContextRequest, CodeContextResponse, CodeHit, CodeSymbol, IngestCodebaseRequest,
+    IngestCodebaseResponse, ReindexCodebaseRequest, SearchCodeRequest, SearchCodeResponse,
+};
 pub use search::search_service_server::{SearchService, SearchServiceServer};
 pub use search::{
     GapWalkRequest, GapWalkResponse, ProvenanceGraph, ProvenanceNode, ProvenanceRequest,

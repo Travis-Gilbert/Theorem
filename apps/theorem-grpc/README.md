@@ -10,15 +10,25 @@ proto package + message shapes (copied byte-identical from
 `RustyRed-Graph-Database/proto/theseus_search/v1/search.proto`), so the civic
 backend dials it by setting `THEOREM_SEARCH_URL` with no code change.
 
-It also serves `theorem_grpc.AppAffordanceService`, the live transport boundary
-for metadata-registered `theorem_grpc.*` Theseus app affordances. The service
-validates affordance ids, confirmation gates, timeout policy, and
-content-addressed receipt shape, then dispatches local receipt-first handlers for
-read-only Theseus app families. Each non-dry-run invocation records an
-affordance outcome into the service RedCore store and returns charter-scoped
-capability recommendations from the same selection path. Confirmed side-effecting
-actions call a configured Theseus app adapter endpoint; without one they fail
-safely and still record the failed attempt as a learning receipt.
+It also serves `theorem_code.v1.CodeCrawlerService`, a native internal code
+index lane. `IngestCodebase` and `ReindexCodebase` crawl local repo files into a
+durable RedCore code graph; `SearchCode` ranks indexed symbols; `CodeContext`
+expands a file or symbol hit into surrounding source context. Every operation
+returns a content-addressed receipt, and search/context receipt writes are
+separate from the code graph mutations.
+
+The app surface serves `theorem_grpc.AppAffordanceService`, the live transport
+boundary for metadata-registered `theorem_grpc.*` Theseus app affordances. The
+service validates affordance ids, confirmation gates, timeout policy, and
+content-addressed receipt shape, then dispatches local receipt-first handlers.
+Code affordances (`code_search.ingest`, `code_search.reindex`,
+`code_search.search`, `code_search.context`) call the native CodeCrawler runtime
+directly, so app/harness callers and direct gRPC callers share the same code
+index. Each non-dry-run invocation records an affordance outcome into the
+service RedCore store and returns charter-scoped capability recommendations from
+the same selection path. Confirmed non-code side-effecting actions call a
+configured Theseus app adapter endpoint; without one they fail safely and still
+record the failed attempt as a learning receipt.
 
 Durability and live adapter knobs:
 
@@ -28,6 +38,12 @@ Durability and live adapter knobs:
   `aof_always`, `snapshot_only`, or `none`.
 - `THEOREM_GRPC_REDCORE_STRICT_ACID`: set to `true` with `aof_always` when every
   receipt write must fsync before success.
+- `THEOREM_CODE_INDEX_DIR` or `THEOREM_GRPC_CODE_INDEX_DIR`: RedCore data
+  directory for the native code graph (default:
+  `data/theorem-grpc/code-index`; when `THEOREM_GRPC_DATA_DIR` is set, defaults
+  to `$THEOREM_GRPC_DATA_DIR/code-index`).
+- `THEOREM_CODE_INDEX_DURABILITY`: code-index RedCore durability; falls back to
+  `THEOREM_GRPC_REDCORE_DURABILITY`.
 - `THESEUS_APP_ADAPTER_ENDPOINT`: full HTTP endpoint for confirmed
   side-effecting app affordance calls.
 - `THESEUS_APP_BASE_URL`: alternate base URL; the service appends
@@ -41,9 +57,9 @@ Deploy: its own Railway service (`railway.toml` + `Dockerfile`, build context =
 Theorem repo root). Binds `0.0.0.0:$PORT` (Railway injects `PORT`; default
 `50071` locally).
 
-Honest-minimal RPCs: `Search` is real graph rank (`prior_knowledge` populated
-from the substrate). `GapWalk` is a real single-round PPR over the existing
-substrate. `SourcePair` returns the honest empty state (no source/web anchoring
-layer ingested yet). `Provenance` returns the real node or honest-empty. None
+Search RPCs: `Search` is real graph rank (`prior_knowledge` populated from the
+substrate). `GapWalk` is a real single-round PPR over the existing substrate.
+`SourcePair` returns the honest empty state (no source/web anchoring layer
+ingested yet). `Provenance` returns the real node or honest-empty. None
 fabricate: graph-grounded-or-empty, never invented. An empty substrate yields
 zero hits, which is truthful, not a bug.

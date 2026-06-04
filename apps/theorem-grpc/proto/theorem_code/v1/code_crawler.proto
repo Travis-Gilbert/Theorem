@@ -1,0 +1,123 @@
+// Copyright 2026 Travis Gilbert. MIT licensed.
+//
+// Native Theorem code-index and code-search surface. The service is internal
+// app infrastructure: it indexes code into RedCore, searches indexed symbols,
+// and expands hits into file context.
+
+syntax = "proto3";
+
+package theorem_code.v1;
+
+service CodeCrawlerService {
+  rpc IngestCodebase(IngestCodebaseRequest) returns (IngestCodebaseResponse);
+  rpc ReindexCodebase(ReindexCodebaseRequest) returns (IngestCodebaseResponse);
+  rpc SearchCode(SearchCodeRequest) returns (SearchCodeResponse);
+  rpc CodeContext(CodeContextRequest) returns (CodeContextResponse);
+}
+
+message IngestCodebaseRequest {
+  string tenant_id = 1;
+  string repo_path = 2;
+  string repo_id = 3;
+  repeated string include_extensions = 4;
+  repeated string exclude_dirs = 5;
+  uint64 max_files = 6;
+  uint64 max_file_bytes = 7;
+  string actor = 8;
+}
+
+message ReindexCodebaseRequest {
+  string tenant_id = 1;
+  string repo_path = 2;
+  string repo_id = 3;
+  repeated string include_extensions = 4;
+  repeated string exclude_dirs = 5;
+  uint64 max_files = 6;
+  uint64 max_file_bytes = 7;
+  string actor = 8;
+}
+
+message IngestCodebaseResponse {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string repo_root = 3;
+  uint64 generation = 4;
+  uint64 files_indexed = 5;
+  uint64 symbols_indexed = 6;
+  uint64 files_skipped = 7;
+  uint64 graph_version = 8;
+  string receipt_hash = 9;
+  string receipt_json = 10;
+  string status = 11;
+  string message = 12;
+}
+
+message SearchCodeRequest {
+  string tenant_id = 1;
+  string query = 2;
+  string repo_id = 3;
+  string path_prefix = 4;
+  repeated string kinds = 5;
+  uint64 limit = 6;
+}
+
+message SearchCodeResponse {
+  string tenant_id = 1;
+  string query = 2;
+  repeated CodeHit hits = 3;
+  uint64 total_admitted = 4;
+  uint64 total_returned = 5;
+  uint64 latency_ms = 6;
+  string receipt_hash = 7;
+  string receipt_json = 8;
+}
+
+message CodeContextRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string repo_id = 3;
+  string file_path = 4;
+  uint64 before_lines = 5;
+  uint64 after_lines = 6;
+  uint64 max_chars = 7;
+}
+
+message CodeContextResponse {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string file_id = 3;
+  string symbol_id = 4;
+  string file_path = 5;
+  uint64 start_line = 6;
+  uint64 end_line = 7;
+  string context = 8;
+  repeated CodeSymbol symbols = 9;
+  string receipt_hash = 10;
+  string receipt_json = 11;
+}
+
+message CodeHit {
+  string node_id = 1;
+  string repo_id = 2;
+  string file_id = 3;
+  string file_path = 4;
+  string kind = 5;
+  string name = 6;
+  string language = 7;
+  uint64 line = 8;
+  string snippet = 9;
+  double score = 10;
+}
+
+message CodeSymbol {
+  string node_id = 1;
+  string repo_id = 2;
+  string file_id = 3;
+  string file_path = 4;
+  string kind = 5;
+  string name = 6;
+  string language = 7;
+  uint64 line = 8;
+  string signature = 9;
+  string snippet = 10;
+}

@@ -136,12 +136,16 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
     let result = register_theseus_app_affordances(&mut store, "theorem", Some("test")).unwrap();
 
     assert_eq!(result.server_id, THEOREM_GRPC_SERVER_ID);
-    assert_eq!(result.affordance_node_ids.len(), 11);
+    assert_eq!(result.affordance_node_ids.len(), 15);
     assert!(store.get_node(&result.connector_node_id).is_some());
 
     let publisher_id = affordance_node_id("theorem", "theorem_grpc.publisher.publish");
+    let code_search_id = affordance_node_id("theorem", "theorem_grpc.code_search.search");
     assert!(result.affordance_node_ids.contains(&publisher_id));
+    assert!(result.affordance_node_ids.contains(&code_search_id));
     let publisher = Affordance::from_node_record(store.get_node(&publisher_id).unwrap()).unwrap();
+    let code_search =
+        Affordance::from_node_record(store.get_node(&code_search_id).unwrap()).unwrap();
 
     assert_eq!(publisher.server_id, THEOREM_GRPC_SERVER_ID);
     assert_eq!(publisher.family, "publisher");
@@ -155,10 +159,13 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
         publisher.cost["failure_receipt"]["receipt_type"],
         "THEOREM_GRPC.AFFORDANCE_FAILED"
     );
+    assert_eq!(code_search.family, "code_search");
+    assert_eq!(code_search.writeback_policy, "receipt-only");
+    assert!(code_search.permissions.contains(&"code_read".to_string()));
 
     let offers =
         store.neighbors(NeighborQuery::out(&result.connector_node_id).with_edge_type(OFFERS));
-    assert_eq!(offers.len(), 11);
+    assert_eq!(offers.len(), 15);
 }
 
 #[test]

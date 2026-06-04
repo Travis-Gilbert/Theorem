@@ -156,7 +156,7 @@ state-machine and toolgraph ports.
 | `harness_compare` | read | core (`replay::compare_*`) exists; not surfaced | R8 |
 | `harness_toolkit` | read/compile | core (`toolgraph`) exists; not surfaced | R9 |
 | `harness_fractal_expansion` | read/write | composes native PPR; not surfaced | R10 |
-| `code_search` | read | depends on code symbols in THG (CodeCrawler); see R11 + deferral D3 | R11 |
+| `code_search` | read | first native RedCore lane exists in `apps/theorem-grpc`; harness verb routing still needs to call it | R11 |
 | `mentions_wait` | read (long-poll) | GAP | C1 |
 | `resolve_tension` | write | GAP (records have `tension` type; no resolve verb) | C4 |
 | `next` | read (action rail) | GAP | C3 |
@@ -296,10 +296,13 @@ work is the tool schema, the run-id threading, and the read/write gating.
   (`rustyred_thg_algorithm_ppr` / `harness_kg_ppr`); no Python `push_ppr`
   fallback (the deploy log `FALLBACK: Python push_ppr running` becomes
   structurally impossible because there is no Python in the path).
-- [ ] **R11 `code_search`** — search ingested code symbols. Native **iff** code
-  symbols already live in the THG graph (then it is `harness_kg_search` /
-  fulltext filtered to code-symbol nodes). If code ingestion (CodeCrawler) is
-  still Python-only, see deferral **D3**.
+- [ ] **R11 `code_search`** — search ingested code symbols. First native lane
+  now exists in `apps/theorem-grpc`: `CodeCrawlerService` can ingest/reindex a
+  repo into a RedCore code graph, search symbols, expand code context, and record
+  receipts; the same runtime is exposed as `theorem_grpc.code_search.*`
+  affordances. Remaining R11 work: route the harness verb to this service and
+  enrich symbols with full CodeCrawler parity (trust tiers, Explore/Explain,
+  call/dependency graph expansion).
 
 ## Lane C: coordination completeness
 
@@ -452,12 +455,11 @@ as out of scope:
   now in scope as **Lane T** below. Only the `theorem_runner_*` process-spawn
   verbs carry an open sub-question (T35/T36); everything else is a clean
   GraphStore port. No longer deferred.
-- **D3 — `code_search` native (R11) IF code symbols are not yet in THG.**
-  Justification: the CodeCrawler ingest that populates code-symbol nodes may be
-  Python-only; native `code_search` is trivial once the symbols are in the
-  graph but blocked on that ingest. Proposed: ship R11 native if symbols are
-  present; otherwise defer R11 with the CodeCrawler-ingest port and keep
-  `code_search` on Python until then.
+- **D3 — closed for first lane.** Native code-symbol ingestion/search/context is
+  no longer blocked on the Python CodeCrawler path. The remaining deferral is
+  parity depth, not basic availability: harness callers still need to route to
+  the gRPC/app affordance lane, and richer CodeCrawler verbs need native graph
+  semantics.
 
 If the answer is "no, do all of it," D1-D3 fold into a Phase 2 of this same
 plan rather than disappearing.

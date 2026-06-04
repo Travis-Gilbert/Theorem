@@ -201,9 +201,14 @@ encoder never moves to Rust; only the serving does.
 - [ ] **S3** Run the pack's native Rust validators in-process (the payoff of a
   Rust corpus: the validators ARE Rust, so they execute natively in Theorem,
   not as advisory strings).
-- [ ] **S4** Native gRPC code search = the agent query surface for "be better at
+- [x] **S4a** Native gRPC code search first lane = the agent query surface for "be better at
   Rust" (Travis: "the gRPC external codebase search would be useful for this").
-  There is already a contract and both a Python impl and a native precedent:
+  Theorem now has a native first lane in `apps/theorem-grpc`:
+  `theorem_code.v1.CodeCrawlerService` exposes `IngestCodebase`,
+  `ReindexCodebase`, `SearchCode`, and `CodeContext`; it stores repo/file/symbol
+  nodes plus operation receipts in RedCore and is also reachable through
+  `theorem_grpc.code_search.*` app affordances.
+- [ ] **S4b** Bring the native lane to full CodeCrawler parity:
   - Contract: `Index-API/protos/theorem/v1/code_crawler.proto`
     (`CodeCrawlerService`): `Search`, `Recognize`, `Explore`, `Context`,
     `Explain`, `RecordUseReceipt`. `CodeSymbol` carries `trust_tier`
@@ -215,11 +220,11 @@ encoder never moves to Rust; only the serving does.
   - Native precedent exists: `Theorem/apps/theorem-grpc` already serves
     `theseus_search.v1.SearchService` in pure Rust over the RustyRed substrate
     (the URL-swap connection-point pattern via `THEOREM_SEARCH_URL`).
-  - **Build:** implement `code_crawler.proto` natively in Theorem as a sibling
-    of `theseus_search` (search the code atoms in RustyRed). This is how harness
-    agents query the encoded Rust corpus - symbols, context, call graphs,
-    explanations - not just run validators. It is the runtime payoff of the
-    whole encode.
+  - **Next build:** add `Recognize`, `Explore`, `Explain`, trust tiers, and
+    `RecordUseReceipt` parity on top of the native RedCore code graph. This is
+    how harness agents query the encoded Rust corpus - symbols, context, call
+    graphs, explanations - not just run validators. It is the runtime payoff of
+    the whole encode.
   - `RecordUseReceipt` over this gRPC IS the self-improvement connection point
     (Lane F): every agent code query/use emits a receipt that drives
     fitness/promotion. The seam already exists in the proto.
