@@ -298,7 +298,10 @@ impl Affordance {
             family: optional_string(props, "family").unwrap_or_else(|| "connector".to_string()),
             label: optional_string(props, "label").unwrap_or_default(),
             description: optional_string(props, "description").unwrap_or_default(),
-            input_schema: props.get("input_schema").cloned().unwrap_or_else(|| json!({})),
+            input_schema: props
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
             permissions: optional_string_vec(props, "permissions"),
             cost: props.get("cost").cloned().unwrap_or_else(|| json!({})),
             writeback_policy: optional_string(props, "writeback_policy")

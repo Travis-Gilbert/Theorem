@@ -84,7 +84,11 @@ fn record_invocation_writes_receipt_edges_and_updates_fitness() {
     assert_eq!(served.len(), 1, "one SERVED_TASK edge to the task type");
     let produced =
         store.neighbors(NeighborQuery::out(&selected_node).with_edge_type(PRODUCED_OUTCOME));
-    assert_eq!(produced.len(), 1, "one PRODUCED_OUTCOME edge to the receipt");
+    assert_eq!(
+        produced.len(),
+        1,
+        "one PRODUCED_OUTCOME edge to the receipt"
+    );
 
     assert!(
         result.effective_fitness > DEFAULT_BASE_FITNESS,
@@ -105,7 +109,11 @@ fn sequenced_with_links_consecutive_selections() {
     .unwrap();
     let second = record_invocation(
         &mut store,
-        invocation("github.search_code", "triage_issue", Some("github.create_issue")),
+        invocation(
+            "github.search_code",
+            "triage_issue",
+            Some("github.create_issue"),
+        ),
         Some("test"),
     )
     .unwrap();
@@ -125,7 +133,10 @@ fn record_invocation_rejects_unregistered_affordance() {
         invocation("github.delete_repo", "triage_issue", None),
         Some("test"),
     );
-    assert!(err.is_err(), "cannot record an outcome for an unregistered affordance");
+    assert!(
+        err.is_err(),
+        "cannot record an outcome for an unregistered affordance"
+    );
 }
 
 #[test]
@@ -135,8 +146,18 @@ fn receipt_hashing_is_content_addressed() {
     let mut payload = Map::new();
     payload.insert("task_type".to_string(), json!("triage_issue"));
     payload.insert("outcome_value".to_string(), json!(1.0));
-    let a = AffordanceReceipt::new("github", "github.create_issue", "input-hash", payload.clone());
-    let b = AffordanceReceipt::new("github", "github.create_issue", "input-hash", payload.clone());
+    let a = AffordanceReceipt::new(
+        "github",
+        "github.create_issue",
+        "input-hash",
+        payload.clone(),
+    );
+    let b = AffordanceReceipt::new(
+        "github",
+        "github.create_issue",
+        "input-hash",
+        payload.clone(),
+    );
     assert_eq!(a.receipt_hash, b.receipt_hash);
 
     let mut changed = payload.clone();

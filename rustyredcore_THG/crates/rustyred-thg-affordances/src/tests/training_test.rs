@@ -75,10 +75,18 @@ fn affordance_substrate_survives_redcore_reopen_and_exports() {
     {
         let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
         register_connector(&mut store, manifest(), Some("test")).unwrap();
-        record_invocation(&mut store, invocation("github.create_issue", "triage", 1.0), Some("test"))
-            .unwrap();
-        record_invocation(&mut store, invocation("github.search_code", "search", 0.8), Some("test"))
-            .unwrap();
+        record_invocation(
+            &mut store,
+            invocation("github.create_issue", "triage", 1.0),
+            Some("test"),
+        )
+        .unwrap();
+        record_invocation(
+            &mut store,
+            invocation("github.search_code", "search", 0.8),
+            Some("test"),
+        )
+        .unwrap();
         store.snapshot_now().unwrap();
         assert_eq!(store.status().durability, "aof_always");
     }
@@ -130,7 +138,10 @@ fn affordance_substrate_survives_redcore_reopen_and_exports() {
         .unwrap();
 
         assert!(store.get_node(&writeback.model_node_id).unwrap().is_some());
-        assert!(store.get_node(&writeback.evaluation_node_id).unwrap().is_some());
+        assert!(store
+            .get_node(&writeback.evaluation_node_id)
+            .unwrap()
+            .is_some());
         assert_eq!(
             store
                 .neighbors(NeighborQuery::out(&writeback.model_node_id).with_edge_type(TRAINED_ON))
@@ -140,7 +151,9 @@ fn affordance_substrate_survives_redcore_reopen_and_exports() {
         );
         assert_eq!(
             store
-                .neighbors(NeighborQuery::out(&writeback.model_node_id).with_edge_type(EVALUATED_BY))
+                .neighbors(
+                    NeighborQuery::out(&writeback.model_node_id).with_edge_type(EVALUATED_BY)
+                )
                 .unwrap()
                 .len(),
             1
@@ -180,7 +193,10 @@ fn pairformer_refuses_active_without_evaluation() {
         },
         Some("test"),
     );
-    assert!(err.is_err(), "promotion to active requires evaluation metrics");
+    assert!(
+        err.is_err(),
+        "promotion to active requires evaluation metrics"
+    );
 }
 
 #[test]
@@ -192,7 +208,10 @@ fn validation_gate_wraps_compare_modes() {
     let verdict = pairformer_validation_gate(lines, Some("off"), Some("full")).unwrap();
     assert!(verdict.get("status").is_some());
     // With only one completed session per arm, the 90%-confidence bar is not met.
-    assert_eq!(verdict.get("passed").and_then(|value| value.as_bool()), Some(false));
+    assert_eq!(
+        verdict.get("passed").and_then(|value| value.as_bool()),
+        Some(false)
+    );
 }
 
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {

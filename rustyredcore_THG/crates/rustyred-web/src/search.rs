@@ -58,6 +58,15 @@ const DENSE_DIM: usize = 128;
 const DENSE_BIT_WIDTH: usize = 4;
 /// Avoid arbitrary dense-only matches when the hash vector has no meaningful overlap.
 const MIN_DENSE_SCORE: f32 = 0.08;
+/// Direct matches are scored above this floor so a query-relevant page always
+/// outranks any expansion neighbour. PPR mass per node is < 1 (the seed mass sums
+/// to 1 and disperses across the graph), so a floor of 1.0 cleanly separates the
+/// relevance band (direct matches) from the proximity band (neighbours).
+const RELEVANCE_FLOOR: f64 = 1.0;
+/// A page that links to more than this many others (out + in) is treated as a
+/// directory / index hub: the search does not propagate the expansion frontier
+/// *through* it. This stops one crawl seed's out-links from swamping every query.
+const DEFAULT_MAX_EXPANSION_FANOUT: usize = 32;
 
 /// Knobs for a substrate search. `Default` is the common browser case.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +79,10 @@ pub struct SearchOptions {
     pub dense_limit: usize,
     /// Reciprocal-rank fusion constant for lexical + dense candidate ranks.
     pub rrf_k: usize,
+    /// Max degree (out + in `LINKS_TO`) a page may have and still propagate the
+    /// expansion frontier. Pages above this are hubs whose neighbours are not
+    /// pulled into the result, so a single index page cannot flood the scene.
+    pub max_expansion_fanout: usize,
 }
 
 impl Default for SearchOptions {
@@ -79,6 +92,7 @@ impl Default for SearchOptions {
             scan_limit: DEFAULT_SCAN_LIMIT,
             dense_limit: DEFAULT_DENSE_LIMIT,
             rrf_k: DEFAULT_RRF_K,
+            max_expansion_fanout: DEFAULT_MAX_EXPANSION_FANOUT,
         }
     }
 }
@@ -167,7 +181,7 @@ fn title_from_url(url: &str) -> String {
     if let Ok(parsed) = Url::parse(url) {
         if let Some(segment) = parsed
             .path_segments()
-            .and_then(|segments| segments.filter(|s| !s.is_empty()).next_back())
+            .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
         {
             return segment.to_string();
         }
@@ -305,22 +319,34 @@ fn ppr_seed_scores_f64(score_of: &BTreeMap<String, f64>) -> HashMap<String, f64>
         .collect()
 }
 
+/// The score a hit carries. Direct matches (ring 0) rank by query *relevance*
+/// (the fused lexical + dense score) lifted above `RELEVANCE_FLOOR`; expansion
+/// neighbours (ring >= 1), which never matched the query directly, rank by graph
+/// *proximity* (PPR). Because every direct match sits above the PPR band, a
+/// relevant page is always the top hit, so the structural hub can no longer win on
+/// centrality alone (the star-PPR failure where one crawl seed won every query).
+/// PPR now ranks only the neighbourhood *around* the matches, which is its job.
 fn rank_score(
     id: &str,
-    lexical_scores: &BTreeMap<String, f64>,
+    ring: usize,
+    relevance: &BTreeMap<String, f64>,
     ppr_scores: &HashMap<String, f64>,
 ) -> f64 {
-    ppr_scores
-        .get(id)
-        .copied()
-        .or_else(|| lexical_scores.get(id).copied())
-        .unwrap_or(0.0)
+    if ring == 0 {
+        RELEVANCE_FLOOR + relevance.get(id).copied().unwrap_or(0.0)
+    } else {
+        ppr_scores.get(id).copied().unwrap_or(0.0)
+    }
 }
 
+/// Order hits matches-first: by ring ascending (direct matches before the
+/// expansion neighbourhood), then by score descending within a ring, then by node
+/// id for determinism. Ring-first ordering keeps the invariant independent of the
+/// score bands, so a future scoring change cannot silently float a neighbour above
+/// the matches.
 fn compare_ranked_hits(a: &(String, usize, f64), b: &(String, usize, f64)) -> Ordering {
-    b.2.partial_cmp(&a.2)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| a.1.cmp(&b.1))
+    a.1.cmp(&b.1)
+        .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal))
         .then_with(|| a.0.cmp(&b.0))
 }
 
@@ -549,7 +575,16 @@ pub fn search_substrate(
         }
         let mut next: BTreeSet<String> = BTreeSet::new();
         for id in &frontier {
-            for neighbour in linked_neighbours(store, id) {
+            let neighbours = linked_neighbours(store, id);
+            // Do not propagate the frontier through a super-hub: a page that links
+            // to more than `max_expansion_fanout` others is a directory / index, not
+            // a topical neighbour, and expanding through it is what let one crawl
+            // seed's out-links swamp every query. The hub itself still appears if it
+            // is a match or is reached as a neighbour; we just stop *at* it.
+            if neighbours.len() > options.max_expansion_fanout {
+                continue;
+            }
+            for neighbour in neighbours {
                 if !ring_of.contains_key(&neighbour) {
                     ring_of.insert(neighbour.clone(), ring);
                     next.insert(neighbour);
@@ -572,7 +607,7 @@ pub fn search_substrate(
     let mut ordered: Vec<(String, usize, f64)> = ring_of
         .into_iter()
         .map(|(id, ring)| {
-            let score = rank_score(&id, &score_of, &ppr_scores);
+            let score = rank_score(&id, ring, &score_of, &ppr_scores);
             (id, ring, score)
         })
         .collect();
@@ -791,6 +826,127 @@ mod tests {
         let first = search_substrate(&store, "apple", SearchOptions::default());
         let second = search_substrate(&store, "apple", SearchOptions::default());
         assert_eq!(first, second, "same substrate + query => identical result");
+    }
+
+    /// A hub-and-spoke substrate: one index page links out to several leaf pages,
+    /// with no leaf-to-leaf links. This is the shape a single depth-1 web crawl
+    /// produces (a seed page plus its out-links) and the shape that made graph
+    /// centrality crown the hub for every query. Anchor text is generic ("link N")
+    /// so the hub does not itself lexically match any leaf's distinctive term.
+    fn star_store(leaves: &[(&str, &str)]) -> InMemoryGraphStore {
+        let mut hub_body = String::from("<html><body>index of pages ");
+        for (index, (slug, _)) in leaves.iter().enumerate() {
+            hub_body.push_str(&format!("<a href=\"/{slug}\">link {index}</a> "));
+        }
+        hub_body.push_str("</body></html>");
+
+        let mut pages = vec![page("http://hub.com/hub", &hub_body)];
+        for (slug, body) in leaves {
+            pages.push(page(&format!("http://hub.com/{slug}"), body));
+        }
+        let seeds = pages.iter().map(|p| p.url.clone()).collect();
+        let output = build_v2_fixture_crawl(CrawlRequest::new("star-test", seeds), &pages)
+            .expect("fixture crawl should build");
+        let mut store = InMemoryGraphStore::new();
+        output
+            .graph
+            .apply_to_store(&mut store)
+            .expect("apply to store should succeed");
+        store
+    }
+
+    /// Fix #1: relevance beats centrality. The hub is the most central node, but a
+    /// query matching only a leaf must rank that leaf #1, not the hub. This is the
+    /// regression test for the star-PPR bug where one page won every query.
+    #[test]
+    fn relevant_match_outranks_the_central_hub() {
+        let store = star_store(&[
+            (
+                "leaf-one",
+                "<html><body>apples are red and crisp</body></html>",
+            ),
+            (
+                "leaf-two",
+                "<html><body>bananas are yellow and soft</body></html>",
+            ),
+            (
+                "leaf-three",
+                "<html><body>cherries are small and tart</body></html>",
+            ),
+        ]);
+        let out = search_substrate(
+            &store,
+            "banana",
+            SearchOptions {
+                dense_limit: 0,
+                ..SearchOptions::default()
+            },
+        );
+
+        let top = &out.hits[0];
+        assert_eq!(
+            top.url, "http://hub.com/leaf-two",
+            "the relevant leaf must rank #1, not the central hub"
+        );
+        assert_eq!(top.ring, 0);
+
+        // The hub has no relevance to "banana"; it is reached only by expansion and
+        // must therefore score below the direct match.
+        let hub = out
+            .hits
+            .iter()
+            .find(|h| h.url == "http://hub.com/hub")
+            .expect("hub is reachable from the matched leaf");
+        assert!(hub.ring >= 1, "the hub is an expansion neighbour here");
+        assert!(
+            top.match_score > hub.match_score,
+            "relevant match ({}) must outscore the central hub ({})",
+            top.match_score,
+            hub.match_score
+        );
+    }
+
+    /// Fix #2: a super-hub does not flood the neighbourhood. A query matching one
+    /// leaf must not pull in the hub's other leaves once the hub's degree exceeds
+    /// the fanout cap.
+    #[test]
+    fn super_hub_does_not_flood_the_neighbourhood() {
+        let store = star_store(&[
+            (
+                "alpha",
+                "<html><body>alpha distinctive zorp term</body></html>",
+            ),
+            ("beta", "<html><body>beta unrelated content</body></html>"),
+            ("gamma", "<html><body>gamma unrelated content</body></html>"),
+            ("delta", "<html><body>delta unrelated content</body></html>"),
+            (
+                "epsilon",
+                "<html><body>epsilon unrelated content</body></html>",
+            ),
+        ]);
+        // The hub links to 5 leaves; cap the fanout at 3 so it is treated as a hub.
+        let out = search_substrate(
+            &store,
+            "zorp",
+            SearchOptions {
+                max_expansion_fanout: 3,
+                ..SearchOptions::default()
+            },
+        );
+
+        let kept = urls(&out);
+        assert!(
+            kept.contains(&"http://hub.com/alpha".to_string()),
+            "the direct match is kept"
+        );
+        // alpha reaches the hub at ring 1, but the hub (degree 5 > 3) is not
+        // expanded through, so its other leaves stay out of the result.
+        for leaf in ["beta", "gamma", "delta", "epsilon"] {
+            assert!(
+                !kept.contains(&format!("http://hub.com/{leaf}")),
+                "{leaf} must not be flooded in through the super-hub"
+            );
+        }
     }
 
     fn store_url(store: &InMemoryGraphStore, node_id: &str) -> String {

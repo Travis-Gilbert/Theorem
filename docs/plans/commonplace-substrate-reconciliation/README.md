@@ -46,6 +46,7 @@ All commits use explicit pathspecs (never bare `git commit`) because the index i
 
 - `README.md` (this file): index, verdict, ladder, boundary.
 - `reconciliation-matrix.md`: claim-by-claim mapping of all seven input docs to built / planned-elsewhere / greenfield / owned-by, with file:line evidence and the destination plan for each unbuilt item.
+- `credit-model.md`: Commonplace credit-estimation product note moved out of the repo root so pricing policy stays with the Commonplace plan corpus.
 
 ## Where the work goes next
 

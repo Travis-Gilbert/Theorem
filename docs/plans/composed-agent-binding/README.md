@@ -1,6 +1,6 @@
 # Composed Agent Binding
 
-Status: first implementation slice, 2026-06-02.
+Status: core binding slice plus follow-on runtime and charter slices, 2026-06-02.
 
 Source spec: `/Users/travisgilbert/Downloads/theorem-composed-agent-spec (1).md`.
 
@@ -8,7 +8,7 @@ Source spec: `/Users/travisgilbert/Downloads/theorem-composed-agent-spec (1).md`
 
 Give Theorem a first-class `AgentBinding` runtime object in the Rust harness core. The binding is the enforceable object that makes a composed agent real: identity, roster, private working memory, published scope, capability scope, budget, and trace all travel together instead of being implied by a prompt.
 
-This slice implements the foundation only. It does not call models, persist bindings to GraphStore, expose a UI, or wrap the remaining Theseus apps. Those are later slices.
+The first slice implemented the pure binding foundation. Follow-on work now persists bindings and scratchpad revisions through `theorem-harness-runtime`, enforces budget/alignment guards, and compiles per-binding charters through `rustyred-thg-affordances`. It still does not call models, expose a UI, or wrap the remaining Theseus apps.
 
 ## Dependency Cut
 
@@ -54,8 +54,8 @@ Claude Code was mentioned on the native coordination substrate and asked to take
 ## Next Slices
 
 1. Add Python reference fixtures for the binding lifecycle once Theseus has the matching canonical shape.
-2. Persist `AgentBinding`, `AgentHead`, scratchpad revisions, and binding lifecycle events through `theorem-harness-runtime`.
-3. Expose binding read/write tools through `rustyred-thg-mcp`.
-4. Compile a binding charter from stance plus capability enumeration.
-5. Add the intra-agent loop: primary proposal, critic contributions, synthesis, policy check, publication receipt.
-6. Wire the remaining Theseus app abilities as native affordances or theorem gRPC tools.
+2. Done: persist `AgentBinding`, scratchpad revisions, and binding lifecycle events through `theorem-harness-runtime`.
+3. Open: expose binding read/write tools through `rustyred-thg-mcp` when the product MCP surface is ready.
+4. Done locally: compile a binding charter from stance plus capability enumeration through `rustyred-thg-affordances`.
+5. Open: add the intra-agent loop: primary proposal, critic contributions, synthesis, policy check, publication receipt.
+6. Open: wire the remaining Theseus app abilities as native affordances or theorem gRPC tools.

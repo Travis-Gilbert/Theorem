@@ -140,7 +140,11 @@ pub fn record_invocation<S: AffordanceGraphStore>(
     let mut updated_node = selected_node.clone();
     updated_node.properties["fitness"] = json!(updated_fitness);
     updated_node.properties["fitness_updated_at_ms"] = json!(recorded_at_ms);
-    if updated_node.properties.get("fitness_half_life_days").is_none() {
+    if updated_node
+        .properties
+        .get("fitness_half_life_days")
+        .is_none()
+    {
         updated_node.properties["fitness_half_life_days"] = json!(DEFAULT_HALF_LIFE_DAYS);
     }
     mutations.push(GraphMutation::NodeUpsert(updated_node));

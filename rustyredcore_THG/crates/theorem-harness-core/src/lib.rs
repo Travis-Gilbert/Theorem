@@ -1,9 +1,12 @@
 pub mod affordances;
 pub mod agent_binding;
+pub mod agent_head_registry;
 pub mod alignment;
 pub mod budget;
 pub mod context_web;
 pub mod federated_signals;
+pub mod head_invocation;
+pub mod intra_agent_loop;
 pub mod map_artifacts;
 pub mod memory_contracts;
 pub mod provider_head_adapter;
@@ -26,6 +29,10 @@ pub use agent_binding::{
     HeadContributionRecord, HeadCostProfile, HeadKind, HeadReliabilityProfile, HeadTransport,
     MemoryZone, MemoryZoneKind, PublishedScope, ScratchpadDocument, ScratchpadRevision, TraceTier,
 };
+pub use agent_head_registry::{
+    AgentHeadEndpoint, AgentHeadKindSummary, AgentHeadRegistry, AgentHeadRegistryError,
+    RegisteredAgentHead, ResolvedAgentHead,
+};
 pub use alignment::{evaluate_publication, MIN_CONSENSUS_HEADS};
 pub use budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
 pub use context_web::{
@@ -39,6 +46,14 @@ pub use federated_signals::{
     assert_no_raw_content, extract_structural_signal, observed_count_bucket,
     receive_federated_signal, success_rate_bucket, FederatedSignal, PrivacyViolation,
     StructuralSignalInput,
+};
+pub use head_invocation::{
+    FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
+    HeadInvocationRequest, HeadInvoker,
+};
+pub use intra_agent_loop::{
+    run_fake_intra_agent_loop, run_intra_agent_loop_with_invoker, FakeIntraAgentLoopInput,
+    FakeIntraAgentLoopResult, IntraAgentLoopError,
 };
 pub use map_artifacts::{
     compile_map_artifact, describe_map_artifact, scope_for_map_kind, stable_map_id,

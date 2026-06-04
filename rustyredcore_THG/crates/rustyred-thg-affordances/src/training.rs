@@ -100,7 +100,10 @@ pub fn export_affordance_training_view(
         .iter()
         .filter(|node| {
             !node.tombstone
-                && node.labels.iter().any(|label| label == INVOCATION_RECEIPT_LABEL)
+                && node
+                    .labels
+                    .iter()
+                    .any(|label| label == INVOCATION_RECEIPT_LABEL)
                 && property_str(&node.properties, "tenant_id") == Some(tenant_id.as_str())
         })
         .map(ranking_pair_from_receipt)
@@ -167,7 +170,10 @@ pub fn register_pairformer_artifact<S: AffordanceGraphStore>(
     let promote_to_active = promotion_decision == "active";
 
     if model_id.is_empty() {
-        return Err(ThgError::new("invalid_pairformer_artifact", "model_id is required"));
+        return Err(ThgError::new(
+            "invalid_pairformer_artifact",
+            "model_id is required",
+        ));
     }
     if model_type.is_empty() {
         return Err(ThgError::new(
@@ -260,7 +266,11 @@ pub fn register_pairformer_artifact<S: AffordanceGraphStore>(
 
     if promote_to_active {
         mutations.push(GraphMutation::EdgeUpsert(edge_with_affordance_provenance(
-            edge_id(&tenant_node_id(&tenant_id), PROMOTED_TO_ACTIVE, &model_node_id),
+            edge_id(
+                &tenant_node_id(&tenant_id),
+                PROMOTED_TO_ACTIVE,
+                &model_node_id,
+            ),
             tenant_node_id(&tenant_id),
             PROMOTED_TO_ACTIVE,
             &model_node_id,
@@ -326,7 +336,9 @@ pub fn pairformer_eval_node_id(tenant_id: &str, model_id: &str) -> String {
 fn ranking_pair_from_receipt(node: &NodeRecord) -> AffordanceRankingPair {
     let props = &node.properties;
     AffordanceRankingPair {
-        task_type: property_str(props, "task_type").unwrap_or_default().to_string(),
+        task_type: property_str(props, "task_type")
+            .unwrap_or_default()
+            .to_string(),
         candidate_affordance_ids: props
             .get("candidate_affordance_ids")
             .and_then(Value::as_array)
@@ -357,7 +369,9 @@ fn ranking_pair_from_receipt(node: &NodeRecord) -> AffordanceRankingPair {
             .get("recorded_at_ms")
             .and_then(Value::as_i64)
             .unwrap_or(0),
-        receipt_hash: property_str(props, "receipt_hash").unwrap_or_default().to_string(),
+        receipt_hash: property_str(props, "receipt_hash")
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 
