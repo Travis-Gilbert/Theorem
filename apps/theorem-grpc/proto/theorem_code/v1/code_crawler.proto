@@ -13,6 +13,9 @@ service CodeCrawlerService {
   rpc ReindexCodebase(ReindexCodebaseRequest) returns (IngestCodebaseResponse);
   rpc SearchCode(SearchCodeRequest) returns (SearchCodeResponse);
   rpc CodeContext(CodeContextRequest) returns (CodeContextResponse);
+  rpc RecognizeCode(RecognizeCodeRequest) returns (RecognizeCodeResponse);
+  rpc ExploreCode(ExploreCodeRequest) returns (ExploreCodeResponse);
+  rpc ExplainCode(ExplainCodeRequest) returns (ExplainCodeResponse);
 }
 
 message IngestCodebaseRequest {
@@ -96,6 +99,59 @@ message CodeContextResponse {
   string receipt_json = 11;
 }
 
+message RecognizeCodeRequest {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string file_path = 3;
+  string text = 4;
+  uint64 limit = 5;
+}
+
+message RecognizeCodeResponse {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string file_path = 3;
+  repeated CodeSymbol symbols = 4;
+  string receipt_hash = 5;
+  string receipt_json = 6;
+}
+
+message ExploreCodeRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string query = 3;
+  string repo_id = 4;
+  uint64 max_depth = 5;
+  uint64 limit = 6;
+}
+
+message ExploreCodeResponse {
+  string tenant_id = 1;
+  CodeSymbol focus = 2;
+  repeated CodeSymbol related_symbols = 3;
+  repeated CodeGraphEdge edges = 4;
+  string receipt_hash = 5;
+  string receipt_json = 6;
+}
+
+message ExplainCodeRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string query = 3;
+  string repo_id = 4;
+  uint64 max_chars = 5;
+}
+
+message ExplainCodeResponse {
+  string tenant_id = 1;
+  CodeSymbol symbol = 2;
+  string summary = 3;
+  string context = 4;
+  repeated CodeGraphEdge edges = 5;
+  string receipt_hash = 6;
+  string receipt_json = 7;
+}
+
 message CodeHit {
   string node_id = 1;
   string repo_id = 2;
@@ -107,6 +163,8 @@ message CodeHit {
   uint64 line = 8;
   string snippet = 9;
   double score = 10;
+  string trust_tier = 11;
+  string community_id = 12;
 }
 
 message CodeSymbol {
@@ -120,4 +178,17 @@ message CodeSymbol {
   uint64 line = 8;
   string signature = 9;
   string snippet = 10;
+  string trust_tier = 11;
+  string community_id = 12;
+  repeated string callers = 13;
+  repeated string callees = 14;
+}
+
+message CodeGraphEdge {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  string edge_type = 3;
+  string from_name = 4;
+  string to_name = 5;
+  string evidence = 6;
 }

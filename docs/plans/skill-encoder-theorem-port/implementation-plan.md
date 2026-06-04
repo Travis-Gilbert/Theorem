@@ -205,9 +205,11 @@ encoder never moves to Rust; only the serving does.
   Rust" (Travis: "the gRPC external codebase search would be useful for this").
   Theorem now has a native first lane in `apps/theorem-grpc`:
   `theorem_code.v1.CodeCrawlerService` exposes `IngestCodebase`,
-  `ReindexCodebase`, `SearchCode`, and `CodeContext`; it stores repo/file/symbol
-  nodes plus operation receipts in RedCore and is also reachable through
-  `theorem_grpc.code_search.*` app affordances.
+  `ReindexCodebase`, `SearchCode`, `RecognizeCode`, `ExploreCode`,
+  `CodeContext`, and `ExplainCode`; it stores repo/file/symbol nodes, heuristic
+  call graph edges, trust tiers, community ids, and operation receipts in
+  RedCore and is also reachable through `theorem_grpc.code_search.*` app
+  affordances.
 - [ ] **S4b** Bring the native lane to full CodeCrawler parity:
   - Contract: `Index-API/protos/theorem/v1/code_crawler.proto`
     (`CodeCrawlerService`): `Search`, `Recognize`, `Explore`, `Context`,
@@ -220,11 +222,14 @@ encoder never moves to Rust; only the serving does.
   - Native precedent exists: `Theorem/apps/theorem-grpc` already serves
     `theseus_search.v1.SearchService` in pure Rust over the RustyRed substrate
     (the URL-swap connection-point pattern via `THEOREM_SEARCH_URL`).
-  - **Next build:** add `Recognize`, `Explore`, `Explain`, trust tiers, and
-    `RecordUseReceipt` parity on top of the native RedCore code graph. This is
-    how harness agents query the encoded Rust corpus - symbols, context, call
-    graphs, explanations - not just run validators. It is the runtime payoff of
-    the whole encode.
+  - **Shipped native subset:** `Recognize`, `Explore`, `Explain`, advisory
+    trust tiers, community ids, and heuristic call graph edges now live on top
+    of the native RedCore code graph and the `theorem_grpc.code_search.*`
+    affordance path. Harness agents can query symbols, context, graph
+    neighborhoods, and explanations without calling the Python CodeCrawler.
+  - **Remaining parity:** add `RecordUseReceipt` and replace heuristic
+    dependency/call graph expansion with parser-grade semantics where the
+    Python CodeCrawler contract requires it.
   - `RecordUseReceipt` over this gRPC IS the self-improvement connection point
     (Lane F): every agent code query/use emits a receipt that drives
     fitness/promotion. The seam already exists in the proto.

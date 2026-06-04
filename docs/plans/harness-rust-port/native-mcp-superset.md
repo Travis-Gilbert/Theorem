@@ -298,11 +298,12 @@ work is the tool schema, the run-id threading, and the read/write gating.
   structurally impossible because there is no Python in the path).
 - [ ] **R11 `code_search`** — search ingested code symbols. First native lane
   now exists in `apps/theorem-grpc`: `CodeCrawlerService` can ingest/reindex a
-  repo into a RedCore code graph, search symbols, expand code context, and record
-  receipts; the same runtime is exposed as `theorem_grpc.code_search.*`
-  affordances. Remaining R11 work: route the harness verb to this service and
-  enrich symbols with full CodeCrawler parity (trust tiers, Explore/Explain,
-  call/dependency graph expansion).
+  repo into a RedCore code graph, search symbols, recognize symbols from indexed
+  files or inline source, expand heuristic call graph edges, read context,
+  explain symbols with trust tiers, and record receipts; the same runtime is
+  exposed as `theorem_grpc.code_search.*` affordances. Remaining R11 work: route
+  the harness verb to this service and replace heuristic call/dependency
+  expansion with deeper parser-grade parity where needed.
 
 ## Lane C: coordination completeness
 
@@ -455,11 +456,12 @@ as out of scope:
   now in scope as **Lane T** below. Only the `theorem_runner_*` process-spawn
   verbs carry an open sub-question (T35/T36); everything else is a clean
   GraphStore port. No longer deferred.
-- **D3 — closed for first lane.** Native code-symbol ingestion/search/context is
-  no longer blocked on the Python CodeCrawler path. The remaining deferral is
-  parity depth, not basic availability: harness callers still need to route to
-  the gRPC/app affordance lane, and richer CodeCrawler verbs need native graph
-  semantics.
+- **D3 — closed for first richer lane.** Native code-symbol
+  ingestion/search/recognition/exploration/context/explanation is no longer
+  blocked on the Python CodeCrawler path. The remaining deferral is parity
+  depth, not basic availability: harness callers still need to route to the
+  gRPC/app affordance lane, and parser-grade dependency/call graph semantics
+  still need native parity.
 
 If the answer is "no, do all of it," D1-D3 fold into a Phase 2 of this same
 plan rather than disappearing.

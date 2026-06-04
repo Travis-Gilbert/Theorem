@@ -28,8 +28,10 @@ pub use app_affordance::app_affordance_service_server::{
 pub use app_affordance::{InvokeAffordanceRequest, InvokeAffordanceResponse};
 pub use code::code_crawler_service_server::{CodeCrawlerService, CodeCrawlerServiceServer};
 pub use code::{
-    CodeContextRequest, CodeContextResponse, CodeHit, CodeSymbol, IngestCodebaseRequest,
-    IngestCodebaseResponse, ReindexCodebaseRequest, SearchCodeRequest, SearchCodeResponse,
+    CodeContextRequest, CodeContextResponse, CodeGraphEdge, CodeHit, CodeSymbol,
+    ExplainCodeRequest, ExplainCodeResponse, ExploreCodeRequest, ExploreCodeResponse,
+    IngestCodebaseRequest, IngestCodebaseResponse, RecognizeCodeRequest, RecognizeCodeResponse,
+    ReindexCodebaseRequest, SearchCodeRequest, SearchCodeResponse,
 };
 pub use search::search_service_server::{SearchService, SearchServiceServer};
 pub use search::{

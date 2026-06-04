@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rustyred_thg_core::{
-    now_ms, stable_hash, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStoreError, NodeQuery,
-    NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+    now_ms, stable_hash, Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStoreError,
+    NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
 };
 use serde_json::{json, Value};
 
@@ -22,6 +22,8 @@ const CODE_RECEIPT_LABEL: &str = "CodeInvocationReceipt";
 const SOURCE: &str = "theorem_grpc_code_index";
 const CONTAINS_FILE: &str = "CONTAINS_FILE";
 const DECLARES_SYMBOL: &str = "DECLARES_SYMBOL";
+const CALLS_SYMBOL: &str = "CALLS_SYMBOL";
+const DEFAULT_TRUST_TIER: &str = "advisory";
 const DEFAULT_MAX_FILES: usize = 2_500;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
 const DEFAULT_LIMIT: usize = 20;
@@ -76,6 +78,30 @@ impl CodeIndexRuntime {
     ) -> Result<CodeContextOutput, CodeIndexError> {
         let mut store = self.lock_store()?;
         code_context_with_store(&mut store, input)
+    }
+
+    pub fn recognize_code(
+        &self,
+        input: RecognizeCodeInput,
+    ) -> Result<RecognizeCodeOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        recognize_code_with_store(&mut store, input)
+    }
+
+    pub fn explore_code(
+        &self,
+        input: ExploreCodeInput,
+    ) -> Result<ExploreCodeOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        explore_code_with_store(&mut store, input)
+    }
+
+    pub fn explain_code(
+        &self,
+        input: ExplainCodeInput,
+    ) -> Result<ExplainCodeOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        explain_code_with_store(&mut store, input)
     }
 
     fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, RedCoreGraphStore>, CodeIndexError> {
@@ -211,6 +237,102 @@ impl CodeContextOutput {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RecognizeCodeInput {
+    pub tenant_id: String,
+    pub repo_id: String,
+    pub file_path: String,
+    pub text: String,
+    pub limit: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecognizeCodeOutput {
+    pub tenant_id: String,
+    pub repo_id: String,
+    pub file_path: String,
+    pub symbols: Vec<CodeSymbolRecord>,
+    pub receipt_hash: String,
+    pub receipt_json: String,
+}
+
+impl RecognizeCodeOutput {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tenant_id": self.tenant_id,
+            "repo_id": self.repo_id,
+            "file_path": self.file_path,
+            "symbols": self.symbols.iter().map(CodeSymbolRecord::to_json).collect::<Vec<_>>(),
+            "receipt_hash": self.receipt_hash,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExploreCodeInput {
+    pub tenant_id: String,
+    pub node_id: String,
+    pub query: String,
+    pub repo_id: String,
+    pub max_depth: u64,
+    pub limit: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExploreCodeOutput {
+    pub tenant_id: String,
+    pub focus: Option<CodeSymbolRecord>,
+    pub related_symbols: Vec<CodeSymbolRecord>,
+    pub edges: Vec<CodeGraphEdgeRecord>,
+    pub receipt_hash: String,
+    pub receipt_json: String,
+}
+
+impl ExploreCodeOutput {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tenant_id": self.tenant_id,
+            "focus": self.focus.as_ref().map(CodeSymbolRecord::to_json),
+            "related_symbols": self.related_symbols.iter().map(CodeSymbolRecord::to_json).collect::<Vec<_>>(),
+            "edges": self.edges.iter().map(CodeGraphEdgeRecord::to_json).collect::<Vec<_>>(),
+            "receipt_hash": self.receipt_hash,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExplainCodeInput {
+    pub tenant_id: String,
+    pub node_id: String,
+    pub query: String,
+    pub repo_id: String,
+    pub max_chars: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExplainCodeOutput {
+    pub tenant_id: String,
+    pub symbol: Option<CodeSymbolRecord>,
+    pub summary: String,
+    pub context: String,
+    pub edges: Vec<CodeGraphEdgeRecord>,
+    pub receipt_hash: String,
+    pub receipt_json: String,
+}
+
+impl ExplainCodeOutput {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tenant_id": self.tenant_id,
+            "symbol": self.symbol.as_ref().map(CodeSymbolRecord::to_json),
+            "summary": self.summary,
+            "context": self.context,
+            "edges": self.edges.iter().map(CodeGraphEdgeRecord::to_json).collect::<Vec<_>>(),
+            "receipt_hash": self.receipt_hash,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CodeHitRecord {
     pub node_id: String,
@@ -223,6 +345,8 @@ pub struct CodeHitRecord {
     pub line: u64,
     pub snippet: String,
     pub score: f64,
+    pub trust_tier: String,
+    pub community_id: String,
 }
 
 impl CodeHitRecord {
@@ -238,6 +362,8 @@ impl CodeHitRecord {
             "line": self.line,
             "snippet": self.snippet,
             "score": self.score,
+            "trust_tier": self.trust_tier,
+            "community_id": self.community_id,
         })
     }
 }
@@ -254,9 +380,32 @@ pub struct CodeSymbolRecord {
     pub line: u64,
     pub signature: String,
     pub snippet: String,
+    pub trust_tier: String,
+    pub community_id: String,
+    pub callers: Vec<String>,
+    pub callees: Vec<String>,
 }
 
 impl CodeSymbolRecord {
+    fn from_indexed(symbol: IndexedSymbol, repo_id: &str) -> Self {
+        Self {
+            node_id: symbol.symbol_id,
+            repo_id: repo_id.to_string(),
+            file_id: symbol.file_id,
+            file_path: symbol.file_path,
+            kind: symbol.kind,
+            name: symbol.name,
+            language: symbol.language,
+            line: symbol.line,
+            signature: symbol.signature,
+            snippet: symbol.snippet,
+            trust_tier: symbol.trust_tier,
+            community_id: symbol.community_id,
+            callers: Vec::new(),
+            callees: Vec::new(),
+        }
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "node_id": self.node_id,
@@ -269,6 +418,33 @@ impl CodeSymbolRecord {
             "line": self.line,
             "signature": self.signature,
             "snippet": self.snippet,
+            "trust_tier": self.trust_tier,
+            "community_id": self.community_id,
+            "callers": self.callers,
+            "callees": self.callees,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CodeGraphEdgeRecord {
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub edge_type: String,
+    pub from_name: String,
+    pub to_name: String,
+    pub evidence: String,
+}
+
+impl CodeGraphEdgeRecord {
+    fn to_json(&self) -> Value {
+        json!({
+            "from_node_id": self.from_node_id,
+            "to_node_id": self.to_node_id,
+            "edge_type": self.edge_type,
+            "from_name": self.from_name,
+            "to_name": self.to_name,
+            "evidence": self.evidence,
         })
     }
 }
@@ -345,6 +521,9 @@ struct IndexedSymbol {
     line: u64,
     signature: String,
     snippet: String,
+    body: String,
+    trust_tier: String,
+    community_id: String,
 }
 
 fn ingest_codebase_with_store(
@@ -422,6 +601,8 @@ fn ingest_codebase_with_store(
                     "line": symbol.line,
                     "signature": symbol.signature,
                     "snippet": symbol.snippet,
+                    "trust_tier": symbol.trust_tier,
+                    "community_id": symbol.community_id,
                     "search_text": format!("{} {} {} {}", symbol.name, symbol.kind, symbol.signature, symbol.file_path),
                     "generation": config.generation,
                     "indexed_at_ms": config.generation,
@@ -441,6 +622,9 @@ fn ingest_codebase_with_store(
                 }),
             )));
         }
+    }
+    for edge in infer_symbol_call_edges(&collected, &config) {
+        mutations.push(GraphMutation::EdgeUpsert(edge));
     }
 
     let transaction = store
@@ -656,6 +840,206 @@ fn code_context_with_store(
     })
 }
 
+fn recognize_code_with_store(
+    store: &mut RedCoreGraphStore,
+    input: RecognizeCodeInput,
+) -> Result<RecognizeCodeOutput, CodeIndexError> {
+    let tenant_id = normalize_tenant(&input.tenant_id);
+    let limit = bounded_limit(input.limit);
+    let mut symbols = if input.text.trim().is_empty() {
+        recognize_indexed_symbols(store, &tenant_id, &input)?
+    } else {
+        extract_symbols(
+            input.repo_id.trim(),
+            "",
+            input.file_path.trim(),
+            language_for_extension(&extension_for(Path::new(input.file_path.trim()))),
+            &input.text,
+        )
+        .into_iter()
+        .map(|symbol| CodeSymbolRecord::from_indexed(symbol, input.repo_id.trim()))
+        .collect::<Vec<_>>()
+    };
+    symbols.truncate(limit);
+    let payload = json!({
+        "tenant_id": tenant_id,
+        "operation": "code_recognize",
+        "repo_id": input.repo_id,
+        "file_path": input.file_path,
+        "symbols_returned": symbols.len(),
+    });
+    let receipt = record_receipt(store, &tenant_id, "code_recognize", &payload)?;
+    Ok(RecognizeCodeOutput {
+        tenant_id,
+        repo_id: input.repo_id,
+        file_path: input.file_path,
+        symbols,
+        receipt_hash: receipt.receipt_hash,
+        receipt_json: receipt.receipt_json,
+    })
+}
+
+fn explore_code_with_store(
+    store: &mut RedCoreGraphStore,
+    input: ExploreCodeInput,
+) -> Result<ExploreCodeOutput, CodeIndexError> {
+    let tenant_id = normalize_tenant(&input.tenant_id);
+    let focus_node = resolve_symbol_node(
+        store,
+        &tenant_id,
+        &input.node_id,
+        &input.query,
+        &input.repo_id,
+    )?;
+    let Some(focus_node) = focus_node else {
+        let payload = json!({
+            "tenant_id": tenant_id,
+            "operation": "code_explore",
+            "query": input.query,
+            "repo_id": input.repo_id,
+            "resolved": false,
+        });
+        let receipt = record_receipt(store, &tenant_id, "code_explore", &payload)?;
+        return Ok(ExploreCodeOutput {
+            tenant_id,
+            focus: None,
+            related_symbols: Vec::new(),
+            edges: Vec::new(),
+            receipt_hash: receipt.receipt_hash,
+            receipt_json: receipt.receipt_json,
+        });
+    };
+    let limit = bounded_limit(input.limit);
+    let max_depth = if input.max_depth == 0 {
+        1
+    } else {
+        input.max_depth.min(4) as usize
+    };
+    let mut edges = Vec::new();
+    let mut related_ids = BTreeSet::new();
+    expand_symbol_edges(
+        store,
+        &focus_node.id,
+        max_depth,
+        limit,
+        &mut related_ids,
+        &mut edges,
+    )?;
+    related_ids.remove(&focus_node.id);
+    let mut related_symbols = Vec::new();
+    for node_id in related_ids.into_iter().take(limit) {
+        if let Some(node) = store
+            .get_node(&node_id)
+            .map_err(CodeIndexError::from_store)?
+        {
+            if let Some(mut symbol) = symbol_record_from_node(&node) {
+                enrich_symbol_graph(store, &mut symbol)?;
+                related_symbols.push(symbol);
+            }
+        }
+    }
+    let mut focus = symbol_record_from_node(&focus_node);
+    if let Some(symbol) = focus.as_mut() {
+        enrich_symbol_graph(store, symbol)?;
+    }
+    let payload = json!({
+        "tenant_id": tenant_id,
+        "operation": "code_explore",
+        "focus_node_id": focus_node.id,
+        "related_count": related_symbols.len(),
+        "edge_count": edges.len(),
+    });
+    let receipt = record_receipt(store, &tenant_id, "code_explore", &payload)?;
+    Ok(ExploreCodeOutput {
+        tenant_id,
+        focus,
+        related_symbols,
+        edges,
+        receipt_hash: receipt.receipt_hash,
+        receipt_json: receipt.receipt_json,
+    })
+}
+
+fn explain_code_with_store(
+    store: &mut RedCoreGraphStore,
+    input: ExplainCodeInput,
+) -> Result<ExplainCodeOutput, CodeIndexError> {
+    let tenant_id = normalize_tenant(&input.tenant_id);
+    let focus_node = resolve_symbol_node(
+        store,
+        &tenant_id,
+        &input.node_id,
+        &input.query,
+        &input.repo_id,
+    )?;
+    let Some(focus_node) = focus_node else {
+        let payload = json!({
+            "tenant_id": tenant_id,
+            "operation": "code_explain",
+            "query": input.query,
+            "resolved": false,
+        });
+        let receipt = record_receipt(store, &tenant_id, "code_explain", &payload)?;
+        return Ok(ExplainCodeOutput {
+            tenant_id,
+            symbol: None,
+            summary: "No indexed code symbol matched the explanation request.".to_string(),
+            context: String::new(),
+            edges: Vec::new(),
+            receipt_hash: receipt.receipt_hash,
+            receipt_json: receipt.receipt_json,
+        });
+    };
+    let mut symbol = symbol_record_from_node(&focus_node)
+        .ok_or_else(|| CodeIndexError::invalid("resolved code node is missing symbol metadata"))?;
+    enrich_symbol_graph(store, &mut symbol)?;
+    let context = code_context_with_store(
+        store,
+        CodeContextInput {
+            tenant_id: tenant_id.clone(),
+            node_id: focus_node.id.clone(),
+            max_chars: input.max_chars,
+            ..Default::default()
+        },
+    )?;
+    let mut edges = Vec::new();
+    let mut related_ids = BTreeSet::new();
+    expand_symbol_edges(
+        store,
+        &focus_node.id,
+        1,
+        DEFAULT_LIMIT,
+        &mut related_ids,
+        &mut edges,
+    )?;
+    let summary = format!(
+        "{} `{}` is a {} in `{}`. Trust tier: {}. It calls {} symbol(s) and is called by {} symbol(s).",
+        symbol.language,
+        symbol.name,
+        symbol.kind,
+        symbol.file_path,
+        symbol.trust_tier,
+        symbol.callees.len(),
+        symbol.callers.len()
+    );
+    let payload = json!({
+        "tenant_id": tenant_id,
+        "operation": "code_explain",
+        "symbol_id": symbol.node_id,
+        "edge_count": edges.len(),
+    });
+    let receipt = record_receipt(store, &tenant_id, "code_explain", &payload)?;
+    Ok(ExplainCodeOutput {
+        tenant_id,
+        symbol: Some(symbol),
+        summary,
+        context: context.context,
+        edges,
+        receipt_hash: receipt.receipt_hash,
+        receipt_json: receipt.receipt_json,
+    })
+}
+
 fn collect_code_files(
     dir: &Path,
     config: &IngestConfig,
@@ -792,7 +1176,8 @@ fn extract_symbols(
     language: &str,
     text: &str,
 ) -> Vec<IndexedSymbol> {
-    let mut symbols = Vec::new();
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut raw_symbols = Vec::new();
     for (idx, raw_line) in text.lines().enumerate() {
         let line_number = idx as u64 + 1;
         let trimmed = raw_line.trim();
@@ -801,19 +1186,79 @@ fn extract_symbols(
         };
         let signature = trimmed.to_string();
         let symbol_id = symbol_node_id(repo_id, file_path, &kind, &name, line_number);
+        raw_symbols.push((symbol_id, kind, name, line_number, signature));
+    }
+
+    let mut symbols = Vec::new();
+    for (idx, (symbol_id, kind, name, line, signature)) in raw_symbols.iter().enumerate() {
+        let next_line = raw_symbols
+            .get(idx + 1)
+            .map(|(_, _, _, next_line, _)| next_line.saturating_sub(1))
+            .unwrap_or(lines.len() as u64);
+        let body = body_between_lines(&lines, *line, next_line);
         symbols.push(IndexedSymbol {
-            symbol_id,
+            symbol_id: symbol_id.clone(),
             file_id: file_id.to_string(),
             file_path: file_path.to_string(),
-            kind,
-            name,
+            kind: kind.clone(),
+            name: name.clone(),
             language: language.to_string(),
-            line: line_number,
+            line: *line,
             signature: signature.clone(),
-            snippet: signature,
+            snippet: signature.clone(),
+            body,
+            trust_tier: DEFAULT_TRUST_TIER.to_string(),
+            community_id: community_id(repo_id, language, kind),
         });
     }
     symbols
+}
+
+fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<EdgeRecord> {
+    let mut symbols_by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+    for symbol in files.iter().flat_map(|file| file.symbols.iter()) {
+        symbols_by_name
+            .entry(symbol.name.as_str())
+            .or_default()
+            .push(symbol);
+    }
+
+    let mut edges = Vec::new();
+    let mut seen = BTreeSet::new();
+    for symbol in files.iter().flat_map(|file| file.symbols.iter()) {
+        for (name, targets) in &symbols_by_name {
+            if *name == symbol.name.as_str() || !body_references_name(&symbol.body, name) {
+                continue;
+            }
+            for target in targets {
+                if target.symbol_id == symbol.symbol_id {
+                    continue;
+                }
+                let call_edge_id = edge_id(
+                    "code:edge:symbol_call",
+                    &symbol.symbol_id,
+                    &target.symbol_id,
+                );
+                if !seen.insert(call_edge_id.clone()) {
+                    continue;
+                }
+                edges.push(EdgeRecord::new(
+                    call_edge_id,
+                    &symbol.symbol_id,
+                    CALLS_SYMBOL,
+                    &target.symbol_id,
+                    json!({
+                        "tenant_id": config.tenant_id,
+                        "repo_id": config.repo_id,
+                        "generation": config.generation,
+                        "evidence": format!("{} body references {}", symbol.name, target.name),
+                        "source": SOURCE,
+                    }),
+                ));
+            }
+        }
+    }
+    edges
 }
 
 fn symbol_from_line(line: &str, language: &str) -> Option<(String, String)> {
@@ -966,8 +1411,209 @@ fn symbols_for_file(
         })
         .filter_map(|node| symbol_record_from_node(&node))
         .collect::<Vec<_>>();
+    for symbol in &mut out {
+        enrich_symbol_graph(store, symbol)?;
+    }
     out.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
+}
+
+fn recognize_indexed_symbols(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+    input: &RecognizeCodeInput,
+) -> Result<Vec<CodeSymbolRecord>, CodeIndexError> {
+    let mut query = NodeQuery::label(CODE_SYMBOL_LABEL)
+        .with_property("tenant_id", json!(tenant_id))
+        .with_limit(100_000);
+    if !input.repo_id.trim().is_empty() {
+        query = query.with_property("repo_id", json!(input.repo_id.trim()));
+    }
+    if !input.file_path.trim().is_empty() {
+        query = query.with_property("file_path", json!(input.file_path.trim()));
+    }
+    let latest = latest_repo_generations(store)?;
+    let mut out = store
+        .query_nodes(query)
+        .map_err(CodeIndexError::from_store)?
+        .into_iter()
+        .filter(|node| match property_string(&node.properties, "repo_id") {
+            Some(repo_id) => latest
+                .get(&repo_id)
+                .map(|generation| property_u64(&node.properties, "generation") == Some(*generation))
+                .unwrap_or(true),
+            None => false,
+        })
+        .filter_map(|node| symbol_record_from_node(&node))
+        .collect::<Vec<_>>();
+    for symbol in &mut out {
+        enrich_symbol_graph(store, symbol)?;
+    }
+    out.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(out)
+}
+
+fn resolve_symbol_node(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+    node_id: &str,
+    query: &str,
+    repo_id: &str,
+) -> Result<Option<NodeRecord>, CodeIndexError> {
+    if !node_id.trim().is_empty() {
+        let node = store
+            .get_node(node_id.trim())
+            .map_err(CodeIndexError::from_store)?;
+        return Ok(node.filter(|node| {
+            node.labels.iter().any(|label| label == CODE_SYMBOL_LABEL)
+                && node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_id)
+        }));
+    }
+    if query.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut node_query = NodeQuery::label(CODE_SYMBOL_LABEL).with_limit(100_000);
+    if !repo_id.trim().is_empty() {
+        node_query = node_query.with_property("repo_id", json!(repo_id.trim()));
+    }
+    let latest = latest_repo_generations(store)?;
+    let query_terms = query_terms(query);
+    let mut scored = store
+        .query_nodes(node_query)
+        .map_err(CodeIndexError::from_store)?
+        .into_iter()
+        .filter(|node| node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_id))
+        .filter(|node| match property_string(&node.properties, "repo_id") {
+            Some(repo_id) => latest
+                .get(&repo_id)
+                .map(|generation| property_u64(&node.properties, "generation") == Some(*generation))
+                .unwrap_or(true),
+            None => false,
+        })
+        .filter_map(|node| {
+            hit_from_node(&node).map(|hit| (node, score_hit(&hit, query, &query_terms)))
+        })
+        .filter(|(_, score)| *score > 0.0)
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.id.cmp(&b.0.id))
+    });
+    Ok(scored.into_iter().next().map(|(node, _)| node))
+}
+
+fn expand_symbol_edges(
+    store: &RedCoreGraphStore,
+    focus_id: &str,
+    max_depth: usize,
+    limit: usize,
+    related_ids: &mut BTreeSet<String>,
+    edges: &mut Vec<CodeGraphEdgeRecord>,
+) -> Result<(), CodeIndexError> {
+    let mut frontier = vec![(focus_id.to_string(), 0usize)];
+    related_ids.insert(focus_id.to_string());
+    let mut seen_edges = BTreeSet::new();
+    while let Some((node_id, depth)) = frontier.pop() {
+        if depth >= max_depth || related_ids.len() >= limit.saturating_add(1) {
+            continue;
+        }
+        for direction in [Direction::Out, Direction::In] {
+            let neighbors = store
+                .neighbors(NeighborQuery {
+                    node_id: node_id.clone(),
+                    direction,
+                    edge_type: Some(CALLS_SYMBOL.to_string()),
+                    include_expired: false,
+                })
+                .map_err(CodeIndexError::from_store)?;
+            for neighbor in neighbors {
+                if !seen_edges.insert(neighbor.edge_id.clone()) {
+                    continue;
+                }
+                if let Some(edge) = store
+                    .get_edge(&neighbor.edge_id)
+                    .map_err(CodeIndexError::from_store)?
+                {
+                    if let Some(record) = graph_edge_record(store, &edge)? {
+                        edges.push(record);
+                    }
+                }
+                if related_ids.insert(neighbor.node_id.clone()) && related_ids.len() <= limit {
+                    frontier.push((neighbor.node_id, depth + 1));
+                }
+            }
+        }
+    }
+    edges.sort_by(|a, b| {
+        a.from_name
+            .cmp(&b.from_name)
+            .then_with(|| a.to_name.cmp(&b.to_name))
+    });
+    Ok(())
+}
+
+fn enrich_symbol_graph(
+    store: &RedCoreGraphStore,
+    symbol: &mut CodeSymbolRecord,
+) -> Result<(), CodeIndexError> {
+    symbol.callees = neighbor_symbol_names(store, &symbol.node_id, Direction::Out)?;
+    symbol.callers = neighbor_symbol_names(store, &symbol.node_id, Direction::In)?;
+    Ok(())
+}
+
+fn neighbor_symbol_names(
+    store: &RedCoreGraphStore,
+    node_id: &str,
+    direction: Direction,
+) -> Result<Vec<String>, CodeIndexError> {
+    let mut names = store
+        .neighbors(NeighborQuery {
+            node_id: node_id.to_string(),
+            direction,
+            edge_type: Some(CALLS_SYMBOL.to_string()),
+            include_expired: false,
+        })
+        .map_err(CodeIndexError::from_store)?
+        .into_iter()
+        .filter_map(|hit| store.get_node(&hit.node_id).ok().flatten())
+        .filter_map(|node| property_string(&node.properties, "name"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn graph_edge_record(
+    store: &RedCoreGraphStore,
+    edge: &EdgeRecord,
+) -> Result<Option<CodeGraphEdgeRecord>, CodeIndexError> {
+    let Some(from) = store
+        .get_node(&edge.from_id)
+        .map_err(CodeIndexError::from_store)?
+    else {
+        return Ok(None);
+    };
+    let Some(to) = store
+        .get_node(&edge.to_id)
+        .map_err(CodeIndexError::from_store)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(CodeGraphEdgeRecord {
+        from_node_id: edge.from_id.clone(),
+        to_node_id: edge.to_id.clone(),
+        edge_type: edge.edge_type.clone(),
+        from_name: property_string(&from.properties, "name")
+            .unwrap_or_else(|| edge.from_id.clone()),
+        to_name: property_string(&to.properties, "name").unwrap_or_else(|| edge.to_id.clone()),
+        evidence: property_string(&edge.properties, "evidence").unwrap_or_default(),
+    }))
 }
 
 fn hit_from_node(node: &NodeRecord) -> Option<CodeHitRecord> {
@@ -982,6 +1628,9 @@ fn hit_from_node(node: &NodeRecord) -> Option<CodeHitRecord> {
         line: property_u64(&node.properties, "line").unwrap_or(0),
         snippet: property_string(&node.properties, "snippet").unwrap_or_default(),
         score: 0.0,
+        trust_tier: property_string(&node.properties, "trust_tier")
+            .unwrap_or_else(|| DEFAULT_TRUST_TIER.to_string()),
+        community_id: property_string(&node.properties, "community_id").unwrap_or_default(),
     })
 }
 
@@ -997,6 +1646,11 @@ fn symbol_record_from_node(node: &NodeRecord) -> Option<CodeSymbolRecord> {
         line: property_u64(&node.properties, "line").unwrap_or(0),
         signature: property_string(&node.properties, "signature").unwrap_or_default(),
         snippet: property_string(&node.properties, "snippet").unwrap_or_default(),
+        trust_tier: property_string(&node.properties, "trust_tier")
+            .unwrap_or_else(|| DEFAULT_TRUST_TIER.to_string()),
+        community_id: property_string(&node.properties, "community_id").unwrap_or_default(),
+        callers: Vec::new(),
+        callees: Vec::new(),
     })
 }
 
@@ -1064,6 +1718,31 @@ fn line_context(
         }
     }
     (start, end, context)
+}
+
+fn body_between_lines(lines: &[&str], start_line: u64, end_line: u64) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let start = start_line.max(1) as usize - 1;
+    let end = end_line.min(lines.len() as u64) as usize;
+    lines.get(start..end).unwrap_or(&[]).join("\n")
+}
+
+fn body_references_name(body: &str, name: &str) -> bool {
+    body.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '!')
+        .any(|token| token == name)
+}
+
+fn community_id(repo_id: &str, language: &str, kind: &str) -> String {
+    format!(
+        "code:community:{}",
+        stable_hash(json!({
+            "repo_id": repo_id,
+            "language": language,
+            "kind": kind,
+        }))
+    )
 }
 
 struct Receipt {
@@ -1341,7 +2020,7 @@ mod tests {
         fs::create_dir_all(repo_dir.join("src")).unwrap();
         fs::write(
             repo_dir.join("src/lib.rs"),
-            "pub struct SearchKernel {}\n\npub fn search_code(query: &str) -> usize {\n    query.len()\n}\n",
+            "pub struct SearchKernel {}\n\npub fn helper_len(query: &str) -> usize {\n    query.len()\n}\n\npub fn search_code(query: &str) -> usize {\n    helper_len(query)\n}\n",
         )
         .unwrap();
         fs::write(
@@ -1379,6 +2058,57 @@ mod tests {
             .unwrap();
         assert_eq!(search.total_returned, 1);
         assert_eq!(search.hits[0].name, "search_code");
+        assert_eq!(search.hits[0].trust_tier, DEFAULT_TRUST_TIER);
+        assert!(!search.hits[0].community_id.is_empty());
+
+        let recognized = runtime
+            .recognize_code(RecognizeCodeInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: ingest.repo_id.clone(),
+                text: "pub fn inline_symbol() -> usize {\n    1\n}\n".to_string(),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(recognized
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "inline_symbol"));
+
+        let explored = runtime
+            .explore_code(ExploreCodeInput {
+                tenant_id: "theorem".to_string(),
+                node_id: search.hits[0].node_id.clone(),
+                max_depth: 1,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(explored.focus.as_ref().unwrap().name, "search_code");
+        assert!(explored
+            .related_symbols
+            .iter()
+            .any(|symbol| symbol.name == "helper_len"));
+        assert!(explored.edges.iter().any(|edge| {
+            edge.edge_type == CALLS_SYMBOL
+                && edge.from_name == "search_code"
+                && edge.to_name == "helper_len"
+        }));
+
+        let explained = runtime
+            .explain_code(ExplainCodeInput {
+                tenant_id: "theorem".to_string(),
+                node_id: search.hits[0].node_id.clone(),
+                max_chars: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(explained.summary.contains("Trust tier: advisory"));
+        assert!(explained.context.contains("helper_len(query)"));
+        assert!(explained
+            .edges
+            .iter()
+            .any(|edge| edge.to_name == "helper_len"));
 
         let context = runtime
             .code_context(CodeContextInput {

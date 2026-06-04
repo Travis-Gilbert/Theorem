@@ -20,7 +20,10 @@ use serde_json::{json, Map, Value};
 use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
 
-use crate::code_index::{CodeContextInput, CodeIndexRuntime, IngestCodebaseInput, SearchCodeInput};
+use crate::code_index::{
+    CodeContextInput, CodeIndexRuntime, ExplainCodeInput, ExploreCodeInput, IngestCodebaseInput,
+    RecognizeCodeInput, SearchCodeInput,
+};
 use crate::pb;
 
 #[derive(Clone)]
@@ -358,6 +361,15 @@ fn handle_affordance(
         "code_search.context" => {
             return code_context_handler(base, code_index, request, tenant_id);
         }
+        "code_search.recognize" => {
+            return code_recognize_handler(base, code_index, request, tenant_id);
+        }
+        "code_search.explore" => {
+            return code_explore_handler(base, code_index, request, tenant_id);
+        }
+        "code_search.explain" => {
+            return code_explain_handler(base, code_index, request, tenant_id);
+        }
         "anti_misinfo_algo.inspect_claim" => merge_json(
             base,
             json!({
@@ -603,6 +615,112 @@ fn code_context_handler(
             message: "native code context failed".to_string(),
             outcome_value: 0.0,
             outcome_label: "code_context_failed".to_string(),
+        },
+    }
+}
+
+fn code_recognize_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let result = code_index.recognize_code(RecognizeCodeInput {
+        tenant_id: tenant_id.to_string(),
+        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        file_path: request_string(request, &["file_path", "path"]).unwrap_or_default(),
+        text: request_string(request, &["text", "source"]).unwrap_or_default(),
+        limit: request_u64(request, "limit").unwrap_or_default(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code recognition completed over RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_recognize_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code recognition failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_recognize_failed".to_string(),
+        },
+    }
+}
+
+fn code_explore_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let result = code_index.explore_code(ExploreCodeInput {
+        tenant_id: tenant_id.to_string(),
+        node_id: request_string(request, &["node_id", "symbol_id"]).unwrap_or_default(),
+        query: request_string(request, &["query", "text", "symbol"]).unwrap_or_default(),
+        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        max_depth: request_u64(request, "max_depth").unwrap_or_default(),
+        limit: request_u64(request, "limit").unwrap_or_default(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code exploration completed over RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_explore_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code exploration failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_explore_failed".to_string(),
+        },
+    }
+}
+
+fn code_explain_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let result = code_index.explain_code(ExplainCodeInput {
+        tenant_id: tenant_id.to_string(),
+        node_id: request_string(request, &["node_id", "symbol_id"]).unwrap_or_default(),
+        query: request_string(request, &["query", "text", "symbol"]).unwrap_or_default(),
+        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        max_chars: request_u64(request, "max_chars").unwrap_or_default(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code explanation completed over RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_explain_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code explanation failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_explain_failed".to_string(),
         },
     }
 }
@@ -1220,7 +1338,7 @@ mod tests {
         std::fs::create_dir_all(repo_dir.join("src")).unwrap();
         std::fs::write(
             repo_dir.join("src/lib.rs"),
-            "pub fn native_code_search(query: &str) -> usize {\n    query.len()\n}\n",
+            "pub fn native_code_helper(query: &str) -> usize {\n    query.len()\n}\n\npub fn native_code_search(query: &str) -> usize {\n    native_code_helper(query)\n}\n",
         )
         .unwrap();
         repo_dir
@@ -1351,7 +1469,69 @@ mod tests {
             .unwrap();
         assert_eq!(search.status, "ok");
         assert!(search.output_json.contains("\"native_code_search\""));
+        assert!(search.output_json.contains("\"trust_tier\":\"advisory\""));
         assert!(search.output_json.contains("\"capability_selection\""));
+        let search_output: Value = serde_json::from_str(&search.output_json).unwrap();
+        let node_id = search_output["hits"][0]["node_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let recognize = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.recognize".to_string(),
+                    actor: "test".to_string(),
+                    request_json:
+                        r#"{"file_path":"src/inline.rs","text":"pub fn inline_affordance() {}"}"#
+                            .to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(recognize.status, "ok");
+        assert!(recognize.output_json.contains("\"inline_affordance\""));
+
+        let explore = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.explore".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({ "node_id": node_id, "max_depth": 1 }).to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(explore.status, "ok");
+        assert!(explore.output_json.contains("\"native_code_helper\""));
+        assert!(explore.output_json.contains("\"CALLS_SYMBOL\""));
+
+        let explain = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.explain".to_string(),
+                    actor: "test".to_string(),
+                    request_json: r#"{"query":"native_code_search"}"#.to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(explain.status, "ok");
+        let explain_output: Value = serde_json::from_str(&explain.output_json).unwrap();
+        let summary = explain_output["summary"].as_str().unwrap_or_default();
+        assert!(summary.contains("Trust tier: advisory"), "{summary}");
 
         drop(runtime);
         std::fs::remove_dir_all(repo_dir).ok();

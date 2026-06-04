@@ -3,8 +3,10 @@
 use tonic::{Request, Response, Status};
 
 use crate::code_index::{
-    CodeContextInput, CodeContextOutput, CodeHitRecord, CodeIndexError, CodeIndexRuntime,
-    CodeSymbolRecord, IngestCodebaseInput, IngestCodebaseOutput, SearchCodeInput, SearchCodeOutput,
+    CodeContextInput, CodeContextOutput, CodeGraphEdgeRecord, CodeHitRecord, CodeIndexError,
+    CodeIndexRuntime, CodeSymbolRecord, ExplainCodeInput, ExplainCodeOutput, ExploreCodeInput,
+    ExploreCodeOutput, IngestCodebaseInput, IngestCodebaseOutput, RecognizeCodeInput,
+    RecognizeCodeOutput, SearchCodeInput, SearchCodeOutput,
 };
 use crate::pb;
 
@@ -80,6 +82,61 @@ impl pb::CodeCrawlerService for TheoremCodeCrawlerService {
             .map_err(status_from_code_error)?;
         Ok(Response::new(context_to_pb(output)))
     }
+
+    async fn recognize_code(
+        &self,
+        request: Request<pb::RecognizeCodeRequest>,
+    ) -> Result<Response<pb::RecognizeCodeResponse>, Status> {
+        let req = request.into_inner();
+        let output = self
+            .runtime
+            .recognize_code(RecognizeCodeInput {
+                tenant_id: req.tenant_id,
+                repo_id: req.repo_id,
+                file_path: req.file_path,
+                text: req.text,
+                limit: req.limit,
+            })
+            .map_err(status_from_code_error)?;
+        Ok(Response::new(recognize_to_pb(output)))
+    }
+
+    async fn explore_code(
+        &self,
+        request: Request<pb::ExploreCodeRequest>,
+    ) -> Result<Response<pb::ExploreCodeResponse>, Status> {
+        let req = request.into_inner();
+        let output = self
+            .runtime
+            .explore_code(ExploreCodeInput {
+                tenant_id: req.tenant_id,
+                node_id: req.node_id,
+                query: req.query,
+                repo_id: req.repo_id,
+                max_depth: req.max_depth,
+                limit: req.limit,
+            })
+            .map_err(status_from_code_error)?;
+        Ok(Response::new(explore_to_pb(output)))
+    }
+
+    async fn explain_code(
+        &self,
+        request: Request<pb::ExplainCodeRequest>,
+    ) -> Result<Response<pb::ExplainCodeResponse>, Status> {
+        let req = request.into_inner();
+        let output = self
+            .runtime
+            .explain_code(ExplainCodeInput {
+                tenant_id: req.tenant_id,
+                node_id: req.node_id,
+                query: req.query,
+                repo_id: req.repo_id,
+                max_chars: req.max_chars,
+            })
+            .map_err(status_from_code_error)?;
+        Ok(Response::new(explain_to_pb(output)))
+    }
 }
 
 fn input_from_ingest(req: pb::IngestCodebaseRequest) -> IngestCodebaseInput {
@@ -154,6 +211,44 @@ fn context_to_pb(output: CodeContextOutput) -> pb::CodeContextResponse {
     }
 }
 
+fn recognize_to_pb(output: RecognizeCodeOutput) -> pb::RecognizeCodeResponse {
+    pb::RecognizeCodeResponse {
+        tenant_id: output.tenant_id,
+        repo_id: output.repo_id,
+        file_path: output.file_path,
+        symbols: output.symbols.into_iter().map(symbol_to_pb).collect(),
+        receipt_hash: output.receipt_hash,
+        receipt_json: output.receipt_json,
+    }
+}
+
+fn explore_to_pb(output: ExploreCodeOutput) -> pb::ExploreCodeResponse {
+    pb::ExploreCodeResponse {
+        tenant_id: output.tenant_id,
+        focus: output.focus.map(symbol_to_pb),
+        related_symbols: output
+            .related_symbols
+            .into_iter()
+            .map(symbol_to_pb)
+            .collect(),
+        edges: output.edges.into_iter().map(edge_to_pb).collect(),
+        receipt_hash: output.receipt_hash,
+        receipt_json: output.receipt_json,
+    }
+}
+
+fn explain_to_pb(output: ExplainCodeOutput) -> pb::ExplainCodeResponse {
+    pb::ExplainCodeResponse {
+        tenant_id: output.tenant_id,
+        symbol: output.symbol.map(symbol_to_pb),
+        summary: output.summary,
+        context: output.context,
+        edges: output.edges.into_iter().map(edge_to_pb).collect(),
+        receipt_hash: output.receipt_hash,
+        receipt_json: output.receipt_json,
+    }
+}
+
 fn hit_to_pb(hit: CodeHitRecord) -> pb::CodeHit {
     pb::CodeHit {
         node_id: hit.node_id,
@@ -166,6 +261,8 @@ fn hit_to_pb(hit: CodeHitRecord) -> pb::CodeHit {
         line: hit.line,
         snippet: hit.snippet,
         score: hit.score,
+        trust_tier: hit.trust_tier,
+        community_id: hit.community_id,
     }
 }
 
@@ -181,6 +278,21 @@ fn symbol_to_pb(symbol: CodeSymbolRecord) -> pb::CodeSymbol {
         line: symbol.line,
         signature: symbol.signature,
         snippet: symbol.snippet,
+        trust_tier: symbol.trust_tier,
+        community_id: symbol.community_id,
+        callers: symbol.callers,
+        callees: symbol.callees,
+    }
+}
+
+fn edge_to_pb(edge: CodeGraphEdgeRecord) -> pb::CodeGraphEdge {
+    pb::CodeGraphEdge {
+        from_node_id: edge.from_node_id,
+        to_node_id: edge.to_node_id,
+        edge_type: edge.edge_type,
+        from_name: edge.from_name,
+        to_name: edge.to_name,
+        evidence: edge.evidence,
     }
 }
 
