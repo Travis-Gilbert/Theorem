@@ -1,4 +1,4 @@
-# Handoff pipeline test (re-fire after adding id-token: write)
+# Handoff pipeline test (re-fire with regenerated OAuth token)
 
 This is a deliberately trivial task to verify the claude.ai handoff pipeline end to end (push to .handoff -> relay -> repository_dispatch -> claude-code-action) on a cheap, fast run before a real one.
 
