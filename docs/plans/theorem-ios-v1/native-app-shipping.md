@@ -137,3 +137,41 @@ THEOREM_TEAM_ID=XXXXXXXXXX apps/theorem-ios/App/ship-testflight.sh
 ```
 
 The script regenerates the project, archives Release with `DEVELOPMENT_TEAM` and `-allowProvisioningUpdates`, and uploads via `ExportOptions.plist` (already app-store-connect, internal-testing-only). Pass `-a` to archive-only (validate signing without uploading). It fails loudly with the exact missing-credential message rather than producing an unsigned or fake artifact.
+
+## Apple gate checklist: first ship to a physical device (2026-06-03)
+
+Learned shipping build 1/2 of Theorem iOS onto a physical iPhone 17 Pro. Each item below was a distinct, separately-discovered blocker. After the first build most are done; this is the "do not rediscover it" list. The substrate memory copy is `doc_671af9eea614642f`.
+
+Account and signing (owner, one-time):
+
+1. Apple Developer Program enrollment must be ACTIVE and the Apple Developer Program License Agreement ACCEPTED (developer.apple.com, Account). An unaccepted agreement keeps the team invisible everywhere (empty `IDEProvisioningTeams`, zero signing certs) with no obvious error message.
+2. Sign into Xcode itself: Xcode, Settings, Accounts, (+), Apple ID. This is NOT the same as logging into the developer website or App Store Connect in a browser; only the in-Xcode account gives the machine a signing identity. Verify with `defaults read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists` (a non-empty list means the account is added).
+3. Team ID: developer.apple.com, Membership, Team ID (10-char alphanumeric). Pass as `DEVELOPMENT_TEAM` to xcodebuild. Without it: `Signing for "Theorem" requires a development team` (exit 65). xcodebuild will not infer it even with an account signed in.
+4. Register the device UDID: developer.apple.com, Devices, (+). Get the real UDID (modern 24-hex-plus-dash form, e.g. `00008150-...`) via `xcrun devicectl device info details --device <id> | grep -i udid` (the devicectl `identifier` is NOT the UDID). Until a device is registered, automatic signing cannot create the development provisioning profile the archive embeds ("Your team has no devices from which to generate a provisioning profile"); network pairing alone is not enough.
+
+Build content:
+
+5. An app icon is required, or App Store Connect rejects the upload (90713 missing `CFBundleIconName`, 90022 missing 120x120). Use `Assets.xcassets` with a single-size 1024 `AppIcon` (opaque, no alpha; the store rejects alpha) plus `ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon` in `project.yml`. Generate the PNG with Swift/Node CoreGraphics (gen-AI icons turn to mush at 60px). The shipped icon is a generated placeholder (constellation mark); replace before any public release.
+6. Export compliance is per build (`internalBuildState=MISSING_EXPORT_COMPLIANCE` blocks distribution). Either set `INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO` in `project.yml` to auto-answer every build, or clear it per build via the App Store Connect API (`PATCH /v1/builds/{id}`, attribute `usesNonExemptEncryption=false`).
+
+Signing model:
+
+7. The archive is signed with an Apple DEVELOPMENT identity (which needs the registered device). The export step (`-exportArchive`, `method=app-store-connect`) re-signs for App Store DISTRIBUTION, which is device-free. Both are auto-created by `-allowProvisioningUpdates` once account, team, device, and agreement are in place.
+
+TestFlight (the slow, opaque path):
+
+8. Internal testers must be added via the App Store Connect UI user-picker (checkbox existing account users), NOT by typing an email and NOT via `POST /v1/betaTesters`. Note: `inviteType=EMAIL` is reported for internal testers too; it is not the internal-vs-external discriminator. Ignore "invitation has been revoked or is invalid" emails; internal testers do not redeem links, and a deleted tester's email always errors.
+9. First-build backend lag is real and opaque: a build can read `IN_BETA_TESTING` with everything green (VALID, not expired, minOS below the device OS, group `hasAccessToAllBuilds=true`, tester present) and still show "No Builds Available" and never appear in the TestFlight app for a long time. It is not forceable.
+
+The deterministic bypass (when TestFlight stalls):
+
+10. With a dev-signed archive plus a registered device plus Developer Mode ON (iPhone, Settings, Privacy and Security, Developer Mode; requires a restart; "Developer Mode disabled" surfaces as `CoreDeviceError 10005`), install straight to the phone:
+
+```bash
+xcrun devicectl device install app --device <DEVICE_ID> /tmp/Theorem.xcarchive/Products/Applications/Theorem.app
+xcrun devicectl device process launch --device <DEVICE_ID> me.travisgilbert.theorem
+```
+
+On a paid account the development profile is valid for about a year (no 7-day expiry), so this is a durable way to keep the app on the phone, decoupled from TestFlight.
+
+App Store Connect API (status checks plus headless uploads): needs the Key ID (in the `AuthKey_<KEYID>.p8` filename), the Issuer ID (Users and Access, Integrations; a UUID, not in the `.p8`), and the `.p8`. There was no Python JWT library on this Mac, so mint the ES256 JWT with Node's built-in crypto: `crypto.sign('sha256', input, {key, dsaEncoding: 'ieee-p1363'})` (raw r-or-s, not DER); Node also has built-in `fetch`. Keep the `.p8` out of git. macOS bash 3.2 with `set -u`: expand a possibly-empty array as `${arr[@]+"${arr[@]}"}` or it throws "unbound variable".

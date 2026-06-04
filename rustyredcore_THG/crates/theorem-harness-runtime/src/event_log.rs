@@ -207,6 +207,7 @@ fn event_of_run_edge(event: &EventState) -> RuntimeResult<EdgeRecord> {
             "state_hash_before": event.state_hash_before,
             "state_hash_after": event.state_hash_after,
             "type": event.event_type,
+            "idempotency_key": event.idempotency_key,
         }),
     ))
 }
@@ -248,6 +249,7 @@ fn event_matches(existing: &NodeRecord, event: &EventState) -> bool {
         && existing.properties.get("type").and_then(Value::as_str)
             == Some(event.event_type.as_str())
         && existing.properties.get("payload") == Some(&Value::Object(event.payload.clone()))
+        && property_string_or_default(existing, "idempotency_key") == event.idempotency_key.as_str()
         && existing
             .properties
             .get("state_hash_before")
@@ -258,6 +260,13 @@ fn event_matches(existing: &NodeRecord, event: &EventState) -> bool {
             .get("state_hash_after")
             .and_then(Value::as_str)
             == Some(event.state_hash_after.as_str())
+}
+
+fn property_string_or_default<'a>(node: &'a NodeRecord, key: &str) -> &'a str {
+    node.properties
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn upsert_node_if_changed<S: GraphStore>(store: &mut S, node: NodeRecord) -> GraphStoreResult<()> {
@@ -307,21 +316,20 @@ mod tests {
     #[test]
     fn append_transition_persists_run_event_and_edges() {
         let mut store = InMemoryGraphStore::new();
-        let created = append_transition(&mut store, None, created_transition()).unwrap();
-        let observed = append_transition(
-            &mut store,
-            Some(created.run),
-            transition(
-                "HOST.OBSERVED",
-                json!({
-                    "repo": "Theorem",
-                    "branch": "main",
-                    "commit_sha": "abc123",
-                    "cwd": "/repo/Theorem",
-                }),
-            ),
-        )
-        .unwrap();
+        let mut created_input = created_transition();
+        created_input.idempotency_key = "create-once".to_string();
+        let created = append_transition(&mut store, None, created_input).unwrap();
+        let mut observed_input = transition(
+            "HOST.OBSERVED",
+            json!({
+                "repo": "Theorem",
+                "branch": "main",
+                "commit_sha": "abc123",
+                "cwd": "/repo/Theorem",
+            }),
+        );
+        observed_input.idempotency_key = "observe-once".to_string();
+        let observed = append_transition(&mut store, Some(created.run), observed_input).unwrap();
 
         assert!(store.get_node(&run_node_id(RUN_ID)).is_some());
         assert!(store.get_node(&event_node_id(RUN_ID, 1)).is_some());
@@ -336,7 +344,17 @@ mod tests {
         let loaded_events = load_events(&store, RUN_ID).unwrap();
         assert_eq!(loaded_events.len(), 2);
         assert_eq!(loaded_events[0].seq, 1);
+        assert_eq!(loaded_events[0].idempotency_key, "create-once");
         assert_eq!(loaded_events[1].event_type, "HOST.OBSERVED");
+        assert_eq!(loaded_events[1].idempotency_key, "observe-once");
+        let observed_node = store.get_node(&event_node_id(RUN_ID, 2)).unwrap();
+        assert_eq!(
+            observed_node
+                .properties
+                .get("idempotency_key")
+                .and_then(Value::as_str),
+            Some("observe-once")
+        );
 
         let loaded_run = load_run(&store, RUN_ID).unwrap().unwrap();
         assert_eq!(loaded_run.status, observed.run.status);
@@ -433,6 +451,33 @@ mod tests {
                 seq: 1,
             }
         );
+    }
+
+    #[test]
+    fn event_match_treats_missing_idempotency_key_as_empty_for_old_events() {
+        let result = apply_transition(None, created_transition()).unwrap();
+        let mut node = event_node(&result.event).unwrap();
+        node.properties
+            .as_object_mut()
+            .expect("event properties are object")
+            .remove("idempotency_key");
+
+        assert!(event_matches(&node, &result.event));
+    }
+
+    #[test]
+    fn replay_preserves_event_idempotency_key() {
+        let mut store = InMemoryGraphStore::new();
+        let mut created = created_transition();
+        created.idempotency_key = "replay-create".to_string();
+        append_transition(&mut store, None, created).unwrap();
+
+        let events = load_events(&store, RUN_ID).unwrap();
+        assert_eq!(events[0].idempotency_key, "replay-create");
+        let replayed = replay_persisted_run(&store, RUN_ID).unwrap().unwrap();
+        assert_eq!(replayed.last_event_seq, 1);
+        let replayed_events = load_events(&store, RUN_ID).unwrap();
+        assert_eq!(replayed_events[0].idempotency_key, "replay-create");
     }
 
     fn created_transition() -> TransitionInput {

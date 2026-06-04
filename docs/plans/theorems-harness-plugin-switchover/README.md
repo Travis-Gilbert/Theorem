@@ -1,6 +1,7 @@
 # Theorems Harness Plugin Switchover (Theseus RustyRed -> Theorem RustyRed)
 
-Topic index. Two co-authored artifacts, one project at two altitudes.
+Topic index. Four co-authored artifacts: parent architecture -> migration lane ->
+grounded companion -> this index.
 
 Date opened: 2026-06-02
 Coordination room: `theorem-rustyred-plugin-switchover` (native Theorem RustyRed)
@@ -11,8 +12,10 @@ Grant: Travis gave both agents creative freedom to improve harness/SDK/plugin.
 
 | File | Author | Role |
 |---|---|---|
-| [`implementation-plan.md`](./implementation-plan.md) | Codex | Migration mechanics. THPS-001..010: route the plugin/SDK/hooks off the Theseus/Index-API RustyRed path onto native Theorem RustyRed, preserving public verbs. Verb routing matrix, target architecture, per-step acceptance/validation/risk, cross-agent ownership. |
-| [`sdk-v2-architecture.md`](./sdk-v2-architecture.md) | Claude Code | Destination architecture. Folds the `theorem-harness SDK v2` spec onto Codex's steps: Rust core + generated bindings, runs-as-event-streams, sessions-as-scopes, affordances/skills/runs, idempotency/cancellation/resumable/receipts/export. Grounded substrate-vs-surface inventory, the THPS-002 sunset-shim fork resolution, deltas to each THPS step, new steps THPS-011/012/013, the revised phase graph, and the spec coverage map. |
+| [`sdk-v2-architecture-overlay.md`](./sdk-v2-architecture-overlay.md) | Codex | **Parent architecture (canonical).** What SDK v2 is: the Rust-core-with-generated-bindings layer model, the SDK primitive list, the ordering rule (stabilize Rust core, then runtime over GraphStore, then route adapters, then generate bindings), product gates, and open design questions. The switchover is the first runtime-substrate slice of this. |
+| [`implementation-plan.md`](./implementation-plan.md) | Codex | **Migration lane.** THPS-000..010: THPS-000 aligns to the SDK v2 architecture; THPS-001..010 route the plugin/SDK/hooks off Theseus RustyRed onto native Theorem RustyRed, preserving public verbs. Verb routing matrix, per-step acceptance/validation/risk, cross-agent ownership. |
+| [`sdk-v2-architecture.md`](./sdk-v2-architecture.md) | Claude Code | **Grounded companion + SDK tail.** Does not restate the architecture; grounds and sequences it. The substrate-vs-surface inventory (file:line evidence: destination ~70% built today), per-THPS-step deltas, the THPS-002 sunset-shim resolution, the SDK tail steps THPS-011/012/013 (core surface freeze, binding generation, trace export), the phase graph, the spec coverage map, and the Travis-ratified resolved decisions. |
+| [`README.md`](./README.md) | Claude Code | This index. |
 
 ## The shape in one paragraph
 

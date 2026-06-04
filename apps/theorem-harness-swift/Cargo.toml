@@ -1,0 +1,28 @@
+[package]
+name = "theorem-harness-swift"
+version = "0.1.0"
+edition = "2021"
+description = "Swift (UniFFI) binding over the theorem-harness Rust SDK. The same surface as the Node (NAPI-RS) binding, generated from the same Rust core, so the two cannot drift. Serves the Theorem iOS app."
+license = "MIT"
+rust-version = "1.85"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+# A local uniffi-bindgen so `cargo run --bin uniffi-bindgen -- generate
+# --library <dylib> --language swift` works without a separate install.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+uniffi = { version = "0.31", features = ["cli"] }
+thiserror = "1"
+serde_json = "1.0"
+theorem-harness = { path = "../../rustyredcore_THG/crates/theorem-harness" }
+theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+
+# Standalone single-crate workspace: kept OUT of the rustyredcore_THG workspace
+# (the apps/browser isolation convention) so uniffi stays off the main build.
+[workspace]

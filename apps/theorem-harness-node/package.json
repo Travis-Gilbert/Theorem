@@ -1,0 +1,19 @@
+{
+  "name": "@theorem/harness-node",
+  "version": "0.1.0",
+  "description": "Node.js binding over the theorem-harness Rust SDK (NAPI-RS). THPS-012 slice 1.",
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "theorem_harness_node.node"
+  ],
+  "scripts": {
+    "build": "cargo build --release && cp target/release/libtheorem_harness_node.dylib theorem_harness_node.node",
+    "build:debug": "cargo build && cp target/debug/libtheorem_harness_node.dylib theorem_harness_node.node",
+    "smoke": "node smoke.mjs"
+  },
+  "license": "MIT"
+}

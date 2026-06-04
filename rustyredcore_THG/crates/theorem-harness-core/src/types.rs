@@ -169,6 +169,8 @@ pub struct EventState {
     pub event_type: String,
     #[serde(default)]
     pub payload: Payload,
+    #[serde(default, alias = "idempotencyKey")]
+    pub idempotency_key: String,
     #[serde(default)]
     pub state_hash_before: String,
     #[serde(default)]
@@ -201,7 +203,7 @@ pub struct TransitionInput {
     pub payload: Payload,
     #[serde(default)]
     pub actor: String,
-    #[serde(default)]
+    #[serde(default, alias = "idempotencyKey")]
     pub idempotency_key: String,
     #[serde(default = "now_string")]
     pub created_at: String,
@@ -278,5 +280,43 @@ pub fn now_string() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => format!("{}.{:09}Z", duration.as_secs(), duration.subsec_nanos()),
         Err(_) => "0.000000000Z".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventState, TransitionInput};
+    use serde_json::json;
+
+    #[test]
+    fn transition_input_accepts_camel_case_idempotency_key() {
+        let input: TransitionInput = serde_json::from_value(json!({
+            "run_id": "run-1",
+            "type": "RUN.CANCELLED",
+            "payload": {
+                "reason": "duplicate",
+                "cancelled_by": "codex"
+            },
+            "actor": "codex",
+            "idempotencyKey": "camel-transition",
+            "created_at": "2026-06-02T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(input.idempotency_key, "camel-transition");
+    }
+
+    #[test]
+    fn event_state_accepts_camel_case_idempotency_key() {
+        let event: EventState = serde_json::from_value(json!({
+            "run_id": "run-1",
+            "seq": 1,
+            "type": "RUN.CREATED",
+            "payload": {},
+            "idempotencyKey": "camel-event"
+        }))
+        .unwrap();
+
+        assert_eq!(event.idempotency_key, "camel-event");
     }
 }

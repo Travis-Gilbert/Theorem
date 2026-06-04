@@ -1,0 +1,16 @@
+# Rust build output (standalone workspace target dir).
+/target
+
+# Generated UniFFI bindings (Swift + Python): regenerate with the uniffi-bindgen
+# commands in the README. The source of truth is src/lib.rs, not the generated code.
+/generated
+/generated-python
+
+# Compiled Swift smoke and any native library copy: build artifacts.
+smoke_swift
+*.dylib
+
+# xcframework build artifacts (80M): regenerate with ./build-xcframework.sh.
+/TheoremHarnessFFI.xcframework
+/headers
+/Sources/TheoremHarness

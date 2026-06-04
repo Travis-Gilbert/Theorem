@@ -71,6 +71,7 @@ pub fn apply_transition(
         seq: next_run.last_event_seq,
         event_type: transition.event_type,
         payload: transition.payload,
+        idempotency_key: transition.idempotency_key,
         state_hash_before: before_hash.clone(),
         state_hash_after: after_hash.clone(),
         created_at: transition.created_at,
