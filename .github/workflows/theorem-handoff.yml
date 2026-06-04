@@ -23,11 +23,14 @@ name: Theorem Handoff
 #      Actions secret. The runner authenticates to Claude with this. Without it
 #      the action fails. (This is NOT the github-mcp commit token; different thing.)
 #      Also run `/install-github-app` once from Claude Code.
-#   2. HANDOFF_DISPATCH_PAT  - a fine-grained PAT (this repo, Contents: write)
-#      used ONLY by the relay job to fire the repository_dispatch. A PAT is
-#      required because the default GITHUB_TOKEN cannot re-trigger a workflow
-#      (recursion prevention), so a GITHUB_TOKEN-fired dispatch would no-op.
-#      Only needed for entry point B; path A via a spawn tool does not use it.
+#   2. HANDOFF_DISPATCH_PAT  - a token used ONLY by the relay job to fire the
+#      repository_dispatch. A separate token is required because the default
+#      GITHUB_TOKEN cannot re-trigger a workflow (recursion prevention), so a
+#      GITHUB_TOKEN-fired dispatch would no-op. A classic PAT with the `repo`
+#      scope works reliably; a fine-grained PAT needs Contents: read+write but is
+#      flakier for dispatches. Paste the token value with NO trailing newline
+#      (a stray newline makes gh fail with "invalid header field value for
+#      Authorization"). Only needed for entry point B; a spawn tool does not use it.
 #
 # IMPORTANT precedence note: do NOT also set ANTHROPIC_API_KEY as a secret/env here.
 # Claude Code prefers the API key over the OAuth token, so if both are present the
@@ -59,7 +62,7 @@ jobs:
           GH_TOKEN: ${{ secrets.HANDOFF_DISPATCH_PAT }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "HANDOFF_DISPATCH_PAT is not set. Add a fine-grained PAT (this repo, Contents: write) so the push can relay into a repository_dispatch." >&2
+            echo "HANDOFF_DISPATCH_PAT is not set. Add a token (classic PAT with repo scope is most reliable) so the push can relay into a repository_dispatch." >&2
             exit 1
           fi
           if [ ! -f .handoff/intent.md ]; then
@@ -74,9 +77,14 @@ jobs:
   run:
     if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
+    # id-token: write is REQUIRED by claude-code-action@v1: it mints its GitHub
+    # token via OIDC, and without this permission the runner never sets
+    # ACTIONS_ID_TOKEN_REQUEST_URL, so auth fails with
+    # "Could not fetch an OIDC token. Did you remember to add `id-token: write`...".
     permissions:
       contents: write
       pull-requests: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
