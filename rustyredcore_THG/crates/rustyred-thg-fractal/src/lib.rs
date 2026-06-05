@@ -89,6 +89,11 @@ pub struct FractalExpansionReceipt {
     pub provider_candidates: Vec<FractalProviderCandidate>,
     #[serde(default)]
     pub provider_receipts: Vec<FractalProviderReceipt>,
+    /// Seed URLs whose fetch failed in the live runner. Lets a run that reaches no
+    /// pages report honestly (web_reached:false + these failures) instead of a
+    /// false web_reached:true on zero fetches.
+    #[serde(default)]
+    pub web_seed_failures: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -130,7 +135,17 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
     }
 
     let mut output = build_admitted_pages_output(&request, &web_seed_urls, fetched_pages)?;
-    apply_admitted_pages(store, &request, web_seed_urls, frontier, &mut output, None)
+    let web_reached = !fetched_pages.is_empty();
+    apply_admitted_pages(
+        store,
+        &request,
+        web_seed_urls,
+        frontier,
+        &mut output,
+        None,
+        web_reached,
+        Vec::new(),
+    )
 }
 
 pub async fn run_fractal_expansion<S: GraphStore>(
@@ -152,11 +167,16 @@ pub async fn run_fractal_expansion<S: GraphStore>(
     }
 
     let mut fetched = Vec::new();
+    let mut web_seed_failures = Vec::new();
     for url in &web_seed_urls {
-        if let Ok(result) = cascade.fetch_with_promotion(url, max_bytes).await {
-            fetched.push(fetched_page_from_tier_result(url, result));
+        match cascade.fetch_with_promotion(url, max_bytes).await {
+            Ok(result) => fetched.push(fetched_page_from_tier_result(url, result)),
+            // Record the failed seed instead of swallowing it, so a run that
+            // reaches no pages reports honestly rather than as a false success.
+            Err(error) => web_seed_failures.push(format!("{url}: {error}")),
         }
     }
+    let web_reached = !fetched.is_empty();
 
     let mut output = build_admitted_pages_output(&request, &web_seed_urls, &fetched)?;
     let embedding_receipt = maybe_embed_live_crawl_output(&mut output).await?;
@@ -167,6 +187,8 @@ pub async fn run_fractal_expansion<S: GraphStore>(
         frontier,
         &mut output,
         embedding_receipt,
+        web_reached,
+        web_seed_failures,
     )
 }
 
@@ -384,6 +406,9 @@ async fn maybe_embed_live_crawl_output(
     Ok(Some(receipt))
 }
 
+// Internal run-state threader: the arg count is the cost of keeping the receipt
+// build in one place rather than scattering it across the runners.
+#[allow(clippy::too_many_arguments)]
 fn apply_admitted_pages<S: GraphStore>(
     store: &mut S,
     request: &FractalExpansionRequest,
@@ -391,6 +416,8 @@ fn apply_admitted_pages<S: GraphStore>(
     frontier: Vec<FractalFrontierHit>,
     output: &mut CrawlRunOutput,
     embedding_receipt: Option<CrawlEmbeddingReceipt>,
+    web_reached: bool,
+    web_seed_failures: Vec<String>,
 ) -> ThgResult<FractalExpansionReceipt> {
     let writes = output
         .graph
@@ -405,8 +432,12 @@ fn apply_admitted_pages<S: GraphStore>(
             .embedder_model
             .clone()
             .unwrap_or_else(|| DEFAULT_FRACTAL_EMBEDDER_MODEL.to_string()),
+        // Stays true: we only reach here after the graph frontier was exhausted
+        // into web seeds (otherwise the runners return fractal_web_seed_required).
         graph_exhausted: true,
-        web_reached: true,
+        // ACTUAL successful fetches, not the attempt: a run where every seed
+        // failed reports web_reached:false, never a silent zero-page success.
+        web_reached,
         web_seed_urls,
         frontier,
         crawl_receipt_id: output.receipt.receipt_id.clone(),
@@ -415,6 +446,7 @@ fn apply_admitted_pages<S: GraphStore>(
         embedding_receipt,
         provider_candidates: Vec::new(),
         provider_receipts: Vec::new(),
+        web_seed_failures,
     })
 }
 
@@ -559,6 +591,70 @@ mod tests {
 
         let open_web_pages = open_web_pages_for_tenant(&store, "theorem");
         assert!(open_web_pages.contains(&"https://example.com/new-grounding".to_string()));
+    }
+
+    #[test]
+    fn fixture_fractal_expansion_reports_zero_fetch_honestly() {
+        // A graph frontier exists (so web seeds are generated and the run does NOT
+        // error fractal_web_seed_required), but no pages are fetched (every seed
+        // failed). The receipt must report web_reached:false + admitted_pages:0 --
+        // never a false web_reached:true on zero pages (the P1 empty-fetch bug).
+        let mut store = InMemoryGraphStore::new();
+        let mut initial = build_v2_fixture_crawl(
+            CrawlRequest::new(
+                "initial-empty",
+                vec!["https://example.com/seed-source".to_string()],
+            ),
+            &[FetchedPage::html(
+                "https://example.com/seed-source",
+                "<html><body>grounding source for the zero-fetch case</body></html>",
+            )],
+        )
+        .unwrap();
+        let initial_request = FractalExpansionRequest {
+            run_id: "initial-empty-fractal".to_string(),
+            tenant_id: "theorem".to_string(),
+            query: "grounding".to_string(),
+            web_seed_urls: Vec::new(),
+            top_k: 2,
+            frontier_limit: 4,
+            web_seed_limit: 4,
+            embedder_model: None,
+            actor_id: None,
+        }
+        .normalized();
+        annotate_open_web_batch(&mut initial.graph.batch.mutations, &initial_request);
+        initial.graph.apply_to_store(&mut store).unwrap();
+
+        let receipt = run_fixture_fractal_expansion(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "fractal-zero-fetch".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "grounding".to_string(),
+                web_seed_urls: vec!["https://example.com/dead-seed".to_string()],
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 4,
+                embedder_model: None,
+                actor_id: Some("test".to_string()),
+            },
+            &[], // every seed failed to fetch -> no admitted pages
+        )
+        .unwrap();
+
+        // The graph WAS exhausted into web seeds (honest, structural)...
+        assert!(receipt.graph_exhausted);
+        assert!(
+            !receipt.web_seed_urls.is_empty(),
+            "seeds were generated; the run did not terminate at the graph"
+        );
+        // ...but web_reached is honest about the zero fetch.
+        assert!(
+            !receipt.web_reached,
+            "zero fetched pages must report web_reached=false, not a false success"
+        );
+        assert_eq!(receipt.admitted_pages, 0);
     }
 
     #[test]
