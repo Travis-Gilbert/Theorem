@@ -135,7 +135,11 @@ public struct RemoteRoomChannel: RoomChannel {
     }
 
     public func stream() -> AsyncThrowingStream<RoomMessage, Error> {
-        let url = baseURL.appendingPathComponent("harness/rooms/\(roomID)/stream")
+        // The stream must carry the tenant. The harness-server SSE filter scopes by
+        // tenant AND room (GET /harness/rooms/:room_id/stream?tenant=...), so two
+        // tenants sharing a room_id never cross-receive. Without it the server now
+        // rejects the subscription with 400.
+        let url = Self.streamURL(baseURL: baseURL, roomID: roomID, tenantSlug: tenantSlug)
         let session = self.session
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -166,6 +170,20 @@ public struct RemoteRoomChannel: RoomChannel {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Build the SSE stream URL with the required `tenant` query parameter. The
+    /// path is assembled exactly as the POST path is, then the tenant is added as a
+    /// query item so the server's tenant+room filter admits this client's events.
+    /// Internal for unit testing. Falls back to the path-only URL only if URL
+    /// component assembly fails, which it will not for a well-formed base.
+    static func streamURL(baseURL: URL, roomID: String, tenantSlug: String) -> URL {
+        let base = baseURL.appendingPathComponent("harness/rooms/\(roomID)/stream")
+        guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+            return base
+        }
+        components.queryItems = [URLQueryItem(name: "tenant", value: tenantSlug)]
+        return components.url ?? base
     }
 
     /// Extract the JSON payload from an SSE `data:` line. Field lines other than

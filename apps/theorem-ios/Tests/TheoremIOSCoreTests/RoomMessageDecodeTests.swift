@@ -74,6 +74,24 @@ final class RoomMessageDecodeTests: XCTestCase {
         XCTAssertNil(RemoteRoomChannel.sseData(from: ""))
     }
 
+    func testStreamURLCarriesTenant() {
+        let base = URL(string: "https://harness.example")!
+        let url = RemoteRoomChannel.streamURL(
+            baseURL: base,
+            roomID: "repo:theorem:branch:main",
+            tenantSlug: "travis-gilbert"
+        )
+        // The path still resolves to this room's stream endpoint...
+        XCTAssertTrue(url.path.hasSuffix("/stream"), "stream path preserved")
+        // ...and the tenant rides as a query item so the server's tenant+room
+        // filter admits this client's events (the cross-tenant SSE leak fix).
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        XCTAssertEqual(
+            components?.queryItems?.first(where: { $0.name == "tenant" })?.value,
+            "travis-gilbert"
+        )
+    }
+
     func testSampleChannelEchoesSendAndStreamsNothing() async throws {
         let channel = SampleRoomChannel(actorID: "travis")
         let wake = try await channel.send("@codex build", delivery: .wake)

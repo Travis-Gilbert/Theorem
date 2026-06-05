@@ -21,7 +21,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
@@ -358,21 +358,52 @@ async fn post_message_handler<S: GraphStore + Send + 'static>(
     Ok(Json(json!({ "message": message, "event": event })))
 }
 
+/// Query parameters for the room stream. `tenant` is REQUIRED. The SSE filter
+/// must scope by tenant as well as room: the bus is a single in-process broadcast
+/// shared by every tenant, so room-only filtering lets two tenants that happen to
+/// share a `room_id` (e.g. the default `repo:theorem:branch:main`) cross-receive
+/// each other's messages. POST writes already carry `tenant_slug`; the stream has
+/// to carry it too, or the write/read sides disagree on isolation.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct StreamQuery {
+    #[serde(default)]
+    pub tenant: String,
+}
+
+/// The bus-event filter a stream applies: an event is delivered only when BOTH its
+/// tenant and its room match the subscription. Pulled out as a pure predicate so
+/// the tenant-isolation invariant is unit-testable without standing up the server.
+pub fn stream_event_matches(event: &RoomMessageEvent, tenant: &str, room_id: &str) -> bool {
+    event.tenant_slug == tenant && event.room_id == room_id
+}
+
 async fn stream_room_handler<S: GraphStore + Send + 'static>(
     State(state): State<PushState<S>>,
     Path(room_id): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Query(query): Query<StreamQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    let tenant = query.tenant.trim().to_string();
+    if tenant.is_empty() {
+        // Without a tenant the only available filter is room-only scoping, which
+        // is exactly the cross-tenant leak. Refuse the subscription rather than
+        // silently fall back to leaking.
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "tenant query parameter is required".to_string(),
+        ));
+    }
     let receiver = state.bus.subscribe();
     let stream = BroadcastStream::new(receiver).filter_map(move |item| match item {
-        // Only this room's events; skip other rooms and lag notifications.
-        Ok(event) if event.room_id == room_id => Event::default()
+        // This tenant's events in this room only; skip other tenants, other rooms,
+        // and lag notifications.
+        Ok(event) if stream_event_matches(&event, &tenant, &room_id) => Event::default()
             .event("room_message")
             .json_data(&event)
             .ok()
             .map(Ok),
         _ => None,
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 fn coordination_status(error: CoordinationError) -> (StatusCode, String) {
@@ -713,5 +744,63 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    fn event_for(tenant: &str, room: &str, message: &str) -> RoomMessageEvent {
+        RoomMessageEvent {
+            tenant_slug: tenant.to_string(),
+            room_id: room.to_string(),
+            message_id: format!("{tenant}-{message}"),
+            author: "peer".to_string(),
+            urgency: "info".to_string(),
+            message: message.to_string(),
+            mentions: Vec::new(),
+            delivery: Delivery::Passive,
+            created_at: "t".to_string(),
+        }
+    }
+
+    #[test]
+    fn stream_filter_scopes_by_tenant_not_just_room() {
+        let mine = event_for(TENANT, ROOM, "for-travis");
+        let other = event_for("other-tenant", ROOM, "for-other");
+
+        // The leak: same room_id, different tenant. The fixed predicate admits
+        // only the matching tenant.
+        assert!(stream_event_matches(&mine, TENANT, ROOM));
+        assert!(
+            !stream_event_matches(&other, TENANT, ROOM),
+            "an event from another tenant on the same room_id must not match"
+        );
+        // The room dimension still matters within a tenant.
+        assert!(!stream_event_matches(&mine, TENANT, "repo:other:branch:main"));
+    }
+
+    #[tokio::test]
+    async fn shared_room_does_not_leak_across_tenants_on_the_bus() {
+        let bus = RoomBus::new(64, Arc::new(CommandSpawnDispatcher));
+        let mut receiver = bus.subscribe();
+
+        // Both tenants ride the same bus on the same room_id.
+        let theirs = event_for("other-tenant", ROOM, "secret");
+        let mine = event_for(TENANT, ROOM, "mine");
+        bus.publish(theirs);
+        bus.publish(mine);
+
+        // A subscriber scoped to TENANT sees only TENANT's event, even though the
+        // other tenant's message was published first on the same shared room.
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            if let Ok(event) = receiver.recv().await {
+                if stream_event_matches(&event, TENANT, ROOM) {
+                    delivered.push(event.tenant_slug.clone());
+                }
+            }
+        }
+        assert_eq!(
+            delivered,
+            vec![TENANT.to_string()],
+            "the other tenant's message must be filtered out of this tenant's stream"
+        );
     }
 }
