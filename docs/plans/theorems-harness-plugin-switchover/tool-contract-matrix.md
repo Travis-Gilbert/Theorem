@@ -5,6 +5,43 @@ Status: active contract snapshot with first handler wiring
 Owner: Codex
 Coordination room: `theorem-rustyred-plugin-switchover`
 
+## 2026-06-05 update (Claude Code): coordination + memory are native-sole-path
+
+The plugin's coordination and memory verbs now route to the native Theorem
+RustyRed MCP as the SOLE path; the Theseus/Django backend and the THG-product
+mirror are retired for these families (Travis directive: the plugin must route
+directly to the native room and not depend on or mention the Python version).
+Built on Codex's native-routing groundwork in `mcp/server.mjs`; the legacy
+`theoremPost` fallbacks (which fell back to a 500ing service) were removed.
+
+- Coordination (`coordination_room`/`coordination_intent`/`coordinate`/`mentions`/`presence`,
+  and `coordination_reflection|decision|tension` -> native `coordination_record`):
+  native sole path. `mentions_wait` polls native `mentions` client-side;
+  `subscribe` is folded; `continuity_pack` writes a native
+  `coordination_record(record_type=reflection)`.
+- Memory (`remember`/`recall`/`self_note`/`self_revise`/`self_archive`/`self_recall_archive`/`encode`):
+  native sole path; `legacyRemember` removed. `relate` (an edge upsert) routes to
+  native `rustyred_thg_bulk_edges`, NOT native `relate` (which is a neighbor read) --
+  verify edge record shape on first live write.
+- Subagent authorization (Travis ask): `scripts/auto-approve-harness.sh`
+  PreToolUse hook auto-approves the `theorems-harness` + `rustyred-thg` MCP
+  namespaces (both `mcp__plugin_theorems-harness_*` and plain forms; defers
+  everything else), wired in both hook manifests, so spawned subagents use the
+  harness without a per-call prompt.
+- Agent-facing framing: the manifest `defaultPrompt` now states the two
+  execution heads of one agent model (co-work default, advisory intent with the
+  deepest-in-file tiebreak, turn-start `coordination_context`, shared frontier,
+  end-of-slice contribution, do not both drive the same line).
+- Version: 0.4.0 across manifest + host outputs + `mcp/package.json` + marketplace.
+- Validation: `node --check mcp/server.mjs`; `node sdk/route-policy.test.mjs`;
+  all plugin JSON parse; zero coordination/memory `theoremPost`; live native
+  smoke returned the active room.
+- Remaining (follow-up): the lifecycle HOOK scripts still post to the context
+  backend via `lib.sh theorem_post` (run-lifecycle + context-compile, which this
+  matrix intentionally keeps on product HTTP / theseus-engine); `ensemble.rs`
+  core; deeper auto-wiring of turn-start `coordination_context` and a dedicated
+  frontier verb.
+
 ## Purpose
 
 This matrix keeps the plugin switchover honest. It maps the current
@@ -119,6 +156,10 @@ route deliberate, observable, and testable.
 | `observe` | Native memory/tenant observation | Useful for diagnostics and smoke tests. |
 | `forget` | Native memory deletion/forget path | Add plugin tool or fold into memory maintenance commands. |
 | `handoff` | Native cross-actor memory handoff | Add plugin tool if not already represented through coordination. |
+| `skill_list` | Read native content-addressed skill packs | Use internally when deciding whether a harness skill pack is available for a Rust task. |
+| `skill_get` | Read one native skill pack by id or content hash | Back future plugin skill retrieval and context injection. |
+| `skill_publish` | Publish an offline-encoded `CapabilityPackSpec` into Theorem RustyRed | Admin/write-mode path for the Theseus encoder to push finished packs out of band. |
+| `skill_apply` | Apply a native skill pack and persist a use receipt | Agent-facing route once write-mode and route-policy receipts are wired. Current validator mode is safe declaration checks; sandboxed Rust artifact execution remains a follow-up. |
 | `rustyred_thg_graph_schema` | Cheap native graph context | Use in context/graph diagnostics. |
 | `rustyred_thg_graph_query` | Native graph query | Expert/debug tool, not default user path. |
 | `rustyred_thg_algorithm_ppr` | Native PPR over tenant graph | Back graph discovery and fractal expansion. |
