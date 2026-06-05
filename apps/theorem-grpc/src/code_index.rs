@@ -538,7 +538,7 @@ impl std::fmt::Display for CodeIndexError {
 
 impl std::error::Error for CodeIndexError {}
 
-struct IngestConfig {
+pub(crate) struct IngestConfig {
     tenant_id: String,
     repo_root: PathBuf,
     repo_root_display: String,
@@ -552,7 +552,7 @@ struct IngestConfig {
 }
 
 #[derive(Clone)]
-struct IndexedFile {
+pub(crate) struct IndexedFile {
     file_id: String,
     rel_path: String,
     language: String,
@@ -563,7 +563,7 @@ struct IndexedFile {
 }
 
 #[derive(Clone)]
-struct IndexedSymbol {
+pub(crate) struct IndexedSymbol {
     symbol_id: String,
     file_id: String,
     file_path: String,
@@ -581,16 +581,20 @@ struct IndexedSymbol {
     parser_backed: bool,
 }
 
-fn ingest_codebase_with_store(
-    store: &mut RedCoreGraphStore,
-    input: IngestCodebaseInput,
-    operation: &str,
-) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    let config = resolve_ingest_config(input)?;
-    let mut collected = Vec::new();
-    let mut skipped = 0u64;
-    collect_code_files(&config.repo_root, &config, &mut collected, &mut skipped)?;
-
+/// Build the code-graph mutations (repo/file/symbol node upserts + contains/
+/// declares/call/dependency edge upserts) for a set of indexed files WITHOUT
+/// writing them to a store. This is the reusable extraction seam:
+/// `ingest_codebase_with_store` wraps the result in a `GraphMutationBatch` and
+/// commits it, while the instant-KG session-delta converter (`session_delta.rs`)
+/// partitions the same mutations into a `SessionDelta`'s objects + edges.
+/// Separating record-building from the store write is what lets a code edit
+/// produce an overlay delta instead of an unconditional commit. The mutation
+/// sequence is identical to the original inline build, so the committed graph is
+/// byte-for-byte unchanged.
+pub(crate) fn build_code_mutations(
+    config: &IngestConfig,
+    files: &[IndexedFile],
+) -> Vec<GraphMutation> {
     let repo_node = NodeRecord::new(
         &config.repo_id,
         [CODE_REPO_LABEL],
@@ -606,9 +610,7 @@ fn ingest_codebase_with_store(
     );
 
     let mut mutations = vec![GraphMutation::NodeUpsert(repo_node)];
-    let mut symbols_indexed = 0u64;
-    for file in &collected {
-        symbols_indexed += file.symbols.len() as u64;
+    for file in files {
         mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
             &file.file_id,
             [CODE_FILE_LABEL],
@@ -681,9 +683,25 @@ fn ingest_codebase_with_store(
             )));
         }
     }
-    for edge in infer_symbol_call_edges(&collected, &config) {
+    for edge in infer_symbol_call_edges(files, config) {
         mutations.push(GraphMutation::EdgeUpsert(edge));
     }
+
+    mutations
+}
+
+fn ingest_codebase_with_store(
+    store: &mut RedCoreGraphStore,
+    input: IngestCodebaseInput,
+    operation: &str,
+) -> Result<IngestCodebaseOutput, CodeIndexError> {
+    let config = resolve_ingest_config(input)?;
+    let mut collected = Vec::new();
+    let mut skipped = 0u64;
+    collect_code_files(&config.repo_root, &config, &mut collected, &mut skipped)?;
+
+    let mutations = build_code_mutations(&config, &collected);
+    let symbols_indexed: u64 = collected.iter().map(|file| file.symbols.len() as u64).sum();
 
     let transaction = store
         .commit_batch(GraphMutationBatch::new(mutations))
