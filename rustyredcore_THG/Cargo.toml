@@ -26,6 +26,7 @@ members = [
     "crates/theorem-harness",
     "crates/rustyred-thg-affordances",
     "crates/rustyred-thg-connectors",
+    "crates/ensemble",
 ]
 resolver = "2"
 
