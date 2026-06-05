@@ -5,12 +5,16 @@ use axum::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
     },
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyred_thg_adapters::execute_adapter_command;
@@ -20,10 +24,12 @@ use rustyred_thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
     merge_graph_snapshots, stable_hash, update_graph_ref, CodeKgManifest, Direction, EdgeRecord,
-    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphMergeStrategy, GraphSnapshot,
-    GraphStats, GraphStoreError, GraphVersionRepository, HarnessInstantKg, InMemoryGraphStore,
-    NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
+    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphMergeStrategy, GraphRebuildReport,
+    GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
+    GraphVersionRepository, GraphWriteResult, HarnessInstantKg, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, SessionDelta, VerifyReport,
 };
+use rustyred_thg_fractal::{run_fractal_expansion, FractalExpansionRequest};
 use rustyred_thg_mcp::{
     agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
 };
@@ -36,6 +42,7 @@ use rustyred_web::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::require_scope;
@@ -340,6 +347,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/.well-known/mcp/rustyred_thg.json", get(mcp_well_known))
         .route("/.well-known/agent.json", get(agent_well_known))
         .route("/mcp", post(mcp_post))
+        .route("/v1/coordination/events", get(coordination_events))
         .route("/metrics", get(crate::metrics::metrics))
         .route(
             "/v1/diagnostics/slow_queries",
@@ -553,6 +561,9 @@ async fn mcp_post(
 
     let config = state.mcp_config();
     let mcp_context = McpRequestContext::with_scopes(auth_context.scopes);
+    if let Some(response) = maybe_handle_live_fractal_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
     Json(handle_mcp_request_with_context(
         &state,
         &config,
@@ -560,6 +571,256 @@ async fn mcp_post(
         payload,
     ))
     .into_response()
+}
+
+async fn coordination_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !state.config.mcp_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !mcp_origin_allowed(&headers, &state.config.allowed_origins) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let stream = BroadcastStream::new(rustyred_thg_mcp::subscribe_coordination_room_events())
+        .filter_map(|event| match event {
+            Ok(message) => {
+                let sse_event = Event::default()
+                    .event("room_message")
+                    .json_data(message)
+                    .unwrap_or_else(|_| Event::default().event("room_message").data("{}"));
+                Some(Ok::<Event, Infallible>(sse_event))
+            }
+            Err(_) => None,
+        });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn maybe_handle_live_fractal_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(
+        name,
+        "fractal_expansion" | "harness_fractal_expansion" | "theorem_harness_fractal_expansion"
+    ) {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let result = if config.read_only {
+        mcp_tool_result_error(json!({
+            "error": "mcp_read_only",
+            "message": "Live fractal expansion writes are unavailable while read-only mode is active."
+        }))
+    } else {
+        let arguments = payload
+            .get("params")
+            .and_then(|params| params.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        match live_fractal_expansion_payload(state, config, &arguments).await {
+            Ok(payload) => mcp_tool_result(payload),
+            Err(payload) => mcp_tool_result_error(payload),
+        }
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn live_fractal_expansion_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_fractal_expansion",
+            "message": "fractal_expansion requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut fractal_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "fractal_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let request = FractalExpansionRequest {
+        run_id: argument_text_any(arguments, &["run_id", "runId"])
+            .unwrap_or_else(default_fractal_run_id),
+        tenant_id: tenant.clone(),
+        query,
+        web_seed_urls: string_array_argument(arguments, "web_seed_urls"),
+        top_k: argument_u64_any(arguments, &["top_k", "topK"]).unwrap_or(5) as usize,
+        frontier_limit: argument_u64_any(arguments, &["frontier_limit", "frontierLimit"])
+            .unwrap_or(8) as usize,
+        web_seed_limit: argument_u64_any(arguments, &["web_seed_limit", "webSeedLimit"])
+            .unwrap_or(8) as usize,
+        embedder_model: argument_text_any(arguments, &["embedder_model", "embedderModel"]),
+        actor_id: argument_text_any(arguments, &["actor", "actor_id", "actorId"]),
+    };
+    let max_bytes = argument_u64_any(arguments, &["max_bytes", "maxBytes"])
+        .unwrap_or(LIVE_SEARCH_DEFAULT_MAX_BYTES as u64)
+        .clamp(1, LIVE_SEARCH_HARD_MAX_BYTES as u64) as usize;
+    let cascade = state.live_fetch_cascade();
+    let receipt = run_fractal_expansion(&mut fractal_store, request, cascade.as_ref(), max_bytes)
+        .await
+        .map_err(|error| {
+            json!({
+                "error": error.code,
+                "message": error.message
+            })
+        })?;
+    Ok(json!({
+        "tenant": tenant,
+        "receipt": receipt
+    }))
+}
+
+struct TenantMirrorGraphStore<'a> {
+    store: &'a mut TenantGraphStore,
+    mirror: InMemoryGraphStore,
+}
+
+impl<'a> TenantMirrorGraphStore<'a> {
+    fn new(store: &'a mut TenantGraphStore) -> GraphStoreResult<Self> {
+        let mirror = InMemoryGraphStore::from_snapshot(store.graph_snapshot()?)?;
+        Ok(Self { store, mirror })
+    }
+}
+
+impl GraphStore for TenantMirrorGraphStore<'_> {
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
+        let write = self.store.upsert_node(node.clone())?;
+        GraphStore::upsert_node(&mut self.mirror, node)?;
+        Ok(write)
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+        let write = self.store.upsert_edge(edge.clone())?;
+        GraphStore::upsert_edge(&mut self.mirror, edge)?;
+        Ok(write)
+    }
+
+    fn get_node(&self, id: &str) -> Option<&NodeRecord> {
+        GraphStore::get_node(&self.mirror, id)
+    }
+
+    fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
+        GraphStore::get_edge(&self.mirror, id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
+        GraphStore::query_nodes(&self.mirror, query)
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
+        GraphStore::neighbors(&self.mirror, query)
+    }
+
+    fn stats(&self) -> GraphStats {
+        GraphStore::stats(&self.mirror)
+    }
+
+    fn verify(&self) -> VerifyReport {
+        GraphStore::verify(&self.mirror)
+    }
+
+    fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        let report = self.store.rebuild_indexes()?;
+        GraphStore::rebuild_indexes(&mut self.mirror)?;
+        Ok(report)
+    }
+}
+
+fn mcp_tool_result(payload: Value) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+        }],
+        "structuredContent": payload
+    })
+}
+
+fn mcp_tool_result_error(payload: Value) -> Value {
+    let mut result = mcp_tool_result(payload);
+    if let Value::Object(map) = &mut result {
+        map.insert("isError".to_string(), Value::Bool(true));
+    }
+    result
+}
+
+fn argument_text_any(arguments: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn argument_u64_any(arguments: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_u64))
+}
+
+fn string_array_argument(arguments: &Value, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn default_fractal_run_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("fractal-{millis}")
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {

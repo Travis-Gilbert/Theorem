@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyred_thg_core::{
@@ -28,6 +29,7 @@ use theorem_harness_runtime::{
     MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput,
     WriteIntentInput, WriteMessageInput, WriteRecordInput,
 };
+use tokio::sync::broadcast;
 
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -44,6 +46,37 @@ pub struct HandoffDispatch {
     pub event_type: String,
     pub intent: String,
     pub branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct RoomMessageEvent {
+    pub tenant_slug: String,
+    pub room_id: String,
+    pub message_id: String,
+    pub author: String,
+    pub mentions: Vec<String>,
+    pub delivery: String,
+}
+
+static COORDINATION_ROOM_EVENTS: OnceLock<broadcast::Sender<RoomMessageEvent>> = OnceLock::new();
+
+pub fn subscribe_coordination_room_events() -> broadcast::Receiver<RoomMessageEvent> {
+    coordination_room_event_sender().subscribe()
+}
+
+fn coordination_room_event_sender() -> &'static broadcast::Sender<RoomMessageEvent> {
+    COORDINATION_ROOM_EVENTS.get_or_init(|| broadcast::channel(1024).0)
+}
+
+fn publish_coordination_room_event(state: &CoordinationMessageState) {
+    let _ = coordination_room_event_sender().send(RoomMessageEvent {
+        tenant_slug: state.tenant_slug.clone(),
+        room_id: state.room_id.clone(),
+        message_id: state.message_id.clone(),
+        author: state.actor_id.clone(),
+        mentions: state.mentions.clone(),
+        delivery: normalize_coordination_delivery_lossy(&state.delivery),
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -922,6 +955,18 @@ fn call_tool<P: McpGraphProvider>(
                 })));
             }
             coordinate_payload(&tenant, &mut backend, &arguments)?
+        }
+        "fractal_expansion" | "harness_fractal_expansion" | "theorem_harness_fractal_expansion" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Live fractal expansion writes are unavailable while read-only mode is active."
+                })));
+            }
+            tool_result_error(json!({
+                "error": "live_fractal_requires_async_server",
+                "message": "fractal_expansion is handled by the async harness server MCP route because it performs live web fetches."
+            }))
         }
         "mentions" | "theorem_harness_mentions" => {
             let consume = arguments
@@ -2397,6 +2442,8 @@ fn coordinate_payload(
             )?,
             message_id: argument_text(arguments, &["message_id", "messageId"]).unwrap_or_default(),
             urgency: argument_text(arguments, &["urgency"]).unwrap_or_else(|| "info".to_string()),
+            delivery: argument_text(arguments, &["delivery"])
+                .unwrap_or_else(|| coordination_delivery_from_legacy_wake(arguments)),
             message: required_text_any(arguments, &["message"], "coordinate")?,
             mentions: string_array_any(arguments, &["mentions"]),
             metadata: argument_object(arguments, "metadata"),
@@ -2409,6 +2456,7 @@ fn coordinate_payload(
         "room_id": room_id,
         "message_id": message.message_id,
         "mentions": message.mentions,
+        "delivery": message.delivery,
         "unread_count": message.mentions.len(),
         "urgency": message.urgency,
         "created_at": message.created_at
@@ -3475,6 +3523,7 @@ fn write_coordination_message(
     let message = require_nonempty(input.message.trim(), "coordinate requires message")?;
     let urgency = normalize_coordination_urgency(&input.urgency)
         .map_err(|error| McpError::invalid_params(error.to_string()))?;
+    let delivery = normalize_coordination_delivery(&input.delivery)?;
     let created_at = timestamp_or_now(&input.created_at);
     let mentions = merge_string_vecs(
         parse_coordination_mentions(&message),
@@ -3497,6 +3546,7 @@ fn write_coordination_message(
         message_id,
         actor_id,
         urgency,
+        delivery,
         message,
         mentions,
         metadata: input.metadata,
@@ -3504,6 +3554,7 @@ fn write_coordination_message(
         created_at,
     };
     persist_coordination_message(backend, &message)?;
+    publish_coordination_room_event(&message);
     Ok(message)
 }
 
@@ -3916,6 +3967,7 @@ fn coordination_message_room_edge(state: &CoordinationMessageState) -> EdgeRecor
             "message_id": state.message_id,
             "actor_id": state.actor_id,
             "urgency": state.urgency,
+            "delivery": state.delivery,
             "created_at": state.created_at,
         }),
     )
@@ -3955,6 +4007,7 @@ fn coordination_mention_edge(state: &CoordinationMessageState, actor_id: &str) -
             "message_id": state.message_id,
             "actor_id": actor_id,
             "urgency": state.urgency,
+            "delivery": state.delivery,
             "created_at": state.created_at,
         }),
     )
@@ -4049,6 +4102,37 @@ fn normalize_coordination_record_type(record_type: &str) -> Result<String, McpEr
         _ => Err(McpError::invalid_params(
             "coordination record type must be event, decision, tension, or reflection",
         )),
+    }
+}
+
+fn coordination_delivery_from_legacy_wake(arguments: &Value) -> String {
+    if arguments
+        .get("wake")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "wake".to_string()
+    } else {
+        "passive".to_string()
+    }
+}
+
+fn normalize_coordination_delivery(delivery: &str) -> Result<String, McpError> {
+    let delivery = normalize_coordination_delivery_lossy(delivery);
+    match delivery.as_str() {
+        "passive" | "wake" => Ok(delivery),
+        _ => Err(McpError::invalid_params(
+            "coordination message delivery must be passive or wake",
+        )),
+    }
+}
+
+fn normalize_coordination_delivery_lossy(delivery: &str) -> String {
+    let delivery = delivery.trim().to_lowercase();
+    if delivery.is_empty() {
+        "passive".to_string()
+    } else {
+        delivery
     }
 }
 
@@ -5502,6 +5586,29 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
     ));
     if !config.read_only {
         tools.push(tool_write(
+            "fractal_expansion",
+            "Run live RustyRed fractal expansion: search the tenant graph frontier, fetch web seed URLs, quarantine admitted open-web pages, and return the crawl receipt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_id": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "query": { "type": "string" },
+                    "web_seed_urls": { "type": "array", "items": { "type": "string" } },
+                    "top_k": { "type": "integer", "default": 5 },
+                    "frontier_limit": { "type": "integer", "default": 8 },
+                    "web_seed_limit": { "type": "integer", "default": 8 },
+                    "max_bytes": { "type": "integer", "default": 5242880 },
+                    "embedder_model": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "run_id": { "type": "string" }
+                },
+                "required": ["query"]
+            }),
+        ));
+        tools.push(tool_write(
             "coordination_room",
             "Join or inspect a native Theorem harness coordination room backed by THG GraphStore.",
             json!({
@@ -5581,6 +5688,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "actor": { "type": "string" },
                     "actor_id": { "type": "string" },
                     "urgency": { "type": "string", "enum": ["info", "ask", "block"], "default": "info" },
+                    "delivery": { "type": "string", "enum": ["passive", "wake"], "default": "passive" },
+                    "wake": { "type": "boolean", "default": false },
                     "message": { "type": "string" },
                     "mentions": { "type": "array", "items": { "type": "string" } },
                     "metadata": { "type": "object" }
@@ -6440,8 +6549,8 @@ mod tests {
 
     use super::{
         append_harness_transition_to_store, handle_mcp_request, handle_mcp_request_with_context,
-        harness_run_detail_from_store, AppAffordanceInvocation, McpError, McpGraphBackend,
-        McpGraphProvider, McpRequestContext, McpServerConfig,
+        harness_run_detail_from_store, subscribe_coordination_room_events, AppAffordanceInvocation,
+        McpError, McpGraphBackend, McpGraphProvider, McpRequestContext, McpServerConfig,
     };
 
     struct FixtureProvider(Rc<RefCell<InMemoryGraphStore>>);
@@ -6817,6 +6926,7 @@ mod tests {
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
+        assert!(!has_tool(tools, "fractal_expansion"));
         assert!(has_tool(tools, "mentions"));
         assert!(has_tool(tools, "recall"));
         assert!(has_tool(tools, "relate"));
@@ -6902,6 +7012,7 @@ mod tests {
         assert!(has_tool(tools, "presence"));
         assert!(has_tool(tools, "coordination_intent"));
         assert!(has_tool(tools, "coordinate"));
+        assert!(has_tool(tools, "fractal_expansion"));
         assert!(has_tool(tools, "coordination_record"));
         assert!(has_tool(tools, "coordination_contribution"));
         assert!(has_tool(tools, "mentions"));
@@ -6990,6 +7101,7 @@ mod tests {
         assert_eq!(intent["intent"]["actor_id"], "codex");
         assert_eq!(intent["intent"]["status"], "working");
 
+        let mut room_events = subscribe_coordination_room_events();
         let receipt = call_tool_json(
             &provider,
             &config,
@@ -6999,6 +7111,7 @@ mod tests {
                 "actor": "codex",
                 "room_id": "harness-rust-port",
                 "urgency": "ask",
+                "delivery": "wake",
                 "message": "@claude-code please test native MCP",
                 "metadata": { "commit": "pending" },
                 "created_at": "2026-06-01T00:03:00Z"
@@ -7006,8 +7119,19 @@ mod tests {
         );
         assert_eq!(receipt["ok"], true);
         assert_eq!(receipt["mentions"], json!(["claude-code"]));
+        assert_eq!(receipt["delivery"], "wake");
         assert_eq!(receipt["unread_count"], 1);
         assert_eq!(receipt["urgency"], "ask");
+        let room_event = room_events.try_recv().expect("room event emitted");
+        assert_eq!(room_event.tenant_slug, "smoke");
+        assert_eq!(room_event.room_id, "harness-rust-port");
+        assert_eq!(
+            room_event.message_id,
+            receipt["message_id"].as_str().unwrap()
+        );
+        assert_eq!(room_event.author, "codex");
+        assert_eq!(room_event.mentions, vec!["claude-code".to_string()]);
+        assert_eq!(room_event.delivery, "wake");
 
         let mentions = call_tool_json(
             &provider,
@@ -7075,6 +7199,7 @@ mod tests {
             messages["messages"][0]["message"],
             "@claude-code please test native MCP"
         );
+        assert_eq!(messages["messages"][0]["delivery"], "wake");
 
         let record = call_tool_json(
             &provider,

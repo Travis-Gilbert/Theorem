@@ -17,6 +17,7 @@ const DEFAULT_MODE: &str = "collaborating";
 const DEFAULT_PRESENCE_TTL_SECONDS: u64 = 60;
 const INTENT_STATUSES: &[&str] = &["working", "paused", "done"];
 const MESSAGE_URGENCIES: &[&str] = &["info", "ask", "block"];
+const MESSAGE_DELIVERIES: &[&str] = &["passive", "wake"];
 const RECORD_TYPES: &[&str] = &["event", "decision", "tension", "reflection"];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,6 +145,8 @@ pub struct WriteMessageInput {
     pub message_id: String,
     #[serde(default)]
     pub urgency: String,
+    #[serde(default)]
+    pub delivery: String,
     #[serde(default)]
     pub message: String,
     #[serde(default)]
@@ -309,6 +312,8 @@ pub struct CoordinationMessageState {
     pub message_id: String,
     pub actor_id: String,
     pub urgency: String,
+    #[serde(default = "default_message_delivery")]
+    pub delivery: String,
     pub message: String,
     #[serde(default)]
     pub mentions: Vec<String>,
@@ -595,6 +600,7 @@ pub fn write_message<S: GraphStore>(
     let actor_id = require_text("actor_id", &input.actor_id)?;
     let message = require_text("message", &input.message)?;
     let urgency = normalize_urgency(&input.urgency)?;
+    let delivery = normalize_delivery(&input.delivery)?;
     let created_at = timestamp_or_now(&input.created_at);
     let mentions = merge_mentions(parse_mentions(&message), normalize_files(&input.mentions));
     let message_id = if input.message_id.trim().is_empty() {
@@ -616,6 +622,7 @@ pub fn write_message<S: GraphStore>(
         message_id,
         actor_id,
         urgency,
+        delivery,
         message,
         mentions,
         metadata: input.metadata,
@@ -1228,6 +1235,26 @@ fn normalize_urgency(urgency: &str) -> CoordinationResult<String> {
         Err(CoordinationError::InvalidInput {
             field: "urgency".to_string(),
             message: format!("must be one of {:?}", MESSAGE_URGENCIES),
+        })
+    }
+}
+
+fn default_message_delivery() -> String {
+    "passive".to_string()
+}
+
+fn normalize_delivery(delivery: &str) -> CoordinationResult<String> {
+    let delivery = if delivery.trim().is_empty() {
+        "passive".to_string()
+    } else {
+        delivery.trim().to_lowercase()
+    };
+    if MESSAGE_DELIVERIES.contains(&delivery.as_str()) {
+        Ok(delivery)
+    } else {
+        Err(CoordinationError::InvalidInput {
+            field: "delivery".to_string(),
+            message: "must be passive or wake".to_string(),
         })
     }
 }

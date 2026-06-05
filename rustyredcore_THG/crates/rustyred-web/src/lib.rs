@@ -105,6 +105,16 @@ impl FixturePage {
             fetched_at: String::new(),
         }
     }
+
+    pub fn with_status(url: impl Into<String>, body: impl Into<String>, status: u16) -> Self {
+        Self {
+            url: url.into(),
+            status,
+            body: body.into(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            fetched_at: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

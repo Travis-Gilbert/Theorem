@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 
 use rustyred_thg_core::{GraphMutation, GraphStore, NodeQuery, ThgError, ThgResult};
 use rustyred_web::{
-    build_v2_fixture_crawl, search_substrate, CrawlRequest, FetchedPage, SearchOptions, LABEL_PAGE,
+    build_v2_fixture_crawl, search_substrate, CrawlRequest, FetchCascade, FetchTierResult,
+    FetchedPage, SearchOptions, LABEL_PAGE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -98,36 +99,35 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
         ));
     }
 
-    let admitted_pages = rank_and_sanitize_pages(&request.query, fetched_pages, request.top_k);
-    let mut crawl_request = CrawlRequest::new(request.run_id.clone(), web_seed_urls.clone());
-    crawl_request.scope.namespace = format!("fractal:{}", request.tenant_id);
-    crawl_request.scope.source_graph = "rustyred_fractal_expansion".to_string();
-    crawl_request.scope.source_license = OPEN_WEB_UNVERIFIED_TRUST_TIER.to_string();
-    crawl_request.scope.actor_id = request.actor_id.clone().unwrap_or_default();
+    ingest_admitted_pages(store, &request, web_seed_urls, fetched_pages, frontier)
+}
 
-    let mut output = build_v2_fixture_crawl(crawl_request, &admitted_pages)
-        .map_err(|error| ThgError::new("fractal_web_crawl_failed", error.to_string()))?;
-    annotate_open_web_batch(&mut output.graph.batch.mutations, &request);
-    let writes = output
-        .graph
-        .apply_to_store(store)
-        .map_err(|error| ThgError::new(error.code, error.message))?;
+pub async fn run_fractal_expansion<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    cascade: &FetchCascade,
+    max_bytes: usize,
+) -> ThgResult<FractalExpansionReceipt> {
+    let request = request.normalized();
+    validate_request(&request)?;
 
-    Ok(FractalExpansionReceipt {
-        run_id: request.run_id,
-        tenant_id: request.tenant_id,
-        query: request.query,
-        embedder_model: request
-            .embedder_model
-            .unwrap_or_else(|| DEFAULT_FRACTAL_EMBEDDER_MODEL.to_string()),
-        graph_exhausted: true,
-        web_reached: true,
-        web_seed_urls,
-        frontier,
-        crawl_receipt_id: output.receipt.receipt_id,
-        admitted_pages: output.receipt.counters.fetched_pages,
-        applied_writes: writes.len(),
-    })
+    let frontier = graph_frontier(store, &request);
+    let web_seed_urls = web_seeds_from_frontier(&request, &frontier);
+    if web_seed_urls.is_empty() {
+        return Err(ThgError::new(
+            "fractal_web_seed_required",
+            "fractal expansion cannot terminate at the graph frontier",
+        ));
+    }
+
+    let mut fetched = Vec::new();
+    for url in &web_seed_urls {
+        if let Ok(result) = cascade.fetch_with_promotion(url, max_bytes).await {
+            fetched.push(fetched_page_from_tier_result(url, result));
+        }
+    }
+
+    ingest_admitted_pages(store, &request, web_seed_urls, &fetched, frontier)
 }
 
 pub fn open_web_pages_for_tenant<S: GraphStore>(store: &S, tenant_id: &str) -> Vec<String> {
@@ -231,6 +231,59 @@ fn rank_and_sanitize_pages(query: &str, pages: &[FetchedPage], top_k: usize) -> 
         .take(top_k.max(1))
         .map(|(_, _, page)| page)
         .collect()
+}
+
+fn ingest_admitted_pages<S: GraphStore>(
+    store: &mut S,
+    request: &FractalExpansionRequest,
+    web_seed_urls: Vec<String>,
+    fetched_pages: &[FetchedPage],
+    frontier: Vec<FractalFrontierHit>,
+) -> ThgResult<FractalExpansionReceipt> {
+    let admitted_pages = rank_and_sanitize_pages(&request.query, fetched_pages, request.top_k);
+    let mut crawl_request = CrawlRequest::new(request.run_id.clone(), web_seed_urls.clone());
+    crawl_request.scope.namespace = format!("fractal:{}", request.tenant_id);
+    crawl_request.scope.source_graph = "rustyred_fractal_expansion".to_string();
+    crawl_request.scope.source_license = OPEN_WEB_UNVERIFIED_TRUST_TIER.to_string();
+    crawl_request.scope.actor_id = request.actor_id.clone().unwrap_or_default();
+
+    let mut output = build_v2_fixture_crawl(crawl_request, &admitted_pages)
+        .map_err(|error| ThgError::new("fractal_web_crawl_failed", error.to_string()))?;
+    annotate_open_web_batch(&mut output.graph.batch.mutations, request);
+    let writes = output
+        .graph
+        .apply_to_store(store)
+        .map_err(|error| ThgError::new(error.code, error.message))?;
+
+    Ok(FractalExpansionReceipt {
+        run_id: request.run_id.clone(),
+        tenant_id: request.tenant_id.clone(),
+        query: request.query.clone(),
+        embedder_model: request
+            .embedder_model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_FRACTAL_EMBEDDER_MODEL.to_string()),
+        graph_exhausted: true,
+        web_reached: true,
+        web_seed_urls,
+        frontier,
+        crawl_receipt_id: output.receipt.receipt_id,
+        admitted_pages: output.receipt.counters.fetched_pages,
+        applied_writes: writes.len(),
+    })
+}
+
+fn fetched_page_from_tier_result(seed_url: &str, result: FetchTierResult) -> FetchedPage {
+    let body = String::from_utf8_lossy(&result.html_bytes).into_owned();
+    FetchedPage::with_status(
+        if result.final_url.trim().is_empty() {
+            seed_url
+        } else {
+            &result.final_url
+        },
+        body,
+        result.http_status,
+    )
 }
 
 fn sanitize_web_body(body: &str) -> String {

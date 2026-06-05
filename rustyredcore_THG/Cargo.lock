@@ -2975,6 +2975,7 @@ dependencies = [
  "serde_json",
  "theorem-harness-core",
  "theorem-harness-runtime",
+ "tokio",
 ]
 
 [[package]]
@@ -3003,11 +3004,13 @@ dependencies = [
  "reqwest",
  "rustyred-thg-adapters",
  "rustyred-thg-core",
+ "rustyred-thg-fractal",
  "rustyred-thg-mcp",
  "rustyred-web",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tower 0.5.3",
@@ -3792,6 +3795,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

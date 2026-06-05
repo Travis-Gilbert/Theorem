@@ -3,6 +3,7 @@
 mod auth;
 mod bulk;
 mod config;
+mod coordination_push;
 mod cypher;
 mod graph_cache;
 mod grpc;
@@ -38,6 +39,7 @@ async fn main() -> std::io::Result<()> {
     // a JoinHandle we'll await on shutdown so the process doesn't exit
     // mid-AOF write. The loop is cancellable via state.ttl_sweep.shutdown().
     let sweep_handle = ttl_sweep::spawn_sweep_loop(state.clone(), ttl_sweep_ms);
+    let wake_handle = coordination_push::spawn_wake_listener(state.clone());
     tracing::info!(ttl_sweep_ms, "TTL background sweep started");
 
     let http_router = router::build_router(state.clone());
@@ -58,6 +60,7 @@ async fn main() -> std::io::Result<()> {
     // Sweep ticks should complete in <1s under normal conditions; the
     // 5s bound gives generous headroom for slow disk fsync.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sweep_handle).await;
+    wake_handle.abort();
     tracing::info!("TTL sweep loop exited; process shutting down");
 
     serve_result

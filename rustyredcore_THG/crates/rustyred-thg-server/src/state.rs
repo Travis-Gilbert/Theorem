@@ -19,6 +19,7 @@ use rustyred_thg_mcp::{
     AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
     McpServerConfig,
 };
+use rustyred_web::{FetchCascade, FetchCascadeOptions, LiveFetchOptions};
 use serde_json::{json, Value};
 
 use crate::config::{Config, StorageMode};
@@ -57,6 +58,7 @@ pub struct AppState {
     redcore_stores: Arc<Mutex<BTreeMap<String, Arc<RedCoreTenantExecutor>>>>,
     graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
     graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
+    live_fetch_cascade: Arc<FetchCascade>,
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
     fulltext_indexes: Arc<Mutex<FullTextIndexes>>,
@@ -69,6 +71,12 @@ impl AppState {
             config.slow_query_capacity,
             config.slow_query_log.clone(),
         );
+        let live_fetch_options = LiveFetchOptions::default();
+        let live_fetch_cascade = FetchCascade::new(FetchCascadeOptions {
+            user_agent: live_fetch_options.user_agent,
+            timeout_seconds: live_fetch_options.timeout_seconds,
+        })
+        .expect("default live fetch cascade options must build");
         Self {
             config: Arc::new(config),
             observability,
@@ -76,6 +84,7 @@ impl AppState {
             redcore_stores: Arc::new(Mutex::new(BTreeMap::new())),
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
+            live_fetch_cascade: Arc::new(live_fetch_cascade),
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -582,6 +591,10 @@ impl AppState {
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,
         }
+    }
+
+    pub fn live_fetch_cascade(&self) -> Arc<FetchCascade> {
+        Arc::clone(&self.live_fetch_cascade)
     }
 
     pub fn tenant_graph_cache(
