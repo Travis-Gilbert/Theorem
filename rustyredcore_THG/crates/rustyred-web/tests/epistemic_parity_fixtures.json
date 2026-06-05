@@ -140,6 +140,16 @@
       ]
     },
     {
+      "name": "tie_preserves_input_order",
+      "query": "q",
+      "config": {},
+      "candidates": [
+        {"object_pk": "tieA", "rrf_score": 0.5},
+        {"object_pk": "tieB", "rrf_score": 0.5},
+        {"object_pk": "lower", "rrf_score": 0.3}
+      ]
+    },
+    {
       "name": "empty_input",
       "query": "q",
       "config": {},

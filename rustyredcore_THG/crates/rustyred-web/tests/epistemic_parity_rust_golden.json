@@ -313,6 +313,38 @@
     ]
   },
   {
+    "name": "tie_preserves_input_order",
+    "results": [
+      {
+        "object_pk": "tieA",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "tieB",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "lower",
+        "rrf_score": 0.3,
+        "learned_score": 0.3,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
     "name": "empty_input",
     "results": []
   }
