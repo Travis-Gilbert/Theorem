@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyred_thg_core::{
@@ -13,23 +12,27 @@ use rustyred_thg_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{TransitionInput, TransitionResult};
+#[cfg(test)]
+use theorem_harness_runtime::subscribe_coordination_room_events;
 use theorem_harness_runtime::{
-    append_transition_from_store, archive_memory_document, coordination_intent_edge_id,
-    coordination_intent_node_id, coordination_member_edge_id, coordination_member_node_id,
-    coordination_mention_edge_id, coordination_message_edge_id, coordination_message_node_id,
-    coordination_presence_node_id, coordination_record_edge_id, coordination_record_node_id,
-    coordination_room_node_id, encode_memory, forget_memory, handoff_memory,
-    infer_coordination_room_id, load_events, load_run, normalize_coordination_urgency,
-    parse_coordination_mentions, recall_archived_memory, recall_memory, relate_memory,
-    remember_memory, revise_memory_document, self_note_memory, stable_coordination_message_id,
-    stable_coordination_record_id, ArchiveMemoryInput, CoordinationIntentState,
-    CoordinationMessageState, CoordinationPresenceState, CoordinationRecordState,
-    CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput,
-    HandoffMemoryInput, HarnessRuntimeError, JoinRoomInput, MemoryError, MemoryGraphStore,
-    MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput,
-    WriteIntentInput, WriteMessageInput, WriteRecordInput,
+    append_transition_from_store, apply_skill_pack, archive_memory_document,
+    coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
+    coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
+    coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
+    coordination_record_node_id, coordination_room_node_id, encode_memory, forget_memory,
+    get_skill_pack, handoff_memory, infer_coordination_room_id, list_skill_packs, load_events,
+    load_run, normalize_coordination_urgency, parse_coordination_mentions,
+    publish_coordination_room_event_from_state, publish_skill_pack, recall_archived_memory,
+    recall_memory, relate_memory, remember_memory, revise_memory_document, self_note_memory,
+    stable_coordination_message_id, stable_coordination_record_id, ArchiveMemoryInput,
+    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
+    CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
+    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JoinRoomInput, MemoryError,
+    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
+    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
+    SkillPackListInput, SkillPackPublishInput, WriteIntentInput, WriteMessageInput,
+    WriteRecordInput,
 };
-use tokio::sync::broadcast;
 
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -48,35 +51,8 @@ pub struct HandoffDispatch {
     pub branch: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
-pub struct RoomMessageEvent {
-    pub tenant_slug: String,
-    pub room_id: String,
-    pub message_id: String,
-    pub author: String,
-    pub mentions: Vec<String>,
-    pub delivery: String,
-}
-
-static COORDINATION_ROOM_EVENTS: OnceLock<broadcast::Sender<RoomMessageEvent>> = OnceLock::new();
-
-pub fn subscribe_coordination_room_events() -> broadcast::Receiver<RoomMessageEvent> {
-    coordination_room_event_sender().subscribe()
-}
-
-fn coordination_room_event_sender() -> &'static broadcast::Sender<RoomMessageEvent> {
-    COORDINATION_ROOM_EVENTS.get_or_init(|| broadcast::channel(1024).0)
-}
-
 fn publish_coordination_room_event(state: &CoordinationMessageState) {
-    let _ = coordination_room_event_sender().send(RoomMessageEvent {
-        tenant_slug: state.tenant_slug.clone(),
-        room_id: state.room_id.clone(),
-        message_id: state.message_id.clone(),
-        author: state.actor_id.clone(),
-        mentions: state.mentions.clone(),
-        delivery: normalize_coordination_delivery_lossy(&state.delivery),
-    });
+    publish_coordination_room_event_from_state(state);
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +66,7 @@ pub struct AppAffordanceInvocation {
     pub timeout_ms: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub trait McpGraphBackend {
     fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>>;
     fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>>;
@@ -1046,6 +1023,30 @@ fn call_tool<P: McpGraphProvider>(
         }
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
+        }
+        "skill_list" | "theorem_harness_skill_list" => {
+            skill_list_payload(&tenant, &backend, &arguments)?
+        }
+        "skill_get" | "theorem_harness_skill_get" => {
+            skill_get_payload(&tenant, &backend, &arguments)?
+        }
+        "skill_publish" | "theorem_harness_skill_publish" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native skill-pack publishes are unavailable while read-only mode is active."
+                })));
+            }
+            skill_publish_payload(&tenant, &mut backend, &arguments)?
+        }
+        "skill_apply" | "theorem_harness_skill_apply" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native skill-pack applies are unavailable while read-only mode is active."
+                })));
+            }
+            skill_apply_payload(&tenant, &mut backend, &arguments)?
         }
         "code_search" | "theorem_harness_code_search" => {
             let operation = code_search_operation(&arguments)?;
@@ -2866,6 +2867,173 @@ fn harness_run_payload(
         "run_id": run_id,
         "detail": detail,
         "found": found
+    }))
+}
+
+fn skill_list_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let store = McpSkillPackReadStore { backend };
+    let packs = list_skill_packs(
+        &store,
+        SkillPackListInput {
+            tenant_slug: tenant.to_string(),
+            status: argument_text(arguments, &["status"]).unwrap_or_default(),
+            include_retired: arguments
+                .get("include_retired")
+                .or_else(|| arguments.get("includeRetired"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            limit: argument_u64(arguments, &["limit"]).unwrap_or(20) as usize,
+        },
+    )
+    .map_err(mcp_skill_pack_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "packs": packs,
+        "count": packs.len()
+    }))
+}
+
+fn skill_get_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let store = McpSkillPackReadStore { backend };
+    let pack = get_skill_pack(
+        &store,
+        SkillPackGetInput {
+            tenant_slug: tenant.to_string(),
+            pack_id: argument_text(arguments, &["pack_id", "packId", "id"]).unwrap_or_default(),
+            pack_content_hash: argument_text(
+                arguments,
+                &[
+                    "pack_content_hash",
+                    "packContentHash",
+                    "content_hash",
+                    "contentHash",
+                ],
+            )
+            .unwrap_or_default(),
+        },
+    )
+    .map_err(mcp_skill_pack_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "pack": pack
+    }))
+}
+
+fn skill_publish_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let pack = arguments
+        .get("pack")
+        .or_else(|| arguments.get("capability_pack"))
+        .or_else(|| arguments.get("capabilityPack"))
+        .cloned()
+        .ok_or_else(|| McpError::invalid_params("skill_publish requires pack object"))?;
+    let mut store = McpSkillPackStore { backend };
+    let receipt = publish_skill_pack(
+        &mut store,
+        SkillPackPublishInput {
+            tenant_slug: tenant.to_string(),
+            actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"])
+                .unwrap_or_default(),
+            pack_content_hash: argument_text(
+                arguments,
+                &[
+                    "pack_content_hash",
+                    "packContentHash",
+                    "content_hash",
+                    "contentHash",
+                ],
+            )
+            .unwrap_or_default(),
+            source_content_hash: argument_text(
+                arguments,
+                &[
+                    "source_content_hash",
+                    "sourceContentHash",
+                    "source_hash",
+                    "sourceHash",
+                ],
+            )
+            .unwrap_or_default(),
+            artifact_hashes: string_array_any(
+                arguments,
+                &[
+                    "artifact_hashes",
+                    "artifactHashes",
+                    "artifact_hash",
+                    "artifactHash",
+                ],
+            ),
+            status: argument_text(arguments, &["status"]).unwrap_or_default(),
+            metadata: argument_object(arguments, "metadata"),
+            created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+            pack,
+        },
+    )
+    .map_err(mcp_skill_pack_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "published": receipt
+    }))
+}
+
+fn skill_apply_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let mut store = McpSkillPackStore { backend };
+    let receipt = apply_skill_pack(
+        &mut store,
+        SkillPackApplyInput {
+            tenant_slug: tenant.to_string(),
+            pack_id: argument_text(arguments, &["pack_id", "packId", "id"]).unwrap_or_default(),
+            pack_content_hash: argument_text(
+                arguments,
+                &[
+                    "pack_content_hash",
+                    "packContentHash",
+                    "content_hash",
+                    "contentHash",
+                ],
+            )
+            .unwrap_or_default(),
+            actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"])
+                .unwrap_or_default(),
+            run_id: argument_text(arguments, &["run_id", "runId"]).unwrap_or_default(),
+            task: argument_text(arguments, &["task"]).unwrap_or_default(),
+            context: arguments
+                .get("context")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            outcome: arguments
+                .get("outcome")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            allow_retired: arguments
+                .get("allow_retired")
+                .or_else(|| arguments.get("allowRetired"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            receipt_id: argument_text(arguments, &["receipt_id", "receiptId"]).unwrap_or_default(),
+            metadata: argument_object(arguments, "metadata"),
+            created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+        },
+    )
+    .map_err(mcp_skill_pack_error)?;
+    Ok(json!({
+        "tenant": tenant,
+        "receipt": receipt
     }))
 }
 
@@ -4700,6 +4868,20 @@ fn mcp_memory_error(error: MemoryError) -> McpError {
     }
 }
 
+fn mcp_skill_pack_error(error: SkillPackError) -> McpError {
+    let code = match &error {
+        SkillPackError::InvalidInput { .. } | SkillPackError::NotFound { .. } => -32602,
+        SkillPackError::Store(_)
+        | SkillPackError::Serialization(_)
+        | SkillPackError::Deserialization(_) => -32603,
+    };
+    McpError {
+        code,
+        message: error.to_string(),
+        data: Some(json!({ "code": "harness_skill_pack_error" })),
+    }
+}
+
 struct McpMemoryStore<'a, B: McpGraphBackend> {
     backend: &'a mut B,
 }
@@ -4755,6 +4937,56 @@ impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryReadStore<'_, B> {
 
     fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
         self.backend.neighbors(query)
+    }
+}
+
+struct McpSkillPackStore<'a, B: McpGraphBackend> {
+    backend: &'a mut B,
+}
+
+struct McpSkillPackReadStore<'a, B: McpGraphBackend> {
+    backend: &'a B,
+}
+
+impl<B: McpGraphBackend> SkillPackGraphStore for McpSkillPackStore<'_, B> {
+    fn skill_pack_upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        self.backend.upsert_node(node)
+    }
+
+    fn skill_pack_upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.backend.upsert_edge(edge)
+    }
+
+    fn skill_pack_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.backend.get_node(id)
+    }
+
+    fn skill_pack_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.backend.query_nodes(query)
+    }
+}
+
+impl<B: McpGraphBackend> SkillPackGraphStore for McpSkillPackReadStore<'_, B> {
+    fn skill_pack_upsert_node(&mut self, _node: NodeRecord) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "read_only_skill_pack_adapter",
+            "read-only skill-pack adapter cannot upsert nodes",
+        ))
+    }
+
+    fn skill_pack_upsert_edge(&mut self, _edge: EdgeRecord) -> GraphStoreResult<()> {
+        Err(GraphStoreError::new(
+            "read_only_skill_pack_adapter",
+            "read-only skill-pack adapter cannot upsert edges",
+        ))
+    }
+
+    fn skill_pack_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.backend.get_node(id)
+    }
+
+    fn skill_pack_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.backend.query_nodes(query)
     }
 }
 
@@ -5610,6 +5842,38 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             "required": ["node_id"]
         }),
     ));
+    tools.push(tool(
+        "skill_list",
+        "List native Theorem harness skill packs stored in RustyRed.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "tenant_slug": { "type": "string" },
+                "status": { "type": "string", "enum": ["draft", "shadow", "advisory", "validated", "canonical", "retired"] },
+                "include_retired": { "type": "boolean", "default": false },
+                "limit": { "type": "integer", "default": 20 }
+            }
+        }),
+    ));
+    tools.push(tool(
+        "skill_get",
+        "Read one native Theorem harness skill pack by id or content hash.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "tenant_slug": { "type": "string" },
+                "pack_id": { "type": "string" },
+                "packId": { "type": "string" },
+                "id": { "type": "string" },
+                "pack_content_hash": { "type": "string" },
+                "packContentHash": { "type": "string" },
+                "content_hash": { "type": "string" },
+                "contentHash": { "type": "string" }
+            }
+        }),
+    ));
     if !config.read_only {
         tools.push(tool_write(
             "fractal_expansion",
@@ -5805,6 +6069,63 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "budget_units": { "type": "number" }
                 },
                 "required": ["actor", "intent"]
+            }),
+        ));
+        tools.push(tool_write(
+            "skill_publish",
+            "Publish a content-addressed skill pack into native Theorem RustyRed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "pack": { "type": "object" },
+                    "capability_pack": { "type": "object" },
+                    "pack_content_hash": { "type": "string" },
+                    "packContentHash": { "type": "string" },
+                    "source_content_hash": { "type": "string" },
+                    "sourceContentHash": { "type": "string" },
+                    "artifact_hashes": { "type": "array", "items": { "type": "string" } },
+                    "artifactHashes": { "type": "array", "items": { "type": "string" } },
+                    "status": { "type": "string", "enum": ["draft", "shadow", "advisory", "validated", "canonical", "retired"] },
+                    "metadata": { "type": "object" },
+                    "created_at": { "type": "string" },
+                    "createdAt": { "type": "string" }
+                },
+                "required": ["pack"]
+            }),
+        ));
+        tools.push(tool_write(
+            "skill_apply",
+            "Apply a native Theorem harness skill pack and persist a use receipt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "pack_id": { "type": "string" },
+                    "packId": { "type": "string" },
+                    "id": { "type": "string" },
+                    "pack_content_hash": { "type": "string" },
+                    "packContentHash": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "task": { "type": "string" },
+                    "context": { "type": "object" },
+                    "outcome": { "type": "object" },
+                    "allow_retired": { "type": "boolean", "default": false },
+                    "allowRetired": { "type": "boolean", "default": false },
+                    "receipt_id": { "type": "string" },
+                    "receiptId": { "type": "string" },
+                    "metadata": { "type": "object" },
+                    "created_at": { "type": "string" },
+                    "createdAt": { "type": "string" }
+                },
+                "required": ["actor"]
             }),
         ));
         tools.push(tool_write(
@@ -6894,6 +7215,26 @@ mod tests {
         )
     }
 
+    fn sample_skill_pack() -> Value {
+        json!({
+            "id": "rustyred-rust-skill",
+            "kind": "skill_pack",
+            "title": "RustyRed Rust skill",
+            "capabilities": ["rust_refactor", "graph_store"],
+            "validators": [
+                { "id": "has-kind", "kind": "required_field", "field": "kind" },
+                { "id": "has-artifact", "kind": "artifact_hash_present", "artifact_hash": "hash-validator" }
+            ],
+            "metadata": {
+                "pack_content_hash": "hash-pack",
+                "source_content_hash": "hash-source",
+                "artifacts": {
+                    "validator": { "content_hash": "hash-validator" }
+                }
+            }
+        })
+    }
+
     fn has_tool(tools: &[Value], name: &str) -> bool {
         tools.iter().any(|tool| tool["name"] == name)
     }
@@ -6957,6 +7298,8 @@ mod tests {
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
+        assert!(has_tool(tools, "skill_list"));
+        assert!(has_tool(tools, "skill_get"));
         assert!(!has_tool(tools, "fractal_expansion"));
         assert!(has_tool(tools, "mentions"));
         assert!(has_tool(tools, "recall"));
@@ -6986,6 +7329,8 @@ mod tests {
         assert!(!has_tool(tools, "coordination_record"));
         assert!(!has_tool(tools, "coordination_contribution"));
         assert!(!has_tool(tools, "harness_append_transition"));
+        assert!(!has_tool(tools, "skill_publish"));
+        assert!(!has_tool(tools, "skill_apply"));
         assert!(!has_tool(tools, "remember"));
         assert!(!has_tool(tools, "self_note"));
         assert!(!has_tool(tools, "self_revise"));
@@ -7068,6 +7413,10 @@ mod tests {
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
         assert!(has_tool(tools, "harness_append_transition"));
+        assert!(has_tool(tools, "skill_list"));
+        assert!(has_tool(tools, "skill_get"));
+        assert!(has_tool(tools, "skill_publish"));
+        assert!(has_tool(tools, "skill_apply"));
         assert!(has_tool(tools, "remember"));
         assert!(has_tool(tools, "recall"));
         assert!(has_tool(tools, "relate"));
@@ -7079,6 +7428,70 @@ mod tests {
         assert!(has_tool(tools, "forget"));
         assert!(has_tool(tools, "handoff"));
         assert!(has_tool(tools, "observe"));
+    }
+
+    #[test]
+    fn native_skill_pack_tools_round_trip_through_mcp() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let published = call_tool_json(
+            &provider,
+            &config,
+            "skill_publish",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "status": "validated",
+                "pack": sample_skill_pack(),
+                "created_at": "2026-06-05T00:00:00Z"
+            }),
+        );
+        assert_eq!(
+            published["published"]["pack"]["pack_content_hash"],
+            "hash-pack"
+        );
+        assert_eq!(published["published"]["pack"]["status"], "validated");
+
+        let listed = call_tool_json(
+            &provider,
+            &config,
+            "skill_list",
+            json!({ "tenant": "smoke" }),
+        );
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["packs"][0]["pack_id"], "rustyred-rust-skill");
+
+        let loaded = call_tool_json(
+            &provider,
+            &config,
+            "skill_get",
+            json!({ "tenant": "smoke", "pack_content_hash": "hash-pack" }),
+        );
+        assert_eq!(loaded["pack"]["pack_id"], "rustyred-rust-skill");
+
+        let applied = call_tool_json(
+            &provider,
+            &config,
+            "skill_apply",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "pack_id": "rustyred-rust-skill",
+                "run_id": "run-1",
+                "task": "refactor GraphStore",
+                "created_at": "2026-06-05T00:01:00Z"
+            }),
+        );
+        assert_eq!(applied["receipt"]["status"], "applied");
+        assert_eq!(
+            applied["receipt"]["validator_execution_mode"],
+            "safe_declaration"
+        );
+        assert_eq!(
+            applied["receipt"]["validators"].as_array().unwrap().len(),
+            2
+        );
     }
 
     #[test]

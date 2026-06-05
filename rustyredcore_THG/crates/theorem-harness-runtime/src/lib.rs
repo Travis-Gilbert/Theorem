@@ -1,7 +1,9 @@
 pub mod binding_store;
 pub mod coordination;
+pub mod coordination_push;
 pub mod event_log;
 pub mod memory;
+pub mod skill_pack;
 
 pub use binding_store::{
     append_binding_transition, binding_event_node_id, binding_node_id, load_binding,
@@ -24,6 +26,11 @@ pub use coordination::{
     CoordinationRoomState, JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
     WriteRecordInput,
 };
+pub use coordination_push::{
+    global_coordination_room_bus, publish_coordination_room_event_from_state, stream_event_matches,
+    subscribe_coordination_room_events, wake_targets, RoomEventBus, RoomMessageDelivery,
+    RoomMessageEvent, DEFAULT_ROOM_BUS_CAPACITY,
+};
 pub use event_log::{
     append_transition, append_transition_from_store, event_node_id, load_events, load_run,
     persist_transition_result, replay_persisted_run, run_node_id, HarnessRuntimeError,
@@ -38,4 +45,11 @@ pub use memory::{
     HandoffMemoryInput, MemoryDocumentState, MemoryError, MemoryGraphStore, MemoryNodeState,
     MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput, RecallMemoryInput,
     RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput, ReviseMemoryReceipt,
+};
+pub use skill_pack::{
+    apply_skill_pack, get_skill_pack, list_skill_packs, publish_skill_pack,
+    skill_pack_artifact_node_id, skill_pack_node_id, skill_pack_source_node_id,
+    skill_pack_use_receipt_node_id, SkillPackApplyInput, SkillPackApplyReceipt, SkillPackError,
+    SkillPackGetInput, SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput,
+    SkillPackPublishReceipt, SkillPackState, SkillPackValidatorReceipt,
 };

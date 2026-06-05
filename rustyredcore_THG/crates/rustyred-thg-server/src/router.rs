@@ -45,6 +45,7 @@ use rustyred_web::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use theorem_harness_runtime::subscribe_coordination_room_events;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -600,17 +601,19 @@ async fn coordination_events(
         return status.into_response();
     }
 
-    let stream = BroadcastStream::new(rustyred_thg_mcp::subscribe_coordination_room_events())
-        .filter_map(|event| match event {
-            Ok(message) => {
-                let sse_event = Event::default()
-                    .event("room_message")
-                    .json_data(message)
-                    .unwrap_or_else(|_| Event::default().event("room_message").data("{}"));
-                Some(Ok::<Event, Infallible>(sse_event))
-            }
-            Err(_) => None,
-        });
+    let stream =
+        BroadcastStream::new(subscribe_coordination_room_events()).filter_map(
+            |event| match event {
+                Ok(message) => {
+                    let sse_event = Event::default()
+                        .event("room_message")
+                        .json_data(message)
+                        .unwrap_or_else(|_| Event::default().event("room_message").data("{}"));
+                    Some(Ok::<Event, Infallible>(sse_event))
+                }
+                Err(_) => None,
+            },
+        );
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())

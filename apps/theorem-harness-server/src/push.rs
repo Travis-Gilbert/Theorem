@@ -16,7 +16,6 @@
 //! `coordinate` waking an open app in real time) is the named follow-up and
 //! would swap the in-process `broadcast` for Redis/NATS or a RustyRed pub/sub.
 
-use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
@@ -36,76 +35,13 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use theorem_harness_runtime::{
-    room_status, write_message, CoordinationError, CoordinationMessageState, WriteMessageInput,
+    room_status, stream_event_matches, wake_targets, write_message, CoordinationError,
+    CoordinationMessageState, RoomEventBus, WriteMessageInput, DEFAULT_ROOM_BUS_CAPACITY,
 };
 
-/// Default in-process bus depth. Generous: each open app and the spawn-listener
-/// is a receiver, and a slow receiver only lags (it never blocks the writer).
-pub const DEFAULT_BUS_CAPACITY: usize = 1024;
+pub const DEFAULT_BUS_CAPACITY: usize = DEFAULT_ROOM_BUS_CAPACITY;
 
-/// The single send button's two behaviors, both riding the same emit. `delivery`
-/// is the whole difference between leaving a note and queueing the agents.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Delivery {
-    /// Tap: leave a note. Streamed to anyone watching the room; the spawn-listener
-    /// ignores it, so the agent sees it next time it is live and calls `mentions`.
-    #[default]
-    Passive,
-    /// Hold: queue the agents. The spawn-listener fires a session for the targets.
-    Wake,
-}
-
-impl Delivery {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Delivery::Passive => "passive",
-            Delivery::Wake => "wake",
-        }
-    }
-
-    /// Parse the coordination message's first-class `delivery` field, defaulting
-    /// to passive (the safe "left a note" reading) when empty or unrecognized.
-    pub fn from_core(delivery: &str) -> Delivery {
-        if delivery.trim().eq_ignore_ascii_case("wake") {
-            Delivery::Wake
-        } else {
-            Delivery::Passive
-        }
-    }
-}
-
-/// The event published on the room bus when a message is written. This is both
-/// the SSE payload the app renders and the trigger the spawn-listener reads.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RoomMessageEvent {
-    pub tenant_slug: String,
-    pub room_id: String,
-    pub message_id: String,
-    pub author: String,
-    pub urgency: String,
-    pub message: String,
-    pub mentions: Vec<String>,
-    pub delivery: Delivery,
-    pub created_at: String,
-}
-
-impl RoomMessageEvent {
-    /// Project a persisted message into the bus event the consumers ride.
-    pub fn from_state(state: &CoordinationMessageState) -> RoomMessageEvent {
-        RoomMessageEvent {
-            tenant_slug: state.tenant_slug.clone(),
-            room_id: state.room_id.clone(),
-            message_id: state.message_id.clone(),
-            author: state.actor_id.clone(),
-            urgency: state.urgency.clone(),
-            message: state.message.clone(),
-            mentions: state.mentions.clone(),
-            delivery: Delivery::from_core(&state.delivery),
-            created_at: state.created_at.clone(),
-        }
-    }
-}
+pub use theorem_harness_runtime::{RoomMessageDelivery as Delivery, RoomMessageEvent};
 
 /// Request body for the room write endpoint: the single send button's payload.
 /// `delivery` defaults to passive (tap) when the field is absent.
@@ -153,30 +89,6 @@ pub fn write_room_message<S: GraphStore>(
     )?;
     let event = RoomMessageEvent::from_state(&state);
     Ok((state, event))
-}
-
-/// Who to wake for an event: the explicit mentions, or - if none are named - all
-/// the supplied room agents (the "all room agents if none" rule). Passive events
-/// wake no one. The author is never woken by their own message.
-pub fn wake_targets(event: &RoomMessageEvent, room_agents: &[String]) -> Vec<String> {
-    if event.delivery != Delivery::Wake {
-        return Vec::new();
-    }
-    let source: &[String] = if event.mentions.is_empty() {
-        room_agents
-    } else {
-        &event.mentions
-    };
-    let mut seen = BTreeSet::new();
-    let mut targets = Vec::new();
-    for actor in source {
-        let actor = actor.trim();
-        if actor.is_empty() || actor == event.author.trim() || !seen.insert(actor.to_string()) {
-            continue;
-        }
-        targets.push(actor.to_string());
-    }
-    targets
 }
 
 /// Outcome of attempting to wake one actor.
@@ -272,14 +184,16 @@ impl SpawnDispatcher for CommandSpawnDispatcher {
 /// clone. A lagging subscriber is dropped events, never a blocked writer.
 #[derive(Clone)]
 pub struct RoomBus {
-    sender: broadcast::Sender<RoomMessageEvent>,
+    events: RoomEventBus,
     spawn: Arc<dyn SpawnDispatcher>,
 }
 
 impl RoomBus {
     pub fn new(capacity: usize, spawn: Arc<dyn SpawnDispatcher>) -> Self {
-        let (sender, _receiver) = broadcast::channel(capacity.max(1));
-        Self { sender, spawn }
+        Self {
+            events: RoomEventBus::new(capacity),
+            spawn,
+        }
     }
 
     /// Convenience constructor with the default command-spawn dispatcher.
@@ -289,11 +203,11 @@ impl RoomBus {
 
     pub fn publish(&self, event: RoomMessageEvent) {
         // Err only means no receivers right now; the durable write already landed.
-        let _ = self.sender.send(event);
+        self.events.publish(event);
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RoomMessageEvent> {
-        self.sender.subscribe()
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RoomMessageEvent> {
+        self.events.subscribe()
     }
 
     pub fn spawn_dispatcher(&self) -> Arc<dyn SpawnDispatcher> {
@@ -368,13 +282,6 @@ async fn post_message_handler<S: GraphStore + Send + 'static>(
 pub struct StreamQuery {
     #[serde(default)]
     pub tenant: String,
-}
-
-/// The bus-event filter a stream applies: an event is delivered only when BOTH its
-/// tenant and its room match the subscription. Pulled out as a pure predicate so
-/// the tenant-isolation invariant is unit-testable without standing up the server.
-pub fn stream_event_matches(event: &RoomMessageEvent, tenant: &str, room_id: &str) -> bool {
-    event.tenant_slug == tenant && event.room_id == room_id
 }
 
 async fn stream_room_handler<S: GraphStore + Send + 'static>(
@@ -473,6 +380,7 @@ fn room_agent_ids<S: GraphStore>(
 mod tests {
     use super::*;
     use rustyred_thg_core::InMemoryGraphStore;
+    use std::collections::BTreeSet;
     use std::sync::Mutex as StdMutex;
     use theorem_harness_runtime::{join_room, JoinRoomInput};
 
@@ -773,7 +681,11 @@ mod tests {
             "an event from another tenant on the same room_id must not match"
         );
         // The room dimension still matters within a tenant.
-        assert!(!stream_event_matches(&mine, TENANT, "repo:other:branch:main"));
+        assert!(!stream_event_matches(
+            &mine,
+            TENANT,
+            "repo:other:branch:main"
+        ));
     }
 
     #[tokio::test]

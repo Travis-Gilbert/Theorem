@@ -48,6 +48,21 @@ heavy engine work that is still legitimately Python/Django/Modal-backed.
 - `apps/theorem-harness-server` exposes HTTP run, coordination read, and
   connector surfaces over the same runtime family. It is already the iOS
   product read transport.
+- `theorem-harness-runtime::skill_pack` now stores content-addressed
+  `SkillPack` nodes keyed by `pack_content_hash`, source/artifact hash edges,
+  and durable `SkillPackUseReceipt` nodes. `rustyred-thg-mcp` exposes
+  `skill_list` and `skill_get` in read-only mode plus write-gated
+  `skill_publish` and `skill_apply`.
+- The source plugin route policy now has a native MCP client and treats
+  `skill_list`, `skill_get`, `skill_publish`, and `skill_apply` as native
+  Theorem/RustyRed capability verbs. The slim plugin MCP advertises those tools
+  and forwards them through the native MCP route with route receipts.
+- The source plugin slim MCP now routes the core room/agent-space tools
+  native-first through route policy: `coordination_room`, `presence`,
+  `coordination_intent`, `coordination_reflection`, `coordination_decision`,
+  `coordination_tension`, `coordinate`, and `mentions`. The old Theseus
+  endpoints remain fallback when the deployed native write surface is missing
+  or unauthenticated.
 - `rustyredcore_THG/crates/theorem-harness` now exists as the native Rust SDK
   surface over core/runtime. It exposes run handles, stream cursors, session
   memory, idempotency tokens, and trace export without leaking the raw transition
@@ -404,6 +419,22 @@ Risk:
 - `mentions_wait` can tie up host requests. Keep short polling caps and prefer
   checkpoint reads.
 
+Progress:
+- 2026-06-05 source plugin wiring landed for the core room/agent-space tools:
+  `coordination_room`, `presence`, `coordination_intent`,
+  `coordination_reflection`, `coordination_decision`, `coordination_tension`,
+  `coordinate`, and `mentions` now go native-first through the route policy and
+  fall back to the old Theseus endpoint when native write/read is unavailable.
+- `coordination_reflection`, `coordination_decision`, and
+  `coordination_tension` map to native `coordination_record` with
+  `record_type` set to `reflection`, `decision`, or `tension`.
+
+Remaining:
+- `mentions_wait`, `subscribe`, and `continuity_pack` still use compatibility
+  routes because native blocking wait and continuity-pack contracts are not yet
+  one-to-one.
+- Hook flow still needs a native SessionStart/UserPromptSubmit context pass.
+
 ### THPS-005: Run lifecycle and context ergonomics
 
 Owner: Claude owns the core/runtime event surface. Codex owns plugin route
@@ -522,6 +553,79 @@ Validation:
 Risk:
 - Slow MCP server handshakes must not hold the GraphStore lock. Keep existing
   spawn/register discipline.
+
+### THPS-007A: Native skill-pack serving
+
+Owner: Codex primary, Claude validation-gate reviewer.
+
+Files:
+- `rustyredcore_THG/crates/theorem-harness-runtime/src/skill_pack.rs`
+- `rustyredcore_THG/crates/theorem-harness-runtime/src/lib.rs`
+- `rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs`
+- `docs/plans/skill-encoder-theorem-port/implementation-plan.md`
+
+Work:
+- Store finished `CapabilityPackSpec` artifacts from the Theseus offline
+  encoder as content-addressed native `SkillPack` graph nodes.
+- Expose `skill_list` and `skill_get` in read-only native MCP mode so agents can
+  discover and pull packs without write credentials.
+- Expose `skill_publish` and `skill_apply` only in write mode. `skill_publish`
+  accepts the pack JSON and provenance hashes. `skill_apply` writes a durable
+  use receipt that can feed the later promotion loop.
+- Keep the runtime path Python-free. The encoder remains an out-of-band
+  producer; it does not become a harness runtime dependency.
+
+Current state:
+- Shipped 2026-06-05: `skill_pack` runtime module, MCP `skill_*` verbs,
+  read-only/write-mode tool-list gating, source/artifact graph edges, and
+  `SkillPackUseReceipt` persistence.
+- Shipped 2026-06-05: source plugin route-policy wiring for `skill_*` through
+  `/Users/travisgilbert/Tech Dev Local/codex-plugins/theorems-harness/sdk/route-policy.mjs`
+  and
+  `/Users/travisgilbert/Tech Dev Local/codex-plugins/theorems-harness/mcp/server.mjs`.
+- Shipped validator mode: safe deterministic declaration checks
+  (`required_field`, `context_required_field`, `artifact_hash_present`,
+  `always_pass`) with `validator_execution_mode: safe_declaration`.
+- Shipped validator mode: bounded native artifact-descriptor checks for
+  `native_validator_candidate` / Rust validator artifacts emitted by the
+  Theseus encoder, currently covering the code-member signature predicate with
+  `validator_execution_mode: native_artifact_sandbox`.
+- Shipped 2026-06-05 in Index-API: the 20-task held-out Rust refactoring
+  corpus plus the pure baseline-vs-treatment receipt-scoring gate in
+  `apps/notebook/encode/benchmarks.py`.
+- Not shipped yet: a live E1 encoded-pack run feeding real baseline/treatment
+  receipts through that gate, live authenticated deployment smoke,
+  installed-cache verification, and any future compiled crate/WASM validator
+  runner.
+
+Acceptance:
+- Native MCP can publish a pack, list it, read it by id or hash, apply it, and
+  persist a use receipt without calling Theseus.
+- Read-only mode advertises `skill_list` and `skill_get` but not
+  `skill_publish` or `skill_apply`.
+- Write mode advertises all four `skill_*` verbs with top-level object schemas
+  and no root schema combinators.
+- The response receipt makes validator execution mode explicit.
+- The source plugin can call the native `skill_*` tools through route policy,
+  with `route_receipt.route = native-mcp`.
+- Applying a pack with native validator artifact descriptors executes the
+  bounded descriptor sandbox and persists those validator receipts as
+  `SkillPackUseReceipt` data.
+
+Validation:
+- `cd rustyredcore_THG && cargo test -p theorem-harness-runtime`
+- `cd rustyredcore_THG && cargo test -p rustyred-thg-mcp`
+- `cd rustyredcore_THG && cargo clippy -p theorem-harness-runtime -p rustyred-thg-mcp --all-targets --no-deps -- -D warnings`
+- `cd /Users/travisgilbert/Tech Dev Local/codex-plugins/theorems-harness && node sdk/route-policy.test.mjs`
+
+Risk:
+- Do not run arbitrary uploaded Rust validator code in the MCP request path.
+  The shipped S3b runner interprets bounded descriptors only; compiled
+  crate/WASM execution must be a separate isolated runner.
+- Cargo resolution currently depends on the dirty RustyWeb optional
+  impersonation dependency being resolvable. This slice unblocked default builds
+  by aliasing that optional dependency to `wreq`, but did not validate the
+  `impersonate-fetch` feature.
 
 ### THPS-008: Deployment, auth, and live truth gates
 

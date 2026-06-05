@@ -177,30 +177,50 @@ encoder never moves to Rust; only the serving does.
 - [ ] **E1** Run `run_encoding_pipeline` over the lowered Rust views ->
   candidate patterns (`pairformer/cluster_abstraction.py`) -> compile via
   `codegen/rust.py` -> `build_capability_pack_spec` -> `skill_pack` candidate.
-- [ ] **E2** Author the held-out validation task set (spec §6: 20 real Rust
-  refactoring tasks; `open-questions.md` Q2). Seed 3-5 against `rustyredcore_THG`
-  first; full 20 is the bar for canonical.
-- [ ] **E3** Wire the full held-out runner in `encode/benchmarks.py` (baseline
-  vs treatment). Promote per `rust.yaml` policy: `validator_pass_rate >= 0.95`
-  AND `benchmark_treatment_beats_baseline`.
+- [x] **E2** Held-out validation task set (shipped 2026-06-05, Index-API):
+  `apps/notebook/encode/validation_tasks/rust_refactoring_v1.jsonl` now carries
+  the full 20 real Rust refactoring tasks against Theorem/RustyRed files, with
+  acceptance criteria and validator ids. This resolves the old 3-5 seed-only
+  working assumption; the full 20-task floor is now data.
+- [x] **E3** Full held-out runner in `encode/benchmarks.py` (shipped
+  2026-06-05, Index-API): `load_rust_held_out_task_set` +
+  `rust_held_out_validation_gate` score baseline vs treatment `UseReceipt`s,
+  enforce the 20-task floor, require treatment coverage, require
+  `validator_pass_rate >= 0.95`, and emit
+  `benchmark_treatment_beats_baseline` / `canonical_ready`. The runner is
+  wired; actual pack promotion still waits on real baseline/treatment receipts
+  from a live run.
 - [ ] **E4** Flip `rust.yaml` `is_active: true` once E3 passes.
 
 ### Lane S - Theorem serving surface (Rust, V2, CODEX - hot lib.rs, claim first)
 
-- [ ] **S1** `skill_pack` node contract in the runtime (new module, mirror
-  `coordination.rs` / the planned `memory.rs`): store a `CapabilityPackSpec`
-  by `pack_content_hash` as a content-addressed node in RustyRed, with edges to
-  source/artifact hashes. Reuse the Prolly/versioned graph
-  (`versioned_graph.rs`).
-- [ ] **S2** Native MCP verbs on V2 (Form-B): `skill_list` (available packs),
-  `skill_get` (pack metadata + artifacts by id/hash), `skill_apply` (load a
-  pack's artifacts into the agent's context / run the Rust validators),
-  `skill_publish` (accept a pack from the Python encoder by hash). Read verbs in
-  read-only mode; `skill_publish`/`skill_apply` behind write mode (Lane O of the
-  superset plan).
-- [ ] **S3** Run the pack's native Rust validators in-process (the payoff of a
-  Rust corpus: the validators ARE Rust, so they execute natively in Theorem,
-  not as advisory strings).
+- [x] **S1** `skill_pack` node contract in the runtime (shipped 2026-06-05):
+  `theorem-harness-runtime::skill_pack` stores `CapabilityPackSpec` JSON as
+  content-addressed `SkillPack` graph nodes keyed by `pack_content_hash`, with
+  `SKILL_PACK_SOURCE` and `SKILL_PACK_ARTIFACT` edges to source/artifact hash
+  nodes. It also persists `SkillPackUseReceipt` nodes and
+  `SKILL_PACK_APPLIED` edges for the use loop.
+- [x] **S2** Native MCP verbs on V2 (Form-B, shipped 2026-06-05):
+  `skill_list` and `skill_get` are advertised in read-only mode;
+  `skill_publish` and `skill_apply` are write-mode tools. The MCP round trip is
+  covered by `native_skill_pack_tools_round_trip_through_mcp`. The source
+  Theorems Harness plugin route policy now advertises the same `skill_*` verbs
+  and forwards them through the native MCP route with route receipts.
+- [x] **S3a** Safe native validator declarations (shipped 2026-06-05):
+  `skill_apply` runs deterministic validator declarations in-process
+  (`required_field`, `context_required_field`, `artifact_hash_present`,
+  `always_pass`) and persists the receipt with `validator_execution_mode:
+  safe_declaration`.
+- [x] **S3b** Bounded native validator artifact execution (shipped 2026-06-05):
+  `skill_apply` now loads `native_validator_candidate` / Rust validator artifact
+  descriptors from the published pack metadata and runs the code-member
+  signature predicate in a bounded native sandbox with
+  `validator_execution_mode: native_artifact_sandbox`. It does not compile or
+  execute arbitrary uploaded Rust source in the MCP request path.
+- [ ] **S3c** Optional compiled-artifact runner: if the encoder later publishes
+  packaged validator crates or WASM artifacts, add a separate bounded runner
+  with process/wasm isolation and explicit operator policy. Do not fold raw
+  source execution into `skill_apply`.
 - [x] **S4a** Native gRPC code search first lane = the agent query surface for "be better at
   Rust" (Travis: "the gRPC external codebase search would be useful for this").
   Theorem now has a native first lane in `apps/theorem-grpc`:
@@ -274,15 +294,16 @@ full-harness-on-Theorem move "work better for everything."
 
 1. Lane G (corpus + worker) - mine, started this session. G1 worker is the
    unblock; G3 run needs infra.
-2. Lane E (encode + validate) - mostly exists; E2/E3 (validation tasks + gate)
-   are the real remaining build.
+2. Lane E (encode + validate) - E2/E3 are shipped as a full 20-task task set
+   plus pure receipt-scoring gate. E1 still needs a real encoded Rust pack run;
+   E4 remains gated on live baseline/treatment receipts passing E3.
 3. Lane S (Theorem serving) - Codex, after claiming the hot lib.rs seam.
 4. Lanes H + F - integration, after S + E.
 
 ## What needs whom / what
 
 - **Mine, buildable now (no infra):** G0 (corpus def), G1 (code_repo worker),
-  E2 (validation task seed), the plan.
+  E2/E3 (validation task corpus + pure runner), the plan.
 - **Needs your infra/greenlight:** G3 (S3 cold-tier creds + clone compute),
   E3 run (Claude Code on the task set), Lane O deploy + write-mode on V2.
 - **Codex (Theorem MCP territory):** Lane S (claim the lib.rs seam first).
@@ -293,19 +314,27 @@ full-harness-on-Theorem move "work better for everything."
   not a dangling `local_filesystem` reference.
 - A `skill_pack` compiles from the corpus with content-addressed provenance
   (`pack_content_hash`) and passes the held-out gate (E3).
-- V2 serves the pack natively (`skill_list`/`skill_get`/`skill_apply`), Rust
-  validators run in-process (S3).
+- V2 serves the pack natively (`skill_list`/`skill_get`/`skill_apply`), with
+  safe validator declaration receipts and bounded native artifact-descriptor
+  execution shipped.
 - A harness agent on V2 pulls + applies the pack on a real Rust task (H2).
 - Use emits UseReceipts that drive promotion/retirement (F1-F3): the skill
   measurably self-improves.
 
 ## Codex handoff (Lane S)
 
-Claim the `rustyred-thg-mcp/src/lib.rs` + a new runtime `skill_pack` module
-before building (hot file; duplicate-module lesson). The seam contract is the
-`CapabilityPackSpec` JSON `build_capability_pack_spec` emits
-(`apps/notebook/encode/code_corpus.py:118`): `id`, `kind='skill_pack'`,
-`capabilities`, `validators`, `metadata.pack_content_hash`,
-`metadata.artifacts`. Store by `pack_content_hash` in the versioned graph;
-expose `skill_*` verbs; run the Rust artifacts natively. Coordinate with the
-harness-superset plan (same V2 server, same write-mode gate).
+Codex claimed and shipped the first Lane S slice on 2026-06-05. The seam
+contract remains the `CapabilityPackSpec` JSON `build_capability_pack_spec`
+emits (`apps/notebook/encode/code_corpus.py:118`): `id`, `kind='skill_pack'`,
+`capabilities`, `validators`, `metadata.pack_content_hash`, and
+`metadata.artifacts`.
+
+The next Codex/Claude work should start from the shipped Rust surface:
+`theorem-harness-runtime::skill_pack` plus MCP verbs `skill_list`,
+`skill_get`, `skill_publish`, and `skill_apply`. Do not create a duplicate
+registry. The source plugin already routes those verbs through native MCP. The
+Lane E task corpus and pure receipt-scoring gate are now shipped in Index-API;
+the next implementation gap is running E1 and feeding real baseline/treatment
+receipts through E3 before E4 flips `rust.yaml` active. Compiled crate/WASM
+validator execution remains a separate optional S3c runner, not an MCP
+request-path source execution feature.
