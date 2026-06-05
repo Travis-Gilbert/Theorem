@@ -16,11 +16,16 @@
 //! base and drops dangling edges, so an additions-only delta is safe -- it just
 //! does not yet retract a symbol that disappeared from a changed file.
 
+use std::collections::{HashMap, HashSet};
+
 use rustyred_thg_core::{
     EdgeRecord, GraphMutation, GraphSnapshot, HarnessInstantKg, NodeRecord, SessionDelta,
 };
 
 use crate::code_index::{build_code_mutations, IndexedFile, IngestConfig};
+
+const CODE_FILE_LABEL: &str = "CodeFile";
+const CODE_SYMBOL_LABEL: &str = "CodeSymbol";
 
 /// Build an instant-KG `SessionDelta` from a set of indexed code files. The
 /// `commit_sha` (when known, e.g. from `git rev-parse HEAD`) is stamped on the
@@ -71,6 +76,69 @@ pub(crate) fn serve_session_kg(
 ) -> HarnessInstantKg {
     let delta = build_session_delta(config, files, commit_sha);
     HarnessInstantKg::new(base, None, delta)
+}
+
+/// IK-2: build a `SessionDelta` that also RETRACTS what an edited file deleted.
+/// Beyond the additions `build_session_delta` produces, this scans the base
+/// snapshot for code records under the changed files and, for any the fresh parse
+/// no longer emits, records a tombstone (a deleted symbol) or a removed edge (a
+/// dropped call/dependency from a changed-file symbol). Ids are deterministic
+/// (`stable_hash(repo_id, path, kind, name, line)`, no generation), so a surviving
+/// symbol keeps its id across re-index and is never falsely tombstoned.
+/// `HarnessInstantKg` also drops edges left dangling by a tombstone, so the edge
+/// retraction here is belt-and-suspenders for the both-endpoints-survive case.
+#[allow(dead_code)]
+pub(crate) fn build_session_delta_with_base(
+    config: &IngestConfig,
+    files: &[IndexedFile],
+    base: &GraphSnapshot,
+    commit_sha: Option<String>,
+) -> SessionDelta {
+    let mut delta = build_session_delta(config, files, commit_sha);
+
+    // The file ids the fresh parse covers (read off the delta's CodeFile nodes).
+    let changed_file_ids: HashSet<&str> = delta
+        .objects
+        .iter()
+        .filter(|node| node.labels.iter().any(|l| l.as_str() == CODE_FILE_LABEL))
+        .filter_map(|node| node.properties.get("file_id").and_then(|v| v.as_str()))
+        .collect();
+    let new_object_ids: HashSet<&str> = delta.objects.iter().map(|n| n.id.as_str()).collect();
+    let new_edge_ids: HashSet<&str> = delta.edges.iter().map(|e| e.id.as_str()).collect();
+
+    // Base symbols belonging to a changed file: tombstone the ones the fresh parse
+    // dropped. Map each base symbol id to its file id for the edge pass below.
+    let mut base_symbol_file: HashMap<&str, &str> = HashMap::new();
+    let mut tombstoned: Vec<String> = Vec::new();
+    for node in &base.nodes {
+        if !node.labels.iter().any(|l| l.as_str() == CODE_SYMBOL_LABEL) {
+            continue;
+        }
+        let Some(file_id) = node.properties.get("file_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        base_symbol_file.insert(node.id.as_str(), file_id);
+        if changed_file_ids.contains(file_id) && !new_object_ids.contains(node.id.as_str()) {
+            tombstoned.push(node.id.clone());
+        }
+    }
+    tombstoned.sort();
+
+    // Base edges originating from a changed-file symbol that the fresh parse no
+    // longer emits are removed.
+    let mut removed_edges: Vec<String> = Vec::new();
+    for edge in &base.edges {
+        let from_changed = base_symbol_file
+            .get(edge.from_id.as_str())
+            .is_some_and(|file_id| changed_file_ids.contains(file_id));
+        if from_changed && !new_edge_ids.contains(edge.id.as_str()) {
+            removed_edges.push(edge.id.clone());
+        }
+    }
+
+    delta.tombstoned_object_ids = tombstoned;
+    delta.removed_edge_ids = removed_edges;
+    delta
 }
 
 #[cfg(test)]
@@ -179,6 +247,77 @@ mod tests {
                     && node.properties.get("name").and_then(|v| v.as_str()) == Some("alpha")
             }),
             "the alpha symbol is served through the instant KG"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    fn index_repo(repo: &std::path::Path) -> (IngestConfig, Vec<IndexedFile>) {
+        let config = resolve_ingest_config(IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut files = Vec::new();
+        let mut skipped = 0u64;
+        collect_code_files(&config.repo_root, &config, &mut files, &mut skipped).unwrap();
+        (config, files)
+    }
+
+    fn symbol_id(delta: &SessionDelta, name: &str) -> Option<String> {
+        delta
+            .objects
+            .iter()
+            .find(|node| {
+                node.labels.iter().any(|l| l.as_str() == "CodeSymbol")
+                    && node.properties.get("name").and_then(|v| v.as_str()) == Some(name)
+            })
+            .map(|node| node.id.clone())
+    }
+
+    #[test]
+    fn session_delta_against_base_tombstones_deleted_symbols() {
+        let repo = unique_dir("tomb-repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let src = repo.join("src/lib.rs");
+
+        // v1: alpha + beta (beta calls alpha).
+        fs::write(
+            &src,
+            "pub fn alpha() -> usize {\n    1\n}\n\npub fn beta() -> usize {\n    alpha()\n}\n",
+        )
+        .unwrap();
+        let (config1, files1) = index_repo(&repo);
+        let delta1 = build_session_delta(&config1, &files1, None);
+        let beta_id = symbol_id(&delta1, "beta").expect("beta symbol in v1");
+        let base = GraphSnapshot {
+            version: 1,
+            nodes: delta1.objects.clone(),
+            edges: delta1.edges.clone(),
+        };
+
+        // v2: beta deleted, alpha kept.
+        fs::write(&src, "pub fn alpha() -> usize {\n    1\n}\n").unwrap();
+        let (config2, files2) = index_repo(&repo);
+        let delta2 =
+            build_session_delta_with_base(&config2, &files2, &base, Some("v2".to_string()));
+
+        // beta is retracted; alpha survives with its id intact (never tombstoned).
+        assert!(
+            delta2.tombstoned_object_ids.contains(&beta_id),
+            "the deleted beta symbol is tombstoned"
+        );
+        let alpha_id = symbol_id(&delta2, "alpha").expect("alpha symbol in v2");
+        assert!(
+            !delta2.tombstoned_object_ids.contains(&alpha_id),
+            "the surviving alpha symbol is not tombstoned"
+        );
+        // beta's call edge (beta -> alpha) originated from a changed-file symbol and
+        // is not re-emitted, so it is removed.
+        assert!(
+            !delta2.removed_edge_ids.is_empty(),
+            "beta's dropped call edge is removed"
         );
 
         let _ = fs::remove_dir_all(&repo);
