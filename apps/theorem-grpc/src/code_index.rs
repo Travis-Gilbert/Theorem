@@ -540,7 +540,7 @@ impl std::error::Error for CodeIndexError {}
 
 pub(crate) struct IngestConfig {
     tenant_id: String,
-    repo_root: PathBuf,
+    pub(crate) repo_root: PathBuf,
     repo_root_display: String,
     repo_id: String,
     include_extensions: BTreeSet<String>,
@@ -554,7 +554,7 @@ pub(crate) struct IngestConfig {
 #[derive(Clone)]
 pub(crate) struct IndexedFile {
     file_id: String,
-    rel_path: String,
+    pub(crate) rel_path: String,
     language: String,
     extension: String,
     content_hash: String,
@@ -1172,7 +1172,7 @@ fn record_use_receipt_with_store(
     })
 }
 
-fn collect_code_files(
+pub(crate) fn collect_code_files(
     dir: &Path,
     config: &IngestConfig,
     out: &mut Vec<IndexedFile>,
@@ -1244,7 +1244,9 @@ fn collect_code_files(
     Ok(())
 }
 
-fn resolve_ingest_config(input: IngestCodebaseInput) -> Result<IngestConfig, CodeIndexError> {
+pub(crate) fn resolve_ingest_config(
+    input: IngestCodebaseInput,
+) -> Result<IngestConfig, CodeIndexError> {
     let tenant_id = normalize_tenant(&input.tenant_id);
     let repo_root = if input.repo_path.trim().is_empty() {
         std::env::current_dir().map_err(|err| CodeIndexError {

@@ -13,6 +13,7 @@ mod code_service;
 mod engine;
 mod pb;
 mod service;
+mod session_delta;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
