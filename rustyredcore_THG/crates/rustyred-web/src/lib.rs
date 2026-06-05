@@ -48,6 +48,12 @@ pub use fetch_cascade::{
     should_promote, FetchCascade, FetchCascadeOptions, FetchTier, FetchTierResult,
 };
 
+pub mod providers;
+pub use providers::{
+    configured_search_providers_from_env, BraveSearchProvider, ExaSearchProvider,
+    MojeekSearchProvider, OfflineSearchProvider, SerpApiSearchProvider,
+};
+
 pub mod robots;
 pub use robots::{
     crawl_delay_duration, global_robots_cache, RobotsCache, RobotsDecision, RobotsPolicyState,
@@ -61,13 +67,36 @@ pub use source_class::{
 pub mod trigger_gate;
 pub use trigger_gate::{evaluate_trigger_gate, CrawlDial, TriggerGateConfig, TriggerGateDecision};
 
+// Page-vector annotation for the crawl-to-search bridge. See embedding.rs.
+pub mod embedding;
+pub use embedding::{
+    configured_qwen3_embedding_4b_client_from_env, embed_crawl_graph_pages,
+    qwen3_embedding_4b_contract, qwen3_embedding_4b_vector_designation, CrawlEmbeddingReceipt,
+    EmbeddingError, EmbeddingModelContract, QwenEmbeddingClient, QwenEmbeddingConfig,
+    QWEN3_EMBEDDING_4B_DIMENSION, QWEN3_EMBEDDING_4B_MODEL_ID, SEMANTIC_VECTOR_METRIC,
+    SEMANTIC_VECTOR_PROPERTY,
+};
+
 // Substrate-native local graph search (the READ seam). See search.rs.
 pub mod search;
-pub use search::{search_substrate, SearchHit, SearchLink, SearchOptions, SubstrateSearch};
+pub use search::{
+    fanout_search_providers, fused_candidates_from_search_acquisition, search_substrate,
+    RankedSearchCandidate, SearchAcquisition, SearchCandidate, SearchHit, SearchLink,
+    SearchOptions, SearchOpts, SearchProvider, SearchProviderError, SearchProviderReceipt,
+    StaticSearchProvider, SubstrateSearch,
+};
 
 // The browser's SERP: render a search as a node-and-edge graph page. See serp.rs.
 pub mod serp;
 pub use serp::{render_search_page, render_serp_html, serp_payload_json};
+
+// The eleven-stage epistemic filter (fusion-quality layer over the fused
+// candidate set). Ported from Theseus retrieval.py. See epistemic_filter.rs.
+pub mod epistemic_filter;
+pub use epistemic_filter::{
+    apply_epistemic_filter, round_half_even, ConnectionScorer, EpistemicFilterConfig,
+    FusedCandidate, RrfFallbackScorer, ScoredResult,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrawlConfig {

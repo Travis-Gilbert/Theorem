@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -19,7 +19,10 @@ use rustyred_thg_mcp::{
     AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
     McpServerConfig,
 };
-use rustyred_web::{FetchCascade, FetchCascadeOptions, LiveFetchOptions};
+use rustyred_web::{
+    configured_search_providers_from_env, FetchCascade, FetchCascadeOptions, LiveFetchOptions,
+    SearchProvider,
+};
 use serde_json::{json, Value};
 
 use crate::config::{Config, StorageMode};
@@ -59,6 +62,7 @@ pub struct AppState {
     graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
     graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
     live_fetch_cascade: Arc<FetchCascade>,
+    search_providers: Arc<RwLock<Vec<Arc<dyn SearchProvider>>>>,
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
     fulltext_indexes: Arc<Mutex<FullTextIndexes>>,
@@ -66,6 +70,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        Self::new_with_search_providers(config, configured_search_providers_from_env())
+    }
+
+    pub fn new_with_search_providers(
+        config: Config,
+        search_providers: Vec<Arc<dyn SearchProvider>>,
+    ) -> Self {
         let observability = Observability::new_with_log(
             config.slow_query_threshold_nanos,
             config.slow_query_capacity,
@@ -85,6 +96,7 @@ impl AppState {
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
             live_fetch_cascade: Arc::new(live_fetch_cascade),
+            search_providers: Arc::new(RwLock::new(search_providers)),
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -595,6 +607,25 @@ impl AppState {
 
     pub fn live_fetch_cascade(&self) -> Arc<FetchCascade> {
         Arc::clone(&self.live_fetch_cascade)
+    }
+
+    pub fn search_providers(&self, allowlist: &[String]) -> Vec<Arc<dyn SearchProvider>> {
+        let Ok(providers) = self.search_providers.read() else {
+            return Vec::new();
+        };
+        if allowlist.is_empty() {
+            return providers.iter().cloned().collect();
+        }
+        let allowed: BTreeSet<String> = allowlist
+            .iter()
+            .map(|provider| provider.trim().to_ascii_lowercase())
+            .filter(|provider| !provider.is_empty())
+            .collect();
+        providers
+            .iter()
+            .filter(|provider| allowed.contains(&provider.name().to_ascii_lowercase()))
+            .cloned()
+            .collect()
     }
 
     pub fn tenant_graph_cache(

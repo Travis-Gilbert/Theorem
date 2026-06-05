@@ -6,11 +6,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use instant_distance::{Builder, HnswMap, Search};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use turbovec::IdMapIndex;
 
 use crate::state::stable_hash;
+
+const VECTOR_INDEX_BIT_WIDTH: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct VectorPoint(Vec<f32>);
@@ -24,19 +26,16 @@ impl VectorPoint {
             Self(raw.iter().map(|x| x / norm).collect())
         }
     }
-}
 
-impl instant_distance::Point for VectorPoint {
-    fn distance(&self, other: &Self) -> f32 {
-        let dot: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
-        1.0 - dot
+    fn as_slice(&self) -> &[f32] {
+        &self.0
     }
 }
 
 pub struct VectorIndex {
     points: Vec<VectorPoint>,
     node_ids: Vec<String>,
-    hnsw: Option<HnswMap<VectorPoint, String>>,
+    turbovec: Option<IdMapIndex>,
     pub dimension: usize,
 }
 
@@ -45,7 +44,7 @@ impl Clone for VectorIndex {
         let mut cloned = Self {
             points: self.points.clone(),
             node_ids: self.node_ids.clone(),
-            hnsw: None,
+            turbovec: None,
             dimension: self.dimension,
         };
         cloned.rebuild();
@@ -67,7 +66,7 @@ impl VectorIndex {
         Self {
             points: Vec::new(),
             node_ids: Vec::new(),
-            hnsw: None,
+            turbovec: None,
             dimension,
         }
     }
@@ -84,24 +83,92 @@ impl VectorIndex {
 
     fn rebuild(&mut self) {
         if self.points.is_empty() {
-            self.hnsw = None;
+            self.turbovec = None;
             return;
         }
-        let hnsw = Builder::default().build(self.points.clone(), self.node_ids.clone());
-        self.hnsw = Some(hnsw);
+        let mut vectors = Vec::with_capacity(self.points.len() * self.dimension);
+        for point in &self.points {
+            vectors.extend_from_slice(point.as_slice());
+        }
+        let ids = (0..self.node_ids.len())
+            .map(|index| index as u64)
+            .collect::<Vec<_>>();
+        let mut index = match IdMapIndex::new(self.dimension, VECTOR_INDEX_BIT_WIDTH) {
+            Ok(index) => index,
+            Err(_) => {
+                self.turbovec = None;
+                return;
+            }
+        };
+        if index.add_with_ids(&vectors, &ids).is_err() {
+            self.turbovec = None;
+            return;
+        }
+        self.turbovec = Some(index);
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
-        let Some(ref hnsw) = self.hnsw else {
+        if k == 0 || query.iter().any(|value| !value.is_finite()) {
             return Vec::new();
+        }
+        let Some(index) = &self.turbovec else {
+            return self.exact_search(query, k);
         };
-        let point = VectorPoint::new(query);
-        let mut search = Search::default();
-        hnsw.search(&point, &mut search)
-            .take(k)
-            .map(|item| (item.value.clone(), item.distance))
-            .collect()
+        let query_point = VectorPoint::new(query);
+        let recall_k = k.saturating_mul(4).max(k).min(self.node_ids.len());
+        let (_scores, ids) = index.search(query_point.as_slice(), recall_k);
+        let mut results = ids
+            .into_iter()
+            .filter_map(|id| {
+                let index = id as usize;
+                let node_id = self.node_ids.get(index)?;
+                let point = self.points.get(index)?;
+                Some((
+                    node_id.clone(),
+                    cosine_distance(query_point.as_slice(), point.as_slice()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        results.truncate(k);
+        results
     }
+
+    fn exact_search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+        let query_point = VectorPoint::new(query);
+        let mut results = self
+            .node_ids
+            .iter()
+            .zip(self.points.iter())
+            .map(|(node_id, point)| {
+                (
+                    node_id.clone(),
+                    cosine_distance(query_point.as_slice(), point.as_slice()),
+                )
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        results.truncate(k);
+        results
+    }
+}
+
+fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
+    let dot = left
+        .iter()
+        .zip(right.iter())
+        .map(|(a, b)| a * b)
+        .sum::<f32>()
+        .clamp(-1.0, 1.0);
+    1.0 - dot
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -4340,7 +4407,7 @@ mod tests {
     use super::{
         Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, GraphStore,
         InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability,
-        RedCoreGraphStore, RedCoreOptions,
+        RedCoreGraphStore, RedCoreOptions, VectorIndex,
     };
 
     #[test]
@@ -5509,6 +5576,26 @@ mod tests {
             "exact match should have near-zero distance"
         );
         assert_eq!(results[1].0, "doc:3");
+    }
+
+    #[test]
+    fn vector_index_uses_turbovec_for_supported_embedding_dimension() {
+        let mut index = VectorIndex::new(128);
+        let mut alpha = vec![0.0_f32; 128];
+        alpha[0] = 1.0;
+        let mut beta = vec![0.0_f32; 128];
+        beta[1] = 1.0;
+
+        index.insert("doc:alpha", &alpha);
+        index.insert("doc:beta", &beta);
+
+        assert!(
+            index.turbovec.is_some(),
+            "supported embedding dimensions should use Turbovec"
+        );
+        let results = index.search(&alpha, 1);
+        assert_eq!(results[0].0, "doc:alpha");
+        assert!(results[0].1 < 0.01);
     }
 
     #[test]

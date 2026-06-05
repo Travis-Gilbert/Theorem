@@ -968,6 +968,12 @@ fn call_tool<P: McpGraphProvider>(
                 "message": "fractal_expansion is handled by the async harness server MCP route because it performs live web fetches."
             }))
         }
+        "rustyweb_search_acquisition" | "search_acquisition" => {
+            return Ok(tool_result_error(json!({
+                "error": "live_search_acquisition_requires_async_server",
+                "message": "rustyweb_search_acquisition is handled by the async harness server MCP route because it fans out to live or offline search providers."
+            })));
+        }
         "mentions" | "theorem_harness_mentions" => {
             let consume = arguments
                 .get("consume")
@@ -5497,6 +5503,26 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         }),
     ));
     tools.push(tool(
+        "rustyweb_search_acquisition",
+        "Fan out across configured RustyWeb search providers, dedupe by normalized URL, RRF-merge candidates, and return crawl seed URLs. Executed by the async harness server route.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "tenant_id": { "type": "string" },
+                "tenant_slug": { "type": "string" },
+                "query": { "type": "string" },
+                "q": { "type": "string" },
+                "providers": { "type": "array", "items": { "type": "string" } },
+                "provider_limit": { "type": "integer", "default": 10 },
+                "limit": { "type": "integer", "default": 16 },
+                "rrf_k": { "type": "integer", "default": 60 },
+                "seed_limit": { "type": "integer", "default": 8 }
+            },
+            "required": ["query"]
+        }),
+    ));
+    tools.push(tool(
         "rustyred_thg_spatial_radius",
         "Search a designated spatial property within a radius in kilometers.",
         json!({
@@ -5595,6 +5621,10 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "tenant_id": { "type": "string" },
                     "tenant_slug": { "type": "string" },
                     "query": { "type": "string" },
+                    "providers": { "type": "array", "items": { "type": "string" } },
+                    "provider_limit": { "type": "integer", "default": 10 },
+                    "search_limit": { "type": "integer" },
+                    "rrf_k": { "type": "integer", "default": 60 },
                     "web_seed_urls": { "type": "array", "items": { "type": "string" } },
                     "top_k": { "type": "integer", "default": 5 },
                     "frontier_limit": { "type": "integer", "default": 8 },
@@ -6914,6 +6944,7 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_fulltext_search"));
+        assert!(has_tool(tools, "rustyweb_search_acquisition"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_spatial_radius"));
@@ -6997,6 +7028,22 @@ mod tests {
     }
 
     #[test]
+    fn sync_mcp_punts_search_acquisition_to_async_server() {
+        let (provider, config) = fixture();
+        let payload = call_tool_json(
+            &provider,
+            &config,
+            "rustyweb_search_acquisition",
+            json!({ "query": "rustyweb" }),
+        );
+
+        assert_eq!(
+            payload["error"],
+            "live_search_acquisition_requires_async_server"
+        );
+    }
+
+    #[test]
     fn tools_list_exposes_native_coordination_write_tools_when_enabled() {
         let (provider, mut config) = fixture();
         config.read_only = false;
@@ -7012,6 +7059,7 @@ mod tests {
         assert!(has_tool(tools, "presence"));
         assert!(has_tool(tools, "coordination_intent"));
         assert!(has_tool(tools, "coordinate"));
+        assert!(has_tool(tools, "rustyweb_search_acquisition"));
         assert!(has_tool(tools, "fractal_expansion"));
         assert!(has_tool(tools, "coordination_record"));
         assert!(has_tool(tools, "coordination_contribution"));

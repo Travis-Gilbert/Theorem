@@ -27,13 +27,18 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
+use futures_util::future::join_all;
 use rustyred_thg_core::graph_store::{GraphStore, NeighborQuery, NodeQuery, NodeRecord};
 use rustyred_thg_core::personalized_pagerank;
 use serde::{Deserialize, Serialize};
 use turbovec::IdMapIndex;
 use url::Url;
 
+use crate::epistemic_filter::FusedCandidate;
 use crate::{EDGE_HAS_SNAPSHOT, EDGE_LINKS_TO, LABEL_PAGE};
 
 /// How many `LINKS_TO` hops out from a direct match to pull into the result.
@@ -52,6 +57,10 @@ const DEFAULT_PPR_MAX_PUSHES: usize = 100_000;
 const DEFAULT_DENSE_LIMIT: usize = 64;
 /// Reciprocal rank fusion constant; 60 is the common IR default.
 const DEFAULT_RRF_K: usize = 60;
+/// Per-provider search candidates requested in the borrowed-breadth acquisition layer.
+const DEFAULT_PROVIDER_LIMIT: usize = 10;
+/// Total deduped candidates returned after fan-out + RRF merge.
+const DEFAULT_ACQUISITION_LIMIT: usize = 16;
 /// Hash embedding dimensionality for the standalone dense layer.
 const DENSE_DIM: usize = 128;
 /// TurboVec quantization bit width for ephemeral local search indexes.
@@ -95,6 +104,330 @@ impl Default for SearchOptions {
             max_expansion_fanout: DEFAULT_MAX_EXPANSION_FANOUT,
         }
     }
+}
+
+/// Knobs for borrowed-breadth provider acquisition. This is deliberately
+/// separate from `SearchOptions`: providers find web candidates; substrate
+/// search ranks graph state that has already been ingested.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchOpts {
+    /// Max candidates requested from each provider before dedupe.
+    pub provider_limit: usize,
+    /// Max candidates returned after dedupe and RRF.
+    pub limit: usize,
+    /// Reciprocal-rank fusion constant.
+    pub rrf_k: usize,
+}
+
+impl Default for SearchOpts {
+    fn default() -> Self {
+        Self {
+            provider_limit: DEFAULT_PROVIDER_LIMIT,
+            limit: DEFAULT_ACQUISITION_LIMIT,
+            rrf_k: DEFAULT_RRF_K,
+        }
+    }
+}
+
+impl SearchOpts {
+    pub fn normalized(mut self) -> Self {
+        self.provider_limit = self.provider_limit.max(1);
+        self.limit = self.limit.max(1);
+        self.rrf_k = self.rrf_k.max(1);
+        self
+    }
+}
+
+/// A candidate returned by an external or offline search source before the
+/// substrate crawls it. Ranks are provider-local and one-based; rank 0 is
+/// normalized to the candidate's list position.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchCandidate {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    pub source: String,
+    pub rank: usize,
+}
+
+/// A merged candidate after provider fan-out, normalized URL dedupe, and RRF.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RankedSearchCandidate {
+    pub candidate: SearchCandidate,
+    pub normalized_url: String,
+    pub score: f64,
+    pub sources: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchProviderError {
+    pub provider: String,
+    pub message: String,
+}
+
+impl SearchProviderError {
+    pub fn new(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Per-provider receipt: enough to debug quota/config failures without treating
+/// one failed provider as a failed whole search.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchProviderReceipt {
+    pub provider: String,
+    pub status: String,
+    pub returned_candidates: usize,
+    pub admitted_candidates: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchAcquisition {
+    pub query: String,
+    pub candidates: Vec<RankedSearchCandidate>,
+    pub providers: Vec<SearchProviderReceipt>,
+}
+
+impl SearchAcquisition {
+    pub fn seed_urls(&self, limit: usize) -> Vec<String> {
+        self.candidates
+            .iter()
+            .take(limit)
+            .map(|candidate| candidate.candidate.url.clone())
+            .collect()
+    }
+
+    pub fn fused_candidates_for_epistemic_filter(&self) -> Vec<FusedCandidate> {
+        fused_candidates_from_search_acquisition(self)
+    }
+}
+
+/// Convert provider acquisition candidates into the pure epistemic-filter input
+/// shape. Provider RRF scores are naturally small (`1 / (60 + rank)`), while the
+/// Theseus filter's default `min_score` is 0.1, so this bridge calibrates the
+/// acquisition-local top score to 1.0 before the filter runs.
+pub fn fused_candidates_from_search_acquisition(
+    acquisition: &SearchAcquisition,
+) -> Vec<FusedCandidate> {
+    let max_score = acquisition
+        .candidates
+        .iter()
+        .map(|candidate| candidate.score)
+        .fold(0.0_f64, f64::max);
+    if max_score <= 0.0 {
+        return Vec::new();
+    }
+
+    acquisition
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let mut fused = FusedCandidate::new(
+                candidate.normalized_url.clone(),
+                (candidate.score / max_score).clamp(0.0, 1.0),
+            );
+            fused.slug = Some(candidate.normalized_url.clone());
+            fused.title = candidate.candidate.title.clone().unwrap_or_default();
+            fused
+                .signals
+                .insert("provider_rrf".to_string(), candidate.score);
+            for source in &candidate.sources {
+                fused
+                    .signals
+                    .insert(format!("provider:{source}"), candidate.score);
+            }
+            fused
+        })
+        .collect()
+}
+
+/// Provider abstraction for borrowed breadth. Implementors may call live APIs
+/// (Brave/Mojeek/Exa/SerpAPI), offline indexes (OWI/Common Crawl), or fixture
+/// providers in tests. The trait returns a boxed future so the public surface is
+/// object-safe without requiring a provider-specific enum.
+pub trait SearchProvider: Send + Sync {
+    fn name(&self) -> &str;
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        opts: &'a SearchOpts,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>> + Send + 'a>>;
+}
+
+/// Fixture/provider harness used by tests and by future config smoke checks.
+#[derive(Clone, Debug)]
+pub struct StaticSearchProvider {
+    name: String,
+    candidates: Vec<SearchCandidate>,
+}
+
+impl StaticSearchProvider {
+    pub fn new(name: impl Into<String>, candidates: Vec<SearchCandidate>) -> Self {
+        Self {
+            name: name.into(),
+            candidates,
+        }
+    }
+}
+
+impl SearchProvider for StaticSearchProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
+        opts: &'a SearchOpts,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Ok(self
+                .candidates
+                .iter()
+                .take(opts.provider_limit)
+                .cloned()
+                .collect())
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CandidateAccumulator {
+    candidate: SearchCandidate,
+    normalized_url: String,
+    score: f64,
+    sources: BTreeSet<String>,
+}
+
+/// Fan out across enabled providers, fail soft per provider, dedupe by
+/// normalized URL, and RRF-merge provider-local ranks into one seed list.
+pub async fn fanout_search_providers(
+    providers: &[Arc<dyn SearchProvider>],
+    query: &str,
+    opts: SearchOpts,
+) -> SearchAcquisition {
+    let opts = opts.normalized();
+    let normalized_query = query.trim().to_string();
+    let calls = providers.iter().map(|provider| async {
+        let provider_name = provider.name().trim().to_string();
+        let result = provider.search(&normalized_query, &opts).await;
+        (provider_name, result)
+    });
+    let results = join_all(calls).await;
+
+    let mut receipts = Vec::with_capacity(results.len());
+    let mut by_url: BTreeMap<String, CandidateAccumulator> = BTreeMap::new();
+
+    for (provider_name, result) in results {
+        match result {
+            Ok(candidates) => {
+                let returned_candidates = candidates.len();
+                let mut admitted_candidates = 0usize;
+                for (index, mut candidate) in candidates.into_iter().enumerate() {
+                    let Some(normalized_url) = normalize_candidate_url(&candidate.url) else {
+                        continue;
+                    };
+                    admitted_candidates += 1;
+                    if candidate.source.trim().is_empty() {
+                        candidate.source = provider_name.clone();
+                    }
+                    if candidate.rank == 0 {
+                        candidate.rank = index + 1;
+                    }
+                    let source = candidate.source.clone();
+                    let rank = candidate.rank.max(1);
+                    let contribution = 1.0 / (opts.rrf_k + rank) as f64;
+                    let entry = by_url.entry(normalized_url.clone()).or_insert_with(|| {
+                        let mut sources = BTreeSet::new();
+                        sources.insert(source.clone());
+                        CandidateAccumulator {
+                            candidate: candidate.clone(),
+                            normalized_url,
+                            score: 0.0,
+                            sources,
+                        }
+                    });
+                    entry.score += contribution;
+                    entry.sources.insert(source);
+                    if entry.candidate.title.is_none() {
+                        entry.candidate.title = candidate.title;
+                    }
+                    if entry.candidate.snippet.is_none() {
+                        entry.candidate.snippet = candidate.snippet;
+                    }
+                }
+                receipts.push(SearchProviderReceipt {
+                    provider: provider_name,
+                    status: "ok".to_string(),
+                    returned_candidates,
+                    admitted_candidates,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                receipts.push(SearchProviderReceipt {
+                    provider: if error.provider.trim().is_empty() {
+                        provider_name
+                    } else {
+                        error.provider
+                    },
+                    status: "error".to_string(),
+                    returned_candidates: 0,
+                    admitted_candidates: 0,
+                    error: Some(error.message),
+                });
+            }
+        }
+    }
+
+    let mut candidates: Vec<RankedSearchCandidate> = by_url
+        .into_values()
+        .map(|accumulator| RankedSearchCandidate {
+            candidate: accumulator.candidate,
+            normalized_url: accumulator.normalized_url,
+            score: accumulator.score,
+            sources: accumulator.sources.into_iter().collect(),
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.normalized_url.cmp(&b.normalized_url))
+    });
+    candidates.truncate(opts.limit);
+
+    SearchAcquisition {
+        query: normalized_query,
+        candidates,
+        providers: receipts,
+    }
+}
+
+fn normalize_candidate_url(url: &str) -> Option<String> {
+    let mut parsed = Url::parse(url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.set_fragment(None);
+    if let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase()) {
+        parsed.set_host(Some(&host)).ok()?;
+    }
+    if (parsed.scheme() == "https" && parsed.port() == Some(443))
+        || (parsed.scheme() == "http" && parsed.port() == Some(80))
+    {
+        parsed.set_port(None).ok()?;
+    }
+    Some(parsed.to_string())
 }
 
 /// One page in the result neighbourhood, annotated with how it got there.
@@ -645,6 +978,10 @@ pub fn search_substrate(
 
 #[cfg(test)]
 mod tests {
+    use crate::epistemic_filter::{
+        apply_epistemic_filter, EpistemicFilterConfig, RrfFallbackScorer,
+    };
+
     use super::*;
     use crate::{build_v2_fixture_crawl, CrawlRequest, FetchedPage};
     use rustyred_thg_core::graph_store::InMemoryGraphStore;
@@ -947,6 +1284,117 @@ mod tests {
                 "{leaf} must not be flooded in through the super-hub"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn provider_fanout_dedupes_and_rrf_merges_candidates() {
+        let providers: Vec<Arc<dyn SearchProvider>> = vec![
+            Arc::new(StaticSearchProvider::new(
+                "brave",
+                vec![
+                    SearchCandidate {
+                        url: "https://Example.com/a#section".to_string(),
+                        title: Some("A from Brave".to_string()),
+                        snippet: Some("first provider".to_string()),
+                        source: "brave".to_string(),
+                        rank: 1,
+                    },
+                    SearchCandidate {
+                        url: "https://example.com/b".to_string(),
+                        title: Some("B".to_string()),
+                        snippet: None,
+                        source: "brave".to_string(),
+                        rank: 2,
+                    },
+                ],
+            )),
+            Arc::new(StaticSearchProvider::new(
+                "mojeek",
+                vec![
+                    SearchCandidate {
+                        url: "https://example.com/a".to_string(),
+                        title: Some("A from Mojeek".to_string()),
+                        snippet: None,
+                        source: "mojeek".to_string(),
+                        rank: 1,
+                    },
+                    SearchCandidate {
+                        url: "ftp://example.com/not-admitted".to_string(),
+                        title: None,
+                        snippet: None,
+                        source: "mojeek".to_string(),
+                        rank: 2,
+                    },
+                ],
+            )),
+        ];
+
+        let acquisition =
+            fanout_search_providers(&providers, "example", SearchOpts::default()).await;
+
+        assert_eq!(acquisition.providers.len(), 2);
+        assert_eq!(acquisition.providers[0].status, "ok");
+        assert_eq!(acquisition.providers[1].returned_candidates, 2);
+        assert_eq!(
+            acquisition.providers[1].admitted_candidates, 1,
+            "non-http candidates are not admitted as crawl seeds"
+        );
+        assert_eq!(acquisition.candidates.len(), 2);
+        assert_eq!(
+            acquisition.candidates[0].normalized_url,
+            "https://example.com/a"
+        );
+        assert_eq!(
+            acquisition.candidates[0].sources,
+            vec!["brave".to_string(), "mojeek".to_string()]
+        );
+        assert!(
+            acquisition.candidates[0].score > acquisition.candidates[1].score,
+            "duplicate high-rank support from two providers should RRF above a single-provider hit"
+        );
+        assert_eq!(
+            acquisition.seed_urls(1),
+            vec!["https://Example.com/a#section".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_acquisition_calibrates_into_epistemic_filter() {
+        let providers: Vec<Arc<dyn SearchProvider>> = vec![Arc::new(StaticSearchProvider::new(
+            "brave",
+            vec![SearchCandidate {
+                url: "https://example.com/provider-grounding".to_string(),
+                title: Some("Provider grounding".to_string()),
+                snippet: Some("search provider candidate".to_string()),
+                source: "brave".to_string(),
+                rank: 1,
+            }],
+        ))];
+
+        let acquisition =
+            fanout_search_providers(&providers, "provider grounding", SearchOpts::default()).await;
+        let fused = acquisition.fused_candidates_for_epistemic_filter();
+
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].rrf_score, 1.0);
+        assert_eq!(
+            fused[0].signals.get("provider:brave"),
+            Some(&acquisition.candidates[0].score)
+        );
+
+        let filtered = apply_epistemic_filter(
+            fused,
+            "provider grounding",
+            &EpistemicFilterConfig::default(),
+            &RrfFallbackScorer,
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].object_pk,
+            "https://example.com/provider-grounding"
+        );
+        assert!(filtered[0].learned_score >= EpistemicFilterConfig::default().min_score);
     }
 
     fn store_url(store: &InMemoryGraphStore, node_id: &str) -> String {

@@ -271,7 +271,11 @@ fn boost_epistemic(result: &mut ScoredResult, is_code_debug: bool) {
 
 /// Stage 8: title-query overlap bonus for one result given the query word set and
 /// the candidate's title.
-fn apply_title_overlap_bonus(result: &mut ScoredResult, query_words: &HashSet<String>, title: &str) {
+fn apply_title_overlap_bonus(
+    result: &mut ScoredResult,
+    query_words: &HashSet<String>,
+    title: &str,
+) {
     let title_words: HashSet<String> = title
         .to_lowercase()
         .split_whitespace()
@@ -445,7 +449,8 @@ mod tests {
     #[test]
     fn rrf_fallback_scorer_carries_rrf_into_learned_score() {
         let fused = vec![candidate("a", 0.5), candidate("b", 0.25)];
-        let out = apply_epistemic_filter_for_test(fused, "anything", &EpistemicFilterConfig::default());
+        let out =
+            apply_epistemic_filter_for_test(fused, "anything", &EpistemicFilterConfig::default());
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].object_pk, "a");
         assert_eq!(out[0].scoring_method, "rrf_fallback");
@@ -548,8 +553,14 @@ mod tests {
             &EpistemicFilterConfig::default(),
         );
         let pks: Vec<&str> = out.iter().map(|r| r.object_pk.as_str()).collect();
-        assert!(pks.contains(&"high"), "the higher-scored duplicate survives");
-        assert!(!pks.contains(&"low"), "the lower-scored duplicate is dropped");
+        assert!(
+            pks.contains(&"high"),
+            "the higher-scored duplicate survives"
+        );
+        assert!(
+            !pks.contains(&"low"),
+            "the lower-scored duplicate is dropped"
+        );
         assert!(pks.contains(&"other"));
     }
 
@@ -609,7 +620,12 @@ mod tests {
 
         // Default: only accepted survives.
         let out = apply_epistemic_filter_for_test(
-            vec![accepted.clone(), retracted.clone(), provisional.clone(), contested.clone()],
+            vec![
+                accepted.clone(),
+                retracted.clone(),
+                provisional.clone(),
+                contested.clone(),
+            ],
             "q",
             &EpistemicFilterConfig::default(),
         );
@@ -622,8 +638,11 @@ mod tests {
             include_contested: true,
             ..EpistemicFilterConfig::default()
         };
-        let out =
-            apply_epistemic_filter_for_test(vec![accepted, retracted, provisional, contested], "q", &permissive);
+        let out = apply_epistemic_filter_for_test(
+            vec![accepted, retracted, provisional, contested],
+            "q",
+            &permissive,
+        );
         let mut pks: Vec<&str> = out.iter().map(|r| r.object_pk.as_str()).collect();
         pks.sort();
         assert_eq!(pks, vec!["cont", "ok", "prov"]);
@@ -666,8 +685,16 @@ mod tests {
                 },
             ]
         };
-        let first = apply_epistemic_filter_for_test(build(), "shared topic", &EpistemicFilterConfig::default());
-        let second = apply_epistemic_filter_for_test(build(), "shared topic", &EpistemicFilterConfig::default());
+        let first = apply_epistemic_filter_for_test(
+            build(),
+            "shared topic",
+            &EpistemicFilterConfig::default(),
+        );
+        let second = apply_epistemic_filter_for_test(
+            build(),
+            "shared topic",
+            &EpistemicFilterConfig::default(),
+        );
         assert_eq!(first, second);
     }
 

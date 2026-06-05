@@ -64,8 +64,45 @@ Pick the vertical to vectorize first by where there is both an existing corpus a
 
 ## Wiring summary
 
-`search.rs` in `rustyred-web` holds the `SearchProvider` trait and impls, the fan-out, dedup, and RRF merge, the ported eleven-stage filter, and the entry into the crawl-feed loop. One `FetchCascade` is owned in the MCP and server state for `DomainTierState` persistence and is shared with the fractal loop. The embedding client points at the theorem-owned 4B endpoint. Turbovec is the single vector index in core, replacing the HNSW in `graph_store.rs`, and `rustyred-web` writes crawl vectors to it. A search MCP tool is registered in `rustyred-thg-mcp/src/lib.rs` mirroring the fractal tool, running the fan-out and returning ranked candidates, optionally triggering the crawl-feed.
+`search.rs` in `rustyred-web` holds the `SearchProvider` trait and impls, the fan-out, dedup, and RRF merge; `epistemic_filter.rs` holds the pure eleven-stage filter port, but hydration/scorer integration and the crawl-feed entry stay as follow-up work. One `FetchCascade` is owned in the MCP and server state for `DomainTierState` persistence and is shared with the fractal loop. The embedding client points at the theorem-owned 4B endpoint. Turbovec is the single vector index in core, replacing the HNSW in `graph_store.rs`, and `rustyred-web` writes crawl vectors to it. A search MCP tool is registered in `rustyred-thg-mcp/src/lib.rs` mirroring the fractal tool, running the fan-out and returning ranked candidates, optionally triggering the crawl-feed.
 
 ## Open items
 
 The rquest pin and Servo V2 embedding API carry over from the `live-web-reach` handoff. The eleven-stage filter port should be done stage by stage against the Theseus reference. Provider keys and quotas (Brave, Exa, SerpAPI) go in config and secrets. Decide whether to stand up the OWI MOSAIC sidecar now or defer to offline ingest. Confirm the Qwen3-Reranker (4B or 8B) is served alongside the embedder for the exact rerank over Turbovec's approximate candidates.
+
+## Implementation status (2026-06-05 Codex)
+
+First slice landed in the Rust library layer:
+
+- `rustyred-web/src/search.rs` now owns the borrowed-breadth acquisition contract: `SearchProvider`, `SearchOpts`, `SearchCandidate`, provider receipts, `fanout_search_providers`, normalized URL dedupe, and RRF merge.
+- `rustyred-web/src/epistemic_filter.rs` is exported as the pure ranking/filter port. `SearchAcquisition::fused_candidates_for_epistemic_filter` now calibrates provider RRF scores into the filter input shape so default `min_score` does not drop every borrowed-breadth candidate. Full graph hydration and learned scorer wiring are still open.
+- `StaticSearchProvider` gives tests and future config smoke checks a deterministic provider.
+- `rustyred-web/src/providers.rs` now has live provider adapters for Brave, Mojeek, Exa, and SerpAPI, plus a file-backed offline JSON/JSONL seed-manifest provider for OWI/Common Crawl corpus jobs. Providers are enabled only by `RUSTYWEB_SEARCH_PROVIDERS` / `RUSTY_RED_SEARCH_PROVIDERS` plus provider-specific config; stray keys alone do not trigger outbound API calls.
+- `rustyred-thg-fractal` now exposes `run_fractal_expansion_with_search_providers` and `run_fixture_fractal_expansion_with_search_providers`; provider candidates are merged into `web_seed_urls`, and receipts report provider candidates plus provider receipts.
+- `rustyweb_search_acquisition` is advertised by `rustyred-thg-mcp` and intercepted by `rustyred-thg-server`; tests cover both the stable empty-provider shape and configured-provider seed URLs.
+- `fractal_expansion` now calls the provider-backed wrapper when the server has configured providers; otherwise it preserves the existing explicit-seed/frontier behavior.
+- `rustyred-web/src/embedding.rs` owns the Qwen3-Embedding-4B contract: model id `Qwen/Qwen3-Embedding-4B`, `Page.semantic_vec`, 2560 dimensions, cosine normalization, OpenAI/vLLM and TEI response parsing, env-configured HTTP client, crawl Page annotation, and an embedding receipt.
+- Live `run_fractal_expansion` embeds admitted crawl pages when a Qwen4B endpoint is configured; fixture fractal runs stay deterministic and skip outbound embedding.
+- `rustyred-thg-server` designates `Page.semantic_vec` at 2560 dimensions before live fractal writes and returns a `vector_designation` readiness payload so Redis or unsupported stores fail transparently instead of silently missing the vector index.
+- `rustyred-thg-core` moved the graph vector index off `instant-distance` HNSW and onto Turbovec `IdMapIndex` with exact cosine rerank over recalled candidates. Unsupported toy dimensions fall back to exact search so small tests keep their old semantics; supported embedding dimensions exercise Turbovec.
+- Focused validation is green: `cargo test -p rustyred-thg-core`, `cargo test -p rustyred-web`, `cargo test -p rustyred-thg-fractal`, `cargo test -p rustyred-thg-mcp`, and `cargo test -p rustyred-thg-server`.
+
+Still open for the next slice:
+
+- Add the heavier OWI/Common Crawl ingest path into Tantivy/Turbovec once the corpus target is chosen; the JSON/JSONL seed-manifest provider is only the first offline bridge.
+- Wire hydrated graph fields and a learned scorer into the existing pure eleven-stage filter.
+- Run the full corpus re-embed with Qwen3-Embedding-4B and rebuild the production vector indexes. The live crawl path is ready, but the historical corpus migration has not been run here.
+- Confirm and serve the Qwen3-Reranker model alongside the embedder for exact rerank over Turbovec recall.
+
+Provider env:
+
+- `RUSTYWEB_SEARCH_PROVIDERS=brave,mojeek,exa,serpapi,offline` (or `RUSTY_RED_SEARCH_PROVIDERS`).
+- Brave key: `RUSTYWEB_BRAVE_SEARCH_API_KEY`, `RUSTY_RED_BRAVE_SEARCH_API_KEY`, or `BRAVE_SEARCH_API_KEY`.
+- Mojeek key: `RUSTYWEB_MOJEEK_SEARCH_API_KEY`, `RUSTY_RED_MOJEEK_SEARCH_API_KEY`, or `MOJEEK_SEARCH_API_KEY`.
+- Exa key: `RUSTYWEB_EXA_API_KEY`, `RUSTY_RED_EXA_API_KEY`, or `EXA_API_KEY`.
+- SerpAPI key: `RUSTYWEB_SERPAPI_API_KEY`, `RUSTY_RED_SERPAPI_API_KEY`, or `SERPAPI_API_KEY`.
+- Offline seed manifest: `RUSTYWEB_OFFLINE_SEARCH_MANIFEST` or `RUSTY_RED_OFFLINE_SEARCH_MANIFEST`. The file can be a JSON array or JSONL rows with `url`, optional `title`, `snippet`, `source`, `rank`, `query`, and `terms`.
+- Qwen4B embed endpoint: `RUSTYWEB_QWEN4B_EMBED_URL`, `RUSTYWEB_QWEN3_EMBEDDING_4B_URL`, `RUSTY_RED_QWEN4B_EMBED_URL`, `RUNPOD_QWEN3_EMBED_URL`, or `QWEN3_EMBEDDING_4B_URL`.
+- Optional Qwen4B overrides: `RUSTYWEB_QWEN4B_MODEL_ID`, `RUSTYWEB_QWEN4B_DIMENSION`, `RUSTYWEB_QWEN4B_BATCH_SIZE`, `RUSTYWEB_QWEN4B_TIMEOUT_SECONDS`, and `RUSTYWEB_QWEN4B_REQUEST_FORMAT` (`auto`, `openai`, or `tei`).
+
+Docs checked before implementation: Brave Web Search uses `https://api.search.brave.com/res/v1/web/search` with `X-Subscription-Token` and returns `web.results`; Exa uses `POST https://api.exa.ai/search` with `x-api-key` and `results`; SerpAPI Google Search uses `https://serpapi.com/search.json?engine=google` and `organic_results`; Mojeek uses `https://api.mojeek.com/search` with `api_key`, `q`, `fmt=json`, and `response.results`.

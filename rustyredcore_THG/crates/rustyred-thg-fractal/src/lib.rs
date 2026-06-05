@@ -5,16 +5,19 @@
 //! admitted web graph state as a lower-trust, quarantined tier.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use rustyred_thg_core::{GraphMutation, GraphStore, NodeQuery, ThgError, ThgResult};
 use rustyred_web::{
-    build_v2_fixture_crawl, search_substrate, CrawlRequest, FetchCascade, FetchTierResult,
-    FetchedPage, SearchOptions, LABEL_PAGE,
+    build_v2_fixture_crawl, configured_qwen3_embedding_4b_client_from_env, embed_crawl_graph_pages,
+    fanout_search_providers, search_substrate, CrawlEmbeddingReceipt, CrawlRequest, CrawlRunOutput,
+    FetchCascade, FetchTierResult, FetchedPage, SearchAcquisition, SearchOptions, SearchOpts,
+    SearchProvider, LABEL_PAGE, QWEN3_EMBEDDING_4B_MODEL_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const DEFAULT_FRACTAL_EMBEDDER_MODEL: &str = "qwen3-embedding-8b";
+pub const DEFAULT_FRACTAL_EMBEDDER_MODEL: &str = QWEN3_EMBEDDING_4B_MODEL_ID;
 pub const OPEN_WEB_UNVERIFIED_TRUST_TIER: &str = "open_web_unverified";
 pub const DEFAULT_OPEN_WEB_CONFIDENCE_CEILING: f32 = 0.35;
 
@@ -80,6 +83,33 @@ pub struct FractalExpansionReceipt {
     pub crawl_receipt_id: String,
     pub admitted_pages: usize,
     pub applied_writes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_receipt: Option<CrawlEmbeddingReceipt>,
+    #[serde(default)]
+    pub provider_candidates: Vec<FractalProviderCandidate>,
+    #[serde(default)]
+    pub provider_receipts: Vec<FractalProviderReceipt>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FractalProviderCandidate {
+    pub url: String,
+    pub score: f64,
+    pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FractalProviderReceipt {
+    pub provider: String,
+    pub status: String,
+    pub returned_candidates: usize,
+    pub admitted_candidates: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub fn run_fixture_fractal_expansion<S: GraphStore>(
@@ -99,7 +129,8 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
         ));
     }
 
-    ingest_admitted_pages(store, &request, web_seed_urls, fetched_pages, frontier)
+    let mut output = build_admitted_pages_output(&request, &web_seed_urls, fetched_pages)?;
+    apply_admitted_pages(store, &request, web_seed_urls, frontier, &mut output, None)
 }
 
 pub async fn run_fractal_expansion<S: GraphStore>(
@@ -127,7 +158,45 @@ pub async fn run_fractal_expansion<S: GraphStore>(
         }
     }
 
-    ingest_admitted_pages(store, &request, web_seed_urls, &fetched, frontier)
+    let mut output = build_admitted_pages_output(&request, &web_seed_urls, &fetched)?;
+    let embedding_receipt = maybe_embed_live_crawl_output(&mut output).await?;
+    apply_admitted_pages(
+        store,
+        &request,
+        web_seed_urls,
+        frontier,
+        &mut output,
+        embedding_receipt,
+    )
+}
+
+pub async fn run_fractal_expansion_with_search_providers<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    cascade: &FetchCascade,
+    max_bytes: usize,
+    providers: &[Arc<dyn SearchProvider>],
+    search_opts: SearchOpts,
+) -> ThgResult<FractalExpansionReceipt> {
+    let (request, acquisition) =
+        request_with_provider_seeds(request.normalized(), providers, search_opts).await;
+    let mut receipt = run_fractal_expansion(store, request, cascade, max_bytes).await?;
+    attach_acquisition(&mut receipt, acquisition);
+    Ok(receipt)
+}
+
+pub async fn run_fixture_fractal_expansion_with_search_providers<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    fetched_pages: &[FetchedPage],
+    providers: &[Arc<dyn SearchProvider>],
+    search_opts: SearchOpts,
+) -> ThgResult<FractalExpansionReceipt> {
+    let (request, acquisition) =
+        request_with_provider_seeds(request.normalized(), providers, search_opts).await;
+    let mut receipt = run_fixture_fractal_expansion(store, request, fetched_pages)?;
+    attach_acquisition(&mut receipt, acquisition);
+    Ok(receipt)
 }
 
 pub fn open_web_pages_for_tenant<S: GraphStore>(store: &S, tenant_id: &str) -> Vec<String> {
@@ -141,6 +210,56 @@ pub fn open_web_pages_for_tenant<S: GraphStore>(store: &S, tenant_id: &str) -> V
         })
         .filter_map(|node| prop_str(&node.properties, "url").map(str::to_string))
         .collect()
+}
+
+async fn request_with_provider_seeds(
+    mut request: FractalExpansionRequest,
+    providers: &[Arc<dyn SearchProvider>],
+    search_opts: SearchOpts,
+) -> (FractalExpansionRequest, SearchAcquisition) {
+    let mut opts = search_opts.normalized();
+    opts.limit = opts.limit.max(request.web_seed_limit.max(1));
+    let acquisition = fanout_search_providers(providers, &request.query, opts).await;
+    merge_provider_seeds(&mut request, &acquisition);
+    (request, acquisition)
+}
+
+fn merge_provider_seeds(request: &mut FractalExpansionRequest, acquisition: &SearchAcquisition) {
+    let mut seen: BTreeSet<String> = request.web_seed_urls.iter().cloned().collect();
+    for candidate in &acquisition.candidates {
+        if request.web_seed_urls.len() >= request.web_seed_limit {
+            break;
+        }
+        let url = candidate.candidate.url.trim();
+        if !url.is_empty() && seen.insert(url.to_string()) {
+            request.web_seed_urls.push(url.to_string());
+        }
+    }
+}
+
+fn attach_acquisition(receipt: &mut FractalExpansionReceipt, acquisition: SearchAcquisition) {
+    receipt.provider_candidates = acquisition
+        .candidates
+        .into_iter()
+        .map(|candidate| FractalProviderCandidate {
+            url: candidate.candidate.url,
+            score: candidate.score,
+            sources: candidate.sources,
+            title: candidate.candidate.title,
+            snippet: candidate.candidate.snippet,
+        })
+        .collect();
+    receipt.provider_receipts = acquisition
+        .providers
+        .into_iter()
+        .map(|provider| FractalProviderReceipt {
+            provider: provider.provider,
+            status: provider.status,
+            returned_candidates: provider.returned_candidates,
+            admitted_candidates: provider.admitted_candidates,
+            error: provider.error,
+        })
+        .collect();
 }
 
 fn validate_request(request: &FractalExpansionRequest) -> ThgResult<()> {
@@ -233,15 +352,13 @@ fn rank_and_sanitize_pages(query: &str, pages: &[FetchedPage], top_k: usize) -> 
         .collect()
 }
 
-fn ingest_admitted_pages<S: GraphStore>(
-    store: &mut S,
+fn build_admitted_pages_output(
     request: &FractalExpansionRequest,
-    web_seed_urls: Vec<String>,
+    web_seed_urls: &[String],
     fetched_pages: &[FetchedPage],
-    frontier: Vec<FractalFrontierHit>,
-) -> ThgResult<FractalExpansionReceipt> {
+) -> ThgResult<CrawlRunOutput> {
     let admitted_pages = rank_and_sanitize_pages(&request.query, fetched_pages, request.top_k);
-    let mut crawl_request = CrawlRequest::new(request.run_id.clone(), web_seed_urls.clone());
+    let mut crawl_request = CrawlRequest::new(request.run_id.clone(), web_seed_urls.to_vec());
     crawl_request.scope.namespace = format!("fractal:{}", request.tenant_id);
     crawl_request.scope.source_graph = "rustyred_fractal_expansion".to_string();
     crawl_request.scope.source_license = OPEN_WEB_UNVERIFIED_TRUST_TIER.to_string();
@@ -250,6 +367,31 @@ fn ingest_admitted_pages<S: GraphStore>(
     let mut output = build_v2_fixture_crawl(crawl_request, &admitted_pages)
         .map_err(|error| ThgError::new("fractal_web_crawl_failed", error.to_string()))?;
     annotate_open_web_batch(&mut output.graph.batch.mutations, request);
+    Ok(output)
+}
+
+async fn maybe_embed_live_crawl_output(
+    output: &mut CrawlRunOutput,
+) -> ThgResult<Option<CrawlEmbeddingReceipt>> {
+    let Some(embedder) = configured_qwen3_embedding_4b_client_from_env()
+        .map_err(|error| ThgError::new("fractal_embedding_config_failed", error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let receipt = embed_crawl_graph_pages(&mut output.graph, &embedder)
+        .await
+        .map_err(|error| ThgError::new("fractal_embedding_failed", error.to_string()))?;
+    Ok(Some(receipt))
+}
+
+fn apply_admitted_pages<S: GraphStore>(
+    store: &mut S,
+    request: &FractalExpansionRequest,
+    web_seed_urls: Vec<String>,
+    frontier: Vec<FractalFrontierHit>,
+    output: &mut CrawlRunOutput,
+    embedding_receipt: Option<CrawlEmbeddingReceipt>,
+) -> ThgResult<FractalExpansionReceipt> {
     let writes = output
         .graph
         .apply_to_store(store)
@@ -267,9 +409,12 @@ fn ingest_admitted_pages<S: GraphStore>(
         web_reached: true,
         web_seed_urls,
         frontier,
-        crawl_receipt_id: output.receipt.receipt_id,
+        crawl_receipt_id: output.receipt.receipt_id.clone(),
         admitted_pages: output.receipt.counters.fetched_pages,
         applied_writes: writes.len(),
+        embedding_receipt,
+        provider_candidates: Vec::new(),
+        provider_receipts: Vec::new(),
     })
 }
 
@@ -343,8 +488,13 @@ fn prop_str<'a>(properties: &'a Value, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rustyred_thg_core::InMemoryGraphStore;
-    use rustyred_web::{build_v2_fixture_crawl, CrawlRequest, FetchedPage};
+    use rustyred_web::{
+        build_v2_fixture_crawl, CrawlRequest, FetchedPage, SearchCandidate, SearchOpts,
+        SearchProvider, StaticSearchProvider,
+    };
 
     use super::*;
 
@@ -481,5 +631,56 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, "fractal_web_seed_required");
+    }
+
+    #[tokio::test]
+    async fn fixture_fractal_expansion_uses_provider_candidates_as_web_seeds() {
+        let mut store = InMemoryGraphStore::new();
+        let providers: Vec<Arc<dyn SearchProvider>> = vec![Arc::new(StaticSearchProvider::new(
+            "brave",
+            vec![SearchCandidate {
+                url: "https://example.com/provider-grounding".to_string(),
+                title: Some("Provider grounding".to_string()),
+                snippet: Some("search provider candidate".to_string()),
+                source: "brave".to_string(),
+                rank: 1,
+            }],
+        ))];
+
+        let receipt = run_fixture_fractal_expansion_with_search_providers(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "provider-fractal".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "provider grounding".to_string(),
+                web_seed_urls: Vec::new(),
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 4,
+                embedder_model: None,
+                actor_id: Some("test".to_string()),
+            },
+            &[FetchedPage::html(
+                "https://example.com/provider-grounding",
+                "<html><body>Provider grounding search candidate body</body></html>",
+            )],
+            &providers,
+            SearchOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(receipt.web_reached);
+        assert_eq!(
+            receipt.web_seed_urls,
+            vec!["https://example.com/provider-grounding".to_string()]
+        );
+        assert_eq!(receipt.provider_candidates.len(), 1);
+        assert_eq!(receipt.provider_candidates[0].sources, vec!["brave"]);
+        assert_eq!(receipt.provider_receipts.len(), 1);
+        assert_eq!(receipt.provider_receipts[0].status, "ok");
+
+        let open_web_pages = open_web_pages_for_tenant(&store, "theorem");
+        assert!(open_web_pages.contains(&"https://example.com/provider-grounding".to_string()));
     }
 }

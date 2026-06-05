@@ -29,16 +29,19 @@ use rustyred_thg_core::{
     GraphVersionRepository, GraphWriteResult, HarnessInstantKg, InMemoryGraphStore, NeighborHit,
     NeighborQuery, NodeQuery, NodeRecord, SessionDelta, VerifyReport,
 };
-use rustyred_thg_fractal::{run_fractal_expansion, FractalExpansionRequest};
+use rustyred_thg_fractal::{
+    run_fractal_expansion, run_fractal_expansion_with_search_providers, FractalExpansionRequest,
+};
 use rustyred_thg_mcp::{
     agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
 };
 use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
-    render_serp_html, run_live_crawl, search_substrate, CrawlBudget, CrawlReceipt, CrawlRequest,
-    CrawlScope, PageRecord, RustyWebError, SearchOptions, WebCommonsFragment,
-    WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt, EDGE_LINKS_TO,
-    LABEL_PAGE, LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER,
+    fanout_search_providers, render_serp_html, run_live_crawl, search_substrate, CrawlBudget,
+    CrawlReceipt, CrawlRequest, CrawlScope, PageRecord, RustyWebError, SearchOptions, SearchOpts,
+    WebCommonsFragment, WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt,
+    EDGE_LINKS_TO, LABEL_PAGE, LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER,
+    QWEN3_EMBEDDING_4B_DIMENSION, SEMANTIC_VECTOR_PROPERTY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -561,6 +564,11 @@ async fn mcp_post(
 
     let config = state.mcp_config();
     let mcp_context = McpRequestContext::with_scopes(auth_context.scopes);
+    if let Some(response) =
+        maybe_handle_live_search_acquisition_mcp(&state, &config, &payload).await
+    {
+        return Json(response).into_response();
+    }
     if let Some(response) = maybe_handle_live_fractal_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
     }
@@ -650,6 +658,88 @@ async fn maybe_handle_live_fractal_mcp(
     }))
 }
 
+async fn maybe_handle_live_search_acquisition_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "rustyweb_search_acquisition" | "search_acquisition") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match live_search_acquisition_payload(state, config, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn live_search_acquisition_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_search_acquisition",
+            "message": "rustyweb_search_acquisition requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let provider_allowlist = string_array_argument(arguments, "providers");
+    let providers = state.search_providers(&provider_allowlist);
+    let opts = SearchOpts {
+        provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
+            .unwrap_or(10)
+            .clamp(1, 50) as usize,
+        limit: argument_u64_any(arguments, &["limit", "top_k", "topK"])
+            .unwrap_or(16)
+            .clamp(1, 100) as usize,
+        rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
+            .unwrap_or(60)
+            .clamp(1, 1_000) as usize,
+    };
+    let seed_limit = argument_u64_any(arguments, &["seed_limit", "seedLimit"])
+        .unwrap_or(8)
+        .clamp(1, 50) as usize;
+    let acquisition = fanout_search_providers(&providers, &query, opts).await;
+    let seed_urls = acquisition.seed_urls(seed_limit);
+    let normalized_query = acquisition.query.clone();
+    let stats = json!({
+        "candidates": acquisition.candidates.len(),
+        "providers": providers.len(),
+        "provider_receipts": acquisition.providers.len(),
+        "seed_urls": seed_urls.len(),
+    });
+
+    Ok(json!({
+        "tenant": tenant,
+        "query": normalized_query,
+        "acquisition": acquisition,
+        "seed_urls": seed_urls,
+        "stats": stats
+    }))
+}
+
 async fn live_fractal_expansion_payload(
     state: &AppState,
     config: &rustyred_thg_mcp::McpServerConfig,
@@ -673,6 +763,7 @@ async fn live_fractal_expansion_payload(
             "message": error.message
         })
     })?;
+    let vector_designation = ensure_fractal_vector_designation(&store);
     let mut fractal_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
         json!({
             "error": "fractal_store_unavailable",
@@ -697,19 +788,67 @@ async fn live_fractal_expansion_payload(
     let max_bytes = argument_u64_any(arguments, &["max_bytes", "maxBytes"])
         .unwrap_or(LIVE_SEARCH_DEFAULT_MAX_BYTES as u64)
         .clamp(1, LIVE_SEARCH_HARD_MAX_BYTES as u64) as usize;
+    let provider_allowlist = string_array_argument(arguments, "providers");
+    let providers = state.search_providers(&provider_allowlist);
+    let search_opts = SearchOpts {
+        provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
+            .unwrap_or(10)
+            .clamp(1, 50) as usize,
+        limit: argument_u64_any(arguments, &["search_limit", "searchLimit"])
+            .unwrap_or(request.web_seed_limit as u64)
+            .clamp(1, 100) as usize,
+        rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
+            .unwrap_or(60)
+            .clamp(1, 1_000) as usize,
+    };
     let cascade = state.live_fetch_cascade();
-    let receipt = run_fractal_expansion(&mut fractal_store, request, cascade.as_ref(), max_bytes)
+    let receipt = if providers.is_empty() {
+        run_fractal_expansion(&mut fractal_store, request, cascade.as_ref(), max_bytes).await
+    } else {
+        run_fractal_expansion_with_search_providers(
+            &mut fractal_store,
+            request,
+            cascade.as_ref(),
+            max_bytes,
+            &providers,
+            search_opts,
+        )
         .await
-        .map_err(|error| {
-            json!({
-                "error": error.code,
-                "message": error.message
-            })
-        })?;
+    }
+    .map_err(|error| {
+        json!({
+            "error": error.code,
+            "message": error.message
+        })
+    })?;
     Ok(json!({
         "tenant": tenant,
-        "receipt": receipt
+        "receipt": receipt,
+        "vector_designation": vector_designation
     }))
+}
+
+fn ensure_fractal_vector_designation(store: &TenantGraphStore) -> Value {
+    match store.designate_vector_property(
+        LABEL_PAGE,
+        SEMANTIC_VECTOR_PROPERTY,
+        QWEN3_EMBEDDING_4B_DIMENSION,
+    ) {
+        Ok(()) => json!({
+            "status": "ready",
+            "label": LABEL_PAGE,
+            "property": SEMANTIC_VECTOR_PROPERTY,
+            "dimension": QWEN3_EMBEDDING_4B_DIMENSION
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "label": LABEL_PAGE,
+            "property": SEMANTIC_VECTOR_PROPERTY,
+            "dimension": QWEN3_EMBEDDING_4B_DIMENSION,
+            "code": error.code,
+            "message": error.message
+        }),
+    }
 }
 
 struct TenantMirrorGraphStore<'a> {
@@ -5343,6 +5482,7 @@ async fn instant_kg_explain_edge(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use axum::body::{to_bytes, Body};
     use axum::extract::{Query, State};
@@ -5359,12 +5499,13 @@ mod tests {
         graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes, graph_error_status,
         graph_fulltext_search, graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge,
         instant_kg_impact, instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command,
-        is_graph_command, live_search_budget, live_search_is_sparse, mcp_origin_allowed,
-        public_cypher, required_scope_for_command, search_live, transaction_begin,
-        transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
-        FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
-        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, PageRankBody,
-        PprBody, PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        is_graph_command, live_search_budget, live_search_is_sparse,
+        maybe_handle_live_search_acquisition_mcp, mcp_origin_allowed, public_cypher,
+        required_scope_for_command, search_live, transaction_begin, transaction_commit,
+        transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody,
+        HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
+        InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, PageRankBody, PprBody,
+        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         config::{Config, StorageMode, TenantConfigOverride},
@@ -5372,6 +5513,7 @@ mod tests {
         state::AppState,
     };
     use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
+    use rustyred_web::{SearchCandidate, SearchProvider, StaticSearchProvider};
 
     async fn response_payload_json(response: axum::response::Response) -> Value {
         serde_json::from_slice(
@@ -5384,40 +5526,49 @@ mod tests {
     }
 
     fn memory_product_state() -> AppState {
-        AppState::new(Config {
-            host: "127.0.0.1".to_string(),
-            port: 8380,
-            storage_mode: StorageMode::Memory,
-            data_dir: "data/rusty-red".to_string(),
-            require_volume: false,
-            volume_available: false,
-            durability: RedCoreDurability::None,
-            snapshot_interval_writes: 0,
-            strict_acid: false,
-            concurrency: "single_writer".to_string(),
-            txn_isolation: "snapshot".to_string(),
-            tenant_memory_quota_bytes: 0,
-            tenant_memory_quota_config_error: None,
-            tenant_config_overrides: Default::default(),
-            tenant_config_error: None,
-            slow_query_threshold_nanos: 100_000_000,
-            slow_query_capacity: 128,
-            slow_query_log: None,
-            hybrid_scoring: rustyred_thg_core::HybridScoringConfig::default(),
-            redis_url: "not-a-redis-url".to_string(),
-            redis_key_prefix: "rusty-red".to_string(),
-            require_auth: false,
-            allowed_origins: Vec::new(),
-            api_tokens: Vec::new(),
-            service_name: "rusty-red".to_string(),
-            api_title: "Rusty Red".to_string(),
-            public_url: None,
-            mcp_enabled: true,
-            mcp_read_only: true,
-            mcp_allow_admin: false,
-            mcp_default_tenant: "default".to_string(),
-            ttl_sweep_ms: 1000,
-        })
+        memory_product_state_with_search_providers(Vec::new())
+    }
+
+    fn memory_product_state_with_search_providers(
+        search_providers: Vec<Arc<dyn SearchProvider>>,
+    ) -> AppState {
+        AppState::new_with_search_providers(
+            Config {
+                host: "127.0.0.1".to_string(),
+                port: 8380,
+                storage_mode: StorageMode::Memory,
+                data_dir: "data/rusty-red".to_string(),
+                require_volume: false,
+                volume_available: false,
+                durability: RedCoreDurability::None,
+                snapshot_interval_writes: 0,
+                strict_acid: false,
+                concurrency: "single_writer".to_string(),
+                txn_isolation: "snapshot".to_string(),
+                tenant_memory_quota_bytes: 0,
+                tenant_memory_quota_config_error: None,
+                tenant_config_overrides: Default::default(),
+                tenant_config_error: None,
+                slow_query_threshold_nanos: 100_000_000,
+                slow_query_capacity: 128,
+                slow_query_log: None,
+                hybrid_scoring: rustyred_thg_core::HybridScoringConfig::default(),
+                redis_url: "not-a-redis-url".to_string(),
+                redis_key_prefix: "rusty-red".to_string(),
+                require_auth: false,
+                allowed_origins: Vec::new(),
+                api_tokens: Vec::new(),
+                service_name: "rusty-red".to_string(),
+                api_title: "Rusty Red".to_string(),
+                public_url: None,
+                mcp_enabled: true,
+                mcp_read_only: true,
+                mcp_allow_admin: false,
+                mcp_default_tenant: "default".to_string(),
+                ttl_sweep_ms: 1000,
+            },
+            search_providers,
+        )
     }
 
     #[test]
@@ -5444,6 +5595,95 @@ mod tests {
         assert_eq!(budget.max_seconds, 30);
         assert_eq!(budget.max_depth, 2);
         assert_eq!(budget.max_bytes, 5 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn mcp_search_acquisition_intercept_returns_empty_registry_shape() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+        let response = maybe_handle_live_search_acquisition_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "search-acquisition",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyweb_search_acquisition",
+                    "arguments": {
+                        "q": " rustyweb ",
+                        "seed_limit": 4
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("search acquisition MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["query"], "rustyweb");
+        assert_eq!(payload["stats"]["providers"], 0);
+        assert_eq!(payload["stats"]["candidates"], 0);
+        assert!(payload["seed_urls"].as_array().unwrap().is_empty());
+        assert!(payload["acquisition"]["providers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_search_acquisition_intercept_returns_provider_seed_urls() {
+        let state =
+            memory_product_state_with_search_providers(vec![Arc::new(StaticSearchProvider::new(
+                "static",
+                vec![
+                    SearchCandidate {
+                        url: "https://example.com/search-candidate".to_string(),
+                        title: Some("Search candidate".to_string()),
+                        snippet: Some("candidate from configured provider".to_string()),
+                        source: "static".to_string(),
+                        rank: 1,
+                    },
+                    SearchCandidate {
+                        url: "https://example.com/other".to_string(),
+                        title: Some("Other".to_string()),
+                        snippet: None,
+                        source: "static".to_string(),
+                        rank: 2,
+                    },
+                ],
+            ))]);
+        let config = state.mcp_config();
+        let response = maybe_handle_live_search_acquisition_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "search-acquisition-with-provider",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyweb_search_acquisition",
+                    "arguments": {
+                        "query": "search candidate",
+                        "providers": ["static"],
+                        "seed_limit": 1
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("search acquisition MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["stats"]["providers"], 1);
+        assert_eq!(payload["stats"]["candidates"], 2);
+        assert_eq!(
+            payload["seed_urls"].as_array().unwrap()[0],
+            "https://example.com/search-candidate"
+        );
+        assert_eq!(payload["acquisition"]["providers"][0]["provider"], "static");
+        assert_eq!(payload["acquisition"]["providers"][0]["status"], "ok");
     }
 
     #[tokio::test]
