@@ -8,14 +8,25 @@
 //!
 //! Kept as pure functions over `GraphStore` so they are unit-testable without a
 //! live server; `main.rs` is a thin Axum shell that calls them.
+//!
+//! Push (docs/plans/coordination-room-push) lives in [`push`]: the room write
+//! endpoint, the in-process emit, the SSE stream the app subscribes to, and the
+//! spawn-listener that wakes agents on `delivery = wake` messages.
 
+pub mod push;
+
+pub use push::{
+    push_router, spawn_wake_listener, CommandSpawnDispatcher, Delivery, MessagePost, PushState,
+    RoomBus, RoomMessageEvent, SpawnDispatcher, SpawnOutcome, DEFAULT_BUS_CAPACITY,
+};
+
+use rustyred_thg_affordances::{affordance_nodes, AffordanceGraphStore};
 use rustyred_thg_core::{GraphStore, NodeQuery};
 use serde_json::{json, Value};
 use theorem_harness_runtime::{
     list_presence, load_events, load_run, read_intents_for_room, read_mentions_for_actor,
     read_records_for_room, room_status, CoordinationError, HarnessRuntimeError,
 };
-use rustyred_thg_affordances::{affordance_nodes, AffordanceGraphStore};
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
 pub const RUN_LABEL: &str = "HarnessRun";
@@ -135,7 +146,9 @@ pub fn connectors_json<S: AffordanceGraphStore>(store: &S, tenant_slug: &str) ->
     let affordances: Vec<Value> = affordance_nodes(store)
         .unwrap_or_default()
         .into_iter()
-        .filter(|node| node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_slug))
+        .filter(|node| {
+            node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_slug)
+        })
         .map(|node| {
             let p = node.properties;
             json!({
@@ -151,7 +164,11 @@ pub fn connectors_json<S: AffordanceGraphStore>(store: &S, tenant_slug: &str) ->
         .collect();
     let mut servers: Vec<String> = affordances
         .iter()
-        .filter_map(|a| a.get("server_id").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|a| {
+            a.get("server_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     servers.sort();
     servers.dedup();

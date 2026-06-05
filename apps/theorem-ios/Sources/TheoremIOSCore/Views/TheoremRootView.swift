@@ -52,6 +52,21 @@ public struct TheoremRootView: View {
         return SampleConnectorStore()
     }
 
+    /// The room channel for the Room surface. The same `-remote <url>` points the
+    /// tap/hold send button + live SSE feed at theorem-harness-server's push
+    /// endpoints; `-tenant`, `-room`, and `-actor` scope membership. Default is an
+    /// honest offline channel (local echo, no faked live feed).
+    private var roomChannel: RoomChannel {
+        if let raw = UserDefaults.standard.string(forKey: "remote"),
+           let url = URL(string: raw) {
+            let tenant = UserDefaults.standard.string(forKey: "tenant") ?? "default"
+            let room = UserDefaults.standard.string(forKey: "room") ?? "default"
+            let actor = UserDefaults.standard.string(forKey: "actor") ?? "travis"
+            return RemoteRoomChannel(baseURL: url, roomID: room, tenantSlug: tenant, actorID: actor)
+        }
+        return SampleRoomChannel()
+    }
+
     private var package: ScenePackageV2 {
         room.scene
     }
@@ -127,6 +142,9 @@ public struct TheoremRootView: View {
                     theme: theme
                 )
                 .tag(AppSurface.home)
+
+                RoomComposerView(theme: theme, channel: roomChannel)
+                    .tag(AppSurface.room)
 
                 RunsListView(theme: theme, store: runStore)
                     .tag(AppSurface.runs)
@@ -286,6 +304,7 @@ private extension View {
 
 public enum AppSurface: String, CaseIterable, Identifiable {
     case home = "Home"
+    case room = "Room"
     case runs = "Runs"
     case maps = "Maps"
     case projects = "Projects"
@@ -301,6 +320,8 @@ public enum AppSurface: String, CaseIterable, Identifiable {
         switch self {
         case .home:
             "network"
+        case .room:
+            "bubble.left.and.bubble.right"
         case .runs:
             "clock.arrow.circlepath"
         case .maps:
@@ -348,6 +369,8 @@ struct SurfacePlaceholder: View {
         switch surface {
         case .home:
             "Ask over the substrate room."
+        case .room:
+            "Tap to leave a note. Hold to wake the agents."
         case .runs:
             "Recorded runs, each a governed state machine."
         case .maps:

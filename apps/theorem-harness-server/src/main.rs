@@ -8,6 +8,8 @@
 //!   GET /harness/rooms/{room_id}/presence -> { "presence": [...] }
 //!   GET /harness/rooms/{room_id}/intents  -> { "intents": [...] }
 //!   GET /harness/rooms/{room_id}/records  -> { "records": [...] }
+//!   POST /harness/rooms/{room_id}/messages -> write a message + emit push (tap/hold)
+//!   GET  /harness/rooms/{room_id}/stream    -> SSE of this room's messages (live)
 //!   GET /harness/actors/{actor}/mentions  -> { "mentions": [...] }
 //!   GET /connectors              -> { "connectors": [...], "affordances": [...] }
 //!   POST /connectors/register    -> connect an MCP server, register its tools as affordances
@@ -35,8 +37,8 @@ use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use theorem_harness_server::{
-    connectors_json, intents_json, mentions_json, presence_json, records_json, room_json, run_json,
-    runs_json,
+    connectors_json, intents_json, mentions_json, presence_json, push_router, records_json,
+    room_json, run_json, runs_json, spawn_wake_listener, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
@@ -96,6 +98,16 @@ async fn main() {
         .expect("open RedCore graph store");
     let state: SharedStore = Arc::new(Mutex::new(store));
 
+    // The in-process push bus: the room write endpoint emits onto it, the SSE
+    // stream and the spawn-listener subscribe. The listener rides on this server,
+    // so the always-on cost of the whole push feature is one subscription.
+    let bus = RoomBus::with_command_spawn(DEFAULT_BUS_CAPACITY);
+    spawn_wake_listener(bus.clone(), state.clone());
+    let push = push_router(PushState {
+        store: state.clone(),
+        bus: bus.clone(),
+    });
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/harness/runs", get(list_runs))
@@ -110,7 +122,8 @@ async fn main() {
         )
         .route("/connectors", get(list_connectors))
         .route("/connectors/register", post(register_connector_route))
-        .with_state(state);
+        .with_state(state)
+        .merge(push);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "50080".to_string());
     let addr = format!("0.0.0.0:{port}");
@@ -279,7 +292,9 @@ async fn register_connector_route(
         let target_value = serde_json::to_value(&target).map_err(|e| e.to_string())?;
 
         // Lock the store only for the fast register write.
-        let mut store = store.lock().map_err(|_| "store lock poisoned".to_string())?;
+        let mut store = store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
         let registration = register_connector_with_target(
             &mut *store,
             manifest,
@@ -300,7 +315,12 @@ async fn register_connector_route(
         }))
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join error: {e}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("join error: {e}"),
+        )
+    })?;
 
     outcome
         .map(Json)
