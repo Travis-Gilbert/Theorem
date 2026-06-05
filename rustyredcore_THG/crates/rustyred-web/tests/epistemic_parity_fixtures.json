@@ -1,0 +1,149 @@
+{
+  "_comment": "Shared parity fixtures for the eleven-stage epistemic filter. Both the Rust harness (tests/epistemic_parity.rs) and the Python harness (docs/plans/multi-source-search/epistemic-parity-gate.md) run these exact cases and must produce identical output. Candidates carry the POST-hydration epistemic fields directly so neither side needs a live DB. Per-candidate field defaults (applied identically on both sides): epistemic_weight=1.0, acceptance_status=\"accepted\", justification_prior=0.5, slug=null, title=\"\", source_system=null, code_entity_type=null, signals={}. config defaults: top_n=50, min_score=0.1, include_provisional=false, include_contested=false, exclude_acquaintance=true, include_code=false, query_type=null.",
+  "cases": [
+    {
+      "name": "rrf_fallback_ordering",
+      "query": "anything",
+      "config": {},
+      "candidates": [
+        {"object_pk": "a", "rrf_score": 0.5},
+        {"object_pk": "b", "rrf_score": 0.3},
+        {"object_pk": "c", "rrf_score": 0.15}
+      ]
+    },
+    {
+      "name": "epistemic_weight_boost",
+      "query": "q",
+      "config": {},
+      "candidates": [
+        {"object_pk": "axiomatic", "rrf_score": 0.4, "epistemic_weight": 1.5},
+        {"object_pk": "normal", "rrf_score": 0.4, "epistemic_weight": 1.0},
+        {"object_pk": "hypothetical", "rrf_score": 0.4, "epistemic_weight": 0.5}
+      ]
+    },
+    {
+      "name": "acquaintance_dropped",
+      "query": "q",
+      "config": {},
+      "candidates": [
+        {"object_pk": "acq", "rrf_score": 0.9, "epistemic_weight": 0.0},
+        {"object_pk": "normal", "rrf_score": 0.5, "epistemic_weight": 1.0}
+      ]
+    },
+    {
+      "name": "code_gate_default_excludes",
+      "query": "q",
+      "config": {},
+      "candidates": [
+        {"object_pk": "code", "rrf_score": 0.9, "source_system": "codebase"},
+        {"object_pk": "spec", "rrf_score": 0.8, "code_entity_type": "specification"},
+        {"object_pk": "prose", "rrf_score": 0.7}
+      ]
+    },
+    {
+      "name": "code_gate_included",
+      "query": "q",
+      "config": {"include_code": true},
+      "candidates": [
+        {"object_pk": "code", "rrf_score": 0.9, "source_system": "codebase"},
+        {"object_pk": "spec", "rrf_score": 0.8, "code_entity_type": "specification"},
+        {"object_pk": "prose", "rrf_score": 0.7}
+      ]
+    },
+    {
+      "name": "code_debug_bump",
+      "query": "q",
+      "config": {"query_type": "code_debug"},
+      "candidates": [
+        {"object_pk": "boost", "rrf_score": 0.4, "signals": {"code_boost": 0.3}},
+        {"object_pk": "plain", "rrf_score": 0.4}
+      ]
+    },
+    {
+      "name": "slug_dedup_keeps_higher",
+      "query": "q",
+      "config": {},
+      "candidates": [
+        {"object_pk": "low", "rrf_score": 0.3, "slug": "shared"},
+        {"object_pk": "high", "rrf_score": 0.9, "slug": "shared"},
+        {"object_pk": "other", "rrf_score": 0.5, "slug": "unique"}
+      ]
+    },
+    {
+      "name": "title_overlap_capped",
+      "query": "alpha beta gamma delta",
+      "config": {},
+      "candidates": [
+        {"object_pk": "t", "rrf_score": 0.2, "title": "alpha beta gamma delta"},
+        {"object_pk": "u", "rrf_score": 0.4, "title": "zzz nothing matches"}
+      ]
+    },
+    {
+      "name": "acceptance_default_only_accepted",
+      "query": "q",
+      "config": {},
+      "candidates": [
+        {"object_pk": "ok", "rrf_score": 0.5, "acceptance_status": "accepted"},
+        {"object_pk": "retracted", "rrf_score": 0.9, "acceptance_status": "retracted"},
+        {"object_pk": "provisional", "rrf_score": 0.8, "acceptance_status": "provisional"},
+        {"object_pk": "contested", "rrf_score": 0.7, "acceptance_status": "contested"}
+      ]
+    },
+    {
+      "name": "acceptance_permissive_keeps_prov_contested",
+      "query": "q",
+      "config": {"include_provisional": true, "include_contested": true},
+      "candidates": [
+        {"object_pk": "ok", "rrf_score": 0.5, "acceptance_status": "accepted"},
+        {"object_pk": "retracted", "rrf_score": 0.9, "acceptance_status": "retracted"},
+        {"object_pk": "provisional", "rrf_score": 0.8, "acceptance_status": "provisional"},
+        {"object_pk": "contested", "rrf_score": 0.7, "acceptance_status": "contested"}
+      ]
+    },
+    {
+      "name": "truncation_before_rerank",
+      "query": "match query",
+      "config": {"top_n": 1},
+      "candidates": [
+        {"object_pk": "first", "rrf_score": 0.9},
+        {"object_pk": "second", "rrf_score": 0.8},
+        {"object_pk": "third", "rrf_score": 0.05, "title": "match query exactly"}
+      ]
+    },
+    {
+      "name": "final_topn_slice",
+      "query": "q",
+      "config": {"top_n": 2},
+      "candidates": [
+        {"object_pk": "a", "rrf_score": 0.9},
+        {"object_pk": "b", "rrf_score": 0.7},
+        {"object_pk": "c", "rrf_score": 0.5},
+        {"object_pk": "d", "rrf_score": 0.3}
+      ]
+    },
+    {
+      "name": "min_score_threshold",
+      "query": "q",
+      "config": {},
+      "candidates": [
+        {"object_pk": "strong", "rrf_score": 0.5},
+        {"object_pk": "weak", "rrf_score": 0.05}
+      ]
+    },
+    {
+      "name": "rounding_interleave",
+      "query": "rust",
+      "config": {},
+      "candidates": [
+        {"object_pk": "r", "rrf_score": 0.123457, "epistemic_weight": 1.2, "title": "rust parser", "slug": "r"},
+        {"object_pk": "s", "rrf_score": 0.111111, "epistemic_weight": 1.1, "title": "no overlap here", "slug": "s"}
+      ]
+    },
+    {
+      "name": "empty_input",
+      "query": "q",
+      "config": {},
+      "candidates": []
+    }
+  ]
+}
