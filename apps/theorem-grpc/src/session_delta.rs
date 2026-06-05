@@ -16,7 +16,9 @@
 //! base and drops dangling edges, so an additions-only delta is safe -- it just
 //! does not yet retract a symbol that disappeared from a changed file.
 
-use rustyred_thg_core::{EdgeRecord, GraphMutation, NodeRecord, SessionDelta};
+use rustyred_thg_core::{
+    EdgeRecord, GraphMutation, GraphSnapshot, HarnessInstantKg, NodeRecord, SessionDelta,
+};
 
 use crate::code_index::{build_code_mutations, IndexedFile, IngestConfig};
 
@@ -51,6 +53,24 @@ pub(crate) fn build_session_delta(
         tombstoned_object_ids: Vec::new(),
         removed_edge_ids: Vec::new(),
     }
+}
+
+/// IK-1: serve an instant code KG for a set of indexed files overlaid on a base
+/// snapshot. Builds the `SessionDelta` (IK-0b) and merges it via
+/// `HarnessInstantKg`, which the `harness_kg_*` MCP/HTTP surface already serves
+/// (search / ppr / impact / explain_edge). The `base` is the committed graph the
+/// session edits sit on; an empty base yields a view of just the edit. Manifest
+/// provenance (a `CodeKgManifest`) is IK-1b; the merge accepts `None` today. IK-3
+/// wires this to a live session-reingest verb.
+#[allow(dead_code)]
+pub(crate) fn serve_session_kg(
+    base: GraphSnapshot,
+    config: &IngestConfig,
+    files: &[IndexedFile],
+    commit_sha: Option<String>,
+) -> HarnessInstantKg {
+    let delta = build_session_delta(config, files, commit_sha);
+    HarnessInstantKg::new(base, None, delta)
 }
 
 #[cfg(test)]
@@ -120,6 +140,46 @@ mod tests {
         // Additions-only for now: no tombstones / removed edges yet (IK-2).
         assert!(delta.tombstoned_object_ids.is_empty());
         assert!(delta.removed_edge_ids.is_empty());
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn served_instant_kg_overlays_code_edit_on_base() {
+        let repo = unique_dir("serve-repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn alpha() -> usize {\n    1\n}\n").unwrap();
+
+        let config = resolve_ingest_config(IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut files = Vec::new();
+        let mut skipped = 0u64;
+        collect_code_files(&config.repo_root, &config, &mut files, &mut skipped).unwrap();
+
+        let base = GraphSnapshot {
+            version: 0,
+            nodes: vec![],
+            edges: vec![],
+        };
+        let view = serve_session_kg(base, &config, &files, Some("cafef00d".to_string()));
+
+        // Empty base + the delta => the served view is exactly the code records.
+        let delta = build_session_delta(&config, &files, None);
+        assert_eq!(view.status().total_objects, delta.objects.len());
+        assert_eq!(view.status().total_edges, delta.edges.len());
+        // The alpha symbol is served through the merged instant KG.
+        let merged = view.merged_snapshot();
+        assert!(
+            merged.nodes.iter().any(|node| {
+                node.labels.iter().any(|label| label.as_str() == "CodeSymbol")
+                    && node.properties.get("name").and_then(|v| v.as_str()) == Some("alpha")
+            }),
+            "the alpha symbol is served through the instant KG"
+        );
 
         let _ = fs::remove_dir_all(&repo);
     }
