@@ -98,6 +98,15 @@ pub use epistemic_filter::{
     FusedCandidate, RrfFallbackScorer, ScoredResult,
 };
 
+// Relevance extraction: turn a fetched page into the few passages that answer a
+// query (the "scrape the relevant pieces" half of progressive-disclosure
+// search). Provider-snippet-independent and query-aligned. See relevance.rs.
+pub mod relevance;
+pub use relevance::{
+    extract_main_text, relevant_excerpt, relevant_excerpt_lexical, split_passages, LexicalScorer,
+    Passage, PassageScorer,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrawlConfig {
     pub run_id: String,
@@ -241,6 +250,8 @@ pub struct LiveFetchOptions {
     pub timeout_seconds: u64,
     pub guard_policy: UrlGuardPolicy,
     pub respect_robots: bool,
+    pub allow_impersonate: bool,
+    pub rendered_endpoint: Option<String>,
 }
 
 impl Default for LiveFetchOptions {
@@ -250,6 +261,10 @@ impl Default for LiveFetchOptions {
             timeout_seconds: 10,
             guard_policy: UrlGuardPolicy::default(),
             respect_robots: true,
+            allow_impersonate: true,
+            rendered_endpoint: std::env::var("THEOREM_SERVO_RENDER_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         }
     }
 }
@@ -1160,6 +1175,9 @@ pub async fn fetch_seed_pages(
     let fetcher = FetchCascade::new(FetchCascadeOptions {
         user_agent: effective_options.user_agent.clone(),
         timeout_seconds: effective_options.timeout_seconds,
+        allow_impersonate: effective_options.allow_impersonate,
+        rendered_endpoint: effective_options.rendered_endpoint.clone(),
+        respect_robots_for_escalation: effective_options.respect_robots,
     })?;
     let mut pages = Vec::new();
     let mut remaining_bytes = request.budget.max_bytes;
@@ -1199,6 +1217,16 @@ pub async fn fetch_seed_pages(
         }
 
         let result = fetcher.fetch_with_promotion(&url, remaining_bytes).await?;
+        // The crawler enforces its byte budget as a hard limit: a page that fills
+        // the remaining budget is rejected, not ingested partially. The cascade
+        // truncates + flags; the fractal/search fast-path accepts truncated bodies,
+        // but full-page ingestion must never store half a page.
+        if result.truncated {
+            return Err(RustyWebError::BodyLimitExceeded {
+                url: url.clone(),
+                limit: remaining_bytes,
+            });
+        }
         let final_url =
             guarded_canonicalize_url(&result.final_url, &effective_options.guard_policy)?;
         let page = FetchedPage {

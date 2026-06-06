@@ -494,6 +494,8 @@ fn live_robots_options(respect_robots: bool) -> LiveFetchOptions {
             block_metadata_services: true,
         },
         respect_robots,
+        allow_impersonate: false,
+        rendered_endpoint: None,
     }
 }
 

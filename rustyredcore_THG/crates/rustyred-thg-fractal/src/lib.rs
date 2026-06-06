@@ -4,15 +4,15 @@
 //! public runner in this crate always builds a web crawl request and ingests
 //! admitted web graph state as a lower-trust, quarantined tier.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rustyred_thg_core::{GraphMutation, GraphStore, NodeQuery, ThgError, ThgResult};
 use rustyred_web::{
     build_v2_fixture_crawl, configured_qwen3_embedding_4b_client_from_env, embed_crawl_graph_pages,
-    fanout_search_providers, search_substrate, CrawlEmbeddingReceipt, CrawlRequest, CrawlRunOutput,
-    FetchCascade, FetchTierResult, FetchedPage, SearchAcquisition, SearchOptions, SearchOpts,
-    SearchProvider, LABEL_PAGE, QWEN3_EMBEDDING_4B_MODEL_ID,
+    fanout_search_providers, relevant_excerpt_lexical, search_substrate, CrawlEmbeddingReceipt,
+    CrawlRequest, CrawlRunOutput, FetchCascade, FetchTierResult, FetchedPage, SearchAcquisition,
+    SearchOptions, SearchOpts, SearchProvider, LABEL_PAGE, QWEN3_EMBEDDING_4B_MODEL_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,6 +20,12 @@ use serde_json::{json, Value};
 pub const DEFAULT_FRACTAL_EMBEDDER_MODEL: &str = QWEN3_EMBEDDING_4B_MODEL_ID;
 pub const OPEN_WEB_UNVERIFIED_TRUST_TIER: &str = "open_web_unverified";
 pub const DEFAULT_OPEN_WEB_CONFIDENCE_CEILING: f32 = 0.35;
+/// Max query-ranked passages kept per admitted page for the excerpt.
+pub const FRACTAL_EXCERPT_MAX_PASSAGES: usize = 3;
+/// Max total characters across an admitted page's excerpt passages. Matches the
+/// provider snippet budget so the excerpt is a drop-in upgrade over the snippet,
+/// not a heavier payload.
+pub const FRACTAL_EXCERPT_MAX_CHARS: usize = 600;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FractalExpansionRequest {
@@ -94,6 +100,11 @@ pub struct FractalExpansionReceipt {
     /// false web_reached:true on zero fetches.
     #[serde(default)]
     pub web_seed_failures: Vec<String>,
+    /// Query-ranked passages extracted from each admitted page body (the "scrape
+    /// the relevant pieces" excerpt). Empty passages for a page mean no content
+    /// matched -- the consumer falls back to the provider snippet.
+    #[serde(default)]
+    pub admitted_page_excerpts: Vec<FractalPageExcerpt>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -105,6 +116,14 @@ pub struct FractalProviderCandidate {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FractalPageExcerpt {
+    pub url: String,
+    /// Best-first query-ranked passages extracted from the page body.
+    #[serde(default)]
+    pub passages: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -134,7 +153,8 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
         ));
     }
 
-    let mut output = build_admitted_pages_output(&request, &web_seed_urls, fetched_pages)?;
+    let (mut output, admitted_page_excerpts) =
+        build_admitted_pages_output(&request, &web_seed_urls, fetched_pages)?;
     let web_reached = !fetched_pages.is_empty();
     apply_admitted_pages(
         store,
@@ -145,6 +165,7 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
         None,
         web_reached,
         Vec::new(),
+        admitted_page_excerpts,
     )
 }
 
@@ -166,19 +187,44 @@ pub async fn run_fractal_expansion<S: GraphStore>(
         ));
     }
 
+    // Fetch seeds concurrently (bounded) instead of one-at-a-time: wall-clock
+    // becomes the slowest single fetch, not the sum of all of them. Results are
+    // re-sorted into the original seed order, so `fetched` / `web_seed_failures`
+    // -- and the receipt built from them -- stay byte-identical to the previous
+    // sequential version (parity-safe).
+    use futures_util::stream::StreamExt;
+    const FETCH_CONCURRENCY: usize = 8;
+    // Own each seed URL (`cloned`) so the per-fetch future borrows nothing from
+    // the stream iterator: a borrowed item would impose a higher-ranked lifetime
+    // bound the future cannot satisfy once the caller drives it under
+    // `tokio::spawn`. Cloning a handful of short URL strings is negligible.
+    let mut indexed: Vec<_> = futures_util::stream::iter(web_seed_urls.iter().cloned().enumerate())
+        .map(|(idx, url)| async move {
+            let outcome = match cascade.fetch_with_promotion(&url, max_bytes).await {
+                Ok(result) => Ok(fetched_page_from_tier_result(&url, result)),
+                // Record the failed seed instead of swallowing it, so a run that
+                // reaches no pages reports honestly rather than as a false success.
+                Err(error) => Err(format!("{url}: {error}")),
+            };
+            (idx, outcome)
+        })
+        .buffer_unordered(FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    indexed.sort_by_key(|(idx, _)| *idx);
+
     let mut fetched = Vec::new();
     let mut web_seed_failures = Vec::new();
-    for url in &web_seed_urls {
-        match cascade.fetch_with_promotion(url, max_bytes).await {
-            Ok(result) => fetched.push(fetched_page_from_tier_result(url, result)),
-            // Record the failed seed instead of swallowing it, so a run that
-            // reaches no pages reports honestly rather than as a false success.
-            Err(error) => web_seed_failures.push(format!("{url}: {error}")),
+    for (_, outcome) in indexed {
+        match outcome {
+            Ok(page) => fetched.push(page),
+            Err(failure) => web_seed_failures.push(failure),
         }
     }
     let web_reached = !fetched.is_empty();
 
-    let mut output = build_admitted_pages_output(&request, &web_seed_urls, &fetched)?;
+    let (mut output, admitted_page_excerpts) =
+        build_admitted_pages_output(&request, &web_seed_urls, &fetched)?;
     let embedding_receipt = maybe_embed_live_crawl_output(&mut output).await?;
     apply_admitted_pages(
         store,
@@ -189,6 +235,7 @@ pub async fn run_fractal_expansion<S: GraphStore>(
         embedding_receipt,
         web_reached,
         web_seed_failures,
+        admitted_page_excerpts,
     )
 }
 
@@ -378,8 +425,40 @@ fn build_admitted_pages_output(
     request: &FractalExpansionRequest,
     web_seed_urls: &[String],
     fetched_pages: &[FetchedPage],
-) -> ThgResult<CrawlRunOutput> {
+) -> ThgResult<(CrawlRunOutput, Vec<FractalPageExcerpt>)> {
     let admitted_pages = rank_and_sanitize_pages(&request.query, fetched_pages, request.top_k);
+
+    // Query-ranked excerpt per admitted page, computed from the RAW body:
+    // relevance runs its own readability, and the sanitized body only escapes
+    // <script> (leaving its text to leak). Match admitted pages back to their raw
+    // bodies by URL.
+    let raw_body_by_url: BTreeMap<&str, &str> = fetched_pages
+        .iter()
+        .map(|page| (page.url.as_str(), page.body.as_str()))
+        .collect();
+    let admitted_page_excerpts = admitted_pages
+        .iter()
+        .map(|page| {
+            let raw = raw_body_by_url
+                .get(page.url.as_str())
+                .copied()
+                .unwrap_or(page.body.as_str());
+            let passages = relevant_excerpt_lexical(
+                &request.query,
+                raw,
+                FRACTAL_EXCERPT_MAX_PASSAGES,
+                FRACTAL_EXCERPT_MAX_CHARS,
+            )
+            .into_iter()
+            .map(|passage| passage.text)
+            .collect::<Vec<_>>();
+            FractalPageExcerpt {
+                url: page.url.clone(),
+                passages,
+            }
+        })
+        .collect::<Vec<_>>();
+
     let mut crawl_request = CrawlRequest::new(request.run_id.clone(), web_seed_urls.to_vec());
     crawl_request.scope.namespace = format!("fractal:{}", request.tenant_id);
     crawl_request.scope.source_graph = "rustyred_fractal_expansion".to_string();
@@ -389,7 +468,7 @@ fn build_admitted_pages_output(
     let mut output = build_v2_fixture_crawl(crawl_request, &admitted_pages)
         .map_err(|error| ThgError::new("fractal_web_crawl_failed", error.to_string()))?;
     annotate_open_web_batch(&mut output.graph.batch.mutations, request);
-    Ok(output)
+    Ok((output, admitted_page_excerpts))
 }
 
 async fn maybe_embed_live_crawl_output(
@@ -418,6 +497,7 @@ fn apply_admitted_pages<S: GraphStore>(
     embedding_receipt: Option<CrawlEmbeddingReceipt>,
     web_reached: bool,
     web_seed_failures: Vec<String>,
+    admitted_page_excerpts: Vec<FractalPageExcerpt>,
 ) -> ThgResult<FractalExpansionReceipt> {
     let writes = output
         .graph
@@ -447,6 +527,7 @@ fn apply_admitted_pages<S: GraphStore>(
         provider_candidates: Vec::new(),
         provider_receipts: Vec::new(),
         web_seed_failures,
+        admitted_page_excerpts,
     })
 }
 
@@ -591,6 +672,75 @@ mod tests {
 
         let open_web_pages = open_web_pages_for_tenant(&store, "theorem");
         assert!(open_web_pages.contains(&"https://example.com/new-grounding".to_string()));
+    }
+
+    #[test]
+    fn fixture_fractal_expansion_attaches_query_ranked_excerpt() {
+        let mut store = InMemoryGraphStore::new();
+        let mut initial = build_v2_fixture_crawl(
+            CrawlRequest::new("excerpt-initial", vec!["https://example.com/seed".to_string()]),
+            &[FetchedPage::html(
+                "https://example.com/seed",
+                "<html><body>tokio asynchronous runtime seed page</body></html>",
+            )],
+        )
+        .unwrap();
+        let initial_request = FractalExpansionRequest {
+            run_id: "excerpt-initial-fractal".to_string(),
+            tenant_id: "theorem".to_string(),
+            query: "tokio async runtime".to_string(),
+            web_seed_urls: Vec::new(),
+            top_k: 2,
+            frontier_limit: 4,
+            web_seed_limit: 4,
+            embedder_model: None,
+            actor_id: None,
+        }
+        .normalized();
+        annotate_open_web_batch(&mut initial.graph.batch.mutations, &initial_request);
+        initial.graph.apply_to_store(&mut store).unwrap();
+
+        let receipt = run_fixture_fractal_expansion(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "excerpt-fractal".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "tokio async runtime".to_string(),
+                web_seed_urls: vec!["https://example.com/doc".to_string()],
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 4,
+                embedder_model: None,
+                actor_id: Some("test".to_string()),
+            },
+            &[FetchedPage::html(
+                "https://example.com/doc",
+                "<html><head><script>var leak = 1;</script></head><body>\
+                 <nav>Home About Contact</nav>\
+                 <p>The Tokio runtime is an asynchronous runtime for Rust that \
+                 provides the building blocks for writing network services.</p>\
+                 <p>This unrelated paragraph is about baking sourdough bread with \
+                 a long overnight fermentation in a hot cast iron dutch oven.</p>\
+                 </body></html>",
+            )],
+        )
+        .unwrap();
+
+        let excerpt = receipt
+            .admitted_page_excerpts
+            .iter()
+            .find(|excerpt| excerpt.url == "https://example.com/doc")
+            .expect("an excerpt for the admitted page");
+        // The query-relevant passage is selected...
+        assert!(excerpt
+            .passages
+            .iter()
+            .any(|passage| passage.contains("asynchronous runtime")));
+        // ...and boilerplate (script body, off-topic paragraph) is excluded.
+        assert!(excerpt
+            .passages
+            .iter()
+            .all(|passage| !passage.contains("sourdough") && !passage.contains("leak")));
     }
 
     #[test]

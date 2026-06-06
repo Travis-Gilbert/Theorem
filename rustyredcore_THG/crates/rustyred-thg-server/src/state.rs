@@ -90,6 +90,9 @@ impl AppState {
         let live_fetch_cascade = FetchCascade::new(FetchCascadeOptions {
             user_agent: live_fetch_options.user_agent,
             timeout_seconds: live_fetch_options.timeout_seconds,
+            allow_impersonate: live_fetch_options.allow_impersonate,
+            rendered_endpoint: live_fetch_options.rendered_endpoint,
+            respect_robots_for_escalation: live_fetch_options.respect_robots,
         })
         .expect("default live fetch cascade options must build");
         Self {
