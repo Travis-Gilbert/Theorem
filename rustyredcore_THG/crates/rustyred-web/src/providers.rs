@@ -14,6 +14,7 @@ const BRAVE_WEB_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web
 const MOJEEK_SEARCH_ENDPOINT: &str = "https://api.mojeek.com/search";
 const EXA_SEARCH_ENDPOINT: &str = "https://api.exa.ai/search";
 const SERPAPI_SEARCH_ENDPOINT: &str = "https://serpapi.com/search.json";
+const PERPLEXITY_SEARCH_ENDPOINT: &str = "https://api.perplexity.ai/search";
 
 pub fn configured_search_providers_from_env() -> Vec<Arc<dyn SearchProvider>> {
     let enabled =
@@ -55,6 +56,13 @@ fn provider_from_env(provider: &str) -> Option<Arc<dyn SearchProvider>> {
             "SERPAPI_API_KEY",
         ])
         .map(SerpApiSearchProvider::new)
+        .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
+        "perplexity" | "perplexity_search" => env_first(&[
+            "RUSTYWEB_PERPLEXITY_API_KEY",
+            "RUSTY_RED_PERPLEXITY_API_KEY",
+            "PERPLEXITY_API_KEY",
+        ])
+        .map(PerplexitySearchProvider::new)
         .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
         "offline" | "offline_jsonl" | "seed_manifest" => env_first(&[
             "RUSTYWEB_OFFLINE_SEARCH_MANIFEST",
@@ -260,6 +268,53 @@ impl SearchProvider for SerpApiSearchProvider {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PerplexitySearchProvider {
+    api_key: String,
+    client: Client,
+    endpoint: String,
+}
+
+impl PerplexitySearchProvider {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            client: Client::new(),
+            endpoint: PERPLEXITY_SEARCH_ENDPOINT.to_string(),
+        }
+    }
+}
+
+impl SearchProvider for PerplexitySearchProvider {
+    fn name(&self) -> &str {
+        "perplexity"
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        opts: &'a SearchOpts,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let response = self
+                .client
+                .post(&self.endpoint)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&json!({
+                    "query": query,
+                    "max_results": opts.provider_limit.min(20),
+                    "search_context_size": "medium"
+                }))
+                .send()
+                .await
+                .map_err(|error| provider_error(self.name(), error.to_string()))?;
+            let payload = response_json(self.name(), response).await?;
+            Ok(perplexity_candidates(&payload, self.name()))
+        })
+    }
+}
+
 /// File-backed provider for offline OWI/Common Crawl seed manifests. This is
 /// the light adapter path: upstream corpus jobs can emit JSON/JSONL candidates,
 /// and RustyWeb feeds them through the same provider fan-out and RRF layer.
@@ -452,6 +507,26 @@ fn serpapi_candidates(payload: &Value, source: &str) -> Vec<SearchCandidate> {
         .collect()
 }
 
+fn perplexity_candidates(payload: &Value, source: &str) -> Vec<SearchCandidate> {
+    payload
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, result)| {
+            let url = string_field(result, "url")?;
+            Some(SearchCandidate {
+                url,
+                title: string_field(result, "title"),
+                snippet: string_field(result, "snippet"),
+                source: source.to_string(),
+                rank: index + 1,
+            })
+        })
+        .collect()
+}
+
 fn string_field(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -615,6 +690,23 @@ mod tests {
         );
         assert_eq!(serpapi[0].url, "https://example.com/serpapi");
         assert_eq!(serpapi[0].rank, 3);
+
+        let perplexity = perplexity_candidates(
+            &json!({
+                "results": [{
+                    "title": "Perplexity title",
+                    "url": "https://example.com/perplexity",
+                    "snippet": "Perplexity snippet",
+                    "date": "2026-01-23"
+                }]
+            }),
+            "perplexity",
+        );
+        assert_eq!(perplexity[0].url, "https://example.com/perplexity");
+        assert_eq!(perplexity[0].title.as_deref(), Some("Perplexity title"));
+        assert_eq!(perplexity[0].snippet.as_deref(), Some("Perplexity snippet"));
+        assert_eq!(perplexity[0].rank, 1);
+        assert_eq!(perplexity[0].source, "perplexity");
     }
 
     #[tokio::test]
