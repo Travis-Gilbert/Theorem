@@ -9,16 +9,21 @@
 //! slices -- selects which packs/agents/tools to bring in per task under a budget,
 //! emitting a replayable `EnsembleDecision`.
 //!
-//! Status: slice S1 (registry) implemented. Budgeted selector (S2), trust gating in
-//! selection (S3), and MCP exposure (S4, Codex's hot `rustyred-thg-mcp`) are tracked in
-//! `docs/plans/ensemble/ensemble-rs-implementation-plan.md`.
+//! Status: slices S1 (registry), S2 (budgeted selector + replayable `EnsembleDecision`), and S3
+//! (trust-ladder gating in selection) are implemented as a pure library. MCP exposure (S4 --
+//! `ensemble_register` / `ensemble_select` in Codex's hot `rustyred-thg-mcp`) stays a coordinated
+//! follow-up. Tracked in `docs/plans/ensemble/ensemble-rs-implementation-plan.md`.
 
 pub mod decision;
 pub mod registry;
+pub mod selector;
+pub mod trust;
 
 pub use decision::{EnsembleDecision, RejectedCandidate, SelectedCapability};
 pub use registry::{
-    get_pack, pack_node_id, register_pack, CapabilityPack, EnsembleError, EnsembleGraphStore,
-    EnsembleResult, PackExposure, PackKind, TrustTier, PACK_ARTIFACT_EDGE, PACK_LABEL,
-    PACK_SOURCE_EDGE,
+    get_pack, list_packs, pack_node_id, register_pack, CapabilityPack, EnsembleError,
+    EnsembleGraphStore, EnsembleResult, PackExposure, PackKind, TrustTier, PACK_ARTIFACT_EDGE,
+    PACK_LABEL, PACK_SOURCE_EDGE,
 };
+pub use selector::{select, select_from_store, EnsembleSelectRequest};
+pub use trust::{meets_floor, parse_trust_floor, passport_id, trust_rank, trust_score};

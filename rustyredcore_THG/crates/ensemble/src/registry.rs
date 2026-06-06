@@ -2,7 +2,7 @@
 //! kinds, generalizing the `theorem-harness-runtime::skill_pack` storage pattern beyond the
 //! single `skill_pack` kind.
 
-use rustyred_thg_core::{EdgeRecord, GraphStore, GraphStoreError, NodeRecord};
+use rustyred_thg_core::{EdgeRecord, GraphStore, GraphStoreError, NodeQuery, NodeRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use theorem_harness_core::stable_value_hash;
@@ -10,6 +10,7 @@ use theorem_harness_core::stable_value_hash;
 pub const PACK_LABEL: &str = "CapabilityPack";
 pub const PACK_SOURCE_EDGE: &str = "PACK_SOURCE";
 pub const PACK_ARTIFACT_EDGE: &str = "PACK_ARTIFACT";
+const PACK_QUERY_LIMIT: usize = 10_000;
 
 /// The kind discriminator carried by a `CapabilityPackSpec` JSON contract. `CapabilityPackSpec`
 /// is a JSON shape (not a Rust struct) produced by the offline encode pipeline; the registry
@@ -46,7 +47,7 @@ impl PackKind {
     /// Accepts the snake_case kind plus the `skill_pack` alias used by the existing
     /// skill-pack serving slice.
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
+        match value.trim().to_ascii_lowercase().as_str() {
             "skill" | "skill_pack" => Some(PackKind::Skill),
             "agent" => Some(PackKind::Agent),
             "tool" => Some(PackKind::Tool),
@@ -67,7 +68,9 @@ impl PackKind {
 pub enum TrustTier {
     #[default]
     Unverified,
-    FirstParty { passport_id: String },
+    FirstParty {
+        passport_id: String,
+    },
 }
 
 /// Exposure flag: packs stay hidden behind the single Ensemble surface
@@ -149,19 +152,28 @@ pub trait EnsembleGraphStore {
     fn pack_upsert_node(&mut self, node: NodeRecord) -> EnsembleResult<()>;
     fn pack_upsert_edge(&mut self, edge: EdgeRecord) -> EnsembleResult<()>;
     fn pack_get_node(&self, id: &str) -> EnsembleResult<Option<NodeRecord>>;
+    fn pack_query_nodes(&self, query: NodeQuery) -> EnsembleResult<Vec<NodeRecord>>;
 }
 
 impl<T: GraphStore> EnsembleGraphStore for T {
     fn pack_upsert_node(&mut self, node: NodeRecord) -> EnsembleResult<()> {
-        self.upsert_node(node).map(|_| ()).map_err(EnsembleError::from)
+        self.upsert_node(node)
+            .map(|_| ())
+            .map_err(EnsembleError::from)
     }
 
     fn pack_upsert_edge(&mut self, edge: EdgeRecord) -> EnsembleResult<()> {
-        self.upsert_edge(edge).map(|_| ()).map_err(EnsembleError::from)
+        self.upsert_edge(edge)
+            .map(|_| ())
+            .map_err(EnsembleError::from)
     }
 
     fn pack_get_node(&self, id: &str) -> EnsembleResult<Option<NodeRecord>> {
         Ok(self.get_node(id).cloned())
+    }
+
+    fn pack_query_nodes(&self, query: NodeQuery) -> EnsembleResult<Vec<NodeRecord>> {
+        Ok(self.query_nodes(query))
     }
 }
 
@@ -200,12 +212,13 @@ pub fn register_pack<S: EnsembleGraphStore>(
             .trim()
             .to_string();
     }
-    if PackKind::parse(&pack.kind).is_none() {
+    let Some(kind) = PackKind::parse(&pack.kind) else {
         return Err(EnsembleError::InvalidPack(format!(
             "unknown or missing pack kind: {:?}",
             pack.kind
         )));
-    }
+    };
+    pack.kind = kind.as_str().to_string();
     if pack.pack_content_hash.trim().is_empty() {
         pack.pack_content_hash = stable_value_hash(&pack.spec);
     }
@@ -284,6 +297,32 @@ pub fn get_pack<S: EnsembleGraphStore>(
     }
 }
 
+/// List registered packs for a tenant, optionally filtered to a single [`PackKind`]. Queries by the
+/// `CapabilityPack` label, deserializes each node, keeps the requested tenant (and kind), and orders
+/// the result by `pack_content_hash` ascending so callers (notably the selector) see a deterministic
+/// candidate order. Nodes that fail to deserialize as a `CapabilityPack` are skipped rather than
+/// failing the whole listing.
+pub fn list_packs<S: EnsembleGraphStore>(
+    store: &S,
+    tenant: &str,
+    kind: Option<PackKind>,
+) -> EnsembleResult<Vec<CapabilityPack>> {
+    let want_tenant = normalize_tenant(tenant);
+    let nodes =
+        store.pack_query_nodes(NodeQuery::label(PACK_LABEL).with_limit(PACK_QUERY_LIMIT))?;
+    let mut packs: Vec<CapabilityPack> = nodes
+        .into_iter()
+        .filter_map(|node| serde_json::from_value::<CapabilityPack>(node.properties).ok())
+        .filter(|pack| normalize_tenant(&pack.tenant_slug) == want_tenant)
+        .filter(|pack| match kind {
+            Some(want) => PackKind::parse(&pack.kind) == Some(want),
+            None => true,
+        })
+        .collect();
+    packs.sort_by(|a, b| a.pack_content_hash.cmp(&b.pack_content_hash));
+    Ok(packs)
+}
+
 fn text_at(spec: &Value, keys: &[&str]) -> String {
     for key in keys {
         if let Some(s) = spec.get(*key).and_then(Value::as_str) {
@@ -346,6 +385,21 @@ mod tests {
     }
 
     #[test]
+    fn register_normalizes_skill_pack_alias() {
+        let mut store = InMemoryGraphStore::new();
+        let registered = register_pack(
+            &mut store,
+            pack_from(json!({
+                "kind": "skill_pack",
+                "title": "Skill alias",
+            })),
+        )
+        .expect("register");
+
+        assert_eq!(registered.kind, "skill");
+    }
+
+    #[test]
     fn content_hash_is_deterministic() {
         let mut a = InMemoryGraphStore::new();
         let mut b = InMemoryGraphStore::new();
@@ -359,5 +413,20 @@ mod tests {
         let mut store = InMemoryGraphStore::new();
         let pack = pack_from(json!({ "kind": "nonsense" }));
         assert!(register_pack(&mut store, pack).is_err());
+    }
+
+    #[test]
+    fn list_packs_reads_beyond_default_graph_query_limit() {
+        let mut store = InMemoryGraphStore::new();
+        for index in 0..125 {
+            let pack = pack_from(json!({
+                "kind": "skill",
+                "title": format!("Pack {index}"),
+            }));
+            register_pack(&mut store, pack).expect("register");
+        }
+
+        let packs = list_packs(&store, "default", Some(PackKind::Skill)).expect("list");
+        assert_eq!(packs.len(), 125);
     }
 }

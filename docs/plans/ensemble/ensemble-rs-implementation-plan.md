@@ -50,15 +50,25 @@ with that `kind`, generalizing the skill_pack storage pattern to every kind.
 
 ## Slices (each independently buildable + testable, `-p ensemble`)
 
-- S1 registry: `CapabilityPack` + `PackKind` + `TrustTier` + `EnsembleGraphStore` trait +
+- S1 registry [DONE]: `CapabilityPack` + `PackKind` + `TrustTier` + `EnsembleGraphStore` trait +
   `register_pack` / `get_pack` / `list_packs`. Content addressing + source/artifact edges. Unit tests
-  over `InMemoryGraphStore`. (Mirrors skill_pack; the foundational slice.)
-- S2 budgeted selector + `EnsembleDecision`: pack scoring under a budget, rejected-with-reasons,
-  replayable artifact. Pure-function tests.
-- S3 trust ladder: tier gating + passport.
+  over `InMemoryGraphStore`. (Mirrors skill_pack; the foundational slice.) `list_packs` +
+  `pack_query_nodes` (mirroring Codex's `skill_pack_query_nodes`) landed with S2.
+- S2 budgeted selector + `EnsembleDecision` [DONE -- `src/selector.rs`]: pure deterministic `select`
+  over an explicit candidate set (score DESC, content-hash ASC tie-break; learned prior with a lexical
+  cold-start fallback; budget-bounded greedy fill that keeps walking so a cheaper lower-score pack can
+  still fit the remainder), rejected-with-reasons, plus a store-backed `select_from_store` wrapper.
+  Scores rounded to 6dp so the decision `content_address` is reproducible. 8 pure-function tests.
+- S3 trust ladder [DONE -- `src/trust.rs`]: `trust_rank` / `trust_score` / `parse_trust_floor` /
+  `meets_floor` / `passport_id`; the selector applies the `min_trust` floor (priors) as an intrinsic
+  gate and folds `trust_score` into relevance as a bounded bonus. 4 tests.
 - S4 (COORDINATE WITH CODEX, later): MCP exposure (`ensemble_register` / `ensemble_select` /
   `ensemble_decision`) in `rustyred-thg-mcp/src/lib.rs` -- Codex's hot file. Claim + coordinate before
   touching. Until then ensemble is a pure library exercised by tests.
+
+Validation (2026-06-05): `cargo test -p ensemble` = 18 passed; `cargo clippy -p ensemble
+--all-targets --no-deps -- -D warnings` = clean. S2/S3 complete the crate as a pure library; only
+S4 (the Codex-coordinated MCP surface) remains.
 
 ## Stays out of scope (named, not cut)
 
