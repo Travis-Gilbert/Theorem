@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ensemble::{
+    pack_node_id as ensemble_pack_node_id, register_pack as ensemble_register_pack,
+    select_from_store as ensemble_select_from_store, CapabilityPack, EnsembleError,
+    EnsembleGraphStore, EnsembleResult, EnsembleSelectRequest, PackExposure, PackKind, TrustTier,
+};
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
     merge_graph_snapshots, update_graph_ref, CodeKgManifest, Direction, EdgeRecord, EpistemicType,
@@ -1048,12 +1053,31 @@ fn call_tool<P: McpGraphProvider>(
             }
             skill_apply_payload(&tenant, &mut backend, &arguments)?
         }
-        "code_search" | "theorem_harness_code_search" => {
-            let operation = code_search_operation(&arguments)?;
-            if operation == "record_use_receipt" && config.read_only {
+        "ensemble_register" | "theorem_harness_ensemble_register" => {
+            if config.read_only {
                 return Ok(tool_result_error(json!({
                     "error": "mcp_read_only",
-                    "message": "Recording code use receipts is unavailable while read-only mode is active."
+                    "message": "Native Ensemble capability-pack registration is unavailable while read-only mode is active."
+                })));
+            }
+            ensemble_register_payload(&tenant, &mut backend, &arguments)?
+        }
+        "ensemble_select" | "theorem_harness_ensemble_select" => {
+            ensemble_select_payload(&tenant, &backend, &arguments)?
+        }
+        "code_search"
+        | "compute_code"
+        | "theorem_harness_code_search"
+        | "theorem_harness_compute_code" => {
+            let operation = code_search_operation(&arguments)?;
+            if matches!(
+                operation.as_str(),
+                "ingest" | "reindex" | "record_use_receipt"
+            ) && config.read_only
+            {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Code-search writes are unavailable while read-only mode is active."
                 })));
             }
             code_search_payload(&tenant, &mut backend, &arguments, &operation)?
@@ -3037,6 +3061,189 @@ fn skill_apply_payload(
     }))
 }
 
+fn ensemble_register_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let pack = capability_pack_from_arguments(tenant, arguments)?;
+    let mut store = McpEnsembleStore { backend };
+    let registered = ensemble_register_pack(&mut store, pack).map_err(mcp_ensemble_error)?;
+    let node_id = ensemble_pack_node_id(tenant, &registered.pack_content_hash);
+    Ok(json!({
+        "tenant": tenant,
+        "node_id": node_id,
+        "pack": registered
+    }))
+}
+
+fn ensemble_select_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let task = argument_text(arguments, &["task", "query", "intent"])
+        .ok_or_else(|| McpError::invalid_params("ensemble_select requires task"))?;
+    let kind = optional_pack_kind(arguments)?;
+    let request = EnsembleSelectRequest {
+        task,
+        budget_units: arguments
+            .get("budget_units")
+            .or_else(|| arguments.get("budgetUnits"))
+            .and_then(Value::as_u64),
+        max_selected: arguments
+            .get("max_selected")
+            .or_else(|| arguments.get("maxSelected"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        candidates: Vec::new(),
+        priors: ensemble_priors_from_arguments(arguments)?,
+    };
+    let store = McpEnsembleReadStore { backend };
+    let decision =
+        ensemble_select_from_store(&store, tenant, kind, request).map_err(mcp_ensemble_error)?;
+    let decision_content_hash = decision.content_address();
+    Ok(json!({
+        "tenant": tenant,
+        "decision_content_hash": decision_content_hash,
+        "decision": decision
+    }))
+}
+
+fn capability_pack_from_arguments(
+    tenant: &str,
+    arguments: &Value,
+) -> Result<CapabilityPack, McpError> {
+    let pack_value = arguments
+        .get("pack")
+        .or_else(|| arguments.get("capability_pack"))
+        .or_else(|| arguments.get("capabilityPack"))
+        .or_else(|| arguments.get("spec"))
+        .cloned()
+        .ok_or_else(|| {
+            McpError::invalid_params("ensemble_register requires pack or spec object")
+        })?;
+    if !pack_value.is_object() {
+        return Err(McpError::invalid_params(
+            "ensemble_register pack/spec must be an object",
+        ));
+    }
+    let spec = pack_value
+        .get("spec")
+        .cloned()
+        .unwrap_or_else(|| pack_value.clone());
+    if !spec.is_object() {
+        return Err(McpError::invalid_params(
+            "ensemble_register spec must be an object",
+        ));
+    }
+    let tenant_slug = argument_text(arguments, &["tenant_slug", "tenantSlug", "tenant"])
+        .or_else(|| argument_text(&pack_value, &["tenant_slug", "tenantSlug", "tenant"]))
+        .unwrap_or_else(|| tenant.to_string());
+    let kind = argument_text(arguments, &["kind"])
+        .or_else(|| argument_text(&pack_value, &["kind"]))
+        .or_else(|| argument_text(&spec, &["kind"]))
+        .unwrap_or_default();
+    let title = argument_text(arguments, &["title", "name"])
+        .or_else(|| argument_text(&pack_value, &["title", "name"]))
+        .or_else(|| argument_text(&spec, &["title", "name"]))
+        .unwrap_or_default();
+    let description = argument_text(arguments, &["description", "summary"])
+        .or_else(|| argument_text(&pack_value, &["description", "summary"]))
+        .or_else(|| argument_text(&spec, &["description", "summary"]))
+        .unwrap_or_default();
+    let pack_content_hash = argument_text(arguments, &["pack_content_hash", "packContentHash"])
+        .or_else(|| argument_text(&pack_value, &["pack_content_hash", "packContentHash"]))
+        .unwrap_or_default();
+    let source_content_hash =
+        argument_text(arguments, &["source_content_hash", "sourceContentHash"])
+            .or_else(|| argument_text(&pack_value, &["source_content_hash", "sourceContentHash"]))
+            .unwrap_or_default();
+    let artifact_hashes = {
+        let from_arguments = string_array_any(arguments, &["artifact_hashes", "artifactHashes"]);
+        if from_arguments.is_empty() {
+            string_array_any(&pack_value, &["artifact_hashes", "artifactHashes"])
+        } else {
+            from_arguments
+        }
+    };
+    let trust = optional_trust_tier(arguments, &pack_value)?;
+    let exposure = optional_pack_exposure(arguments, &pack_value)?;
+
+    Ok(CapabilityPack {
+        tenant_slug,
+        pack_content_hash,
+        kind,
+        title,
+        description,
+        spec,
+        trust,
+        exposure,
+        source_content_hash,
+        artifact_hashes,
+    })
+}
+
+fn optional_pack_kind(arguments: &Value) -> Result<Option<PackKind>, McpError> {
+    let Some(kind) = argument_text(arguments, &["kind", "pack_kind", "packKind"]) else {
+        return Ok(None);
+    };
+    PackKind::parse(&kind)
+        .map(Some)
+        .ok_or_else(|| McpError::invalid_params(format!("unsupported Ensemble pack kind `{kind}`")))
+}
+
+fn optional_trust_tier(arguments: &Value, pack_value: &Value) -> Result<TrustTier, McpError> {
+    let value = arguments.get("trust").or_else(|| pack_value.get("trust"));
+    match value {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| McpError::invalid_params(format!("invalid Ensemble trust: {error}"))),
+        None => Ok(TrustTier::default()),
+    }
+}
+
+fn optional_pack_exposure(arguments: &Value, pack_value: &Value) -> Result<PackExposure, McpError> {
+    let value = arguments
+        .get("exposure")
+        .or_else(|| pack_value.get("exposure"));
+    match value {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+            McpError::invalid_params(format!("invalid Ensemble exposure: {error}"))
+        }),
+        None => Ok(PackExposure::default()),
+    }
+}
+
+fn ensemble_priors_from_arguments(arguments: &Value) -> Result<Value, McpError> {
+    let mut priors = arguments
+        .get("priors")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !priors.is_object() {
+        return Err(McpError::invalid_params(
+            "ensemble_select priors must be an object",
+        ));
+    }
+    if let Some(priors_object) = priors.as_object_mut() {
+        for key in [
+            "pack_scores",
+            "pack_costs",
+            "prior_weight",
+            "lexical_weight",
+            "trust_weight",
+            "min_trust",
+            "kinds",
+        ] {
+            if !priors_object.contains_key(key) {
+                if let Some(value) = arguments.get(key) {
+                    priors_object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+    Ok(priors)
+}
+
 fn code_search_payload(
     tenant: &str,
     backend: &mut impl McpGraphBackend,
@@ -3105,7 +3312,9 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
         .to_ascii_lowercase()
         .replace('-', "_");
     match raw.as_str() {
-        "search" | "context" | "recognize" | "explore" | "explain" => Ok(raw),
+        "ingest" | "reindex" | "search" | "context" | "recognize" | "explore" | "explain" => {
+            Ok(raw)
+        }
         "record_use" | "use_receipt" | "record_use_receipt" => Ok("record_use_receipt".to_string()),
         _ => Err(McpError::invalid_params(format!(
             "unsupported code_search operation `{raw}`"
@@ -4882,6 +5091,18 @@ fn mcp_skill_pack_error(error: SkillPackError) -> McpError {
     }
 }
 
+fn mcp_ensemble_error(error: EnsembleError) -> McpError {
+    let code = match &error {
+        EnsembleError::InvalidPack(_) => -32602,
+        EnsembleError::Store(_) => -32603,
+    };
+    McpError {
+        code,
+        message: error.to_string(),
+        data: Some(json!({ "code": "ensemble_error" })),
+    }
+}
+
 struct McpMemoryStore<'a, B: McpGraphBackend> {
     backend: &'a mut B,
 }
@@ -4987,6 +5208,56 @@ impl<B: McpGraphBackend> SkillPackGraphStore for McpSkillPackReadStore<'_, B> {
 
     fn skill_pack_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
         self.backend.query_nodes(query)
+    }
+}
+
+struct McpEnsembleStore<'a, B: McpGraphBackend> {
+    backend: &'a mut B,
+}
+
+struct McpEnsembleReadStore<'a, B: McpGraphBackend> {
+    backend: &'a B,
+}
+
+impl<B: McpGraphBackend> EnsembleGraphStore for McpEnsembleStore<'_, B> {
+    fn pack_upsert_node(&mut self, node: NodeRecord) -> EnsembleResult<()> {
+        self.backend.upsert_node(node).map_err(EnsembleError::from)
+    }
+
+    fn pack_upsert_edge(&mut self, edge: EdgeRecord) -> EnsembleResult<()> {
+        self.backend.upsert_edge(edge).map_err(EnsembleError::from)
+    }
+
+    fn pack_get_node(&self, id: &str) -> EnsembleResult<Option<NodeRecord>> {
+        self.backend.get_node(id).map_err(EnsembleError::from)
+    }
+
+    fn pack_query_nodes(&self, query: NodeQuery) -> EnsembleResult<Vec<NodeRecord>> {
+        self.backend.query_nodes(query).map_err(EnsembleError::from)
+    }
+}
+
+impl<B: McpGraphBackend> EnsembleGraphStore for McpEnsembleReadStore<'_, B> {
+    fn pack_upsert_node(&mut self, _node: NodeRecord) -> EnsembleResult<()> {
+        Err(EnsembleError::from(GraphStoreError::new(
+            "read_only_ensemble_adapter",
+            "read-only Ensemble adapter cannot upsert nodes",
+        )))
+    }
+
+    fn pack_upsert_edge(&mut self, _edge: EdgeRecord) -> EnsembleResult<()> {
+        Err(EnsembleError::from(GraphStoreError::new(
+            "read_only_ensemble_adapter",
+            "read-only Ensemble adapter cannot upsert edges",
+        )))
+    }
+
+    fn pack_get_node(&self, id: &str) -> EnsembleResult<Option<NodeRecord>> {
+        self.backend.get_node(id).map_err(EnsembleError::from)
+    }
+
+    fn pack_query_nodes(&self, query: NodeQuery) -> EnsembleResult<Vec<NodeRecord>> {
+        self.backend.query_nodes(query).map_err(EnsembleError::from)
     }
 }
 
@@ -5611,9 +5882,10 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "tenant_slug": { "type": "string" },
                     "operation": {
                         "type": "string",
-                        "enum": ["search", "context", "recognize", "explore", "explain", "record_use_receipt"],
+                        "enum": ["ingest", "reindex", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
                         "default": "search"
                     },
+                    "repo_path": { "type": "string" },
                     "query": { "type": "string" },
                     "node_id": { "type": "string" },
                     "repo_id": { "type": "string" },
@@ -5631,6 +5903,68 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "timeout_ms": { "type": "integer" },
                     "dry_run": { "type": "boolean", "default": false }
                 }
+            }),
+        ),
+        tool(
+            "compute_code",
+            "Alias for native CodeCrawler-backed code_search; use for graph-structural code discovery and compute-code replacement flows.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["ingest", "reindex", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
+                        "default": "search"
+                    },
+                    "repo_path": { "type": "string" },
+                    "query": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "repo_id": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "path_prefix": { "type": "string" },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "limit": { "type": "integer", "default": 20 },
+                    "max_depth": { "type": "integer", "default": 1 },
+                    "max_chars": { "type": "integer" },
+                    "text": { "type": "string" },
+                    "action": { "type": "string" },
+                    "outcome": { "type": "string" },
+                    "use": { "type": "object" },
+                    "actor": { "type": "string" },
+                    "timeout_ms": { "type": "integer" },
+                    "dry_run": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
+        tool(
+            "ensemble_select",
+            "Select registered Ensemble capability packs under task, budget, trust, and prior constraints.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "task": { "type": "string" },
+                    "query": { "type": "string" },
+                    "intent": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["skill", "skill_pack", "agent", "tool", "validator", "renderer", "compute", "policy", "domain", "context"] },
+                    "pack_kind": { "type": "string", "enum": ["skill", "skill_pack", "agent", "tool", "validator", "renderer", "compute", "policy", "domain", "context"] },
+                    "budget_units": { "type": "integer" },
+                    "budgetUnits": { "type": "integer" },
+                    "max_selected": { "type": "integer" },
+                    "maxSelected": { "type": "integer" },
+                    "priors": { "type": "object" },
+                    "pack_scores": { "type": "object" },
+                    "pack_costs": { "type": "object" },
+                    "prior_weight": { "type": "number" },
+                    "lexical_weight": { "type": "number" },
+                    "trust_weight": { "type": "number" },
+                    "min_trust": { "type": "string", "enum": ["unverified", "first_party"] },
+                    "kinds": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["task"]
             }),
         ),
         tool(
@@ -6126,6 +6460,32 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "createdAt": { "type": "string" }
                 },
                 "required": ["actor"]
+            }),
+        ));
+        tools.push(tool_write(
+            "ensemble_register",
+            "Register a content-addressed Ensemble capability pack in the tenant GraphStore.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "pack": { "type": "object" },
+                    "capability_pack": { "type": "object" },
+                    "capabilityPack": { "type": "object" },
+                    "spec": { "type": "object" },
+                    "kind": { "type": "string", "enum": ["skill", "skill_pack", "agent", "tool", "validator", "renderer", "compute", "policy", "domain", "context"] },
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "pack_content_hash": { "type": "string" },
+                    "packContentHash": { "type": "string" },
+                    "source_content_hash": { "type": "string" },
+                    "sourceContentHash": { "type": "string" },
+                    "artifact_hashes": { "type": "array", "items": { "type": "string" } },
+                    "artifactHashes": { "type": "array", "items": { "type": "string" } },
+                    "trust": { "type": "object" },
+                    "exposure": { "type": "object" }
+                }
             }),
         ));
         tools.push(tool_write(
@@ -7235,6 +7595,19 @@ mod tests {
         })
     }
 
+    fn sample_capability_pack() -> Value {
+        json!({
+            "kind": "skill_pack",
+            "title": "Rust Engineering",
+            "description": "Rust systems and graph-store engineering guidance",
+            "capabilities": ["rust", "graph_store", "mcp"],
+            "tags": ["rust", "ensemble", "graph"],
+            "metadata": {
+                "source": "fixture"
+            }
+        })
+    }
+
     fn has_tool(tools: &[Value], name: &str) -> bool {
         tools.iter().any(|tool| tool["name"] == name)
     }
@@ -7307,6 +7680,8 @@ mod tests {
         assert!(has_tool(tools, "self_recall_archive"));
         assert!(has_tool(tools, "observe"));
         assert!(has_tool(tools, "code_search"));
+        assert!(has_tool(tools, "compute_code"));
+        assert!(has_tool(tools, "ensemble_select"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_symbolic_datalog_derive"));
@@ -7331,6 +7706,7 @@ mod tests {
         assert!(!has_tool(tools, "harness_append_transition"));
         assert!(!has_tool(tools, "skill_publish"));
         assert!(!has_tool(tools, "skill_apply"));
+        assert!(!has_tool(tools, "ensemble_register"));
         assert!(!has_tool(tools, "remember"));
         assert!(!has_tool(tools, "self_note"));
         assert!(!has_tool(tools, "self_revise"));
@@ -7370,6 +7746,47 @@ mod tests {
         assert!(routed["app_affordance"]["request"]
             .get("operation")
             .is_none());
+    }
+
+    #[test]
+    fn compute_code_alias_routes_to_code_search_app_affordance() {
+        let (provider, config) = fixture();
+        let routed = call_tool_json(
+            &provider,
+            &config,
+            "compute_code",
+            json!({
+                "tenant": "smoke",
+                "query": "graph store persistence",
+                "repo_id": "repo:test",
+                "actor": "codex",
+            }),
+        );
+
+        assert_eq!(routed["operation"], "search");
+        assert_eq!(routed["affordance_id"], "theorem_grpc.code_search.search");
+        assert_eq!(
+            routed["app_affordance"]["request"]["query"],
+            "graph store persistence"
+        );
+    }
+
+    #[test]
+    fn code_search_write_operations_are_read_only_gated() {
+        let (provider, config) = fixture();
+        let gated = call_tool_json(
+            &provider,
+            &config,
+            "code_search",
+            json!({
+                "tenant": "smoke",
+                "operation": "ingest",
+                "repo_path": "/tmp/theorem-fixture",
+                "actor": "codex",
+            }),
+        );
+
+        assert_eq!(gated["error"], "mcp_read_only");
     }
 
     #[test]
@@ -7417,6 +7834,9 @@ mod tests {
         assert!(has_tool(tools, "skill_get"));
         assert!(has_tool(tools, "skill_publish"));
         assert!(has_tool(tools, "skill_apply"));
+        assert!(has_tool(tools, "ensemble_select"));
+        assert!(has_tool(tools, "ensemble_register"));
+        assert!(has_tool(tools, "compute_code"));
         assert!(has_tool(tools, "remember"));
         assert!(has_tool(tools, "recall"));
         assert!(has_tool(tools, "relate"));
@@ -7491,6 +7911,53 @@ mod tests {
         assert_eq!(
             applied["receipt"]["validators"].as_array().unwrap().len(),
             2
+        );
+    }
+
+    #[test]
+    fn native_ensemble_tools_register_and_select_capability_pack() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let registered = call_tool_json(
+            &provider,
+            &config,
+            "ensemble_register",
+            json!({
+                "tenant": "smoke",
+                "pack": sample_capability_pack(),
+                "source_content_hash": "hash-source",
+                "artifact_hashes": ["hash-artifact"],
+            }),
+        );
+        let pack_hash = registered["pack"]["pack_content_hash"]
+            .as_str()
+            .expect("pack hash")
+            .to_string();
+        assert_eq!(registered["pack"]["kind"], "skill");
+        assert_eq!(registered["pack"]["tenant_slug"], "smoke");
+        assert!(!pack_hash.is_empty());
+
+        let selected = call_tool_json(
+            &provider,
+            &config,
+            "ensemble_select",
+            json!({
+                "tenant": "smoke",
+                "task": "use rust graph store mcp code search",
+                "kind": "skill_pack",
+                "max_selected": 1
+            }),
+        );
+
+        assert!(!selected["decision_content_hash"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert_eq!(selected["decision"]["selected"][0]["kind"], "skill");
+        assert_eq!(
+            selected["decision"]["selected"][0]["pack_content_hash"],
+            pack_hash
         );
     }
 

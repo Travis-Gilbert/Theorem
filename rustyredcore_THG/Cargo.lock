@@ -843,6 +843,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ensemble"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "theorem-harness-core",
+]
+
+[[package]]
 name = "enum-as-inner"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3209,6 +3219,7 @@ dependencies = [
 name = "rustyred-thg-mcp"
 version = "0.5.0"
 dependencies = [
+ "ensemble",
  "rustyred-thg-core",
  "serde",
  "serde_json",
