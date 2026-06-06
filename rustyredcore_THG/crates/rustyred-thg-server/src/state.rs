@@ -10,7 +10,7 @@ use rustyred_thg_core::store::RedisThgStore;
 use rustyred_thg_core::{
     make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
     EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
-    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStoreError, GraphStoreResult,
+    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
     GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore, NeighborHit,
     NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
     SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
@@ -24,6 +24,10 @@ use rustyred_web::{
     SearchProvider,
 };
 use serde_json::{json, Value};
+use theorem_harness_core::{TransitionInput, TransitionResult};
+use theorem_harness_runtime::{
+    append_transition_from_store, load_events, load_run, HarnessRuntimeError,
+};
 
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
@@ -1623,6 +1627,80 @@ pub struct ProductMcpBackend {
     store: TenantGraphStore,
 }
 
+struct RuntimeTenantMirrorGraphStore<'a> {
+    store: &'a mut TenantGraphStore,
+    mirror: InMemoryGraphStore,
+}
+
+impl<'a> RuntimeTenantMirrorGraphStore<'a> {
+    fn new(store: &'a mut TenantGraphStore) -> GraphStoreResult<Self> {
+        let mirror = InMemoryGraphStore::from_snapshot(store.graph_snapshot()?)?;
+        Ok(Self { store, mirror })
+    }
+}
+
+impl GraphStore for RuntimeTenantMirrorGraphStore<'_> {
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
+        let write = self.store.upsert_node(node.clone())?;
+        GraphStore::upsert_node(&mut self.mirror, node)?;
+        Ok(write)
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+        let write = self.store.upsert_edge(edge.clone())?;
+        GraphStore::upsert_edge(&mut self.mirror, edge)?;
+        Ok(write)
+    }
+
+    fn get_node(&self, id: &str) -> Option<&NodeRecord> {
+        GraphStore::get_node(&self.mirror, id)
+    }
+
+    fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
+        GraphStore::get_edge(&self.mirror, id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
+        GraphStore::query_nodes(&self.mirror, query)
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
+        GraphStore::neighbors(&self.mirror, query)
+    }
+
+    fn stats(&self) -> GraphStats {
+        GraphStore::stats(&self.mirror)
+    }
+
+    fn verify(&self) -> VerifyReport {
+        GraphStore::verify(&self.mirror)
+    }
+
+    fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        let report = self.store.rebuild_indexes()?;
+        GraphStore::rebuild_indexes(&mut self.mirror)?;
+        Ok(report)
+    }
+}
+
+fn mcp_harness_runtime_error(error: HarnessRuntimeError) -> McpError {
+    McpError {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({ "code": "harness_runtime_error" })),
+    }
+}
+
+fn transition_result_payload(result: TransitionResult) -> Value {
+    json!({
+        "run": result.run,
+        "event": result.event,
+        "effects": result.effects,
+        "state_hash_before": result.state_hash_before,
+        "state_hash_after": result.state_hash_after
+    })
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 struct InvokeAppAffordanceGrpcRequest {
     #[prost(string, tag = "1")]
@@ -1727,6 +1805,28 @@ impl McpGraphBackend for ProductMcpBackend {
         self.store.upsert_edge(edge)?;
         self.state.observability.record_mutation();
         Ok(())
+    }
+
+    fn append_harness_transition(
+        &mut self,
+        transition: TransitionInput,
+    ) -> Result<Value, McpError> {
+        let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
+        append_transition_from_store(&mut runtime_store, transition)
+            .map(transition_result_payload)
+            .map_err(mcp_harness_runtime_error)
+    }
+
+    fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
+        let snapshot = self.store.graph_snapshot()?;
+        let mirror = InMemoryGraphStore::from_snapshot(snapshot)?;
+        match load_run(&mirror, run_id).map_err(mcp_harness_runtime_error)? {
+            None => Ok(None),
+            Some(run) => {
+                let events = load_events(&mirror, run_id).map_err(mcp_harness_runtime_error)?;
+                Ok(Some(json!({ "run": run, "events": events })))
+            }
+        }
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {

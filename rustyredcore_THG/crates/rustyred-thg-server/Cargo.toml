@@ -18,6 +18,7 @@ redis = "0.27"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rustyred-thg-core = { path = "../rustyred-thg-core", features = ["redis-store"] }
+theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }
 rustyred-thg-adapters = { path = "../rustyred-thg-adapters" }
 rustyred-thg-mcp = { path = "../rustyred-thg-mcp", features = ["redis-store"] }

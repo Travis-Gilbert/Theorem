@@ -3259,6 +3259,7 @@ dependencies = [
  "rustyred-web",
  "serde",
  "serde_json",
+ "theorem-harness-core",
  "theorem-harness-runtime",
  "tokio",
  "tokio-stream",

@@ -44,8 +44,9 @@ use rustyred_web::{
     QWEN3_EMBEDDING_4B_DIMENSION, SEMANTIC_VECTOR_PROPERTY,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use theorem_harness_runtime::subscribe_coordination_room_events;
+use serde_json::{json, Map, Value};
+use theorem_harness_core::TransitionInput;
+use theorem_harness_runtime::{append_transition_from_store, subscribe_coordination_room_events};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -153,6 +154,30 @@ pub struct LiveSearchRequest {
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
+
+#[derive(Clone, Debug)]
+struct LiveSearchAcquisitionJob {
+    run_id: String,
+    tenant: String,
+    query: String,
+    provider_allowlist: Vec<String>,
+    opts: SearchOpts,
+    seed_limit: usize,
+    actor_id: String,
+    wait: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LiveFractalExpansionJob {
+    tenant: String,
+    request: FractalExpansionRequest,
+    max_bytes: usize,
+    provider_allowlist: Vec<String>,
+    search_opts: SearchOpts,
+    actor_id: String,
+    wait: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FederateSubmitBody {
     #[serde(default, alias = "tenant_id")]
@@ -697,6 +722,17 @@ async fn live_search_acquisition_payload(
     config: &rustyred_thg_mcp::McpServerConfig,
     arguments: &Value,
 ) -> Result<Value, Value> {
+    let job = live_search_acquisition_job(config, arguments)?;
+    if job.wait || config.read_only {
+        return execute_live_search_acquisition(state, &job).await;
+    }
+    enqueue_live_search_acquisition(state.clone(), job).await
+}
+
+fn live_search_acquisition_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<LiveSearchAcquisitionJob, Value> {
     let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
         json!({
             "error": "invalid_search_acquisition",
@@ -709,7 +745,6 @@ async fn live_search_acquisition_payload(
     )
     .map_err(|error| error.payload())?;
     let provider_allowlist = string_array_argument(arguments, "providers");
-    let providers = state.search_providers(&provider_allowlist);
     let opts = SearchOpts {
         provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
             .unwrap_or(10)
@@ -724,8 +759,27 @@ async fn live_search_acquisition_payload(
     let seed_limit = argument_u64_any(arguments, &["seed_limit", "seedLimit"])
         .unwrap_or(8)
         .clamp(1, 50) as usize;
-    let acquisition = fanout_search_providers(&providers, &query, opts).await;
-    let seed_urls = acquisition.seed_urls(seed_limit);
+    Ok(LiveSearchAcquisitionJob {
+        run_id: argument_text_any(arguments, &["run_id", "runId"])
+            .unwrap_or_else(|| default_live_web_run_id("search")),
+        tenant,
+        query,
+        provider_allowlist,
+        opts,
+        seed_limit,
+        actor_id: argument_text_any(arguments, &["actor", "actor_id", "actorId"])
+            .unwrap_or_else(default_live_web_actor),
+        wait: live_web_wait_requested(arguments),
+    })
+}
+
+async fn execute_live_search_acquisition(
+    state: &AppState,
+    job: &LiveSearchAcquisitionJob,
+) -> Result<Value, Value> {
+    let providers = state.search_providers(&job.provider_allowlist);
+    let acquisition = fanout_search_providers(&providers, &job.query, job.opts.clone()).await;
+    let seed_urls = acquisition.seed_urls(job.seed_limit);
     let normalized_query = acquisition.query.clone();
     let stats = json!({
         "candidates": acquisition.candidates.len(),
@@ -735,12 +789,47 @@ async fn live_search_acquisition_payload(
     });
 
     Ok(json!({
-        "tenant": tenant,
+        "tenant": job.tenant,
+        "run_id": job.run_id,
         "query": normalized_query,
         "acquisition": acquisition,
         "seed_urls": seed_urls,
-        "stats": stats
+        "stats": stats,
+        "mode": "sync"
     }))
+}
+
+async fn enqueue_live_search_acquisition(
+    state: AppState,
+    job: LiveSearchAcquisitionJob,
+) -> Result<Value, Value> {
+    start_live_web_harness_run(
+        &state,
+        &job.tenant,
+        &job.run_id,
+        "rustyweb_search_acquisition",
+        &job.query,
+        &job.actor_id,
+    )?;
+    let handoff = live_web_async_handoff_payload(
+        &job.tenant,
+        &job.run_id,
+        "rustyweb_search_acquisition",
+        &job.query,
+    );
+    tokio::spawn(async move {
+        let result = execute_live_search_acquisition(&state, &job).await;
+        finish_live_web_harness_run(
+            &state,
+            &job.tenant,
+            &job.run_id,
+            "rustyweb_search_acquisition",
+            &job.actor_id,
+            result,
+        )
+        .await;
+    });
+    Ok(handoff)
 }
 
 async fn live_fractal_expansion_payload(
@@ -748,6 +837,17 @@ async fn live_fractal_expansion_payload(
     config: &rustyred_thg_mcp::McpServerConfig,
     arguments: &Value,
 ) -> Result<Value, Value> {
+    let job = live_fractal_expansion_job(config, arguments)?;
+    if job.wait {
+        return execute_live_fractal_expansion(state, &job).await;
+    }
+    enqueue_live_fractal_expansion(state.clone(), job).await
+}
+
+fn live_fractal_expansion_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<LiveFractalExpansionJob, Value> {
     let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
         json!({
             "error": "invalid_fractal_expansion",
@@ -759,24 +859,9 @@ async fn live_fractal_expansion_payload(
         &config.default_tenant,
     )
     .map_err(|error| error.payload())?;
-    let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
-        json!({
-            "error": "store_unavailable",
-            "code": error.code,
-            "message": error.message
-        })
-    })?;
-    let vector_designation = ensure_fractal_vector_designation(&store);
-    let mut fractal_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
-        json!({
-            "error": "fractal_store_unavailable",
-            "code": error.code,
-            "message": error.message
-        })
-    })?;
     let request = FractalExpansionRequest {
         run_id: argument_text_any(arguments, &["run_id", "runId"])
-            .unwrap_or_else(default_fractal_run_id),
+            .unwrap_or_else(|| default_live_web_run_id("fractal")),
         tenant_id: tenant.clone(),
         query,
         web_seed_urls: string_array_argument(arguments, "web_seed_urls"),
@@ -792,7 +877,6 @@ async fn live_fractal_expansion_payload(
         .unwrap_or(LIVE_SEARCH_DEFAULT_MAX_BYTES as u64)
         .clamp(1, LIVE_SEARCH_HARD_MAX_BYTES as u64) as usize;
     let provider_allowlist = string_array_argument(arguments, "providers");
-    let providers = state.search_providers(&provider_allowlist);
     let search_opts = SearchOpts {
         provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
             .unwrap_or(10)
@@ -804,17 +888,57 @@ async fn live_fractal_expansion_payload(
             .unwrap_or(60)
             .clamp(1, 1_000) as usize,
     };
-    let cascade = state.live_fetch_cascade();
+    let actor_id = request
+        .actor_id
+        .clone()
+        .unwrap_or_else(default_live_web_actor);
+    Ok(LiveFractalExpansionJob {
+        tenant,
+        request,
+        max_bytes,
+        provider_allowlist,
+        search_opts,
+        actor_id,
+        wait: live_web_wait_requested(arguments),
+    })
+}
+
+async fn execute_live_fractal_expansion(
+    state: &AppState,
+    job: &LiveFractalExpansionJob,
+) -> Result<Value, Value> {
+    let mut store = state.tenant_graph_store(&job.tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let vector_designation = ensure_fractal_vector_designation(&store);
+    let mut fractal_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "fractal_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let providers = state.search_providers(&job.provider_allowlist);
     let receipt = if providers.is_empty() {
-        run_fractal_expansion(&mut fractal_store, request, cascade.as_ref(), max_bytes).await
+        run_fractal_expansion(
+            &mut fractal_store,
+            job.request.clone(),
+            state.live_fetch_cascade().as_ref(),
+            job.max_bytes,
+        )
+        .await
     } else {
         run_fractal_expansion_with_search_providers(
             &mut fractal_store,
-            request,
-            cascade.as_ref(),
-            max_bytes,
+            job.request.clone(),
+            state.live_fetch_cascade().as_ref(),
+            job.max_bytes,
             &providers,
-            search_opts,
+            job.search_opts.clone(),
         )
         .await
     }
@@ -825,10 +949,340 @@ async fn live_fractal_expansion_payload(
         })
     })?;
     Ok(json!({
-        "tenant": tenant,
+        "tenant": job.tenant,
+        "run_id": job.request.run_id,
         "receipt": receipt,
-        "vector_designation": vector_designation
+        "vector_designation": vector_designation,
+        "mode": "sync"
     }))
+}
+
+async fn enqueue_live_fractal_expansion(
+    state: AppState,
+    job: LiveFractalExpansionJob,
+) -> Result<Value, Value> {
+    start_live_web_harness_run(
+        &state,
+        &job.tenant,
+        &job.request.run_id,
+        "fractal_expansion",
+        &job.request.query,
+        &job.actor_id,
+    )?;
+    let handoff = live_web_async_handoff_payload(
+        &job.tenant,
+        &job.request.run_id,
+        "fractal_expansion",
+        &job.request.query,
+    );
+    tokio::spawn(async move {
+        let result = execute_live_fractal_expansion(&state, &job).await;
+        finish_live_web_harness_run(
+            &state,
+            &job.tenant,
+            &job.request.run_id,
+            "fractal_expansion",
+            &job.actor_id,
+            result,
+        )
+        .await;
+    });
+    Ok(handoff)
+}
+
+fn live_web_async_handoff_payload(
+    tenant: &str,
+    run_id: &str,
+    tool_name: &str,
+    query: &str,
+) -> Value {
+    json!({
+        "tenant": tenant,
+        "run_id": run_id,
+        "query": query,
+        "tool": tool_name,
+        "status": "queued",
+        "mode": "async_handoff",
+        "poll": {
+            "tool": "harness_run",
+            "arguments": {
+                "tenant": tenant,
+                "run_id": run_id
+            }
+        }
+    })
+}
+
+fn start_live_web_harness_run(
+    state: &AppState,
+    tenant: &str,
+    run_id: &str,
+    tool_name: &str,
+    query: &str,
+    actor: &str,
+) -> Result<(), Value> {
+    let actor = if actor.trim().is_empty() {
+        default_live_web_actor()
+    } else {
+        actor.trim().to_string()
+    };
+    let artifact_id = format!("live-web-context:{run_id}");
+    let task_signature = stable_hash(json!({
+        "run_id": run_id,
+        "tenant": tenant,
+        "tool": tool_name,
+        "query": query
+    }));
+    append_live_web_harness_transitions(
+        state,
+        tenant,
+        vec![
+            live_web_transition(
+                run_id,
+                &actor,
+                "RUN.CREATED",
+                json!({
+                    "task": format!("{tool_name} live-web async handoff"),
+                    "actor": actor,
+                    "scope": {
+                        "repo": "Theorem",
+                        "branch": "main",
+                        "commit_sha": "",
+                        "workstream_id": "live-web-reach",
+                        "agent_host": "rustyred-thg-server",
+                        "agent_model": "native",
+                        "tenant": tenant,
+                        "tool_name": tool_name,
+                        "query": query,
+                        "async_handoff": true
+                    }
+                }),
+                "created",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "TASK.RESOLVED",
+                json!({ "task_signature": task_signature }),
+                "task-resolved",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "PROFILE.SELECTED",
+                json!({
+                    "profile_id": "live-web-mcp-route",
+                    "profile_version": "1",
+                    "policy_hash": "policy:live-web-async-handoff:v1"
+                }),
+                "profile-selected",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "TOOLKIT.COMPILED",
+                json!({
+                    "selected_tools": [tool_name, "harness_run"],
+                    "selected_plugins": ["theorems-harness"],
+                    "excluded_tools": [],
+                    "permission_reasons": {
+                        tool_name: "live web work runs in a background task and persists receipts",
+                        "harness_run": "client polls run detail after MCP timeout-safe handoff"
+                    }
+                }),
+                "toolkit-compiled",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "CONTEXT.PLANNED",
+                json!({
+                    "budget_tokens": 1024,
+                    "plan_hash": format!("plan:{run_id}"),
+                    "candidate_token_count": 512
+                }),
+                "context-planned",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "CONTEXT.PACKED",
+                json!({
+                    "artifact_id": artifact_id,
+                    "capsule_tokens": 256,
+                    "budget_tokens": 1024,
+                    "included_atom_count": 1,
+                    "excluded_atom_count": 0,
+                    "token_ledger": {
+                        "request": 128,
+                        "route": 128
+                    }
+                }),
+                "context-packed",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "CONTEXT.INJECTED",
+                json!({
+                    "artifact_id": artifact_id,
+                    "adapter": "rustyred-thg-server",
+                    "target": "background_live_web_worker"
+                }),
+                "context-injected",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "AGENT.ACTING",
+                json!({
+                    "adapter": "rustyred-thg-server",
+                    "started_at": live_web_now_string()
+                }),
+                "agent-acting",
+            ),
+        ],
+    )
+}
+
+async fn finish_live_web_harness_run(
+    state: &AppState,
+    tenant: &str,
+    run_id: &str,
+    tool_name: &str,
+    actor: &str,
+    result: Result<Value, Value>,
+) {
+    let transitions = match result {
+        Ok(payload) => vec![
+            live_web_transition(
+                run_id,
+                actor,
+                "OUTCOME.RECORDED",
+                json!({
+                    "accepted": true,
+                    "tests_passed": false,
+                    "validator_results": [],
+                    "files_changed": [],
+                    "summary": format!("{tool_name} completed"),
+                    "receipt": payload
+                }),
+                "outcome-recorded",
+            ),
+            live_web_transition(
+                run_id,
+                actor,
+                "RUN.CLOSED",
+                json!({
+                    "summary": format!("{tool_name} completed"),
+                    "closed_by": actor
+                }),
+                "run-closed",
+            ),
+        ],
+        Err(error) => vec![live_web_transition(
+            run_id,
+            actor,
+            "RUN.FAILED",
+            json!({
+                "error_code": error
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("live_web_background_error"),
+                "message": error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("live web background task failed"),
+                "details": error
+            }),
+            "run-failed",
+        )],
+    };
+    if let Err(error) = append_live_web_harness_transitions(state, tenant, transitions) {
+        tracing::warn!(
+            run_id = run_id,
+            tenant = tenant,
+            tool_name = tool_name,
+            error = %error,
+            "failed to persist live-web harness completion"
+        );
+    }
+}
+
+fn append_live_web_harness_transitions(
+    state: &AppState,
+    tenant: &str,
+    transitions: Vec<TransitionInput>,
+) -> Result<(), Value> {
+    let mut store = state.tenant_graph_store(tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut runtime_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "harness_run_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    for transition in transitions {
+        append_transition_from_store(&mut runtime_store, transition).map_err(|error| {
+            json!({
+                "error": "harness_run_append_failed",
+                "message": error.to_string()
+            })
+        })?;
+    }
+    Ok(())
+}
+
+fn live_web_transition(
+    run_id: &str,
+    actor: &str,
+    event_type: &str,
+    payload: Value,
+    idempotency_key: &str,
+) -> TransitionInput {
+    let mut transition = TransitionInput::new(event_type, json_object(payload));
+    transition.run_id = run_id.to_string();
+    transition.actor = actor.to_string();
+    transition.idempotency_key = format!("{run_id}:{idempotency_key}");
+    transition
+}
+
+fn json_object(value: Value) -> Map<String, Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+fn live_web_wait_requested(arguments: &Value) -> bool {
+    if let Some(wait) = argument_bool_any(arguments, &["wait", "sync", "synchronous"]) {
+        return wait;
+    }
+    argument_bool_any(arguments, &["async", "async_handoff", "asyncHandoff"])
+        .map(|async_requested| !async_requested)
+        .unwrap_or(false)
+}
+
+fn default_live_web_actor() -> String {
+    "rustyred-thg-server".to_string()
+}
+
+fn default_live_web_run_id(prefix: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("{prefix}-{millis}")
+}
+
+fn live_web_now_string() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("{}.{:09}Z", duration.as_secs(), duration.subsec_nanos()),
+        Err(_) => "0.000000000Z".to_string(),
+    }
 }
 
 fn ensure_fractal_vector_designation(store: &TenantGraphStore) -> Value {
@@ -941,6 +1395,21 @@ fn argument_u64_any(arguments: &Value, keys: &[&str]) -> Option<u64> {
         .find_map(|key| arguments.get(*key).and_then(Value::as_u64))
 }
 
+fn argument_bool_any(arguments: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        let value = arguments.get(*key)?;
+        match value {
+            Value::Bool(value) => Some(*value),
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
 fn string_array_argument(arguments: &Value, key: &str) -> Vec<String> {
     arguments
         .get(key)
@@ -955,14 +1424,6 @@ fn string_array_argument(arguments: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn default_fractal_run_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    format!("fractal-{millis}")
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
@@ -5516,6 +5977,7 @@ mod tests {
         state::AppState,
     };
     use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
+    use rustyred_thg_mcp::{handle_mcp_request_with_context, McpRequestContext};
     use rustyred_web::{SearchCandidate, SearchProvider, StaticSearchProvider};
 
     async fn response_payload_json(response: axum::response::Response) -> Value {
@@ -5534,6 +5996,19 @@ mod tests {
 
     fn memory_product_state_with_search_providers(
         search_providers: Vec<Arc<dyn SearchProvider>>,
+    ) -> AppState {
+        memory_product_state_with_search_providers_and_read_only(search_providers, true)
+    }
+
+    fn memory_product_write_state_with_search_providers(
+        search_providers: Vec<Arc<dyn SearchProvider>>,
+    ) -> AppState {
+        memory_product_state_with_search_providers_and_read_only(search_providers, false)
+    }
+
+    fn memory_product_state_with_search_providers_and_read_only(
+        search_providers: Vec<Arc<dyn SearchProvider>>,
+        read_only: bool,
     ) -> AppState {
         AppState::new_with_search_providers(
             Config {
@@ -5565,7 +6040,7 @@ mod tests {
                 api_title: "Rusty Red".to_string(),
                 public_url: None,
                 mcp_enabled: true,
-                mcp_read_only: true,
+                mcp_read_only: read_only,
                 mcp_allow_admin: false,
                 mcp_default_tenant: "default".to_string(),
                 ttl_sweep_ms: 1000,
@@ -5687,6 +6162,86 @@ mod tests {
         );
         assert_eq!(payload["acquisition"]["providers"][0]["provider"], "static");
         assert_eq!(payload["acquisition"]["providers"][0]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn mcp_search_acquisition_async_handoff_persists_pollable_harness_run() {
+        let state = memory_product_write_state_with_search_providers(vec![Arc::new(
+            StaticSearchProvider::new(
+                "static",
+                vec![SearchCandidate {
+                    url: "https://example.com/search-candidate".to_string(),
+                    title: Some("Search candidate".to_string()),
+                    snippet: Some("candidate from configured provider".to_string()),
+                    source: "static".to_string(),
+                    rank: 1,
+                }],
+            ),
+        )]);
+        let config = state.mcp_config();
+        let response = maybe_handle_live_search_acquisition_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "search-acquisition-async",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyweb_search_acquisition",
+                    "arguments": {
+                        "query": "search candidate",
+                        "providers": ["static"],
+                        "seed_limit": 1,
+                        "run_id": "search-run-async-test"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("search acquisition MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["mode"], "async_handoff");
+        assert_eq!(payload["status"], "queued");
+        assert_eq!(payload["run_id"], "search-run-async-test");
+        assert_eq!(payload["poll"]["tool"], "harness_run");
+
+        let mut run_payload = Value::Null;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let response = handle_mcp_request_with_context(
+                &state,
+                &config,
+                &McpRequestContext::default(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "poll-search-acquisition",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "harness_run",
+                        "arguments": {
+                            "run_id": "search-run-async-test"
+                        }
+                    }
+                }),
+            );
+            run_payload = response["result"]["structuredContent"].clone();
+            if run_payload["detail"]["run"]["status"] == "closed" {
+                break;
+            }
+        }
+
+        assert_eq!(run_payload["found"], true);
+        assert_eq!(run_payload["detail"]["run"]["status"], "closed");
+        assert!(run_payload["detail"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "OUTCOME.RECORDED"));
+        assert_eq!(
+            run_payload["detail"]["run"]["outcome"]["receipt"]["stats"]["candidates"],
+            1
+        );
     }
 
     #[tokio::test]

@@ -6070,7 +6070,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
     ));
     tools.push(tool(
         "rustyweb_search_acquisition",
-        "Fan out across configured RustyWeb search providers, dedupe by normalized URL, RRF-merge candidates, and return crawl seed URLs. Executed by the async harness server route.",
+        "Queue RustyWeb search provider fan-out through the async harness server route, returning a pollable run_id by default. Pass wait=true for a synchronous diagnostic result.",
         json!({
             "type": "object",
             "properties": {
@@ -6083,7 +6083,9 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "provider_limit": { "type": "integer", "default": 10 },
                 "limit": { "type": "integer", "default": 16 },
                 "rrf_k": { "type": "integer", "default": 60 },
-                "seed_limit": { "type": "integer", "default": 8 }
+                "seed_limit": { "type": "integer", "default": 8 },
+                "run_id": { "type": "string" },
+                "wait": { "type": "boolean", "default": false }
             },
             "required": ["query"]
         }),
@@ -6211,7 +6213,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
     if !config.read_only {
         tools.push(tool_write(
             "fractal_expansion",
-            "Run live RustyRed fractal expansion: search the tenant graph frontier, fetch web seed URLs, quarantine admitted open-web pages, and return the crawl receipt.",
+            "Queue live RustyRed fractal expansion through the async harness server route, returning a pollable run_id by default. Pass wait=true for a synchronous diagnostic receipt.",
             json!({
                 "type": "object",
                 "properties": {
@@ -6231,7 +6233,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "embedder_model": { "type": "string" },
                     "actor": { "type": "string" },
                     "actor_id": { "type": "string" },
-                    "run_id": { "type": "string" }
+                    "run_id": { "type": "string" },
+                    "wait": { "type": "boolean", "default": false }
                 },
                 "required": ["query"]
             }),
