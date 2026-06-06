@@ -18,12 +18,17 @@ COPY rustyredcore_THG/crates/rustyred-thg-affordances ./rustyredcore_THG/crates/
 COPY rustyredcore_THG/crates/rustyred-thg-connectors ./rustyredcore_THG/crates/rustyred-thg-connectors
 
 WORKDIR /app/apps/theorem-harness-server
+# rustyred-thg-affordances pulls in BLAS-backed crates (statrs/nalgebra/faer),
+# so the binary links -lopenblas. Install it (and pkg-config) before building.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libopenblas-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo build --release --bin theorem-harness-server
 
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/apps/theorem-harness-server/target/release/theorem-harness-server /usr/local/bin/theorem-harness-server
