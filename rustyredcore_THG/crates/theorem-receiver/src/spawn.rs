@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use theorem_harness_core::{LANE_CLAUDE, LANE_CODEX};
+use crate::head::adapter_for;
 
 /// The env var that must NEVER reach the child. An API key in the child env
 /// silently wins precedence over the CLI's subscription login and bills metered
@@ -35,37 +35,14 @@ pub struct SpawnPlan {
     pub strip_env: Vec<String>,
 }
 
-/// Build the spawn plan for a lane. Returns `None` for an unknown lane.
+/// Build the spawn plan for a lane by dispatching to its head adapter. Returns
+/// `None` for an unregistered lane. The per-head shape (program, args, env
+/// policy) lives in `head.rs`:
 ///
 ///   - Claude lane: `claude -p "<intent>" --permission-mode acceptEdits`.
 ///   - Codex lane:  `codex exec "<intent>"`.
-///
-/// Exact flags are verified against the installed CLI at build time; adjust here
-/// if the CLI surface changes.
 pub fn build_spawn_plan(lane: &str, intent: &str, worktree: &Path) -> Option<SpawnPlan> {
-    let (program, args) = match lane {
-        LANE_CLAUDE => (
-            "claude".to_string(),
-            vec![
-                "-p".to_string(),
-                intent.to_string(),
-                "--permission-mode".to_string(),
-                "acceptEdits".to_string(),
-            ],
-        ),
-        LANE_CODEX => (
-            "codex".to_string(),
-            vec!["exec".to_string(), intent.to_string()],
-        ),
-        _ => return None,
-    };
-    Some(SpawnPlan {
-        program,
-        args,
-        cwd: worktree.to_path_buf(),
-        // Inherit the user environment, then strip the metered-billing key.
-        strip_env: vec![ANTHROPIC_API_KEY.to_string()],
-    })
+    adapter_for(lane).map(|adapter| adapter.spawn_plan(intent, worktree))
 }
 
 /// Turn a plan into a runnable [`Command`] (inherits the environment minus the

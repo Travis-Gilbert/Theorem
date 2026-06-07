@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use theorem_harness_core::{LANE_CLAUDE, LANE_CODEX};
+use crate::head::head_adapters;
 
 /// Detect installed lanes against the real `PATH` and filesystem.
 pub fn detect_lanes() -> Vec<String> {
@@ -16,15 +16,14 @@ pub fn detect_lanes() -> Vec<String> {
 
 /// Detect installed lanes against an explicit `PATH` value and an executable
 /// predicate. Pure: the predicate is injected so this is unit-testable without a
-/// real filesystem.
+/// real filesystem. Each registered head adapter decides whether it is installed
+/// via its own `detect`; the result preserves registry (detect-priority) order.
 pub fn detect_lanes_in(path_var: &str, exists: impl Fn(&Path) -> bool) -> Vec<String> {
-    let mut lanes = Vec::new();
-    for lane in [LANE_CLAUDE, LANE_CODEX] {
-        if which_in(path_var, lane, &exists).is_some() {
-            lanes.push(lane.to_string());
-        }
-    }
-    lanes
+    head_adapters()
+        .iter()
+        .filter(|adapter| adapter.detect(path_var, &exists))
+        .map(|adapter| adapter.head_id().to_string())
+        .collect()
 }
 
 /// Locate `program` on `path_var`, returning the first matching path the

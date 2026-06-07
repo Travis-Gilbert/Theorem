@@ -28,12 +28,14 @@
 
 pub mod client;
 pub mod config;
+pub mod head;
 pub mod lanes;
 pub mod receiver;
 pub mod spawn;
 
 pub use client::HarnessClient;
 pub use config::ReceiverConfig;
+pub use head::{adapter_for, head_adapters, HeadAdapter};
 pub use lanes::detect_lanes;
 pub use receiver::{run_loop, JobRunReport};
 pub use spawn::{build_intent, build_spawn_plan, SpawnPlan};

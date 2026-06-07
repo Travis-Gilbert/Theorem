@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 use theorem_harness_core::Job;
 
 use crate::config::ReceiverConfig;
+use crate::head::adapter_for;
 use crate::lanes::detect_lanes;
-use crate::spawn::{build_intent, build_spawn_plan, command_from_plan};
+use crate::spawn::command_from_plan;
 use crate::{client::HarnessClient, ReceiverError, ReceiverResult};
 
 /// How many stdout lines to retain as the fallback receipt tail.
@@ -80,10 +81,11 @@ fn run_job(
             job.job_id
         ))
     })?;
-    let intent = build_intent(&job.spec_ref, &job.job_id);
-    let plan = build_spawn_plan(lane, &intent, worktree).ok_or_else(|| {
-        ReceiverError::Protocol(format!("no spawn plan for lane {lane}"))
+    let adapter = adapter_for(lane).ok_or_else(|| {
+        ReceiverError::Protocol(format!("no head adapter registered for lane {lane}"))
     })?;
+    let intent = adapter.intent_template(&job.spec_ref, &job.job_id);
+    let plan = adapter.spawn_plan(&intent, worktree);
 
     log(&format!(
         "claimed {} ({:?}/{:?}) -> spawning {} in {}",
@@ -135,7 +137,7 @@ fn run_job(
     // already called job_complete (Done or Failed), the job is terminal and this
     // is a no-op (applied=false). If the head exited WITHOUT completing, this
     // closes the job Failed with the exit receipt.
-    let receipts = fallback_receipts(lane, exit_code, &tail.joined());
+    let receipts = adapter.parse_receipt(exit_code, &tail.joined());
     let outcome = client.job_complete(&job.job_id, "failed", None, None, receipts)?;
     let defensive_close_applied = outcome
         .get("applied")
@@ -147,17 +149,6 @@ fn run_job(
         lane: lane.to_string(),
         exit_code,
         defensive_close_applied,
-    })
-}
-
-/// The fallback receipt the receiver writes when closing a job after the child
-/// exits.
-fn fallback_receipts(lane: &str, exit_code: Option<i32>, stdout_tail: &str) -> Value {
-    json!({
-        "source": "receiver_fallback",
-        "lane": lane,
-        "exit_code": exit_code,
-        "stdout_tail": stdout_tail,
     })
 }
 
@@ -194,22 +185,6 @@ fn log(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fallback_receipt_shape() {
-        let receipt = fallback_receipts("claude", Some(1), "panic: boom");
-        assert_eq!(receipt["source"], json!("receiver_fallback"));
-        assert_eq!(receipt["lane"], json!("claude"));
-        assert_eq!(receipt["exit_code"], json!(1));
-        assert_eq!(receipt["stdout_tail"], json!("panic: boom"));
-    }
-
-    #[test]
-    fn fallback_receipt_handles_signal_exit() {
-        // A signal-terminated child has no exit code.
-        let receipt = fallback_receipts("codex", None, "");
-        assert_eq!(receipt["exit_code"], Value::Null);
-    }
 
     #[test]
     fn tail_buffer_keeps_only_the_last_n_lines() {
