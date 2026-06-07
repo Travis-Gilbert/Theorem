@@ -68,7 +68,7 @@ mod tests {
     use crate::head_fitness::NodeResult;
     use crate::work_graph::{ClaimOutcome, TaskNode};
     use crate::work_graph_verify::{
-        spawn_verify_node, submit_verify_receipt, verify_node_id, VerifyOutcome, VerifyReceipt,
+        spawn_verify_node, submit_verify_receipt, VerifyOutcome, VerifyReceipt,
     };
 
     const TTL: Millis = 100;
