@@ -155,11 +155,12 @@ mod tests {
         assert_eq!(next_for_head(&graph, &fitness, "codex", 999, 0), None);
     }
 
-    /// A defect found in verification reopens the target (Rejected); the loop is
-    /// closed because rejected work flows back to be redone.
+    /// The failure path closes the loop: a defect reopens the target, the
+    /// scheduler re-offers it, the head reworks and re-proposes, a fresh verify
+    /// spawns, and a clean refutation finally accepts it.
     #[test]
-    fn a_defect_reopens_the_target() {
-        let (mut graph, _fitness) = graph_and_fitness();
+    fn a_defect_reopens_and_the_loop_reruns_to_acceptance() {
+        let (mut graph, fitness) = graph_and_fitness();
         graph.insert(TaskNode::open(
             "impl-x",
             "run-1",
@@ -171,14 +172,34 @@ mod tests {
         graph.nodes.get_mut("impl-x").unwrap().status = NodeStatus::PatchProposed;
         spawn_verify_node(&mut graph, "impl-x", "codex");
 
-        let outcome = submit_verify_receipt(&mut graph, &refutation("impl-x", "codex", true));
-        assert_eq!(outcome, VerifyOutcome::DefectFound);
-        assert_eq!(graph.get("impl-x").unwrap().status, NodeStatus::Rejected);
-        // The verify itself is accepted (finding the defect was its job).
+        // First review finds a defect: the target reopens to Open, verify Accepted.
         assert_eq!(
-            graph.get(&verify_node_id("impl-x")).unwrap().status,
-            NodeStatus::Accepted
+            submit_verify_receipt(&mut graph, &refutation("impl-x", "codex", true)),
+            VerifyOutcome::DefectFound
         );
+        assert_eq!(graph.get("impl-x").unwrap().status, NodeStatus::Open);
+
+        // The scheduler re-offers the reopened node for rework (the loop closes).
+        assert_eq!(
+            next_for_head(&graph, &fitness, "claude", 999, 0).as_deref(),
+            Some("impl-x")
+        );
+
+        // Rework: reclaim at the bumped epoch, re-propose, re-spawn the verify.
+        let epoch = graph.get("impl-x").unwrap().claim_epoch;
+        assert!(matches!(
+            graph.claim("impl-x", "claude", epoch, 0, TTL).unwrap(),
+            ClaimOutcome::Won { .. }
+        ));
+        graph.nodes.get_mut("impl-x").unwrap().status = NodeStatus::PatchProposed;
+        spawn_verify_node(&mut graph, "impl-x", "codex");
+
+        // Second review is clean: the target is finally accepted.
+        assert_eq!(
+            submit_verify_receipt(&mut graph, &refutation("impl-x", "codex", false)),
+            VerifyOutcome::TargetAccepted
+        );
+        assert_eq!(graph.get("impl-x").unwrap().status, NodeStatus::Accepted);
     }
 
     /// An explore token routes the SAME node-type to the other head: the floor

@@ -53,7 +53,7 @@ pub enum VerifyOutcome {
     /// Real attempt, no defect: verify and target both `Accepted`.
     TargetAccepted,
     /// Real attempt found a defect: verify `Accepted` (it did its job), target
-    /// `Rejected` and reopened for rework.
+    /// reopened to `Open` for rework (claim cleared, epoch bumped).
     DefectFound,
     /// LGTM: no failure mode was attempted. Rejected; nothing changes.
     NotAFalsificationAttempt,
@@ -111,7 +111,12 @@ pub fn submit_verify_receipt(graph: &mut WorkGraph, receipt: &VerifyReceipt) -> 
 
     set_status(graph, &verify_id, NodeStatus::Accepted);
     if receipt.defect_found {
-        set_status(graph, &receipt.target_node_id, NodeStatus::Rejected);
+        // The defect was real: reopen the target for rework. Reopening (not a
+        // terminal Rejected) is the whole point of "reopened for rework" -- a
+        // terminal node can never be reclaimed, so the rework could never happen.
+        // The epoch bump voids the previous owner's stale claim, so the rework is
+        // a fresh claim and any late op from the prior owner loses.
+        reopen_for_rework(graph, &receipt.target_node_id);
         VerifyOutcome::DefectFound
     } else {
         set_status(graph, &receipt.target_node_id, NodeStatus::Accepted);
@@ -122,6 +127,18 @@ pub fn submit_verify_receipt(graph: &mut WorkGraph, receipt: &VerifyReceipt) -> 
 fn set_status(graph: &mut WorkGraph, node_id: &str, status: NodeStatus) {
     if let Some(node) = graph.nodes.get_mut(node_id) {
         node.status = status;
+    }
+}
+
+/// Reopen a target for rework after a defect: back to `Open` (claimable), claim
+/// cleared, epoch bumped so the previous owner's stale ops lose. After the head
+/// reworks and re-proposes, a fresh `spawn_verify_node` resets the verify (same
+/// id) to `Open` and the cycle repeats.
+fn reopen_for_rework(graph: &mut WorkGraph, node_id: &str) {
+    if let Some(node) = graph.nodes.get_mut(node_id) {
+        node.status = NodeStatus::Open;
+        node.claim = None;
+        node.claim_epoch += 1;
     }
 }
 
@@ -210,12 +227,16 @@ mod tests {
             &receipt("impl-x", "codex", &["off-by-one in epoch"], true),
         );
         assert_eq!(outcome, VerifyOutcome::DefectFound);
-        // The verify did its job (Accepted); the target is reopened (Rejected).
+        // The verify did its job (Accepted); the target is reopened to Open for
+        // rework (claimable again, claim cleared, epoch bumped).
         assert_eq!(
             graph.get(&verify_node_id("impl-x")).unwrap().status,
             NodeStatus::Accepted
         );
-        assert_eq!(graph.get("impl-x").unwrap().status, NodeStatus::Rejected);
+        let target = graph.get("impl-x").unwrap();
+        assert_eq!(target.status, NodeStatus::Open);
+        assert!(target.claim.is_none());
+        assert!(target.is_claimable(0), "a reopened target can be reclaimed");
     }
 
     #[test]
