@@ -5,6 +5,7 @@ pub mod alignment;
 pub mod budget;
 pub mod context_web;
 pub mod federated_signals;
+pub mod head_fitness;
 pub mod head_invocation;
 pub mod intra_agent_loop;
 pub mod map_artifacts;
@@ -49,6 +50,7 @@ pub use federated_signals::{
     receive_federated_signal, success_rate_bucket, FederatedSignal, PrivacyViolation,
     StructuralSignalInput,
 };
+pub use head_fitness::{FitnessCounter, HeadFitness, NodeResult, RoutingPolicy};
 pub use head_invocation::{
     FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
     HeadInvocationRequest, HeadInvoker,
