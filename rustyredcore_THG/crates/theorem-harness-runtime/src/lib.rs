@@ -1,4 +1,5 @@
 pub mod binding_store;
+pub mod canonical_write;
 pub mod coordination;
 pub mod coordination_push;
 pub mod event_log;
@@ -13,6 +14,13 @@ pub use binding_store::{
     load_binding_events, load_scratchpad_revisions, persist_binding,
     persist_binding_transition_result, scratchpad_revision_node_id, BindingRuntimeError,
     BindingRuntimeResult,
+};
+pub use canonical_write::{
+    alias_witness_node_id, canonical_fact_node_id, canonicalize_on_write,
+    embedding_nomination_node_id, AliasWitness, CanonicalWriteError, CanonicalWriteReceipt,
+    CanonicalWriteResult, CanonicalizeOnWriteInput, EmbeddingNomination, TypedFact,
+    ALIAS_WITNESS_LABEL, CANONICAL_FACT_LABEL, EDGE_ALIAS_WITNESS_FOR, EDGE_EMBEDDING_NOMINATED,
+    EMBEDDING_NOMINATION_LABEL,
 };
 pub use work_graph_store::{
     claim_task_node_durable, load_task_node, load_work_graph, persist_task_node,
