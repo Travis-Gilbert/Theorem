@@ -3,13 +3,20 @@ pub mod coordination;
 pub mod coordination_push;
 pub mod event_log;
 pub mod memory;
+pub mod patch_sequencer;
 pub mod skill_pack;
+pub mod work_graph_store;
 
 pub use binding_store::{
     append_binding_transition, binding_event_node_id, binding_node_id, load_binding,
     load_binding_events, load_scratchpad_revisions, persist_binding,
     persist_binding_transition_result, scratchpad_revision_node_id, BindingRuntimeError,
     BindingRuntimeResult,
+};
+pub use work_graph_store::{
+    claim_task_node_durable, load_task_node, load_work_graph, persist_task_node,
+    persist_work_graph, refine_task_node_durable, task_node_graph_id, WorkGraphStoreError,
+    EDGE_CLAIMED_BY, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 pub use coordination::{
@@ -47,6 +54,10 @@ pub use memory::{
     MemoryNodeState, MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput,
     RecallMemoryInput, RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput,
     ReviseMemoryReceipt, UpsertNoteInput, UpsertNoteReceipt,
+};
+pub use patch_sequencer::{
+    PatchApplyReceipt, PatchApplyStatus, PatchProposal, PatchSequencer, PatchSequencerError,
+    PatchSequencerResult,
 };
 pub use skill_pack::{
     apply_skill_pack, get_skill_pack, list_skill_packs, publish_skill_pack,

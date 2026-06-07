@@ -1216,9 +1216,10 @@ fn reconcile_incoming_links<S: MemoryGraphStore>(
             &source_node_id,
             json!({ "source": "links_reconciled", "updated_at": document.updated_at }),
         )?;
-        other
-            .metadata
-            .insert("unresolved_links".to_string(), Value::Array(still_unresolved));
+        other.metadata.insert(
+            "unresolved_links".to_string(),
+            Value::Array(still_unresolved),
+        );
         if !other.links.iter().any(|link| link == &document.doc_id) {
             other.links.push(document.doc_id.clone());
         }
@@ -2507,9 +2508,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(related
-            .iter()
-            .any(|item| item.id == target.document.doc_id));
+        assert!(related.iter().any(|item| item.id == target.document.doc_id));
     }
 
     #[test]
