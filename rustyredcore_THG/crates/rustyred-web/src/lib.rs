@@ -48,6 +48,15 @@ pub use fetch_cascade::{
     should_promote, FetchCascade, FetchCascadeOptions, FetchTier, FetchTierResult,
 };
 
+pub mod browser_engine;
+pub use browser_engine::{
+    action_allowed_by_policy, action_allowed_by_robots, page_state_from_html, web_consume_to_graph,
+    BrowserAction, BrowserActionOutcome, BrowserActionPolicy, BrowserEngineError,
+    BrowserEngineResult, BrowserPoolConfig, ElementBox, FetchCascadeBrowserEngine,
+    InteractiveElement, PageExtract, PageState, WaitCondition, WebConsumeReceipt,
+    WebConsumeRequest,
+};
+
 pub mod providers;
 pub use providers::{
     configured_search_providers_from_env, BraveSearchProvider, ExaSearchProvider,

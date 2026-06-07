@@ -950,6 +950,36 @@ fn call_tool<P: McpGraphProvider>(
                 "message": "fractal_expansion is handled by the async harness server MCP route because it performs live web fetches."
             }))
         }
+        "web_consume" | "theorem_browser_web_consume" => {
+            return Ok(tool_result_error(json!({
+                "error": "browser_use_requires_async_server",
+                "message": "web_consume is handled by the async THG server MCP route because it can navigate, extract, and ingest live web pages."
+            })));
+        }
+        "browse_with_me" | "theorem_browser_browse_with_me" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "browse_with_me is unavailable while read-only mode is active."
+                })));
+            }
+            return Ok(tool_result_error(json!({
+                "error": "browser_use_requires_async_server",
+                "message": "browse_with_me is handled by the async THG server MCP route because it coordinates a live supervised browser session."
+            })));
+        }
+        "browse_for_me" | "theorem_browser_browse_for_me" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "browse_for_me is unavailable while read-only mode is active."
+                })));
+            }
+            return Ok(tool_result_error(json!({
+                "error": "browser_use_requires_async_server",
+                "message": "browse_for_me is handled by the async THG server MCP route because it can run a browser-use loop and persist receipts."
+            })));
+        }
         "rustyweb_search_acquisition" | "search_acquisition" => {
             return Ok(tool_result_error(json!({
                 "error": "live_search_acquisition_requires_async_server",
@@ -6091,6 +6121,26 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         }),
     ));
     tools.push(tool(
+        "web_consume",
+        "Navigate, observe, extract, and optionally ingest one web page through the async THG browser-use route.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "tenant_id": { "type": "string" },
+                "tenant_slug": { "type": "string" },
+                "url": { "type": "string" },
+                "run_id": { "type": "string" },
+                "actor": { "type": "string" },
+                "actor_id": { "type": "string" },
+                "max_bytes": { "type": "integer", "default": 5242880 },
+                "ingest": { "type": "boolean", "default": true },
+                "wait": { "type": "boolean", "default": false }
+            },
+            "required": ["url"]
+        }),
+    ));
+    tools.push(tool(
         "rustyred_thg_spatial_radius",
         "Search a designated spatial property within a radius in kilometers.",
         json!({
@@ -6237,6 +6287,49 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "wait": { "type": "boolean", "default": false }
                 },
                 "required": ["query"]
+            }),
+        ));
+        tools.push(tool_write(
+            "browse_with_me",
+            "Start or advance a supervised co-browse session with pre-action preview and browser-use receipts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_id": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "task": { "type": "string" },
+                    "query": { "type": "string" },
+                    "url": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "max_bytes": { "type": "integer", "default": 5242880 },
+                    "control_mode": { "type": "string", "enum": ["human_drive", "agent_drive", "pair"], "default": "pair" },
+                    "wait": { "type": "boolean", "default": false }
+                },
+                "required": ["task"]
+            }),
+        ));
+        tools.push(tool_write(
+            "browse_for_me",
+            "Run the browser-use perceive -> afford loop for a task, bounded by policy and returning a BrowsingRun receipt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_id": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "task": { "type": "string" },
+                    "query": { "type": "string" },
+                    "url": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "max_bytes": { "type": "integer", "default": 5242880 },
+                    "wait": { "type": "boolean", "default": false }
+                },
+                "required": ["task"]
             }),
         ));
         tools.push(tool_write(
@@ -7677,6 +7770,9 @@ mod tests {
         assert!(has_tool(tools, "skill_list"));
         assert!(has_tool(tools, "skill_get"));
         assert!(!has_tool(tools, "fractal_expansion"));
+        assert!(has_tool(tools, "web_consume"));
+        assert!(!has_tool(tools, "browse_with_me"));
+        assert!(!has_tool(tools, "browse_for_me"));
         assert!(has_tool(tools, "mentions"));
         assert!(has_tool(tools, "recall"));
         assert!(has_tool(tools, "relate"));
@@ -7809,6 +7905,19 @@ mod tests {
     }
 
     #[test]
+    fn sync_mcp_punts_browser_use_to_async_server() {
+        let (provider, config) = fixture();
+        let payload = call_tool_json(
+            &provider,
+            &config,
+            "web_consume",
+            json!({ "url": "https://example.com" }),
+        );
+
+        assert_eq!(payload["error"], "browser_use_requires_async_server");
+    }
+
+    #[test]
     fn tools_list_exposes_native_coordination_write_tools_when_enabled() {
         let (provider, mut config) = fixture();
         config.read_only = false;
@@ -7826,6 +7935,9 @@ mod tests {
         assert!(has_tool(tools, "coordinate"));
         assert!(has_tool(tools, "rustyweb_search_acquisition"));
         assert!(has_tool(tools, "fractal_expansion"));
+        assert!(has_tool(tools, "web_consume"));
+        assert!(has_tool(tools, "browse_with_me"));
+        assert!(has_tool(tools, "browse_for_me"));
         assert!(has_tool(tools, "coordination_record"));
         assert!(has_tool(tools, "coordination_contribution"));
         assert!(has_tool(tools, "mentions"));

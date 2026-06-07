@@ -3292,6 +3292,7 @@ dependencies = [
  "rustyred-web",
  "serde",
  "serde_json",
+ "theorem-browser-agent",
  "theorem-harness-core",
  "theorem-harness-runtime",
  "tokio",
@@ -3911,6 +3912,16 @@ dependencies = [
  "regex",
  "thiserror 1.0.69",
  "url",
+]
+
+[[package]]
+name = "theorem-browser-agent"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

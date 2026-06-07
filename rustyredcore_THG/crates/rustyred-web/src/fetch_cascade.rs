@@ -153,6 +153,10 @@ impl FetchCascade {
         &self.client
     }
 
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
     pub fn max_supported_tier(&self) -> FetchTier {
         if self.rendered_endpoint.is_some() {
             FetchTier::Rendered
@@ -219,8 +223,7 @@ impl FetchCascade {
             .unwrap_or_else(|| "application/octet-stream".to_string());
         let etag = header_string(&headers, ETAG.as_str()).unwrap_or_default();
         let last_modified = header_string(&headers, LAST_MODIFIED.as_str()).unwrap_or_default();
-        let (html_bytes, truncated) =
-            read_limited_body(response, canonical_url, max_bytes).await?;
+        let (html_bytes, truncated) = read_limited_body(response, canonical_url, max_bytes).await?;
 
         Ok(FetchTierResult {
             tier_used,
@@ -267,13 +270,10 @@ impl FetchCascade {
             let last_modified =
                 rquest_header_string(&headers, rquest::header::LAST_MODIFIED.as_str())
                     .unwrap_or_default();
-            let raw = response
-                .bytes()
-                .await
-                .map_err(|err| RustyWebError::Fetch {
-                    url: canonical_url.to_string(),
-                    reason: err.to_string(),
-                })?;
+            let raw = response.bytes().await.map_err(|err| RustyWebError::Fetch {
+                url: canonical_url.to_string(),
+                reason: err.to_string(),
+            })?;
             // Cap oversize bodies instead of erroring (see cap_body): the
             // progressive-disclosure path wants the top of the page, not a hard
             // failure. The impersonate client buffers, so this truncates

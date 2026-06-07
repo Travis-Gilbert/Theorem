@@ -319,7 +319,9 @@ mod tests {
         // The two content paragraphs survive; the short <h1> "Heading" does not.
         assert!(passages.iter().any(|p| p.contains("Tokio runtime")));
         assert!(passages.iter().any(|p| p.contains("cooking pasta")));
-        assert!(passages.iter().all(|p| !p.trim().eq_ignore_ascii_case("Heading")));
+        assert!(passages
+            .iter()
+            .all(|p| !p.trim().eq_ignore_ascii_case("Heading")));
     }
 
     #[test]

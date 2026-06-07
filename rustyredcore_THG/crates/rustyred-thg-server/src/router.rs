@@ -37,16 +37,25 @@ use rustyred_thg_mcp::{
 };
 use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
-    fanout_search_providers, render_serp_html, run_live_crawl, search_substrate, CrawlBudget,
-    CrawlReceipt, CrawlRequest, CrawlScope, PageRecord, RustyWebError, SearchOptions, SearchOpts,
-    WebCommonsFragment, WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt,
-    EDGE_LINKS_TO, LABEL_PAGE, LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER,
-    QWEN3_EMBEDDING_4B_DIMENSION, SEMANTIC_VECTOR_PROPERTY,
+    fanout_search_providers, render_serp_html, run_live_crawl, search_substrate,
+    web_consume_to_graph, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope, PageRecord,
+    PageState, RustyWebError, SearchOptions, SearchOpts, WebCommonsFragment,
+    WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt, WebConsumeReceipt,
+    WebConsumeRequest, EDGE_LINKS_TO, LABEL_PAGE, LABEL_WEB_COMMONS_ATTESTATION,
+    LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION, SEMANTIC_VECTOR_PROPERTY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use theorem_browser_agent::{
+    browsing_run_receipt, build_action_rail, default_browser_playbooks, perceive_with_graph,
+    resolve_context_command, BrowserSurface, ContextCommandRequest, ObservedElement,
+    PageObservation, PerceptionInput, PerceptionMode, RetrievalMode, RiskMode,
+};
 use theorem_harness_core::TransitionInput;
-use theorem_harness_runtime::{append_transition_from_store, subscribe_coordination_room_events};
+use theorem_harness_runtime::{
+    append_transition_from_store, publish_skill_pack, subscribe_coordination_room_events,
+    SkillPackPublishInput,
+};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -176,6 +185,21 @@ struct LiveFractalExpansionJob {
     search_opts: SearchOpts,
     actor_id: String,
     wait: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserUseJob {
+    tool_name: String,
+    tenant: String,
+    run_id: String,
+    task: String,
+    surface: BrowserSurface,
+    url: Option<String>,
+    max_bytes: usize,
+    actor_id: String,
+    wait: bool,
+    ingest: bool,
+    control_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,6 +536,18 @@ pub fn build_router(state: AppState) -> Router {
             post(graph_fulltext_search),
         )
         .route(
+            "/v1/tenants/:tenant_id/browser/web-consume",
+            post(browser_web_consume),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/browser/browse-with-me",
+            post(browser_browse_with_me),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/browser/browse-for-me",
+            post(browser_browse_for_me),
+        )
+        .route(
             "/v1/tenants/:tenant_id/graph/bulk/nodes",
             post(graph_bulk_nodes),
         )
@@ -590,6 +626,9 @@ async fn mcp_post(
 
     let config = state.mcp_config();
     let mcp_context = McpRequestContext::with_scopes(auth_context.scopes);
+    if let Some(response) = maybe_handle_browser_use_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
     if let Some(response) =
         maybe_handle_live_search_acquisition_mcp(&state, &config, &payload).await
     {
@@ -643,6 +682,548 @@ async fn coordination_events(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+async fn maybe_handle_browser_use_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(
+        name,
+        "web_consume"
+            | "theorem_browser_web_consume"
+            | "browse_with_me"
+            | "theorem_browser_browse_with_me"
+            | "browse_for_me"
+            | "theorem_browser_browse_for_me"
+    ) {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match browser_use_payload(state, config, name, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn browser_use_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let job = browser_use_job(config, tool_name, arguments)?;
+    if config.read_only && (job.surface != BrowserSurface::WebConsume || job.ingest) {
+        return Err(json!({
+            "error": "mcp_read_only",
+            "message": format!("{} is unavailable while read-only mode is active", job.tool_name)
+        }));
+    }
+    if job.wait || config.read_only {
+        return execute_browser_use(state, &job).await;
+    }
+    enqueue_browser_use(state.clone(), job).await
+}
+
+fn browser_use_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<BrowserUseJob, Value> {
+    let canonical_tool_name = match tool_name {
+        "web_consume" | "theorem_browser_web_consume" => "web_consume",
+        "browse_with_me" | "theorem_browser_browse_with_me" => "browse_with_me",
+        "browse_for_me" | "theorem_browser_browse_for_me" => "browse_for_me",
+        _ => tool_name,
+    }
+    .to_string();
+    let surface = match canonical_tool_name.as_str() {
+        "web_consume" => BrowserSurface::WebConsume,
+        "browse_with_me" => BrowserSurface::BrowseWithMe,
+        "browse_for_me" => BrowserSurface::BrowseForMe,
+        _ => BrowserSurface::BrowseForMe,
+    };
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let url = argument_text_any(arguments, &["url", "href"]);
+    if surface == BrowserSurface::WebConsume && url.is_none() {
+        return Err(json!({
+            "error": "invalid_web_consume",
+            "message": "web_consume requires url"
+        }));
+    }
+    let task = argument_text_any(arguments, &["task", "query", "q"])
+        .or_else(|| url.clone().map(|url| format!("consume {url}")))
+        .ok_or_else(|| {
+            json!({
+                "error": "invalid_browser_use",
+                "message": format!("{} requires task or url", canonical_tool_name)
+            })
+        })?;
+    let run_id = argument_text_any(arguments, &["run_id", "runId"])
+        .unwrap_or_else(|| default_live_web_run_id(canonical_tool_name.as_str()));
+    let max_bytes = argument_u64_any(arguments, &["max_bytes", "maxBytes"])
+        .unwrap_or(LIVE_SEARCH_DEFAULT_MAX_BYTES as u64)
+        .clamp(1, LIVE_SEARCH_HARD_MAX_BYTES as u64) as usize;
+    let ingest = argument_bool_any(arguments, &["ingest", "capture"])
+        .unwrap_or(surface != BrowserSurface::BrowseWithMe || url.is_some());
+    let control_mode = argument_text_any(arguments, &["control_mode", "controlMode"])
+        .unwrap_or_else(|| match surface {
+            BrowserSurface::BrowseWithMe => "pair".to_string(),
+            BrowserSurface::BrowseForMe => "agent_drive".to_string(),
+            BrowserSurface::WebConsume => "read".to_string(),
+        });
+
+    Ok(BrowserUseJob {
+        tool_name: canonical_tool_name,
+        tenant,
+        run_id,
+        task,
+        surface,
+        url,
+        max_bytes,
+        actor_id: argument_text_any(arguments, &["actor", "actor_id", "actorId"])
+            .unwrap_or_else(default_live_web_actor),
+        wait: live_web_wait_requested(arguments),
+        ingest,
+        control_mode,
+    })
+}
+
+async fn execute_browser_use(state: &AppState, job: &BrowserUseJob) -> Result<Value, Value> {
+    let mut store = state.tenant_graph_store(&job.tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut browser_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "browser_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut web_consume = None;
+    let mut page_observation = None;
+    let mut pages_reached: Vec<String> = Vec::new();
+    if let Some(url) = &job.url {
+        let cascade = state.live_fetch_cascade();
+        if job.surface == BrowserSurface::BrowseForMe {
+            // browse_for_me autopilot: a bounded link-following loop. Each step
+            // consumes a page through the robots-checked fetch cascade and
+            // ingests it into the quarantined graph, so the visited pages turn
+            // up in the closing perception. The step cap is a fixed budget until
+            // an Ensemble budget is wired in.
+            let steps =
+                run_browse_for_me_loop(&mut browser_store, cascade.as_ref(), job, url).await?;
+            pages_reached = steps.pages_reached;
+            page_observation = steps.last_page.as_ref().map(page_observation_from_state);
+            web_consume = Some(Value::Array(steps.step_payloads));
+        } else {
+            let receipt = web_consume_to_graph(
+                &mut browser_store,
+                cascade.as_ref(),
+                WebConsumeRequest {
+                    run_id: job.run_id.clone(),
+                    url: url.clone(),
+                    actor_id: job.actor_id.clone(),
+                    namespace: "open_web_unverified".to_string(),
+                    max_bytes: job.max_bytes,
+                    ingest: job.ingest,
+                    respect_robots: true,
+                },
+            )
+            .await
+            .map_err(|error| {
+                json!({
+                    "error": "browser_web_consume_failed",
+                    "message": format!("{error:?}")
+                })
+            })?;
+            pages_reached.push(receipt.url.clone());
+            page_observation = Some(page_observation_from_state(&receipt.page));
+            web_consume = Some(web_consume_receipt_payload(&receipt));
+        }
+    }
+
+    let command = resolve_context_command(ContextCommandRequest {
+        raw_request: job.task.clone(),
+        surface: Some(job.surface),
+        retrieval_mode: Some(if job.url.is_some() {
+            RetrievalMode::WebAllowed
+        } else {
+            RetrievalMode::LocalFirst
+        }),
+        risk_mode: Some(match job.surface {
+            BrowserSurface::BrowseWithMe => RiskMode::SupervisedAction,
+            BrowserSurface::BrowseForMe => RiskMode::ConfirmBeforeWrite,
+            BrowserSurface::WebConsume => RiskMode::ConfirmBeforeWrite,
+        }),
+        allow_external_web: Some(job.url.is_some()),
+        allow_agent_execution: Some(job.surface != BrowserSurface::WebConsume),
+        ..ContextCommandRequest::default()
+    });
+    let perception = perceive_with_graph(
+        &browser_store,
+        &command,
+        PerceptionInput {
+            mode: match job.surface {
+                BrowserSurface::BrowseWithMe => PerceptionMode::Browse,
+                BrowserSurface::BrowseForMe => PerceptionMode::Act,
+                BrowserSurface::WebConsume => PerceptionMode::Capture,
+            },
+            query: job.task.clone(),
+            page: page_observation,
+            seed_urls: job.url.clone().into_iter().collect(),
+        },
+    );
+    let action_rail = build_action_rail(&command, &perception);
+    let browsing_run = browsing_run_receipt(&job.run_id, &command, &perception, &action_rail);
+
+    // C: publish the playbooks as native skill packs (idempotent) and persist
+    // the BrowsingRun as a content-addressed graph node so the run plus its
+    // event ledger are durable and queryable. These are graph writes, so they
+    // only run when the job already permits writes (job.ingest); a read-only
+    // web_consume (ingest=false) stays read-only.
+    let (playbook_pack_ids, browsing_run_node) = if job.ingest {
+        let playbook_pack_ids =
+            publish_browser_playbooks(&mut browser_store, &job.tenant, &job.actor_id);
+        let browsing_run_value = serde_json::to_value(&browsing_run).unwrap_or_else(|_| json!({}));
+        let browsing_run_node = persist_browsing_run_node(
+            &mut browser_store,
+            &job.tenant,
+            &job.run_id,
+            &browsing_run_value,
+            &pages_reached,
+            &playbook_pack_ids,
+        );
+        (playbook_pack_ids, browsing_run_node)
+    } else {
+        (Vec::new(), None)
+    };
+
+    Ok(json!({
+        "tenant": job.tenant,
+        "run_id": job.run_id,
+        "tool": job.tool_name,
+        "surface": job.surface,
+        "control_mode": job.control_mode,
+        "task": job.task,
+        "context_command": command,
+        "perception": perception,
+        "action_rail": action_rail,
+        "browsing_run": browsing_run,
+        "browsing_run_node": browsing_run_node,
+        "playbook_pack_ids": playbook_pack_ids,
+        "web_consume": web_consume,
+        "pages_reached": pages_reached,
+        "mode": "sync"
+    }))
+}
+
+const BROWSE_FOR_ME_MAX_STEPS: usize = 4;
+
+struct BrowseForMeSteps {
+    last_page: Option<PageState>,
+    pages_reached: Vec<String>,
+    step_payloads: Vec<Value>,
+}
+
+/// browse_for_me autopilot walk: consume the seed, then follow the first
+/// unvisited on-page link, up to `BROWSE_FOR_ME_MAX_STEPS` pages. Every step is
+/// robots-checked and ingested by `web_consume_to_graph`. A robots-blocked or
+/// dead link ends the walk and returns what was reached so far.
+async fn run_browse_for_me_loop<S: GraphStore>(
+    store: &mut S,
+    cascade: &rustyred_web::FetchCascade,
+    job: &BrowserUseJob,
+    seed_url: &str,
+) -> Result<BrowseForMeSteps, Value> {
+    let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pages_reached: Vec<String> = Vec::new();
+    let mut step_payloads: Vec<Value> = Vec::new();
+    let mut last_page: Option<PageState> = None;
+    let mut next: Option<String> = Some(seed_url.to_string());
+    let mut last_error: Option<String> = None;
+
+    while let Some(url) = next.take() {
+        if pages_reached.len() >= BROWSE_FOR_ME_MAX_STEPS {
+            break;
+        }
+        if !visited.insert(url.clone()) {
+            continue;
+        }
+        match web_consume_to_graph(
+            store,
+            cascade,
+            WebConsumeRequest {
+                run_id: job.run_id.clone(),
+                url: url.clone(),
+                actor_id: job.actor_id.clone(),
+                namespace: "open_web_unverified".to_string(),
+                max_bytes: job.max_bytes,
+                ingest: job.ingest,
+                respect_robots: true,
+            },
+        )
+        .await
+        {
+            Ok(receipt) => {
+                pages_reached.push(receipt.url.clone());
+                next = receipt
+                    .page
+                    .interactive_elements
+                    .iter()
+                    .filter(|element| element.role == "link")
+                    .filter_map(|element| element.value.clone())
+                    .find(|candidate| !visited.contains(candidate));
+                step_payloads.push(web_consume_receipt_payload(&receipt));
+                last_page = Some(receipt.page);
+            }
+            Err(error) => {
+                last_error = Some(format!("{error:?}"));
+                break;
+            }
+        }
+    }
+
+    if pages_reached.is_empty() {
+        return Err(json!({
+            "error": "browse_for_me_no_pages",
+            "message": last_error
+                .unwrap_or_else(|| "browse_for_me reached no pages".to_string())
+        }));
+    }
+
+    Ok(BrowseForMeSteps {
+        last_page,
+        pages_reached,
+        step_payloads,
+    })
+}
+
+/// Publish the built-in browser playbooks as native skill packs through the
+/// existing skill encoder/registry. Idempotent: packs are content-hash keyed,
+/// so re-publishing the same playbook is a no-op upsert. Returns the pack ids.
+fn publish_browser_playbooks<S: GraphStore>(
+    store: &mut S,
+    tenant: &str,
+    actor: &str,
+) -> Vec<String> {
+    let mut pack_ids = Vec::new();
+    for playbook in default_browser_playbooks() {
+        let intent = playbook.intent;
+        let title = playbook.title;
+        let body = playbook.skill_markdown;
+        let pack = json!({
+            "kind": "skill_pack",
+            "name": format!("browser-playbook-{intent}"),
+            "title": title,
+            "description": format!("Browser-use playbook for intent '{intent}'"),
+            "intent": intent.clone(),
+            "capabilities": ["browser_playbook", intent.clone()],
+            "body": body,
+        });
+        let input = SkillPackPublishInput {
+            tenant_slug: tenant.to_string(),
+            actor_id: actor.to_string(),
+            status: "advisory".to_string(),
+            pack,
+            ..SkillPackPublishInput::default()
+        };
+        if let Ok(receipt) = publish_skill_pack(store, input) {
+            pack_ids.push(receipt.pack.pack_id);
+        }
+    }
+    pack_ids
+}
+
+/// Persist the BrowsingRun as a content-addressed `BrowsingRun` graph node so
+/// the run plus its ordered event ledger are durable and queryable, mirroring
+/// the EnsembleDecision content-addressing pattern. The write goes through the
+/// tenant store (TenantMirrorGraphStore writes through), so it is durable.
+fn persist_browsing_run_node<S: GraphStore>(
+    store: &mut S,
+    tenant: &str,
+    run_id: &str,
+    browsing_run: &Value,
+    pages_reached: &[String],
+    playbook_pack_ids: &[String],
+) -> Option<String> {
+    let content_hash = stable_hash(json!({
+        "run_id": run_id,
+        "tenant": tenant,
+        "browsing_run": browsing_run,
+        "pages_reached": pages_reached
+    }));
+    let node_id = format!("browsing-run:{tenant}:{content_hash}");
+    let events = browsing_run
+        .get("events")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let node = NodeRecord::new(
+        node_id.clone(),
+        ["BrowsingRun"],
+        json!({
+            "run_id": run_id,
+            "tenant": tenant,
+            "content_hash": content_hash,
+            "browsing_run": browsing_run,
+            "pages_reached": pages_reached,
+            "playbook_pack_ids": playbook_pack_ids,
+            "events": events,
+            "trust_tier": "open_web_unverified"
+        }),
+    );
+    GraphStore::upsert_node(store, node).ok().map(|_| node_id)
+}
+
+async fn enqueue_browser_use(state: AppState, job: BrowserUseJob) -> Result<Value, Value> {
+    start_live_web_harness_run(
+        &state,
+        &job.tenant,
+        &job.run_id,
+        &job.tool_name,
+        &job.task,
+        &job.actor_id,
+    )?;
+    let handoff =
+        live_web_async_handoff_payload(&job.tenant, &job.run_id, &job.tool_name, &job.task);
+    tokio::spawn(async move {
+        let result = execute_browser_use(&state, &job).await;
+        finish_live_web_harness_run(
+            &state,
+            &job.tenant,
+            &job.run_id,
+            &job.tool_name,
+            &job.actor_id,
+            result,
+        )
+        .await;
+    });
+    Ok(handoff)
+}
+
+fn page_observation_from_state(page: &PageState) -> PageObservation {
+    PageObservation {
+        url: page.url.clone(),
+        title: page.title.clone(),
+        distilled_text: page.distilled_text.clone(),
+        interactive_elements: page
+            .interactive_elements
+            .iter()
+            .map(|element| ObservedElement {
+                element_id: element.element_id.clone(),
+                role: element.role.clone(),
+                name: element.name.clone(),
+                value: element.value.clone(),
+                visible: element.visible,
+            })
+            .collect(),
+    }
+}
+
+fn web_consume_receipt_payload(receipt: &WebConsumeReceipt) -> Value {
+    json!({
+        "run_id": receipt.run_id,
+        "url": receipt.url,
+        "ingested": receipt.ingested,
+        "write_count": receipt.writes.len(),
+        "crawl_receipt": receipt.crawl_receipt,
+        "page": page_state_payload(&receipt.page),
+        "extract": receipt.extract
+    })
+}
+
+fn page_state_payload(page: &PageState) -> Value {
+    json!({
+        "url": page.url,
+        "title": page.title,
+        "distilled_text": page.distilled_text,
+        "interactive_elements": page.interactive_elements,
+        "fetch": page.fetch.as_ref().map(|fetch| json!({
+            "tier_used": fetch.tier_used,
+            "http_status": fetch.http_status,
+            "content_type": fetch.content_type,
+            "final_url": fetch.final_url,
+            "truncated": fetch.truncated,
+            "body_bytes": fetch.html_bytes.len(),
+            "error": fetch.error
+        }))
+    })
+}
+
+async fn browser_web_consume(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    browser_route_response(state, tenant_id, "web_consume", body).await
+}
+
+async fn browser_browse_with_me(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    browser_route_response(state, tenant_id, "browse_with_me", body).await
+}
+
+async fn browser_browse_for_me(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    browser_route_response(state, tenant_id, "browse_for_me", body).await
+}
+
+async fn browser_route_response(
+    state: AppState,
+    tenant_id: String,
+    tool_name: &str,
+    body: Value,
+) -> axum::response::Response {
+    let config = state.mcp_config();
+    let arguments = body_with_tenant(body, tenant_id);
+    match browser_use_payload(&state, &config, tool_name, &arguments).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(payload) => {
+            let status = match payload.get("error").and_then(Value::as_str) {
+                Some("store_unavailable") => StatusCode::INTERNAL_SERVER_ERROR,
+                Some("mcp_read_only") => StatusCode::FORBIDDEN,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(payload)).into_response()
+        }
+    }
+}
+
+fn body_with_tenant(body: Value, tenant_id: String) -> Value {
+    let mut object = body.as_object().cloned().unwrap_or_default();
+    object.insert("tenant".to_string(), Value::String(tenant_id));
+    Value::Object(object)
 }
 
 async fn maybe_handle_live_fractal_mcp(
@@ -5956,14 +6537,14 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        default_ppr_alpha, default_ppr_epsilon, default_ppr_max_pushes, default_pr_damping,
-        default_pr_max_iter, default_pr_tolerance, derive_live_search_seeds,
+        browser_use_job, default_ppr_alpha, default_ppr_epsilon, default_ppr_max_pushes,
+        default_pr_damping, default_pr_max_iter, default_pr_tolerance, derive_live_search_seeds,
         execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
         graph_algorithm_communities, graph_algorithm_components, graph_algorithm_pagerank,
         graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes, graph_error_status,
         graph_fulltext_search, graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge,
         instant_kg_impact, instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command,
-        is_graph_command, live_search_budget, live_search_is_sparse,
+        is_graph_command, live_search_budget, live_search_is_sparse, maybe_handle_browser_use_mcp,
         maybe_handle_live_search_acquisition_mcp, mcp_origin_allowed, public_cypher,
         required_scope_for_command, search_live, transaction_begin, transaction_commit,
         transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody,
@@ -5979,6 +6560,32 @@ mod tests {
     use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
     use rustyred_thg_mcp::{handle_mcp_request_with_context, McpRequestContext};
     use rustyred_web::{SearchCandidate, SearchProvider, StaticSearchProvider};
+    use theorem_browser_agent::BrowserSurface;
+
+    #[test]
+    fn browser_playbooks_publish_and_browsing_run_node_persists() {
+        let mut store = super::InMemoryGraphStore::default();
+        let ids = super::publish_browser_playbooks(&mut store, "default", "tester");
+        assert_eq!(
+            ids.len(),
+            6,
+            "all six browser playbooks publish as skill packs"
+        );
+        let node_id = super::persist_browsing_run_node(
+            &mut store,
+            "default",
+            "run-1",
+            &json!({ "events": ["context_command.resolved"] }),
+            &["https://example.com/".to_string()],
+            &ids,
+        )
+        .expect("browsing run node persisted");
+        let node = super::GraphStore::get_node(&store, &node_id).expect("node present");
+        assert!(node
+            .labels
+            .iter()
+            .any(|label| label.as_str() == "BrowsingRun"));
+    }
 
     async fn response_payload_json(response: axum::response::Response) -> Value {
         serde_json::from_slice(
@@ -6073,6 +6680,86 @@ mod tests {
         assert_eq!(budget.max_seconds, 30);
         assert_eq!(budget.max_depth, 2);
         assert_eq!(budget.max_bytes, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn browser_use_job_maps_tool_names_to_surfaces() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let config = state.mcp_config();
+
+        let co_browse = browser_use_job(
+            &config,
+            "browse_with_me",
+            &json!({
+                "task": "co-browse documentation",
+                "url": "https://example.com/docs",
+                "control_mode": "pair",
+                "run_id": "browse-with-me-test"
+            }),
+        )
+        .expect("browse_with_me job");
+        assert_eq!(co_browse.surface, BrowserSurface::BrowseWithMe);
+        assert_eq!(co_browse.control_mode, "pair");
+        assert_eq!(co_browse.run_id, "browse-with-me-test");
+
+        let consume = browser_use_job(
+            &config,
+            "web_consume",
+            &json!({
+                "url": "https://example.com/source",
+                "ingest": false
+            }),
+        )
+        .expect("web_consume job");
+        assert_eq!(consume.surface, BrowserSurface::WebConsume);
+        assert!(!consume.ingest);
+        assert_eq!(consume.task, "consume https://example.com/source");
+    }
+
+    #[tokio::test]
+    async fn mcp_browser_use_read_only_blocks_write_surfaces_without_fetching() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+
+        let response = maybe_handle_browser_use_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "browse-for-me",
+                "method": "tools/call",
+                "params": {
+                    "name": "browse_for_me",
+                    "arguments": { "task": "research pricing" }
+                }
+            }),
+        )
+        .await
+        .expect("browser-use MCP route should be intercepted");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
+
+        let response = maybe_handle_browser_use_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "web-consume",
+                "method": "tools/call",
+                "params": {
+                    "name": "web_consume",
+                    "arguments": { "url": "https://example.com/source" }
+                }
+            }),
+        )
+        .await
+        .expect("web_consume MCP route should be intercepted");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
     }
 
     #[tokio::test]

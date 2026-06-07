@@ -24,6 +24,7 @@ members = [
     "crates/theorem-harness-core",
     "crates/theorem-harness-runtime",
     "crates/theorem-harness",
+    "crates/theorem-browser-agent",
     "crates/rustyred-thg-affordances",
     "crates/rustyred-thg-connectors",
     "crates/ensemble",
