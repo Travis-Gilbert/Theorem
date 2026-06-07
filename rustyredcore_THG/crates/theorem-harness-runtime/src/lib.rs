@@ -3,6 +3,7 @@ pub mod coordination;
 pub mod coordination_push;
 pub mod event_log;
 pub mod memory;
+pub mod node_type_binding;
 pub mod patch_sequencer;
 pub mod skill_pack;
 pub mod work_graph_store;
@@ -54,6 +55,14 @@ pub use memory::{
     MemoryNodeState, MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput,
     RecallMemoryInput, RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput,
     ReviseMemoryReceipt, UpsertNoteInput, UpsertNoteReceipt,
+};
+pub use node_type_binding::{
+    bind_node_type_skill_packs, load_node_type_skill_pack_binding, node_type_binding_node_id,
+    node_type_skill_pack_edge_id, resolve_node_type_skill_packs, resolve_task_node_skill_packs,
+    BindNodeTypeSkillPacksInput, NodeTypeBindingError, NodeTypeBindingResult,
+    NodeTypeSkillPackBindingReceipt, NodeTypeSkillPackBindingState, NodeTypeSkillPackRef,
+    NodeTypeSkillPackResolution, ResolveNodeTypeSkillPacksInput, ResolvedNodeTypeSkillPack,
+    EDGE_NODE_TYPE_USES_SKILL_PACK, NODE_TYPE_BINDING_LABEL,
 };
 pub use patch_sequencer::{
     PatchApplyReceipt, PatchApplyStatus, PatchProposal, PatchSequencer, PatchSequencerError,
