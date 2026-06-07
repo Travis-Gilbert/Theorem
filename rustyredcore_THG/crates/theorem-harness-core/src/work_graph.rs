@@ -116,6 +116,9 @@ pub struct TaskNode {
     pub receipts: Vec<Receipt>,
     #[serde(default)]
     pub created_by: String,
+    /// For a verify node: the head that must review the target (the other head).
+    #[serde(default)]
+    pub review_required_by: Option<String>,
 }
 
 impl TaskNode {
@@ -139,6 +142,7 @@ impl TaskNode {
             claim_epoch: 0,
             receipts: Vec::new(),
             created_by: created_by.into(),
+            review_required_by: None,
         }
     }
 

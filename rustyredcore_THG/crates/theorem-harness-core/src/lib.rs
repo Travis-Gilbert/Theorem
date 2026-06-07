@@ -17,6 +17,7 @@ pub mod state_machine;
 pub mod toolgraph;
 pub mod types;
 pub mod work_graph;
+pub mod work_graph_verify;
 
 pub use affordances::{
     affordance_by_id, affordance_ids, default_affordance_registry, validate_affordance_registry,
@@ -83,4 +84,8 @@ pub use types::{
 pub use work_graph::{
     claim_task_node, heartbeat_task_node, ClaimLease, ClaimOutcome, Millis, NodeStatus, Receipt,
     TaskNode, WorkGraph, WorkGraphError,
+};
+pub use work_graph_verify::{
+    spawn_verify_node, submit_verify_receipt, verify_node_id, VerifyOutcome, VerifyReceipt,
+    VERIFY_NODE_TYPE,
 };
