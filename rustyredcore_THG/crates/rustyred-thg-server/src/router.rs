@@ -53,8 +53,8 @@ use theorem_browser_agent::{
 };
 use theorem_harness_core::TransitionInput;
 use theorem_harness_runtime::{
-    append_transition_from_store, publish_skill_pack, subscribe_coordination_room_events,
-    SkillPackPublishInput,
+    append_transition_from_store, memory_content_hash, normalize_tenant_slug, publish_skill_pack,
+    subscribe_coordination_room_events, MemoryDocumentState, SkillPackPublishInput,
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
@@ -453,6 +453,7 @@ pub fn build_router(state: AppState) -> Router {
             post(graph_neighbors),
         )
         .route("/v1/tenants/:tenant_id/graph/stats", get(graph_stats))
+        .route("/v1/tenants/:tenant_id/memory/docs", get(memory_docs_list))
         .route("/v1/tenants/:tenant_id/graph/verify", get(graph_verify))
         .route(
             "/v1/tenants/:tenant_id/graph/rebuild-indexes",
@@ -4154,6 +4155,110 @@ async fn graph_stats(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct MemoryDocsQuery {
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    include_inactive: Option<bool>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// List a tenant's memory documents for the Obsidian sync plugin. Authenticated GET
+/// scoped to `graph:read`; the tenant comes from the path so a token only reads its
+/// own partition. `?since=<watermark>` returns documents updated at or after the
+/// watermark for incremental pulls; `?include_inactive=true` adds superseded and
+/// archived documents (deleted are always omitted). Each doc carries its scalar
+/// fields, `tags`, outgoing `links` (target doc_ids), and a `content_hash` the
+/// plugin uses as its echo gate.
+async fn memory_docs_list(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<MemoryDocsQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let tenant_slug = normalize_tenant_slug(&tenant_id);
+    let since = params.since.unwrap_or_default();
+    let since = since.trim();
+    let include_inactive = params.include_inactive.unwrap_or(false);
+
+    let nodes = match store.query_nodes(
+        NodeQuery::label("MemoryDocument")
+            .with_property("tenant_slug", Value::String(tenant_slug.clone()))
+            .with_limit(10_000),
+    ) {
+        Ok(nodes) => nodes,
+        Err(error) => return graph_store_error_response(error),
+    };
+
+    let mut docs: Vec<Value> = Vec::new();
+    let mut max_updated_at = String::new();
+    for node in nodes {
+        let document: MemoryDocumentState = match serde_json::from_value(node.properties) {
+            Ok(document) => document,
+            Err(_) => continue,
+        };
+        if document.status == "deleted" {
+            continue;
+        }
+        if !include_inactive && document.status != "active" {
+            continue;
+        }
+        if !since.is_empty() && document.updated_at.as_str() < since {
+            continue;
+        }
+        if document.updated_at > max_updated_at {
+            max_updated_at = document.updated_at.clone();
+        }
+        docs.push(json!({
+            "doc_id": document.doc_id,
+            "kind": document.kind,
+            "title": document.title,
+            "summary": document.summary,
+            "content": document.content,
+            "content_hash": memory_content_hash(&document.content),
+            "status": document.status,
+            "tags": document.tags,
+            "links": document.links,
+            "created_at": document.created_at,
+            "updated_at": document.updated_at,
+        }));
+    }
+    docs.sort_by(|left, right| {
+        right["updated_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(left["updated_at"].as_str().unwrap_or_default())
+    });
+    if let Some(limit) = params.limit {
+        docs.truncate(limit);
+    }
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_slug,
+        "count": docs.len(),
+        "max_updated_at": max_updated_at,
+        "docs": docs,
+    }))
+    .into_response()
+}
+
 async fn graph_verify(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -6545,9 +6650,10 @@ mod tests {
         graph_fulltext_search, graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge,
         instant_kg_impact, instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command,
         is_graph_command, live_search_budget, live_search_is_sparse, maybe_handle_browser_use_mcp,
-        maybe_handle_live_search_acquisition_mcp, mcp_origin_allowed, public_cypher,
-        required_scope_for_command, search_live, transaction_begin, transaction_commit,
-        transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody,
+        maybe_handle_live_search_acquisition_mcp, mcp_origin_allowed, memory_docs_list,
+        public_cypher, required_scope_for_command, search_live, transaction_begin,
+        transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
+        FullTextSearchBody, MemoryDocsQuery,
         HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
         InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, PageRankBody, PprBody,
         PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
@@ -6928,6 +7034,83 @@ mod tests {
         assert_eq!(
             run_payload["detail"]["run"]["outcome"]["receipt"]["stats"]["candidates"],
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_docs_endpoint_lists_upserted_notes_with_links_and_hash() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let config = state.mcp_config();
+        let tenant = "obsidian-sync-test";
+
+        let target = handle_mcp_request_with_context(
+            &state,
+            &config,
+            &McpRequestContext::default(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "upsert-target",
+                "method": "tools/call",
+                "params": {
+                    "name": "upsert_note",
+                    "arguments": { "tenant": tenant, "title": "Target", "content": "target body" }
+                }
+            }),
+        );
+        let target_doc_id = target["result"]["structuredContent"]["receipt"]["document"]["doc_id"]
+            .as_str()
+            .expect("target doc_id")
+            .to_string();
+
+        handle_mcp_request_with_context(
+            &state,
+            &config,
+            &McpRequestContext::default(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "upsert-source",
+                "method": "tools/call",
+                "params": {
+                    "name": "upsert_note",
+                    "arguments": {
+                        "tenant": tenant,
+                        "title": "Source",
+                        "content": "source body",
+                        "tags": ["alpha", "beta"],
+                        "links": [target_doc_id.clone()]
+                    }
+                }
+            }),
+        );
+
+        let response = memory_docs_list(
+            State(state.clone()),
+            axum::extract::Path(tenant.to_string()),
+            HeaderMap::new(),
+            Query(MemoryDocsQuery::default()),
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["count"], 2);
+        assert!(payload["max_updated_at"].as_str().is_some());
+        let docs = payload["docs"].as_array().unwrap();
+        assert!(docs.iter().all(|doc| doc["content_hash"]
+            .as_str()
+            .map(|hash| !hash.is_empty())
+            .unwrap_or(false)));
+        let source = docs
+            .iter()
+            .find(|doc| doc["title"] == "Source")
+            .expect("source doc present");
+        assert_eq!(source["tags"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            source["links"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap(),
+            target_doc_id
         );
     }
 

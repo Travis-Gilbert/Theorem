@@ -29,13 +29,13 @@ use theorem_harness_runtime::{
     load_run, normalize_coordination_urgency, parse_coordination_mentions,
     publish_coordination_room_event_from_state, publish_skill_pack, recall_archived_memory,
     recall_memory, relate_memory, remember_memory, revise_memory_document, self_note_memory,
-    stable_coordination_message_id, stable_coordination_record_id, ArchiveMemoryInput,
+    stable_coordination_message_id, stable_coordination_record_id, upsert_note, ArchiveMemoryInput,
     CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
     CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
     ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JoinRoomInput, MemoryError,
     MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
     ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
-    SkillPackListInput, SkillPackPublishInput, WriteIntentInput, WriteMessageInput,
+    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput,
     WriteRecordInput,
 };
 
@@ -1182,6 +1182,15 @@ fn call_tool<P: McpGraphProvider>(
                 })));
             }
             encode_memory_payload(&tenant, &mut backend, &arguments)?
+        }
+        "upsert_note" | "theorem_harness_upsert_note" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Obsidian note upserts are unavailable while read-only mode is active."
+                })));
+            }
+            upsert_note_payload(&tenant, &mut backend, &arguments)?
         }
         "forget" | "theorem_harness_forget" => {
             if config.read_only {
@@ -3559,6 +3568,41 @@ fn encode_memory_payload(
     )
     .map_err(mcp_memory_error)?;
     Ok(json!({ "tenant": tenant, "memory": document }))
+}
+
+fn upsert_note_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let input = UpsertNoteInput {
+        tenant_slug: tenant.to_string(),
+        actor_id: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
+        session_id: argument_text(arguments, &["session_id", "sessionId"]).unwrap_or_default(),
+        origin_surface: argument_text(arguments, &["origin_surface", "originSurface", "surface"])
+            .unwrap_or_else(|| "obsidian".to_string()),
+        project_slug: argument_text(arguments, &["project_slug", "projectSlug"]).unwrap_or_default(),
+        doc_id: argument_text(arguments, &["doc_id", "docId"]).unwrap_or_default(),
+        kind: argument_text(arguments, &["kind"]).unwrap_or_default(),
+        title: argument_text(arguments, &["title"]).unwrap_or_default(),
+        content: required_text_any(arguments, &["content"], "upsert_note")?,
+        summary: argument_text(arguments, &["summary"]).unwrap_or_default(),
+        tags: string_array_any(arguments, &["tags"]),
+        links: string_array_any(arguments, &["links"]),
+        status: argument_text(arguments, &["status"]).unwrap_or_default(),
+        memory_node_type: argument_text(arguments, &["memory_node_type", "memoryNodeType"])
+            .unwrap_or_default(),
+        metadata: argument_object(arguments, "metadata"),
+        outcome: argument_text(arguments, &["outcome"]).unwrap_or_default(),
+        signal: argument_text(arguments, &["signal"]).unwrap_or_default(),
+        reason: argument_text(arguments, &["reason"]).unwrap_or_default(),
+        event_id: argument_text(arguments, &["event_id", "eventId"]).unwrap_or_default(),
+        updated_at: argument_text(arguments, &["updated_at", "updatedAt"]).unwrap_or_default(),
+        created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+    };
+    let mut store = McpMemoryStore { backend };
+    let receipt = upsert_note(&mut store, input).map_err(mcp_memory_error)?;
+    Ok(json!({ "tenant": tenant, "receipt": receipt }))
 }
 
 fn forget_memory_payload(
@@ -6698,6 +6742,35 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ));
         tools.push(tool_write(
+            "upsert_note",
+            "Create or update an Obsidian-synced memory document by stable doc_id and reconcile its [[wikilink]] edges (resolved links become edges, removed links are tombstoned, forward references are recorded and resolved on target creation).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "doc_id": { "type": "string", "description": "blank to create, known id to update in place" },
+                    "docId": { "type": "string" },
+                    "kind": { "type": "string", "default": "note" },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "wikilink targets: doc_id when resolved, target title when a forward reference" },
+                    "status": { "type": "string" },
+                    "memory_node_type": { "type": "string" },
+                    "metadata": { "type": "object" },
+                    "outcome": { "type": "string", "enum": ["positive", "negative", "mixed", "neutral"] },
+                    "signal": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "event_id": { "type": "string" }
+                },
+                "required": ["content"]
+            }),
+        ));
+        tools.push(tool_write(
             "forget",
             "Soft-delete a native memory document or typed memory node with an audit reason.",
             json!({
@@ -7811,6 +7884,7 @@ mod tests {
         assert!(!has_tool(tools, "self_revise"));
         assert!(!has_tool(tools, "self_archive"));
         assert!(!has_tool(tools, "encode"));
+        assert!(!has_tool(tools, "upsert_note"));
         assert!(!has_tool(tools, "forget"));
         assert!(!has_tool(tools, "handoff"));
     }
@@ -7960,6 +8034,7 @@ mod tests {
         assert!(has_tool(tools, "self_archive"));
         assert!(has_tool(tools, "self_recall_archive"));
         assert!(has_tool(tools, "encode"));
+        assert!(has_tool(tools, "upsert_note"));
         assert!(has_tool(tools, "forget"));
         assert!(has_tool(tools, "handoff"));
         assert!(has_tool(tools, "observe"));

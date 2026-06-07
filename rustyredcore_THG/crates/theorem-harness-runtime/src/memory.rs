@@ -259,6 +259,73 @@ pub struct EncodeMemoryInput {
     pub auto_triggered: bool,
 }
 
+/// Input for `upsert_note`: the convenience write the Obsidian sync plugin calls
+/// per note. A blank `doc_id` creates a new document; a known `doc_id` updates the
+/// existing one in place (the stable identity round-trips, unlike `self_revise`,
+/// which mints a new id). `links` is the desired set of `[[wikilink]]` targets,
+/// each either a target `doc_id` (resolved) or a target note title (forward ref).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct UpsertNoteInput {
+    #[serde(default)]
+    pub tenant_slug: String,
+    #[serde(default)]
+    pub actor_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub origin_surface: String,
+    #[serde(default)]
+    pub project_slug: String,
+    #[serde(default)]
+    pub doc_id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub links: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub memory_node_type: String,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub signal: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub event_id: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Receipt for `upsert_note`, reporting how the link set was reconciled so the
+/// plugin can write back resolved ids and surface unresolved forward references.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UpsertNoteReceipt {
+    pub action: String,
+    pub document: MemoryDocumentState,
+    #[serde(default)]
+    pub resolved_links: Vec<String>,
+    #[serde(default)]
+    pub unresolved_links: Vec<String>,
+    #[serde(default)]
+    pub removed_links: Vec<String>,
+    #[serde(default)]
+    pub reconciled_back: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryDocumentState {
     pub tenant_slug: String,
@@ -892,6 +959,298 @@ pub fn encode_memory<S: MemoryGraphStore>(
     create_memory_document(store, input)
 }
 
+/// Stable content hash for a memory document body. The Obsidian sync plugin uses
+/// this as its echo gate: a note whose body already matches the graph's
+/// `content_hash` is not pushed back, breaking the bidirectional sync loop.
+pub fn memory_content_hash(content: &str) -> String {
+    hash_prefix(&stable_value_hash(&Value::String(content.to_string())))
+}
+
+/// List a tenant's memory documents for the Obsidian mirror, newest first.
+///
+/// `since` filters to documents whose `updated_at` is at or after the watermark
+/// (lexical compare, matching the recall path); pass the `max_updated_at` returned
+/// by a previous sync for incremental pulls. Deleted documents are always omitted.
+/// With `include_inactive` false only `active` documents are returned; with it true
+/// `superseded` and `archived` documents are included as well.
+pub fn list_memory_documents_since<S: MemoryGraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    since: &str,
+    include_inactive: bool,
+) -> MemoryResult<Vec<MemoryDocumentState>> {
+    let since = since.trim();
+    let mut documents = load_memory_documents(store, tenant_slug, include_inactive)?;
+    documents.retain(|document| document.status != "deleted");
+    if !since.is_empty() {
+        documents.retain(|document| document.updated_at.as_str() >= since);
+    }
+    Ok(documents)
+}
+
+/// Create or update an Obsidian-synced memory document and reconcile its
+/// `[[wikilink]]` edges in one call. This is the write path the sync plugin uses:
+/// `self_revise` cannot carry a changed link set and exposes no edge removal, so
+/// reconciliation has to happen server-side. Resolved links become `MEMORY_RELATES`
+/// edges, removed links are tombstoned, and forward references to notes that do not
+/// exist yet are recorded as unresolved and resolved when the target note appears.
+pub fn upsert_note<S: MemoryGraphStore>(
+    store: &mut S,
+    input: UpsertNoteInput,
+) -> MemoryResult<UpsertNoteReceipt> {
+    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let content = require_text("content", &input.content)?;
+    let now = timestamp_or_now(&input.updated_at);
+    let kind = if input.kind.trim().is_empty() {
+        "note".to_string()
+    } else {
+        input.kind.trim().to_lowercase()
+    };
+    let desired_links = normalize_strings(&input.links);
+    let tags = normalize_strings(&input.tags);
+
+    let existing = if input.doc_id.trim().is_empty() {
+        None
+    } else {
+        load_memory_document(store, &tenant_slug, input.doc_id.trim())?
+    };
+
+    let (mut document, action) = match existing {
+        Some(mut document) => {
+            document.kind = kind.clone();
+            document.title = input.title.trim().to_string();
+            document.content = content.clone();
+            document.summary = input.summary.trim().to_string();
+            document.tags = tags.clone();
+            document.links = desired_links.clone();
+            if !input.status.trim().is_empty() {
+                document.status = normalize_status(&input.status)?;
+            }
+            if !input.memory_node_type.trim().is_empty() {
+                document.memory_node_type = input.memory_node_type.trim().to_string();
+            }
+            if !input.origin_surface.trim().is_empty() {
+                document.origin_surface = input.origin_surface.trim().to_string();
+            }
+            if !input.actor_id.trim().is_empty() {
+                document.actor_id = input.actor_id.trim().to_string();
+            }
+            for (key, value) in input.metadata.clone() {
+                document.metadata.insert(key, value);
+            }
+            document.updated_at = now.clone();
+            (document, "updated")
+        }
+        None => {
+            let created_at = timestamp_or_now(&input.created_at);
+            let doc_id = if input.doc_id.trim().is_empty() {
+                stable_document_id(&tenant_slug, &kind, &input.title, &content, &created_at)
+            } else {
+                input.doc_id.trim().to_string()
+            };
+            let document = MemoryDocumentState {
+                tenant_slug: tenant_slug.clone(),
+                doc_id,
+                kind: kind.clone(),
+                title: input.title.trim().to_string(),
+                content: content.clone(),
+                summary: input.summary.trim().to_string(),
+                tags: tags.clone(),
+                links: desired_links.clone(),
+                actor_id: input.actor_id.trim().to_string(),
+                session_id: input.session_id.trim().to_string(),
+                origin_surface: if input.origin_surface.trim().is_empty() {
+                    "obsidian".to_string()
+                } else {
+                    input.origin_surface.trim().to_string()
+                },
+                project_slug: input.project_slug.trim().to_string(),
+                status: if input.status.trim().is_empty() {
+                    DEFAULT_STATUS.to_string()
+                } else {
+                    normalize_status(&input.status)?
+                },
+                memory_node_type: input.memory_node_type.trim().to_string(),
+                target_actor_id: String::new(),
+                expires_at: String::new(),
+                metadata: input.metadata.clone(),
+                fitness: None,
+                created_at: created_at.clone(),
+                updated_at: now.clone(),
+                deleted_reason: String::new(),
+                deleted_at: String::new(),
+            };
+            (document, "created")
+        }
+    };
+
+    if is_encode_kind(&document.kind) {
+        let mut fitness = Map::new();
+        fitness.insert(
+            "outcome".to_string(),
+            Value::String(normalize_outcome(&input.outcome)?),
+        );
+        fitness.insert(
+            "signal".to_string(),
+            Value::String(input.signal.trim().to_string()),
+        );
+        fitness.insert(
+            "reason".to_string(),
+            Value::String(input.reason.trim().to_string()),
+        );
+        fitness.insert(
+            "event_id".to_string(),
+            Value::String(input.event_id.trim().to_string()),
+        );
+        fitness.insert("auto_triggered".to_string(), Value::Bool(false));
+        document.fitness = Some(Value::Object(fitness.clone()));
+        document
+            .metadata
+            .insert("fitness".to_string(), Value::Object(fitness));
+    }
+
+    let source_node_id = memory_document_node_id(&tenant_slug, &document.doc_id);
+
+    let previous_targets: Vec<(String, String)> = store
+        .memory_neighbors(NeighborQuery {
+            node_id: source_node_id.clone(),
+            direction: Direction::Out,
+            edge_type: None,
+            include_expired: false,
+        })?
+        .into_iter()
+        .filter(|hit| hit.edge_type == "MEMORY_RELATES")
+        .map(|hit| (hit.edge_id, hit.node_id))
+        .collect();
+
+    let mut resolved_links = Vec::new();
+    let mut unresolved_links = Vec::new();
+    let mut resolved_node_ids = BTreeSet::new();
+    for link in &desired_links {
+        match resolve_memory_graph_id(store, &tenant_slug, link)? {
+            Some(node_id) => {
+                resolved_node_ids.insert(node_id);
+                resolved_links.push(link.clone());
+            }
+            None => unresolved_links.push(link.clone()),
+        }
+    }
+
+    document.metadata.insert(
+        "unresolved_links".to_string(),
+        Value::Array(
+            unresolved_links
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
+    );
+
+    persist_memory_document(store, &document)?;
+
+    let mut removed_links = Vec::new();
+    for (edge_id, target_node_id) in previous_targets {
+        if resolved_node_ids.contains(&target_node_id) {
+            continue;
+        }
+        tombstone_memory_edge(store, &edge_id, &source_node_id, &target_node_id)?;
+        removed_links.push(target_node_id);
+    }
+
+    let reconciled_back = reconcile_incoming_links(store, &tenant_slug, &document)?;
+
+    Ok(UpsertNoteReceipt {
+        action: action.to_string(),
+        document,
+        resolved_links,
+        unresolved_links,
+        removed_links,
+        reconciled_back,
+    })
+}
+
+/// Resolve other documents' unresolved forward references that point at `document`,
+/// by matching their recorded `unresolved_links` against this note's `doc_id` or
+/// title. A match upserts the previously-dangling `MEMORY_RELATES` edge and drops
+/// the entry from the source document's unresolved list.
+fn reconcile_incoming_links<S: MemoryGraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    document: &MemoryDocumentState,
+) -> MemoryResult<Vec<String>> {
+    let source_node_id = memory_document_node_id(tenant_slug, &document.doc_id);
+    let doc_id_key = document.doc_id.to_lowercase();
+    let title_key = document.title.trim().to_lowercase();
+    let mut reconciled = Vec::new();
+
+    for mut other in load_memory_documents(store, tenant_slug, true)? {
+        if other.doc_id == document.doc_id {
+            continue;
+        }
+        let Some(Value::Array(entries)) = other.metadata.get("unresolved_links").cloned() else {
+            continue;
+        };
+        let mut still_unresolved = Vec::new();
+        let mut matched = false;
+        for entry in entries {
+            let Some(text) = entry.as_str() else {
+                continue;
+            };
+            let normalized = text.trim().to_lowercase();
+            if normalized == doc_id_key || (!title_key.is_empty() && normalized == title_key) {
+                matched = true;
+            } else {
+                still_unresolved.push(Value::String(text.to_string()));
+            }
+        }
+        if !matched {
+            continue;
+        }
+        let other_node_id = memory_document_node_id(tenant_slug, &other.doc_id);
+        upsert_memory_edge(
+            store,
+            tenant_slug,
+            "MEMORY_RELATES",
+            &other_node_id,
+            &source_node_id,
+            json!({ "source": "links_reconciled", "updated_at": document.updated_at }),
+        )?;
+        other
+            .metadata
+            .insert("unresolved_links".to_string(), Value::Array(still_unresolved));
+        if !other.links.iter().any(|link| link == &document.doc_id) {
+            other.links.push(document.doc_id.clone());
+        }
+        persist_memory_document(store, &other)?;
+        reconciled.push(other.doc_id.clone());
+    }
+
+    Ok(reconciled)
+}
+
+fn tombstone_memory_edge<S: MemoryGraphStore>(
+    store: &mut S,
+    edge_id: &str,
+    from_id: &str,
+    to_id: &str,
+) -> MemoryResult<()> {
+    let mut edge = EdgeRecord::new(
+        edge_id,
+        from_id,
+        "MEMORY_RELATES",
+        to_id,
+        json!({ "removed": true }),
+    );
+    edge.tombstone = true;
+    store.memory_upsert_edge(edge)?;
+    Ok(())
+}
+
+fn is_encode_kind(kind: &str) -> bool {
+    matches!(kind, "encode" | "feedback" | "solution" | "postmortem")
+}
+
 pub fn forget_memory<S: MemoryGraphStore>(
     store: &mut S,
     input: ForgetMemoryInput,
@@ -1481,7 +1840,7 @@ fn insert_search_text(
     }
 }
 
-fn normalize_tenant_slug(value: &str) -> String {
+pub fn normalize_tenant_slug(value: &str) -> String {
     let value = value.trim().to_lowercase();
     if value.is_empty() {
         DEFAULT_TENANT.to_string()
@@ -2030,5 +2389,181 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn list_memory_documents_since_filters_by_watermark() {
+        let mut store = InMemoryGraphStore::new();
+        create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "note".to_string(),
+                title: "Old".to_string(),
+                content: "old body".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "note".to_string(),
+                title: "New".to_string(),
+                content: "new body".to_string(),
+                created_at: T2.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_memory_documents_since(&store, TENANT, "", false)
+                .unwrap()
+                .len(),
+            2
+        );
+        let since = list_memory_documents_since(&store, TENANT, T2, false).unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].title, "New");
+    }
+
+    #[test]
+    fn upsert_note_round_trips_doc_id_and_reconciles_links() {
+        let mut store = InMemoryGraphStore::new();
+        let target = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: TENANT.to_string(),
+                title: "Target".to_string(),
+                content: "target body".to_string(),
+                created_at: T1.to_string(),
+                updated_at: T1.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(target.action, "created");
+
+        let source = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: TENANT.to_string(),
+                title: "Source".to_string(),
+                content: "source body".to_string(),
+                links: vec![target.document.doc_id.clone(), "Future".to_string()],
+                created_at: T1.to_string(),
+                updated_at: T2.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(source.action, "created");
+        assert_eq!(source.resolved_links, vec![target.document.doc_id.clone()]);
+        assert_eq!(source.unresolved_links, vec!["Future".to_string()]);
+        let source_doc_id = source.document.doc_id.clone();
+
+        // Forward reference resolves when the target note is created.
+        let future = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: TENANT.to_string(),
+                title: "Future".to_string(),
+                content: "future body".to_string(),
+                updated_at: T2.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+        assert!(future.reconciled_back.contains(&source_doc_id));
+
+        // Updating by doc_id keeps the same identity (no supersede churn).
+        let updated = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: TENANT.to_string(),
+                doc_id: source_doc_id.clone(),
+                title: "Source".to_string(),
+                content: "source body v2".to_string(),
+                links: vec![target.document.doc_id.clone()],
+                updated_at: T2.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.action, "updated");
+        assert_eq!(updated.document.doc_id, source_doc_id);
+        assert_eq!(updated.document.content, "source body v2");
+
+        let related = relate_memory(
+            &store,
+            RelateMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                seed_id: source_doc_id.clone(),
+                edge_types: vec!["MEMORY_RELATES".to_string()],
+                max_hops: 1,
+            },
+        )
+        .unwrap();
+        assert!(related
+            .iter()
+            .any(|item| item.id == target.document.doc_id));
+    }
+
+    #[test]
+    fn upsert_note_removes_dropped_links() {
+        let mut store = InMemoryGraphStore::new();
+        let target = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: TENANT.to_string(),
+                title: "A".to_string(),
+                content: "a".to_string(),
+                updated_at: T1.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+        let source = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: TENANT.to_string(),
+                title: "S".to_string(),
+                content: "s".to_string(),
+                links: vec![target.document.doc_id.clone()],
+                updated_at: T1.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+
+        let updated = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: TENANT.to_string(),
+                doc_id: source.document.doc_id.clone(),
+                title: "S".to_string(),
+                content: "s".to_string(),
+                links: Vec::new(),
+                updated_at: T2.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.removed_links.len(), 1);
+
+        let related = relate_memory(
+            &store,
+            RelateMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                seed_id: source.document.doc_id.clone(),
+                edge_types: vec!["MEMORY_RELATES".to_string()],
+                max_hops: 1,
+            },
+        )
+        .unwrap();
+        assert!(related.is_empty());
     }
 }

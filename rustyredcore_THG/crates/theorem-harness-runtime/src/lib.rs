@@ -38,13 +38,15 @@ pub use event_log::{
 };
 pub use memory::{
     archive_memory_document, create_memory_document, create_memory_node, encode_memory,
-    forget_memory, handoff_memory, load_memory_document, load_memory_node, memory_document_node_id,
-    memory_edge_id, memory_node_node_id, recall_archived_memory, recall_memory, relate_memory,
-    remember_memory, revise_memory_document, self_note_memory, ArchiveMemoryInput,
-    ArchiveMemoryReceipt, EncodeMemoryInput, ForgetMemoryInput, ForgetMemoryReceipt,
-    HandoffMemoryInput, MemoryDocumentState, MemoryError, MemoryGraphStore, MemoryNodeState,
-    MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput, RecallMemoryInput,
-    RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput, ReviseMemoryReceipt,
+    forget_memory, handoff_memory, list_memory_documents_since, load_memory_document,
+    load_memory_node, memory_content_hash, memory_document_node_id, memory_edge_id,
+    memory_node_node_id, normalize_tenant_slug, recall_archived_memory, recall_memory,
+    relate_memory, remember_memory, revise_memory_document, self_note_memory, upsert_note,
+    ArchiveMemoryInput, ArchiveMemoryReceipt, EncodeMemoryInput, ForgetMemoryInput,
+    ForgetMemoryReceipt, HandoffMemoryInput, MemoryDocumentState, MemoryError, MemoryGraphStore,
+    MemoryNodeState, MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput,
+    RecallMemoryInput, RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput,
+    ReviseMemoryReceipt, UpsertNoteInput, UpsertNoteReceipt,
 };
 pub use skill_pack::{
     apply_skill_pack, get_skill_pack, list_skill_packs, publish_skill_pack,
