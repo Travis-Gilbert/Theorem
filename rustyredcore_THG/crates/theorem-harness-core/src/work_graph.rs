@@ -153,7 +153,7 @@ impl TaskNode {
 
     /// Claimable when Open, or when a held lease has expired (crashed-head
     /// reclaim). Terminal nodes are never claimable.
-    fn is_claimable(&self, now: Millis) -> bool {
+    pub fn is_claimable(&self, now: Millis) -> bool {
         if self.status.is_terminal() {
             return false;
         }

@@ -64,10 +64,14 @@ pub enum VerifyOutcome {
 }
 
 /// Auto-spawn the sibling verify node for a target that has proposed a patch,
-/// assigned to `reviewer_head` (the head that did not implement the target). The
-/// verify node prerequisites on the target, so it is ready only once the target
-/// is patch-proposed. Inserts it; returns the verify node id, or `None` if the
-/// target is absent.
+/// assigned to `reviewer_head` (the head that did not implement the target).
+///
+/// The verify links to its target via `parent_id` (the VERIFIES relationship),
+/// NOT a prerequisite: a prerequisite requires the target Accepted, but the
+/// target is accepted only THROUGH this verify, which would be circular and the
+/// verify would never become ready. The verify is ready to claim once its target
+/// reaches `PatchProposed` (the scheduler checks that). Inserts it; returns the
+/// verify node id, or `None` if the target is absent.
 pub fn spawn_verify_node(
     graph: &mut WorkGraph,
     target_id: &str,
@@ -83,7 +87,6 @@ pub fn spawn_verify_node(
         "substrate",
     );
     node.parent_id = Some(target_id.to_string());
-    node.prerequisites = vec![target_id.to_string()];
     node.review_required_by = Some(reviewer_head.to_string());
     graph.insert(node);
     Some(id)
@@ -151,7 +154,11 @@ mod tests {
         let v = graph.get(&vid).unwrap();
         assert_eq!(v.node_type, VERIFY_NODE_TYPE);
         assert_eq!(v.review_required_by.as_deref(), Some("codex"));
-        assert_eq!(v.prerequisites, vec!["impl-x"]);
+        assert!(
+            v.prerequisites.is_empty(),
+            "verify links by parent_id, not a circular prerequisite"
+        );
+        assert_eq!(v.parent_id.as_deref(), Some("impl-x"));
     }
 
     #[test]

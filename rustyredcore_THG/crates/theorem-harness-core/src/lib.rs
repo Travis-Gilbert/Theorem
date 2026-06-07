@@ -12,6 +12,7 @@ pub mod map_artifacts;
 pub mod memory_contracts;
 pub mod provider_head_adapter;
 pub mod replay;
+pub mod scheduler;
 pub mod session_metrics;
 pub mod state_hash;
 pub mod state_machine;
@@ -69,6 +70,7 @@ pub use memory_contracts::{
 };
 pub use provider_head_adapter::ProviderHeadExecutionContext;
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};
+pub use scheduler::next_for_head;
 pub use session_metrics::{
     compare_modes, load_jsonl_metrics, summarize_pairformer_ab, PairformerSummaryRow,
     SessionMetricsState, PAIRFORMER_MODES,
