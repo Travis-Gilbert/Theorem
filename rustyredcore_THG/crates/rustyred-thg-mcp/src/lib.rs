@@ -35,8 +35,8 @@ use theorem_harness_runtime::{
     ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JoinRoomInput, MemoryError,
     MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
     ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
-    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput,
-    WriteRecordInput,
+    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
+    WriteMessageInput, WriteRecordInput,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -3581,7 +3581,8 @@ fn upsert_note_payload(
         session_id: argument_text(arguments, &["session_id", "sessionId"]).unwrap_or_default(),
         origin_surface: argument_text(arguments, &["origin_surface", "originSurface", "surface"])
             .unwrap_or_else(|| "obsidian".to_string()),
-        project_slug: argument_text(arguments, &["project_slug", "projectSlug"]).unwrap_or_default(),
+        project_slug: argument_text(arguments, &["project_slug", "projectSlug"])
+            .unwrap_or_default(),
         doc_id: argument_text(arguments, &["doc_id", "docId"]).unwrap_or_default(),
         kind: argument_text(arguments, &["kind"]).unwrap_or_default(),
         title: argument_text(arguments, &["title"]).unwrap_or_default(),
@@ -6932,10 +6933,11 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
         "name": name,
         "description": description,
         "inputSchema": input_schema,
+        "outputSchema": output_schema_for_tool(name),
         "annotations": {
             "readOnlyHint": true,
             "destructiveHint": false,
-            "openWorldHint": false
+            "openWorldHint": open_world_hint_for_tool(name)
         }
     })
 }
@@ -6945,12 +6947,114 @@ fn tool_write(name: &str, description: &str, input_schema: Value) -> Value {
         "name": name,
         "description": description,
         "inputSchema": input_schema,
+        "outputSchema": output_schema_for_tool(name),
         "annotations": {
             "readOnlyHint": false,
             "destructiveHint": false,
-            "openWorldHint": false
+            "openWorldHint": open_world_hint_for_tool(name)
         }
     })
+}
+
+fn output_schema_for_tool(name: &str) -> Value {
+    match name {
+        "code_search" | "compute_code" => code_search_output_schema(),
+        "web_consume" => web_consume_output_schema(),
+        "browse_with_me" | "browse_for_me" => browsing_run_output_schema(),
+        "fractal_expansion" | "rustyweb_search_acquisition" => async_run_output_schema(),
+        _ => generic_object_output_schema(),
+    }
+}
+
+fn generic_object_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true
+    })
+}
+
+fn async_run_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "query": { "type": "string" },
+            "run_id": { "type": "string" },
+            "status": { "type": "string" },
+            "receipt": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn browsing_run_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "task": { "type": "string" },
+            "run_id": { "type": "string" },
+            "browser_run_id": { "type": "string" },
+            "status": { "type": "string" },
+            "receipt": { "type": "object" },
+            "pages_reached": { "type": "integer" },
+            "actions_applied": { "type": "integer" },
+            "data_extracted": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn web_consume_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "url": { "type": "string" },
+            "run_id": { "type": "string" },
+            "status": { "type": "string" },
+            "page": { "type": "object" },
+            "ingested": { "type": "boolean" },
+            "receipt": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn code_search_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "operation": { "type": "string" },
+            "affordance_id": { "type": "string" },
+            "app_affordance": { "type": "object" },
+            "results": { "type": "array", "items": { "type": "object" } },
+            "symbols": { "type": "array", "items": { "type": "object" } },
+            "context": { "type": "object" },
+            "receipt": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn open_world_hint_for_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fractal_expansion"
+            | "rustyweb_search_acquisition"
+            | "web_consume"
+            | "browse_with_me"
+            | "browse_for_me"
+    )
 }
 
 fn prompt_definitions() -> Vec<Value> {
@@ -7794,6 +7898,26 @@ mod tests {
         }
     }
 
+    fn assert_output_schemas_present(tools: &[Value]) {
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            let schema = tool
+                .get("outputSchema")
+                .unwrap_or_else(|| panic!("{name} is missing outputSchema"));
+            assert_eq!(
+                schema["type"], "object",
+                "{name} outputSchema must describe structuredContent as an object"
+            );
+        }
+    }
+
+    fn tool_by_name<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+    }
+
     #[test]
     fn initialize_returns_mcp_capabilities() {
         let (provider, config) = fixture();
@@ -7818,6 +7942,7 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_no_top_level_schema_combinators(tools);
+        assert_output_schemas_present(tools);
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "rustyred_thg_graph_neighbors"));
@@ -8003,6 +8128,7 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_no_top_level_schema_combinators(tools);
+        assert_output_schemas_present(tools);
         assert!(has_tool(tools, "coordination_room"));
         assert!(has_tool(tools, "presence"));
         assert!(has_tool(tools, "coordination_intent"));
@@ -8038,6 +8164,40 @@ mod tests {
         assert!(has_tool(tools, "forget"));
         assert!(has_tool(tools, "handoff"));
         assert!(has_tool(tools, "observe"));
+    }
+
+    #[test]
+    fn chatgpt_flagged_tools_advertise_receipt_output_schemas() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+        for name in ["browse_for_me", "browse_with_me", "code_search"] {
+            let tool = tool_by_name(tools, name);
+            assert_eq!(tool["outputSchema"]["type"], "object");
+            assert!(
+                tool["outputSchema"]["properties"].is_object(),
+                "{name} should expose a concrete receipt schema"
+            );
+        }
+        assert_eq!(
+            tool_by_name(tools, "browse_for_me")["annotations"]["openWorldHint"],
+            true
+        );
+        assert_eq!(
+            tool_by_name(tools, "browse_with_me")["annotations"]["openWorldHint"],
+            true
+        );
+        assert_eq!(
+            tool_by_name(tools, "code_search")["outputSchema"]["properties"]["affordance_id"]
+                ["type"],
+            "string"
+        );
     }
 
     #[test]
