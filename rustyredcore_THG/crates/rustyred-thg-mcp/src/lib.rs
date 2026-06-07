@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ensemble::{
     pack_node_id as ensemble_pack_node_id, register_pack as ensemble_register_pack,
@@ -16,7 +18,11 @@ use rustyred_thg_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use theorem_harness_core::{TransitionInput, TransitionResult};
+use theorem_harness_core::{
+    next_for_head, spawn_verify_node, stable_value_hash, submit_verify_receipt, ClaimOutcome,
+    HeadFitness, Millis, NodeStatus, Receipt, TaskNode, TransitionInput, TransitionResult,
+    VerifyReceipt, WorkGraph,
+};
 #[cfg(test)]
 use theorem_harness_runtime::subscribe_coordination_room_events;
 use theorem_harness_runtime::{
@@ -29,18 +35,23 @@ use theorem_harness_runtime::{
     load_run, normalize_coordination_urgency, parse_coordination_mentions,
     publish_coordination_room_event_from_state, publish_skill_pack, recall_archived_memory,
     recall_memory, relate_memory, remember_memory, revise_memory_document, self_note_memory,
-    stable_coordination_message_id, stable_coordination_record_id, upsert_note, ArchiveMemoryInput,
-    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
-    CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
-    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JoinRoomInput, MemoryError,
-    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
-    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
-    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
-    WriteMessageInput, WriteRecordInput,
+    stable_coordination_message_id, stable_coordination_record_id, task_node_graph_id, upsert_note,
+    ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
+    CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
+    CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
+    HarnessRuntimeError, JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput,
+    PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput,
+    SkillPackError, SkillPackGetInput, SkillPackGraphStore, SkillPackListInput,
+    SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
+    EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MULTIHEAD_RUN_LABEL: &str = "MultiheadRun";
+const MULTIHEAD_PATCH_LABEL: &str = "MultiheadPatch";
+const MULTIHEAD_PROOF_LABEL: &str = "MultiheadProofReceipt";
+const DEFAULT_MULTIHEAD_LEASE_TTL_MS: Millis = 90_000;
 
 #[allow(clippy::too_many_arguments)]
 /// Request to fire a GitHub Actions `repository_dispatch` that spawns a session. The MCP crate
@@ -1058,6 +1069,93 @@ fn call_tool<P: McpGraphProvider>(
         }
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
+        }
+        "multihead_run" | "theorem_harness_multihead_run" => {
+            let action = argument_text(&arguments, &["action"])
+                .unwrap_or_else(|| "start".to_string())
+                .to_lowercase();
+            if action != "status" && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head run writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_run_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_task" | "theorem_harness_multihead_task" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head task writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_task_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_claim" | "theorem_harness_multihead_claim" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head claim writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_claim_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_refine" | "theorem_harness_multihead_refine" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head refine writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_refine_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_next" | "theorem_harness_multihead_next" => {
+            multihead_next_payload(&tenant, &backend, &arguments)?
+        }
+        "multihead_patch" | "theorem_harness_multihead_patch" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head patch writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_patch_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_proof" | "theorem_harness_multihead_proof" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head proof writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_proof_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_review" | "theorem_harness_multihead_review" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head review writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_review_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_spawn_verify" | "theorem_harness_multihead_spawn_verify" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head verify-spawn writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_spawn_verify_payload(&tenant, &mut backend, &arguments)?
+        }
+        "multihead_submit_verify" | "theorem_harness_multihead_submit_verify" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Native multi-head verify-submit writes are unavailable while read-only mode is active."
+                })));
+            }
+            multihead_submit_verify_payload(&tenant, &mut backend, &arguments)?
         }
         "skill_list" | "theorem_harness_skill_list" => {
             skill_list_payload(&tenant, &backend, &arguments)?
@@ -5065,6 +5163,934 @@ fn parse_edge_record(raw: &Value) -> Result<EdgeRecord, McpError> {
     Ok(edge)
 }
 
+fn multihead_run_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let action = argument_text(arguments, &["action"])
+        .unwrap_or_else(|| "start".to_string())
+        .to_lowercase();
+    let run_id = argument_text(arguments, &["run_id", "runId"])
+        .unwrap_or_else(|| format!("multihead:{}", timestamp_or_now("")));
+    if action != "status" {
+        persist_multihead_run_marker(
+            tenant,
+            backend,
+            &run_id,
+            argument_text(arguments, &["goal"])
+                .unwrap_or_else(|| "Multi-head run".to_string())
+                .as_str(),
+            argument_text(arguments, &["actor", "actor_id", "actorId"])
+                .unwrap_or_default()
+                .as_str(),
+        )?;
+    }
+    let run = load_multihead_run_marker(tenant, backend, &run_id)?
+        .unwrap_or_else(|| empty_multihead_run_marker(tenant, &run_id));
+    let graph = load_multihead_work_graph(backend, &run_id)?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "run": run,
+        "graph": graph,
+        "tasks": graph.nodes.values().collect::<Vec<_>>()
+    }))
+}
+
+fn multihead_task_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "multihead_task")?;
+    let node_id = argument_text(arguments, &["node_id", "nodeId"]).unwrap_or_else(|| {
+        let hash = stable_value_hash(&json!({
+            "run_id": run_id,
+            "goal": arguments.get("goal").cloned().unwrap_or(Value::Null),
+            "kind": arguments.get("kind").cloned().unwrap_or(Value::Null),
+        }));
+        format!("task:{}", &hash[..16])
+    });
+    if let Some(existing) = load_multihead_task_node(backend, &run_id, &node_id)? {
+        return Ok(json!({
+            "tenant": normalize_tenant_slug(tenant),
+            "ok": true,
+            "reused": true,
+            "task": existing
+        }));
+    }
+    let mut node = TaskNode::open(
+        &node_id,
+        &run_id,
+        argument_text(arguments, &["kind", "node_type", "nodeType"])
+            .unwrap_or_else(|| "task".to_string()),
+        required_text_any(arguments, &["goal"], "multihead_task")?,
+        argument_text(arguments, &["actor", "actor_id", "actorId"])
+            .unwrap_or_else(|| "substrate".to_string()),
+    );
+    node.prerequisites = string_array_any(arguments, &["prerequisites"]);
+    node.file_scope = string_array_any(arguments, &["files", "file_scope", "fileScope"]);
+    persist_multihead_task_node(backend, &node)?;
+    persist_multihead_run_marker(
+        tenant,
+        backend,
+        &run_id,
+        argument_text(arguments, &["run_goal", "runGoal", "goal"])
+            .unwrap_or_else(|| "Multi-head run".to_string())
+            .as_str(),
+        argument_text(arguments, &["actor", "actor_id", "actorId"])
+            .unwrap_or_default()
+            .as_str(),
+    )?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "task": node
+    }))
+}
+
+fn multihead_claim_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let action = argument_text(arguments, &["action"])
+        .unwrap_or_else(|| "claim".to_string())
+        .to_lowercase();
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "multihead_claim")?;
+    let node_id = required_text_any(arguments, &["node_id", "nodeId"], "multihead_claim")?;
+    let owner = required_text_any(
+        arguments,
+        &["owner", "actor", "actor_id", "actorId"],
+        "multihead_claim",
+    )?;
+    let mut node = load_required_multihead_task_node(backend, &run_id, &node_id)?;
+    if action == "release" {
+        match node.claim.as_ref() {
+            Some(claim) if claim.owner == owner => {
+                node.claim = None;
+                node.status = NodeStatus::Open;
+                persist_multihead_task_node(backend, &node)?;
+                return Ok(json!({
+                    "tenant": normalize_tenant_slug(tenant),
+                    "ok": true,
+                    "released": true,
+                    "task": node
+                }));
+            }
+            Some(claim) => {
+                return Err(McpError::invalid_params(format!(
+                    "multihead_claim release owner mismatch: active owner is {}",
+                    claim.owner
+                )))
+            }
+            None => {
+                return Ok(json!({
+                    "tenant": normalize_tenant_slug(tenant),
+                    "ok": true,
+                    "released": false,
+                    "task": node
+                }))
+            }
+        }
+    }
+
+    let now = multihead_now(arguments);
+    let expected_epoch = argument_u64(arguments, &["expected_epoch", "expectedEpoch", "epoch"])
+        .unwrap_or(node.claim_epoch) as u64;
+    let ttl = lease_ttl_ms(arguments);
+    let outcome =
+        theorem_harness_core::claim_task_node(&mut node, &owner, expected_epoch, now, ttl);
+    if matches!(outcome, ClaimOutcome::Won { .. }) {
+        persist_multihead_task_node(backend, &node)?;
+    }
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": matches!(outcome, ClaimOutcome::Won { .. }),
+        "outcome": outcome,
+        "task": node
+    }))
+}
+
+fn multihead_refine_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "multihead_refine")?;
+    let parent_id = required_text_any(
+        arguments,
+        &["node_id", "nodeId", "parent_id", "parentId"],
+        "multihead_refine",
+    )?;
+    let owner = required_text_any(
+        arguments,
+        &["owner", "actor", "actor_id", "actorId"],
+        "multihead_refine",
+    )?;
+    let mut graph = load_multihead_work_graph(backend, &run_id)?;
+    let children = arguments
+        .get("children")
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::invalid_params("multihead_refine requires children array"))?
+        .iter()
+        .map(|child| multihead_child_task_from_value(&run_id, child, &owner))
+        .collect::<Result<Vec<_>, _>>()?;
+    graph
+        .refine(
+            &parent_id,
+            &owner,
+            string_array_any(arguments, &["files", "file_scope", "fileScope"]),
+            children,
+            multihead_now(arguments),
+        )
+        .map_err(|error| McpError::invalid_params(format!("multihead_refine failed: {error:?}")))?;
+    for node in graph.nodes.values() {
+        persist_multihead_task_node(backend, node)?;
+    }
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "graph": graph
+    }))
+}
+
+fn multihead_next_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "multihead_next")?;
+    let head = required_text_any(
+        arguments,
+        &["head", "owner", "actor", "actor_id", "actorId"],
+        "multihead_next",
+    )?;
+    let graph = load_multihead_work_graph(backend, &run_id)?;
+    let fitness = multihead_fitness(arguments)?;
+    let explore_token = argument_u64(arguments, &["explore_token", "exploreToken"])
+        .unwrap_or(0)
+        .min(999) as u32;
+    let next = next_for_head(
+        &graph,
+        &fitness,
+        &head,
+        explore_token,
+        multihead_now(arguments),
+    );
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "run_id": run_id,
+        "head": head,
+        "next_node_id": next
+    }))
+}
+
+fn multihead_patch_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let action = argument_text(arguments, &["action"])
+        .unwrap_or_else(|| "propose".to_string())
+        .to_lowercase();
+    if action == "rebase" {
+        return multihead_rebase_patch_payload(tenant, backend, arguments);
+    }
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "multihead_patch")?;
+    let node_id = required_text_any(arguments, &["node_id", "nodeId"], "multihead_patch")?;
+    let owner = required_text_any(
+        arguments,
+        &["owner", "actor", "actor_id", "actorId"],
+        "multihead_patch",
+    )?;
+    let epoch = argument_u64(arguments, &["epoch"])
+        .ok_or_else(|| McpError::invalid_params("multihead_patch requires epoch"))?;
+    let base_commit =
+        required_text_any(arguments, &["base_commit", "baseCommit"], "multihead_patch")?;
+    let mut node = load_required_multihead_task_node(backend, &run_id, &node_id)?;
+    require_live_claim(
+        &node,
+        &owner,
+        epoch,
+        multihead_now(arguments),
+        "multihead_patch",
+    )?;
+    let patch = multihead_patch_record(&run_id, &node_id, &owner, epoch, &base_commit, arguments);
+    node.status = NodeStatus::PatchProposed;
+    node.receipts.push(Receipt {
+        kind: "patch_proposal".to_string(),
+        command: "patch_proposed".to_string(),
+        base_commit: base_commit.clone(),
+        claimed_status: "proposed".to_string(),
+        verified_status: None,
+        artifact_hash: patch["patch_hash"].as_str().unwrap_or_default().to_string(),
+    });
+    persist_multihead_task_node(backend, &node)?;
+    persist_multihead_patch(tenant, backend, &patch)?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "patch": patch,
+        "task": node
+    }))
+}
+
+fn multihead_rebase_patch_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let patch_id = required_text_any(arguments, &["patch_id", "patchId"], "multihead_patch")?;
+    let new_base = required_text_any(
+        arguments,
+        &["new_base_commit", "newBaseCommit"],
+        "multihead_patch",
+    )?;
+    let mut patch = load_required_multihead_patch(backend, &patch_id)?;
+    let old_base = patch
+        .get("base_commit")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if let Some(object) = patch.as_object_mut() {
+        object.insert("base_commit".to_string(), json!(new_base));
+        object.insert("status".to_string(), json!("rebased"));
+        object.insert("updated_at".to_string(), json!(timestamp_or_now("")));
+    }
+    persist_multihead_patch(tenant, backend, &patch)?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "changed": old_base != patch["base_commit"].as_str().unwrap_or_default(),
+        "old_base_commit": old_base,
+        "patch": patch,
+        "invalidated_receipts": []
+    }))
+}
+
+fn multihead_proof_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let patch_id = required_text_any(arguments, &["patch_id", "patchId"], "multihead_proof")?;
+    let patch = load_required_multihead_patch(backend, &patch_id)?;
+    let command = required_text_any(arguments, &["command"], "multihead_proof")?;
+    let args = string_array_any(arguments, &["args"]);
+    let cwd = argument_text(arguments, &["cwd"]);
+    let output =
+        run_multihead_proof_command(&command, &args, cwd.as_deref(), proof_timeout_ms(arguments))?;
+    let status = if output.status_code == Some(0) {
+        "passed"
+    } else {
+        "failed"
+    };
+    let receipt = json!({
+        "receipt_id": stable_value_hash(&json!({
+            "patch_id": patch_id,
+            "command": command,
+            "args": args,
+            "started_at": output.started_at,
+        })),
+        "run_id": patch["run_id"].clone(),
+        "patch_id": patch_id,
+        "node_id": patch["node_id"].clone(),
+        "base_commit": patch["base_commit"].clone(),
+        "status": status,
+        "trust_tier": "substrate_rerun",
+        "command": command,
+        "args": args,
+        "cwd": cwd.unwrap_or_default(),
+        "exit_code": output.status_code,
+        "timed_out": output.timed_out,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "started_at": output.started_at,
+        "finished_at": output.finished_at,
+    });
+    persist_multihead_proof(tenant, backend, &receipt)?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": status == "passed",
+        "receipt": receipt,
+        "patch": patch
+    }))
+}
+
+fn multihead_review_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let action = argument_text(arguments, &["action"])
+        .unwrap_or_else(|| "open".to_string())
+        .to_lowercase();
+    let patch_id = required_text_any(arguments, &["patch_id", "patchId"], "multihead_review")?;
+    let reviewer = required_text_any(
+        arguments,
+        &["reviewer", "actor", "actor_id", "actorId"],
+        "multihead_review",
+    )?;
+    let patch = load_required_multihead_patch(backend, &patch_id)?;
+    let run_id = patch["run_id"].as_str().unwrap_or_default().to_string();
+    let node_id = patch["node_id"].as_str().unwrap_or_default().to_string();
+    if action == "open" {
+        let verify = spawn_verify_for_target(backend, &run_id, &node_id, &reviewer)?;
+        return Ok(json!({
+            "tenant": normalize_tenant_slug(tenant),
+            "ok": true,
+            "review": {
+                "review_id": verify,
+                "run_id": run_id,
+                "patch_id": patch_id,
+                "node_id": node_id,
+                "reviewer": reviewer,
+                "status": "open"
+            },
+            "patch": patch
+        }));
+    }
+    let status = argument_text(arguments, &["status"]).unwrap_or_else(|| "reviewed".to_string());
+    let defect_found = !matches!(
+        status.as_str(),
+        "passed" | "accepted" | "approved" | "no_defect"
+    );
+    let receipt = VerifyReceipt {
+        target_node_id: node_id,
+        reviewer,
+        attempted_failure_modes: string_array_any(
+            arguments,
+            &["falsification_attempts", "attempted_failure_modes"],
+        ),
+        commands_run: string_array_any(arguments, &["commands_run", "commandsRun"]),
+        defect_found,
+        waived_risks: string_array_any(arguments, &["waived_risks", "waivedRisks"]),
+    };
+    let outcome = submit_verify_for_target(backend, &run_id, &receipt)?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "review": {
+            "run_id": run_id,
+            "patch_id": patch_id,
+            "reviewer": receipt.reviewer,
+            "status": status,
+            "outcome": outcome
+        },
+        "patch": patch
+    }))
+}
+
+fn multihead_spawn_verify_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "multihead_spawn_verify")?;
+    let target = required_text_any(
+        arguments,
+        &["target_node_id", "targetNodeId", "node_id", "nodeId"],
+        "multihead_spawn_verify",
+    )?;
+    let reviewer = required_text_any(
+        arguments,
+        &["reviewer", "reviewer_head", "reviewerHead", "head"],
+        "multihead_spawn_verify",
+    )?;
+    let verify_node_id = spawn_verify_for_target(backend, &run_id, &target, &reviewer)?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "verify_node_id": verify_node_id
+    }))
+}
+
+fn multihead_submit_verify_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let run_id = required_text_any(arguments, &["run_id", "runId"], "multihead_submit_verify")?;
+    let receipt = VerifyReceipt {
+        target_node_id: required_text_any(
+            arguments,
+            &["target_node_id", "targetNodeId", "node_id", "nodeId"],
+            "multihead_submit_verify",
+        )?,
+        reviewer: required_text_any(
+            arguments,
+            &["reviewer", "head", "actor", "actor_id", "actorId"],
+            "multihead_submit_verify",
+        )?,
+        attempted_failure_modes: string_array_any(
+            arguments,
+            &["attempted_failure_modes", "falsification_attempts"],
+        ),
+        commands_run: string_array_any(arguments, &["commands_run", "commandsRun"]),
+        defect_found: arguments
+            .get("defect_found")
+            .or_else(|| arguments.get("defectFound"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        waived_risks: string_array_any(arguments, &["waived_risks", "waivedRisks"]),
+    };
+    let outcome = submit_verify_for_target(backend, &run_id, &receipt)?;
+    Ok(json!({
+        "tenant": normalize_tenant_slug(tenant),
+        "ok": true,
+        "outcome": outcome,
+        "receipt": receipt
+    }))
+}
+
+fn multihead_child_task_from_value(
+    run_id: &str,
+    value: &Value,
+    created_by: &str,
+) -> Result<TaskNode, McpError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| McpError::invalid_params("multihead_refine children must be objects"))?;
+    let child_id = object
+        .get("node_id")
+        .or_else(|| object.get("nodeId"))
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let hash = stable_value_hash(value);
+            format!("task:{}", &hash[..16])
+        });
+    let mut node = TaskNode::open(
+        child_id,
+        run_id,
+        object
+            .get("kind")
+            .or_else(|| object.get("node_type"))
+            .or_else(|| object.get("nodeType"))
+            .and_then(Value::as_str)
+            .unwrap_or("task"),
+        object
+            .get("goal")
+            .and_then(Value::as_str)
+            .ok_or_else(|| McpError::invalid_params("multihead_refine child requires goal"))?,
+        created_by,
+    );
+    node.prerequisites = object
+        .get("prerequisites")
+        .map(|raw| string_array_any(&json!({ "items": raw }), &["items"]))
+        .unwrap_or_default();
+    node.file_scope = object
+        .get("file_scope")
+        .or_else(|| object.get("fileScope"))
+        .or_else(|| object.get("files"))
+        .map(|raw| string_array_any(&json!({ "items": raw }), &["items"]))
+        .unwrap_or_default();
+    Ok(node)
+}
+
+fn load_multihead_work_graph(
+    backend: &impl McpGraphBackend,
+    run_id: &str,
+) -> Result<WorkGraph, McpError> {
+    let mut graph = WorkGraph::new(run_id);
+    for record in backend.query_nodes(
+        NodeQuery::label(TASK_NODE_LABEL)
+            .with_property("run_id", Value::String(run_id.to_string())),
+    )? {
+        graph.insert(parse_node_properties::<TaskNode>(record.properties)?);
+    }
+    Ok(graph)
+}
+
+fn load_multihead_task_node(
+    backend: &impl McpGraphBackend,
+    run_id: &str,
+    node_id: &str,
+) -> Result<Option<TaskNode>, McpError> {
+    backend
+        .get_node(&task_node_graph_id(run_id, node_id))?
+        .map(|record| parse_node_properties::<TaskNode>(record.properties))
+        .transpose()
+}
+
+fn load_required_multihead_task_node(
+    backend: &impl McpGraphBackend,
+    run_id: &str,
+    node_id: &str,
+) -> Result<TaskNode, McpError> {
+    load_multihead_task_node(backend, run_id, node_id)?.ok_or_else(|| {
+        McpError::invalid_params(format!("multi-head task not found: {run_id}/{node_id}"))
+    })
+}
+
+fn persist_multihead_task_node(
+    backend: &mut impl McpGraphBackend,
+    node: &TaskNode,
+) -> Result<(), McpError> {
+    let properties =
+        serde_json::to_value(node).map_err(|error| McpError::internal(error.to_string()))?;
+    backend.upsert_node(NodeRecord::new(
+        task_node_graph_id(&node.run_id, &node.id),
+        [TASK_NODE_LABEL],
+        properties,
+    ))?;
+    if let Some(parent) = node.parent_id.as_deref() {
+        if backend
+            .get_node(&task_node_graph_id(&node.run_id, parent))?
+            .is_some()
+        {
+            backend.upsert_edge(EdgeRecord::new(
+                format!(
+                    "work-graph:{}:refined-into:{}->{}",
+                    node.run_id, parent, node.id
+                ),
+                task_node_graph_id(&node.run_id, parent),
+                EDGE_REFINED_INTO,
+                task_node_graph_id(&node.run_id, &node.id),
+                json!({ "run_id": node.run_id }),
+            ))?;
+        }
+    }
+    for prerequisite in &node.prerequisites {
+        if backend
+            .get_node(&task_node_graph_id(&node.run_id, prerequisite))?
+            .is_some()
+        {
+            backend.upsert_edge(EdgeRecord::new(
+                format!(
+                    "work-graph:{}:prereq-of:{}->{}",
+                    node.run_id, prerequisite, node.id
+                ),
+                task_node_graph_id(&node.run_id, prerequisite),
+                EDGE_PREREQUISITE_OF,
+                task_node_graph_id(&node.run_id, &node.id),
+                json!({ "run_id": node.run_id }),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn spawn_verify_for_target(
+    backend: &mut impl McpGraphBackend,
+    run_id: &str,
+    target: &str,
+    reviewer: &str,
+) -> Result<String, McpError> {
+    let mut graph = load_multihead_work_graph(backend, run_id)?;
+    let verify_node_id = spawn_verify_node(&mut graph, target, reviewer)
+        .ok_or_else(|| McpError::invalid_params(format!("target not found: {target}")))?;
+    let verify = graph
+        .get(&verify_node_id)
+        .ok_or_else(|| McpError::internal("spawned verify node missing from graph"))?;
+    persist_multihead_task_node(backend, verify)?;
+    Ok(verify_node_id)
+}
+
+fn submit_verify_for_target(
+    backend: &mut impl McpGraphBackend,
+    run_id: &str,
+    receipt: &VerifyReceipt,
+) -> Result<theorem_harness_core::VerifyOutcome, McpError> {
+    let mut graph = load_multihead_work_graph(backend, run_id)?;
+    let outcome = submit_verify_receipt(&mut graph, receipt);
+    if let Some(target) = graph.get(&receipt.target_node_id) {
+        persist_multihead_task_node(backend, target)?;
+    }
+    if let Some(verify) = graph.get(&theorem_harness_core::verify_node_id(
+        &receipt.target_node_id,
+    )) {
+        persist_multihead_task_node(backend, verify)?;
+    }
+    Ok(outcome)
+}
+
+fn require_live_claim(
+    node: &TaskNode,
+    owner: &str,
+    epoch: u64,
+    now: Millis,
+    tool_name: &str,
+) -> Result<(), McpError> {
+    match node.claim.as_ref() {
+        Some(claim) if claim.owner == owner && claim.epoch == epoch && !claim.is_expired(now) => {
+            Ok(())
+        }
+        Some(claim) => Err(McpError::invalid_params(format!(
+            "{tool_name} active claim is {}@{}, not {owner}@{epoch}",
+            claim.owner, claim.epoch
+        ))),
+        None => Err(McpError::invalid_params(format!(
+            "{tool_name} target task has no active claim"
+        ))),
+    }
+}
+
+fn multihead_patch_record(
+    run_id: &str,
+    node_id: &str,
+    owner: &str,
+    epoch: u64,
+    base_commit: &str,
+    arguments: &Value,
+) -> Value {
+    let patch_text = argument_text(arguments, &["patch"]).unwrap_or_default();
+    let patch_ref = arguments.get("patch_ref").cloned().unwrap_or(Value::Null);
+    let files = string_array_any(arguments, &["files"]);
+    let patch_hash = stable_value_hash(&json!({
+        "patch": patch_text,
+        "patch_ref": patch_ref,
+        "files": files,
+    }));
+    let patch_id = argument_text(arguments, &["patch_id", "patchId"])
+        .unwrap_or_else(|| format!("patch:{}", &patch_hash[..16]));
+    json!({
+        "patch_id": patch_id,
+        "run_id": run_id,
+        "node_id": node_id,
+        "owner": owner,
+        "epoch": epoch,
+        "base_commit": base_commit,
+        "status": "proposed",
+        "files": files,
+        "patch": patch_text,
+        "patch_ref": patch_ref,
+        "patch_hash": patch_hash,
+        "created_at": timestamp_or_now(""),
+        "updated_at": timestamp_or_now(""),
+    })
+}
+
+fn multihead_fitness(arguments: &Value) -> Result<HeadFitness, McpError> {
+    if let Some(fitness) = arguments.get("fitness") {
+        return serde_json::from_value::<HeadFitness>(fitness.clone()).map_err(|error| {
+            McpError::invalid_params(format!("multihead_next fitness is invalid: {error}"))
+        });
+    }
+    let heads = string_array_any(arguments, &["heads"]);
+    if !heads.is_empty() {
+        return Ok(HeadFitness::new(heads));
+    }
+    let head = required_text_any(
+        arguments,
+        &["head", "owner", "actor", "actor_id", "actorId"],
+        "multihead_next",
+    )?;
+    Ok(HeadFitness::new(vec![head]))
+}
+
+fn multihead_now(arguments: &Value) -> Millis {
+    argument_u64(arguments, &["now", "now_ms", "nowMs"]).unwrap_or_else(current_unix_ms)
+}
+
+fn lease_ttl_ms(arguments: &Value) -> Millis {
+    if let Some(ms) = argument_u64(arguments, &["lease_ttl_ms", "leaseTtlMs"]) {
+        return ms;
+    }
+    argument_u64(arguments, &["lease_ttl_seconds", "leaseTtlSeconds"])
+        .map(|seconds| seconds.saturating_mul(1000))
+        .unwrap_or(DEFAULT_MULTIHEAD_LEASE_TTL_MS)
+}
+
+fn proof_timeout_ms(arguments: &Value) -> u64 {
+    argument_u64(arguments, &["timeout_ms", "timeoutMs"])
+        .unwrap_or(120_000)
+        .clamp(1_000, 30 * 60_000)
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn multihead_run_node_id(tenant: &str, run_id: &str) -> String {
+    format!("multihead-run:{}:{}", normalize_tenant_slug(tenant), run_id)
+}
+
+fn empty_multihead_run_marker(tenant: &str, run_id: &str) -> Value {
+    json!({
+        "tenant_slug": normalize_tenant_slug(tenant),
+        "run_id": run_id,
+        "goal": "",
+        "actor": "",
+        "created_at": "",
+        "updated_at": "",
+    })
+}
+
+fn load_multihead_run_marker(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    run_id: &str,
+) -> Result<Option<Value>, McpError> {
+    Ok(backend
+        .get_node(&multihead_run_node_id(tenant, run_id))?
+        .map(|record| record.properties))
+}
+
+fn persist_multihead_run_marker(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    run_id: &str,
+    goal: &str,
+    actor: &str,
+) -> Result<(), McpError> {
+    let existing = load_multihead_run_marker(tenant, backend, run_id)?
+        .unwrap_or_else(|| empty_multihead_run_marker(tenant, run_id));
+    let created_at = existing
+        .get("created_at")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| timestamp_or_now(""));
+    backend.upsert_node(NodeRecord::new(
+        multihead_run_node_id(tenant, run_id),
+        [MULTIHEAD_RUN_LABEL],
+        json!({
+            "tenant_slug": normalize_tenant_slug(tenant),
+            "run_id": run_id,
+            "goal": if goal.trim().is_empty() { existing.get("goal").cloned().unwrap_or(Value::String(String::new())) } else { json!(goal) },
+            "actor": actor,
+            "created_at": created_at,
+            "updated_at": timestamp_or_now(""),
+        }),
+    ))?;
+    Ok(())
+}
+
+fn multihead_patch_node_id(patch_id: &str) -> String {
+    format!("multihead-patch:{patch_id}")
+}
+
+fn load_required_multihead_patch(
+    backend: &impl McpGraphBackend,
+    patch_id: &str,
+) -> Result<Value, McpError> {
+    backend
+        .get_node(&multihead_patch_node_id(patch_id))?
+        .map(|record| record.properties)
+        .ok_or_else(|| McpError::invalid_params(format!("multi-head patch not found: {patch_id}")))
+}
+
+fn persist_multihead_patch(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    patch: &Value,
+) -> Result<(), McpError> {
+    let patch_id = patch
+        .get("patch_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::internal("multi-head patch missing patch_id"))?;
+    backend.upsert_node(NodeRecord::new(
+        multihead_patch_node_id(patch_id),
+        [MULTIHEAD_PATCH_LABEL],
+        merge_json_object(
+            patch,
+            json!({
+                "tenant_slug": normalize_tenant_slug(tenant),
+            }),
+        ),
+    ))?;
+    Ok(())
+}
+
+fn persist_multihead_proof(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    receipt: &Value,
+) -> Result<(), McpError> {
+    let receipt_id = receipt
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::internal("multi-head proof missing receipt_id"))?;
+    backend.upsert_node(NodeRecord::new(
+        format!("multihead-proof:{receipt_id}"),
+        [MULTIHEAD_PROOF_LABEL],
+        merge_json_object(
+            receipt,
+            json!({
+                "tenant_slug": normalize_tenant_slug(tenant),
+            }),
+        ),
+    ))?;
+    Ok(())
+}
+
+fn merge_json_object(left: &Value, right: Value) -> Value {
+    let mut merged = left.as_object().cloned().unwrap_or_default();
+    if let Some(right) = right.as_object() {
+        for (key, value) in right {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
+struct MultiheadProofOutput {
+    status_code: Option<i32>,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+    started_at: String,
+    finished_at: String,
+}
+
+fn run_multihead_proof_command(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    timeout_ms: u64,
+) -> Result<MultiheadProofOutput, McpError> {
+    let started_at = timestamp_or_now("");
+    let mut command_builder = Command::new(command);
+    command_builder.args(args);
+    command_builder
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        command_builder.current_dir(cwd);
+    }
+    let mut child = command_builder.spawn().map_err(|error| {
+        McpError::internal(format!("multihead_proof command failed to start: {error}"))
+    })?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| McpError::internal(format!("multihead_proof wait failed: {error}")))?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break;
+        }
+        sleep(Duration::from_millis(25));
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| McpError::internal(format!("multihead_proof output failed: {error}")))?;
+    Ok(MultiheadProofOutput {
+        status_code: output.status.code(),
+        timed_out,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        started_at,
+        finished_at: timestamp_or_now(""),
+    })
+}
+
 fn tool_result(payload: Value) -> Value {
     json!({
         "content": [{
@@ -6305,7 +7331,243 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }
         }),
     ));
+    tools.push(tool(
+        "multihead_run",
+        "Start or inspect a native multi-head work-graph run. In read-only mode only action=status is available.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "tenant_slug": { "type": "string" },
+                "action": { "type": "string", "enum": ["start", "status"], "default": "start" },
+                "run_id": { "type": "string" },
+                "runId": { "type": "string" },
+                "goal": { "type": "string" },
+                "actor": { "type": "string" },
+                "actor_id": { "type": "string" }
+            }
+        }),
+    ));
+    tools.push(tool(
+        "multihead_next",
+        "Route the next claimable node for a head from the durable multi-head work graph.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "tenant_slug": { "type": "string" },
+                "run_id": { "type": "string" },
+                "runId": { "type": "string" },
+                "head": { "type": "string" },
+                "owner": { "type": "string" },
+                "actor": { "type": "string" },
+                "actor_id": { "type": "string" },
+                "heads": { "type": "array", "items": { "type": "string" } },
+                "fitness": { "type": "object" },
+                "explore_token": { "type": "integer", "default": 0 },
+                "now": { "type": "integer" },
+                "now_ms": { "type": "integer" }
+            },
+            "required": ["run_id"]
+        }),
+    ));
     if !config.read_only {
+        tools.push(tool_write(
+            "multihead_task",
+            "Create a durable claimable task node in the native multi-head work graph.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "nodeId": { "type": "string" },
+                    "goal": { "type": "string" },
+                    "kind": { "type": "string", "default": "task" },
+                    "node_type": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "prerequisites": { "type": "array", "items": { "type": "string" } },
+                    "files": { "type": "array", "items": { "type": "string" } },
+                    "file_scope": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["run_id", "goal"]
+            }),
+        ));
+        tools.push(tool_write(
+            "multihead_claim",
+            "Acquire or release a leased CAS claim on a native multi-head task node.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "action": { "type": "string", "enum": ["claim", "release"], "default": "claim" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "nodeId": { "type": "string" },
+                    "owner": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "expected_epoch": { "type": "integer" },
+                    "epoch": { "type": "integer" },
+                    "lease_ttl_seconds": { "type": "integer", "default": 90 },
+                    "lease_ttl_ms": { "type": "integer" },
+                    "now": { "type": "integer" },
+                    "now_ms": { "type": "integer" }
+                },
+                "required": ["run_id", "node_id"]
+            }),
+        ));
+        tools.push(tool_write(
+            "multihead_refine",
+            "Split a claimed native multi-head task into child task nodes.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "parent_id": { "type": "string" },
+                    "owner": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "files": { "type": "array", "items": { "type": "string" } },
+                    "file_scope": { "type": "array", "items": { "type": "string" } },
+                    "children": { "type": "array", "items": { "type": "object" } },
+                    "now": { "type": "integer" },
+                    "now_ms": { "type": "integer" }
+                },
+                "required": ["run_id", "node_id", "children"]
+            }),
+        ));
+        tools.push(tool_write(
+            "multihead_patch",
+            "Mark a claimed task as patch_proposed and bind the patch to its base commit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "action": { "type": "string", "enum": ["propose", "rebase"], "default": "propose" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "nodeId": { "type": "string" },
+                    "patch_id": { "type": "string" },
+                    "patchId": { "type": "string" },
+                    "owner": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "epoch": { "type": "integer" },
+                    "base_commit": { "type": "string" },
+                    "baseCommit": { "type": "string" },
+                    "new_base_commit": { "type": "string" },
+                    "newBaseCommit": { "type": "string" },
+                    "files": { "type": "array", "items": { "type": "string" } },
+                    "patch": { "type": "string" },
+                    "patch_ref": { "type": "object" },
+                    "now": { "type": "integer" },
+                    "now_ms": { "type": "integer" }
+                },
+                "required": ["run_id"]
+            }),
+        ));
+        tools.push(tool_write(
+            "multihead_proof",
+            "Run a proof command from the substrate and persist a proof receipt for a multi-head patch.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "patch_id": { "type": "string" },
+                    "patchId": { "type": "string" },
+                    "command": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } },
+                    "cwd": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "default": 120000 },
+                    "timeoutMs": { "type": "integer", "default": 120000 }
+                },
+                "required": ["patch_id", "command"]
+            }),
+        ));
+        tools.push(tool_write(
+            "multihead_review",
+            "Open or complete an adversarial verify node for a multi-head patch.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "action": { "type": "string", "enum": ["open", "complete"], "default": "open" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "patch_id": { "type": "string" },
+                    "patchId": { "type": "string" },
+                    "reviewer": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "status": { "type": "string" },
+                    "falsification_attempts": { "type": "array", "items": { "type": "string" } },
+                    "attempted_failure_modes": { "type": "array", "items": { "type": "string" } },
+                    "commands_run": { "type": "array", "items": { "type": "string" } },
+                    "waived_risks": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["patch_id", "reviewer"]
+            }),
+        ));
+        tools.push(tool_write(
+            "multihead_spawn_verify",
+            "Spawn the sibling verify node for a patch-proposed target.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "target_node_id": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "reviewer": { "type": "string" },
+                    "reviewer_head": { "type": "string" },
+                    "head": { "type": "string" }
+                },
+                "required": ["run_id", "target_node_id", "reviewer"]
+            }),
+        ));
+        tools.push(tool_write(
+            "multihead_submit_verify",
+            "Submit a falsification receipt for a native multi-head verify node.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "target_node_id": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "reviewer": { "type": "string" },
+                    "head": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "attempted_failure_modes": { "type": "array", "items": { "type": "string" } },
+                    "falsification_attempts": { "type": "array", "items": { "type": "string" } },
+                    "commands_run": { "type": "array", "items": { "type": "string" } },
+                    "defect_found": { "type": "boolean", "default": false },
+                    "waived_risks": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["run_id", "target_node_id", "reviewer"]
+            }),
+        ));
         tools.push(tool_write(
             "fractal_expansion",
             "Queue live RustyRed fractal expansion through the async harness server route, returning a pollable run_id by default. Pass wait=true for a synchronous diagnostic receipt.",
@@ -7965,6 +9227,8 @@ mod tests {
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
+        assert!(has_tool(tools, "multihead_run"));
+        assert!(has_tool(tools, "multihead_next"));
         assert!(has_tool(tools, "skill_list"));
         assert!(has_tool(tools, "skill_get"));
         assert!(!has_tool(tools, "fractal_expansion"));
@@ -8001,6 +9265,10 @@ mod tests {
         assert!(!has_tool(tools, "coordination_record"));
         assert!(!has_tool(tools, "coordination_contribution"));
         assert!(!has_tool(tools, "harness_append_transition"));
+        assert!(!has_tool(tools, "multihead_task"));
+        assert!(!has_tool(tools, "multihead_claim"));
+        assert!(!has_tool(tools, "multihead_patch"));
+        assert!(!has_tool(tools, "multihead_review"));
         assert!(!has_tool(tools, "skill_publish"));
         assert!(!has_tool(tools, "skill_apply"));
         assert!(!has_tool(tools, "ensemble_register"));
@@ -8144,6 +9412,16 @@ mod tests {
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
+        assert!(has_tool(tools, "multihead_run"));
+        assert!(has_tool(tools, "multihead_task"));
+        assert!(has_tool(tools, "multihead_claim"));
+        assert!(has_tool(tools, "multihead_refine"));
+        assert!(has_tool(tools, "multihead_next"));
+        assert!(has_tool(tools, "multihead_patch"));
+        assert!(has_tool(tools, "multihead_proof"));
+        assert!(has_tool(tools, "multihead_review"));
+        assert!(has_tool(tools, "multihead_spawn_verify"));
+        assert!(has_tool(tools, "multihead_submit_verify"));
         assert!(has_tool(tools, "harness_append_transition"));
         assert!(has_tool(tools, "skill_list"));
         assert!(has_tool(tools, "skill_get"));
@@ -8309,6 +9587,151 @@ mod tests {
             selected["decision"]["selected"][0]["pack_content_hash"],
             pack_hash
         );
+    }
+
+    #[test]
+    fn native_multihead_tools_round_trip_through_mcp() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let run = call_tool_json(
+            &provider,
+            &config,
+            "multihead_run",
+            json!({
+                "tenant": "smoke",
+                "action": "start",
+                "run_id": "run-multihead",
+                "goal": "exercise native work graph",
+                "actor": "codex"
+            }),
+        );
+        assert_eq!(run["run"]["run_id"], "run-multihead");
+
+        let task = call_tool_json(
+            &provider,
+            &config,
+            "multihead_task",
+            json!({
+                "tenant": "smoke",
+                "run_id": "run-multihead",
+                "node_id": "impl-a",
+                "goal": "write native MCP surface",
+                "kind": "rust_impl",
+                "actor": "codex"
+            }),
+        );
+        assert_eq!(task["task"]["status"], "open");
+
+        let next = call_tool_json(
+            &provider,
+            &config,
+            "multihead_next",
+            json!({
+                "tenant": "smoke",
+                "run_id": "run-multihead",
+                "head": "codex",
+                "heads": ["codex", "claude-code"],
+                "explore_token": 999,
+                "now": 0
+            }),
+        );
+        assert_eq!(next["next_node_id"], "impl-a");
+
+        let claim = call_tool_json(
+            &provider,
+            &config,
+            "multihead_claim",
+            json!({
+                "tenant": "smoke",
+                "run_id": "run-multihead",
+                "node_id": "impl-a",
+                "owner": "codex",
+                "expected_epoch": 0,
+                "lease_ttl_ms": 1000,
+                "now": 0
+            }),
+        );
+        assert_eq!(claim["task"]["status"], "claimed");
+        assert_eq!(claim["task"]["claim_epoch"], 1);
+
+        let patch = call_tool_json(
+            &provider,
+            &config,
+            "multihead_patch",
+            json!({
+                "tenant": "smoke",
+                "run_id": "run-multihead",
+                "node_id": "impl-a",
+                "owner": "codex",
+                "epoch": 1,
+                "base_commit": "base-a",
+                "files": ["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"],
+                "patch": "diff --git a/lib.rs b/lib.rs\n",
+                "now": 1
+            }),
+        );
+        assert_eq!(patch["task"]["status"], "patch_proposed");
+        let patch_id = patch["patch"]["patch_id"].as_str().unwrap().to_string();
+
+        let proof_command = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let proof = call_tool_json(
+            &provider,
+            &config,
+            "multihead_proof",
+            json!({
+                "tenant": "smoke",
+                "patch_id": patch_id,
+                "command": proof_command,
+                "args": ["--help"],
+                "timeout_ms": 10_000
+            }),
+        );
+        assert_eq!(proof["receipt"]["status"], "passed");
+        let patch_id = proof["patch"]["patch_id"].as_str().unwrap().to_string();
+
+        let opened = call_tool_json(
+            &provider,
+            &config,
+            "multihead_review",
+            json!({
+                "tenant": "smoke",
+                "patch_id": patch_id,
+                "reviewer": "claude-code",
+                "action": "open"
+            }),
+        );
+        assert_eq!(opened["review"]["status"], "open");
+
+        let reviewed = call_tool_json(
+            &provider,
+            &config,
+            "multihead_review",
+            json!({
+                "tenant": "smoke",
+                "patch_id": opened["patch"]["patch_id"],
+                "reviewer": "claude-code",
+                "action": "complete",
+                "status": "accepted",
+                "falsification_attempts": ["ran targeted MCP lifecycle test"]
+            }),
+        );
+        assert_eq!(reviewed["review"]["outcome"], "target_accepted");
+
+        let status = call_tool_json(
+            &provider,
+            &config,
+            "multihead_run",
+            json!({
+                "tenant": "smoke",
+                "action": "status",
+                "run_id": "run-multihead"
+            }),
+        );
+        assert_eq!(status["graph"]["nodes"]["impl-a"]["status"], "accepted");
     }
 
     #[test]
