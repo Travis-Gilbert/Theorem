@@ -16,6 +16,7 @@ pub mod state_hash;
 pub mod state_machine;
 pub mod toolgraph;
 pub mod types;
+pub mod work_graph;
 
 pub use affordances::{
     affordance_by_id, affordance_ids, default_affordance_registry, validate_affordance_registry,
@@ -78,4 +79,8 @@ pub use toolgraph::{
 pub use types::{
     AgentRunState, AgentStepState, EventState, GuardViolation, Payload, RunState, TransitionInput,
     TransitionResult,
+};
+pub use work_graph::{
+    claim_task_node, heartbeat_task_node, ClaimLease, ClaimOutcome, Millis, NodeStatus, Receipt,
+    TaskNode, WorkGraph, WorkGraphError,
 };
