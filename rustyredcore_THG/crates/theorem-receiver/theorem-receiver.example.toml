@@ -1,0 +1,29 @@
+# theorem-receiver configuration (example).
+#
+# The bearer token is NOT in this file. Set it in the environment:
+#   THEOREM_HARNESS_TOKEN=<bearer>
+#
+# Run:
+#   THEOREM_HARNESS_TOKEN=... theorem-receiver path/to/this.toml
+
+# The cloud harness MCP endpoint (outbound only).
+harness_url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
+
+# Tenant the receiver claims for.
+tenant_slug = "default"
+
+# Stable receiver id. Optional; defaults to a hostname-derived value.
+# receiver_id = "traviss-laptop"
+
+# Poll interval between empty claims, in seconds (default 20).
+# SSE wake on the jobs channel is a named follow-up; until it lands, polling is
+# the mechanism.
+claim_interval_secs = 20
+
+# Per-repo capacity (default 1). One job runs to completion before the next is
+# claimed; values > 1 are accepted but currently processed sequentially.
+capacity = 1
+
+# repo -> local worktree. A job for an unmapped repo is NEVER claimed.
+[worktrees]
+"Travis-Gilbert/theorem" = "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem"

@@ -3,6 +3,7 @@ pub mod canonical_write;
 pub mod coordination;
 pub mod coordination_push;
 pub mod event_log;
+pub mod job_queue;
 pub mod memory;
 pub mod node_type_binding;
 pub mod patch_sequencer;
@@ -51,6 +52,13 @@ pub use event_log::{
     append_transition, append_transition_from_store, event_node_id, load_events, load_run,
     persist_transition_result, replay_persisted_run, run_node_id, HarnessRuntimeError,
     RuntimeResult,
+};
+pub use job_queue::{
+    job_artifact_node_id, job_cancel, job_claim, job_complete, job_event_node_id, job_node_id,
+    job_promote, job_submit, load_job, load_job_events, queue_status, JobActionResult,
+    JobCompletion, JobEvent, JobOutcome, JobSubmitOutcome, EDGE_DISPATCHED_AS, EDGE_JOB_EVENT_NEXT,
+    EDGE_JOB_EVENT_OF, EDGE_JOB_FOR_SPEC, EDGE_PRODUCED, JOB_ARTIFACT_LABEL, JOB_EVENT_LABEL,
+    JOB_LABEL,
 };
 pub use memory::{
     archive_memory_document, create_memory_document, create_memory_node, encode_memory,

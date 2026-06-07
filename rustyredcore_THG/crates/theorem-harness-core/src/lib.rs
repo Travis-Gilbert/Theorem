@@ -8,6 +8,7 @@ pub mod federated_signals;
 pub mod head_fitness;
 pub mod head_invocation;
 pub mod intra_agent_loop;
+pub mod job;
 pub mod map_artifacts;
 pub mod memory_contracts;
 pub mod provider_head_adapter;
@@ -59,6 +60,10 @@ pub use head_invocation::{
 pub use intra_agent_loop::{
     run_fake_intra_agent_loop, run_intra_agent_loop_with_invoker, FakeIntraAgentLoopInput,
     FakeIntraAgentLoopResult, IntraAgentLoopError,
+};
+pub use job::{
+    default_branch, idempotency_key_for, new_job_id, Job, JobKind, JobStatus, JobSubmission,
+    Priority, TargetHead, LANE_CLAUDE, LANE_CODEX,
 };
 pub use map_artifacts::{
     compile_map_artifact, describe_map_artifact, scope_for_map_kind, stable_map_id,
