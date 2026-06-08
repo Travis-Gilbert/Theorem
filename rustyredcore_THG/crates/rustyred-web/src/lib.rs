@@ -65,6 +65,11 @@ pub use browser_perception::{
     SensitiveData, Tab, TabSet, UploadDecision,
 };
 
+pub mod browser_run;
+pub use browser_run::{
+    BrowsingRunRecord, BrowsingRunRecorder, BrowsingRunReplay, BrowsingRunStep,
+};
+
 pub mod providers;
 pub use providers::{
     configured_search_providers_from_env, BraveSearchProvider, ExaSearchProvider,
