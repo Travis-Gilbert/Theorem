@@ -1,9 +1,11 @@
 pub mod binding_store;
 pub mod canonical_write;
+pub mod compound_engineering;
 pub mod coordination;
 pub mod coordination_push;
 pub mod event_log;
 pub mod job_queue;
+pub mod library_encoding;
 pub mod memory;
 pub mod node_type_binding;
 pub mod patch_sequencer;
@@ -30,6 +32,11 @@ pub use work_graph_store::{
     EDGE_CLAIMED_BY, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
+pub use compound_engineering::{
+    apply_run_close_hook, compound_config_hash, compound_config_node_id, compound_state_node_id,
+    load_compound_config, persist_compound_config, CompoundConfig, CompoundHookReceipt,
+    COMPOUND_CONFIG_NODE_LABEL, COMPOUND_ROOM_ID, COMPOUND_STATE_NODE_LABEL,
+};
 pub use coordination::{
     coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
     coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
@@ -57,6 +64,11 @@ pub use event_log::{
 pub use job_queue::{
     job_archive, job_list, job_node_id, job_note, job_submit, load_job, JobActionResult,
     JobNoteInput, JobSubmitOutcome, EDGE_DISPATCHED_AS, EDGE_JOB_FOR_SPEC, JOB_LABEL,
+};
+pub use library_encoding::{
+    library_encoding_pack_payload, library_encoding_plan, library_encoding_plan_hash,
+    library_encoding_plan_value, library_pack_by_source, library_source_is_infrastructure,
+    LibraryEncodingPlan, LibraryKeystone, LibraryPackSpec, RetiredProcessPlugin,
 };
 pub use memory::{
     archive_memory_document, create_memory_document, create_memory_node, encode_memory,
@@ -91,6 +103,6 @@ pub use skill_pack::{
 };
 pub use writing_style::{
     check_boundary_text, enrich_binding_transition, enrich_run_transition,
-    fold_style_receipts_into_pack_fitness, metadata_with_style_receipt, register_for_boundary,
+    metadata_with_style_receipt, register_for_boundary, summarize_style_receipts_for_fitness,
     BoundaryStyleReceipt, WritingStyleFitnessSummary, STYLE_FITNESS_FIELD, STYLE_RECEIPTS_FIELD,
 };

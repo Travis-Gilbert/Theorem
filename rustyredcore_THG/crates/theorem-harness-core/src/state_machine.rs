@@ -417,6 +417,9 @@ fn advance_run(mut run: RunState, transition: &TransitionInput) -> Result<RunSta
             run.learning_patches.clear();
             run.federation_signals.clear();
         }
+        event if is_compound_event(event) => {
+            run.status = run.status.clone();
+        }
         event if is_cache_event(event) => {
             run = append_cache_event(run, transition)?;
         }
@@ -577,6 +580,11 @@ fn reject_terminal_run(run: &RunState, transition: &TransitionInput) -> Result<(
         return Ok(());
     }
     if transition.event_type == "RUN.REPLAYED" && run.status == "closed" {
+        return Ok(());
+    }
+    if is_compound_event(&transition.event_type)
+        && matches!(run.status.as_str(), "closed" | "failed")
+    {
         return Ok(());
     }
     Err(guard_violation(
@@ -1158,6 +1166,10 @@ fn cache_allowed_previous(event: &str) -> &'static [&'static str] {
     }
 }
 
+fn is_compound_event(event: &str) -> bool {
+    event.starts_with("COMPOUND.")
+}
+
 fn oracle_event_requirements(event: &str) -> &'static [&'static str] {
     match event {
         "ORACLE.REQUESTED" => &["tool_name", "request_id"],
@@ -1486,6 +1498,22 @@ mod tests {
         );
         assert!(fork.run.outcome.is_none());
         assert!(fork.run.context.is_none());
+    }
+
+    #[test]
+    fn compound_events_append_after_terminal_run_without_reopening_it() {
+        let closed = closed_run();
+        let compound = apply(
+            closed,
+            "COMPOUND.CAPTURED",
+            json!({
+                "config_hash": "sha256:compound",
+                "captured": true
+            }),
+        );
+
+        assert_eq!(compound.run.status, "closed");
+        assert_eq!(compound.event.event_type, "COMPOUND.CAPTURED");
     }
 
     fn closed_run() -> RunState {

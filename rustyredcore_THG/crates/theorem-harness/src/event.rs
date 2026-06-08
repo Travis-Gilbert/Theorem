@@ -170,6 +170,10 @@ mod tests {
             RunEventKind::from_event_type("CONTEXT.PACKED"),
             RunEventKind::Other("CONTEXT.PACKED".to_string())
         );
+        assert_eq!(
+            RunEventKind::from_event_type("COMPOUND.CAPTURED"),
+            RunEventKind::Other("COMPOUND.CAPTURED".to_string())
+        );
     }
 
     #[test]

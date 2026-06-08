@@ -639,6 +639,7 @@ pub fn recall_memory<S: MemoryGraphStore>(
             .then_with(|| left.id.cmp(&right.id))
     });
     results.truncate(limit);
+    bump_recalled_compound_fitness(store, &tenant_slug, &results)?;
 
     if input.consume_handoffs && kind_filter == "handoff" {
         for item in &results {
@@ -1949,6 +1950,59 @@ fn is_low_fitness(fitness: Option<&Value>) -> bool {
         .and_then(Value::as_str)
         .map(|outcome| outcome == "negative")
         .unwrap_or(false)
+        || fitness
+            .get("compound")
+            .and_then(|value| value.get("low_fitness"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn bump_recalled_compound_fitness<S: MemoryGraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    items: &[MemoryRecallItem],
+) -> MemoryResult<()> {
+    for item in items {
+        match item.item_type.as_str() {
+            "document" => {
+                let Some(mut document) = load_memory_document(store, tenant_slug, &item.id)? else {
+                    continue;
+                };
+                if clear_compound_low_fitness(document.fitness.as_mut()) {
+                    persist_memory_document(store, &document)?;
+                }
+            }
+            "node" => {
+                let Some(mut node) = load_memory_node(store, tenant_slug, &item.id)? else {
+                    continue;
+                };
+                if clear_compound_low_fitness(node.fitness.as_mut()) {
+                    persist_memory_node(store, &node)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn clear_compound_low_fitness(fitness: Option<&mut Value>) -> bool {
+    let Some(Value::Object(fitness)) = fitness else {
+        return false;
+    };
+    let Some(Value::Object(compound)) = fitness.get_mut("compound") else {
+        return false;
+    };
+    if compound
+        .get("low_fitness")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        compound.insert("low_fitness".to_string(), Value::Bool(false));
+        compound.insert("rehearsed_by_recall".to_string(), Value::Bool(true));
+        return true;
+    }
+    false
 }
 
 fn require_text(field: &str, value: &str) -> MemoryResult<String> {

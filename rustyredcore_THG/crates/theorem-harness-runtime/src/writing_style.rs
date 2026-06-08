@@ -1,9 +1,6 @@
-use crate::skill_pack::{skill_pack_node_id, SkillPackState};
-use crate::{HarnessRuntimeError, RuntimeResult};
 use prose_check::{check, pack_hash, Register, StyleReceipt, PACK_ID};
-use rustyred_thg_core::GraphStore;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use theorem_harness_core::{BindingTransitionInput, Payload, TransitionInput};
 
 pub const STYLE_RECEIPTS_FIELD: &str = "style_receipts";
@@ -113,57 +110,6 @@ pub fn register_for_boundary(boundary: &str) -> Register {
     }
 }
 
-pub fn fold_style_receipts_into_pack_fitness<S: GraphStore>(
-    store: &mut S,
-    tenant_slug: &str,
-    payload: &Payload,
-) -> RuntimeResult<Option<WritingStyleFitnessSummary>> {
-    let Some(receipts) = payload.get(STYLE_RECEIPTS_FIELD).and_then(Value::as_array) else {
-        return Ok(None);
-    };
-    let current_summary = summarize_receipts(receipts);
-    let Some(mut node) = store
-        .get_node(&skill_pack_node_id(tenant_slug, &pack_hash()))
-        .cloned()
-    else {
-        return Ok(Some(current_summary));
-    };
-    let mut state: SkillPackState = serde_json::from_value(node.properties.clone())
-        .map_err(|error| HarnessRuntimeError::Deserialization(error.to_string()))?;
-    let previous = state
-        .metadata
-        .get("fitness")
-        .and_then(|fitness| fitness.get("writing_engineering"))
-        .cloned()
-        .and_then(|value| serde_json::from_value::<WritingStyleFitnessSummary>(value).ok())
-        .unwrap_or_else(|| WritingStyleFitnessSummary {
-            pack_id: PACK_ID.to_string(),
-            pack_hash: pack_hash(),
-            ..WritingStyleFitnessSummary::default()
-        });
-    let merged = merge_fitness(previous, current_summary);
-    state.status = next_status(&state.status, &state.metadata, &merged);
-    state.metadata.insert(
-        "fitness".to_string(),
-        merged_fitness_metadata(&state.metadata, &merged),
-    );
-    if merged.last_hard_axis_failed && state.status == "advisory" {
-        state.metadata.insert(
-            "last_tension".to_string(),
-            json!({
-                "kind": "writing_engineering_fidelity_regression",
-                "pack_id": PACK_ID,
-                "pack_hash": pack_hash(),
-                "message": "A hard writing axis failed; canonical packs demote to advisory."
-            }),
-        );
-    }
-    node.properties = serde_json::to_value(&state)
-        .map_err(|error| HarnessRuntimeError::Serialization(error.to_string()))?;
-    store.upsert_node(node)?;
-    Ok(Some(merged))
-}
-
 fn push_style_receipt(
     payload: &mut Map<String, Value>,
     boundary: &str,
@@ -271,7 +217,7 @@ fn style_action(status: &str, hard_axis_failed: bool) -> &'static str {
     }
 }
 
-fn summarize_receipts(receipts: &[Value]) -> WritingStyleFitnessSummary {
+pub fn summarize_style_receipts_for_fitness(receipts: &[Value]) -> WritingStyleFitnessSummary {
     let mut summary = WritingStyleFitnessSummary {
         pack_id: PACK_ID.to_string(),
         pack_hash: pack_hash(),
@@ -317,66 +263,6 @@ fn summarize_receipts(receipts: &[Value]) -> WritingStyleFitnessSummary {
     summary
 }
 
-fn merge_fitness(
-    mut previous: WritingStyleFitnessSummary,
-    current: WritingStyleFitnessSummary,
-) -> WritingStyleFitnessSummary {
-    previous.pack_id = PACK_ID.to_string();
-    previous.pack_hash = pack_hash();
-    previous.style_receipt_count += current.style_receipt_count;
-    previous.fidelity_failures += current.fidelity_failures;
-    previous.hard_axis_failures += current.hard_axis_failures;
-    previous.em_dash_failures += current.em_dash_failures;
-    previous.total_reduction += current.total_reduction;
-    previous.last_register = current.last_register;
-    previous.last_hard_axis_failed = current.last_hard_axis_failed;
-    if previous.style_receipt_count > 0 {
-        previous.average_reduction = previous.total_reduction / previous.style_receipt_count as f32;
-    }
-    previous
-}
-
-fn next_status(
-    current_status: &str,
-    metadata: &Map<String, Value>,
-    fitness: &WritingStyleFitnessSummary,
-) -> String {
-    if current_status == "canonical" && fitness.last_hard_axis_failed {
-        return "advisory".to_string();
-    }
-    if current_status == "shadow"
-        && metadata
-            .get("benchmark_gate_passed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        return "advisory".to_string();
-    }
-    if current_status == "advisory"
-        && fitness.style_receipt_count >= 25
-        && fitness.fidelity_failures == 0
-    {
-        return "validated".to_string();
-    }
-    current_status.to_string()
-}
-
-fn merged_fitness_metadata(
-    metadata: &Map<String, Value>,
-    summary: &WritingStyleFitnessSummary,
-) -> Value {
-    let mut fitness = metadata
-        .get("fitness")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    fitness.insert(
-        "writing_engineering".to_string(),
-        serde_json::to_value(summary).expect("fitness summary serializes"),
-    );
-    Value::Object(fitness)
-}
-
 fn first_text(payload: &Payload, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| text_path(payload, path))
 }
@@ -404,9 +290,6 @@ fn text_path(payload: &Payload, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skill_pack::{publish_skill_pack, SkillPackPublishInput};
-    use prose_check::writing_engineering_pack_payload;
-    use rustyred_thg_core::InMemoryGraphStore;
     use serde_json::json;
 
     #[test]
@@ -434,94 +317,6 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0]["boundary"], json!("report"));
         assert_eq!(receipts[0]["receipt"]["register"], json!("Plain"));
-    }
-
-    #[test]
-    fn canonical_fidelity_failure_demotes_pack_and_records_negative_signal() {
-        let mut store = InMemoryGraphStore::new();
-        let mut pack = writing_engineering_pack_payload(None);
-        pack["metadata"]["status"] = json!("canonical");
-        publish_skill_pack(
-            &mut store,
-            SkillPackPublishInput {
-                tenant_slug: "default".to_string(),
-                pack_content_hash: pack_hash(),
-                status: "canonical".to_string(),
-                pack,
-                ..SkillPackPublishInput::default()
-            },
-        )
-        .unwrap();
-        let transition = enrich_run_transition(TransitionInput::new(
-            "RUN.CLOSED",
-            json!({
-                "summary": "The runtime module changed.",
-                "closed_by": "codex",
-                "source_identifiers": ["rustyred-web/src/lib.rs"],
-                "writing_engineering_status": "canonical"
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        ));
-
-        let summary =
-            fold_style_receipts_into_pack_fitness(&mut store, "default", &transition.payload)
-                .unwrap()
-                .unwrap();
-        assert_eq!(summary.style_receipt_count, 1);
-        assert_eq!(summary.fidelity_failures, 1);
-
-        let node = store
-            .get_node(&skill_pack_node_id("default", &pack_hash()))
-            .unwrap();
-        let state: SkillPackState = serde_json::from_value(node.properties.clone()).unwrap();
-        assert_eq!(state.status, "advisory");
-        assert!(state.metadata.get("last_tension").is_some());
-    }
-
-    #[test]
-    fn three_run_closes_aggregate_pack_fitness_counts() {
-        let mut store = InMemoryGraphStore::new();
-        publish_skill_pack(
-            &mut store,
-            SkillPackPublishInput {
-                tenant_slug: "default".to_string(),
-                pack_content_hash: pack_hash(),
-                status: "shadow".to_string(),
-                pack: writing_engineering_pack_payload(None),
-                ..SkillPackPublishInput::default()
-            },
-        )
-        .unwrap();
-
-        for index in 0..3 {
-            let transition = enrich_run_transition(TransitionInput::new(
-                "RUN.CLOSED",
-                json!({
-                    "summary": format!("Run {index} closed with receipts."),
-                    "closed_by": "codex"
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            ));
-            fold_style_receipts_into_pack_fitness(&mut store, "default", &transition.payload)
-                .unwrap();
-        }
-
-        let node = store
-            .get_node(&skill_pack_node_id("default", &pack_hash()))
-            .unwrap();
-        let state: SkillPackState = serde_json::from_value(node.properties.clone()).unwrap();
-        assert_eq!(
-            state.metadata["fitness"]["writing_engineering"]["style_receipt_count"],
-            json!(3)
-        );
-        assert_eq!(
-            state.metadata["fitness"]["writing_engineering"]["fidelity_failures"],
-            json!(0)
-        );
     }
 
     #[test]

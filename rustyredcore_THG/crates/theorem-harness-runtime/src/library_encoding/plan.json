@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "id": "library-encoding-plan-v1",
+  "title": "Claude Marketplace Library Encoding Plan",
+  "source_files": [
+    "/Users/travisgilbert/Downloads/LIBRARY-ENCODING-PLAN.md",
+    "/Users/travisgilbert/Downloads/WRITING-ENGINEERING-HANDOFF.md",
+    "/Users/travisgilbert/Downloads/COMPOUND-ENGINEERING-HARNESS-HANDOFF.md"
+  ],
+  "verified_inventory_date": "2026-06-08",
+  "plugin_inventory": [
+    "animation-pro",
+    "app-forge",
+    "app-pro",
+    "cosmos-pro",
+    "d3-pro",
+    "django-design",
+    "django-engine-pro",
+    "ml-pro",
+    "next-pro",
+    "scipy-pro",
+    "shipit",
+    "spec-compliance",
+    "spec-guard",
+    "swift-pro",
+    "theseus-pro",
+    "three-pro",
+    "ui-design-pro",
+    "ui-lab",
+    "ux-pro",
+    "vie-design"
+  ],
+  "infrastructure_not_packs": [
+    "plugin-server",
+    "theorem-context-sdk",
+    "theorems-harness",
+    "skills",
+    "scripts"
+  ],
+  "retired_into_hooks": [
+    {
+      "source": "spec-compliance",
+      "reason": "process contract enforced by checklist and forbidden-deferral hooks"
+    },
+    {
+      "source": "spec-guard",
+      "reason": "process contract enforced by ambition and checklist hooks"
+    }
+  ],
+  "packs": [
+    {
+      "pack_id": "writing-engineering",
+      "tier": 1,
+      "gate_kind": "static",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["writing-engineering"]
+    },
+    {
+      "pack_id": "design-engineering",
+      "tier": 1,
+      "gate_kind": "static-plus-render-later",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["design-engineering", "ui-design-pro", "ui-lab", "vie-design"]
+    },
+    {
+      "pack_id": "django",
+      "tier": 2,
+      "gate_kind": "sandbox-toolchain",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["django-engine-pro", "django-design", "django-engine-pro-plugin-spec.md", "django-engine-pro-epistemic-layer.md"]
+    },
+    {
+      "pack_id": "next",
+      "tier": 2,
+      "gate_kind": "sandbox-toolchain",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["next-pro"]
+    },
+    {
+      "pack_id": "ml",
+      "tier": 2,
+      "gate_kind": "sandbox-toolchain",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["ml-pro"]
+    },
+    {
+      "pack_id": "scipy",
+      "tier": 2,
+      "gate_kind": "sandbox-toolchain",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["scipy-pro"]
+    },
+    {
+      "pack_id": "rust-engineering",
+      "tier": 2,
+      "gate_kind": "sandbox-toolchain",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["rust-engineering-general-v0.4"]
+    },
+    {
+      "pack_id": "swift",
+      "tier": 2,
+      "gate_kind": "sandbox-toolchain-macos",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["swift-pro"]
+    },
+    {
+      "pack_id": "ux",
+      "tier": 2,
+      "gate_kind": "computable-accessibility-plus-advisory-heuristics",
+      "checker_domain": true,
+      "status_cap": "advisory-until-heuristics-computable",
+      "sources": ["ux-pro"]
+    },
+    {
+      "pack_id": "app",
+      "tier": 2,
+      "gate_kind": "sandbox-toolchain",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["app-pro", "app-forge"]
+    },
+    {
+      "pack_id": "three",
+      "tier": 3,
+      "gate_kind": "render-behavioral",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["three-pro"]
+    },
+    {
+      "pack_id": "cosmos",
+      "tier": 3,
+      "gate_kind": "render-behavioral",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["cosmos-pro"]
+    },
+    {
+      "pack_id": "d3",
+      "tier": 3,
+      "gate_kind": "render-structural-svg",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["d3-pro"]
+    },
+    {
+      "pack_id": "animation",
+      "tier": 3,
+      "gate_kind": "frame-sample-render",
+      "checker_domain": true,
+      "status_cap": "canonical",
+      "sources": ["animation-pro"]
+    },
+    {
+      "pack_id": "theseus",
+      "tier": 4,
+      "gate_kind": "retrieval-uplift",
+      "checker_domain": false,
+      "status_cap": "advisory",
+      "sources": ["theseus-pro"]
+    },
+    {
+      "pack_id": "shipit",
+      "tier": 4,
+      "gate_kind": "usage-fitness",
+      "checker_domain": false,
+      "status_cap": "advisory",
+      "sources": ["shipit"]
+    }
+  ],
+  "keystone": {
+    "pack_id": "sandbox-gate-executor",
+    "role": "generic checker executor for tier 2 and tier 3 gates",
+    "build_once": true
+  }
+}
