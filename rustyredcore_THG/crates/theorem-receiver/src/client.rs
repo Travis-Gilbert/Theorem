@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::{json, Value};
 use theorem_harness_core::Job;
 
+use crate::wake::WakeMessage;
 use crate::{ReceiverError, ReceiverResult};
 
 /// An outbound client for the cloud harness MCP endpoint.
@@ -122,6 +123,22 @@ impl HarnessClient {
             }),
         )
     }
+
+    /// Read recent coordination-room messages for wake planning.
+    pub fn read_messages_for_room(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> ReceiverResult<Vec<WakeMessage>> {
+        let payload = self.call_tool(
+            "read_messages_for_room",
+            json!({
+                "room_id": room_id,
+                "limit": limit,
+            }),
+        )?;
+        parse_room_messages(&payload)
+    }
 }
 
 /// Extract the tool's backend payload from a JSON-RPC `tools/call` response.
@@ -165,6 +182,19 @@ fn parse_list(payload: &Value) -> ReceiverResult<Vec<Job>> {
     jobs.iter()
         .map(|job| serde_json::from_value(job.clone()).map_err(ReceiverError::from))
         .collect()
+}
+
+fn parse_room_messages(payload: &Value) -> ReceiverResult<Vec<WakeMessage>> {
+    let messages = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ReceiverError::Protocol("room payload missing 'messages'".to_string()))?;
+    messages
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ReceiverError::from)
 }
 
 #[cfg(test)]
@@ -229,5 +259,27 @@ mod tests {
         let result = parse_tool_response(&envelope);
         assert!(result.is_err());
         assert!(format!("{}", result.unwrap_err()).contains("read-only"));
+    }
+
+    #[test]
+    fn parses_room_messages_for_wake_client() {
+        let payload = json!({
+            "messages": [
+                {
+                    "tenant_slug": "default",
+                    "room_id": "room",
+                    "message_id": "msg-1",
+                    "actor_id": "travis",
+                    "delivery": "wake",
+                    "message": "@codex hello",
+                    "mentions": ["codex"]
+                }
+            ]
+        });
+        let messages = parse_room_messages(&payload).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "msg-1");
+        assert!(messages[0].is_wake());
+        assert!(messages[0].targets_actor("codex"));
     }
 }

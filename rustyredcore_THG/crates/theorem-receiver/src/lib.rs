@@ -33,6 +33,7 @@ pub mod lanes;
 pub mod local_exec;
 pub mod receiver;
 pub mod spawn;
+pub mod wake;
 
 pub use client::HarnessClient;
 pub use config::ReceiverConfig;
@@ -41,6 +42,12 @@ pub use lanes::detect_lanes;
 pub use local_exec::{run_proof, ProofPlan, ProofReceipt, TRUST_TIER_LOCAL};
 pub use receiver::{run_loop, run_loop_until, JobRunReport};
 pub use spawn::{build_intent, build_spawn_plan, SpawnPlan};
+pub use wake::{
+    build_wake_dry_run_report, build_wake_prompt, run_wake_report_with_spawner, spawn_wake_command,
+    wake_dry_run_report_json, wake_run_report_json, WakeCommandPlan, WakeDryRunReport,
+    WakeLaunchFailed, WakeLedger, WakeMessage, WakeRunReport, WakeSkipped, WakeSpawnOutcome,
+    WakeSpawned, DEFAULT_WAKE_MAX_PLANS, DEFAULT_WAKE_MESSAGE_LIMIT,
+};
 
 use std::fmt;
 
