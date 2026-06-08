@@ -1,18 +1,18 @@
 # Dockerfile for theorem-grpc-server.
 #
 # BUILD CONTEXT must be the Theorem repo root (Theorem/), NOT apps/theorem-grpc,
-# because the crate path-deps reach ../../rustyredcore_THG/crates/{rustyred-web,
-# rustyred-thg-core}. On Railway, set the service Root Directory so the Docker
-# build context is the Theorem repo root.
+# because the crate path-deps reach sibling crates under
+# ../../rustyredcore_THG/crates. On Railway, set the service Root Directory so
+# the Docker build context is the Theorem repo root.
 #
 # Transitive internal-crate set (verified via `cargo tree -p theorem-grpc`):
-# rustyred-web, rustyred-thg-core, rustyred-thg-affordances, theorem-harness-core.
+# rustyred-web, rustyred-thg-core, rustyred-thg-code, rustyred-thg-affordances,
+# theorem-harness-core.
 # rustyred-thg-core and theorem-harness-core are leaf crates (no internal
-# path-deps); rustyred-web path-deps rustyred-thg-core; rustyred-thg-affordances
-# path-deps rustyred-thg-core + theorem-harness-core. So the four COPYs below are
-# complete. (theorem-grpc's app_affordance.rs depends on rustyred-thg-affordances,
-# which pulls theorem-harness-core; both were added after the initial two-crate
-# cut, so this list MUST be kept in sync with apps/theorem-grpc/Cargo.toml.)
+# path-deps); rustyred-web and rustyred-thg-code path-dep rustyred-thg-core;
+# rustyred-thg-affordances path-deps rustyred-thg-core + theorem-harness-core.
+# So the COPY list below is complete. This list MUST be kept in sync with
+# apps/theorem-grpc/Cargo.toml.
 #
 # Toolchain: rust 1.89-bookworm. Above rustyred-thg-server's 1.88, matching the
 # civic backend's >=1.89 requirement, and deliberately NOT the Servo 1.95
@@ -37,6 +37,7 @@ RUN apt-get update \
 COPY apps/theorem-grpc ./apps/theorem-grpc
 COPY rustyredcore_THG/crates/rustyred-web ./rustyredcore_THG/crates/rustyred-web
 COPY rustyredcore_THG/crates/rustyred-thg-core ./rustyredcore_THG/crates/rustyred-thg-core
+COPY rustyredcore_THG/crates/rustyred-thg-code ./rustyredcore_THG/crates/rustyred-thg-code
 COPY rustyredcore_THG/crates/rustyred-thg-affordances ./rustyredcore_THG/crates/rustyred-thg-affordances
 COPY rustyredcore_THG/crates/theorem-harness-core ./rustyredcore_THG/crates/theorem-harness-core
 
