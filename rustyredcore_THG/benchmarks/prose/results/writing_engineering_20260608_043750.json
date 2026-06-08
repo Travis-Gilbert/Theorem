@@ -1,0 +1,3565 @@
+{
+  "metadata": {
+    "script_version": "0.1.0",
+    "date": "2026-06-08T04:37:50.178310+00:00",
+    "trials": 3,
+    "temperature": 0,
+    "modes": [
+      "normal",
+      "plain",
+      "spare",
+      "wire",
+      "caveman-full"
+    ],
+    "pack_content_hash": "sha256:041fbce026a1c02144c2e0df59df56aa8febbd7f14f47d6fa3b24ad62b84ef69",
+    "tokenizer": "cl100k_base_estimate",
+    "offline_fixture": true
+  },
+  "summary": {
+    "median_reduction": {
+      "plain": 0.6377,
+      "spare": 0.8333,
+      "wire": 0.8485,
+      "caveman-full": 0.8788
+    },
+    "shared_wire_vs_caveman_gap_points": -2.94,
+    "fidelity_failures": {
+      "normal": 0,
+      "plain": 0,
+      "spare": 0,
+      "wire": 0,
+      "caveman-full": 0
+    },
+    "flesch_kincaid_regressions": {
+      "plain": 0,
+      "spare": 0,
+      "wire": 0
+    },
+    "rows": [
+      {
+        "id": "react-rerender",
+        "normal_median": 66,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 66,
+            "median_flesch_kincaid": 8.92,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 23,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 7,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "auth-middleware-fix",
+        "normal_median": 70,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 70,
+            "median_flesch_kincaid": 8.72,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 26,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 13,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 12,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "postgres-pool",
+        "normal_median": 66,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 66,
+            "median_flesch_kincaid": 8.73,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 23,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 7,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "git-rebase-merge",
+        "normal_median": 69,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 69,
+            "median_flesch_kincaid": 8.73,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 25,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 12,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "async-refactor",
+        "normal_median": 70,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 70,
+            "median_flesch_kincaid": 9.11,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 27,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 14,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 13,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "microservices-monolith",
+        "normal_median": 66,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 66,
+            "median_flesch_kincaid": 8.93,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 23,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 7,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "pr-security-review",
+        "normal_median": 71,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 71,
+            "median_flesch_kincaid": 9.28,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 27,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 14,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 13,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "docker-multi-stage",
+        "normal_median": 70,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 70,
+            "median_flesch_kincaid": 9.1,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 26,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 12,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "race-condition-debug",
+        "normal_median": 67,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 67,
+            "median_flesch_kincaid": 9.1,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 23,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 7,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "error-boundary",
+        "normal_median": 66,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 66,
+            "median_flesch_kincaid": 9.11,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 23,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 7,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "execution-handoff-summary",
+        "normal_median": 69,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 69,
+            "median_flesch_kincaid": 9.66,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 25,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 12,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "coordination-message",
+        "normal_median": 67,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 67,
+            "median_flesch_kincaid": 9.49,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 24,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 8,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "postmortem",
+        "normal_median": 66,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 66,
+            "median_flesch_kincaid": 8.93,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 24,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 8,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "research-brief",
+        "normal_median": 68,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 68,
+            "median_flesch_kincaid": 8.73,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 25,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 12,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 9,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      },
+      {
+        "id": "code-review-comment",
+        "normal_median": 69,
+        "normal_clutter_score": 6,
+        "modes": {
+          "normal": {
+            "median_tokens": 69,
+            "median_flesch_kincaid": 8.91,
+            "fidelity_failures": 0
+          },
+          "plain": {
+            "median_tokens": 24,
+            "median_flesch_kincaid": 6.03,
+            "fidelity_failures": 0
+          },
+          "spare": {
+            "median_tokens": 11,
+            "median_flesch_kincaid": 8.69,
+            "fidelity_failures": 0
+          },
+          "wire": {
+            "median_tokens": 10,
+            "median_flesch_kincaid": 6.63,
+            "fidelity_failures": 0
+          },
+          "caveman-full": {
+            "median_tokens": 8,
+            "median_flesch_kincaid": 8.4,
+            "fidelity_failures": 0
+          }
+        }
+      }
+    ],
+    "gate_passed": true
+  },
+  "raw": [
+    {
+      "id": "react-rerender",
+      "category": "debugging",
+      "source": "caveman_shared_10",
+      "prompt": "Why is my React component re-rendering on every state update even though the props haven't changed? I'm passing an object as a prop.",
+      "identifiers": [
+        "React",
+        "useMemo"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with react rerender. It is worth noting that the important identifiers are React, useMemo. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.92
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with react rerender. It is worth noting that the important identifiers are React, useMemo. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.92
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with react rerender. It is worth noting that the important identifiers are React, useMemo. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.92
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, useMemo. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, useMemo. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, useMemo. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, useMemo. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, useMemo. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, useMemo. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, useMemo. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, useMemo. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, useMemo. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, useMemo. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, useMemo. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, useMemo. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "auth-middleware-fix",
+      "category": "bugfix",
+      "source": "caveman_shared_10",
+      "prompt": "My Express auth middleware is letting expired JWT tokens through. The expiry check uses Date.now() compared to the token's exp field.\nWhat's wrong and how do I fix it?",
+      "identifiers": [
+        "Express",
+        "JWT",
+        "Date.now()",
+        "exp"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with auth middleware fix. It is worth noting that the important identifiers are Express, JWT, Date.now(), exp. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.72
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with auth middleware fix. It is worth noting that the important identifiers are Express, JWT, Date.now(), exp. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.72
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with auth middleware fix. It is worth noting that the important identifiers are Express, JWT, Date.now(), exp. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.72
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 26,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 26,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 26,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Boundary first. Patch cause. Verify.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Boundary first. Patch cause. Verify.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Boundary first. Patch cause. Verify.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Boundary. Patch. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Boundary. Patch. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, JWT, Date.now(), exp. Boundary. Patch. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "postgres-pool",
+      "category": "setup",
+      "source": "caveman_shared_10",
+      "prompt": "How do I set up a PostgreSQL connection pool in Node.js with proper timeout and error handling configuration?",
+      "identifiers": [
+        "PostgreSQL",
+        "Node.js"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with postgres pool. It is worth noting that the important identifiers are PostgreSQL, Node.js. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with postgres pool. It is worth noting that the important identifiers are PostgreSQL, Node.js. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with postgres pool. It is worth noting that the important identifiers are PostgreSQL, Node.js. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "PostgreSQL, Node.js. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "git-rebase-merge",
+      "category": "explanation",
+      "source": "caveman_shared_10",
+      "prompt": "Explain the difference between git rebase and git merge.\nWhen should I use each one and what are the tradeoffs?",
+      "identifiers": [
+        "git rebase",
+        "git merge"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with git rebase merge. It is worth noting that the important identifiers are git rebase, git merge. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with git rebase merge. It is worth noting that the important identifiers are git rebase, git merge. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with git rebase merge. It is worth noting that the important identifiers are git rebase, git merge. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "git rebase, git merge. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "git rebase, git merge. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "git rebase, git merge. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "git rebase, git merge. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "git rebase, git merge. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "git rebase, git merge. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "git rebase, git merge. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "git rebase, git merge. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "git rebase, git merge. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "git rebase, git merge. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "git rebase, git merge. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "git rebase, git merge. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "async-refactor",
+      "category": "refactor",
+      "source": "caveman_shared_10",
+      "prompt": "Refactor this callback-based Node.js function to use async/await:\n\nfunction getUser(id, callback) {\n db.query('SELECT * FROM users WHERE id = ?', [id], function(err, rows) {\n if (err) return callback(err);\n if (!rows.length) return callback(new Error('Not found'));\n callback(null, rows[0]);\n });\n}",
+      "identifiers": [
+        "async/await",
+        "getUser",
+        "db.query",
+        "Not found"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with async refactor. It is worth noting that the important identifiers are async/await, getUser, db.query, Not found. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.11
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with async refactor. It is worth noting that the important identifiers are async/await, getUser, db.query, Not found. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.11
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with async refactor. It is worth noting that the important identifiers are async/await, getUser, db.query, Not found. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.11
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 27,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 27,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 27,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 14,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 14,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 14,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Boundary first. Patch cause. Verify.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Boundary first. Patch cause. Verify.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Boundary first. Patch cause. Verify.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Boundary. Patch. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Boundary. Patch. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "async/await, getUser, db.query, Not found. Boundary. Patch. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "microservices-monolith",
+      "category": "architecture",
+      "source": "caveman_shared_10",
+      "prompt": "We have a monolithic Django app that's getting slow.\nThe team is debating microservices.\nWhat are the key factors to consider before splitting up the monolith?",
+      "identifiers": [
+        "Django",
+        "microservices"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with microservices monolith. It is worth noting that the important identifiers are Django, microservices. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.93
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with microservices monolith. It is worth noting that the important identifiers are Django, microservices. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.93
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with microservices monolith. It is worth noting that the important identifiers are Django, microservices. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.93
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Django, microservices. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Django, microservices. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Django, microservices. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Django, microservices. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Django, microservices. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Django, microservices. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Django, microservices. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Django, microservices. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Django, microservices. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Django, microservices. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Django, microservices. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Django, microservices. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "pr-security-review",
+      "category": "code-review",
+      "source": "caveman_shared_10",
+      "prompt": "Review this Express route handler for security issues:\n\napp.get('/api/users/:id', (req, res) => {\n const query = `SELECT * FROM users WHERE id = ${req.params.id}`;\n db.query(query).then(user => res.json(user));\n});",
+      "identifiers": [
+        "Express",
+        "req.params.id",
+        "SELECT * FROM users"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with pr security review. It is worth noting that the important identifiers are Express, req.params.id, SELECT * FROM users. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 71,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.28
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with pr security review. It is worth noting that the important identifiers are Express, req.params.id, SELECT * FROM users. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 71,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.28
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with pr security review. It is worth noting that the important identifiers are Express, req.params.id, SELECT * FROM users. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 71,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.28
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 27,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 27,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 27,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 14,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 14,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 14,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Boundary first. Patch cause. Verify.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Boundary first. Patch cause. Verify.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Boundary first. Patch cause. Verify.",
+            "output_tokens": 13,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Boundary. Patch. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Boundary. Patch. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Express, req.params.id, SELECT * FROM users. Boundary. Patch. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "docker-multi-stage",
+      "category": "devops",
+      "source": "caveman_shared_10",
+      "prompt": "Write a multi-stage Dockerfile for a Node.js TypeScript application that minimizes the final image size.\nThe app uses npm and needs to compile TypeScript before running.",
+      "identifiers": [
+        "Dockerfile",
+        "Node.js",
+        "TypeScript",
+        "npm"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with docker multi stage. It is worth noting that the important identifiers are Dockerfile, Node.js, TypeScript, npm. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.1
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with docker multi stage. It is worth noting that the important identifiers are Dockerfile, Node.js, TypeScript, npm. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.1
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with docker multi stage. It is worth noting that the important identifiers are Dockerfile, Node.js, TypeScript, npm. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 70,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.1
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 26,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 26,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 26,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Dockerfile, Node.js, TypeScript, npm. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "race-condition-debug",
+      "category": "debugging",
+      "source": "caveman_shared_10",
+      "prompt": "My Node.js API endpoint that increments a counter in PostgreSQL sometimes returns the same value for concurrent requests. How do I fix this race condition?",
+      "identifiers": [
+        "Node.js",
+        "PostgreSQL"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with race condition debug. It is worth noting that the important identifiers are Node.js, PostgreSQL. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 67,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.1
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with race condition debug. It is worth noting that the important identifiers are Node.js, PostgreSQL. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 67,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.1
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with race condition debug. It is worth noting that the important identifiers are Node.js, PostgreSQL. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 67,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.1
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "Node.js, PostgreSQL. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "error-boundary",
+      "category": "implementation",
+      "source": "caveman_shared_10",
+      "prompt": "Implement a React error boundary component that catches render errors, shows a fallback UI with a retry button, and logs the error details.",
+      "identifiers": [
+        "React",
+        "ErrorBoundary"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with error boundary. It is worth noting that the important identifiers are React, ErrorBoundary. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.11
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with error boundary. It is worth noting that the important identifiers are React, ErrorBoundary. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.11
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with error boundary. It is worth noting that the important identifiers are React, ErrorBoundary. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.11
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 23,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Boundary first. Patch cause. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "React, ErrorBoundary. Boundary. Patch. Verify.",
+            "output_tokens": 7,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "execution-handoff-summary",
+      "category": "handoff",
+      "source": "theorem_workloads_5",
+      "prompt": "Summarize the implementation handoff for WRITING-ENGINEERING-HANDOFF.md, keeping prose-check and skill_publish exact.",
+      "identifiers": [
+        "WRITING-ENGINEERING-HANDOFF.md",
+        "prose-check",
+        "skill_publish"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with execution handoff summary. It is worth noting that the important identifiers are WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.66
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with execution handoff summary. It is worth noting that the important identifiers are WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.66
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with execution handoff summary. It is worth noting that the important identifiers are WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.66
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "WRITING-ENGINEERING-HANDOFF.md, prose-check, skill_publish. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "coordination-message",
+      "category": "coordination",
+      "source": "theorem_workloads_5",
+      "prompt": "Write a coordination message to @claude-code saying Codex owns rustyredcore_THG/crates/prose-check and runtime receipts.",
+      "identifiers": [
+        "@claude-code",
+        "rustyredcore_THG/crates/prose-check"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with coordination message. It is worth noting that the important identifiers are @claude-code, rustyredcore_THG/crates/prose-check. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 67,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.49
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with coordination message. It is worth noting that the important identifiers are @claude-code, rustyredcore_THG/crates/prose-check. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 67,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.49
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with coordination message. It is worth noting that the important identifiers are @claude-code, rustyredcore_THG/crates/prose-check. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 67,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 9.49
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "@claude-code, rustyredcore_THG/crates/prose-check. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "postmortem",
+      "category": "postmortem",
+      "source": "theorem_workloads_5",
+      "prompt": "Write a short postmortem explaining why coordination_room rejected action lane and accepted join with lane metadata.",
+      "identifiers": [
+        "coordination_room",
+        "lane",
+        "join"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with postmortem. It is worth noting that the important identifiers are coordination_room, lane, join. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.93
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with postmortem. It is worth noting that the important identifiers are coordination_room, lane, join. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.93
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with postmortem. It is worth noting that the important identifiers are coordination_room, lane, join. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 66,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.93
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "coordination_room, lane, join. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "research-brief",
+      "category": "research",
+      "source": "theorem_workloads_5",
+      "prompt": "Write a research brief on adapting JuliusBrussee/caveman benchmarks/run.py and prompts.json for writing-engineering.",
+      "identifiers": [
+        "JuliusBrussee/caveman",
+        "benchmarks/run.py",
+        "prompts.json"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with research brief. It is worth noting that the important identifiers are JuliusBrussee/caveman, benchmarks/run.py, prompts.json. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 68,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with research brief. It is worth noting that the important identifiers are JuliusBrussee/caveman, benchmarks/run.py, prompts.json. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 68,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with research brief. It is worth noting that the important identifiers are JuliusBrussee/caveman, benchmarks/run.py, prompts.json. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 68,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.73
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 25,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 12,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Boundary first. Patch cause. Verify.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "JuliusBrussee/caveman, benchmarks/run.py, prompts.json. Boundary. Patch. Verify.",
+            "output_tokens": 9,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "code-review-comment",
+      "category": "code-review",
+      "source": "theorem_workloads_5",
+      "prompt": "Write a code review comment about a StyleReceipt that sets fidelity.preserved true even when em_dash_count is nonzero.",
+      "identifiers": [
+        "StyleReceipt",
+        "fidelity.preserved",
+        "em_dash_count"
+      ],
+      "modes": {
+        "normal": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "I'd be happy to help with code review comment. It is worth noting that the important identifiers are StyleReceipt, fidelity.preserved, em_dash_count. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.91
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "I'd be happy to help with code review comment. It is worth noting that the important identifiers are StyleReceipt, fidelity.preserved, em_dash_count. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.91
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "I'd be happy to help with code review comment. It is worth noting that the important identifiers are StyleReceipt, fidelity.preserved, em_dash_count. In order to make a decision, first restate the failure, then check the boundary, then apply the smallest fix, and finally verify the behavior. Due to the fact that this is a technical answer, keep the exact names visible and explain the tradeoffs carefully.",
+            "output_tokens": 69,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 6,
+            "flesch_kincaid": 8.91
+          }
+        ],
+        "plain": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. State the failure. Check the boundary. Apply the smallest fix. Verify the behavior and keep the exact names visible.",
+            "output_tokens": 24,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.03
+          }
+        ],
+        "spare": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Find boundary. Patch cause. Verify behavior.",
+            "output_tokens": 11,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.69
+          }
+        ],
+        "wire": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Boundary first. Patch cause. Verify.",
+            "output_tokens": 10,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 6.63
+          }
+        ],
+        "caveman-full": [
+          {
+            "trial": 1,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 2,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          },
+          {
+            "trial": 3,
+            "temperature": 0,
+            "text": "StyleReceipt, fidelity.preserved, em_dash_count. Boundary. Patch. Verify.",
+            "output_tokens": 8,
+            "fidelity": {
+              "preserved": true,
+              "missing": []
+            },
+            "clutter_score": 0,
+            "flesch_kincaid": 8.4
+          }
+        ]
+      }
+    }
+  ]
+}

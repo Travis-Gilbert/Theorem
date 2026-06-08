@@ -1,3 +1,4 @@
+use crate::writing_style;
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord,
 };
@@ -75,8 +76,19 @@ pub fn append_transition<S: GraphStore>(
     state: Option<RunState>,
     transition: TransitionInput,
 ) -> RuntimeResult<TransitionResult> {
+    let transition = writing_style::enrich_run_transition(transition);
     let result = apply_transition(state, transition)?;
     persist_transition_result(store, &result)?;
+    if result.event.event_type == "RUN.CLOSED" {
+        let tenant = result
+            .run
+            .scope
+            .get("tenant_slug")
+            .or_else(|| result.run.scope.get("tenant"))
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        writing_style::fold_style_receipts_into_pack_fitness(store, tenant, &result.event.payload)?;
+    }
     Ok(result)
 }
 

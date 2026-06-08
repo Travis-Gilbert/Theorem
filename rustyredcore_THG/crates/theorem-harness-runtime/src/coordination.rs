@@ -1,3 +1,4 @@
+use crate::writing_style;
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord,
 };
@@ -623,9 +624,14 @@ pub fn write_message<S: GraphStore>(
         actor_id,
         urgency,
         delivery,
-        message,
+        message: message.clone(),
         mentions,
-        metadata: input.metadata,
+        metadata: writing_style::metadata_with_style_receipt(
+            input.metadata,
+            "coordinate",
+            &message,
+            &[],
+        ),
         consumed_by: Vec::new(),
         created_at,
     };
@@ -1737,6 +1743,10 @@ mod tests {
                 &message.message_id
             ))
             .is_some());
+        assert_eq!(
+            message.metadata["style_receipts"][0]["receipt"]["register"],
+            json!("Wire")
+        );
         assert!(store
             .get_edge(&coordination_mention_edge_id(
                 TENANT,

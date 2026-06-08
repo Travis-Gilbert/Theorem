@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "sources": {
+    "caveman_shared_10": "https://github.com/JuliusBrussee/caveman/blob/main/benchmarks/prompts.json",
+    "theorem_workloads_5": "WRITING-ENGINEERING-HANDOFF.md real workload categories"
+  },
+  "prompts": [
+    {
+      "id": "react-rerender",
+      "category": "debugging",
+      "source": "caveman_shared_10",
+      "identifiers": ["React", "useMemo"],
+      "prompt": "Why is my React component re-rendering on every state update even though the props haven't changed? I'm passing an object as a prop."
+    },
+    {
+      "id": "auth-middleware-fix",
+      "category": "bugfix",
+      "source": "caveman_shared_10",
+      "identifiers": ["Express", "JWT", "Date.now()", "exp"],
+      "prompt": "My Express auth middleware is letting expired JWT tokens through. The expiry check uses Date.now() compared to the token's exp field.\nWhat's wrong and how do I fix it?"
+    },
+    {
+      "id": "postgres-pool",
+      "category": "setup",
+      "source": "caveman_shared_10",
+      "identifiers": ["PostgreSQL", "Node.js"],
+      "prompt": "How do I set up a PostgreSQL connection pool in Node.js with proper timeout and error handling configuration?"
+    },
+    {
+      "id": "git-rebase-merge",
+      "category": "explanation",
+      "source": "caveman_shared_10",
+      "identifiers": ["git rebase", "git merge"],
+      "prompt": "Explain the difference between git rebase and git merge.\nWhen should I use each one and what are the tradeoffs?"
+    },
+    {
+      "id": "async-refactor",
+      "category": "refactor",
+      "source": "caveman_shared_10",
+      "identifiers": ["async/await", "getUser", "db.query", "Not found"],
+      "prompt": "Refactor this callback-based Node.js function to use async/await:\n\nfunction getUser(id, callback) {\n db.query('SELECT * FROM users WHERE id = ?', [id], function(err, rows) {\n if (err) return callback(err);\n if (!rows.length) return callback(new Error('Not found'));\n callback(null, rows[0]);\n });\n}"
+    },
+    {
+      "id": "microservices-monolith",
+      "category": "architecture",
+      "source": "caveman_shared_10",
+      "identifiers": ["Django", "microservices"],
+      "prompt": "We have a monolithic Django app that's getting slow.\nThe team is debating microservices.\nWhat are the key factors to consider before splitting up the monolith?"
+    },
+    {
+      "id": "pr-security-review",
+      "category": "code-review",
+      "source": "caveman_shared_10",
+      "identifiers": ["Express", "req.params.id", "SELECT * FROM users"],
+      "prompt": "Review this Express route handler for security issues:\n\napp.get('/api/users/:id', (req, res) => {\n const query = `SELECT * FROM users WHERE id = ${req.params.id}`;\n db.query(query).then(user => res.json(user));\n});"
+    },
+    {
+      "id": "docker-multi-stage",
+      "category": "devops",
+      "source": "caveman_shared_10",
+      "identifiers": ["Dockerfile", "Node.js", "TypeScript", "npm"],
+      "prompt": "Write a multi-stage Dockerfile for a Node.js TypeScript application that minimizes the final image size.\nThe app uses npm and needs to compile TypeScript before running."
+    },
+    {
+      "id": "race-condition-debug",
+      "category": "debugging",
+      "source": "caveman_shared_10",
+      "identifiers": ["Node.js", "PostgreSQL"],
+      "prompt": "My Node.js API endpoint that increments a counter in PostgreSQL sometimes returns the same value for concurrent requests. How do I fix this race condition?"
+    },
+    {
+      "id": "error-boundary",
+      "category": "implementation",
+      "source": "caveman_shared_10",
+      "identifiers": ["React", "ErrorBoundary"],
+      "prompt": "Implement a React error boundary component that catches render errors, shows a fallback UI with a retry button, and logs the error details."
+    },
+    {
+      "id": "execution-handoff-summary",
+      "category": "handoff",
+      "source": "theorem_workloads_5",
+      "identifiers": ["WRITING-ENGINEERING-HANDOFF.md", "prose-check", "skill_publish"],
+      "prompt": "Summarize the implementation handoff for WRITING-ENGINEERING-HANDOFF.md, keeping prose-check and skill_publish exact."
+    },
+    {
+      "id": "coordination-message",
+      "category": "coordination",
+      "source": "theorem_workloads_5",
+      "identifiers": ["@claude-code", "rustyredcore_THG/crates/prose-check"],
+      "prompt": "Write a coordination message to @claude-code saying Codex owns rustyredcore_THG/crates/prose-check and runtime receipts."
+    },
+    {
+      "id": "postmortem",
+      "category": "postmortem",
+      "source": "theorem_workloads_5",
+      "identifiers": ["coordination_room", "lane", "join"],
+      "prompt": "Write a short postmortem explaining why coordination_room rejected action lane and accepted join with lane metadata."
+    },
+    {
+      "id": "research-brief",
+      "category": "research",
+      "source": "theorem_workloads_5",
+      "identifiers": ["JuliusBrussee/caveman", "benchmarks/run.py", "prompts.json"],
+      "prompt": "Write a research brief on adapting JuliusBrussee/caveman benchmarks/run.py and prompts.json for writing-engineering."
+    },
+    {
+      "id": "code-review-comment",
+      "category": "code-review",
+      "source": "theorem_workloads_5",
+      "identifiers": ["StyleReceipt", "fidelity.preserved", "em_dash_count"],
+      "prompt": "Write a code review comment about a StyleReceipt that sets fidelity.preserved true even when em_dash_count is nonzero."
+    }
+  ]
+}

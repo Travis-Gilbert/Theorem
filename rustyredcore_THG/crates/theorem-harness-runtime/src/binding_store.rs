@@ -14,6 +14,7 @@
 //! each scratchpad revision is also persisted as its own node + chain edge so
 //! the versioned document is queryable without loading the whole binding.
 
+use crate::writing_style;
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord,
 };
@@ -93,6 +94,7 @@ pub fn append_binding_transition<S: GraphStore>(
     binding: AgentBinding,
     transition: BindingTransitionInput,
 ) -> BindingRuntimeResult<BindingTransitionResult> {
+    let transition = writing_style::enrich_binding_transition(transition);
     let result = apply_binding_transition(binding, transition)?;
     persist_binding_transition_result(store, &result)?;
     Ok(result)
@@ -661,6 +663,14 @@ mod tests {
             assert_eq!(events.len(), 16);
             assert_eq!(events.first().unwrap().event_type, "BINDING.RESOLVED");
             assert_eq!(events.last().unwrap().event_type, "RUN.CLOSED");
+            let synthesis = events
+                .iter()
+                .find(|event| event.event_type == "DRAFTS.SYNTHESIZED")
+                .unwrap();
+            assert_eq!(
+                synthesis.payload["style_receipts"][0]["receipt"]["pack_hash"],
+                json!(prose_check::pack_hash())
+            );
             for (idx, event) in events.iter().enumerate() {
                 assert_eq!(event.seq, (idx as u64) + 1);
             }

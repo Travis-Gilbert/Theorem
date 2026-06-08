@@ -9,6 +9,7 @@ pub mod node_type_binding;
 pub mod patch_sequencer;
 pub mod skill_pack;
 pub mod work_graph_store;
+pub mod writing_style;
 
 pub use binding_store::{
     append_binding_transition, binding_event_node_id, binding_node_id, load_binding,
@@ -87,4 +88,9 @@ pub use skill_pack::{
     skill_pack_use_receipt_node_id, SkillPackApplyInput, SkillPackApplyReceipt, SkillPackError,
     SkillPackGetInput, SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput,
     SkillPackPublishReceipt, SkillPackState, SkillPackValidatorReceipt,
+};
+pub use writing_style::{
+    check_boundary_text, enrich_binding_transition, enrich_run_transition,
+    fold_style_receipts_into_pack_fitness, metadata_with_style_receipt, register_for_boundary,
+    BoundaryStyleReceipt, WritingStyleFitnessSummary, STYLE_FITNESS_FIELD, STYLE_RECEIPTS_FIELD,
 };

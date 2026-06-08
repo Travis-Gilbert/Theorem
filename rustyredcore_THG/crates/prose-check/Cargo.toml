@@ -1,0 +1,12 @@
+[package]
+name = "prose-check"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic writing-engineering style checker for Theorem harness receipts."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"

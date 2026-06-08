@@ -29,6 +29,7 @@ members = [
     "crates/rustyred-thg-affordances",
     "crates/rustyred-thg-connectors",
     "crates/ensemble",
+    "crates/prose-check",
 ]
 resolver = "2"
 

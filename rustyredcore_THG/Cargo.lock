@@ -2624,6 +2624,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prose-check"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3981,6 +3990,7 @@ dependencies = [
 name = "theorem-harness-runtime"
 version = "0.1.0"
 dependencies = [
+ "prose-check",
  "rustyred-thg-core",
  "serde",
  "serde_json",
