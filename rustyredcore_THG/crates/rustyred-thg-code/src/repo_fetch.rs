@@ -9,7 +9,8 @@
 //! parser then reads them. Untrusted remote code is data here, never a build.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use rustyred_thg_core::stable_hash;
 
@@ -18,14 +19,19 @@ use rustyred_thg_core::stable_hash;
 pub struct RepoFetchCaps {
     /// Reject (and clean up) a clone whose working tree exceeds this many bytes.
     pub max_total_bytes: u64,
+    /// Kill `git clone` if it stalls past this many milliseconds.
+    pub clone_timeout_ms: u64,
 }
 
 impl Default for RepoFetchCaps {
     fn default() -> Self {
         // 512 MiB: large enough for real repositories, small enough to bound a
-        // hostile or runaway clone on a constrained runtime.
+        // hostile or runaway clone on a constrained runtime. The clone timeout
+        // sits below theorem-grpc's default 30s deadline, leaving room for
+        // indexing and receipt writeback on ordinary repos.
         Self {
             max_total_bytes: 512 * 1024 * 1024,
+            clone_timeout_ms: 20_000,
         }
     }
 }
@@ -103,6 +109,14 @@ pub fn is_fetchable_repo_url(url: &str) -> bool {
 /// Shallow-clone `url` into a quarantined tempdir and return a handle that
 /// removes the tree on drop. Caps the on-disk size; never executes the tree.
 pub fn fetch_repo(url: &str, caps: &RepoFetchCaps) -> Result<FetchedRepo, RepoFetchError> {
+    fetch_repo_with_git(url, caps, Path::new("git"))
+}
+
+fn fetch_repo_with_git(
+    url: &str,
+    caps: &RepoFetchCaps,
+    git_binary: &Path,
+) -> Result<FetchedRepo, RepoFetchError> {
     let url = url.trim();
     if url.is_empty() {
         return Err(RepoFetchError::new("empty_url", "repo url is empty"));
@@ -120,28 +134,26 @@ pub fn fetch_repo(url: &str, caps: &RepoFetchCaps) -> Result<FetchedRepo, RepoFe
     // Always start from a clean slot.
     let _ = std::fs::remove_dir_all(&dir);
 
-    let output = Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            "--no-tags",
-            "--quiet",
-            url,
-        ])
-        .arg(&dir)
-        .output()
-        .map_err(|err| {
-            RepoFetchError::new("git_spawn_failed", format!("could not run git: {err}"))
-        })?;
-
-    if !output.status.success() {
+    let clone = match run_git_clone(git_binary, url, &dir, caps.clone_timeout_ms) {
+        Ok(clone) => clone,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(err);
+        }
+    };
+    if !clone.status.success() {
         let _ = std::fs::remove_dir_all(&dir);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(RepoFetchError::new(
             "git_clone_failed",
-            format!("git clone failed for {url}: {}", stderr.trim()),
+            format!("git clone failed for {url}: {}", clone.stderr.trim()),
+        ));
+    }
+
+    if !dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(RepoFetchError::new(
+            "git_clone_failed",
+            format!("git clone for {url} did not create {}", dir.display()),
         ));
     }
 
@@ -164,6 +176,123 @@ pub fn fetch_repo(url: &str, caps: &RepoFetchCaps) -> Result<FetchedRepo, RepoFe
     }
 
     Ok(fetched)
+}
+
+struct GitCloneOutput {
+    status: ExitStatus,
+    stderr: String,
+}
+
+fn run_git_clone(
+    git_binary: &Path,
+    url: &str,
+    dir: &Path,
+    timeout_ms: u64,
+) -> Result<GitCloneOutput, RepoFetchError> {
+    let stderr_path = std::env::temp_dir().join(format!(
+        "rustyred-code-clone-stderr-{}",
+        stable_hash(json_safe_path(dir))
+    ));
+    let stdout_path = std::env::temp_dir().join(format!(
+        "rustyred-code-clone-stdout-{}",
+        stable_hash(json_safe_path(dir))
+    ));
+    let stderr_file = std::fs::File::create(&stderr_path).map_err(|err| {
+        RepoFetchError::new(
+            "git_spawn_failed",
+            format!("could not create git stderr capture: {err}"),
+        )
+    })?;
+    let stdout_file = std::fs::File::create(&stdout_path).map_err(|err| {
+        RepoFetchError::new(
+            "git_spawn_failed",
+            format!("could not create git stdout capture: {err}"),
+        )
+    })?;
+
+    let mut child = Command::new(git_binary)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/bin/true")
+        .env("SSH_ASKPASS", "/bin/true")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+        )
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.lowSpeedLimit=1",
+            "-c",
+            "http.lowSpeedTime=10",
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--no-tags",
+            "--quiet",
+            url,
+        ])
+        .arg(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|err| {
+            RepoFetchError::new("git_spawn_failed", format!("could not run git: {err}"))
+        })?;
+
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = read_lossy(&stderr_path);
+                    let _ = std::fs::remove_file(&stderr_path);
+                    let _ = std::fs::remove_file(&stdout_path);
+                    return Err(RepoFetchError::new(
+                        "git_clone_timeout",
+                        format!(
+                            "git clone timed out after {}ms for {url}: {}",
+                            timeout.as_millis(),
+                            stderr.trim()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stderr_path);
+                let _ = std::fs::remove_file(&stdout_path);
+                return Err(RepoFetchError::new(
+                    "git_wait_failed",
+                    format!("could not wait for git clone: {err}"),
+                ));
+            }
+        }
+    };
+
+    let stderr = read_lossy(&stderr_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    let _ = std::fs::remove_file(&stdout_path);
+
+    Ok(GitCloneOutput { status, stderr })
+}
+
+fn read_lossy(path: &Path) -> String {
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default()
+}
+
+fn json_safe_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
 }
 
 /// Sum of regular-file sizes under `root` (best-effort; ignores unreadable
@@ -192,4 +321,109 @@ fn dir_size(root: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rustyred-fetch-test-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn write_fake_git(name: &str, body: &str) -> (PathBuf, PathBuf) {
+        let dir = unique_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        let git = dir.join("git");
+        fs::write(&git, body).unwrap();
+        let mut perms = fs::metadata(&git).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&git, perms).unwrap();
+        (dir, git)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_repo_sets_noninteractive_git_environment() {
+        let (script_dir, fake_git) = write_fake_git(
+            "env",
+            r#"#!/bin/sh
+if [ "$GIT_TERMINAL_PROMPT" != "0" ]; then echo "missing GIT_TERMINAL_PROMPT" >&2; exit 11; fi
+if [ "$GIT_ASKPASS" != "/bin/true" ]; then echo "missing GIT_ASKPASS" >&2; exit 12; fi
+if [ "$SSH_ASKPASS" != "/bin/true" ]; then echo "missing SSH_ASKPASS" >&2; exit 13; fi
+case " $* " in
+  *" -c credential.helper= "*) ;;
+  *) echo "missing credential helper reset: $*" >&2; exit 14 ;;
+esac
+case " $* " in
+  *" clone "*) ;;
+  *) echo "missing clone verb: $*" >&2; exit 15 ;;
+esac
+case " $* " in
+  *" --depth 1 "*) ;;
+  *) echo "missing shallow depth: $*" >&2; exit 16 ;;
+esac
+last=""
+for arg in "$@"; do last="$arg"; done
+mkdir -p "$last"
+printf 'package main\nfunc main() {}\n' > "$last/main.go"
+"#,
+        );
+        let fetched = fetch_repo_with_git(
+            "https://github.com/example/tiny.git",
+            &RepoFetchCaps {
+                clone_timeout_ms: 1_000,
+                ..RepoFetchCaps::default()
+            },
+            &fake_git,
+        )
+        .unwrap();
+
+        assert!(fetched.path().join("main.go").is_file());
+        drop(fetched);
+        fs::remove_dir_all(script_dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_repo_times_out_hung_git_clone() {
+        let (script_dir, fake_git) = write_fake_git(
+            "timeout",
+            r#"#!/bin/sh
+echo "waiting forever" >&2
+sleep 5
+"#,
+        );
+        let url = "https://github.com/example/hung.git";
+        let clone_dir =
+            std::env::temp_dir().join(format!("rustyred-code-clone-{}", stable_hash(url)));
+        let started = Instant::now();
+        let err = fetch_repo_with_git(
+            url,
+            &RepoFetchCaps {
+                clone_timeout_ms: 50,
+                ..RepoFetchCaps::default()
+            },
+            &fake_git,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, "git_clone_timeout");
+        assert!(started.elapsed() < Duration::from_secs(2), "{err}");
+        assert!(!clone_dir.exists());
+        fs::remove_dir_all(script_dir).ok();
+    }
 }
