@@ -7332,6 +7332,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                         "default": "search"
                     },
                     "repo_path": { "type": "string" },
+                    "repo_url": { "type": "string" },
                     "query": { "type": "string" },
                     "node_id": { "type": "string" },
                     "repo_id": { "type": "string" },
@@ -7372,6 +7373,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                         "default": "search"
                     },
                     "repo_path": { "type": "string" },
+                    "repo_url": { "type": "string" },
                     "query": { "type": "string" },
                     "node_id": { "type": "string" },
                     "repo_id": { "type": "string" },
@@ -9833,6 +9835,14 @@ mod tests {
         assert_eq!(
             tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["confirmed"]["type"],
             "boolean"
+        );
+        assert_eq!(
+            tool_by_name(tools, "code_search")["inputSchema"]["properties"]["repo_url"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo_url"]["type"],
+            "string"
         );
         assert!(has_tool(tools, "ensemble_select"));
         assert!(tools

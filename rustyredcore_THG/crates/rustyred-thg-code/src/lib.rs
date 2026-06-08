@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use syn::visit::Visit;
 
 mod repo_fetch;
-pub use repo_fetch::{fetch_repo, FetchedRepo, RepoFetchCaps, RepoFetchError};
+pub use repo_fetch::{
+    fetch_repo, is_fetchable_repo_url, FetchedRepo, RepoFetchCaps, RepoFetchError,
+};
 
 pub const CODE_REPO_LABEL: &str = "CodeRepository";
 pub const CODE_FILE_LABEL: &str = "CodeFile";
@@ -287,12 +289,32 @@ impl CodeIndexRuntime {
         ingest_codebase_with_store(&mut store, input, "ingest")
     }
 
+    pub fn ingest_codebase_from_url(
+        &self,
+        url: &str,
+        input: IngestCodebaseInput,
+        caps: &RepoFetchCaps,
+    ) -> Result<IngestCodebaseOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        ingest_codebase_from_url_in_store(&mut store, url, input, caps)
+    }
+
     pub fn reindex_codebase(
         &self,
         input: IngestCodebaseInput,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
         let mut store = self.lock_store()?;
         ingest_codebase_with_store(&mut store, input, "reindex")
+    }
+
+    pub fn reindex_codebase_from_url(
+        &self,
+        url: &str,
+        input: IngestCodebaseInput,
+        caps: &RepoFetchCaps,
+    ) -> Result<IngestCodebaseOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        reindex_codebase_from_url_in_store(&mut store, url, input, caps)
     }
 
     pub fn search_code(&self, input: SearchCodeInput) -> Result<SearchCodeOutput, CodeIndexError> {
@@ -369,8 +391,27 @@ pub fn reindex_codebase_in_store(
 pub fn ingest_codebase_from_url_in_store(
     store: &mut RedCoreGraphStore,
     url: &str,
+    input: IngestCodebaseInput,
+    caps: &RepoFetchCaps,
+) -> Result<IngestCodebaseOutput, CodeIndexError> {
+    ingest_codebase_from_url_with_operation(store, url, input, caps, "ingest")
+}
+
+pub fn reindex_codebase_from_url_in_store(
+    store: &mut RedCoreGraphStore,
+    url: &str,
+    input: IngestCodebaseInput,
+    caps: &RepoFetchCaps,
+) -> Result<IngestCodebaseOutput, CodeIndexError> {
+    ingest_codebase_from_url_with_operation(store, url, input, caps, "reindex")
+}
+
+fn ingest_codebase_from_url_with_operation(
+    store: &mut RedCoreGraphStore,
+    url: &str,
     mut input: IngestCodebaseInput,
     caps: &RepoFetchCaps,
+    operation: &str,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
     let fetched = fetch_repo(url, caps).map_err(|err| CodeIndexError::invalid(err.to_string()))?;
     input.repo_path = fetched.path().display().to_string();
@@ -381,7 +422,7 @@ pub fn ingest_codebase_from_url_in_store(
         input.repo_id = repo_id_from_url(url);
     }
     // `fetched` stays alive across the ingest and removes the clone on drop.
-    ingest_codebase_in_store(store, input)
+    ingest_codebase_with_store(store, input, operation)
 }
 
 /// Best-effort stable repo id from a clone URL: `repo:<last-path-segment>`.
@@ -469,12 +510,21 @@ fn handle_ingest_code_operation(
     let output = if !repo_url.trim().is_empty() {
         // CA-1: ingest by URL -> shallow clone into a quarantined tempdir ->
         // ingest the local checkout (the clone is removed afterward).
-        ingest_codebase_from_url_in_store(
-            context.store,
-            &repo_url,
-            input,
-            &RepoFetchCaps::default(),
-        )?
+        if context.operation == "reindex" {
+            reindex_codebase_from_url_in_store(
+                context.store,
+                &repo_url,
+                input,
+                &RepoFetchCaps::default(),
+            )?
+        } else {
+            ingest_codebase_from_url_in_store(
+                context.store,
+                &repo_url,
+                input,
+                &RepoFetchCaps::default(),
+            )?
+        }
     } else if context.operation == "reindex" {
         reindex_codebase_in_store(context.store, input)?
     } else {

@@ -21,8 +21,8 @@ use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
 
 use crate::code_index::{
-    CodeContextInput, CodeIndexRuntime, ExplainCodeInput, ExploreCodeInput, IngestCodebaseInput,
-    RecognizeCodeInput, RecordUseReceiptInput, SearchCodeInput,
+    is_fetchable_repo_url, CodeContextInput, CodeIndexRuntime, ExplainCodeInput, ExploreCodeInput,
+    IngestCodebaseInput, RecognizeCodeInput, RecordUseReceiptInput, RepoFetchCaps, SearchCodeInput,
 };
 use crate::pb;
 
@@ -508,17 +508,36 @@ fn code_ingest_handler(
     actor: &str,
     reindex: bool,
 ) -> HandlerOutcome {
+    let raw_repo_path =
+        request_string(request, &["repo_path", "repoPath", "path"]).unwrap_or_default();
+    let explicit_repo_url =
+        request_string(request, &["repo_url", "repoUrl", "url"]).unwrap_or_default();
+    let repo_url = if !explicit_repo_url.trim().is_empty() {
+        explicit_repo_url
+    } else if is_fetchable_repo_url(&raw_repo_path) {
+        raw_repo_path.clone()
+    } else {
+        String::new()
+    };
     let input = IngestCodebaseInput {
         tenant_id: tenant_id.to_string(),
-        repo_path: request_string(request, &["repo_path", "path"]).unwrap_or_default(),
-        repo_id: request_string(request, &["repo_id"]).unwrap_or_default(),
+        repo_path: if repo_url.is_empty() {
+            raw_repo_path
+        } else {
+            String::new()
+        },
+        repo_id: request_string(request, &["repo_id", "repoId"]).unwrap_or_default(),
         include_extensions: request_string_array(request, "include_extensions"),
         exclude_dirs: request_string_array(request, "exclude_dirs"),
         max_files: request_u64(request, "max_files").unwrap_or_default(),
         max_file_bytes: request_u64(request, "max_file_bytes").unwrap_or_default(),
         actor: actor.to_string(),
     };
-    let result = if reindex {
+    let result = if !repo_url.is_empty() && reindex {
+        code_index.reindex_codebase_from_url(&repo_url, input, &RepoFetchCaps::default())
+    } else if !repo_url.is_empty() {
+        code_index.ingest_codebase_from_url(&repo_url, input, &RepoFetchCaps::default())
+    } else if reindex {
         code_index.reindex_codebase(input)
     } else {
         code_index.ingest_codebase(input)
@@ -1390,6 +1409,22 @@ mod tests {
         repo_dir
     }
 
+    fn init_git_fixture(dir: &Path) -> bool {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        };
+        run(&["init", "--quiet"])
+            && run(&["config", "user.email", "fixture@example.com"])
+            && run(&["config", "user.name", "Fixture"])
+            && run(&["add", "."])
+            && run(&["commit", "--quiet", "-m", "fixture"])
+    }
+
     #[test]
     fn dry_run_returns_registered_affordance_receipt() {
         let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
@@ -1602,6 +1637,50 @@ mod tests {
             .unwrap();
         assert_eq!(use_receipt.status, "ok");
         assert!(use_receipt.output_json.contains("\"code_use_receipt_ok\""));
+
+        drop(runtime);
+        std::fs::remove_dir_all(repo_dir).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn code_search_affordance_treats_repo_path_url_as_clone_target() {
+        let repo_dir = fixture_code_repo();
+        if !init_git_fixture(&repo_dir) {
+            std::fs::remove_dir_all(repo_dir).ok();
+            return;
+        }
+        let repo_url = format!("file://{}", repo_dir.display());
+        let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
+        let ingest = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.ingest".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_path": repo_url,
+                        "include_extensions": ["rs"],
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: true,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ingest.status, "ok");
+        let output: Value = serde_json::from_str(&ingest.output_json).unwrap();
+        assert_eq!(output["files_indexed"], json!(1));
+        assert!(output["repo_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("repo:theorem-grpc-code-repo-"));
+        assert!(output["repo_root"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rustyred-code-clone-"));
 
         drop(runtime);
         std::fs::remove_dir_all(repo_dir).ok();

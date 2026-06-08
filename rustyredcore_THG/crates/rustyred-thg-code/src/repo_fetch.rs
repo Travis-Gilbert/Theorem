@@ -94,6 +94,12 @@ fn is_allowed_url(url: &str) -> bool {
     ALLOWED.iter().any(|scheme| url.starts_with(scheme)) || url.starts_with("git@")
 }
 
+/// True when a caller-supplied repository location should be treated as a git
+/// clone target instead of a local filesystem path.
+pub fn is_fetchable_repo_url(url: &str) -> bool {
+    is_allowed_url(url.trim())
+}
+
 /// Shallow-clone `url` into a quarantined tempdir and return a handle that
 /// removes the tree on drop. Caps the on-disk size; never executes the tree.
 pub fn fetch_repo(url: &str, caps: &RepoFetchCaps) -> Result<FetchedRepo, RepoFetchError> {
