@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustyred_thg_affordances::theorem_grpc_timeout_ms;
 use rustyred_thg_core::store::RedisThgStore;
 use rustyred_thg_core::{
     make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
@@ -2150,11 +2151,7 @@ async fn invoke_app_affordance_grpc(
     endpoint: String,
     request: InvokeAppAffordanceGrpcRequest,
 ) -> Result<InvokeAppAffordanceGrpcResponse, McpError> {
-    let timeout_ms = if request.timeout_ms == 0 {
-        30_000
-    } else {
-        request.timeout_ms.min(30_000)
-    };
+    let timeout_ms = theorem_grpc_timeout_ms(&request.affordance_id, request.timeout_ms);
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let channel = tonic::transport::Channel::from_shared(endpoint.clone())
         .map_err(|error| {
@@ -2296,6 +2293,28 @@ mod tests {
         assert_eq!(
             normalize_grpc_endpoint("http://127.0.0.1:50071"),
             "http://127.0.0.1:50071"
+        );
+    }
+
+    #[test]
+    fn app_affordance_timeout_budget_extends_code_ingest_deadline_only() {
+        assert_eq!(
+            rustyred_thg_affordances::theorem_grpc_timeout_ms("theorem_grpc.code_search.ingest", 0),
+            rustyred_thg_affordances::THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            rustyred_thg_affordances::theorem_grpc_timeout_ms(
+                "theorem_grpc.code_search.ingest",
+                180_000
+            ),
+            180_000
+        );
+        assert_eq!(
+            rustyred_thg_affordances::theorem_grpc_timeout_ms(
+                "theorem_grpc.observability.read_trace",
+                180_000
+            ),
+            rustyred_thg_affordances::THEOREM_GRPC_TIMEOUT_MS
         );
     }
 

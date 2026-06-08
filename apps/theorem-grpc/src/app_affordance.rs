@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use rustyred_thg_affordances::{
     record_invocation, register_theseus_app_affordances, select_affordances,
-    theseus_app_affordances, Affordance, AffordanceGraphStore, CapabilityScope,
-    InvocationRecordRequest, InvocationRecordResult, SelectionRequest, THEOREM_GRPC_TIMEOUT_MS,
+    theorem_grpc_timeout_ms, theseus_app_affordances, Affordance, AffordanceGraphStore,
+    CapabilityScope, InvocationRecordRequest, InvocationRecordResult, SelectionRequest,
+    THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS, THEOREM_GRPC_MAX_TIMEOUT_MS,
 };
 use rustyred_thg_core::{stable_hash, RedCoreDurability, RedCoreGraphStore, RedCoreOptions};
 use serde_json::{json, Map, Value};
@@ -131,7 +132,7 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
 ) -> pb::InvokeAffordanceResponse {
     let tenant_id = normalize_tenant(&req.tenant_id);
     let requested_id = req.affordance_id.trim().to_string();
-    let timeout_ms = normalized_timeout(req.timeout_ms);
+    let timeout_ms = theorem_grpc_timeout_ms(&requested_id, req.timeout_ms);
     let request_json = parse_request_json(&req.request_json);
     let actor = req.actor.trim().to_string();
 
@@ -822,7 +823,7 @@ impl TheseusAppAdapter {
 
     fn new(endpoint: Option<String>, bearer_token: Option<String>) -> Self {
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(THEOREM_GRPC_TIMEOUT_MS))
+            .timeout(Duration::from_millis(THEOREM_GRPC_MAX_TIMEOUT_MS))
             .build()
             .expect("reqwest blocking client should build");
         Self {
@@ -1173,14 +1174,6 @@ fn normalize_tenant(raw: &str) -> String {
         "theorem".to_string()
     } else {
         trimmed.to_string()
-    }
-}
-
-fn normalized_timeout(raw: u64) -> u64 {
-    if raw == 0 {
-        THEOREM_GRPC_TIMEOUT_MS
-    } else {
-        raw.min(THEOREM_GRPC_TIMEOUT_MS)
     }
 }
 
@@ -1547,13 +1540,14 @@ mod tests {
                     .to_string(),
                     dry_run: false,
                     confirmed: true,
-                    timeout_ms: 0,
+                    timeout_ms: 180_000,
                 },
                 Instant::now(),
             )
             .unwrap();
         assert_eq!(ingest.status, "ok");
         assert!(ingest.output_json.contains("\"files_indexed\":1"));
+        assert!(ingest.output_json.contains("\"timeout_ms\":180000"));
         assert!(ingest.output_json.contains("\"graph_invocation\""));
 
         let search = runtime
@@ -1695,6 +1689,7 @@ mod tests {
         assert_eq!(ingest.status, "ok");
         let output: Value = serde_json::from_str(&ingest.output_json).unwrap();
         assert_eq!(output["files_indexed"], json!(1));
+        assert_eq!(output["timeout_ms"], THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS);
         assert!(output["repo_id"]
             .as_str()
             .unwrap_or_default()

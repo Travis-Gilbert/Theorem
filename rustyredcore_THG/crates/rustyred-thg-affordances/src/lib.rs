@@ -22,7 +22,9 @@ pub mod types;
 pub use outcomes::{affordance_nodes, effective_affordance_fitness_from_node, record_invocation};
 pub use registry::{
     register_builtin_affordances, register_connector, register_theseus_app_affordances,
-    theseus_app_affordances, upsert_affordance, THEOREM_GRPC_SERVER_ID, THEOREM_GRPC_TIMEOUT_MS,
+    theorem_grpc_allows_extended_timeout, theorem_grpc_default_timeout_ms, theorem_grpc_timeout_ms,
+    theseus_app_affordances, upsert_affordance, THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS,
+    THEOREM_GRPC_MAX_TIMEOUT_MS, THEOREM_GRPC_SERVER_ID, THEOREM_GRPC_TIMEOUT_MS,
 };
 pub use selection::{select_affordances, select_affordances_by_embedding};
 pub use training::{

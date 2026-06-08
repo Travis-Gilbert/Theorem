@@ -3326,6 +3326,7 @@ dependencies = [
  "redis",
  "reqwest",
  "rustyred-thg-adapters",
+ "rustyred-thg-affordances",
  "rustyred-thg-core",
  "rustyred-thg-fractal",
  "rustyred-thg-mcp",

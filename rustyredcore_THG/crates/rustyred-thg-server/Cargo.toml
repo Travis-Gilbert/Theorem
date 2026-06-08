@@ -22,6 +22,7 @@ theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }
 theorem-browser-agent = { path = "../theorem-browser-agent" }
 rustyred-thg-adapters = { path = "../rustyred-thg-adapters" }
+rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
 rustyred-thg-mcp = { path = "../rustyred-thg-mcp", features = ["redis-store"] }
 rustyred-thg-fractal = { path = "../rustyred-thg-fractal" }
 rustyred-web = { path = "../rustyred-web" }

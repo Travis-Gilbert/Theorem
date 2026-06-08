@@ -6,8 +6,8 @@ use crate::types::{affordance_node_id, Affordance};
 use crate::{
     record_invocation, register_builtin_affordances, register_connector,
     register_theseus_app_affordances, ConnectorManifest, InvocationRecordRequest, ToolManifest,
-    AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS, OFFERS, THEOREM_GRPC_SERVER_ID,
-    THEOREM_GRPC_TIMEOUT_MS,
+    AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS, OFFERS, THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS,
+    THEOREM_GRPC_MAX_TIMEOUT_MS, THEOREM_GRPC_SERVER_ID, THEOREM_GRPC_TIMEOUT_MS,
 };
 
 fn tool(name: &str, policy: &str, tags: &[&str]) -> ToolManifest {
@@ -140,16 +140,20 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
     assert!(store.get_node(&result.connector_node_id).is_some());
 
     let publisher_id = affordance_node_id("theorem", "theorem_grpc.publisher.publish");
+    let code_ingest_id = affordance_node_id("theorem", "theorem_grpc.code_search.ingest");
     let code_search_id = affordance_node_id("theorem", "theorem_grpc.code_search.search");
     let code_explore_id = affordance_node_id("theorem", "theorem_grpc.code_search.explore");
     let code_explain_id = affordance_node_id("theorem", "theorem_grpc.code_search.explain");
     let code_use_id = affordance_node_id("theorem", "theorem_grpc.code_search.record_use_receipt");
     assert!(result.affordance_node_ids.contains(&publisher_id));
+    assert!(result.affordance_node_ids.contains(&code_ingest_id));
     assert!(result.affordance_node_ids.contains(&code_search_id));
     assert!(result.affordance_node_ids.contains(&code_explore_id));
     assert!(result.affordance_node_ids.contains(&code_explain_id));
     assert!(result.affordance_node_ids.contains(&code_use_id));
     let publisher = Affordance::from_node_record(store.get_node(&publisher_id).unwrap()).unwrap();
+    let code_ingest =
+        Affordance::from_node_record(store.get_node(&code_ingest_id).unwrap()).unwrap();
     let code_search =
         Affordance::from_node_record(store.get_node(&code_search_id).unwrap()).unwrap();
 
@@ -168,10 +172,39 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
     assert_eq!(code_search.family, "code_search");
     assert_eq!(code_search.writeback_policy, "receipt-only");
     assert!(code_search.permissions.contains(&"code_read".to_string()));
+    assert_eq!(
+        code_ingest.input_schema["timeout_ms"],
+        THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS
+    );
+    assert_eq!(
+        code_ingest.cost["timeout_ms"],
+        THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS
+    );
+    assert_eq!(code_search.cost["timeout_ms"], THEOREM_GRPC_TIMEOUT_MS);
 
     let offers =
         store.neighbors(NeighborQuery::out(&result.connector_node_id).with_edge_type(OFFERS));
     assert_eq!(offers.len(), 19);
+}
+
+#[test]
+fn theorem_grpc_timeout_budget_extends_only_code_ingest_writes() {
+    assert_eq!(
+        crate::theorem_grpc_timeout_ms("theorem_grpc.code_search.ingest", 0),
+        THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS
+    );
+    assert_eq!(
+        crate::theorem_grpc_timeout_ms("code_search.reindex", 240_000),
+        240_000
+    );
+    assert_eq!(
+        crate::theorem_grpc_timeout_ms("theorem_grpc.code_search.ingest", 999_000),
+        THEOREM_GRPC_MAX_TIMEOUT_MS
+    );
+    assert_eq!(
+        crate::theorem_grpc_timeout_ms("theorem_grpc.code_search.search", 90_000),
+        THEOREM_GRPC_TIMEOUT_MS
+    );
 }
 
 #[test]

@@ -19,6 +19,35 @@ use crate::types::{
 
 pub const THEOREM_GRPC_SERVER_ID: &str = "theorem_grpc";
 pub const THEOREM_GRPC_TIMEOUT_MS: u64 = 30_000;
+pub const THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS: u64 = 120_000;
+pub const THEOREM_GRPC_MAX_TIMEOUT_MS: u64 = 300_000;
+
+pub fn theorem_grpc_timeout_ms(affordance_or_tool_name: &str, requested_timeout_ms: u64) -> u64 {
+    let default_timeout = theorem_grpc_default_timeout_ms(affordance_or_tool_name);
+    if requested_timeout_ms == 0 {
+        default_timeout
+    } else if theorem_grpc_allows_extended_timeout(affordance_or_tool_name) {
+        requested_timeout_ms.min(THEOREM_GRPC_MAX_TIMEOUT_MS)
+    } else {
+        requested_timeout_ms.min(THEOREM_GRPC_TIMEOUT_MS)
+    }
+}
+
+pub fn theorem_grpc_default_timeout_ms(affordance_or_tool_name: &str) -> u64 {
+    if theorem_grpc_allows_extended_timeout(affordance_or_tool_name) {
+        THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS
+    } else {
+        THEOREM_GRPC_TIMEOUT_MS
+    }
+}
+
+pub fn theorem_grpc_allows_extended_timeout(affordance_or_tool_name: &str) -> bool {
+    let name = affordance_or_tool_name
+        .trim()
+        .strip_prefix("theorem_grpc.")
+        .unwrap_or_else(|| affordance_or_tool_name.trim());
+    matches!(name, "code_search.ingest" | "code_search.reindex")
+}
 
 /// Register an entire connector: one `Connector` node + one `Affordance` node
 /// per tool + `OFFERS` edges, in a single transaction. Idempotent.
@@ -397,6 +426,7 @@ struct TheseusAppAffordanceSpec {
 
 impl TheseusAppAffordanceSpec {
     fn to_affordance(self, tenant_id: &str) -> Affordance {
+        let timeout_ms = theorem_grpc_timeout_ms(self.tool_name, 0);
         let mut tags = vec![
             "theseus_app".to_string(),
             "theorem_grpc".to_string(),
@@ -417,7 +447,7 @@ impl TheseusAppAffordanceSpec {
             input_schema: json!({
                 "type": "object",
                 "transport": "theorem_grpc",
-                "timeout_ms": THEOREM_GRPC_TIMEOUT_MS,
+                "timeout_ms": timeout_ms,
                 "request": {
                     "type": "object",
                     "additionalProperties": true
@@ -432,7 +462,7 @@ impl TheseusAppAffordanceSpec {
             cost: json!({
                 "execution_surface": "theorem_grpc",
                 "transport": "theorem_grpc",
-                "timeout_ms": THEOREM_GRPC_TIMEOUT_MS,
+                "timeout_ms": timeout_ms,
                 "latency_class": self.latency_class,
                 "cost_class": self.cost_class,
                 "write_class": self.write_class,

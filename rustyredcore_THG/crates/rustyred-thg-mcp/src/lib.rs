@@ -9995,6 +9995,29 @@ mod tests {
     }
 
     #[test]
+    fn code_search_forwards_timeout_as_control_plane_value() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        let routed = call_tool_json(
+            &provider,
+            &config,
+            "code_search",
+            json!({
+                "tenant": "smoke",
+                "operation": "ingest",
+                "repo_path": "https://github.com/tinyhumansai/openhuman.git",
+                "timeout_ms": 180_000,
+                "actor": "codex",
+            }),
+        );
+
+        assert_eq!(routed["app_affordance"]["timeout_ms"], json!(180_000));
+        assert!(routed["app_affordance"]["request"]
+            .get("timeout_ms")
+            .is_none());
+    }
+
+    #[test]
     fn redcore_code_search_ingests_and_searches_tenant_graph_directly() {
         let repo = unique_code_repo("repo");
         fs::create_dir_all(repo.join("src")).unwrap();
