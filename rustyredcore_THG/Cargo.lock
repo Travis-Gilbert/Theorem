@@ -3226,7 +3226,7 @@ dependencies = [
 
 [[package]]
 name = "rustyred-thg-code"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rustyred-thg-core",
  "serde_json",
