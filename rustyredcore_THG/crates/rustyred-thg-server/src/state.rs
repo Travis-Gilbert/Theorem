@@ -16,19 +16,18 @@ use rustyred_thg_core::{
     SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
-    job_cancel_to_store, job_claim_to_store, job_complete_to_store, job_promote_to_store,
-    job_submit_to_store, queue_status_from_store, AppAffordanceInvocation, HandoffDispatch,
-    McpError, McpGraphBackend, McpGraphProvider, McpServerConfig,
+    job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
+    AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
+    McpServerConfig,
 };
 use rustyred_web::{
     configured_search_providers_from_env, FetchCascade, FetchCascadeOptions, LiveFetchOptions,
     SearchProvider,
 };
 use serde_json::{json, Value};
-use theorem_harness_core::{JobStatus, JobSubmission, Priority, TransitionInput, TransitionResult};
+use theorem_harness_core::{JobSubmission, TransitionInput, TransitionResult};
 use theorem_harness_runtime::{
-    append_transition_from_store, load_events, load_run, HarnessRuntimeError, JobCompletion,
-    JobOutcome,
+    append_transition_from_store, load_events, load_run, HarnessRuntimeError, JobNoteInput,
 };
 
 use crate::config::{Config, StorageMode};
@@ -1843,50 +1842,25 @@ impl McpGraphBackend for ProductMcpBackend {
         job_submit_to_store(&mut runtime_store, submission, submitted_by)
     }
 
-    fn queue_status(
-        &self,
-        repo: Option<String>,
-        status: Option<JobStatus>,
-    ) -> Result<Value, McpError> {
+    fn job_list(&self, repo: Option<String>, state: Option<String>) -> Result<Value, McpError> {
         let snapshot = self.store.graph_snapshot()?;
         let mirror = InMemoryGraphStore::from_snapshot(snapshot)?;
-        queue_status_from_store(&mirror, repo, status)
+        job_list_from_store(&mirror, repo, state)
     }
 
-    fn job_cancel(&mut self, job_id: String, actor: String) -> Result<Value, McpError> {
+    fn job_note(&mut self, job_id: String, input: JobNoteInput) -> Result<Value, McpError> {
         let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
-        job_cancel_to_store(&mut runtime_store, job_id, actor)
+        job_note_to_store(&mut runtime_store, job_id, input)
     }
 
-    fn job_promote(
+    fn job_archive(
         &mut self,
         job_id: String,
-        priority: Priority,
+        reason: String,
         actor: String,
     ) -> Result<Value, McpError> {
         let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
-        job_promote_to_store(&mut runtime_store, job_id, priority, actor)
-    }
-
-    fn job_claim(
-        &mut self,
-        receiver_id: String,
-        lanes: Vec<String>,
-        repos: Vec<String>,
-    ) -> Result<Value, McpError> {
-        let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
-        job_claim_to_store(&mut runtime_store, receiver_id, lanes, repos)
-    }
-
-    fn job_complete(
-        &mut self,
-        job_id: String,
-        outcome: JobOutcome,
-        completion: JobCompletion,
-        actor: String,
-    ) -> Result<Value, McpError> {
-        let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
-        job_complete_to_store(&mut runtime_store, job_id, outcome, completion, actor)
+        job_archive_to_store(&mut runtime_store, job_id, reason, actor)
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {

@@ -1,8 +1,8 @@
 //! The outbound MCP-over-HTTP client.
 //!
 //! The receiver speaks JSON-RPC `tools/call` to the cloud harness endpoint. Every
-//! call carries the bearer token and tenant_slug. This is the ONLY network seam,
-//! and it is outbound only: no inbound port, no tunnel.
+//! call carries tenant_slug and, when configured, bearer auth. This is the ONLY
+//! network seam, and it is outbound only: no inbound port, no tunnel.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,17 +15,17 @@ use crate::{ReceiverError, ReceiverResult};
 pub struct HarnessClient {
     http: reqwest::blocking::Client,
     url: String,
-    token: String,
+    token: Option<String>,
     tenant_slug: String,
     next_id: AtomicU64,
 }
 
 impl HarnessClient {
-    /// Build a client. The token is the harness bearer (read from the env by the
-    /// caller); it is never persisted.
+    /// Build a client. The optional token is the harness bearer (read from the
+    /// env by the caller); it is never persisted.
     pub fn new(
         url: impl Into<String>,
-        token: impl Into<String>,
+        token: Option<String>,
         tenant_slug: impl Into<String>,
     ) -> ReceiverResult<Self> {
         let http = reqwest::blocking::Client::builder()
@@ -34,7 +34,7 @@ impl HarnessClient {
         Ok(Self {
             http,
             url: url.into(),
-            token: token.into(),
+            token,
             tenant_slug: tenant_slug.into(),
             next_id: AtomicU64::new(1),
         })
@@ -53,48 +53,72 @@ impl HarnessClient {
             "method": "tools/call",
             "params": { "name": name, "arguments": arguments },
         });
-        let response = self
-            .http
-            .post(&self.url)
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send()?
-            .error_for_status()?;
+        let mut request = self.http.post(&self.url).json(&body);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send()?.error_for_status()?;
         let value: Value = response.json()?;
         parse_tool_response(&value)
     }
 
-    /// Claim the highest-priority matching job, or `None` if nothing is queued.
-    pub fn job_claim(
-        &self,
-        receiver_id: &str,
-        lanes: &[String],
-        repos: &[String],
-    ) -> ReceiverResult<Option<Job>> {
-        let payload = self.call_tool(
-            "job_claim",
-            json!({ "receiver_id": receiver_id, "lanes": lanes, "repos": repos }),
-        )?;
-        parse_claim(&payload)
+    /// Probe the MCP endpoint with `tools/list`.
+    pub fn tools_list(&self) -> ReceiverResult<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/list",
+        });
+        let mut request = self.http.post(&self.url).json(&body);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send()?.error_for_status()?;
+        let value: Value = response.json()?;
+        if let Some(error) = value.get("error") {
+            return Err(ReceiverError::Protocol(format!("jsonrpc error: {error}")));
+        }
+        value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| ReceiverError::Protocol("tools/list missing result".to_string()))
     }
 
-    /// Close a job Done/Failed with a fitness receipt.
-    pub fn job_complete(
+    /// Read the board, filtered by repo and derived state.
+    pub fn job_list(&self, repo: Option<&str>, state: Option<&str>) -> ReceiverResult<Vec<Job>> {
+        let mut arguments = json!({});
+        if let Value::Object(map) = &mut arguments {
+            if let Some(repo) = repo {
+                map.insert("repo".to_string(), json!(repo));
+            }
+            if let Some(state) = state {
+                map.insert("state".to_string(), json!(state));
+            }
+        }
+        let payload = self.call_tool("job_list", arguments)?;
+        parse_list(&payload)
+    }
+
+    /// Append a receipt. Receiver start and retry-clear writes use this verb too.
+    pub fn job_note(
         &self,
         job_id: &str,
-        outcome: &str,
-        pr_ref: Option<String>,
-        session_ref: Option<String>,
-        receipts: Value,
+        actor: &str,
+        text: &str,
+        refs: Vec<String>,
+        start_session_ref: Option<String>,
+        clear_started: bool,
     ) -> ReceiverResult<Value> {
         self.call_tool(
-            "job_complete",
+            "job_note",
             json!({
                 "job_id": job_id,
-                "outcome": outcome,
-                "pr_ref": pr_ref,
-                "session_ref": session_ref,
-                "receipts": receipts,
+                "actor": actor,
+                "text": text,
+                "refs": refs,
+                "start_session_ref": start_session_ref,
+                "clear_started": clear_started,
             }),
         )
     }
@@ -127,24 +151,20 @@ fn parse_tool_response(value: &Value) -> ReceiverResult<Value> {
         }
     }
 
-    payload
-        .get("result")
-        .cloned()
-        .ok_or_else(|| ReceiverError::Protocol("tool payload missing 'result' envelope".to_string()))
+    payload.get("result").cloned().ok_or_else(|| {
+        ReceiverError::Protocol("tool payload missing 'result' envelope".to_string())
+    })
 }
 
-/// Interpret a `job_claim` backend payload.
-fn parse_claim(payload: &Value) -> ReceiverResult<Option<Job>> {
-    match payload.get("claimed").and_then(Value::as_bool) {
-        Some(true) => {
-            let job_value = payload
-                .get("job")
-                .ok_or_else(|| ReceiverError::Protocol("claimed payload missing 'job'".to_string()))?;
-            let job: Job = serde_json::from_value(job_value.clone())?;
-            Ok(Some(job))
-        }
-        _ => Ok(None),
-    }
+/// Interpret a `job_list` backend payload.
+fn parse_list(payload: &Value) -> ReceiverResult<Vec<Job>> {
+    let jobs = payload
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ReceiverError::Protocol("job_list payload missing 'jobs'".to_string()))?;
+    jobs.iter()
+        .map(|job| serde_json::from_value(job.clone()).map_err(ReceiverError::from))
+        .collect()
 }
 
 #[cfg(test)]
@@ -161,50 +181,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_claimed_job() {
+    fn parses_job_list() {
         let job = json!({
             "job_id": "job-001",
-            "kind": "App",
             "title": "Dia",
             "spec_ref": "docs/plans/theorem-desktop/HANDOFF.md",
             "repo": "Travis-Gilbert/theorem",
-            "branch": "job/job-001",
             "priority": "P0",
-            "target_head": "Either",
-            "status": "Claimed",
+            "target_head": "either",
             "submitted_by": "claude.ai",
             "submitted_at": "1.0Z",
-            "claimed_by": "receiver-a",
-            "claimed_at": "2.0Z",
-            "closed_at": null,
             "session_ref": null,
-            "pr_ref": null,
+            "started_at": null,
+            "archived_at": null,
+            "archived_reason": null,
             "idempotency_key": "sha256:abc",
-            "notes": null
+            "receipts": []
         });
-        let envelope = wrap(json!({ "tenant": "default", "result": { "claimed": true, "job_id": "job-001", "job": job } }));
+        let envelope =
+            wrap(json!({ "tenant": "default", "result": { "count": 1, "jobs": [job] } }));
         let payload = parse_tool_response(&envelope).unwrap();
-        let claimed = parse_claim(&payload).unwrap().unwrap();
-        assert_eq!(claimed.job_id, "job-001");
-        assert_eq!(claimed.branch_ref(), "job/job-001");
+        let jobs = parse_list(&payload).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "job-001");
+        assert_eq!(jobs[0].derived_state(), "pending");
     }
 
     #[test]
-    fn parses_empty_claim() {
-        let envelope = wrap(json!({ "tenant": "default", "result": { "claimed": false } }));
+    fn parses_empty_list() {
+        let envelope = wrap(json!({ "tenant": "default", "result": { "count": 0, "jobs": [] } }));
         let payload = parse_tool_response(&envelope).unwrap();
-        assert!(parse_claim(&payload).unwrap().is_none());
+        assert!(parse_list(&payload).unwrap().is_empty());
     }
 
     #[test]
     fn surfaces_jsonrpc_error() {
-        let value = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602, "message": "bad" } });
+        let value =
+            json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602, "message": "bad" } });
         assert!(parse_tool_response(&value).is_err());
     }
 
     #[test]
     fn surfaces_read_only_tool_error() {
-        let envelope = wrap(json!({ "error": "mcp_read_only", "message": "job_claim is unavailable while read-only mode is active." }));
+        let envelope = wrap(
+            json!({ "error": "mcp_read_only", "message": "job_note is unavailable while read-only mode is active." }),
+        );
         let result = parse_tool_response(&envelope);
         assert!(result.is_err());
         assert!(format!("{}", result.unwrap_err()).contains("read-only"));

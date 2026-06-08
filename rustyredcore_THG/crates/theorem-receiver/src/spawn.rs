@@ -14,14 +14,13 @@ use crate::head::adapter_for;
 /// rates; the whole point of local spawn is to draw on the existing login.
 pub const ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 
-/// Build the intent prompt handed to the spawned head. Verbatim contract from
-/// the dispatch-queue HANDOFF: implement the spec, on branch `job/{job_id}`,
-/// push + PR + call job_complete, no scope expansion.
+/// Build the fallback intent prompt handed to a spawned head when a caller does
+/// not provide the richer dispatch v2 launch prompt.
 pub fn build_intent(spec_ref: &str, job_id: &str) -> String {
     format!(
-        "Implement {spec_ref} fully as written. This is {job_id}. Work on branch job/{job_id}. \
-When done: push the branch, open a PR with the local gh login if present, and call job_complete \
-with the outcome, pr_ref, and receipts. Do not expand scope beyond the spec."
+        "Implement {spec_ref} fully as written. This is {job_id}. \
+When you make progress, call job_note with receipts and refs. \
+When the thread is complete, call job_archive with reason \"done\"."
     )
 }
 
@@ -62,13 +61,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn intent_carries_spec_ref_and_job_id_on_the_right_branch() {
+    fn intent_carries_spec_ref_and_job_id_and_v2_verbs() {
         let intent = build_intent("docs/plans/theorem-desktop/HANDOFF.md", "job-001");
         assert!(intent.contains("docs/plans/theorem-desktop/HANDOFF.md"));
         assert!(intent.contains("job-001"));
-        assert!(intent.contains("branch job/job-001"));
-        assert!(intent.contains("call job_complete"));
-        assert!(intent.contains("Do not expand scope"));
+        assert!(intent.contains("job_note"));
+        assert!(intent.contains("job_archive"));
     }
 
     #[test]
@@ -92,7 +90,10 @@ mod tests {
     fn codex_plan_uses_exec() {
         let plan = build_spawn_plan("codex", "do the thing", Path::new("/repos/theorem")).unwrap();
         assert_eq!(plan.program, "codex");
-        assert_eq!(plan.args, vec!["exec".to_string(), "do the thing".to_string()]);
+        assert_eq!(
+            plan.args,
+            vec!["exec".to_string(), "do the thing".to_string()]
+        );
         assert!(plan.strip_env.contains(&ANTHROPIC_API_KEY.to_string()));
     }
 
@@ -109,6 +110,9 @@ mod tests {
         let removed = command
             .get_envs()
             .any(|(key, value)| key == ANTHROPIC_API_KEY && value.is_none());
-        assert!(removed, "ANTHROPIC_API_KEY must be explicitly removed from child env");
+        assert!(
+            removed,
+            "ANTHROPIC_API_KEY must be explicitly removed from child env"
+        );
     }
 }

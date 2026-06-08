@@ -49,8 +49,8 @@ pub trait HeadAdapter: Sync {
     }
 
     /// Frame the intent prompt for this head (`intent_template`). Default is the
-    /// shared dispatch intent (implement the spec on branch job/{job_id}, push +
-    /// PR + call job_complete, no scope expansion).
+    /// shared dispatch v2 intent (note receipts with job_note, archive with
+    /// job_archive when done).
     fn intent_template(&self, spec_ref: &str, job_id: &str) -> String {
         build_intent(spec_ref, job_id)
     }
@@ -188,20 +188,32 @@ mod tests {
             .unwrap()
             .spawn_plan("do the thing", Path::new("/repos/theorem"));
         assert_eq!(plan.program, "codex");
-        assert_eq!(plan.args, vec!["exec".to_string(), "do the thing".to_string()]);
+        assert_eq!(
+            plan.args,
+            vec!["exec".to_string(), "do the thing".to_string()]
+        );
     }
 
     #[test]
     fn detect_uses_the_program_on_path() {
-        let present: HashSet<PathBuf> = ["/usr/local/bin/claude"].iter().map(PathBuf::from).collect();
+        let present: HashSet<PathBuf> = ["/usr/local/bin/claude"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
         let exists = |path: &Path| present.contains(path);
-        assert!(adapter_for("claude").unwrap().detect("/usr/local/bin", &exists));
-        assert!(!adapter_for("codex").unwrap().detect("/usr/local/bin", &exists));
+        assert!(adapter_for("claude")
+            .unwrap()
+            .detect("/usr/local/bin", &exists));
+        assert!(!adapter_for("codex")
+            .unwrap()
+            .detect("/usr/local/bin", &exists));
     }
 
     #[test]
     fn default_parse_receipt_shape() {
-        let receipt = adapter_for("claude").unwrap().parse_receipt(Some(1), "panic: boom");
+        let receipt = adapter_for("claude")
+            .unwrap()
+            .parse_receipt(Some(1), "panic: boom");
         assert_eq!(receipt["source"], json!("receiver_fallback"));
         assert_eq!(receipt["lane"], json!("claude"));
         assert_eq!(receipt["exit_code"], json!(1));
@@ -217,7 +229,9 @@ mod tests {
             .unwrap()
             .intent_template("docs/plans/x/HANDOFF.md", "job-001");
         assert!(intent.contains("docs/plans/x/HANDOFF.md"));
-        assert!(intent.contains("branch job/job-001"));
+        assert!(intent.contains("job-001"));
+        assert!(intent.contains("job_note"));
+        assert!(intent.contains("job_archive"));
     }
 
     // Proves the synthesis promise: a new head is config plus one impl. This fake

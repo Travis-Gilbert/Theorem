@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{
     next_for_head, spawn_verify_node, stable_value_hash, submit_verify_receipt, ClaimOutcome,
-    HeadFitness, JobStatus, JobSubmission, Millis, NodeStatus, Priority, Receipt, TaskNode,
-    TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
+    HeadFitness, JobSubmission, Millis, NodeStatus, Receipt, TaskNode, TransitionInput,
+    TransitionResult, VerifyReceipt, WorkGraph,
 };
 #[cfg(test)]
 use theorem_harness_runtime::subscribe_coordination_room_events;
@@ -39,12 +39,11 @@ use theorem_harness_runtime::{
     ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
     CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
     CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
-    HarnessRuntimeError, JobActionResult, JobCompletion, JobOutcome, JoinRoomInput, MemoryError,
-    MemoryGraphStore, MemoryWriteInput,
-    PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput,
-    SkillPackError, SkillPackGetInput, SkillPackGraphStore, SkillPackListInput,
-    SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
-    EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
+    HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
+    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
+    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
+    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
+    WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -138,7 +137,7 @@ pub trait McpGraphBackend {
             "harness run reads are not supported by this MCP backend",
         ))
     }
-    /// Dispatch-queue verb: create `Job{Queued}` (idempotent on idempotency_key).
+    /// Dispatch-board verb: create or upsert a pending job.
     fn job_submit(
         &mut self,
         _submission: JobSubmission,
@@ -148,54 +147,27 @@ pub trait McpGraphBackend {
             "job_submit is not supported by this MCP backend",
         ))
     }
-    /// Dispatch-queue verb: list jobs ordered by priority then submitted_at.
-    fn queue_status(
-        &self,
-        _repo: Option<String>,
-        _status: Option<JobStatus>,
-    ) -> Result<Value, McpError> {
+    /// Dispatch-board verb: list jobs with derived state.
+    fn job_list(&self, _repo: Option<String>, _state: Option<String>) -> Result<Value, McpError> {
         Err(McpError::internal(
-            "queue_status is not supported by this MCP backend",
+            "job_list is not supported by this MCP backend",
         ))
     }
-    /// Dispatch-queue verb: cancel a Queued (or Claimed-not-yet-running) job.
-    fn job_cancel(&mut self, _job_id: String, _actor: String) -> Result<Value, McpError> {
+    /// Dispatch-board verb: append a receipt, optionally with receiver start metadata.
+    fn job_note(&mut self, _job_id: String, _input: JobNoteInput) -> Result<Value, McpError> {
         Err(McpError::internal(
-            "job_cancel is not supported by this MCP backend",
+            "job_note is not supported by this MCP backend",
         ))
     }
-    /// Dispatch-queue verb: reprioritize a job.
-    fn job_promote(
+    /// Dispatch-board verb: archive a job thread.
+    fn job_archive(
         &mut self,
         _job_id: String,
-        _priority: Priority,
+        _reason: String,
         _actor: String,
     ) -> Result<Value, McpError> {
         Err(McpError::internal(
-            "job_promote is not supported by this MCP backend",
-        ))
-    }
-    /// Dispatch-queue verb: atomically claim the highest-priority matching job.
-    fn job_claim(
-        &mut self,
-        _receiver_id: String,
-        _lanes: Vec<String>,
-        _repos: Vec<String>,
-    ) -> Result<Value, McpError> {
-        Err(McpError::internal(
-            "job_claim is not supported by this MCP backend",
-        ))
-    }
-    /// Dispatch-queue verb: close a job Done/Failed with a fitness receipt.
-    fn job_complete(
-        &mut self,
-        _job_id: String,
-        _outcome: JobOutcome,
-        _completion: JobCompletion,
-        _actor: String,
-    ) -> Result<Value, McpError> {
-        Err(McpError::internal(
-            "job_complete is not supported by this MCP backend",
+            "job_archive is not supported by this MCP backend",
         ))
     }
     /// Fire a session-spawn dispatch (GitHub Actions `repository_dispatch`). Defaults to
@@ -1131,7 +1103,7 @@ fn call_tool<P: McpGraphProvider>(
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
         }
-        "job_submit" | "theorem_job_submit" => {
+        "job_submit" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
                     "error": "mcp_read_only",
@@ -1140,44 +1112,24 @@ fn call_tool<P: McpGraphProvider>(
             }
             job_submit_payload(&tenant, &mut backend, &arguments)?
         }
-        "queue_status" | "theorem_queue_status" => {
-            queue_status_payload(&tenant, &backend, &arguments)?
-        }
-        "job_cancel" | "theorem_job_cancel" => {
+        "job_list" => job_list_payload(&tenant, &backend, &arguments)?,
+        "job_note" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
                     "error": "mcp_read_only",
-                    "message": "job_cancel is unavailable while read-only mode is active."
+                    "message": "job_note is unavailable while read-only mode is active."
                 })));
             }
-            job_cancel_payload(&tenant, &mut backend, &arguments)?
+            job_note_payload(&tenant, &mut backend, &arguments)?
         }
-        "job_promote" | "theorem_job_promote" => {
+        "job_archive" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
                     "error": "mcp_read_only",
-                    "message": "job_promote is unavailable while read-only mode is active."
+                    "message": "job_archive is unavailable while read-only mode is active."
                 })));
             }
-            job_promote_payload(&tenant, &mut backend, &arguments)?
-        }
-        "job_claim" | "theorem_job_claim" => {
-            if config.read_only {
-                return Ok(tool_result_error(json!({
-                    "error": "mcp_read_only",
-                    "message": "job_claim is unavailable while read-only mode is active."
-                })));
-            }
-            job_claim_payload(&tenant, &mut backend, &arguments)?
-        }
-        "job_complete" | "theorem_job_complete" => {
-            if config.read_only {
-                return Ok(tool_result_error(json!({
-                    "error": "mcp_read_only",
-                    "message": "job_complete is unavailable while read-only mode is active."
-                })));
-            }
-            job_complete_payload(&tenant, &mut backend, &arguments)?
+            job_archive_payload(&tenant, &mut backend, &arguments)?
         }
         "multihead_run" | "theorem_harness_multihead_run" => {
             let action = argument_text(&arguments, &["action"])
@@ -6256,7 +6208,7 @@ fn harness_run_detail_from_store<S: GraphStore>(
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch-queue verb shaping. These `*_to_store` helpers run the runtime verbs
+// Dispatch-board verb shaping. These `*_to_store` helpers run the runtime verbs
 // over any GraphStore and shape the MCP payload, so the in-process backends and
 // the product server's RuntimeTenantMirror backend stay byte-identical.
 // ---------------------------------------------------------------------------
@@ -6266,24 +6218,26 @@ fn to_job_payload<T: serde::Serialize>(value: T) -> Result<Value, McpError> {
         .map_err(|error| McpError::internal(format!("job payload serialization failed: {error}")))
 }
 
-fn job_action_payload(
-    job_id: &str,
-    result: Option<JobActionResult>,
-) -> Result<Value, McpError> {
+fn job_action_payload(job_id: &str, result: Option<JobActionResult>) -> Result<Value, McpError> {
     match result {
         None => Ok(json!({ "job_id": job_id, "found": false })),
-        Some(action) => Ok(json!({
-            "job_id": job_id,
-            "found": true,
-            "applied": action.applied,
-            "message": action.message,
-            "job": to_job_payload(&action.job)?,
-        })),
+        Some(action) => {
+            let mut job = to_job_payload(&action.job)?;
+            if let Value::Object(map) = &mut job {
+                map.insert("state".to_string(), json!(action.job.derived_state()));
+            }
+            Ok(json!({
+                "job_id": job_id,
+                "found": true,
+                "applied": action.applied,
+                "message": action.message,
+                "job": job,
+            }))
+        }
     }
 }
 
-/// `job_submit`: create `Job{Queued}`; a duplicate idempotency_key returns the
-/// existing job with `created=false`.
+/// `job_submit`: create a pending job, or upsert an existing idempotency key.
 pub fn job_submit_to_store<S: GraphStore>(
     store: &mut S,
     submission: JobSubmission,
@@ -6298,71 +6252,49 @@ pub fn job_submit_to_store<S: GraphStore>(
     }))
 }
 
-/// `queue_status`: jobs ordered by priority then submitted_at, optionally filtered.
-pub fn queue_status_from_store<S: GraphStore>(
+/// `job_list`: jobs ordered by priority then submitted_at, optionally filtered.
+pub fn job_list_from_store<S: GraphStore>(
     store: &S,
     repo: Option<String>,
-    status: Option<JobStatus>,
+    state: Option<String>,
 ) -> Result<Value, McpError> {
-    let jobs = theorem_harness_runtime::queue_status(store, repo.as_deref(), status)
+    let jobs = theorem_harness_runtime::job_list(store, repo.as_deref(), state.as_deref())
         .map_err(mcp_harness_runtime_error)?;
+    let shaped = jobs
+        .iter()
+        .map(|job| {
+            let mut value = to_job_payload(job)?;
+            if let Value::Object(map) = &mut value {
+                map.insert("state".to_string(), json!(job.derived_state()));
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, McpError>>()?;
     Ok(json!({
         "count": jobs.len(),
-        "jobs": to_job_payload(&jobs)?,
+        "jobs": shaped,
     }))
 }
 
-/// `job_cancel`: Queued/Claimed -> Cancelled.
-pub fn job_cancel_to_store<S: GraphStore>(
+/// `job_note`: append a receipt and optionally set/clear receiver start metadata.
+pub fn job_note_to_store<S: GraphStore>(
     store: &mut S,
     job_id: String,
-    actor: String,
+    input: JobNoteInput,
 ) -> Result<Value, McpError> {
-    let result = theorem_harness_runtime::job_cancel(store, &job_id, actor)
+    let result = theorem_harness_runtime::job_note(store, &job_id, input)
         .map_err(mcp_harness_runtime_error)?;
     job_action_payload(&job_id, result)
 }
 
-/// `job_promote`: set a new priority.
-pub fn job_promote_to_store<S: GraphStore>(
+/// `job_archive`: archive a job thread with a reason.
+pub fn job_archive_to_store<S: GraphStore>(
     store: &mut S,
     job_id: String,
-    priority: Priority,
+    reason: String,
     actor: String,
 ) -> Result<Value, McpError> {
-    let result = theorem_harness_runtime::job_promote(store, &job_id, priority, actor)
-        .map_err(mcp_harness_runtime_error)?;
-    job_action_payload(&job_id, result)
-}
-
-/// `job_claim`: atomically pop the highest-priority matching Queued job.
-pub fn job_claim_to_store<S: GraphStore>(
-    store: &mut S,
-    receiver_id: String,
-    lanes: Vec<String>,
-    repos: Vec<String>,
-) -> Result<Value, McpError> {
-    let claimed = theorem_harness_runtime::job_claim(store, receiver_id, &lanes, &repos)
-        .map_err(mcp_harness_runtime_error)?;
-    match claimed {
-        None => Ok(json!({ "claimed": false })),
-        Some(job) => Ok(json!({
-            "claimed": true,
-            "job_id": job.job_id,
-            "job": to_job_payload(&job)?,
-        })),
-    }
-}
-
-/// `job_complete`: close Done/Failed and write a fitness receipt.
-pub fn job_complete_to_store<S: GraphStore>(
-    store: &mut S,
-    job_id: String,
-    outcome: JobOutcome,
-    completion: JobCompletion,
-    actor: String,
-) -> Result<Value, McpError> {
-    let result = theorem_harness_runtime::job_complete(store, &job_id, outcome, completion, actor)
+    let result = theorem_harness_runtime::job_archive(store, &job_id, reason, actor)
         .map_err(mcp_harness_runtime_error)?;
     job_action_payload(&job_id, result)
 }
@@ -6370,44 +6302,9 @@ pub fn job_complete_to_store<S: GraphStore>(
 fn job_submission_from_arguments(arguments: &Value) -> Result<JobSubmission, McpError> {
     serde_json::from_value::<JobSubmission>(arguments.clone()).map_err(|error| {
         McpError::invalid_params(format!(
-            "job_submit requires title, spec_ref, repo, and kind (ImplementSpec|Feature|Edit|App|Investigation): {error}"
+            "job_submit requires title, repo, and one of spec_ref or spec_inline: {error}"
         ))
     })
-}
-
-fn job_priority_from_arguments(arguments: &Value, tool_name: &str) -> Result<Priority, McpError> {
-    let raw = required_text_any(arguments, &["priority"], tool_name)?;
-    serde_json::from_value::<Priority>(Value::String(raw.clone())).map_err(|_| {
-        McpError::invalid_params(format!("invalid priority '{raw}'; expected P0, P1, or P2"))
-    })
-}
-
-fn job_status_from_arguments(arguments: &Value) -> Result<Option<JobStatus>, McpError> {
-    match argument_text(arguments, &["status"]) {
-        None => Ok(None),
-        Some(raw) => serde_json::from_value::<JobStatus>(Value::String(raw.clone()))
-            .map(Some)
-            .map_err(|_| {
-                McpError::invalid_params(format!(
-                    "invalid status '{raw}'; expected Queued|Claimed|Running|PrOpen|Verifying|Done|Failed|Cancelled"
-                ))
-            }),
-    }
-}
-
-fn job_outcome_from_arguments(arguments: &Value) -> Result<JobOutcome, McpError> {
-    let raw = required_text_any(arguments, &["outcome"], "job_complete")?;
-    serde_json::from_value::<JobOutcome>(Value::String(raw.to_lowercase())).map_err(|_| {
-        McpError::invalid_params(format!("invalid outcome '{raw}'; expected done or failed"))
-    })
-}
-
-fn job_completion_from_arguments(arguments: &Value) -> JobCompletion {
-    JobCompletion {
-        pr_ref: argument_text(arguments, &["pr_ref", "prRef"]),
-        session_ref: argument_text(arguments, &["session_ref", "sessionRef", "run_id", "runId"]),
-        receipts: arguments.get("receipts").cloned(),
-    }
 }
 
 fn job_string_array(arguments: &Value, keys: &[&str]) -> Vec<String> {
@@ -6434,65 +6331,52 @@ fn job_submit_payload(
     Ok(json!({ "tenant": tenant, "result": result }))
 }
 
-fn queue_status_payload(
+fn job_list_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
     arguments: &Value,
 ) -> Result<Value, McpError> {
     let repo = argument_text(arguments, &["repo"]);
-    let status = job_status_from_arguments(arguments)?;
-    let result = backend.queue_status(repo, status)?;
+    let state = argument_text(arguments, &["state"]);
+    let result = backend.job_list(repo, state)?;
     Ok(json!({ "tenant": tenant, "result": result }))
 }
 
-fn job_cancel_payload(
+fn job_note_payload(
     tenant: &str,
     backend: &mut impl McpGraphBackend,
     arguments: &Value,
 ) -> Result<Value, McpError> {
-    let job_id = required_text_any(arguments, &["job_id", "jobId"], "job_cancel")?;
-    let actor = argument_text(arguments, &["actor", "actor_id"])
-        .unwrap_or_else(|| "unknown".to_string());
-    let result = backend.job_cancel(job_id, actor)?;
+    let job_id = required_text_any(arguments, &["job_id", "jobId"], "job_note")?;
+    let actor =
+        argument_text(arguments, &["actor", "actor_id"]).unwrap_or_else(|| "unknown".to_string());
+    let text = required_text_any(arguments, &["text", "message"], "job_note")?;
+    let refs = job_string_array(arguments, &["refs"]);
+    let input = JobNoteInput {
+        actor,
+        text,
+        refs,
+        start_session_ref: argument_text(arguments, &["start_session_ref", "startSessionRef"]),
+        clear_started: arguments
+            .get("clear_started")
+            .or_else(|| arguments.get("clearStarted"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    let result = backend.job_note(job_id, input)?;
     Ok(json!({ "tenant": tenant, "result": result }))
 }
 
-fn job_promote_payload(
+fn job_archive_payload(
     tenant: &str,
     backend: &mut impl McpGraphBackend,
     arguments: &Value,
 ) -> Result<Value, McpError> {
-    let job_id = required_text_any(arguments, &["job_id", "jobId"], "job_promote")?;
-    let priority = job_priority_from_arguments(arguments, "job_promote")?;
-    let actor = argument_text(arguments, &["actor", "actor_id"])
-        .unwrap_or_else(|| "unknown".to_string());
-    let result = backend.job_promote(job_id, priority, actor)?;
-    Ok(json!({ "tenant": tenant, "result": result }))
-}
-
-fn job_claim_payload(
-    tenant: &str,
-    backend: &mut impl McpGraphBackend,
-    arguments: &Value,
-) -> Result<Value, McpError> {
-    let receiver_id = required_text_any(arguments, &["receiver_id", "receiverId"], "job_claim")?;
-    let lanes = job_string_array(arguments, &["lanes"]);
-    let repos = job_string_array(arguments, &["repos"]);
-    let result = backend.job_claim(receiver_id, lanes, repos)?;
-    Ok(json!({ "tenant": tenant, "result": result }))
-}
-
-fn job_complete_payload(
-    tenant: &str,
-    backend: &mut impl McpGraphBackend,
-    arguments: &Value,
-) -> Result<Value, McpError> {
-    let job_id = required_text_any(arguments, &["job_id", "jobId"], "job_complete")?;
-    let outcome = job_outcome_from_arguments(arguments)?;
-    let completion = job_completion_from_arguments(arguments);
-    let actor = argument_text(arguments, &["actor", "actor_id", "receiver_id"])
-        .unwrap_or_else(|| "unknown".to_string());
-    let result = backend.job_complete(job_id, outcome, completion, actor)?;
+    let job_id = required_text_any(arguments, &["job_id", "jobId"], "job_archive")?;
+    let reason = required_text_any(arguments, &["reason"], "job_archive")?;
+    let actor =
+        argument_text(arguments, &["actor", "actor_id"]).unwrap_or_else(|| "unknown".to_string());
+    let result = backend.job_archive(job_id, reason, actor)?;
     Ok(json!({ "tenant": tenant, "result": result }))
 }
 
@@ -7325,7 +7209,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ),
         tool_write(
             "job_submit",
-            "Dispatch-queue: create a Queued Job from a committed spec. Duplicate idempotency_key returns the existing job and creates nothing.",
+            "Dispatch v2: create or upsert a pending Job thread. Duplicate idempotency_key returns the existing job.",
             json!({
                 "type": "object",
                 "properties": {
@@ -7333,91 +7217,61 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "tenant_slug": { "type": "string" },
                     "title": { "type": "string" },
                     "spec_ref": { "type": "string", "description": "repo path (docs/plans/x/HANDOFF.md) or harness doc_id" },
+                    "spec_inline": { "type": "string", "description": "inline spec text when no spec_ref is available" },
                     "repo": { "type": "string", "description": "Travis-Gilbert/theorem etc." },
-                    "kind": { "type": "string", "enum": ["ImplementSpec", "Feature", "Edit", "App", "Investigation"] },
                     "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
-                    "target_head": { "type": "string", "enum": ["ClaudeCode", "Codex", "Either"] },
-                    "branch": { "type": "string", "description": "defaults to job/{job_id}" },
-                    "notes": { "type": "string" },
+                    "target_head": { "type": "string", "enum": ["claude", "codex", "either"] },
+                    "not_before": { "type": "string", "description": "optional timestamp hint; receivers skip future jobs" },
                     "idempotency_key": { "type": "string", "description": "defaults to hash(spec_ref + title)" },
                     "submitted_by": { "type": "string" }
                 },
-                "required": ["title", "spec_ref", "repo", "kind"]
+                "required": ["title", "repo"]
             }),
         ),
         tool(
-            "queue_status",
-            "Dispatch-queue: list jobs ordered by priority then submitted_at, optionally filtered by repo and/or status.",
+            "job_list",
+            "Dispatch v2: list the Job board ordered by priority then submitted_at, optionally filtered by repo and derived state.",
             json!({
                 "type": "object",
                 "properties": {
                     "tenant": { "type": "string" },
                     "tenant_slug": { "type": "string" },
                     "repo": { "type": "string" },
-                    "status": { "type": "string", "enum": ["Queued", "Claimed", "Running", "PrOpen", "Verifying", "Done", "Failed", "Cancelled"] }
+                    "state": { "type": "string", "enum": ["pending", "started", "archived"] }
                 }
             }),
         ),
         tool_write(
-            "job_cancel",
-            "Dispatch-queue: move a Queued (or Claimed-not-yet-running) job to Cancelled.",
+            "job_note",
+            "Dispatch v2: append a receipt to a Job thread. Receivers may include start_session_ref for the set-once launch write.",
             json!({
                 "type": "object",
                 "properties": {
                     "tenant": { "type": "string" },
                     "tenant_slug": { "type": "string" },
                     "job_id": { "type": "string" },
-                    "actor": { "type": "string" }
+                    "actor": { "type": "string" },
+                    "text": { "type": "string" },
+                    "refs": { "type": "array", "items": { "type": "string" } },
+                    "start_session_ref": { "type": "string" },
+                    "clear_started": { "type": "boolean" }
                 },
-                "required": ["job_id"]
+                "required": ["job_id", "text"]
             }),
         ),
         tool_write(
-            "job_promote",
-            "Dispatch-queue: reorder a job by setting a new priority.",
+            "job_archive",
+            "Dispatch v2: archive a Job thread with a reason.",
             json!({
                 "type": "object",
                 "properties": {
                     "tenant": { "type": "string" },
                     "tenant_slug": { "type": "string" },
                     "job_id": { "type": "string" },
-                    "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
+                    "reason": { "type": "string" },
                     "actor": { "type": "string" }
                 },
-                "required": ["job_id", "priority"]
-            }),
-        ),
-        tool_write(
-            "job_claim",
-            "Dispatch-queue: atomically claim the highest-priority Queued job matching the receiver's lanes and configured repos. Returns claimed=false when nothing matches.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "tenant": { "type": "string" },
-                    "tenant_slug": { "type": "string" },
-                    "receiver_id": { "type": "string" },
-                    "lanes": { "type": "array", "items": { "type": "string", "enum": ["claude", "codex"] } },
-                    "repos": { "type": "array", "items": { "type": "string" } }
-                },
-                "required": ["receiver_id"]
-            }),
-        ),
-        tool_write(
-            "job_complete",
-            "Dispatch-queue: close a job Done or Failed and write a fitness outcome receipt.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "tenant": { "type": "string" },
-                    "tenant_slug": { "type": "string" },
-                    "job_id": { "type": "string" },
-                    "outcome": { "type": "string", "enum": ["done", "failed"] },
-                    "pr_ref": { "type": "string" },
-                    "session_ref": { "type": "string", "description": "run_id of the spawned session" },
-                    "receipts": { "type": "object" },
-                    "actor": { "type": "string" }
-                },
-                "required": ["job_id", "outcome"]
+                "required": ["job_id", "reason"]
             }),
         ),
         tool(
@@ -8896,44 +8750,21 @@ impl McpGraphBackend for InMemoryGraphStore {
         job_submit_to_store(self, submission, submitted_by)
     }
 
-    fn queue_status(
-        &self,
-        repo: Option<String>,
-        status: Option<JobStatus>,
-    ) -> Result<Value, McpError> {
-        queue_status_from_store(self, repo, status)
+    fn job_list(&self, repo: Option<String>, state: Option<String>) -> Result<Value, McpError> {
+        job_list_from_store(self, repo, state)
     }
 
-    fn job_cancel(&mut self, job_id: String, actor: String) -> Result<Value, McpError> {
-        job_cancel_to_store(self, job_id, actor)
+    fn job_note(&mut self, job_id: String, input: JobNoteInput) -> Result<Value, McpError> {
+        job_note_to_store(self, job_id, input)
     }
 
-    fn job_promote(
+    fn job_archive(
         &mut self,
         job_id: String,
-        priority: Priority,
+        reason: String,
         actor: String,
     ) -> Result<Value, McpError> {
-        job_promote_to_store(self, job_id, priority, actor)
-    }
-
-    fn job_claim(
-        &mut self,
-        receiver_id: String,
-        lanes: Vec<String>,
-        repos: Vec<String>,
-    ) -> Result<Value, McpError> {
-        job_claim_to_store(self, receiver_id, lanes, repos)
-    }
-
-    fn job_complete(
-        &mut self,
-        job_id: String,
-        outcome: JobOutcome,
-        completion: JobCompletion,
-        actor: String,
-    ) -> Result<Value, McpError> {
-        job_complete_to_store(self, job_id, outcome, completion, actor)
+        job_archive_to_store(self, job_id, reason, actor)
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -9092,44 +8923,21 @@ impl McpGraphBackend for RedCoreGraphStore {
         job_submit_to_store(self, submission, submitted_by)
     }
 
-    fn queue_status(
-        &self,
-        repo: Option<String>,
-        status: Option<JobStatus>,
-    ) -> Result<Value, McpError> {
-        queue_status_from_store(self, repo, status)
+    fn job_list(&self, repo: Option<String>, state: Option<String>) -> Result<Value, McpError> {
+        job_list_from_store(self, repo, state)
     }
 
-    fn job_cancel(&mut self, job_id: String, actor: String) -> Result<Value, McpError> {
-        job_cancel_to_store(self, job_id, actor)
+    fn job_note(&mut self, job_id: String, input: JobNoteInput) -> Result<Value, McpError> {
+        job_note_to_store(self, job_id, input)
     }
 
-    fn job_promote(
+    fn job_archive(
         &mut self,
         job_id: String,
-        priority: Priority,
+        reason: String,
         actor: String,
     ) -> Result<Value, McpError> {
-        job_promote_to_store(self, job_id, priority, actor)
-    }
-
-    fn job_claim(
-        &mut self,
-        receiver_id: String,
-        lanes: Vec<String>,
-        repos: Vec<String>,
-    ) -> Result<Value, McpError> {
-        job_claim_to_store(self, receiver_id, lanes, repos)
-    }
-
-    fn job_complete(
-        &mut self,
-        job_id: String,
-        outcome: JobOutcome,
-        completion: JobCompletion,
-        actor: String,
-    ) -> Result<Value, McpError> {
-        job_complete_to_store(self, job_id, outcome, completion, actor)
+        job_archive_to_store(self, job_id, reason, actor)
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -9358,69 +9166,103 @@ mod tests {
     fn job_submission_fixture(title: &str) -> theorem_harness_core::JobSubmission {
         theorem_harness_core::JobSubmission {
             title: title.to_string(),
-            spec_ref: format!("docs/plans/{title}/HANDOFF.md"),
+            spec_ref: Some(format!("docs/plans/{title}/HANDOFF.md")),
+            spec_inline: None,
             repo: "Travis-Gilbert/theorem".to_string(),
-            kind: theorem_harness_core::JobKind::App,
             priority: Some(theorem_harness_core::Priority::P0),
             target_head: None,
-            branch: None,
-            notes: None,
+            not_before: None,
             idempotency_key: None,
         }
     }
 
     // Acceptance criterion 1 (MCP boundary): submit creates a job visible in
-    // queue_status; criterion 8: a duplicate is a no-op.
+    // job_list; a duplicate upserts the existing job.
     #[test]
-    fn job_submit_and_queue_status_shaping() {
+    fn job_submit_and_job_list_shaping() {
         let mut store = InMemoryGraphStore::new();
-        let submitted =
-            super::job_submit_to_store(&mut store, job_submission_fixture("dia"), "claude.ai".into())
-                .unwrap();
+        let submitted = super::job_submit_to_store(
+            &mut store,
+            job_submission_fixture("dia"),
+            "claude.ai".into(),
+        )
+        .unwrap();
         assert_eq!(submitted["created"], json!(true));
         let job_id = submitted["job_id"].as_str().unwrap().to_string();
 
-        let status = super::queue_status_from_store(&store, None, None).unwrap();
-        assert_eq!(status["count"], json!(1));
-        assert_eq!(status["jobs"][0]["job_id"].as_str().unwrap(), job_id);
+        let list = super::job_list_from_store(&store, None, None).unwrap();
+        assert_eq!(list["count"], json!(1));
+        assert_eq!(list["jobs"][0]["job_id"].as_str().unwrap(), job_id);
+        assert_eq!(list["jobs"][0]["state"], json!("pending"));
 
-        // Duplicate idempotency_key -> same job, created=false, still one in queue.
-        let dup =
-            super::job_submit_to_store(&mut store, job_submission_fixture("dia"), "claude.ai".into())
-                .unwrap();
+        let dup = super::job_submit_to_store(
+            &mut store,
+            job_submission_fixture("dia"),
+            "claude.ai".into(),
+        )
+        .unwrap();
         assert_eq!(dup["created"], json!(false));
         assert_eq!(dup["job_id"].as_str().unwrap(), job_id);
         assert_eq!(
-            super::queue_status_from_store(&store, None, None).unwrap()["count"],
+            super::job_list_from_store(&store, None, None).unwrap()["count"],
             json!(1)
         );
     }
 
     #[test]
-    fn job_claim_and_cancel_shaping() {
+    fn job_note_start_and_archive_shaping() {
         let mut store = InMemoryGraphStore::new();
-        super::job_submit_to_store(&mut store, job_submission_fixture("alpha"), "claude.ai".into())
-            .unwrap();
+        let submitted = super::job_submit_to_store(
+            &mut store,
+            job_submission_fixture("alpha"),
+            "claude.ai".into(),
+        )
+        .unwrap();
+        let job_id = submitted["job_id"].as_str().unwrap().to_string();
 
-        let lanes = vec!["claude".to_string()];
-        let repos = vec!["Travis-Gilbert/theorem".to_string()];
-        let claimed =
-            super::job_claim_to_store(&mut store, "receiver-a".into(), lanes.clone(), repos.clone())
+        let started = super::job_note_to_store(
+            &mut store,
+            job_id.clone(),
+            theorem_harness_runtime::JobNoteInput {
+                actor: "receiver-a".to_string(),
+                text: "starting".to_string(),
+                refs: Vec::new(),
+                start_session_ref: Some("session-a".to_string()),
+                clear_started: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(started["found"], json!(true));
+        assert_eq!(started["applied"], json!(true));
+        assert_eq!(started["job"]["state"], json!("started"));
+        assert_eq!(started["job"]["session_ref"], json!("session-a"));
+
+        let lost = super::job_note_to_store(
+            &mut store,
+            job_id.clone(),
+            theorem_harness_runtime::JobNoteInput {
+                actor: "receiver-b".to_string(),
+                text: "starting".to_string(),
+                refs: Vec::new(),
+                start_session_ref: Some("session-b".to_string()),
+                clear_started: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(lost["applied"], json!(false));
+
+        let archived =
+            super::job_archive_to_store(&mut store, job_id.clone(), "done".into(), "codex".into())
                 .unwrap();
-        assert_eq!(claimed["claimed"], json!(true));
-        // The only job is now claimed; a second claim finds nothing.
-        let empty =
-            super::job_claim_to_store(&mut store, "receiver-b".into(), lanes, repos).unwrap();
-        assert_eq!(empty["claimed"], json!(false));
-
-        // Cancel envelope: found + applied; missing job -> found:false.
-        let job_id = claimed["job_id"].as_str().unwrap().to_string();
-        let cancelled =
-            super::job_cancel_to_store(&mut store, job_id.clone(), "claude.ai".into()).unwrap();
-        assert_eq!(cancelled["found"], json!(true));
-        assert_eq!(cancelled["applied"], json!(true));
-        let missing =
-            super::job_cancel_to_store(&mut store, "job-missing".into(), "x".into()).unwrap();
+        assert_eq!(archived["found"], json!(true));
+        assert_eq!(archived["applied"], json!(true));
+        let missing = super::job_archive_to_store(
+            &mut store,
+            "job-missing".into(),
+            "done".into(),
+            "x".into(),
+        )
+        .unwrap();
         assert_eq!(missing["found"], json!(false));
     }
 

@@ -4,8 +4,8 @@
 //!   THEOREM_HARNESS_TOKEN=<bearer> theorem-receiver [config.toml]
 //!
 //! Config path defaults to `theorem-receiver.toml` in the working directory.
-//! The bearer token is read from the environment, never from disk. Deploy via
-//! `docker run` with a restart policy or launchd (Kubernetes is ruled out).
+//! The bearer token is read from the environment when present, never from disk.
+//! Authless local/dev harnesses may run without it.
 
 use std::process::ExitCode;
 
@@ -25,14 +25,14 @@ fn main() -> ExitCode {
 }
 
 fn run() -> theorem_receiver::ReceiverResult<()> {
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
     let config = ReceiverConfig::load(&config_path)?;
 
-    let token = std::env::var(TOKEN_ENV).map_err(|_| {
-        theorem_receiver::ReceiverError::Config(format!(
-            "{TOKEN_ENV} must be set to the harness bearer token"
-        ))
-    })?;
+    let token = std::env::var(TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
     let client = HarnessClient::new(
         config.harness_url.clone(),

@@ -1,26 +1,28 @@
 # theorem-receiver
 
-The local half of the dispatch-queue (docs/plans/dispatch-queue/HANDOFF.md). It
-replaces the rejected GitHub-Actions dispatcher: an outbound-only claim loop that
-spawns the locally-installed `claude` / `codex` CLI in a mapped worktree, using
-their existing subscription logins. Zero new credentials, zero inbound ports,
-zero GitHub Actions / runners / PATs / stored OAuth tokens.
+The local half of Dispatch v2 (docs/plans/dispatch-queue/dispatch-v2.md). It
+replaces the rejected GitHub-Actions dispatcher: an outbound-only launcher loop
+that starts the locally-installed `claude` / `codex` CLI in a mapped worktree,
+using their existing subscription logins. Zero inbound ports, zero GitHub
+Actions / runners / PATs / stored OAuth tokens.
 
 ## What it does
 
 1. Detects lanes at startup: `which claude`, `which codex`. Registers only what
-   is present (a machine without `codex` never claims Codex-lane jobs).
-2. Polls the cloud harness with `job_claim` on an interval (and immediately after
-   any job completes). Outbound only.
-3. On a claim, spawns the head as a child process in the repo's worktree:
+   is present (a machine without `codex` skips Codex-targeted jobs).
+2. Polls the cloud harness with `job_list state=pending`, skips future
+   `not_before` jobs, then writes the set-once start receipt through `job_note`.
+   Outbound only.
+3. On a start win, reads the spec, probes the harness, builds a launch prompt
+   with a context packet, then spawns the head as a child process in the repo's
+   worktree:
    - Claude lane: `claude -p "<intent>" --permission-mode acceptEdits`
    - Codex lane:  `codex exec "<intent>"`
    - `ANTHROPIC_API_KEY` is stripped from the child environment (an API key
      silently wins precedence over the subscription login and bills metered).
 4. Streams the child's output, captures the exit code + a stdout tail, then
-   defensively calls `job_complete(failed, <receipt>)`. This is idempotent: if the
-   head already self-completed (Done/Failed) it is a no-op; if the head exited
-   WITHOUT completing, the job is closed Failed with the exit receipt.
+   appends one `job_note` receipt. It does not close, claim, or monitor lifecycle
+   state. Anyone can call `job_archive reason=done` when the thread is complete.
 
 It does NOT run the RustyRed engine locally: no vector index, no PPR, no BM25, no
 embedders. Idle footprint is listener-scale.
@@ -30,8 +32,8 @@ embedders. Idle footprint is listener-scale.
 ```bash
 cp crates/theorem-receiver/theorem-receiver.example.toml ./theorem-receiver.toml
 # edit the worktree map + harness_url
-THEOREM_HARNESS_TOKEN=<bearer> \
-  cargo run -p theorem-receiver -- ./theorem-receiver.toml
+THEOREM_HARNESS_TOKEN=<bearer> cargo run -p theorem-receiver -- ./theorem-receiver.toml
+# If the harness has bearer auth disabled, omit THEOREM_HARNESS_TOKEN.
 ```
 
 Deploy via `docker run` with a restart policy or launchd. Kubernetes is ruled out.
@@ -46,7 +48,7 @@ drive the loop directly:
 use theorem_receiver::{config::ReceiverConfig, HarnessClient, run_loop};
 
 let config = ReceiverConfig::load("theorem-receiver.toml")?;
-let token = std::env::var("THEOREM_HARNESS_TOKEN")?;
+let token = std::env::var("THEOREM_HARNESS_TOKEN").ok();
 let client = HarnessClient::new(config.harness_url.clone(), token, config.tenant_slug.clone())?;
 run_loop(&config, &client)?; // or spawn on its own thread
 ```
@@ -65,4 +67,4 @@ run_loop(&config, &client)?; // or spawn on its own thread
 
 - SSE wake on the jobs channel (gated on the tenant-scoped push fix in push.rs);
   until it lands, polling is the mechanism.
-- Parallel dispatch for `capacity > 1` (the loop is currently sequential).
+- Parallel launch for `capacity > 1` (the loop is currently sequential).

@@ -1,15 +1,10 @@
-//! Job: the dispatch-queue unit.
+//! Job: the dispatch-board unit.
 //!
-//! One job is one spec, one session, one run. The Job sits ABOVE runs in the
-//! work hierarchy: do NOT merge it into [`crate::work_graph::TaskNode`], which is
-//! the INTRA-run work graph. A Job is dispatched, becomes a run, and that run may
-//! itself contain a TaskNode graph (multi-head-run-execution/HANDOFF.md).
-//!
-//! This module is pure domain logic with no GraphStore dependency. Persistence
-//! and the six queue verbs (submit / status / cancel / promote / claim /
-//! complete) live in `theorem-harness-runtime::job_queue`, keeping storage out
-//! of the kernel the same way `event_log.rs` is kept out of the pure state
-//! machine.
+//! A Job is no longer a guarded lifecycle machine. Dispatch v2 treats it as a
+//! durable thread: a spec to launch, set-once start metadata, optional archival
+//! metadata, and append-only receipts from any actor. Infrastructure owns only
+//! the "started once" launch invariant; agents coordinate the rest through the
+//! harness room and receipts.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,55 +17,39 @@ pub const LANE_CLAUDE: &str = "claude";
 /// Canonical lane identifier for the Codex CLI (`which codex`).
 pub const LANE_CODEX: &str = "codex";
 
-/// What kind of work a job represents. Drives the receiver's intent framing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobKind {
-    ImplementSpec,
-    Feature,
-    Edit,
-    App,
-    Investigation,
-}
-
-/// Queue priority. Declared highest-first so the derived `Ord` sorts P0 ahead of
-/// P1 ahead of P2 under an ascending sort.
+/// Queue priority. It is a hint only, but it still sorts P0 before P1 before P2.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Priority {
     P0,
     P1,
-    /// Unspecified jobs join the back of the line; explicit urgency must be
-    /// declared so a default-priority job never preempts a marked one.
     #[default]
     P2,
 }
 
-/// Which head a job targets. `Either` is claimable by whichever lane a receiver
-/// has installed.
+/// Which head a job prefers. The value is a launch hint, not an ownership rule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetHead {
-    ClaudeCode,
+    #[serde(rename = "claude", alias = "ClaudeCode")]
+    Claude,
+    #[serde(rename = "codex", alias = "Codex")]
     Codex,
     #[default]
+    #[serde(rename = "either", alias = "Either")]
     Either,
 }
 
 impl TargetHead {
-    /// True when at least one of the receiver's installed lanes can run this job.
+    /// True when at least one installed lane can run this job.
     pub fn matches_lanes(&self, lanes: &[String]) -> bool {
-        let has = |lane: &str| lanes.iter().any(|candidate| candidate == lane);
-        match self {
-            TargetHead::ClaudeCode => has(LANE_CLAUDE),
-            TargetHead::Codex => has(LANE_CODEX),
-            TargetHead::Either => has(LANE_CLAUDE) || has(LANE_CODEX),
-        }
+        self.preferred_lane(lanes).is_some()
     }
 
-    /// The lane a receiver should spawn for this job, given its installed lanes.
-    /// `Either` prefers Claude when present, then falls back to Codex.
+    /// Pick the lane a receiver should spawn. `Either` preserves the old local
+    /// preference: Claude when present, then Codex.
     pub fn preferred_lane(&self, lanes: &[String]) -> Option<&'static str> {
         let has = |lane: &str| lanes.iter().any(|candidate| candidate == lane);
         match self {
-            TargetHead::ClaudeCode if has(LANE_CLAUDE) => Some(LANE_CLAUDE),
+            TargetHead::Claude if has(LANE_CLAUDE) => Some(LANE_CLAUDE),
             TargetHead::Codex if has(LANE_CODEX) => Some(LANE_CODEX),
             TargetHead::Either if has(LANE_CLAUDE) => Some(LANE_CLAUDE),
             TargetHead::Either if has(LANE_CODEX) => Some(LANE_CODEX),
@@ -79,183 +58,179 @@ impl TargetHead {
     }
 }
 
-/// The lifecycle status of a job. Transitions are validated by
-/// [`JobStatus::can_transition`]; every applied transition appends a graph event
-/// in the runtime so the lifecycle is replayable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobStatus {
-    Queued,
-    Claimed,
-    Running,
-    PrOpen,
-    Verifying,
-    Done,
-    Failed,
-    Cancelled,
-}
-
-impl JobStatus {
-    /// Terminal states never transition further.
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled)
-    }
-
-    /// `job_cancel` accepts a Queued job, or a Claimed job that has not yet begun
-    /// running (per the spec: "Queued (or Claimed-not-yet-running) to Cancelled").
-    pub fn can_cancel(&self) -> bool {
-        matches!(self, JobStatus::Queued | JobStatus::Claimed)
-    }
-
-    /// The legal forward transitions of the dispatch lifecycle.
-    pub fn can_transition(from: JobStatus, to: JobStatus) -> bool {
-        use JobStatus::*;
-        matches!(
-            (from, to),
-            (Queued, Claimed)
-                | (Queued, Cancelled)
-                | (Claimed, Running)
-                | (Claimed, Cancelled)
-                | (Claimed, Failed)
-                | (Running, PrOpen)
-                | (Running, Verifying)
-                | (Running, Done)
-                | (Running, Failed)
-                | (PrOpen, Verifying)
-                | (PrOpen, Done)
-                | (PrOpen, Failed)
-                | (Verifying, Done)
-                | (Verifying, Failed)
-        )
-    }
-}
-
-/// The flat input accepted by `job_submit`. Optional fields fall back to defaults
-/// (`branch` -> `job/{job_id}`, `idempotency_key` -> hash(spec_ref + title),
-/// `priority` -> P2, `target_head` -> Either).
+/// The flat input accepted by `job_submit`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobSubmission {
     pub title: String,
-    pub spec_ref: String,
+    #[serde(default)]
+    pub spec_ref: Option<String>,
+    #[serde(default)]
+    pub spec_inline: Option<String>,
     pub repo: String,
-    pub kind: JobKind,
     #[serde(default)]
     pub priority: Option<Priority>,
     #[serde(default)]
     pub target_head: Option<TargetHead>,
     #[serde(default)]
-    pub branch: Option<String>,
-    #[serde(default)]
-    pub notes: Option<String>,
+    pub not_before: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
-/// A dispatch job: one spec, one session, one run.
+impl JobSubmission {
+    /// `spec_ref` when present, else a content-addressed inline spec identity.
+    pub fn spec_identity(&self) -> Option<String> {
+        self.spec_ref
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.spec_inline
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| inline_spec_identity(value))
+            })
+    }
+}
+
+/// One receipt appended to the job thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobReceipt {
+    pub actor: String,
+    pub at: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+}
+
+impl JobReceipt {
+    pub fn new(actor: impl Into<String>, text: impl Into<String>, refs: Vec<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            at: now_string(),
+            text: text.into(),
+            refs,
+        }
+    }
+}
+
+/// A dispatch job: one spec/thread, not a guarded state machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     /// `"job-" + ulid`.
     pub job_id: String,
-    pub kind: JobKind,
     pub title: String,
     /// Repo path (`docs/plans/x/HANDOFF.md`) or harness doc_id.
-    pub spec_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_ref: Option<String>,
+    /// Inline spec text when the caller does not want a repo path/doc id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_inline: Option<String>,
     /// `"Travis-Gilbert/theorem"` etc.
     pub repo: String,
-    /// Defaults to `job/{job_id}`.
-    pub branch: Option<String>,
     pub priority: Priority,
     pub target_head: TargetHead,
-    pub status: JobStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
     /// actor_id of the submitter.
     pub submitted_by: String,
     pub submitted_at: String,
-    /// receiver id.
-    pub claimed_by: Option<String>,
-    pub claimed_at: Option<String>,
-    pub closed_at: Option<String>,
-    /// run_id once dispatched.
+    /// Set once by the receiver that starts the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// run/session id once launched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<String>,
-    /// PR number or branch ref.
-    pub pr_ref: Option<String>,
-    /// Defaults to hash(spec_ref + title).
+    /// Set when someone archives the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_reason: Option<String>,
+    /// Defaults to hash(spec_identity + title).
     pub idempotency_key: String,
-    pub notes: Option<String>,
+    #[serde(default)]
+    pub receipts: Vec<JobReceipt>,
 }
 
 impl Job {
-    /// Build a freshly-queued job from a submission.
-    pub fn from_submission(submission: JobSubmission, submitted_by: impl Into<String>) -> Self {
+    /// Build a pending job from a submission.
+    pub fn from_submission(
+        submission: JobSubmission,
+        submitted_by: impl Into<String>,
+    ) -> Result<Self, String> {
+        let spec_identity = submission
+            .spec_identity()
+            .ok_or_else(|| "job_submit requires spec_ref or spec_inline".to_string())?;
         let job_id = new_job_id();
         let idempotency_key = submission
             .idempotency_key
             .clone()
             .filter(|key| !key.trim().is_empty())
-            .unwrap_or_else(|| idempotency_key_for(&submission.spec_ref, &submission.title));
-        let branch = submission
-            .branch
-            .clone()
-            .filter(|branch| !branch.trim().is_empty())
-            .unwrap_or_else(|| default_branch(&job_id));
-        Self {
+            .unwrap_or_else(|| idempotency_key_for(&spec_identity, &submission.title));
+        Ok(Self {
             job_id,
-            kind: submission.kind,
             title: submission.title,
-            spec_ref: submission.spec_ref,
+            spec_ref: submission.spec_ref.filter(|value| !value.trim().is_empty()),
+            spec_inline: submission
+                .spec_inline
+                .filter(|value| !value.trim().is_empty()),
             repo: submission.repo,
-            branch: Some(branch),
             priority: submission.priority.unwrap_or_default(),
             target_head: submission.target_head.unwrap_or_default(),
-            status: JobStatus::Queued,
+            not_before: submission
+                .not_before
+                .filter(|value| !value.trim().is_empty()),
             submitted_by: submitted_by.into(),
             submitted_at: now_string(),
-            claimed_by: None,
-            claimed_at: None,
-            closed_at: None,
+            started_at: None,
             session_ref: None,
-            pr_ref: None,
+            archived_at: None,
+            archived_reason: None,
             idempotency_key,
-            notes: submission.notes,
+            receipts: Vec::new(),
+        })
+    }
+
+    /// Derived board state. This is intentionally a string, not a lifecycle enum.
+    pub fn derived_state(&self) -> &'static str {
+        if self.archived_at.is_some() {
+            "archived"
+        } else if self.started_at.is_some() {
+            "started"
+        } else {
+            "pending"
         }
     }
 
-    /// The branch this job's work lands on (`job/{job_id}` unless overridden).
-    pub fn branch_ref(&self) -> String {
-        self.branch
-            .clone()
-            .filter(|branch| !branch.trim().is_empty())
-            .unwrap_or_else(|| default_branch(&self.job_id))
+    pub fn is_pending(&self) -> bool {
+        self.started_at.is_none() && self.archived_at.is_none()
     }
 
-    /// True when a receiver with these lanes and configured repos may claim this
-    /// job: it must be Queued, in a repo the receiver maps, and target a lane the
-    /// receiver has installed.
-    pub fn claimable_by(&self, lanes: &[String], repos: &[String]) -> bool {
-        self.status == JobStatus::Queued
-            && repos.iter().any(|repo| repo == &self.repo)
-            && self.target_head.matches_lanes(lanes)
+    pub fn spec_text_or_ref(&self) -> Option<&str> {
+        self.spec_inline
+            .as_deref()
+            .or_else(|| self.spec_ref.as_deref())
     }
 }
 
-/// Mint a new job id: `"job-" + ulid`. ULID gives a Crockford base32, lexically
-/// time-sortable id, a natural secondary key behind `submitted_at`.
+/// Mint a new job id: `"job-" + ulid`.
 pub fn new_job_id() -> String {
     format!("job-{}", Ulid::new())
 }
 
-/// The default branch for a job: `job/{job_id}`.
-pub fn default_branch(job_id: &str) -> String {
-    format!("job/{job_id}")
-}
-
-/// Deterministic idempotency key: `sha256(spec_ref \x1f title)` as lowercase hex.
-/// A unit separator between the fields prevents `("ab", "c")` and `("a", "bc")`
-/// from colliding.
-pub fn idempotency_key_for(spec_ref: &str, title: &str) -> String {
+/// Deterministic idempotency key: `sha256(spec_identity \x1f title)`.
+pub fn idempotency_key_for(spec_identity: &str, title: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(spec_ref.as_bytes());
+    hasher.update(spec_identity.as_bytes());
     hasher.update([0x1f]);
     hasher.update(title.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn inline_spec_identity(spec_inline: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(spec_inline.as_bytes());
+    format!("inline:sha256:{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -265,43 +240,46 @@ mod tests {
     fn submission() -> JobSubmission {
         JobSubmission {
             title: "Desktop app, Dia rebuild".to_string(),
-            spec_ref: "docs/plans/theorem-desktop/HANDOFF.md".to_string(),
+            spec_ref: Some("docs/plans/theorem-desktop/HANDOFF.md".to_string()),
+            spec_inline: None,
             repo: "Travis-Gilbert/theorem".to_string(),
-            kind: JobKind::App,
             priority: None,
             target_head: None,
-            branch: None,
-            notes: None,
+            not_before: None,
             idempotency_key: None,
         }
     }
 
     #[test]
     fn from_submission_applies_defaults() {
-        let job = Job::from_submission(submission(), "claude.ai");
+        let job = Job::from_submission(submission(), "claude.ai").unwrap();
         assert!(job.job_id.starts_with("job-"));
-        assert_eq!(job.status, JobStatus::Queued);
+        assert_eq!(job.derived_state(), "pending");
         assert_eq!(job.priority, Priority::P2);
         assert_eq!(job.target_head, TargetHead::Either);
-        assert_eq!(job.branch_ref(), format!("job/{}", job.job_id));
         assert_eq!(
             job.idempotency_key,
-            idempotency_key_for(&job.spec_ref, &job.title)
+            idempotency_key_for(job.spec_ref.as_deref().unwrap(), &job.title)
         );
         assert_eq!(job.submitted_by, "claude.ai");
     }
 
     #[test]
-    fn idempotency_key_is_deterministic_and_separator_safe() {
-        assert_eq!(
-            idempotency_key_for("docs/plans/x/HANDOFF.md", "Title"),
-            idempotency_key_for("docs/plans/x/HANDOFF.md", "Title")
-        );
-        // The unit separator prevents field-boundary collisions.
-        assert_ne!(
-            idempotency_key_for("ab", "c"),
-            idempotency_key_for("a", "bc")
-        );
+    fn spec_ref_or_spec_inline_is_required() {
+        let mut submission = submission();
+        submission.spec_ref = None;
+        let error = Job::from_submission(submission, "x").unwrap_err();
+        assert!(error.contains("spec_ref or spec_inline"));
+    }
+
+    #[test]
+    fn inline_spec_identity_is_content_addressed() {
+        let mut submission = submission();
+        submission.spec_ref = None;
+        submission.spec_inline = Some("Build the thing.".to_string());
+        let job = Job::from_submission(submission, "codex").unwrap();
+        assert!(job.idempotency_key.starts_with("sha256:"));
+        assert_eq!(job.spec_inline.as_deref(), Some("Build the thing."));
     }
 
     #[test]
@@ -317,51 +295,16 @@ mod tests {
         let codex = vec![LANE_CODEX.to_string()];
         let both = vec![LANE_CLAUDE.to_string(), LANE_CODEX.to_string()];
 
-        assert!(TargetHead::ClaudeCode.matches_lanes(&claude));
-        assert!(!TargetHead::ClaudeCode.matches_lanes(&codex));
+        assert!(TargetHead::Claude.matches_lanes(&claude));
+        assert!(!TargetHead::Claude.matches_lanes(&codex));
         assert!(TargetHead::Codex.matches_lanes(&codex));
         assert!(!TargetHead::Codex.matches_lanes(&claude));
         assert!(TargetHead::Either.matches_lanes(&claude));
         assert!(TargetHead::Either.matches_lanes(&codex));
         assert!(!TargetHead::Either.matches_lanes(&[]));
 
-        // Acceptance criterion 3: a Codex-lane job never matches a claude-only receiver.
-        assert!(!TargetHead::Codex.matches_lanes(&claude));
         assert_eq!(TargetHead::Either.preferred_lane(&both), Some(LANE_CLAUDE));
         assert_eq!(TargetHead::Either.preferred_lane(&codex), Some(LANE_CODEX));
         assert_eq!(TargetHead::Codex.preferred_lane(&claude), None);
-    }
-
-    #[test]
-    fn claimable_requires_queued_repo_and_lane() {
-        let job = Job::from_submission(submission(), "claude.ai");
-        let lanes = vec![LANE_CLAUDE.to_string()];
-        let repos = vec!["Travis-Gilbert/theorem".to_string()];
-        assert!(job.claimable_by(&lanes, &repos));
-        // Unmapped repo is never claimed (security fence).
-        assert!(!job.claimable_by(&lanes, &["other/repo".to_string()]));
-
-        let mut claimed = job.clone();
-        claimed.status = JobStatus::Claimed;
-        assert!(!claimed.claimable_by(&lanes, &repos));
-    }
-
-    #[test]
-    fn lifecycle_transitions() {
-        use JobStatus::*;
-        assert!(JobStatus::can_transition(Queued, Claimed));
-        assert!(JobStatus::can_transition(Queued, Cancelled));
-        assert!(JobStatus::can_transition(Claimed, Running));
-        assert!(JobStatus::can_transition(Running, Done));
-        assert!(JobStatus::can_transition(Running, Failed));
-        assert!(JobStatus::can_transition(PrOpen, Done));
-        // Illegal jumps are rejected.
-        assert!(!JobStatus::can_transition(Queued, Done));
-        assert!(!JobStatus::can_transition(Done, Running));
-        assert!(Done.is_terminal());
-        assert!(Cancelled.is_terminal());
-        assert!(Queued.can_cancel());
-        assert!(Claimed.can_cancel());
-        assert!(!Running.can_cancel());
     }
 }
