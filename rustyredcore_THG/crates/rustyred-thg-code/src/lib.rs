@@ -4,11 +4,14 @@
 //! independent of tonic/MCP/HTTP so every transport can call the same parser
 //! and write into the caller's `RedCoreGraphStore`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use rayon::prelude::*;
 use rustyred_thg_core::{
     now_ms, stable_hash, Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStoreError,
     GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord, PluginCapability, PluginCapabilityKind,
@@ -38,6 +41,7 @@ const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
 const DEFAULT_LIMIT: usize = 20;
 const DEFAULT_CONTEXT_LINES: u64 = 20;
 const DEFAULT_MAX_CONTEXT_CHARS: usize = 20_000;
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 #[derive(Clone)]
 pub struct CodeIndexRuntime {
@@ -285,8 +289,9 @@ impl CodeIndexRuntime {
         &self,
         input: IngestCodebaseInput,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
+        let prepared = prepare_codebase_ingest(input, "ingest", 0)?;
         let mut store = self.lock_store()?;
-        ingest_codebase_with_store(&mut store, input, "ingest")
+        commit_prepared_ingest(&mut store, prepared, "ingest")
     }
 
     pub fn ingest_codebase_from_url(
@@ -295,16 +300,18 @@ impl CodeIndexRuntime {
         input: IngestCodebaseInput,
         caps: &RepoFetchCaps,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
+        let prepared = prepare_codebase_ingest_from_url(url, input, caps, "ingest")?;
         let mut store = self.lock_store()?;
-        ingest_codebase_from_url_in_store(&mut store, url, input, caps)
+        commit_prepared_ingest(&mut store, prepared, "ingest")
     }
 
     pub fn reindex_codebase(
         &self,
         input: IngestCodebaseInput,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
+        let prepared = prepare_codebase_ingest(input, "reindex", 0)?;
         let mut store = self.lock_store()?;
-        ingest_codebase_with_store(&mut store, input, "reindex")
+        commit_prepared_ingest(&mut store, prepared, "reindex")
     }
 
     pub fn reindex_codebase_from_url(
@@ -313,8 +320,9 @@ impl CodeIndexRuntime {
         input: IngestCodebaseInput,
         caps: &RepoFetchCaps,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
+        let prepared = prepare_codebase_ingest_from_url(url, input, caps, "reindex")?;
         let mut store = self.lock_store()?;
-        reindex_codebase_from_url_in_store(&mut store, url, input, caps)
+        commit_prepared_ingest(&mut store, prepared, "reindex")
     }
 
     pub fn search_code(&self, input: SearchCodeInput) -> Result<SearchCodeOutput, CodeIndexError> {
@@ -374,14 +382,16 @@ pub fn ingest_codebase_in_store(
     store: &mut RedCoreGraphStore,
     input: IngestCodebaseInput,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    ingest_codebase_with_store(store, input, "ingest")
+    let prepared = prepare_codebase_ingest(input, "ingest", 0)?;
+    commit_prepared_ingest(store, prepared, "ingest")
 }
 
 pub fn reindex_codebase_in_store(
     store: &mut RedCoreGraphStore,
     input: IngestCodebaseInput,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    ingest_codebase_with_store(store, input, "reindex")
+    let prepared = prepare_codebase_ingest(input, "reindex", 0)?;
+    commit_prepared_ingest(store, prepared, "reindex")
 }
 
 /// CA-1: ingest a repository given a remote URL. Shallow-clones it into a
@@ -409,20 +419,12 @@ pub fn reindex_codebase_from_url_in_store(
 fn ingest_codebase_from_url_with_operation(
     store: &mut RedCoreGraphStore,
     url: &str,
-    mut input: IngestCodebaseInput,
+    input: IngestCodebaseInput,
     caps: &RepoFetchCaps,
     operation: &str,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    let fetched = fetch_repo(url, caps).map_err(|err| CodeIndexError::invalid(err.to_string()))?;
-    input.repo_path = fetched.path().display().to_string();
-    if !input.exclude_dirs.iter().any(|dir| dir == ".git") {
-        input.exclude_dirs.push(".git".to_string());
-    }
-    if input.repo_id.trim().is_empty() {
-        input.repo_id = repo_id_from_url(url);
-    }
-    // `fetched` stays alive across the ingest and removes the clone on drop.
-    ingest_codebase_with_store(store, input, operation)
+    let prepared = prepare_codebase_ingest_from_url(url, input, caps, operation)?;
+    commit_prepared_ingest(store, prepared, operation)
 }
 
 /// Best-effort stable repo id from a clone URL: `repo:<last-path-segment>`.
@@ -722,6 +724,9 @@ pub struct IngestCodebaseOutput {
     pub receipt_json: String,
     pub status: String,
     pub message: String,
+    pub stage_timings: IngestStageTimings,
+    pub language_stats: BTreeMap<String, LanguageIngestStats>,
+    pub skip_stats: IngestSkipStats,
 }
 
 impl IngestCodebaseOutput {
@@ -738,6 +743,65 @@ impl IngestCodebaseOutput {
             "receipt_hash": self.receipt_hash,
             "status": self.status,
             "message": self.message,
+            "stage_timings": self.stage_timings.to_json(),
+            "language_stats": language_stats_json(&self.language_stats),
+            "skip_stats": self.skip_stats.to_json(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IngestStageTimings {
+    pub clone_ms: u64,
+    pub resolve_ms: u64,
+    pub walk_ms: u64,
+    pub parse_ms: u64,
+    pub mutation_ms: u64,
+    pub write_ms: u64,
+    pub total_ms: u64,
+}
+
+impl IngestStageTimings {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "clone_ms": self.clone_ms,
+            "resolve_ms": self.resolve_ms,
+            "walk_ms": self.walk_ms,
+            "parse_ms": self.parse_ms,
+            "mutation_ms": self.mutation_ms,
+            "write_ms": self.write_ms,
+            "total_ms": self.total_ms,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LanguageIngestStats {
+    pub files_indexed: u64,
+    pub symbols_indexed: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IngestSkipStats {
+    pub unsupported_extension: u64,
+    pub filename: u64,
+    pub too_large: u64,
+    pub binary: u64,
+    pub read_error: u64,
+}
+
+impl IngestSkipStats {
+    pub fn total(&self) -> u64 {
+        self.unsupported_extension + self.filename + self.too_large + self.binary + self.read_error
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "unsupported_extension": self.unsupported_extension,
+            "filename": self.filename,
+            "too_large": self.too_large,
+            "binary": self.binary,
+            "read_error": self.read_error,
         })
     }
 }
@@ -1267,55 +1331,147 @@ pub fn build_code_mutations(config: &IngestConfig, files: &[IndexedFile]) -> Vec
     mutations
 }
 
-fn ingest_codebase_with_store(
-    store: &mut RedCoreGraphStore,
+struct PreparedCodebaseIngest {
+    started: Instant,
+    config: IngestConfig,
+    files: Vec<IndexedFile>,
+    mutations: Vec<GraphMutation>,
+    symbols_indexed: u64,
+    files_skipped: u64,
+    stage_timings: IngestStageTimings,
+    language_stats: BTreeMap<String, LanguageIngestStats>,
+    skip_stats: IngestSkipStats,
+}
+
+fn prepare_codebase_ingest_from_url(
+    url: &str,
+    mut input: IngestCodebaseInput,
+    caps: &RepoFetchCaps,
+    _operation: &str,
+) -> Result<PreparedCodebaseIngest, CodeIndexError> {
+    let started = Instant::now();
+    let clone_started = started;
+    let fetched = fetch_repo(url, caps).map_err(|err| CodeIndexError::invalid(err.to_string()))?;
+    let clone_ms = elapsed_ms(clone_started);
+    input.repo_path = fetched.path().display().to_string();
+    if !input.exclude_dirs.iter().any(|dir| dir == ".git") {
+        input.exclude_dirs.push(".git".to_string());
+    }
+    if input.repo_id.trim().is_empty() {
+        input.repo_id = repo_id_from_url(url);
+    }
+    // `fetched` stays alive through preparation and removes the clone after
+    // parsed mutations are materialized in memory.
+    prepare_codebase_ingest_started(input, clone_ms, started)
+}
+
+fn prepare_codebase_ingest(
     input: IngestCodebaseInput,
+    _operation: &str,
+    clone_ms: u64,
+) -> Result<PreparedCodebaseIngest, CodeIndexError> {
+    prepare_codebase_ingest_started(input, clone_ms, Instant::now())
+}
+
+fn prepare_codebase_ingest_started(
+    input: IngestCodebaseInput,
+    clone_ms: u64,
+    started: Instant,
+) -> Result<PreparedCodebaseIngest, CodeIndexError> {
+    let resolve_started = Instant::now();
+    let config = resolve_ingest_config(input)?;
+    let resolve_ms = elapsed_ms(resolve_started);
+
+    let walk_started = Instant::now();
+    let mut candidates = Vec::new();
+    let mut skip_stats = IngestSkipStats::default();
+    collect_code_file_candidates(&config.repo_root, &config, &mut candidates, &mut skip_stats)?;
+    let walk_ms = elapsed_ms(walk_started);
+
+    let parse_started = Instant::now();
+    let (files, parse_skips) = parse_code_file_candidates(&config, &candidates);
+    skip_stats.read_error += parse_skips;
+    let parse_ms = elapsed_ms(parse_started);
+
+    let mutation_started = Instant::now();
+    let mutations = build_code_mutations(&config, &files);
+    let mutation_ms = elapsed_ms(mutation_started);
+    let symbols_indexed = files.iter().map(|file| file.symbols.len() as u64).sum();
+    let language_stats = language_stats_for(&files);
+
+    Ok(PreparedCodebaseIngest {
+        started,
+        config,
+        files,
+        mutations,
+        symbols_indexed,
+        files_skipped: skip_stats.total(),
+        stage_timings: IngestStageTimings {
+            clone_ms,
+            resolve_ms,
+            walk_ms,
+            parse_ms,
+            mutation_ms,
+            ..IngestStageTimings::default()
+        },
+        language_stats,
+        skip_stats,
+    })
+}
+
+fn commit_prepared_ingest(
+    store: &mut RedCoreGraphStore,
+    mut prepared: PreparedCodebaseIngest,
     operation: &str,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    let config = resolve_ingest_config(input)?;
-    let mut collected = Vec::new();
-    let mut skipped = 0u64;
-    collect_code_files(&config.repo_root, &config, &mut collected, &mut skipped)?;
-
-    let mutations = build_code_mutations(&config, &collected);
-    let symbols_indexed: u64 = collected.iter().map(|file| file.symbols.len() as u64).sum();
+    let write_started = Instant::now();
 
     let transaction = store
-        .commit_batch(GraphMutationBatch::new(mutations))
+        .commit_batch(GraphMutationBatch::new(prepared.mutations))
         .map_err(CodeIndexError::from_store)?;
+    prepared.stage_timings.write_ms = elapsed_ms(write_started);
+    prepared.stage_timings.total_ms = elapsed_ms(prepared.started);
 
     let summary = json!({
-        "tenant_id": config.tenant_id,
-        "repo_id": config.repo_id,
-        "repo_root": config.repo_root_display,
-        "generation": config.generation,
+        "tenant_id": prepared.config.tenant_id,
+        "repo_id": prepared.config.repo_id,
+        "repo_root": prepared.config.repo_root_display,
+        "generation": prepared.config.generation,
         "operation": operation,
-        "files_indexed": collected.len(),
-        "symbols_indexed": symbols_indexed,
-        "files_skipped": skipped,
+        "files_indexed": prepared.files.len(),
+        "symbols_indexed": prepared.symbols_indexed,
+        "files_skipped": prepared.files_skipped,
         "graph_version": transaction.graph_version,
-        "actor": config.actor.clone(),
+        "actor": prepared.config.actor.clone(),
+        "stage_timings": prepared.stage_timings.to_json(),
+        "language_stats": language_stats_json(&prepared.language_stats),
+        "skip_stats": prepared.skip_stats.to_json(),
     });
     let receipt = record_receipt(
         store,
-        &config.tenant_id,
+        &prepared.config.tenant_id,
         &format!("code_{operation}"),
         &summary,
     )?;
+    prepared.stage_timings.write_ms = elapsed_ms(write_started);
+    prepared.stage_timings.total_ms = elapsed_ms(prepared.started);
 
     Ok(IngestCodebaseOutput {
-        tenant_id: config.tenant_id,
-        repo_id: config.repo_id,
-        repo_root: config.repo_root_display,
-        generation: config.generation,
-        files_indexed: collected.len() as u64,
-        symbols_indexed,
-        files_skipped: skipped,
+        tenant_id: prepared.config.tenant_id,
+        repo_id: prepared.config.repo_id,
+        repo_root: prepared.config.repo_root_display,
+        generation: prepared.config.generation,
+        files_indexed: prepared.files.len() as u64,
+        symbols_indexed: prepared.symbols_indexed,
+        files_skipped: prepared.files_skipped,
         graph_version: receipt.graph_version,
         receipt_hash: receipt.receipt_hash,
         receipt_json: receipt.receipt_json,
         status: "ok".to_string(),
         message: "codebase indexed into RedCore".to_string(),
+        stage_timings: prepared.stage_timings,
+        language_stats: prepared.language_stats,
+        skip_stats: prepared.skip_stats,
     })
 }
 
@@ -1758,6 +1914,36 @@ pub fn collect_code_files(
     if out.len() >= config.max_files {
         return Ok(());
     }
+    let mut candidates = Vec::new();
+    let mut skip_stats = IngestSkipStats::default();
+    collect_code_file_candidates(dir, config, &mut candidates, &mut skip_stats)?;
+    let (mut files, read_skips) = parse_code_file_candidates(config, &candidates);
+    skip_stats.read_error += read_skips;
+    *skipped += skip_stats.total();
+    out.append(&mut files);
+    if out.len() > config.max_files {
+        out.truncate(config.max_files);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct CodeFileCandidate {
+    path: PathBuf,
+    rel_path: String,
+    extension: String,
+    language: String,
+}
+
+fn collect_code_file_candidates(
+    dir: &Path,
+    config: &IngestConfig,
+    out: &mut Vec<CodeFileCandidate>,
+    skip_stats: &mut IngestSkipStats,
+) -> Result<(), CodeIndexError> {
+    if out.len() >= config.max_files {
+        return Ok(());
+    }
     let entries =
         fs::read_dir(dir).map_err(|err| CodeIndexError::io("read directory", dir, err))?;
     for entry in entries {
@@ -1771,7 +1957,7 @@ pub fn collect_code_files(
             if should_skip_dir(&file_name, &config.exclude_dirs) {
                 continue;
             }
-            collect_code_files(&path, config, out, skipped)?;
+            collect_code_file_candidates(&path, config, out, skip_stats)?;
             if out.len() >= config.max_files {
                 return Ok(());
             }
@@ -1780,45 +1966,128 @@ pub fn collect_code_files(
         if !metadata.is_file() {
             continue;
         }
+        if should_skip_file_name(&file_name) {
+            skip_stats.filename += 1;
+            continue;
+        }
         let extension = extension_for(&path);
         if !config.include_extensions.contains(&extension) {
-            *skipped += 1;
+            skip_stats.unsupported_extension += 1;
             continue;
         }
         if metadata.len() > config.max_file_bytes {
-            *skipped += 1;
+            skip_stats.too_large += 1;
             continue;
         }
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(_) => {
-                *skipped += 1;
+        match has_null_byte_prefix(&path) {
+            Ok(true) => {
+                skip_stats.binary += 1;
                 continue;
             }
-        };
+            Ok(false) => {}
+            Err(_) => {
+                skip_stats.read_error += 1;
+                continue;
+            }
+        }
         let rel_path = relative_path(&config.repo_root, &path)?;
-        let language = language_for_extension(&extension).to_string();
-        let file_id = file_node_id(&config.repo_id, &rel_path);
-        let content_hash = stable_hash(json!({
-            "repo_id": config.repo_id,
-            "path": rel_path,
-            "content": text,
-        }));
-        let symbols = extract_symbols(&config.repo_id, &file_id, &rel_path, &language, &text);
-        out.push(IndexedFile {
-            file_id,
+        out.push(CodeFileCandidate {
+            path,
             rel_path,
-            language,
-            extension,
-            content_hash,
-            text,
-            symbols,
+            extension: extension.clone(),
+            language: language_for_extension(&extension).to_string(),
         });
         if out.len() >= config.max_files {
             return Ok(());
         }
     }
     Ok(())
+}
+
+fn parse_code_file_candidates(
+    config: &IngestConfig,
+    candidates: &[CodeFileCandidate],
+) -> (Vec<IndexedFile>, u64) {
+    let parsed = candidates
+        .par_iter()
+        .map(|candidate| parse_code_file_candidate(config, candidate))
+        .collect::<Vec<_>>();
+    let mut read_skips = 0u64;
+    let mut files = Vec::with_capacity(parsed.len());
+    for item in parsed {
+        match item {
+            Some(file) => files.push(file),
+            None => read_skips += 1,
+        }
+    }
+    (files, read_skips)
+}
+
+fn parse_code_file_candidate(
+    config: &IngestConfig,
+    candidate: &CodeFileCandidate,
+) -> Option<IndexedFile> {
+    let text = fs::read_to_string(&candidate.path).ok()?;
+    let file_id = file_node_id(&config.repo_id, &candidate.rel_path);
+    let content_hash = stable_hash(json!({
+        "repo_id": config.repo_id,
+        "path": candidate.rel_path,
+        "content": text,
+    }));
+    let symbols = extract_symbols(
+        &config.repo_id,
+        &file_id,
+        &candidate.rel_path,
+        &candidate.language,
+        &text,
+    );
+    Some(IndexedFile {
+        file_id,
+        rel_path: candidate.rel_path.clone(),
+        language: candidate.language.clone(),
+        extension: candidate.extension.clone(),
+        content_hash,
+        text,
+        symbols,
+    })
+}
+
+fn has_null_byte_prefix(path: &Path) -> std::io::Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0u8; BINARY_SNIFF_BYTES];
+    let read = file.read(&mut buffer)?;
+    Ok(buffer[..read].contains(&0))
+}
+
+fn language_stats_for(files: &[IndexedFile]) -> BTreeMap<String, LanguageIngestStats> {
+    let mut stats: BTreeMap<String, LanguageIngestStats> = BTreeMap::new();
+    for file in files {
+        let entry = stats.entry(file.language.clone()).or_default();
+        entry.files_indexed += 1;
+        entry.symbols_indexed += file.symbols.len() as u64;
+    }
+    stats
+}
+
+fn language_stats_json(stats: &BTreeMap<String, LanguageIngestStats>) -> Value {
+    Value::Object(
+        stats
+            .iter()
+            .map(|(language, stats)| {
+                (
+                    language.clone(),
+                    json!({
+                        "files_indexed": stats.files_indexed,
+                        "symbols_indexed": stats.symbols_indexed,
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 pub fn resolve_ingest_config(input: IngestCodebaseInput) -> Result<IngestConfig, CodeIndexError> {
@@ -2838,8 +3107,8 @@ fn normalize_set(values: Vec<String>) -> BTreeSet<String> {
 
 fn default_extensions() -> BTreeSet<String> {
     [
-        "rs", "go", "swift", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml",
-        "md", "json",
+        "rs", "go", "swift", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml", "md",
+        "json",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2854,9 +3123,12 @@ fn default_exclude_dirs() -> BTreeSet<String> {
         ".venv",
         "__pycache__",
         "build",
+        "coverage",
         "dist",
         "node_modules",
+        "out",
         "target",
+        "vendor",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2866,6 +3138,26 @@ fn default_exclude_dirs() -> BTreeSet<String> {
 fn should_skip_dir(name: &str, excluded: &BTreeSet<String>) -> bool {
     let lower = name.to_ascii_lowercase();
     excluded.contains(&lower) || lower.starts_with('.')
+}
+
+fn should_skip_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "bun.lock"
+            | "bun.lockb"
+            | "cargo.lock"
+            | "composer.lock"
+            | "deno.lock"
+            | "package-lock.json"
+            | "pdm.lock"
+            | "pnpm-lock.yaml"
+            | "poetry.lock"
+            | "uv.lock"
+            | "yarn.lock"
+    ) || lower.ends_with(".min.css")
+        || lower.ends_with(".min.js")
+        || lower.ends_with(".map")
 }
 
 fn extension_for(path: &Path) -> String {
@@ -3051,11 +3343,7 @@ mod tests {
             "module example.com/boltbrowser\n\ngo 1.22\n",
         )
         .unwrap();
-        fs::write(
-            repo_dir.join("README.md"),
-            "# boltbrowser fixture\n",
-        )
-        .unwrap();
+        fs::write(repo_dir.join("README.md"), "# boltbrowser fixture\n").unwrap();
         fs::write(
             repo_dir.join("main.go"),
             "package main\n\nconst AppName = \"boltbrowser\"\n\ntype Browser struct {\n    title string\n}\n\ntype Screen interface {\n    Draw() string\n}\n\nfunc main() {\n    browser := Browser{title: AppName}\n    _ = browser.Draw()\n}\n\nfunc (browser Browser) Draw() string {\n    return browser.title\n}\n",
@@ -3125,11 +3413,9 @@ mod tests {
         let symbols = store
             .query_nodes(NodeQuery::label(CODE_SYMBOL_LABEL))
             .unwrap();
-        assert!(symbols.iter().any(|node| node
-            .properties
-            .get("name")
-            .and_then(Value::as_str)
-            == Some("helper_len")));
+        assert!(symbols
+            .iter()
+            .any(|node| node.properties.get("name").and_then(Value::as_str) == Some("helper_len")));
 
         fs::remove_dir_all(&repo_dir).ok();
     }
@@ -3159,26 +3445,18 @@ mod tests {
                     .with_limit(100),
             )
             .unwrap();
-        assert!(symbols.iter().any(|node| node
-            .properties
-            .get("language")
-            .and_then(Value::as_str)
-            == Some("go")));
-        assert!(symbols.iter().any(|node| node
-            .properties
-            .get("name")
-            .and_then(Value::as_str)
-            == Some("main")));
-        assert!(symbols.iter().any(|node| node
-            .properties
-            .get("kind")
-            .and_then(Value::as_str)
-            == Some("method")
-            && node
-                .properties
-                .get("name")
-                .and_then(Value::as_str)
-                == Some("Draw")));
+        assert!(symbols
+            .iter()
+            .any(|node| node.properties.get("language").and_then(Value::as_str) == Some("go")));
+        assert!(symbols
+            .iter()
+            .any(|node| node.properties.get("name").and_then(Value::as_str) == Some("main")));
+        assert!(symbols
+            .iter()
+            .any(
+                |node| node.properties.get("kind").and_then(Value::as_str) == Some("method")
+                    && node.properties.get("name").and_then(Value::as_str) == Some("Draw")
+            ));
 
         let search = search_code_in_store(
             &mut store,
@@ -3194,6 +3472,64 @@ mod tests {
         assert!(search.total_returned > 0, "{:?}", search.to_json());
         assert_eq!(search.hits[0].name, "main");
         assert_eq!(search.hits[0].language, "go");
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn ingest_reports_stage_timings_language_stats_and_preread_skips() {
+        let repo_dir = unique_dir("instrumented-repo");
+        fs::create_dir_all(repo_dir.join("src")).unwrap();
+        fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub struct MemoryCore {}\n\npub fn remember() -> MemoryCore {\n    MemoryCore {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("Cargo.lock"),
+            "[[package]]\nname = \"skip\"\n",
+        )
+        .unwrap();
+        fs::write(repo_dir.join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
+        fs::write(
+            repo_dir.join("package-lock.json"),
+            "{\"lockfileVersion\":3}\n",
+        )
+        .unwrap();
+        fs::write(repo_dir.join("app.min.js"), "function minified(){}\n").unwrap();
+        fs::write(repo_dir.join("bundle.js.map"), "{}\n").unwrap();
+        fs::write(repo_dir.join("binary.rs"), b"pub fn hidden() {}\0").unwrap();
+
+        let mut store = RedCoreGraphStore::memory();
+        let ingest = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:instrumented".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let output = ingest.to_json();
+
+        assert_eq!(ingest.files_indexed, 1);
+        assert!(ingest.symbols_indexed >= 2, "{output}");
+        assert_eq!(output["language_stats"]["rust"]["files_indexed"], json!(1));
+        assert!(
+            output["language_stats"]["rust"]["symbols_indexed"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 2,
+            "{output}"
+        );
+        assert_eq!(output["skip_stats"]["filename"], json!(5));
+        assert_eq!(output["skip_stats"]["binary"], json!(1));
+        assert_eq!(ingest.files_skipped, 6);
+        assert!(output["stage_timings"]["walk_ms"].is_u64());
+        assert!(output["stage_timings"]["parse_ms"].is_u64());
+        assert!(output["stage_timings"]["write_ms"].is_u64());
+        assert!(output["stage_timings"]["total_ms"].is_u64());
 
         fs::remove_dir_all(repo_dir).ok();
     }

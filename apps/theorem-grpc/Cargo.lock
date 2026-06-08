@@ -2268,6 +2268,7 @@ dependencies = [
 name = "rustyred-thg-code"
 version = "0.6.0"
 dependencies = [
+ "rayon",
  "rustyred-thg-core",
  "serde_json",
  "syn",

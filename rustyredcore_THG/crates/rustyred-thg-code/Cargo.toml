@@ -7,6 +7,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [dependencies]
+rayon = "1.10"
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 serde_json = "1.0"
 syn = { version = "2", features = ["full", "visit"] }
