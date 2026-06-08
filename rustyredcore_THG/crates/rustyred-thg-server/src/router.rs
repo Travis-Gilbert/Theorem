@@ -1132,6 +1132,7 @@ fn page_observation_from_state(page: &PageState) -> PageObservation {
         url: page.url.clone(),
         title: page.title.clone(),
         distilled_text: page.distilled_text.clone(),
+        active_tab_id: page.active_tab_id.clone(),
         interactive_elements: page
             .interactive_elements
             .iter()
@@ -1141,6 +1142,7 @@ fn page_observation_from_state(page: &PageState) -> PageObservation {
                 name: element.name.clone(),
                 value: element.value.clone(),
                 visible: element.visible,
+                degraded: element.degraded,
             })
             .collect(),
     }
@@ -1163,6 +1165,7 @@ fn page_state_payload(page: &PageState) -> Value {
         "url": page.url,
         "title": page.title,
         "distilled_text": page.distilled_text,
+        "active_tab_id": page.active_tab_id,
         "interactive_elements": page.interactive_elements,
         "fetch": page.fetch.as_ref().map(|fetch| json!({
             "tier_used": fetch.tier_used,

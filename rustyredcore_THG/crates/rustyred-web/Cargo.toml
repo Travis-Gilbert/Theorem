@@ -11,8 +11,14 @@ default = []
 # Browser-fingerprint fetch tier. Pulls wreq (the `rquest` alias) for the client and
 # wreq-util for the Emulation presets; both optional, only built with this feature.
 impersonate-fetch = ["dep:rquest", "dep:wreq-util"]
+# job-007 D1: the real accesskit::TreeUpdate -> A11yTreeUpdate conversion the
+# Servo embedder calls. Off by default so the agent layer stays free of Servo's
+# accesskit version pin; the pure-DTO reader is fully testable without it. When
+# the embedder wires it, reconcile this version with Servo's accesskit pin.
+accesskit = ["dep:accesskit"]
 
 [dependencies]
+accesskit = { version = "0.24", optional = true }
 blake3 = "1.8.5"
 futures-util = "0.3.31"
 lol_html = "2.9.0"

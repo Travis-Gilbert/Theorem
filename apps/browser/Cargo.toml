@@ -13,6 +13,7 @@ publish = false
 # evidence; the embedding API (WebViewBuilder / ServoDelegate / spin_event_loop)
 # moves between revisions.
 [dependencies]
+accesskit = "0.24"
 servo = { git = "https://github.com/servo/servo", rev = "b891f04d0819272b27e80ac975e2e57d3cb9e66b" }
 # Servo exports the WebView hook, but the concrete interception response type
 # lives in the embedder-traits crate at the same pinned rev.
@@ -20,6 +21,7 @@ embedder_traits = { package = "servo-embedder-traits", git = "https://github.com
 # The Servo-free page->substrate seam (LoadedPage -> rustyred-web -> substrate).
 # The WebViewDelegate::load_web_resource hook (step 2) calls into this crate.
 theorem-browser-substrate = { path = "../browser-substrate" }
+rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web", features = ["accesskit"] }
 rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
 scene-os-core = { path = "../../rustyredcore_THG/crates/scene-os-core" }
 scene-os-web = { path = "../../rustyredcore_THG/crates/scene-os-web" }

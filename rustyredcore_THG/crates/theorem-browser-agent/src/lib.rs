@@ -514,6 +514,8 @@ pub struct PageObservation {
     pub url: String,
     pub title: String,
     pub distilled_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab_id: Option<String>,
     #[serde(default)]
     pub interactive_elements: Vec<ObservedElement>,
 }
@@ -527,6 +529,8 @@ pub struct ObservedElement {
     pub value: Option<String>,
     #[serde(default)]
     pub visible: bool,
+    #[serde(default)]
+    pub degraded: bool,
 }
 
 pub fn perceive_with_graph<S: GraphStore>(
@@ -1229,6 +1233,7 @@ mod tests {
                     url: "https://example.com".to_string(),
                     title: "Example".to_string(),
                     distilled_text: "hello".to_string(),
+                    active_tab_id: None,
                     interactive_elements: Vec::new(),
                 }),
                 seed_urls: Vec::new(),

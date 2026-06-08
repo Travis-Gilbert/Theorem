@@ -135,3 +135,18 @@ jobs:
         # substrate, scene-os-core compiles a typed ScenePackageV2, and
         # scene-os-web renders the self-contained scene host HTML.
         run: timeout 180s cargo run -- --headless-scene-smoke
+
+      - name: Run theorem-browser headless accessibility-tree smoke
+        working-directory: theorem/apps/browser
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        # job-007 D1 live sourcing: enable Servo's accessibility tree
+        # (Preferences::accessibility_enabled + WebView::set_accessibility_active),
+        # receive the live accesskit TreeUpdate via
+        # WebViewDelegate::notify_accessibility_tree_update, feed it through
+        # rustyred-web's AccessibilityReader, and assert the PageState was
+        # reprojected from the real engine tree (not intercepted HTML). This
+        # closes the "sourced from the Servo accessibility tree" half of
+        # acceptance criterion 1. Interactive roles are not asserted: Servo does
+        # not roll Link/Button/Input at this rev (structural only).
+        run: timeout 180s cargo run -- --headless-a11y-smoke

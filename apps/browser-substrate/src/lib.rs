@@ -751,6 +751,8 @@ mod tests {
                 block_metadata_services: true,
             },
             respect_robots: true,
+            allow_impersonate: false,
+            rendered_endpoint: None,
         }
     }
 

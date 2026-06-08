@@ -57,6 +57,14 @@ pub use browser_engine::{
     WebConsumeRequest,
 };
 
+pub mod browser_perception;
+pub use browser_perception::{
+    detect_download, extract_structured, keyboard_fallback_for, resolve_upload_path,
+    validate_against_schema, A11yDiff, A11yNode, A11yRect, A11yTreeUpdate, AccessibilityReader,
+    DomainPolicy, DownloadMeta, ExtractOutcome, MaskedText, NavigationDecision, ResponseSignal,
+    SensitiveData, Tab, TabSet, UploadDecision,
+};
+
 pub mod providers;
 pub use providers::{
     configured_search_providers_from_env, BraveSearchProvider, ExaSearchProvider,

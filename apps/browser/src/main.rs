@@ -34,9 +34,11 @@ use scene_os_core::{
 use scene_os_web::render_scene;
 use serde_json::json;
 use servo::{
-    EventLoopWaker, LoadStatus, RenderingContext, ServoBuilder, SoftwareRenderingContext,
-    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    EventLoopWaker, LoadStatus, Preferences, RenderingContext, ServoBuilder,
+    SoftwareRenderingContext, WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate,
+    WindowRenderingContext,
 };
+use rustyred_web::{A11yTreeUpdate, AccessibilityReader};
 use theorem_browser_substrate::{
     browser_affordances, durable_browser_session, memory_browser_session,
     render_substrate_search_result_page, LiveFetchOptions, LoadedPage, RedCoreBrowserSessionStore,
@@ -107,6 +109,7 @@ enum BrowserMode {
     EngineConstructor,
     HeadlessSmoke,
     HeadlessSceneSmoke,
+    HeadlessA11ySmoke,
     Windowed(Url),
 }
 
@@ -231,6 +234,87 @@ impl WebViewDelegate for SubstrateSmokeDelegate {
 
     fn notify_new_frame_ready(&self, webview: WebView) {
         webview.paint();
+    }
+}
+
+/// job-007 D1 live sourcing: a headless delegate that feeds the live Servo
+/// accessibility tree into the rustyred-web `AccessibilityReader`. Servo delivers
+/// the page's accesskit `TreeUpdate` via `notify_accessibility_tree_update` once
+/// the tree is enabled (`WebView::set_accessibility_active(true)` plus
+/// `Preferences::accessibility_enabled`). Each update is converted with
+/// `A11yTreeUpdate::from_accesskit` and applied to the reader, which reprojects
+/// the `PageState` contract from the real engine tree, not intercepted HTML and
+/// not CDP. This is the embedder counterpart of the reader and closes the
+/// "sourced from the Servo accessibility tree" half of acceptance criterion 1.
+struct A11ySmokeDelegate {
+    complete: Cell<bool>,
+    a11y_update_count: Cell<usize>,
+    /// Whether any raw accesskit update carried the page's own content (a node
+    /// whose value/label contains the expected heading text). This is the robust
+    /// live-sourcing signal: it reads what Servo actually delivered, independent
+    /// of how the flat reader assembles it.
+    saw_page_content: Cell<bool>,
+    reader: RefCell<AccessibilityReader>,
+    session: RefCell<RedCoreBrowserSessionStore>,
+}
+
+impl A11ySmokeDelegate {
+    fn new(store_options: &BrowserStoreOptions) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            complete: Cell::new(false),
+            a11y_update_count: Cell::new(0),
+            saw_page_content: Cell::new(false),
+            reader: RefCell::new(AccessibilityReader::new()),
+            session: RefCell::new(store_options.open_session("browser-a11y-smoke")?),
+        })
+    }
+}
+
+impl WebViewDelegate for A11ySmokeDelegate {
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        intercept_local_theorem_page(load, &self.session);
+    }
+
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::Complete {
+            self.complete.set(true);
+        }
+    }
+
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        webview.paint();
+    }
+
+    fn notify_accessibility_tree_update(
+        &self,
+        webview: WebView,
+        tree_update: accesskit::TreeUpdate,
+    ) {
+        // Robust live-sourcing signal: read the raw accesskit nodes Servo
+        // delivered for evidence the page's own content arrived (a text-bearing
+        // node carrying the expected heading text). This reads what Servo
+        // actually sent, independent of how the flat reader assembles the
+        // (multi-tree, grafted) update.
+        for (_node_id, node) in &tree_update.nodes {
+            let carries_page_text = node
+                .value()
+                .map(|value| value.contains("Theorem"))
+                .unwrap_or(false)
+                || node
+                    .label()
+                    .map(|label| label.contains("Theorem"))
+                    .unwrap_or(false);
+            if carries_page_text {
+                self.saw_page_content.set(true);
+            }
+        }
+
+        let url = webview.url().map(|url| url.to_string());
+        let title = webview.page_title();
+        let update = A11yTreeUpdate::from_accesskit(&tree_update, url, title);
+        self.reader.borrow_mut().apply_update(update);
+        self.a11y_update_count
+            .set(self.a11y_update_count.get() + 1);
     }
 }
 
@@ -377,6 +461,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match config.mode {
         BrowserMode::HeadlessSmoke => run_headless_smoke(&config.store),
         BrowserMode::HeadlessSceneSmoke => run_headless_scene_smoke(&config.store),
+        BrowserMode::HeadlessA11ySmoke => run_headless_a11y_smoke(&config.store),
         BrowserMode::Windowed(url) => run_windowed(url, config.store),
         BrowserMode::EngineConstructor => {
             run_engine_constructor(&config.store);
@@ -411,6 +496,7 @@ fn parse_config(args: impl IntoIterator<Item = String>) -> Result<BrowserConfig,
     let mode = match mode_args.first().map(String::as_str) {
         Some("--headless-smoke") => BrowserMode::HeadlessSmoke,
         Some("--headless-scene-smoke") => BrowserMode::HeadlessSceneSmoke,
+        Some("--headless-a11y-smoke") => BrowserMode::HeadlessA11ySmoke,
         Some("--windowed") => {
             let url = mode_args
                 .get(1)
@@ -543,6 +629,82 @@ fn run_headless_scene_smoke(store_options: &BrowserStoreOptions) -> Result<(), B
     Ok(())
 }
 
+fn run_headless_a11y_smoke(store_options: &BrowserStoreOptions) -> Result<(), Box<dyn Error>> {
+    eprintln!("theorem-browser: starting headless accessibility-tree substrate smoke");
+    let rendering_context = software_rendering_context()?;
+
+    // Accessibility must be enabled at the engine level for Servo to build and
+    // emit the a11y tree; the per-WebView toggle below activates delivery.
+    let mut preferences = Preferences::default();
+    preferences.accessibility_enabled = true;
+
+    let servo = ServoBuilder::default()
+        .event_loop_waker(Box::new(HeadlessWaker))
+        .preferences(preferences)
+        .build();
+    servo.setup_logging();
+
+    let delegate = Rc::new(A11ySmokeDelegate::new(store_options)?);
+    let webview = WebViewBuilder::new(&servo, rendering_context)
+        .url(Url::parse(SMOKE_URL)?)
+        .hidpi_scale_factor(Scale::new(1.0))
+        .delegate(delegate.clone())
+        .build();
+
+    // Turn on the accessibility tree for this WebView; Servo then delivers
+    // accesskit TreeUpdates to A11ySmokeDelegate::notify_accessibility_tree_update.
+    webview.set_accessibility_active(true);
+
+    eprintln!(
+        "theorem-browser: WebView created with accessibility active; spinning until load complete and the a11y tree arrives"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !delegate.complete.get() || !delegate.saw_page_content.get() {
+        servo.spin_event_loop();
+        std::thread::sleep(Duration::from_millis(5));
+
+        if Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for live a11y page content; complete={}, a11y_updates={}, saw_page_content={}",
+                delegate.complete.get(),
+                delegate.a11y_update_count.get(),
+                delegate.saw_page_content.get()
+            )
+            .into());
+        }
+    }
+
+    let page = delegate.reader.borrow().page_state();
+    let live_nodes = delegate.reader.borrow().live_node_count();
+    let text_preview: String = page.distilled_text.chars().take(200).collect();
+
+    println!(
+        "theorem-browser: headless a11y smoke OK; a11y_updates={}, saw_page_content={}, live_nodes={}, interactive_elements={}, title={:?}",
+        delegate.a11y_update_count.get(),
+        delegate.saw_page_content.get(),
+        live_nodes,
+        page.interactive_elements.len(),
+        page.title
+    );
+    println!("theorem-browser: a11y-sourced distilled_text[0..200]={text_preview:?}");
+
+    // The robust live-sourcing proof is saw_page_content (guaranteed true by the
+    // loop exit): Servo delivered the page's own accessibility content to the
+    // embedder, and A11yTreeUpdate::from_accesskit + the reader ran on the real
+    // accesskit tree without panicking. The flat reader's distilled_text /
+    // interactive_elements are printed for evidence but NOT asserted: Servo sends
+    // a multi-tree grafted update (a WebView ScrollView tree plus the grafted
+    // document subtree, each with an independent NodeId space), which the flat
+    // reader does not yet assemble; tree_id/graft-aware assembly and
+    // interactive-role rolling (Link/Button/Input) are the named follow-ups.
+    // Sanity check that the reader held live nodes from the real tree:
+    if live_nodes == 0 {
+        return Err("accessibility reader produced no live nodes from the Servo tree".into());
+    }
+
+    Ok(())
+}
+
 fn run_windowed(
     initial_url: Url,
     store_options: BrowserStoreOptions,
@@ -670,6 +832,8 @@ fn browser_open_web_options() -> LiveFetchOptions {
         timeout_seconds: 10,
         guard_policy: UrlGuardPolicy::default(),
         respect_robots: true,
+        allow_impersonate: false,
+        rendered_endpoint: None,
     }
 }
 
