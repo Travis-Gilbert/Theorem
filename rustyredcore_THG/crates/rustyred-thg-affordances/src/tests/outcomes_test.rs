@@ -97,6 +97,50 @@ fn record_invocation_writes_receipt_edges_and_updates_fitness() {
 }
 
 #[test]
+fn confirmation_required_records_receipt_without_changing_fitness() {
+    let mut store = InMemoryGraphStore::new();
+    register_connector(&mut store, manifest(), Some("test")).unwrap();
+
+    let selected_node_id = affordance_node_id("theorem", "github.create_issue");
+    let before = store.get_node(&selected_node_id).cloned().unwrap();
+    let before_fitness = before.properties["fitness"].as_f64().unwrap();
+    assert!(before.properties.get("fitness_updated_at_ms").is_none());
+
+    let mut denied = invocation("github.create_issue", "triage_issue", None);
+    denied.outcome_value = 0.0;
+    denied.outcome_weight = 1.0;
+    denied.outcome_label = "confirmation_required".to_string();
+
+    let result = record_invocation(&mut store, denied, Some("test")).unwrap();
+    let after = store.get_node(&selected_node_id).cloned().unwrap();
+    let after_fitness = after.properties["fitness"].as_f64().unwrap();
+    assert_eq!(after_fitness, before_fitness);
+    assert!(after.properties.get("fitness_updated_at_ms").is_none());
+    assert_eq!(result.effective_fitness, DEFAULT_BASE_FITNESS);
+
+    let receipt = store.get_node(&result.receipt_node_id).cloned().unwrap();
+    assert_eq!(receipt.properties["outcome_label"], "confirmation_required");
+    assert_eq!(receipt.properties["fitness_observed"], json!(false));
+}
+
+#[test]
+fn non_policy_failure_still_lowers_fitness() {
+    let mut store = InMemoryGraphStore::new();
+    register_connector(&mut store, manifest(), Some("test")).unwrap();
+
+    let mut failed = invocation("github.create_issue", "triage_issue", None);
+    failed.outcome_value = 0.0;
+    failed.outcome_weight = 1.0;
+    failed.outcome_label = "handler_failed".to_string();
+
+    let result = record_invocation(&mut store, failed, Some("test")).unwrap();
+    assert!(
+        result.effective_fitness < DEFAULT_BASE_FITNESS,
+        "ordinary failed execution should still lower fitness"
+    );
+}
+
+#[test]
 fn sequenced_with_links_consecutive_selections() {
     let mut store = InMemoryGraphStore::new();
     register_connector(&mut store, manifest(), Some("test")).unwrap();

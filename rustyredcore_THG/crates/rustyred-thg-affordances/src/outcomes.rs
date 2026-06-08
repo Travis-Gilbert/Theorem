@@ -61,6 +61,7 @@ pub fn record_invocation<S: AffordanceGraphStore>(
     let recorded_at_ms = req.recorded_at_ms.unwrap_or_else(now_ms);
     let value = req.outcome_value.clamp(0.0, 1.0);
     let weight = req.outcome_weight.max(0.0);
+    let fitness_observed = !is_fitness_neutral_outcome(&req.outcome_label);
 
     // Fitness EWMA (mirrors the adapter catalog): heavier observations move
     // the estimate more; the estimate decays over time on read.
@@ -70,8 +71,11 @@ pub fn record_invocation<S: AffordanceGraphStore>(
     } else {
         (weight / (weight + 4.0)).clamp(0.0, 1.0)
     };
-    let updated_fitness =
-        (old_fitness + alpha * (value - old_fitness)).clamp(DEFAULT_FITNESS_EPSILON, 1.0);
+    let updated_fitness = if fitness_observed {
+        (old_fitness + alpha * (value - old_fitness)).clamp(DEFAULT_FITNESS_EPSILON, 1.0)
+    } else {
+        old_fitness
+    };
 
     let task_type_node = task_type_node_id(&tenant_id, &task_type);
 
@@ -95,6 +99,7 @@ pub fn record_invocation<S: AffordanceGraphStore>(
     payload.insert("outcome_value".to_string(), json!(value));
     payload.insert("outcome_weight".to_string(), json!(weight));
     payload.insert("outcome_label".to_string(), json!(req.outcome_label));
+    payload.insert("fitness_observed".to_string(), json!(fitness_observed));
     payload.insert("graph_version".to_string(), json!(graph_version));
     payload.insert("recorded_at_ms".to_string(), json!(recorded_at_ms));
     let receipt = AffordanceReceipt::new(&selected.server_id, &selected_id, input_hash, payload)
@@ -129,6 +134,7 @@ pub fn record_invocation<S: AffordanceGraphStore>(
             "outcome_value": value,
             "outcome_weight": weight,
             "outcome_label": req.outcome_label,
+            "fitness_observed": fitness_observed,
             "graph_version": graph_version,
             "recorded_at_ms": recorded_at_ms,
             "receipt": receipt_value,
@@ -136,18 +142,20 @@ pub fn record_invocation<S: AffordanceGraphStore>(
         }),
     )));
 
-    // Update the selected affordance's fitness.
-    let mut updated_node = selected_node.clone();
-    updated_node.properties["fitness"] = json!(updated_fitness);
-    updated_node.properties["fitness_updated_at_ms"] = json!(recorded_at_ms);
-    if updated_node
-        .properties
-        .get("fitness_half_life_days")
-        .is_none()
-    {
-        updated_node.properties["fitness_half_life_days"] = json!(DEFAULT_HALF_LIFE_DAYS);
+    // Update the selected affordance's fitness only for tool-quality observations.
+    if fitness_observed {
+        let mut updated_node = selected_node.clone();
+        updated_node.properties["fitness"] = json!(updated_fitness);
+        updated_node.properties["fitness_updated_at_ms"] = json!(recorded_at_ms);
+        if updated_node
+            .properties
+            .get("fitness_half_life_days")
+            .is_none()
+        {
+            updated_node.properties["fitness_half_life_days"] = json!(DEFAULT_HALF_LIFE_DAYS);
+        }
+        mutations.push(GraphMutation::NodeUpsert(updated_node));
     }
-    mutations.push(GraphMutation::NodeUpsert(updated_node));
 
     // SERVED_TASK: selected affordance -> task type (stable; strengthens via
     // the affordance node fitness rather than per-edge weight).
@@ -257,6 +265,19 @@ pub fn affordance_nodes<S: AffordanceGraphStore>(store: &S) -> ThgResult<Vec<Nod
 
 fn served_task_edge_id(affordance_node_id: &str, task_type_node_id: &str) -> String {
     format!("edge:{affordance_node_id}:served_task:{task_type_node_id}")
+}
+
+fn is_fitness_neutral_outcome(label: &str) -> bool {
+    let normalized = label.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "confirmation_required"
+            | "confirmation_denied"
+            | "approval_required"
+            | "approval_denied"
+            | "policy_denied"
+            | "policy_blocked"
+    )
 }
 
 fn produced_outcome_edge_id(affordance_node_id: &str, receipt_node_id: &str) -> String {

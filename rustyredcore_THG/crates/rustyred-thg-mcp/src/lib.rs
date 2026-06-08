@@ -209,10 +209,7 @@ pub trait McpGraphBackend {
             .or_else(|| arguments.get("dryRun"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let confirmed = arguments
-            .get("confirmed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let confirmed = app_affordance_confirmed(arguments);
         let mut request = arguments.clone();
         if let Some(object) = request.as_object_mut() {
             object.remove("operation");
@@ -224,7 +221,7 @@ pub trait McpGraphBackend {
             object.remove("timeoutMs");
             object.remove("dry_run");
             object.remove("dryRun");
-            object.remove("confirmed");
+            remove_app_affordance_confirmation_controls(object);
         }
         let response = self.invoke_app_affordance(AppAffordanceInvocation {
             tenant_id: tenant.to_string(),
@@ -7356,7 +7353,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "use": { "type": "object" },
                     "actor": { "type": "string" },
                     "timeout_ms": { "type": "integer" },
-                    "dry_run": { "type": "boolean", "default": false }
+                    "dry_run": { "type": "boolean", "default": false },
+                    "confirmed": { "type": "boolean", "default": false }
                 }
             }),
         ),
@@ -7395,7 +7393,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "use": { "type": "object" },
                     "actor": { "type": "string" },
                     "timeout_ms": { "type": "integer" },
-                    "dry_run": { "type": "boolean", "default": false }
+                    "dry_run": { "type": "boolean", "default": false },
+                    "confirmed": { "type": "boolean", "default": false }
                 }
             }),
         ),
@@ -9202,6 +9201,52 @@ impl McpGraphBackend for rustyred_thg_core::RedisGraphStore {
     }
 }
 
+fn app_affordance_confirmed(arguments: &Value) -> bool {
+    truthy_confirmation_value(arguments.get("confirmed"))
+        || truthy_confirmation_value(arguments.get("use").and_then(|value| value.get("confirmed")))
+        || confirmation_action(arguments.get("action"))
+}
+
+fn truthy_confirmation_value(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "y" | "1" | "confirm" | "confirmed"
+        ),
+        _ => false,
+    }
+}
+
+fn confirmation_action(value: Option<&Value>) -> bool {
+    matches!(
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("confirm" | "confirmed" | "approve" | "approved")
+    )
+}
+
+fn remove_app_affordance_confirmation_controls(object: &mut Map<String, Value>) {
+    object.remove("confirmed");
+    if confirmation_action(object.get("action")) {
+        object.remove("action");
+    }
+    let remove_empty_use = object
+        .get_mut("use")
+        .and_then(Value::as_object_mut)
+        .map(|use_object| {
+            use_object.remove("confirmed");
+            use_object.is_empty()
+        })
+        .unwrap_or(false);
+    if remove_empty_use {
+        object.remove("use");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -9781,6 +9826,14 @@ mod tests {
         assert!(has_tool(tools, "observe"));
         assert!(has_tool(tools, "code_search"));
         assert!(has_tool(tools, "compute_code"));
+        assert_eq!(
+            tool_by_name(tools, "code_search")["inputSchema"]["properties"]["confirmed"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["confirmed"]["type"],
+            "boolean"
+        );
         assert!(has_tool(tools, "ensemble_select"));
         assert!(tools
             .iter()
@@ -9874,6 +9927,61 @@ mod tests {
             routed["app_affordance"]["request"]["query"],
             "graph store persistence"
         );
+    }
+
+    #[test]
+    fn code_search_forwards_confirmation_from_tool_control_shapes() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let via_use = call_tool_json(
+            &provider,
+            &config,
+            "code_search",
+            json!({
+                "tenant": "smoke",
+                "operation": "ingest",
+                "repo_path": "/tmp/theorem-fixture",
+                "use": { "confirmed": true },
+                "actor": "codex",
+            }),
+        );
+        assert_eq!(via_use["app_affordance"]["confirmed"], json!(true));
+        assert!(via_use["app_affordance"]["request"].get("use").is_none());
+
+        let via_action = call_tool_json(
+            &provider,
+            &config,
+            "code_search",
+            json!({
+                "tenant": "smoke",
+                "operation": "ingest",
+                "repo_path": "/tmp/theorem-fixture",
+                "action": "confirm",
+                "actor": "codex",
+            }),
+        );
+        assert_eq!(via_action["app_affordance"]["confirmed"], json!(true));
+        assert!(via_action["app_affordance"]["request"]
+            .get("action")
+            .is_none());
+
+        let via_top_level = call_tool_json(
+            &provider,
+            &config,
+            "compute_code",
+            json!({
+                "tenant": "smoke",
+                "operation": "ingest",
+                "repo_path": "/tmp/theorem-fixture",
+                "confirmed": true,
+                "actor": "codex",
+            }),
+        );
+        assert_eq!(via_top_level["app_affordance"]["confirmed"], json!(true));
+        assert!(via_top_level["app_affordance"]["request"]
+            .get("confirmed")
+            .is_none());
     }
 
     #[test]
