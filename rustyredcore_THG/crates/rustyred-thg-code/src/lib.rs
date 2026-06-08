@@ -18,6 +18,9 @@ use rustyred_thg_core::{
 use serde_json::{json, Value};
 use syn::visit::Visit;
 
+mod repo_fetch;
+pub use repo_fetch::{fetch_repo, FetchedRepo, RepoFetchCaps, RepoFetchError};
+
 pub const CODE_REPO_LABEL: &str = "CodeRepository";
 pub const CODE_FILE_LABEL: &str = "CodeFile";
 pub const CODE_SYMBOL_LABEL: &str = "CodeSymbol";
@@ -359,6 +362,36 @@ pub fn reindex_codebase_in_store(
     ingest_codebase_with_store(store, input, "reindex")
 }
 
+/// CA-1: ingest a repository given a remote URL. Shallow-clones it into a
+/// quarantined tempdir (removed after ingest), then runs the normal in-store
+/// ingest over the local checkout. The clone's `.git` dir is always excluded,
+/// and `repo_id` defaults to a slug derived from the URL when not supplied.
+pub fn ingest_codebase_from_url_in_store(
+    store: &mut RedCoreGraphStore,
+    url: &str,
+    mut input: IngestCodebaseInput,
+    caps: &RepoFetchCaps,
+) -> Result<IngestCodebaseOutput, CodeIndexError> {
+    let fetched = fetch_repo(url, caps).map_err(|err| CodeIndexError::invalid(err.to_string()))?;
+    input.repo_path = fetched.path().display().to_string();
+    if !input.exclude_dirs.iter().any(|dir| dir == ".git") {
+        input.exclude_dirs.push(".git".to_string());
+    }
+    if input.repo_id.trim().is_empty() {
+        input.repo_id = repo_id_from_url(url);
+    }
+    // `fetched` stays alive across the ingest and removes the clone on drop.
+    ingest_codebase_in_store(store, input)
+}
+
+/// Best-effort stable repo id from a clone URL: `repo:<last-path-segment>`.
+fn repo_id_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let slug = trimmed.rsplit(['/', ':']).next().filter(|s| !s.is_empty());
+    format!("repo:{}", slug.unwrap_or("repo"))
+}
+
 pub fn search_code_in_store(
     store: &mut RedCoreGraphStore,
     input: SearchCodeInput,
@@ -419,6 +452,7 @@ fn handle_ingest_code_operation(
     context: PluginOperationContext<'_>,
     arguments: Value,
 ) -> GraphStoreResult<Value> {
+    let repo_url = code_plugin_arg_string(&arguments, &["repo_url", "repoUrl", "url"]);
     let input = IngestCodebaseInput {
         tenant_id: context.tenant_id.to_string(),
         repo_path: code_plugin_arg_string(&arguments, &["repo_path", "repoPath"]),
@@ -432,7 +466,16 @@ fn handle_ingest_code_operation(
         max_file_bytes: code_plugin_arg_u64(&arguments, &["max_file_bytes", "maxFileBytes"]),
         actor: code_plugin_arg_string(&arguments, &["actor", "actor_id", "actorId"]),
     };
-    let output = if context.operation == "reindex" {
+    let output = if !repo_url.trim().is_empty() {
+        // CA-1: ingest by URL -> shallow clone into a quarantined tempdir ->
+        // ingest the local checkout (the clone is removed afterward).
+        ingest_codebase_from_url_in_store(
+            context.store,
+            &repo_url,
+            input,
+            &RepoFetchCaps::default(),
+        )?
+    } else if context.operation == "reindex" {
         reindex_codebase_in_store(context.store, input)?
     } else {
         ingest_codebase_in_store(context.store, input)?
@@ -2903,6 +2946,70 @@ mod tests {
         .unwrap();
         let store_dir = unique_dir("store");
         (repo_dir, store_dir)
+    }
+
+    /// Turn a fixture dir into a real git repo with one commit, so it can be
+    /// cloned via `file://` with no network. Returns false if git is absent.
+    fn init_git_fixture(dir: &Path) -> bool {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        run(&["init", "--quiet"])
+            && run(&["config", "user.email", "fixture@example.com"])
+            && run(&["config", "user.name", "Fixture"])
+            && run(&["add", "."])
+            && run(&["commit", "--quiet", "-m", "fixture"])
+    }
+
+    #[test]
+    fn fetch_repo_rejects_unsafe_or_unsupported_urls() {
+        let caps = RepoFetchCaps::default();
+        assert!(fetch_repo("", &caps).is_err());
+        // A leading '-' would be parsed by git as a flag, not a url.
+        assert!(fetch_repo("--upload-pack=evil", &caps).is_err());
+        assert!(fetch_repo("ftp://example.com/repo.git", &caps).is_err());
+        assert!(fetch_repo("/etc/passwd", &caps).is_err());
+    }
+
+    #[test]
+    fn ingest_from_url_clones_local_repo_and_indexes() {
+        let (repo_dir, _store_dir) = write_fixture_repo();
+        if !init_git_fixture(&repo_dir) {
+            // git unavailable in this environment; skip rather than fail.
+            fs::remove_dir_all(&repo_dir).ok();
+            return;
+        }
+        let url = format!("file://{}", repo_dir.display());
+        let mut store = RedCoreGraphStore::memory();
+        let out = ingest_codebase_from_url_in_store(
+            &mut store,
+            &url,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                ..Default::default()
+            },
+            &RepoFetchCaps::default(),
+        )
+        .unwrap();
+        // Only the two source files are recognized code; `.git` is excluded.
+        assert_eq!(out.files_indexed, 2);
+        assert!(out.repo_id.starts_with("repo:"));
+
+        let symbols = store
+            .query_nodes(NodeQuery::label(CODE_SYMBOL_LABEL))
+            .unwrap();
+        assert!(symbols.iter().any(|node| node
+            .properties
+            .get("name")
+            .and_then(Value::as_str)
+            == Some("helper_len")));
+
+        fs::remove_dir_all(&repo_dir).ok();
     }
 
     #[test]
