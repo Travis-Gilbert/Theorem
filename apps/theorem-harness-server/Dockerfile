@@ -10,6 +10,9 @@ COPY apps/theorem-harness-server ./apps/theorem-harness-server
 COPY rustyredcore_THG/crates/theorem-harness-core ./rustyredcore_THG/crates/theorem-harness-core
 COPY rustyredcore_THG/crates/theorem-harness-runtime ./rustyredcore_THG/crates/theorem-harness-runtime
 COPY rustyredcore_THG/crates/rustyred-thg-core ./rustyredcore_THG/crates/rustyred-thg-core
+# theorem-harness-runtime path-depends on prose-check (deterministic style checker
+# for receipts); its source must be in the build context or cargo resolution fails.
+COPY rustyredcore_THG/crates/prose-check ./rustyredcore_THG/crates/prose-check
 # Connector driving surface (slice 3) path-deps: the harness-server Cargo.toml
 # pulls in rustyred-thg-connectors + rustyred-thg-affordances, so their sources
 # must be in the build context too (connectors -> affordances -> core/harness-core,
