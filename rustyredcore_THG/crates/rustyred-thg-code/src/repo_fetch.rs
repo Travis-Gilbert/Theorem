@@ -14,6 +14,14 @@ use std::time::{Duration, Instant};
 
 use rustyred_thg_core::stable_hash;
 
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const ABSOLUTE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_CLONE_TIMEOUT_MS: u64 = 20_000;
+const MAX_TOTAL_BYTES_ENV: [&str; 2] = [
+    "THEOREM_CODE_FETCH_MAX_TOTAL_BYTES",
+    "RUSTYRED_THG_CODE_FETCH_MAX_TOTAL_BYTES",
+];
+
 /// Caps on what a single fetch may pull onto local disk.
 #[derive(Clone, Debug)]
 pub struct RepoFetchCaps {
@@ -25,15 +33,34 @@ pub struct RepoFetchCaps {
 
 impl Default for RepoFetchCaps {
     fn default() -> Self {
-        // 512 MiB: large enough for real repositories, small enough to bound a
-        // hostile or runaway clone on a constrained runtime. The clone timeout
-        // sits below theorem-grpc's default 30s deadline, leaving room for
-        // indexing and receipt writeback on ordinary repos.
         Self {
-            max_total_bytes: 512 * 1024 * 1024,
-            clone_timeout_ms: 20_000,
+            max_total_bytes: configured_default_max_total_bytes(),
+            clone_timeout_ms: DEFAULT_CLONE_TIMEOUT_MS,
         }
     }
+}
+
+impl RepoFetchCaps {
+    pub fn from_requested(max_total_bytes: u64) -> Self {
+        let mut caps = Self::default();
+        if max_total_bytes > 0 {
+            caps.max_total_bytes = max_total_bytes.min(ABSOLUTE_MAX_TOTAL_BYTES);
+        }
+        caps
+    }
+}
+
+fn configured_default_max_total_bytes() -> u64 {
+    MAX_TOTAL_BYTES_ENV
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .filter(|bytes| *bytes > 0)
+        })
+        .unwrap_or(DEFAULT_MAX_TOTAL_BYTES)
+        .min(ABSOLUTE_MAX_TOTAL_BYTES)
 }
 
 /// A cloned repository on local disk. Removed on drop unless `keep()` is taken.

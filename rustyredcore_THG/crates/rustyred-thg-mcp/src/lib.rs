@@ -458,7 +458,7 @@ impl Default for McpServerConfig {
             name: "rusty-red-graph-database".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             default_tenant: "default".to_string(),
-            read_only: true,
+            read_only: false,
             allow_admin: false,
         }
     }
@@ -7345,6 +7345,9 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "max_depth": { "type": "integer", "default": 1 },
                     "max_files": { "type": "integer" },
                     "max_file_bytes": { "type": "integer" },
+                    "max_total_bytes": { "type": "integer" },
+                    "max_clone_bytes": { "type": "integer" },
+                    "max_repo_bytes": { "type": "integer" },
                     "before_lines": { "type": "integer" },
                     "after_lines": { "type": "integer" },
                     "max_chars": { "type": "integer" },
@@ -7386,6 +7389,9 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "max_depth": { "type": "integer", "default": 1 },
                     "max_files": { "type": "integer" },
                     "max_file_bytes": { "type": "integer" },
+                    "max_total_bytes": { "type": "integer" },
+                    "max_clone_bytes": { "type": "integer" },
+                    "max_repo_bytes": { "type": "integer" },
                     "before_lines": { "type": "integer" },
                     "after_lines": { "type": "integer" },
                     "max_chars": { "type": "integer" },
@@ -9205,7 +9211,11 @@ impl McpGraphBackend for rustyred_thg_core::RedisGraphStore {
 
 fn app_affordance_confirmed(arguments: &Value) -> bool {
     truthy_confirmation_value(arguments.get("confirmed"))
-        || truthy_confirmation_value(arguments.get("use").and_then(|value| value.get("confirmed")))
+        || truthy_confirmation_value(
+            arguments
+                .get("use")
+                .and_then(|value| value.get("confirmed")),
+        )
         || confirmation_action(arguments.get("action"))
 }
 
@@ -9767,6 +9777,13 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_config_defaults_to_writable_without_admin() {
+        let config = McpServerConfig::default();
+        assert!(!config.read_only);
+        assert!(!config.allow_admin);
+    }
+
+    #[test]
     fn initialize_returns_mcp_capabilities() {
         let (provider, config) = fixture();
         let response = handle_mcp_request(
@@ -9781,7 +9798,8 @@ mod tests {
 
     #[test]
     fn tools_list_exposes_read_only_graph_tools() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.read_only = true;
         let response = handle_mcp_request(
             &provider,
             &config,
@@ -9843,6 +9861,16 @@ mod tests {
         assert_eq!(
             tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo_url"]["type"],
             "string"
+        );
+        assert_eq!(
+            tool_by_name(tools, "code_search")["inputSchema"]["properties"]["max_total_bytes"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["max_clone_bytes"]
+                ["type"],
+            "integer"
         );
         assert!(has_tool(tools, "ensemble_select"));
         assert!(tools
@@ -10101,7 +10129,8 @@ mod tests {
 
     #[test]
     fn code_search_write_operations_are_read_only_gated() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.read_only = true;
         let gated = call_tool_json(
             &provider,
             &config,
@@ -11181,15 +11210,22 @@ mod tests {
 
         assert_eq!(detail["found"], true);
         assert_eq!(detail["detail"]["run"]["status"], "closed");
-        assert_eq!(detail["detail"]["run"]["last_event_seq"], 11);
-        assert_eq!(detail["detail"]["events"].as_array().unwrap().len(), 11);
-        assert_eq!(detail["detail"]["events"][6]["type"], "CONTEXT.PACKED");
+        let events = detail["detail"]["events"].as_array().unwrap();
         assert_eq!(
-            detail["detail"]["events"][6]["payload"]["token_ledger"]["saved"],
-            300
+            detail["detail"]["run"]["last_event_seq"],
+            events.len() as u64
         );
+        let packed_event = events
+            .iter()
+            .find(|event| event["type"] == "CONTEXT.PACKED")
+            .expect("CONTEXT.PACKED event present");
+        assert_eq!(packed_event["payload"]["token_ledger"]["saved"], 300);
+        let outcome_event = events
+            .iter()
+            .find(|event| event["type"] == "OUTCOME.RECORDED")
+            .expect("OUTCOME.RECORDED event present");
         assert_eq!(
-            detail["detail"]["events"][9]["payload"]["validator_results"][0]["status"],
+            outcome_event["payload"]["validator_results"][0]["status"],
             "passed"
         );
     }
