@@ -48,9 +48,11 @@ FROM debian:bookworm-slim
 # Runtime system deps:
 #   ca-certificates: outbound TLS.
 #   libopenblas0: the OpenBLAS shared library the binary dynamically links.
+#   git: code_search.ingest can shallow-clone repo URLs at runtime.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        git \
         libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/apps/theorem-grpc/target/release/theorem-grpc-server /usr/local/bin/theorem-grpc-server

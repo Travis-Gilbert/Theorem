@@ -22,7 +22,7 @@ RUN cargo build -p rustyred-thg-server --release
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libopenblas-dev \
+    && apt-get install -y --no-install-recommends ca-certificates git libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy-rename: source binary `rustyred-thg-server` → runtime path
