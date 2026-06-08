@@ -40,11 +40,10 @@ use theorem_harness_runtime::{
     CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
     CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
     HarnessRuntimeError, JobActionResult, JobCompletion, JobOutcome, JoinRoomInput, MemoryError,
-    MemoryGraphStore, MemoryWriteInput,
-    PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput,
-    SkillPackError, SkillPackGetInput, SkillPackGraphStore, SkillPackListInput,
-    SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
-    EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
+    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
+    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
+    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
+    WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -213,6 +212,62 @@ pub trait McpGraphBackend {
         Err(McpError::internal(
             "app affordance invocation is not supported by this MCP backend",
         ))
+    }
+    fn invoke_code_search(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        let affordance_id = format!("theorem_grpc.code_search.{operation}");
+        let actor = arguments
+            .get("actor")
+            .or_else(|| arguments.get("actor_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("theorem-harness-mcp")
+            .to_string();
+        let timeout_ms = arguments
+            .get("timeout_ms")
+            .or_else(|| arguments.get("timeoutMs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let dry_run = arguments
+            .get("dry_run")
+            .or_else(|| arguments.get("dryRun"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let confirmed = arguments
+            .get("confirmed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut request = arguments.clone();
+        if let Some(object) = request.as_object_mut() {
+            object.remove("operation");
+            object.remove("mode");
+            object.remove("verb");
+            object.remove("tenant");
+            object.remove("tenant_slug");
+            object.remove("timeout_ms");
+            object.remove("timeoutMs");
+            object.remove("dry_run");
+            object.remove("dryRun");
+            object.remove("confirmed");
+        }
+        let response = self.invoke_app_affordance(AppAffordanceInvocation {
+            tenant_id: tenant.to_string(),
+            affordance_id: affordance_id.clone(),
+            actor,
+            request,
+            dry_run,
+            confirmed,
+            timeout_ms,
+        })?;
+        Ok(json!({
+            "tenant": tenant,
+            "operation": operation,
+            "affordance_id": affordance_id,
+            "app_affordance": response,
+        }))
     }
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>>;
     fn designate_vector_property(
@@ -3496,55 +3551,7 @@ fn code_search_payload(
     arguments: &Value,
     operation: &str,
 ) -> Result<Value, McpError> {
-    let affordance_id = format!("theorem_grpc.code_search.{operation}");
-    let actor = arguments
-        .get("actor")
-        .or_else(|| arguments.get("actor_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("theorem-harness-mcp")
-        .to_string();
-    let timeout_ms = arguments
-        .get("timeout_ms")
-        .or_else(|| arguments.get("timeoutMs"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let dry_run = arguments
-        .get("dry_run")
-        .or_else(|| arguments.get("dryRun"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let confirmed = arguments
-        .get("confirmed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut request = arguments.clone();
-    if let Some(object) = request.as_object_mut() {
-        object.remove("operation");
-        object.remove("mode");
-        object.remove("verb");
-        object.remove("tenant");
-        object.remove("tenant_slug");
-        object.remove("timeout_ms");
-        object.remove("timeoutMs");
-        object.remove("dry_run");
-        object.remove("dryRun");
-        object.remove("confirmed");
-    }
-    let response = backend.invoke_app_affordance(AppAffordanceInvocation {
-        tenant_id: tenant.to_string(),
-        affordance_id: affordance_id.clone(),
-        actor,
-        request,
-        dry_run,
-        confirmed,
-        timeout_ms,
-    })?;
-    Ok(json!({
-        "tenant": tenant,
-        "operation": operation,
-        "affordance_id": affordance_id,
-        "app_affordance": response,
-    }))
+    backend.invoke_code_search(tenant, arguments, operation)
 }
 
 fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
@@ -3566,6 +3573,45 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
             "unsupported code_search operation `{raw}`"
         ))),
     }
+}
+
+fn code_index_error(error: rustyred_thg_code::CodeIndexError) -> McpError {
+    let message = format!("{}: {}", error.code, error.message);
+    if error.code.starts_with("invalid_") {
+        McpError::invalid_params(message)
+    } else {
+        McpError::internal(message)
+    }
+}
+
+fn code_plugin_response(output: rustyred_thg_code::CodePluginExecutionOutput) -> Value {
+    let operation = output.operation.clone();
+    json!({
+        "tenant": output.tenant_id,
+        "operation": output.operation,
+        "command": output.command,
+        "writes_graph": output.writes_graph,
+        "affordance_id": format!("rustyred_thg_code.code_search.{operation}"),
+        "engine": "rustyred_thg_code",
+        "code_plugin": rustyred_thg_code::CodeParsingPlugin.manifest_json(),
+        "result": output.result,
+    })
+}
+
+fn redcore_code_search_payload(
+    store: &mut RedCoreGraphStore,
+    tenant: &str,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    let output = rustyred_thg_code::execute_code_plugin_operation(
+        store,
+        tenant,
+        operation,
+        arguments.clone(),
+    )
+    .map_err(code_index_error)?;
+    Ok(code_plugin_response(output))
 }
 
 fn remember_memory_payload(
@@ -6266,10 +6312,7 @@ fn to_job_payload<T: serde::Serialize>(value: T) -> Result<Value, McpError> {
         .map_err(|error| McpError::internal(format!("job payload serialization failed: {error}")))
 }
 
-fn job_action_payload(
-    job_id: &str,
-    result: Option<JobActionResult>,
-) -> Result<Value, McpError> {
+fn job_action_payload(job_id: &str, result: Option<JobActionResult>) -> Result<Value, McpError> {
     match result {
         None => Ok(json!({ "job_id": job_id, "found": false })),
         Some(action) => Ok(json!({
@@ -6451,8 +6494,8 @@ fn job_cancel_payload(
     arguments: &Value,
 ) -> Result<Value, McpError> {
     let job_id = required_text_any(arguments, &["job_id", "jobId"], "job_cancel")?;
-    let actor = argument_text(arguments, &["actor", "actor_id"])
-        .unwrap_or_else(|| "unknown".to_string());
+    let actor =
+        argument_text(arguments, &["actor", "actor_id"]).unwrap_or_else(|| "unknown".to_string());
     let result = backend.job_cancel(job_id, actor)?;
     Ok(json!({ "tenant": tenant, "result": result }))
 }
@@ -6464,8 +6507,8 @@ fn job_promote_payload(
 ) -> Result<Value, McpError> {
     let job_id = required_text_any(arguments, &["job_id", "jobId"], "job_promote")?;
     let priority = job_priority_from_arguments(arguments, "job_promote")?;
-    let actor = argument_text(arguments, &["actor", "actor_id"])
-        .unwrap_or_else(|| "unknown".to_string());
+    let actor =
+        argument_text(arguments, &["actor", "actor_id"]).unwrap_or_else(|| "unknown".to_string());
     let result = backend.job_promote(job_id, priority, actor)?;
     Ok(json!({ "tenant": tenant, "result": result }))
 }
@@ -7422,7 +7465,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ),
         tool(
             "code_search",
-            "Route the native harness code_search verb through theorem_grpc CodeCrawler app affordances.",
+            "Native CodeParsing plugin operations over the tenant RustyRed graph. RedCore backends ingest/search locally; non-RedCore backends may fall back to app affordances.",
             json!({
                 "type": "object",
                 "properties": {
@@ -7440,8 +7483,14 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "file_path": { "type": "string" },
                     "path_prefix": { "type": "string" },
                     "kinds": { "type": "array", "items": { "type": "string" } },
+                    "include_extensions": { "type": "array", "items": { "type": "string" } },
+                    "exclude_dirs": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
                     "max_depth": { "type": "integer", "default": 1 },
+                    "max_files": { "type": "integer" },
+                    "max_file_bytes": { "type": "integer" },
+                    "before_lines": { "type": "integer" },
+                    "after_lines": { "type": "integer" },
                     "max_chars": { "type": "integer" },
                     "text": { "type": "string" },
                     "action": { "type": "string" },
@@ -7455,7 +7504,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ),
         tool(
             "compute_code",
-            "Alias for native CodeCrawler-backed code_search; use for graph-structural code discovery and compute-code replacement flows.",
+            "Alias for the native CodeParsing plugin-backed code_search; use for graph-structural code discovery and compute-code replacement flows.",
             json!({
                 "type": "object",
                 "properties": {
@@ -7473,8 +7522,14 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "file_path": { "type": "string" },
                     "path_prefix": { "type": "string" },
                     "kinds": { "type": "array", "items": { "type": "string" } },
+                    "include_extensions": { "type": "array", "items": { "type": "string" } },
+                    "exclude_dirs": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
                     "max_depth": { "type": "integer", "default": 1 },
+                    "max_files": { "type": "integer" },
+                    "max_file_bytes": { "type": "integer" },
+                    "before_lines": { "type": "integer" },
+                    "after_lines": { "type": "integer" },
                     "max_chars": { "type": "integer" },
                     "text": { "type": "string" },
                     "action": { "type": "string" },
@@ -8743,6 +8798,9 @@ fn code_search_output_schema() -> Value {
             "tenant": { "type": "string" },
             "operation": { "type": "string" },
             "affordance_id": { "type": "string" },
+            "engine": { "type": "string" },
+            "code_plugin": { "type": "object" },
+            "result": { "type": "object" },
             "app_affordance": { "type": "object" },
             "results": { "type": "array", "items": { "type": "object" } },
             "symbols": { "type": "array", "items": { "type": "object" } },
@@ -9132,6 +9190,15 @@ impl McpGraphBackend for RedCoreGraphStore {
         job_complete_to_store(self, job_id, outcome, completion, actor)
     }
 
+    fn invoke_code_search(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        redcore_code_search_payload(self, tenant, arguments, operation)
+    }
+
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
         Ok(RedCoreGraphStore::vector_designations(self))
     }
@@ -9326,12 +9393,15 @@ impl McpGraphBackend for rustyred_thg_core::RedisGraphStore {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
+    use std::path::PathBuf;
     use std::rc::Rc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use rustyred_thg_core::{
         EdgeRecord, EpistemicType, GraphSnapshot, GraphStats, GraphStoreResult,
         HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-        VectorDesignation, VerifyReport,
+        RedCoreGraphStore, VectorDesignation, VerifyReport,
     };
     use serde_json::{json, Value};
     use theorem_harness_core::TransitionInput;
@@ -9374,9 +9444,12 @@ mod tests {
     #[test]
     fn job_submit_and_queue_status_shaping() {
         let mut store = InMemoryGraphStore::new();
-        let submitted =
-            super::job_submit_to_store(&mut store, job_submission_fixture("dia"), "claude.ai".into())
-                .unwrap();
+        let submitted = super::job_submit_to_store(
+            &mut store,
+            job_submission_fixture("dia"),
+            "claude.ai".into(),
+        )
+        .unwrap();
         assert_eq!(submitted["created"], json!(true));
         let job_id = submitted["job_id"].as_str().unwrap().to_string();
 
@@ -9385,9 +9458,12 @@ mod tests {
         assert_eq!(status["jobs"][0]["job_id"].as_str().unwrap(), job_id);
 
         // Duplicate idempotency_key -> same job, created=false, still one in queue.
-        let dup =
-            super::job_submit_to_store(&mut store, job_submission_fixture("dia"), "claude.ai".into())
-                .unwrap();
+        let dup = super::job_submit_to_store(
+            &mut store,
+            job_submission_fixture("dia"),
+            "claude.ai".into(),
+        )
+        .unwrap();
         assert_eq!(dup["created"], json!(false));
         assert_eq!(dup["job_id"].as_str().unwrap(), job_id);
         assert_eq!(
@@ -9399,14 +9475,22 @@ mod tests {
     #[test]
     fn job_claim_and_cancel_shaping() {
         let mut store = InMemoryGraphStore::new();
-        super::job_submit_to_store(&mut store, job_submission_fixture("alpha"), "claude.ai".into())
-            .unwrap();
+        super::job_submit_to_store(
+            &mut store,
+            job_submission_fixture("alpha"),
+            "claude.ai".into(),
+        )
+        .unwrap();
 
         let lanes = vec!["claude".to_string()];
         let repos = vec!["Travis-Gilbert/theorem".to_string()];
-        let claimed =
-            super::job_claim_to_store(&mut store, "receiver-a".into(), lanes.clone(), repos.clone())
-                .unwrap();
+        let claimed = super::job_claim_to_store(
+            &mut store,
+            "receiver-a".into(),
+            lanes.clone(),
+            repos.clone(),
+        )
+        .unwrap();
         assert_eq!(claimed["claimed"], json!(true));
         // The only job is now claimed; a second claim finds nothing.
         let empty =
@@ -9648,6 +9732,17 @@ mod tests {
                 ..McpServerConfig::default()
             },
         )
+    }
+
+    fn unique_code_repo(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "thg-mcp-code-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     fn call_tool_json(
@@ -9947,6 +10042,88 @@ mod tests {
             routed["app_affordance"]["request"]["query"],
             "graph store persistence"
         );
+    }
+
+    #[test]
+    fn redcore_code_search_ingests_and_searches_tenant_graph_directly() {
+        let repo = unique_code_repo("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn alpha() -> usize {\n    1\n}\n\npub fn beta() -> usize {\n    alpha()\n}\n",
+        )
+        .unwrap();
+
+        let mut store = RedCoreGraphStore::memory();
+        let ingest = super::code_search_payload(
+            "smoke",
+            &mut store,
+            &json!({
+                "operation": "ingest",
+                "repo_path": repo.display().to_string(),
+                "actor": "codex-test"
+            }),
+            "ingest",
+        )
+        .unwrap();
+
+        assert_eq!(ingest["engine"], "rustyred_thg_code");
+        assert_eq!(ingest["result"]["files_indexed"], json!(1));
+        assert_eq!(ingest["result"]["symbols_indexed"], json!(2));
+        let repo_id = ingest["result"]["repo_id"].as_str().unwrap().to_string();
+
+        let code_symbols = RedCoreGraphStore::query_nodes(
+            &store,
+            NodeQuery::label(rustyred_thg_code::CODE_SYMBOL_LABEL)
+                .with_property("tenant_id", json!("smoke"))
+                .with_limit(100),
+        )
+        .unwrap();
+        assert!(code_symbols
+            .iter()
+            .any(|node| node.properties["name"] == "beta"));
+
+        let search = super::code_search_payload(
+            "smoke",
+            &mut store,
+            &json!({
+                "operation": "search",
+                "query": "beta",
+                "repo_id": repo_id,
+                "limit": 5
+            }),
+            "search",
+        )
+        .unwrap();
+        assert_eq!(search["engine"], "rustyred_thg_code");
+        assert_eq!(search["result"]["hits"][0]["name"], "beta");
+
+        let focus_id = search["result"]["hits"][0]["node_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let explore = super::code_search_payload(
+            "smoke",
+            &mut store,
+            &json!({
+                "operation": "explore",
+                "node_id": focus_id,
+                "limit": 5
+            }),
+            "explore",
+        )
+        .unwrap();
+        assert!(explore["result"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                edge["edge_type"] == rustyred_thg_code::CALLS_SYMBOL
+                    && edge["from_name"] == "beta"
+                    && edge["to_name"] == "alpha"
+            }));
+
+        fs::remove_dir_all(repo).ok();
     }
 
     #[test]

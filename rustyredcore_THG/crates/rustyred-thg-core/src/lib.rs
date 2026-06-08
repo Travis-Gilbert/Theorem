@@ -13,6 +13,7 @@ pub mod fulltext_tantivy;
 pub mod graph;
 pub mod graph_store;
 pub mod instant_kg;
+pub mod plugin;
 pub mod spatial;
 #[cfg(feature = "s2")]
 pub mod spatial_s2;
@@ -51,6 +52,11 @@ pub use instant_kg::{
     CodeKgEncodedFile, CodeKgManifest, EdgeExplanation, HarnessInstantKg, ImpactResult,
     InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
     INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
+};
+pub use plugin::{
+    normalize_plugin_command, PluginCapability, PluginCapabilityKind, PluginExecutionOutput,
+    PluginOperationContext, PluginOperationHandler, PluginOperationRegistration, PluginRegistry,
+    RustyRedPlugin,
 };
 pub use spatial::{
     make_spatial_backend, make_spatial_backend_from_value, SpatialBackend, SpatialDesignation,

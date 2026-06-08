@@ -2624,6 +2624,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prose-check"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3216,6 +3225,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-code"
+version = "0.5.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
 name = "rustyred-thg-compat-server"
 version = "0.5.0"
 dependencies = [
@@ -3274,6 +3292,7 @@ name = "rustyred-thg-mcp"
 version = "0.5.0"
 dependencies = [
  "ensemble",
+ "rustyred-thg-code",
  "rustyred-thg-core",
  "serde",
  "serde_json",
@@ -3981,6 +4000,7 @@ dependencies = [
 name = "theorem-harness-runtime"
 version = "0.1.0"
 dependencies = [
+ "prose-check",
  "rustyred-thg-core",
  "serde",
  "serde_json",
