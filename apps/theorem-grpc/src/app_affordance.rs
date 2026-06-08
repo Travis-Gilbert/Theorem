@@ -1409,6 +1409,28 @@ mod tests {
         repo_dir
     }
 
+    fn fixture_go_repo() -> PathBuf {
+        let repo_dir = unique_test_dir("go-code-repo");
+        std::fs::create_dir_all(repo_dir.join("internal")).unwrap();
+        std::fs::write(
+            repo_dir.join("go.mod"),
+            "module example.com/boltbrowser\n\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::write(repo_dir.join("README.md"), "# boltbrowser fixture\n").unwrap();
+        std::fs::write(
+            repo_dir.join("main.go"),
+            "package main\n\nconst AppName = \"boltbrowser\"\n\ntype Browser struct {\n    title string\n}\n\nfunc main() {\n    browser := Browser{title: AppName}\n    _ = browser.Draw()\n}\n\nfunc (browser Browser) Draw() string {\n    return browser.title\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_dir.join("internal/store.go"),
+            "package internal\n\ntype BoltStore struct {}\n\nfunc OpenStore(path string) BoltStore {\n    return BoltStore{}\n}\n",
+        )
+        .unwrap();
+        repo_dir
+    }
+
     fn init_git_fixture(dir: &Path) -> bool {
         let run = |args: &[&str]| {
             std::process::Command::new("git")
@@ -1681,6 +1703,76 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("rustyred-code-clone-"));
+
+        drop(runtime);
+        std::fs::remove_dir_all(repo_dir).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn code_search_affordance_indexes_go_url_and_searches_main() {
+        let repo_dir = fixture_go_repo();
+        if !init_git_fixture(&repo_dir) {
+            std::fs::remove_dir_all(repo_dir).ok();
+            return;
+        }
+        let repo_url = format!("file://{}", repo_dir.display());
+        let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
+        let ingest = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.ingest".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_path": repo_url,
+                        "repo_id": "repo:boltbrowser-affordance",
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: true,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ingest.status, "ok");
+        let ingest_output: Value = serde_json::from_str(&ingest.output_json).unwrap();
+        assert!(
+            ingest_output["files_indexed"].as_u64().unwrap_or_default() >= 3,
+            "{ingest_output}"
+        );
+        assert!(
+            ingest_output["symbols_indexed"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 4,
+            "{ingest_output}"
+        );
+
+        let search = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "theorem".to_string(),
+                    affordance_id: "theorem_grpc.code_search.search".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_id": "repo:boltbrowser-affordance",
+                        "query": "main",
+                        "limit": 5,
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(search.status, "ok");
+        let search_output: Value = serde_json::from_str(&search.output_json).unwrap();
+        assert_eq!(search_output["hits"][0]["name"], json!("main"));
+        assert_eq!(search_output["hits"][0]["language"], json!("go"));
 
         drop(runtime);
         std::fs::remove_dir_all(repo_dir).ok();

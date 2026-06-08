@@ -2055,6 +2055,9 @@ fn symbol_from_line(line: &str, language: &str) -> Option<(String, String)> {
         return None;
     }
     let normalized = strip_leading_modifiers(line);
+    if language == "go" {
+        return go_symbol_from_line(normalized);
+    }
     let patterns: &[(&str, &str)] = match language {
         "python" => &[("def ", "function"), ("class ", "class")],
         "swift" => &[
@@ -2096,6 +2099,46 @@ fn symbol_from_line(line: &str, language: &str) -> Option<(String, String)> {
             .and_then(symbol_name)
             .map(|name| ((*kind).to_string(), name))
     })
+}
+
+fn go_symbol_from_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim_start();
+    if let Some(rest) = line.strip_prefix("func ") {
+        return go_function_symbol(rest);
+    }
+    if let Some(rest) = line.strip_prefix("type ") {
+        return go_type_symbol(rest);
+    }
+    if let Some(rest) = line.strip_prefix("const ") {
+        return symbol_name(rest).map(|name| ("constant".to_string(), name));
+    }
+    if let Some(rest) = line.strip_prefix("var ") {
+        return symbol_name(rest).map(|name| ("binding".to_string(), name));
+    }
+    None
+}
+
+fn go_function_symbol(rest: &str) -> Option<(String, String)> {
+    let rest = rest.trim_start();
+    let (kind, name_start) = if rest.starts_with('(') {
+        let receiver_end = rest.find(')')?;
+        ("method", rest.get(receiver_end + 1..)?.trim_start())
+    } else {
+        ("function", rest)
+    };
+    symbol_name(name_start).map(|name| (kind.to_string(), name))
+}
+
+fn go_type_symbol(rest: &str) -> Option<(String, String)> {
+    let rest = rest.trim_start();
+    let name = symbol_name(rest)?;
+    let after_name = rest.get(name.len()..).unwrap_or_default().trim_start();
+    let kind = match after_name.split_whitespace().next() {
+        Some("struct") => "struct",
+        Some("interface") => "interface",
+        _ => "type",
+    };
+    Some((kind.to_string(), name))
 }
 
 fn strip_leading_modifiers(line: &str) -> &str {
@@ -2795,7 +2838,8 @@ fn normalize_set(values: Vec<String>) -> BTreeSet<String> {
 
 fn default_extensions() -> BTreeSet<String> {
     [
-        "rs", "swift", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml", "md", "json",
+        "rs", "go", "swift", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml",
+        "md", "json",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2833,6 +2877,7 @@ fn extension_for(path: &Path) -> String {
 
 fn language_for_extension(extension: &str) -> &str {
     match extension {
+        "go" => "go",
         "py" => "python",
         "swift" => "swift",
         "ts" | "tsx" => "typescript",
@@ -2998,6 +3043,33 @@ mod tests {
         (repo_dir, store_dir)
     }
 
+    fn write_go_fixture_repo() -> (PathBuf, PathBuf) {
+        let repo_dir = unique_dir("go-repo");
+        fs::create_dir_all(repo_dir.join("internal")).unwrap();
+        fs::write(
+            repo_dir.join("go.mod"),
+            "module example.com/boltbrowser\n\ngo 1.22\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("README.md"),
+            "# boltbrowser fixture\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("main.go"),
+            "package main\n\nconst AppName = \"boltbrowser\"\n\ntype Browser struct {\n    title string\n}\n\ntype Screen interface {\n    Draw() string\n}\n\nfunc main() {\n    browser := Browser{title: AppName}\n    _ = browser.Draw()\n}\n\nfunc (browser Browser) Draw() string {\n    return browser.title\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("internal/store.go"),
+            "package internal\n\ntype BoltStore struct {}\n\nfunc OpenStore(path string) BoltStore {\n    return BoltStore{}\n}\n",
+        )
+        .unwrap();
+        let store_dir = unique_dir("store");
+        (repo_dir, store_dir)
+    }
+
     /// Turn a fixture dir into a real git repo with one commit, so it can be
     /// cloned via `file://` with no network. Returns false if git is absent.
     fn init_git_fixture(dir: &Path) -> bool {
@@ -3060,6 +3132,70 @@ mod tests {
             == Some("helper_len")));
 
         fs::remove_dir_all(&repo_dir).ok();
+    }
+
+    #[test]
+    fn default_ingest_indexes_go_symbols_and_searches_main() {
+        let (repo_dir, _store_dir) = write_go_fixture_repo();
+        let mut store = RedCoreGraphStore::memory();
+        let ingest = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:boltbrowser-fixture".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(ingest.files_indexed >= 3, "{:?}", ingest.to_json());
+        assert!(ingest.symbols_indexed >= 5, "{:?}", ingest.to_json());
+
+        let symbols = store
+            .query_nodes(
+                NodeQuery::label(CODE_SYMBOL_LABEL)
+                    .with_property("tenant_id", json!("theorem"))
+                    .with_limit(100),
+            )
+            .unwrap();
+        assert!(symbols.iter().any(|node| node
+            .properties
+            .get("language")
+            .and_then(Value::as_str)
+            == Some("go")));
+        assert!(symbols.iter().any(|node| node
+            .properties
+            .get("name")
+            .and_then(Value::as_str)
+            == Some("main")));
+        assert!(symbols.iter().any(|node| node
+            .properties
+            .get("kind")
+            .and_then(Value::as_str)
+            == Some("method")
+            && node
+                .properties
+                .get("name")
+                .and_then(Value::as_str)
+                == Some("Draw")));
+
+        let search = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "main".to_string(),
+                repo_id: ingest.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(search.total_returned > 0, "{:?}", search.to_json());
+        assert_eq!(search.hits[0].name, "main");
+        assert_eq!(search.hits[0].language, "go");
+
+        fs::remove_dir_all(repo_dir).ok();
     }
 
     #[test]
