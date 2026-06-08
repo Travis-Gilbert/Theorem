@@ -34,7 +34,6 @@ tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 serde_json = "1.0"
-syn = { version = "2", features = ["full", "visit"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -46,6 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # #[pyfunction] wrappers in rustyredcore_THG/src/*.rs.
 rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web" }
 rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+rustyred-thg-code = { path = "../../rustyredcore_THG/crates/rustyred-thg-code" }
 # AppAffordanceService uses RedCoreGraphStore for durable invocation receipts
 # and rustyred-thg-affordances for registry, selection, and learning writes.
 rustyred-thg-affordances = { path = "../../rustyredcore_THG/crates/rustyred-thg-affordances" }

@@ -3225,6 +3225,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-code"
+version = "0.5.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
 name = "rustyred-thg-compat-server"
 version = "0.5.0"
 dependencies = [
@@ -3283,6 +3292,7 @@ name = "rustyred-thg-mcp"
 version = "0.5.0"
 dependencies = [
  "ensemble",
+ "rustyred-thg-code",
  "rustyred-thg-core",
  "serde",
  "serde_json",
