@@ -42,8 +42,8 @@ textarea {
 }
 
 :focus-visible {
-  outline: 2px solid var(--pcb-green);
-  outline-offset: 1px;
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
 }
 
 ::selection {

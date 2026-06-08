@@ -49,6 +49,29 @@
 
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.04);
   --shadow-2: 0 4px 16px rgba(0, 0, 0, 0.1);
+
+  /* Motion. Chrome transitions only; content is never animated. */
+  --motion-fast: 120ms;
+  --motion: 200ms;
+  --motion-slow: 320ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Focus. Visible on every focusable; never removed without replacement. */
+  --focus-ring: 2px solid var(--pcb-green);
+  --focus-ring-offset: 2px;
+
+  /* Semantic accents: memory/grounding = green; agent/ingestion = brass.
+     These are the only two stories the accents tell. Per the computed
+     contrast (pcb-green ~4.0:1, brass ~2.4:1 on white) they are fills,
+     borders, chips, and large text only -- never body text. */
+  --accent-memory: var(--pcb-green);
+  --accent-memory-soft: var(--pcb-green-soft);
+  --accent-agent: var(--brass);
+  --accent-agent-soft: var(--brass-soft);
+
+  /* Foreground for filled accent surfaces (e.g. the primary button on green).
+     Retires the one raw #fff in app.css; no raw hex outside this file. */
+  --on-accent: #ffffff;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -67,5 +90,15 @@
     --brass-soft: #c9a23a33;
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-2: 0 6px 20px rgba(0, 0, 0, 0.45);
+  }
+}
+
+/* Reduced motion is not optional: zero the chrome transitions so every
+   component that animates via var(--motion*) degrades to an instant change. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion: 0ms;
+    --motion-slow: 0ms;
   }
 }

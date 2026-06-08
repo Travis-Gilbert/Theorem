@@ -91,6 +91,8 @@ export interface RecallHit {
   tags?: string[];
   url?: string;
   createdAt?: number;
+  /** Grounding tier: grounded recall vs open_web_unverified. Default grounded. */
+  tier?: "grounded" | "unverified";
 }
 
 export type ProviderId = "anthropic" | "openai" | "deepseek" | "ollama";

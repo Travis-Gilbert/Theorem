@@ -193,7 +193,30 @@
 }
 .tab__pin--on {
   opacity: 1;
-  color: var(--brass);
+  color: var(--text-dim);
+}
+/* Agent-tab ingestion badge (D4.2). Brass fill/border carries the agent story;
+   the count text stays >=4.5:1. Fades in over --motion (instant under
+   reduced-motion); nothing animates at rest. */
+.tab__badge {
+  flex-shrink: 0;
+  min-width: 16px;
+  padding: 0 5px;
+  text-align: center;
+  font-size: 10px;
+  border-radius: 999px;
+  background: var(--accent-agent-soft);
+  border: 1px solid var(--accent-agent);
+  color: var(--text);
+  animation: badge-fade var(--motion) var(--ease);
+}
+@keyframes badge-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 /* --- Icon buttons --- */
@@ -238,8 +261,12 @@
   display: flex;
   gap: 2px;
 }
-.omnibox__input {
+.omnibox__field {
+  position: relative;
   flex: 1;
+}
+.omnibox__input {
+  width: 100%;
   height: 32px;
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -250,6 +277,52 @@
 .omnibox__input:focus {
   border-color: var(--pcb-green);
   box-shadow: 0 0 0 3px var(--pcb-green-soft);
+}
+.omnibox__suggestions {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin: 0;
+  padding: var(--space-1);
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.omnibox__suggestion {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+}
+.omnibox__suggestion--active,
+.omnibox__suggestion:hover {
+  background: var(--pcb-green-soft);
+}
+.omnibox__suggestion-icon {
+  display: flex;
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+.omnibox__suggestion-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.omnibox__suggestion-sub {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-faint);
 }
 
 /* --- Webview stage --- */
@@ -464,6 +537,16 @@
   color: var(--text-dim);
   display: flex;
 }
+/* 4px stack offset once more than three chips accumulate (D4.4). */
+.composer__chips .composer__chip:nth-child(n + 4) {
+  margin-left: -4px;
+}
+.composer__chip--more {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text-dim);
+  padding: 1px 8px;
+}
 .composer__box {
   width: 100%;
   resize: none;
@@ -527,7 +610,7 @@
   white-space: nowrap;
 }
 
-/* --- Known-context strip --- */
+/* --- Known-context strip (D4.1) --- */
 .known {
   border-bottom: 1px solid var(--border);
   padding: var(--space-2) var(--space-3);
@@ -535,16 +618,58 @@
   flex-direction: column;
   gap: var(--space-1);
   background: var(--surface);
+  max-height: 168px;
+  overflow-y: auto;
+}
+.known__head {
+  display: flex;
+  align-items: center;
 }
 .known__label {
+  flex: 1;
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--brass);
+  color: var(--text-dim);
+}
+.known__dismiss {
+  padding: 2px;
+  color: var(--text-faint);
+}
+.known__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
 }
 .known__item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  min-width: 0;
   font-size: 12px;
   color: var(--text-dim);
+  padding: 2px var(--space-2);
+}
+/* Grounded recall: solid memory-green left border. */
+.known__item--grounded {
+  border-left: 2px solid var(--accent-memory);
+}
+/* Unverified (open web): dashed border + agent-soft fill. Structural, not opacity. */
+.known__item--unverified {
+  border: 1px dashed var(--border-strong);
+  background: var(--accent-agent-soft);
+  border-radius: var(--radius-sm);
+}
+.known__tier {
+  flex-shrink: 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+.known__text {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -637,7 +762,7 @@
 .btn--primary {
   background: var(--pcb-green);
   border-color: var(--pcb-green);
-  color: #fff;
+  color: var(--on-accent);
 }
 .btn--primary:hover {
   filter: brightness(1.05);
@@ -654,7 +779,7 @@
   color: var(--text-faint);
 }
 .badge--on {
-  color: var(--pcb-green);
+  color: var(--text);
   border-color: var(--pcb-green);
   background: var(--pcb-green-soft);
 }
@@ -792,5 +917,81 @@
 }
 
 .agent-strip button {
-  color: var(--pcb-green);
+  color: var(--text-dim);
+}
+
+/* --- Pre-action preview (browse_with_me veto surface, agent flag) --- */
+.preaction {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+}
+.preaction__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.preaction__label {
+  flex: 1;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+.preaction__target {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.preaction__target code {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+.preaction__actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+.preaction__hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* Risk chip: fills and borders carry the signal; text stays >=4.5:1. */
+.risk-chip {
+  white-space: nowrap;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+}
+.risk-chip--read {
+  background: var(--surface-2);
+}
+.risk-chip--agent {
+  background: var(--accent-agent-soft);
+  border-color: var(--accent-agent);
+  color: var(--text);
+}
+.risk-chip--memory {
+  border: 1px solid var(--accent-memory);
+  color: var(--text);
+}
+.risk-chip--danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.preaction-host {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  width: 340px;
+  z-index: 40;
 }
