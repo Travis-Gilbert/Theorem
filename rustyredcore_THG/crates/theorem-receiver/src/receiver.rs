@@ -33,6 +33,19 @@ pub struct JobRunReport {
 /// Run the receiver claim loop forever. Detects lanes once at startup; a machine
 /// with no installed head is a hard error.
 pub fn run_loop(config: &ReceiverConfig, client: &HarnessClient) -> ReceiverResult<()> {
+    run_loop_until(config, client, || false)
+}
+
+/// Run the receiver claim loop until `should_stop` returns true.
+///
+/// The standalone binary uses [`run_loop`] for the historical forever-loop
+/// behavior. Embedded hosts, such as Theorem Desktop, use this cancellable
+/// variant so app shutdown does not leave a receiver thread behind.
+pub fn run_loop_until(
+    config: &ReceiverConfig,
+    client: &HarnessClient,
+    should_stop: impl Fn() -> bool,
+) -> ReceiverResult<()> {
     let lanes = detect_lanes();
     if lanes.is_empty() {
         return Err(ReceiverError::Config(
@@ -46,7 +59,7 @@ pub fn run_loop(config: &ReceiverConfig, client: &HarnessClient) -> ReceiverResu
         config.claim_interval_secs
     ));
 
-    loop {
+    while !should_stop() {
         match client.job_claim(&receiver_id, &lanes, &repos) {
             Ok(Some(job)) => match run_job(config, client, &lanes, job) {
                 Ok(report) => log(&format!(
@@ -55,14 +68,16 @@ pub fn run_loop(config: &ReceiverConfig, client: &HarnessClient) -> ReceiverResu
                 )),
                 Err(error) => log(&format!("job run error: {error}")),
             },
-            Ok(None) => std::thread::sleep(config.claim_interval()),
+            Ok(None) => sleep_until_stop(config.claim_interval(), &should_stop),
             Err(error) => {
                 // A transient claim error must not kill the loop.
                 log(&format!("claim error: {error}; backing off"));
-                std::thread::sleep(config.claim_interval());
+                sleep_until_stop(config.claim_interval(), &should_stop);
             }
         }
     }
+    log(&format!("receiver {receiver_id} stopping"));
+    Ok(())
 }
 
 /// Resolve, spawn, supervise, and close one claimed job.
@@ -89,7 +104,11 @@ fn run_job(
 
     log(&format!(
         "claimed {} ({:?}/{:?}) -> spawning {} in {}",
-        job.job_id, job.priority, job.target_head, lane, worktree.display()
+        job.job_id,
+        job.priority,
+        job.target_head,
+        lane,
+        worktree.display()
     ));
 
     let mut command = command_from_plan(&plan);
@@ -180,6 +199,17 @@ impl TailBuffer {
 
 fn log(message: &str) {
     eprintln!("[theorem-receiver] {message}");
+}
+
+fn sleep_until_stop(interval: std::time::Duration, should_stop: &impl Fn() -> bool) {
+    let step = std::time::Duration::from_millis(250);
+    let mut slept = std::time::Duration::ZERO;
+    while slept < interval && !should_stop() {
+        let remaining = interval.saturating_sub(slept);
+        let next = remaining.min(step);
+        std::thread::sleep(next);
+        slept += next;
+    }
 }
 
 #[cfg(test)]
