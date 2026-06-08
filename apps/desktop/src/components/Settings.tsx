@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as cmd from "../lib/commands";
 import { PROVIDERS, type HarnessTarget, type ReceiverSettings } from "../state/types";
 import { useApp } from "../state/store";
@@ -37,6 +37,39 @@ export function Settings() {
     };
   }, [actions]);
 
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Dialog APG (D3.4): focus the first field on open, trap Tab, restore focus
+  // to the invoking control on close. Esc closes.
+  useEffect(() => {
+    const returnTo = document.activeElement as HTMLElement | null;
+    panelRef.current?.querySelector<HTMLElement>("input, select, textarea")?.focus();
+    return () => returnTo?.focus?.();
+  }, []);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      actions.openSettings(false);
+      return;
+    }
+    if (e.key === "Tab") {
+      const f = panelRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      );
+      if (!f || f.length === 0) return;
+      const first = f[0];
+      const last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+
   const persistHarness = (patch: Partial<typeof settings.harness>) => {
     const next = { ...settings.harness, ...patch };
     actions.setHarness(next);
@@ -64,10 +97,17 @@ export function Settings() {
   const theoremWorktree = settings.receiver.worktrees["Travis-Gilbert/theorem"] ?? "";
 
   return (
-    <div className="settings" role="dialog" aria-modal="true">
+    <div
+      className="settings"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      ref={panelRef}
+      onKeyDown={onKeyDown}
+    >
       <section className="settings__panel">
         <header className="settings__head">
-          <h2>Settings</h2>
+          <h2 id="settings-title">Settings</h2>
           <button className="iconbtn" type="button" onClick={() => actions.openSettings(false)}>
             Close
           </button>

@@ -233,14 +233,34 @@ export function ChatRail() {
         )}
         {mentions.length > 0 && (
           <div className="composer__chips">
-            {mentions.map((m) => (
-              <span className="composer__chip" key={m.tabId}>
+            {mentions.slice(0, 5).map((m) => (
+              <span
+                className="composer__chip"
+                key={m.tabId}
+                tabIndex={0}
+                aria-label={`Mentioned tab ${m.title}. Press Delete to remove.`}
+                onKeyDown={(e) => {
+                  if (e.key === "Delete" || e.key === "Backspace") {
+                    e.preventDefault();
+                    removeMention(m.tabId);
+                  }
+                }}
+              >
                 @{m.title}
-                <button onClick={() => removeMention(m.tabId)} title="Remove">
+                <button
+                  onClick={() => removeMention(m.tabId)}
+                  title="Remove"
+                  tabIndex={-1}
+                >
                   <CloseIcon size={11} />
                 </button>
               </span>
             ))}
+            {mentions.length > 5 && (
+              <span className="composer__chip composer__chip--more">
+                +{mentions.length - 5}
+              </span>
+            )}
           </div>
         )}
         <textarea
@@ -253,6 +273,15 @@ export function ChatRail() {
           placeholder={active ? "Ask anything. Type @ to add a tab." : "Open a tab to chat."}
           disabled={!state.activeTabId}
           spellCheck
+          role="combobox"
+          aria-expanded={mentionQuery !== null && candidates.length > 0}
+          aria-controls="mention-listbox"
+          aria-autocomplete="list"
+          aria-activedescendant={
+            mentionQuery !== null && candidates.length > 0
+              ? `mention-opt-${activeIdx}`
+              : undefined
+          }
         />
         <div className="composer__hint">
           Enter to send, Shift+Enter for a newline, @ to mention a tab.
