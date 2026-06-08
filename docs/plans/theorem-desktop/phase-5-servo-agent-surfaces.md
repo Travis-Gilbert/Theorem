@@ -33,6 +33,6 @@ If the servo crate blocks on a hard gap (build, stability, or missing delegate c
 
 ## Fences
 
-- No standalone web-automation product surface; this is ingestion, not actuation. Web actuation at scale is an affordance to register (Browser Use), not a thing to rebuild.
+- Actuation routes to the native Servo browser-use lane (docs/plans/servo-browser-use-agent/, jobs 007 through 009), which shares the engine and the theorem-browser-agent crate with this phase. This phase ships ingestion tabs; the co-browse and autopilot surfaces ride the same agent-tab interface when that lane lands. No external Browser Use dependency and no Chromium anywhere.
 - No crawling UI; single-tab ingestion only in this phase.
 - The standing no-graph-view fence holds.
