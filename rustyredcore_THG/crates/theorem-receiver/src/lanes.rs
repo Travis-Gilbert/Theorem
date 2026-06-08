@@ -28,11 +28,7 @@ pub fn detect_lanes_in(path_var: &str, exists: impl Fn(&Path) -> bool) -> Vec<St
 
 /// Locate `program` on `path_var`, returning the first matching path the
 /// predicate accepts.
-pub fn which_in(
-    path_var: &str,
-    program: &str,
-    exists: impl Fn(&Path) -> bool,
-) -> Option<PathBuf> {
+pub fn which_in(path_var: &str, program: &str, exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     for dir in std::env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
@@ -102,7 +98,10 @@ mod tests {
     fn searches_path_in_order() {
         let path = "/a:/b";
         let exists = predicate(&["/b/codex"]);
-        assert_eq!(which_in(path, "codex", &exists), Some(PathBuf::from("/b/codex")));
+        assert_eq!(
+            which_in(path, "codex", &exists),
+            Some(PathBuf::from("/b/codex"))
+        );
         assert_eq!(which_in(path, "claude", &exists), None);
     }
 }
