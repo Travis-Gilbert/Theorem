@@ -1,13 +1,15 @@
-//! The claim loop: poll, claim, spawn, wait, close.
+//! The dispatch v2 launcher loop: list, start once, spawn, receipt.
 //!
-//! Outbound only. Idle until a job is claimed; one job runs to completion before
-//! the next is claimed (capacity-1 default). When a job completes the loop
-//! re-claims immediately; otherwise it sleeps the claim interval.
+//! Outbound only. The graph is a board, not a lease table: the receiver polls
+//! pending jobs, writes the one set-once `started_at`/`session_ref` note, then
+//! launches a local head with the spec and harness context.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::Stdio;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::json;
+use theorem_harness_core::types::now_string;
 use theorem_harness_core::Job;
 
 use crate::config::ReceiverConfig;
@@ -16,31 +18,24 @@ use crate::lanes::detect_lanes;
 use crate::spawn::command_from_plan;
 use crate::{client::HarnessClient, ReceiverError, ReceiverResult};
 
-/// How many stdout lines to retain as the fallback receipt tail.
+/// How many stdout lines to retain in the exit receipt.
 const STDOUT_TAIL_LINES: usize = 40;
 
-/// What happened to one claimed job.
+/// What happened to one launched job.
 #[derive(Clone, Debug)]
 pub struct JobRunReport {
     pub job_id: String,
     pub lane: String,
     pub exit_code: Option<i32>,
-    /// True when the receiver's defensive Failed close actually took effect,
-    /// i.e. the child exited without calling job_complete itself.
-    pub defensive_close_applied: bool,
+    pub exit_receipt_written: bool,
 }
 
-/// Run the receiver claim loop forever. Detects lanes once at startup; a machine
-/// with no installed head is a hard error.
+/// Run the receiver launcher loop forever.
 pub fn run_loop(config: &ReceiverConfig, client: &HarnessClient) -> ReceiverResult<()> {
     run_loop_until(config, client, || false)
 }
 
-/// Run the receiver claim loop until `should_stop` returns true.
-///
-/// The standalone binary uses [`run_loop`] for the historical forever-loop
-/// behavior. Embedded hosts, such as Theorem Desktop, use this cancellable
-/// variant so app shutdown does not leave a receiver thread behind.
+/// Run the receiver launcher loop until `should_stop` returns true.
 pub fn run_loop_until(
     config: &ReceiverConfig,
     client: &HarnessClient,
@@ -60,18 +55,18 @@ pub fn run_loop_until(
     ));
 
     while !should_stop() {
-        match client.job_claim(&receiver_id, &lanes, &repos) {
-            Ok(Some(job)) => match run_job(config, client, &lanes, job) {
-                Ok(report) => log(&format!(
-                    "job {} done: lane={} exit={:?} defensive_close={}",
-                    report.job_id, report.lane, report.exit_code, report.defensive_close_applied
+        match next_launchable_job(client, config, &lanes) {
+            Ok(Some(job)) => match start_and_run_job(config, client, &receiver_id, &lanes, job) {
+                Ok(Some(report)) => log(&format!(
+                    "job {} exited: lane={} exit={:?} receipt={}",
+                    report.job_id, report.lane, report.exit_code, report.exit_receipt_written
                 )),
+                Ok(None) => {}
                 Err(error) => log(&format!("job run error: {error}")),
             },
             Ok(None) => sleep_until_stop(config.claim_interval(), &should_stop),
             Err(error) => {
-                // A transient claim error must not kill the loop.
-                log(&format!("claim error: {error}; backing off"));
+                log(&format!("list error: {error}; backing off"));
                 sleep_until_stop(config.claim_interval(), &should_stop);
             }
         }
@@ -80,30 +75,99 @@ pub fn run_loop_until(
     Ok(())
 }
 
-/// Resolve, spawn, supervise, and close one claimed job.
+fn next_launchable_job(
+    client: &HarnessClient,
+    config: &ReceiverConfig,
+    lanes: &[String],
+) -> ReceiverResult<Option<Job>> {
+    let repos = config.repos();
+    let mut jobs = client.job_list(None, Some("pending"))?;
+    jobs.retain(|job| {
+        repos.iter().any(|repo| repo == &job.repo)
+            && job.target_head.matches_lanes(lanes)
+            && !not_before_is_future(job.not_before.as_deref())
+    });
+    jobs.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.submitted_at.cmp(&b.submitted_at))
+            .then_with(|| a.job_id.cmp(&b.job_id))
+    });
+    Ok(jobs.into_iter().next())
+}
+
+fn start_and_run_job(
+    config: &ReceiverConfig,
+    client: &HarnessClient,
+    receiver_id: &str,
+    lanes: &[String],
+    job: Job,
+) -> ReceiverResult<Option<JobRunReport>> {
+    let session_ref = format!("receiver:{receiver_id}:{}", job.job_id);
+    let start = client.job_note(
+        &job.job_id,
+        receiver_id,
+        &format!("starting local session {session_ref}"),
+        Vec::new(),
+        Some(session_ref.clone()),
+        false,
+    )?;
+    if !start
+        .get("applied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        log(&format!("start race lost for {}", job.job_id));
+        return Ok(None);
+    }
+
+    match run_job(config, client, receiver_id, lanes, &job, &session_ref) {
+        Ok(report) => Ok(Some(report)),
+        Err(error) => {
+            let _ = client.job_note(
+                &job.job_id,
+                receiver_id,
+                &format!("receiver abort before launch: {error}"),
+                Vec::new(),
+                None,
+                true,
+            );
+            Err(error)
+        }
+    }
+}
+
 fn run_job(
     config: &ReceiverConfig,
     client: &HarnessClient,
+    receiver_id: &str,
     lanes: &[String],
-    job: Job,
+    job: &Job,
+    session_ref: &str,
 ) -> ReceiverResult<JobRunReport> {
     let worktree = config.worktree_for(&job.repo).ok_or_else(|| {
         ReceiverError::Config(format!("no worktree mapped for repo {}", job.repo))
     })?;
     let lane = job.target_head.preferred_lane(lanes).ok_or_else(|| {
         ReceiverError::Protocol(format!(
-            "claimed job {} targets a lane this receiver does not have",
+            "job {} targets a lane this receiver does not have",
             job.job_id
         ))
     })?;
     let adapter = adapter_for(lane).ok_or_else(|| {
         ReceiverError::Protocol(format!("no head adapter registered for lane {lane}"))
     })?;
-    let intent = adapter.intent_template(&job.spec_ref, &job.job_id);
+
+    let spec_text = resolve_spec_text(job, worktree)?;
+    let context_packet = coordination_context_packet(client, &job.job_id);
+    probe_harness(client).map_err(|error| {
+        ReceiverError::Protocol(format!("harness probe failed before launch: {error}"))
+    })?;
+    let intent = build_launch_prompt(job, &spec_text, &context_packet, receiver_id, session_ref);
     let plan = adapter.spawn_plan(&intent, worktree);
 
     log(&format!(
-        "claimed {} ({:?}/{:?}) -> spawning {} in {}",
+        "starting {} ({:?}/{:?}) -> spawning {} in {}",
         job.job_id,
         job.priority,
         job.target_head,
@@ -114,23 +178,22 @@ fn run_job(
     let mut command = command_from_plan(&plan);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
-    // stderr is inherited so the head's diagnostics stream live to the operator.
 
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            // Could not even start the head: close the job Failed with the reason.
-            let receipts = json!({
-                "source": "receiver_fallback",
-                "lane": lane,
-                "spawn_error": error.to_string(),
-            });
-            let _ = client.job_complete(&job.job_id, "failed", None, None, receipts);
+            let _ = client.job_note(
+                &job.job_id,
+                receiver_id,
+                &format!("spawn error for {lane}: {error}"),
+                Vec::new(),
+                None,
+                true,
+            );
             return Err(ReceiverError::Io(error));
         }
     };
 
-    // Tee stdout to the operator while retaining a tail for the fallback receipt.
     let mut tail = TailBuffer::new(STDOUT_TAIL_LINES);
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
@@ -144,31 +207,111 @@ fn run_job(
 
     let status = child.wait()?;
     let exit_code = status.code();
-
-    // Per-job usage line: from 2026-06-15, claude -p draws the finite monthly
-    // Agent SDK credit bucket, so the draw is logged to be measurable.
     log(&format!(
         "usage: job={} lane={} exit={:?}",
         job.job_id, lane, exit_code
     ));
 
-    // Failed-on-exit fallback. This is unconditional and idempotent: if the head
-    // already called job_complete (Done or Failed), the job is terminal and this
-    // is a no-op (applied=false). If the head exited WITHOUT completing, this
-    // closes the job Failed with the exit receipt.
-    let receipts = adapter.parse_receipt(exit_code, &tail.joined());
-    let outcome = client.job_complete(&job.job_id, "failed", None, None, receipts)?;
-    let defensive_close_applied = outcome
-        .get("applied")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
+    let receipt = json!({
+        "source": "receiver_exit",
+        "lane": lane,
+        "exit_code": exit_code,
+        "stdout_tail": tail.joined(),
+        "branch_tip": branch_tip(worktree),
+    });
+    let written = client.job_note(
+        &job.job_id,
+        receiver_id,
+        &format!("child exited: {receipt}"),
+        Vec::new(),
+        None,
+        false,
+    )?;
     Ok(JobRunReport {
-        job_id: job.job_id,
+        job_id: job.job_id.clone(),
         lane: lane.to_string(),
         exit_code,
-        defensive_close_applied,
+        exit_receipt_written: written
+            .get("applied")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
+}
+
+fn resolve_spec_text(job: &Job, worktree: &Path) -> ReceiverResult<String> {
+    if let Some(spec_inline) = job.spec_inline.as_deref() {
+        return Ok(spec_inline.to_string());
+    }
+    let Some(spec_ref) = job.spec_ref.as_deref() else {
+        return Err(ReceiverError::Protocol(format!(
+            "job {} has neither spec_ref nor spec_inline",
+            job.job_id
+        )));
+    };
+    let path = worktree.join(spec_ref);
+    std::fs::read_to_string(&path).map_err(|error| {
+        ReceiverError::Config(format!("cannot read spec_ref {}: {error}", path.display()))
+    })
+}
+
+fn coordination_context_packet(client: &HarnessClient, job_id: &str) -> String {
+    match client.call_tool(
+        "coordination_context",
+        json!({ "room_id": "repo:theorem:branch:main", "job_id": job_id }),
+    ) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+        Err(error) => format!("coordination_context unavailable: {error}"),
+    }
+}
+
+fn probe_harness(client: &HarnessClient) -> ReceiverResult<()> {
+    client.tools_list().map(|_| ())
+}
+
+pub fn build_launch_prompt(
+    job: &Job,
+    spec_text: &str,
+    context_packet: &str,
+    actor: &str,
+    session_ref: &str,
+) -> String {
+    format!(
+        "SPEC\n----\n{spec_text}\n\nCONTEXT PACKET\n--------------\n{context_packet}\n\nFOOTER\n------\nactor: {actor}\njob_id: {job_id}\nroom_id: repo:theorem:branch:main\nsession_ref: {session_ref}\nrepo: {repo}\ntarget_head: {target_head:?}\n\nDoctrine:\n- Dependencies named in a spec are information for you, not gates. Check the tree, decide, and note your reasoning on the job.\n- Refresh with coordination_context if this packet looks stale.\n\nWhen you make progress, call job_note with commit refs or receipts. When the thread is complete, anyone may call job_archive with reason \"done\".",
+        job_id = job.job_id,
+        repo = job.repo,
+        target_head = job.target_head,
+    )
+}
+
+fn not_before_is_future(not_before: Option<&str>) -> bool {
+    let Some(not_before) = not_before else {
+        return false;
+    };
+    let Some(epoch) = not_before
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let now_epoch = now_string()
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .unwrap_or(0);
+    epoch > now_epoch
+}
+
+fn branch_tip(worktree: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(worktree)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// A bounded ring of the most recent lines.
@@ -215,6 +358,28 @@ fn sleep_until_stop(interval: std::time::Duration, should_stop: &impl Fn() -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use theorem_harness_core::{Priority, TargetHead};
+
+    fn job_fixture() -> Job {
+        Job {
+            job_id: "job-001".to_string(),
+            title: "Dia".to_string(),
+            spec_ref: Some("docs/plans/x/HANDOFF.md".to_string()),
+            spec_inline: None,
+            repo: "Travis-Gilbert/theorem".to_string(),
+            priority: Priority::P0,
+            target_head: TargetHead::Either,
+            not_before: None,
+            submitted_by: "claude.ai".to_string(),
+            submitted_at: "1.000000000Z".to_string(),
+            started_at: None,
+            session_ref: None,
+            archived_at: None,
+            archived_reason: None,
+            idempotency_key: "sha256:abc".to_string(),
+            receipts: Vec::new(),
+        }
+    }
 
     #[test]
     fn tail_buffer_keeps_only_the_last_n_lines() {
@@ -223,5 +388,32 @@ mod tests {
         tail.push("b".to_string());
         tail.push("c".to_string());
         assert_eq!(tail.joined(), "b\nc");
+    }
+
+    #[test]
+    fn launch_prompt_contains_spec_context_and_footer() {
+        let job = job_fixture();
+        let prompt = build_launch_prompt(
+            &job,
+            "Build the thing.",
+            "{\"context\":true}",
+            "receiver-a",
+            "session-a",
+        );
+        assert!(prompt.contains("Build the thing."));
+        assert!(prompt.contains("CONTEXT PACKET"));
+        assert!(prompt.contains("receiver-a"));
+        assert!(prompt.contains("job-001"));
+        assert!(prompt.contains("Dependencies named in a spec are information"));
+        assert!(prompt.contains("coordination_context"));
+        assert!(prompt.contains("job_note"));
+    }
+
+    #[test]
+    fn not_before_epoch_skips_future_only() {
+        assert!(!not_before_is_future(None));
+        assert!(!not_before_is_future(Some("1.000000000Z")));
+        assert!(not_before_is_future(Some("9999999999.000000000Z")));
+        assert!(!not_before_is_future(Some("not-a-timestamp")));
     }
 }

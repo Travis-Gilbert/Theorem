@@ -62,8 +62,8 @@ pub use intra_agent_loop::{
     FakeIntraAgentLoopResult, IntraAgentLoopError,
 };
 pub use job::{
-    default_branch, idempotency_key_for, new_job_id, Job, JobKind, JobStatus, JobSubmission,
-    Priority, TargetHead, LANE_CLAUDE, LANE_CODEX,
+    idempotency_key_for, new_job_id, Job, JobReceipt, JobSubmission, Priority, TargetHead,
+    LANE_CLAUDE, LANE_CODEX,
 };
 pub use map_artifacts::{
     compile_map_artifact, describe_map_artifact, scope_for_map_kind, stable_map_id,

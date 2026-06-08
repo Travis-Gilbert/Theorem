@@ -54,11 +54,8 @@ pub use event_log::{
     RuntimeResult,
 };
 pub use job_queue::{
-    job_artifact_node_id, job_cancel, job_claim, job_complete, job_event_node_id, job_node_id,
-    job_promote, job_submit, load_job, load_job_events, queue_status, JobActionResult,
-    JobCompletion, JobEvent, JobOutcome, JobSubmitOutcome, EDGE_DISPATCHED_AS, EDGE_JOB_EVENT_NEXT,
-    EDGE_JOB_EVENT_OF, EDGE_JOB_FOR_SPEC, EDGE_PRODUCED, JOB_ARTIFACT_LABEL, JOB_EVENT_LABEL,
-    JOB_LABEL,
+    job_archive, job_list, job_node_id, job_note, job_submit, load_job, JobActionResult,
+    JobNoteInput, JobSubmitOutcome, EDGE_DISPATCHED_AS, EDGE_JOB_FOR_SPEC, JOB_LABEL,
 };
 pub use memory::{
     archive_memory_document, create_memory_document, create_memory_node, encode_memory,
