@@ -184,7 +184,12 @@ pub fn invoke_affordance<S: AffordanceGraphStore>(
     policy: &InvokePolicy,
     actor: Option<&str>,
 ) -> ConnectorResult<InvokeReport> {
-    let planned = plan_invocation(store, &req.tenant_id, &req.affordance_id, req.arguments.clone())?;
+    let planned = plan_invocation(
+        store,
+        &req.tenant_id,
+        &req.affordance_id,
+        req.arguments.clone(),
+    )?;
     if !policy.may_fire(&planned) {
         return Ok(InvokeReport {
             planned,

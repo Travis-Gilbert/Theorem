@@ -252,12 +252,13 @@ pub fn resolve_node_type_skill_packs<S: SkillPackGraphStore>(
 ) -> NodeTypeBindingResult<NodeTypeSkillPackResolution> {
     let tenant = normalize_tenant(&input.tenant_slug);
     let node_type = normalize_node_type(&input.node_type)?;
-    let binding = load_node_type_skill_pack_binding(store, &tenant, &node_type)?.ok_or_else(|| {
-        NodeTypeBindingError::NotFound {
-            kind: "node_type_skill_pack_binding".to_string(),
-            id: node_type_binding_node_id(&tenant, &node_type),
-        }
-    })?;
+    let binding =
+        load_node_type_skill_pack_binding(store, &tenant, &node_type)?.ok_or_else(|| {
+            NodeTypeBindingError::NotFound {
+                kind: "node_type_skill_pack_binding".to_string(),
+                id: node_type_binding_node_id(&tenant, &node_type),
+            }
+        })?;
     if binding.status != "active" {
         return Err(NodeTypeBindingError::InvalidInput {
             field: "status".to_string(),
@@ -470,7 +471,12 @@ mod tests {
         .unwrap();
         publish_skill_pack(
             &mut store,
-            sample_pack("fixture-oracle", "hash-oracle", "fixture_check", "validated"),
+            sample_pack(
+                "fixture-oracle",
+                "hash-oracle",
+                "fixture_check",
+                "validated",
+            ),
         )
         .unwrap();
 
@@ -532,7 +538,12 @@ mod tests {
         let mut store = InMemoryGraphStore::new();
         publish_skill_pack(
             &mut store,
-            sample_pack("browser-playbook", "hash-browser", "browser_use", "validated"),
+            sample_pack(
+                "browser-playbook",
+                "hash-browser",
+                "browser_use",
+                "validated",
+            ),
         )
         .unwrap();
         bind_node_type_skill_packs(
@@ -579,7 +590,9 @@ mod tests {
         );
         assert!(matches!(
             missing,
-            Err(NodeTypeBindingError::SkillPack(SkillPackError::NotFound { .. }))
+            Err(NodeTypeBindingError::SkillPack(
+                SkillPackError::NotFound { .. }
+            ))
         ));
 
         publish_skill_pack(

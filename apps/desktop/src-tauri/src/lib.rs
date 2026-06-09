@@ -165,6 +165,7 @@ struct SpaceBindInput {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RoomPostInput {
     room_id: String,
     message: String,
@@ -1132,7 +1133,7 @@ fn start_receiver_locked(backend: &mut DesktopBackendState) -> Result<(), String
     let handle = std::thread::spawn(move || {
         let client = match theorem_receiver::HarnessClient::new(
             config.harness_url.clone(),
-            token,
+            Some(token),
             config.tenant_slug.clone(),
         ) {
             Ok(client) => client,

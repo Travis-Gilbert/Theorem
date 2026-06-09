@@ -48,7 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "\nconnected to: {} v{} (protocol {})",
-        result.server_info.server_name, result.server_info.server_version, result.server_info.protocol_version
+        result.server_info.server_name,
+        result.server_info.server_version,
+        result.server_info.protocol_version
     );
     println!(
         "registered {} tools as Affordance nodes:\n",

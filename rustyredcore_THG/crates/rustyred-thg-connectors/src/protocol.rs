@@ -107,7 +107,10 @@ pub fn parse_tools_list(result: &Value) -> ConnectorResult<Vec<ToolDescriptor>> 
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let input_schema = tool.get("inputSchema").cloned().unwrap_or_else(|| json!({}));
+        let input_schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let annotations = tool.get("annotations");
         let read_only_hint = annotations
             .and_then(|a| a.get("readOnlyHint"))
@@ -181,7 +184,10 @@ pub fn connector_manifest(
         tenant_id: tenant_id.to_string(),
         server_id: server_id.to_string(),
         label: label.to_string(),
-        tools: descriptors.iter().map(tool_manifest_from_descriptor).collect(),
+        tools: descriptors
+            .iter()
+            .map(tool_manifest_from_descriptor)
+            .collect(),
     }
 }
 

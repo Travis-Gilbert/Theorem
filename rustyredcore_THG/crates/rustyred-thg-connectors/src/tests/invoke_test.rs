@@ -115,7 +115,10 @@ fn dry_run_is_the_default_and_fires_nothing() {
         Some("operator"),
     )
     .expect("dry-run invoke");
-    assert!(!report.fired, "the default policy must not fire a live tool");
+    assert!(
+        !report.fired,
+        "the default policy must not fire a live tool"
+    );
     assert!(report.outcome.is_none());
     assert!(report.recorded.is_none());
     assert!(report.dry_run_reason.is_some());
@@ -126,8 +129,8 @@ fn dry_run_is_the_default_and_fires_nothing() {
 #[test]
 fn fire_over_transport_records_a_real_outcome_and_moves_fitness() {
     let mut store = registered_store();
-    let planned = plan_invocation(&store, "acme", "everything.add", json!({ "a": 2, "b": 3 }))
-        .expect("plan");
+    let planned =
+        plan_invocation(&store, "acme", "everything.add", json!({ "a": 2, "b": 3 })).expect("plan");
     let mut transport = FakeServer::with_tool_call(json!({
         "content": [ { "type": "text", "text": "5" } ],
         "isError": false
@@ -173,7 +176,10 @@ fn allowlist_fires_only_named_affordances() {
         Some("operator"),
     )
     .expect("invoke");
-    assert!(!report.fired, "add is not on the allowlist, so it must dry-run");
+    assert!(
+        !report.fired,
+        "add is not on the allowlist, so it must dry-run"
+    );
     assert!(report.recorded.is_none());
 }
 

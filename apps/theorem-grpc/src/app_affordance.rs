@@ -532,6 +532,13 @@ fn code_ingest_handler(
         exclude_dirs: request_string_array(request, "exclude_dirs"),
         max_files: request_u64(request, "max_files").unwrap_or_default(),
         max_file_bytes: request_u64(request, "max_file_bytes").unwrap_or_default(),
+        max_total_bytes: request_u64(request, "max_total_bytes")
+            .or_else(|| request_u64(request, "maxTotalBytes"))
+            .or_else(|| request_u64(request, "max_clone_bytes"))
+            .or_else(|| request_u64(request, "maxCloneBytes"))
+            .or_else(|| request_u64(request, "max_repo_bytes"))
+            .or_else(|| request_u64(request, "maxRepoBytes"))
+            .unwrap_or_default(),
         actor: actor.to_string(),
     };
     let result = if !repo_url.is_empty() && reindex {

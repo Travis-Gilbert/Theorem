@@ -186,7 +186,10 @@ mod tests {
 
         assert_eq!(delta.commit_sha, Some("deadbeef".to_string()));
         assert!(
-            delta.changed_files.iter().any(|path| path.ends_with("lib.rs")),
+            delta
+                .changed_files
+                .iter()
+                .any(|path| path.ends_with("lib.rs")),
             "the changed file is recorded: {:?}",
             delta.changed_files
         );
@@ -197,10 +200,10 @@ mod tests {
             delta.objects.len()
         );
         assert!(
-            delta
-                .objects
+            delta.objects.iter().any(|node| node
+                .labels
                 .iter()
-                .any(|node| node.labels.iter().any(|label| label.as_str() == "CodeSymbol")),
+                .any(|label| label.as_str() == "CodeSymbol")),
             "symbol nodes are present in the delta"
         );
         // contains-file + declares-symbol edges (and the beta->alpha call edge).
@@ -216,7 +219,11 @@ mod tests {
     fn served_instant_kg_overlays_code_edit_on_base() {
         let repo = unique_dir("serve-repo");
         fs::create_dir_all(repo.join("src")).unwrap();
-        fs::write(repo.join("src/lib.rs"), "pub fn alpha() -> usize {\n    1\n}\n").unwrap();
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn alpha() -> usize {\n    1\n}\n",
+        )
+        .unwrap();
 
         let config = resolve_ingest_config(IngestCodebaseInput {
             tenant_id: "theorem".to_string(),
@@ -243,7 +250,9 @@ mod tests {
         let merged = view.merged_snapshot();
         assert!(
             merged.nodes.iter().any(|node| {
-                node.labels.iter().any(|label| label.as_str() == "CodeSymbol")
+                node.labels
+                    .iter()
+                    .any(|label| label.as_str() == "CodeSymbol")
                     && node.properties.get("name").and_then(|v| v.as_str()) == Some("alpha")
             }),
             "the alpha symbol is served through the instant KG"

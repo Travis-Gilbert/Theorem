@@ -66,9 +66,7 @@ pub use browser_perception::{
 };
 
 pub mod browser_run;
-pub use browser_run::{
-    BrowsingRunRecord, BrowsingRunRecorder, BrowsingRunReplay, BrowsingRunStep,
-};
+pub use browser_run::{BrowsingRunRecord, BrowsingRunRecorder, BrowsingRunReplay, BrowsingRunStep};
 
 pub mod providers;
 pub use providers::{

@@ -313,7 +313,9 @@ pub fn resolve_context_command(request: ContextCommandRequest) -> ContextCommand
             allow_disclosure: false,
             ..PermissionPolicy::web_consume()
         },
-        RiskMode::ConfirmBeforeWrite | RiskMode::SupervisedAction => PermissionPolicy::web_consume(),
+        RiskMode::ConfirmBeforeWrite | RiskMode::SupervisedAction => {
+            PermissionPolicy::web_consume()
+        }
     };
     permission_policy.allow_external_web = request
         .allow_external_web
@@ -371,7 +373,9 @@ pub fn resolve_context_command(request: ContextCommandRequest) -> ContextCommand
             ..RetrievalPolicy::default()
         },
         risk_mode,
-        output_target: request.output_target.unwrap_or(OutputTarget::HarnessReceipt),
+        output_target: request
+            .output_target
+            .unwrap_or(OutputTarget::HarnessReceipt),
         graph_layers: vec![
             GraphLayer::RustyredHot,
             GraphLayer::RedisHot,
@@ -595,7 +599,10 @@ pub fn perceive_with_graph<S: GraphStore>(
                 kind: PerceptionCandidateKind::Action,
                 status: PerceptionCandidateStatus::FetchedUnadmitted,
                 label: element.name.clone(),
-                url: element.value.clone().filter(|value| value.starts_with("http")),
+                url: element
+                    .value
+                    .clone()
+                    .filter(|value| value.starts_with("http")),
                 confidence: 0.4,
                 metadata: json!({
                     "role": element.role,
@@ -815,7 +822,10 @@ pub fn build_action_rail(
     ActionRailBundle { actions, groups }
 }
 
-pub fn gate_action(command: &ContextCommandState, mut candidate: ActionCandidate) -> ActionCandidate {
+pub fn gate_action(
+    command: &ContextCommandState,
+    mut candidate: ActionCandidate,
+) -> ActionCandidate {
     candidate.status = match candidate.risk {
         ActionRisk::ReadOnly => ActionStatus::Ready,
         ActionRisk::ExternalWeb => {
@@ -1201,7 +1211,9 @@ mod tests {
         let decoded: ContextCommandState =
             serde_json::from_value(fixture.clone()).expect("python fixture");
         assert_eq!(decoded.output_target, OutputTarget::Answer);
-        assert!(decoded.graph_layers.contains(&GraphLayer::MemgraphCanonical));
+        assert!(decoded
+            .graph_layers
+            .contains(&GraphLayer::MemgraphCanonical));
         assert_eq!(serde_json::to_value(decoded).expect("encoded"), fixture);
     }
 

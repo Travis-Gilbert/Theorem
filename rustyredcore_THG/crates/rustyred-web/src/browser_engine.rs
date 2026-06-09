@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::browser_perception::{
-    extract_structured, keyboard_fallback_for, resolve_upload_path, DomainPolicy, NavigationDecision,
-    SensitiveData, TabSet, UploadDecision,
+    extract_structured, keyboard_fallback_for, resolve_upload_path, DomainPolicy,
+    NavigationDecision, SensitiveData, TabSet, UploadDecision,
 };
 use crate::{
     apply_batch_to_store, build_v2_fixture_crawl, canonicalize_url, extract_links_for_url,
@@ -100,23 +100,54 @@ pub enum WaitCondition {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum BrowserAction {
-    Click { element_id: String },
-    Type { element_id: String, text: String },
-    Select { element_id: String, value: String },
-    SendKeys { sequence: String },
-    SelectOption { element_id: String, value: String },
-    Scroll { delta: i32 },
-    ScrollToElement { element_id: String },
-    UploadFile { element_id: String, path: String },
+    Click {
+        element_id: String,
+    },
+    Type {
+        element_id: String,
+        text: String,
+    },
+    Select {
+        element_id: String,
+        value: String,
+    },
+    SendKeys {
+        sequence: String,
+    },
+    SelectOption {
+        element_id: String,
+        value: String,
+    },
+    Scroll {
+        delta: i32,
+    },
+    ScrollToElement {
+        element_id: String,
+    },
+    UploadFile {
+        element_id: String,
+        path: String,
+    },
     Back,
     Forward,
-    WaitFor { condition: WaitCondition },
+    WaitFor {
+        condition: WaitCondition,
+    },
     Submit,
-    OpenTab { url: String },
-    SwitchTab { tab_id: String },
-    CloseTab { tab_id: String },
+    OpenTab {
+        url: String,
+    },
+    SwitchTab {
+        tab_id: String,
+    },
+    CloseTab {
+        tab_id: String,
+    },
     ListTabs,
-    Extract { schema: Value, candidate: Value },
+    Extract {
+        schema: Value,
+        candidate: Value,
+    },
     Done {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
@@ -315,7 +346,9 @@ impl FetchCascadeBrowserEngine {
                 self.apply_select(element_id, value, &domain, policy, &mut receipt)?
             }
             BrowserAction::SendKeys { sequence } => {
-                let resolved = policy.sensitive_data.resolve_placeholders(&domain, sequence);
+                let resolved = policy
+                    .sensitive_data
+                    .resolve_placeholders(&domain, sequence);
                 let masked = policy.sensitive_data.mask(&domain, &resolved);
                 receipt = json!({
                     "engine": "fetch_cascade_browser_engine",
@@ -391,9 +424,9 @@ impl FetchCascadeBrowserEngine {
                 self.navigate(url).await?
             }
             BrowserAction::SwitchTab { tab_id } => {
-                self.tabs.switch(tab_id).map_err(|reason| BrowserEngineError::ActionBlocked {
-                    reason,
-                })?;
+                self.tabs
+                    .switch(tab_id)
+                    .map_err(|reason| BrowserEngineError::ActionBlocked { reason })?;
                 if let Some(page) = self.tab_pages.get(tab_id).cloned() {
                     self.replace_current(page.clone());
                     page
@@ -405,9 +438,9 @@ impl FetchCascadeBrowserEngine {
                 }
             }
             BrowserAction::CloseTab { tab_id } => {
-                self.tabs.close(tab_id).map_err(|reason| BrowserEngineError::ActionBlocked {
-                    reason,
-                })?;
+                self.tabs
+                    .close(tab_id)
+                    .map_err(|reason| BrowserEngineError::ActionBlocked { reason })?;
                 let mut page = self
                     .tabs
                     .active()
@@ -490,7 +523,10 @@ impl FetchCascadeBrowserEngine {
         if self.tabs.is_empty() {
             self.tabs.open(page.url.clone());
         }
-        if let Some(tab_id) = self.tabs.update_active(page.url.clone(), page.title.clone()) {
+        if let Some(tab_id) = self
+            .tabs
+            .update_active(page.url.clone(), page.title.clone())
+        {
             page.active_tab_id = Some(tab_id);
         }
     }
@@ -1013,7 +1049,10 @@ mod tests {
             .await
             .expect("type");
 
-        let page_value = outcome.page.interactive_elements[0].value.as_deref().unwrap();
+        let page_value = outcome.page.interactive_elements[0]
+            .value
+            .as_deref()
+            .unwrap();
         assert!(!page_value.contains("hunter2"));
         assert!(page_value.contains("<secret:example.com/password>"));
         let receipt = outcome.receipt.to_string();
@@ -1113,7 +1152,9 @@ mod tests {
         let mut second_page = page_state_from_html("https://example.com/two", "<title>Two</title>")
             .expect("second page");
         second_page.active_tab_id = Some(second_tab.clone());
-        engine.tab_pages.insert(first_tab.clone(), first_page.clone());
+        engine
+            .tab_pages
+            .insert(first_tab.clone(), first_page.clone());
         engine.tab_pages.insert(second_tab.clone(), second_page);
         engine.history.push(first_page);
 
@@ -1126,7 +1167,10 @@ mod tests {
             )
             .await
             .expect("switch tab");
-        assert_eq!(outcome.page.active_tab_id.as_deref(), Some(second_tab.as_str()));
+        assert_eq!(
+            outcome.page.active_tab_id.as_deref(),
+            Some(second_tab.as_str())
+        );
         assert_eq!(outcome.page.title, "Two");
     }
 
@@ -1138,8 +1182,8 @@ mod tests {
         ))
         .expect("cascade");
         let mut engine = FetchCascadeBrowserEngine::new(cascade, 1024);
-        let page = page_state_from_html("https://example.com/", "<title>Docs</title>")
-            .expect("page");
+        let page =
+            page_state_from_html("https://example.com/", "<title>Docs</title>").expect("page");
         engine.history.push(page);
 
         let extract = engine
