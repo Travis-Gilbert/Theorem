@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{
     next_for_head, spawn_verify_node, stable_value_hash, submit_verify_receipt, ClaimOutcome,
-    HeadFitness, JobSubmission, Millis, NodeStatus, Receipt, TaskNode, TransitionInput,
-    TransitionResult, VerifyReceipt, WorkGraph,
+    FakeHeadInvoker, GroundedClaim, HeadFitness, JobStatus, JobSubmission, Millis, NodeStatus,
+    Priority, Receipt, TaskNode, TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
 };
 #[cfg(test)]
 use theorem_harness_runtime::subscribe_coordination_room_events;
@@ -137,7 +138,17 @@ pub trait McpGraphBackend {
             "harness run reads are not supported by this MCP backend",
         ))
     }
-    /// Dispatch-board verb: create or upsert a pending job.
+    fn composed_agent_run(
+        &mut self,
+        _binding_id: String,
+        _task: String,
+        _claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        Err(McpError::internal(
+            "composed_agent_run is not supported by this MCP backend",
+        ))
+    }
+    /// Dispatch-queue verb: create `Job{Queued}` (idempotent on idempotency_key).
     fn job_submit(
         &mut self,
         _submission: JobSubmission,
@@ -450,6 +461,10 @@ pub struct McpServerConfig {
     pub default_tenant: String,
     pub read_only: bool,
     pub allow_admin: bool,
+    #[serde(default = "default_tool_result_budget_bytes")]
+    pub tool_result_budget_bytes: usize,
+    #[serde(default)]
+    pub tool_result_family_budgets: HashMap<String, usize>,
 }
 
 impl Default for McpServerConfig {
@@ -458,11 +473,23 @@ impl Default for McpServerConfig {
             name: "rusty-red-graph-database".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             default_tenant: "default".to_string(),
-            read_only: true,
+            read_only: false,
             allow_admin: false,
+            tool_result_budget_bytes: default_tool_result_budget_bytes(),
+            tool_result_family_budgets: HashMap::new(),
         }
     }
 }
+
+pub const DEFAULT_TOOL_RESULT_BUDGET_BYTES: usize = 16 * 1024;
+
+const TOOL_RESULT_MARKER_RESERVED_BYTES: usize = 512;
+
+fn default_tool_result_budget_bytes() -> usize {
+    DEFAULT_TOOL_RESULT_BUDGET_BYTES
+}
+
+static TOOL_RESULT_BODIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpRequestContext {
@@ -703,6 +730,9 @@ fn call_tool<P: McpGraphProvider>(
     let mut backend = provider.backend_for_tenant(&tenant)?;
 
     let payload = match name {
+        "tool_result_fetch" | "theorem_harness_tool_result_fetch" => {
+            tool_result_fetch_payload(&arguments)?
+        }
         "rustyred_thg_graph_neighbors" => {
             let query = neighbor_query_from_value(&arguments)?;
             let mut neighbors = backend.neighbors(query)?;
@@ -1156,7 +1186,16 @@ fn call_tool<P: McpGraphProvider>(
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
         }
-        "job_submit" => {
+        "composed_agent_run" | "theorem_composed_agent_run" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "composed_agent_run is unavailable while read-only mode is active."
+                })));
+            }
+            composed_agent_run_payload(&tenant, &mut backend, &arguments)?
+        }
+        "job_submit" | "theorem_job_submit" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
                     "error": "mcp_read_only",
@@ -1789,7 +1828,7 @@ fn call_tool<P: McpGraphProvider>(
         other => return Err(McpError::method_not_found(other)),
     };
 
-    Ok(tool_result(payload))
+    Ok(tool_result_with_budget(payload, config, name))
 }
 
 fn read_resource<P: McpGraphProvider>(
@@ -3143,6 +3182,54 @@ fn harness_run_payload(
         "detail": detail,
         "found": found
     }))
+}
+
+fn composed_agent_run_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let task = required_text_any(arguments, &["task", "query", "q"], "composed_agent_run")?;
+    let binding_id = argument_text(arguments, &["binding_id", "bindingId"])
+        .unwrap_or_else(|| theorem_harness_runtime::DEFAULT_BINDING_ID.to_string());
+    let claims = grounded_claims_from_arguments(arguments);
+    backend
+        .composed_agent_run(binding_id, task, claims)
+        .map(|result| {
+            json!({
+                "tenant": tenant,
+                "result": result
+            })
+        })
+}
+
+fn grounded_claims_from_arguments(arguments: &Value) -> Vec<GroundedClaim> {
+    arguments
+        .get("claims")
+        .and_then(Value::as_array)
+        .map(|claims| {
+            claims
+                .iter()
+                .filter_map(|claim| {
+                    let text = claim
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    let provenance = claim
+                        .get("provenance")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if text.is_empty() || provenance.is_empty() {
+                        None
+                    } else {
+                        Some(GroundedClaim::new(text, provenance))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn skill_list_payload(
@@ -6206,12 +6293,143 @@ fn tool_result(payload: Value) -> Value {
     })
 }
 
+fn tool_result_with_budget(payload: Value, config: &McpServerConfig, tool_name: &str) -> Value {
+    let budget = tool_result_budget_for(config, tool_name);
+    if budget == 0 {
+        return tool_result(payload);
+    }
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    if text.len() <= budget {
+        return json!({
+            "content": [{
+                "type": "text",
+                "text": text
+            }],
+            "structuredContent": payload
+        });
+    }
+
+    let handle = store_tool_result_body(tool_name, &text);
+    let preview = truncate_utf8_with_marker(&text, budget, &handle);
+    let structured = json!({
+        "budgeted": true,
+        "truncated": true,
+        "tool_name": tool_name,
+        "family": tool_result_family(tool_name),
+        "original_bytes": text.len(),
+        "returned_bytes": preview.len(),
+        "fetch_handle": handle.clone(),
+        "next_cursor": {
+            "handle": handle.clone(),
+            "offset": preview.len(),
+        },
+        "message": "Tool result exceeded the configured MCP boundary budget; call tool_result_fetch with the fetch_handle and offset to retrieve more bytes."
+    });
+    json!({
+        "content": [{
+            "type": "text",
+            "text": preview
+        }],
+        "structuredContent": structured
+    })
+}
+
 fn tool_result_error(payload: Value) -> Value {
     let mut result = tool_result(payload);
     if let Value::Object(map) = &mut result {
         map.insert("isError".to_string(), Value::Bool(true));
     }
     result
+}
+
+fn tool_result_budget_for(config: &McpServerConfig, tool_name: &str) -> usize {
+    let family = tool_result_family(tool_name);
+    config
+        .tool_result_family_budgets
+        .get(family)
+        .copied()
+        .unwrap_or(config.tool_result_budget_bytes)
+}
+
+fn tool_result_family(tool_name: &str) -> &'static str {
+    match tool_name {
+        "compute_code" | "rustyred_thg_compute_code" | "theorem_harness_compute_code" => "code",
+        name if name.contains("code") => "code",
+        name if name.contains("fractal") => "fractal",
+        "recall"
+        | "theorem_harness_recall"
+        | "self_recall_archive"
+        | "theorem_harness_self_recall_archive" => "recall",
+        "coordination_context" | "theorem_harness_coordination_context" => "coordination",
+        name if name.contains("graph") || name.contains("neighbors") => "graph",
+        _ => "default",
+    }
+}
+
+fn store_tool_result_body(tool_name: &str, body: &str) -> String {
+    let handle = format!(
+        "tool-result:{}:{}",
+        rustyred_thg_core::normalize_plugin_command(tool_name),
+        rustyred_thg_core::stable_hash(body)
+    );
+    let store = TOOL_RESULT_BODIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut bodies) = store.lock() {
+        bodies.insert(handle.clone(), body.to_string());
+    }
+    handle
+}
+
+fn tool_result_fetch_payload(arguments: &Value) -> Result<Value, McpError> {
+    let handle = arguments
+        .get("fetch_handle")
+        .or_else(|| arguments.get("handle"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::invalid_params("tool_result_fetch requires fetch_handle"))?;
+    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let max_bytes = arguments
+        .get("max_bytes")
+        .or_else(|| arguments.get("maxBytes"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TOOL_RESULT_BUDGET_BYTES as u64) as usize;
+    let store = TOOL_RESULT_BODIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let bodies = store
+        .lock()
+        .map_err(|_| McpError::internal("tool result body store lock poisoned"))?;
+    let body = bodies.get(handle).ok_or_else(|| {
+        McpError::invalid_params(format!("tool result fetch_handle was not found: {handle}"))
+    })?;
+    let start = floor_char_boundary(body, offset.min(body.len()));
+    let end = floor_char_boundary(body, start.saturating_add(max_bytes).min(body.len()));
+    let next_offset = (end < body.len()).then_some(end);
+    Ok(json!({
+        "fetch_handle": handle,
+        "offset": start,
+        "next_offset": next_offset,
+        "total_bytes": body.len(),
+        "text": &body[start..end],
+    }))
+}
+
+fn truncate_utf8_with_marker(content: &str, budget: usize, handle: &str) -> String {
+    let head_capacity = budget
+        .saturating_sub(TOOL_RESULT_MARKER_RESERVED_BYTES)
+        .max(1);
+    let cut = floor_char_boundary(content, head_capacity.min(content.len()));
+    let dropped = content.len().saturating_sub(cut);
+    let mut out = content[..cut].to_string();
+    out.push_str(&format!(
+        "\n\n[{} bytes truncated by tool_result_budget; fetch_handle={handle}]",
+        dropped
+    ));
+    out
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn jsonrpc_error(id: Option<Value>, error: McpError) -> Value {
@@ -6249,6 +6467,32 @@ fn harness_run_detail_from_store<S: GraphStore>(
             Ok(Some(json!({ "run": run, "events": events })))
         }
     }
+}
+
+fn composed_agent_run_to_store<S: GraphStore>(
+    store: &mut S,
+    binding_id: String,
+    task: String,
+    claims: Vec<GroundedClaim>,
+) -> Result<Value, McpError> {
+    let invoker = FakeHeadInvoker::default();
+    let result = if claims.is_empty() {
+        theorem_harness_runtime::run_composed_agent(store, &binding_id, &task, &invoker)
+    } else {
+        theorem_harness_runtime::run_composed_agent_with_claims(
+            store,
+            &binding_id,
+            &task,
+            claims,
+            &invoker,
+        )
+    }
+    .map_err(mcp_composed_agent_error)?;
+    serde_json::to_value(result).map_err(|error| {
+        McpError::internal(format!(
+            "composed_agent_run payload serialization failed: {error}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6439,6 +6683,14 @@ fn mcp_harness_runtime_error(error: HarnessRuntimeError) -> McpError {
         code: -32603,
         message: error.to_string(),
         data: Some(json!({ "code": "harness_runtime_error" })),
+    }
+}
+
+fn mcp_composed_agent_error(error: theorem_harness_runtime::ComposedAgentRuntimeError) -> McpError {
+    McpError {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({ "code": "composed_agent_runtime_error" })),
     }
 }
 
@@ -6710,6 +6962,23 @@ fn resource_templates() -> Vec<Value> {
 
 fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
     let mut tools = vec![
+        tool(
+            "tool_result_fetch",
+            "Fetch a byte slice from a tool result that exceeded the MCP boundary budget.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "fetch_handle": { "type": "string" },
+                    "handle": { "type": "string" },
+                    "offset": { "type": "integer", "default": 0 },
+                    "max_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESULT_BUDGET_BYTES },
+                    "maxBytes": { "type": "integer", "default": DEFAULT_TOOL_RESULT_BUDGET_BYTES }
+                },
+                "required": ["fetch_handle"]
+            }),
+        ),
         tool(
             "rustyred_thg_graph_neighbors",
             "Read graph neighbors through THG adjacency indexes.",
@@ -7252,6 +7521,32 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool_write(
+            "composed_agent_run",
+            "Run one composed-agent turn through the binding scratchpad and alignment gate.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "binding_id": { "type": "string", "default": "agent:theorem" },
+                    "bindingId": { "type": "string" },
+                    "task": { "type": "string" },
+                    "claims": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "provenance": { "type": "string" }
+                            },
+                            "required": ["text", "provenance"]
+                        }
+                    }
+                },
+                "required": ["task"]
+            }),
+        ),
+        tool_write(
             "job_submit",
             "Dispatch v2: create or upsert a pending Job thread. Duplicate idempotency_key returns the existing job.",
             json!({
@@ -7342,9 +7637,14 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "include_extensions": { "type": "array", "items": { "type": "string" } },
                     "exclude_dirs": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
+                    "cursor": { "type": "integer", "default": 0 },
+                    "next_cursor": { "type": "integer" },
                     "max_depth": { "type": "integer", "default": 1 },
                     "max_files": { "type": "integer" },
                     "max_file_bytes": { "type": "integer" },
+                    "max_total_bytes": { "type": "integer" },
+                    "max_clone_bytes": { "type": "integer" },
+                    "max_repo_bytes": { "type": "integer" },
                     "before_lines": { "type": "integer" },
                     "after_lines": { "type": "integer" },
                     "max_chars": { "type": "integer" },
@@ -7383,9 +7683,14 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "include_extensions": { "type": "array", "items": { "type": "string" } },
                     "exclude_dirs": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
+                    "cursor": { "type": "integer", "default": 0 },
+                    "next_cursor": { "type": "integer" },
                     "max_depth": { "type": "integer", "default": 1 },
                     "max_files": { "type": "integer" },
                     "max_file_bytes": { "type": "integer" },
+                    "max_total_bytes": { "type": "integer" },
+                    "max_clone_bytes": { "type": "integer" },
+                    "max_repo_bytes": { "type": "integer" },
                     "before_lines": { "type": "integer" },
                     "after_lines": { "type": "integer" },
                     "max_chars": { "type": "integer" },
@@ -8805,6 +9110,15 @@ impl McpGraphBackend for InMemoryGraphStore {
         harness_run_detail_from_store(self, run_id)
     }
 
+    fn composed_agent_run(
+        &mut self,
+        binding_id: String,
+        task: String,
+        claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        composed_agent_run_to_store(self, binding_id, task, claims)
+    }
+
     fn job_submit(
         &mut self,
         submission: JobSubmission,
@@ -8976,6 +9290,15 @@ impl McpGraphBackend for RedCoreGraphStore {
 
     fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
         harness_run_detail_from_store(self, run_id)
+    }
+
+    fn composed_agent_run(
+        &mut self,
+        binding_id: String,
+        task: String,
+        claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        composed_agent_run_to_store(self, binding_id, task, claims)
     }
 
     fn job_submit(
@@ -9263,12 +9586,13 @@ mod tests {
         RedCoreGraphStore, VectorDesignation, VerifyReport,
     };
     use serde_json::{json, Value};
-    use theorem_harness_core::TransitionInput;
+    use theorem_harness_core::{GroundedClaim, TransitionInput};
 
     use super::{
-        append_harness_transition_to_store, handle_mcp_request, handle_mcp_request_with_context,
-        harness_run_detail_from_store, subscribe_coordination_room_events, AppAffordanceInvocation,
-        McpError, McpGraphBackend, McpGraphProvider, McpRequestContext, McpServerConfig,
+        append_harness_transition_to_store, composed_agent_run_to_store, handle_mcp_request,
+        handle_mcp_request_with_context, harness_run_detail_from_store,
+        subscribe_coordination_room_events, AppAffordanceInvocation, McpError, McpGraphBackend,
+        McpGraphProvider, McpRequestContext, McpServerConfig,
     };
 
     struct FixtureProvider(Rc<RefCell<InMemoryGraphStore>>);
@@ -9451,6 +9775,16 @@ mod tests {
         fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
             let store = self.0.borrow();
             harness_run_detail_from_store(&*store, run_id)
+        }
+
+        fn composed_agent_run(
+            &mut self,
+            binding_id: String,
+            task: String,
+            claims: Vec<GroundedClaim>,
+        ) -> Result<Value, McpError> {
+            let mut store = self.0.borrow_mut();
+            composed_agent_run_to_store(&mut *store, binding_id, task, claims)
         }
 
         fn dispatch_handoff(&self, _dispatch: super::HandoffDispatch) -> Result<(), McpError> {
@@ -9767,6 +10101,45 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_config_defaults_to_writable_without_admin() {
+        let config = McpServerConfig::default();
+        assert!(!config.read_only);
+        assert!(!config.allow_admin);
+        assert_eq!(
+            config.tool_result_budget_bytes,
+            super::DEFAULT_TOOL_RESULT_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn tool_result_budget_caps_payload_and_exposes_fetch_handle() {
+        let config = McpServerConfig {
+            tool_result_budget_bytes: 1024,
+            ..McpServerConfig::default()
+        };
+        let result = super::tool_result_with_budget(
+            json!({ "blob": "x".repeat(10_000) }),
+            &config,
+            "compute_code",
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= 1024);
+        assert!(text.contains("truncated by tool_result_budget"));
+        let handle = result["structuredContent"]["fetch_handle"]
+            .as_str()
+            .unwrap();
+
+        let fetched = super::tool_result_fetch_payload(&json!({
+            "fetch_handle": handle,
+            "offset": 0,
+            "max_bytes": 32
+        }))
+        .unwrap();
+        assert_eq!(fetched["offset"], json!(0));
+        assert_eq!(fetched["text"].as_str().unwrap().len(), 32);
+    }
+
+    #[test]
     fn initialize_returns_mcp_capabilities() {
         let (provider, config) = fixture();
         let response = handle_mcp_request(
@@ -9781,7 +10154,8 @@ mod tests {
 
     #[test]
     fn tools_list_exposes_read_only_graph_tools() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.read_only = true;
         let response = handle_mcp_request(
             &provider,
             &config,
@@ -9813,6 +10187,7 @@ mod tests {
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
+        assert!(has_tool(tools, "composed_agent_run"));
         assert!(has_tool(tools, "multihead_run"));
         assert!(has_tool(tools, "multihead_next"));
         assert!(has_tool(tools, "skill_list"));
@@ -10101,7 +10476,8 @@ mod tests {
 
     #[test]
     fn code_search_write_operations_are_read_only_gated() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.read_only = true;
         let gated = call_tool_json(
             &provider,
             &config,
@@ -11191,6 +11567,39 @@ mod tests {
         assert_eq!(
             detail["detail"]["events"][9]["payload"]["validator_results"][0]["status"],
             "passed"
+        );
+    }
+
+    #[test]
+    fn composed_agent_run_round_trips_through_mcp_with_fake_heads() {
+        let provider = FixtureProvider(Rc::new(RefCell::new(InMemoryGraphStore::new())));
+        let mut config = McpServerConfig::default();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let result = call_tool_json(
+            &provider,
+            &config,
+            "composed_agent_run",
+            json!({
+                "tenant": "smoke",
+                "binding_id": "agent:mcp-test",
+                "task": "publish composed agent result",
+                "claims": [{
+                    "text": "composed agent result is grounded",
+                    "provenance": "test:composed-agent"
+                }]
+            }),
+        );
+
+        assert_eq!(result["tenant"], "smoke");
+        assert_eq!(result["result"]["run_id"], "agent:mcp-test");
+        assert_eq!(
+            result["result"]["consensus_head_set"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 

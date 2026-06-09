@@ -1,5 +1,6 @@
 pub mod binding_store;
 pub mod canonical_write;
+pub mod composed_agent;
 pub mod compound_engineering;
 pub mod coordination;
 pub mod coordination_push;
@@ -15,9 +16,9 @@ pub mod writing_style;
 
 pub use binding_store::{
     append_binding_transition, binding_event_node_id, binding_node_id, load_binding,
-    load_binding_events, load_scratchpad_revisions, persist_binding,
-    persist_binding_transition_result, scratchpad_revision_node_id, BindingRuntimeError,
-    BindingRuntimeResult,
+    load_binding_events, load_scratchpad_revisions, persist_binding, persist_binding_event_state,
+    persist_binding_run_result, persist_binding_transition_result, scratchpad_revision_node_id,
+    BindingRuntimeError, BindingRuntimeResult,
 };
 pub use canonical_write::{
     alias_witness_node_id, canonical_fact_node_id, canonicalize_on_write,
@@ -25,6 +26,11 @@ pub use canonical_write::{
     CanonicalWriteResult, CanonicalizeOnWriteInput, EmbeddingNomination, TypedFact,
     ALIAS_WITNESS_LABEL, CANONICAL_FACT_LABEL, EDGE_ALIAS_WITNESS_FOR, EDGE_EMBEDDING_NOMINATED,
     EMBEDDING_NOMINATION_LABEL,
+};
+pub use composed_agent::{
+    default_theorem_binding, run_composed_agent, run_composed_agent_with_claims,
+    ComposedAgentRunResult, ComposedAgentRuntimeError, ComposedAgentRuntimeResult,
+    DEFAULT_BINDING_ID,
 };
 pub use work_graph_store::{
     claim_task_node_durable, load_task_node, load_work_graph, persist_task_node,
@@ -94,6 +100,8 @@ pub use patch_sequencer::{
     PatchApplyReceipt, PatchApplyStatus, PatchProposal, PatchSequencer, PatchSequencerError,
     PatchSequencerResult,
 };
+pub mod provider_invoker;
+pub use provider_invoker::{CredentialResolver, EndpointMap, ProviderHeadInvoker};
 pub use skill_pack::{
     apply_skill_pack, get_skill_pack, list_skill_packs, publish_skill_pack,
     skill_pack_artifact_node_id, skill_pack_node_id, skill_pack_source_node_id,

@@ -55,6 +55,15 @@ impl GroundedClaim {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RevisionContext {
+    pub revision_id: String,
+    pub kind: HeadInvocationKind,
+    pub output_summary: String,
+    #[serde(default)]
+    pub payload: Payload,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HeadInvocationRequest {
     pub invocation_id: String,
     pub head: ResolvedAgentHead,
@@ -64,6 +73,8 @@ pub struct HeadInvocationRequest {
     pub scratchpad_version: u64,
     #[serde(default)]
     pub prior_revision_ids: Vec<String>,
+    #[serde(default)]
+    pub prior_context: Vec<RevisionContext>,
     #[serde(default)]
     pub claims: Vec<GroundedClaim>,
     pub created_at: String,
@@ -79,6 +90,28 @@ impl HeadInvocationRequest {
         claims: Vec<GroundedClaim>,
         created_at: impl Into<String>,
     ) -> Self {
+        Self::new_with_context(
+            head,
+            kind,
+            task,
+            scratchpad_version,
+            prior_revision_ids,
+            Vec::new(),
+            claims,
+            created_at,
+        )
+    }
+
+    pub fn new_with_context(
+        head: ResolvedAgentHead,
+        kind: HeadInvocationKind,
+        task: impl Into<String>,
+        scratchpad_version: u64,
+        prior_revision_ids: Vec<String>,
+        prior_context: Vec<RevisionContext>,
+        claims: Vec<GroundedClaim>,
+        created_at: impl Into<String>,
+    ) -> Self {
         let mut request = Self {
             invocation_id: String::new(),
             head,
@@ -86,6 +119,7 @@ impl HeadInvocationRequest {
             task: task.into(),
             scratchpad_version,
             prior_revision_ids,
+            prior_context,
             claims,
             created_at: created_at.into(),
         };
@@ -102,6 +136,7 @@ impl HeadInvocationRequest {
                 "task": self.task,
                 "scratchpad_version": self.scratchpad_version,
                 "prior_revision_ids": self.prior_revision_ids,
+                "prior_context": self.prior_context,
                 "claims": self.claims,
                 "created_at": self.created_at,
             }))
@@ -182,6 +217,16 @@ pub enum HeadInvocationError {
         head_id: String,
         kind: HeadInvocationKind,
     },
+    ProviderError {
+        head_id: String,
+        provider: String,
+        status: u16,
+        detail: String,
+    },
+    Timeout {
+        head_id: String,
+        provider: String,
+    },
 }
 
 impl fmt::Display for HeadInvocationError {
@@ -193,6 +238,18 @@ impl fmt::Display for HeadInvocationError {
             ),
             Self::EmptyTask { head_id, kind } => {
                 write!(f, "head {head_id} cannot run {kind:?} for an empty task")
+            }
+            Self::ProviderError {
+                head_id,
+                provider,
+                status,
+                detail,
+            } => write!(
+                f,
+                "provider {provider} for head {head_id} failed with status {status}: {detail}"
+            ),
+            Self::Timeout { head_id, provider } => {
+                write!(f, "provider {provider} for head {head_id} timed out")
             }
         }
     }
@@ -240,6 +297,7 @@ impl HeadInvoker for FakeHeadInvoker {
             "task": request.task,
             "scratchpad_version": request.scratchpad_version,
             "prior_revision_ids": request.prior_revision_ids,
+            "prior_context": request.prior_context,
             "claims": request.claims,
         }));
 
