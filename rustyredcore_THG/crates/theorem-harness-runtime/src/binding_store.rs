@@ -133,6 +133,51 @@ pub fn persist_binding_transition_result<S: GraphStore>(
     Ok(())
 }
 
+pub fn persist_binding_run_result<S: GraphStore>(
+    store: &mut S,
+    binding: &AgentBinding,
+    events: &[BindingEventState],
+) -> BindingRuntimeResult<()> {
+    let state_hash = events
+        .last()
+        .map(|event| event.state_hash_after.as_str())
+        .unwrap_or_default();
+    persist_binding(store, binding, state_hash)?;
+    for event in events {
+        persist_binding_event_state(store, event)?;
+    }
+    Ok(())
+}
+
+pub fn persist_binding_event_state<S: GraphStore>(
+    store: &mut S,
+    event: &BindingEventState,
+) -> BindingRuntimeResult<()> {
+    ensure_binding_append_position(store, event)?;
+    let event_node = binding_event_node(event)?;
+    let event_id = event_node.id.clone();
+    let event_already_present = match store.get_node(&event_id) {
+        Some(existing) if binding_event_matches(existing, event) => true,
+        Some(_) => {
+            return Err(BindingRuntimeError::EventConflict {
+                event_id,
+                run_id: event.run_id.clone(),
+                seq: event.seq,
+            });
+        }
+        None => false,
+    };
+    if !event_already_present {
+        upsert_node_if_changed(store, event_node)?;
+    }
+
+    upsert_edge_if_changed(store, binding_event_of_edge(event)?)?;
+    if event.seq > 1 {
+        upsert_edge_if_changed(store, previous_binding_event_edge(event)?)?;
+    }
+    Ok(())
+}
+
 /// Persist a binding node plus every scratchpad revision it owns (idempotent).
 /// Used both by transition persistence and directly after a scratchpad append
 /// (which happens outside the lifecycle transitions).

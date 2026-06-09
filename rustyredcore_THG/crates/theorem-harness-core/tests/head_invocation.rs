@@ -1,8 +1,9 @@
+use serde_json::{json, Map};
 use theorem_harness_core::{
     AgentBinding, AgentHead, AgentHeadRegistry, BindingBudgetScope, BindingComposition,
     BindingIdentity, FakeHeadInvoker, GroundedClaim, HeadCostProfile, HeadInvocationError,
     HeadInvocationKind, HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile,
-    HeadTransport, TraceTier,
+    HeadTransport, RevisionContext, TraceTier,
 };
 
 #[test]
@@ -33,6 +34,45 @@ fn fake_invoker_produces_content_addressed_receipt() {
         .chars()
         .all(|character| character.is_ascii_hexdigit()));
     assert_eq!(receipt.payload.get("fake").unwrap(), true);
+}
+
+#[test]
+fn invocation_request_carries_prior_revision_context() {
+    let registry = AgentHeadRegistry::from_binding(&fixture_binding()).unwrap();
+    let head = registry.resolve("claude", HeadTransport::Api).unwrap();
+    let request = HeadInvocationRequest::new_with_context(
+        head,
+        HeadInvocationKind::Synthesis,
+        "synthesize prior work",
+        3,
+        vec![
+            "scratchrev:proposal".to_string(),
+            "scratchrev:critique".to_string(),
+        ],
+        vec![
+            RevisionContext {
+                revision_id: "scratchrev:proposal".to_string(),
+                kind: HeadInvocationKind::Proposal,
+                output_summary: "proposal summary".to_string(),
+                payload: object_payload(json!({ "text": "proposal body" })),
+            },
+            RevisionContext {
+                revision_id: "scratchrev:critique".to_string(),
+                kind: HeadInvocationKind::Critique,
+                output_summary: "critique summary".to_string(),
+                payload: object_payload(json!({ "text": "critique body" })),
+            },
+        ],
+        vec![GroundedClaim::new("grounded claim", "source:1")],
+        "2026-06-03T00:00:00Z",
+    );
+
+    let receipt = FakeHeadInvoker::default().invoke(request).unwrap();
+
+    let prior_context = receipt.payload["prior_context"].as_array().unwrap();
+    assert_eq!(prior_context.len(), 2);
+    assert_eq!(prior_context[0]["output_summary"], "proposal summary");
+    assert_eq!(prior_context[1]["kind"], "critique");
 }
 
 #[test]
@@ -139,5 +179,12 @@ fn head(
         reliability_profile: HeadReliabilityProfile::default(),
         allowed_tools: Vec::new(),
         trace_tier: TraceTier::Receipt,
+    }
+}
+
+fn object_payload(value: serde_json::Value) -> Map<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map,
+        _ => Map::new(),
     }
 }

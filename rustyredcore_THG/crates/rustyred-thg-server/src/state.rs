@@ -26,9 +26,14 @@ use rustyred_web::{
     SearchProvider,
 };
 use serde_json::{json, Value};
-use theorem_harness_core::{JobSubmission, TransitionInput, TransitionResult};
+use theorem_harness_core::{
+    GroundedClaim, HeadInvocationError, JobSubmission, Priority, TransitionInput,
+    TransitionResult,
+};
 use theorem_harness_runtime::{
-    append_transition_from_store, load_events, load_run, HarnessRuntimeError, JobNoteInput,
+    append_transition_from_store, load_events, load_run, run_composed_agent,
+    run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError,
+    JobNoteInput, ProviderHeadInvoker,
 };
 
 use crate::config::{Config, StorageMode};
@@ -611,6 +616,8 @@ impl AppState {
             default_tenant: self.config.mcp_default_tenant.clone(),
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,
+            tool_result_budget_bytes: rustyred_thg_mcp::DEFAULT_TOOL_RESULT_BUDGET_BYTES,
+            tool_result_family_budgets: Default::default(),
         }
     }
 
@@ -1040,7 +1047,8 @@ impl RedCoreTenantExecutor {
     }
 
     pub fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
-        self.with_snapshot(|snapshot| snapshot.vector_designations())
+        let writer = self.lock_writer()?;
+        Ok(writer.vector_designations())
     }
 
     pub fn vector_search(
@@ -1050,7 +1058,8 @@ impl RedCoreTenantExecutor {
         query: &[f32],
         k: usize,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
-        self.with_snapshot(|snapshot| snapshot.vector_search(label, property_name, query, k))?
+        let writer = self.lock_writer()?;
+        writer.vector_search(label, property_name, query, k)
     }
 
     pub fn hybrid_search(
@@ -1063,9 +1072,8 @@ impl RedCoreTenantExecutor {
         max_hops: usize,
         alpha: f32,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
-        self.with_snapshot(|snapshot| {
-            snapshot.hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
-        })?
+        let writer = self.lock_writer()?;
+        writer.hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
     }
 
     pub fn hybrid_search_with_config(
@@ -1078,17 +1086,16 @@ impl RedCoreTenantExecutor {
         max_hops: usize,
         config: &HybridScoringConfig,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
-        self.with_snapshot(|snapshot| {
-            snapshot.hybrid_search_with_config(
-                label,
-                property_name,
-                query,
-                k,
-                graph_seeds,
-                max_hops,
-                config,
-            )
-        })?
+        let writer = self.lock_writer()?;
+        writer.hybrid_search_with_config(
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config,
+        )
     }
 
     fn lock_writer(&self) -> GraphStoreResult<std::sync::MutexGuard<'_, RedCoreGraphStore>> {
@@ -1696,6 +1703,22 @@ fn mcp_harness_runtime_error(error: HarnessRuntimeError) -> McpError {
     }
 }
 
+fn mcp_composed_agent_runtime_error(error: ComposedAgentRuntimeError) -> McpError {
+    McpError {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({ "code": "composed_agent_runtime_error" })),
+    }
+}
+
+fn mcp_head_invocation_error(error: HeadInvocationError) -> McpError {
+    McpError {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({ "code": "head_invocation_error" })),
+    }
+}
+
 fn transition_result_payload(result: TransitionResult) -> Value {
     json!({
         "run": result.run,
@@ -1832,6 +1855,27 @@ impl McpGraphBackend for ProductMcpBackend {
                 Ok(Some(json!({ "run": run, "events": events })))
             }
         }
+    }
+
+    fn composed_agent_run(
+        &mut self,
+        binding_id: String,
+        task: String,
+        claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
+        let invoker = ProviderHeadInvoker::from_env().map_err(mcp_head_invocation_error)?;
+        let result = if claims.is_empty() {
+            run_composed_agent(&mut runtime_store, &binding_id, &task, &invoker)
+        } else {
+            run_composed_agent_with_claims(&mut runtime_store, &binding_id, &task, claims, &invoker)
+        }
+        .map_err(mcp_composed_agent_runtime_error)?;
+        serde_json::to_value(result).map_err(|error| {
+            McpError::internal(format!(
+                "composed_agent_run payload serialization failed: {error}"
+            ))
+        })
     }
 
     fn job_submit(
@@ -2662,6 +2706,34 @@ mod tests {
             "node:b"
         );
         assert_eq!(executor.verify().unwrap().ok, true);
+    }
+
+    #[test]
+    fn redcore_executor_vector_search_uses_writer_index() {
+        let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap();
+        executor
+            .designate_vector_property("CodeSymbol", "semantic_vec", 3)
+            .unwrap();
+        executor
+            .commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(
+                NodeRecord::new(
+                    "code:symbol:format_transcript",
+                    ["CodeSymbol"],
+                    json!({
+                        "name": "format_transcript",
+                        "semantic_vec": [1.0, 0.0, 0.0],
+                    }),
+                ),
+            )]))
+            .unwrap();
+
+        assert_eq!(executor.vector_designations().unwrap().len(), 1);
+        let results = executor
+            .vector_search(Some("CodeSymbol"), "semantic_vec", &[1.0, 0.0, 0.0], 1)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "code:symbol:format_transcript");
     }
 
     #[test]

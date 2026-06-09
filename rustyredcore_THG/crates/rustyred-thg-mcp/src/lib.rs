@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,31 +20,37 @@ use rustyred_thg_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{
-    next_for_head, spawn_verify_node, stable_value_hash, submit_verify_receipt, ClaimOutcome,
-    HeadFitness, JobSubmission, Millis, NodeStatus, Receipt, TaskNode, TransitionInput,
-    TransitionResult, VerifyReceipt, WorkGraph,
+    composition_hash, evaluate_publication, hash_agent_binding, next_for_head, spawn_verify_node,
+    stable_value_hash, submit_verify_receipt, ActionTierPolicy, AgentBinding, AgentHead,
+    BindingBudgetScope, BindingComposition, BindingIdentity, ClaimOutcome, FakeHeadInvoker,
+    GroundedClaim, HeadCostProfile, HeadFitness, HeadKind, HeadReliabilityProfile, HeadTransport,
+    JobSubmission, Millis, NodeStatus, Payload, Receipt, ScratchpadRevision, TaskNode, TraceTier,
+    TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
 };
 #[cfg(test)]
 use theorem_harness_runtime::subscribe_coordination_room_events;
 use theorem_harness_runtime::{
-    append_transition_from_store, apply_skill_pack, archive_memory_document,
-    coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
+    append_transition_from_store, apply_skill_pack, archive_memory_document, binding_node_id,
+    coordination_binding_id, coordination_intent_edge_id, coordination_intent_node_id,
+    coordination_intent_scratchpad_edge_id, coordination_member_edge_id,
     coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
     coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
-    coordination_record_node_id, coordination_room_node_id, encode_memory, forget_memory,
-    get_skill_pack, handoff_memory, infer_coordination_room_id, list_skill_packs, load_events,
-    load_run, normalize_coordination_urgency, parse_coordination_mentions,
+    coordination_record_node_id, coordination_room_binding_edge_id, coordination_room_node_id,
+    default_theorem_binding, encode_memory, forget_memory, get_skill_pack, handoff_memory,
+    infer_coordination_room_id, list_skill_packs, load_events, load_run,
+    normalize_coordination_urgency, parse_coordination_mentions,
     publish_coordination_room_event_from_state, publish_skill_pack, recall_archived_memory,
-    recall_memory, relate_memory, remember_memory, revise_memory_document, self_note_memory,
-    stable_coordination_message_id, stable_coordination_record_id, task_node_graph_id, upsert_note,
-    ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
-    CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
-    CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
-    HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
-    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
-    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
-    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
-    WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
+    recall_memory, relate_memory, remember_memory, revise_memory_document,
+    scratchpad_revision_node_id, self_note_memory, stable_coordination_message_id,
+    stable_coordination_record_id, task_node_graph_id, upsert_note, ArchiveMemoryInput,
+    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
+    CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
+    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult, JobNoteInput,
+    JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput, PresenceInput,
+    RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput, SkillPackError,
+    SkillPackGetInput, SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput,
+    UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF,
+    EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -137,7 +144,17 @@ pub trait McpGraphBackend {
             "harness run reads are not supported by this MCP backend",
         ))
     }
-    /// Dispatch-board verb: create or upsert a pending job.
+    fn composed_agent_run(
+        &mut self,
+        _binding_id: String,
+        _task: String,
+        _claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        Err(McpError::internal(
+            "composed_agent_run is not supported by this MCP backend",
+        ))
+    }
+    /// Dispatch-queue verb: create `Job{Queued}` (idempotent on idempotency_key).
     fn job_submit(
         &mut self,
         _submission: JobSubmission,
@@ -450,6 +467,10 @@ pub struct McpServerConfig {
     pub default_tenant: String,
     pub read_only: bool,
     pub allow_admin: bool,
+    #[serde(default = "default_tool_result_budget_bytes")]
+    pub tool_result_budget_bytes: usize,
+    #[serde(default)]
+    pub tool_result_family_budgets: HashMap<String, usize>,
 }
 
 impl Default for McpServerConfig {
@@ -460,9 +481,21 @@ impl Default for McpServerConfig {
             default_tenant: "default".to_string(),
             read_only: false,
             allow_admin: false,
+            tool_result_budget_bytes: default_tool_result_budget_bytes(),
+            tool_result_family_budgets: HashMap::new(),
         }
     }
 }
+
+pub const DEFAULT_TOOL_RESULT_BUDGET_BYTES: usize = 16 * 1024;
+
+const TOOL_RESULT_MARKER_RESERVED_BYTES: usize = 512;
+
+fn default_tool_result_budget_bytes() -> usize {
+    DEFAULT_TOOL_RESULT_BUDGET_BYTES
+}
+
+static TOOL_RESULT_BODIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpRequestContext {
@@ -703,6 +736,9 @@ fn call_tool<P: McpGraphProvider>(
     let mut backend = provider.backend_for_tenant(&tenant)?;
 
     let payload = match name {
+        "tool_result_fetch" | "theorem_harness_tool_result_fetch" => {
+            tool_result_fetch_payload(&arguments)?
+        }
         "rustyred_thg_graph_neighbors" => {
             let query = neighbor_query_from_value(&arguments)?;
             let mut neighbors = backend.neighbors(query)?;
@@ -1156,7 +1192,16 @@ fn call_tool<P: McpGraphProvider>(
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
         }
-        "job_submit" => {
+        "composed_agent_run" | "theorem_composed_agent_run" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "composed_agent_run is unavailable while read-only mode is active."
+                })));
+            }
+            composed_agent_run_payload(&tenant, &mut backend, &arguments)?
+        }
+        "job_submit" | "theorem_job_submit" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
                     "error": "mcp_read_only",
@@ -1789,7 +1834,7 @@ fn call_tool<P: McpGraphProvider>(
         other => return Err(McpError::method_not_found(other)),
     };
 
-    Ok(tool_result(payload))
+    Ok(tool_result_with_budget(payload, config, name))
 }
 
 fn read_resource<P: McpGraphProvider>(
@@ -2667,6 +2712,8 @@ fn write_intent_payload(
         backend,
         WriteIntentInput {
             tenant_slug: tenant.to_string(),
+            agent_id: argument_text(arguments, &["agent_id", "agentId"]).unwrap_or_default(),
+            binding_id: argument_text(arguments, &["binding_id", "bindingId"]).unwrap_or_default(),
             room_id: resolved_coordination_room_id(arguments),
             actor_id: required_text_any(
                 arguments,
@@ -2675,7 +2722,10 @@ fn write_intent_payload(
             )?,
             status: argument_text(arguments, &["status"]).unwrap_or_else(|| "working".to_string()),
             summary: required_text_any(arguments, &["summary"], "write_intent")?,
-            claimed_files: string_array_any(arguments, &["claimed_files", "claimedFiles"]),
+            footprint: string_array_any(
+                arguments,
+                &["footprint", "touched_files", "claimed_files", "claimedFiles"],
+            ),
             expected_completion: argument_text(
                 arguments,
                 &["expected_completion", "expectedCompletion"],
@@ -3143,6 +3193,54 @@ fn harness_run_payload(
         "detail": detail,
         "found": found
     }))
+}
+
+fn composed_agent_run_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let task = required_text_any(arguments, &["task", "query", "q"], "composed_agent_run")?;
+    let binding_id = argument_text(arguments, &["binding_id", "bindingId"])
+        .unwrap_or_else(|| theorem_harness_runtime::DEFAULT_BINDING_ID.to_string());
+    let claims = grounded_claims_from_arguments(arguments);
+    backend
+        .composed_agent_run(binding_id, task, claims)
+        .map(|result| {
+            json!({
+                "tenant": tenant,
+                "result": result
+            })
+        })
+}
+
+fn grounded_claims_from_arguments(arguments: &Value) -> Vec<GroundedClaim> {
+    arguments
+        .get("claims")
+        .and_then(Value::as_array)
+        .map(|claims| {
+            claims
+                .iter()
+                .filter_map(|claim| {
+                    let text = claim
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    let provenance = claim
+                        .get("provenance")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if text.is_empty() || provenance.is_empty() {
+                        None
+                    } else {
+                        Some(GroundedClaim::new(text, provenance))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn skill_list_payload(
@@ -4099,6 +4197,8 @@ fn write_coordination_intent(
     input: WriteIntentInput,
 ) -> Result<CoordinationIntentState, McpError> {
     let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let agent_id = normalize_binding_agent_id(&input.agent_id, &input.binding_id);
+    let binding_id = resolve_coordination_binding_id(&input.binding_id, &agent_id);
     let room_id = if input.room_id.trim().is_empty() {
         "room:ungrouped".to_string()
     } else {
@@ -4120,22 +4220,338 @@ fn write_coordination_intent(
         .map(|intent| intent.started_at.clone())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| now.clone());
-    let intent = CoordinationIntentState {
+    let mut intent = CoordinationIntentState {
         tenant_slug,
+        agent_id,
+        binding_id,
         room_id,
         actor_id,
         status,
         summary,
-        claimed_files: normalize_string_vec(input.claimed_files),
+        footprint: normalize_string_vec(input.footprint),
         expected_completion: input.expected_completion.trim().to_string(),
         repo: input.repo.trim().to_string(),
         branch: input.branch.trim().to_string(),
         task: input.task.trim().to_string(),
         started_at,
         updated_at: now,
+        scratchpad_revision_id: String::new(),
+        scratchpad_document_id: String::new(),
+        scratchpad_seq: 0,
+        binding_active_head_set: Vec::new(),
     };
+    let projection = project_coordination_intent_onto_binding(backend, &intent)?;
+    intent.scratchpad_revision_id = projection.scratchpad_revision_id;
+    intent.scratchpad_document_id = projection.scratchpad_document_id;
+    intent.scratchpad_seq = projection.scratchpad_seq;
+    intent.binding_active_head_set = projection.binding_active_head_set;
     persist_coordination_intent(backend, &intent)?;
+    persist_coordination_intent_binding_projection(backend, &intent)?;
     Ok(intent)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct McpBindingProjection {
+    scratchpad_revision_id: String,
+    scratchpad_document_id: String,
+    scratchpad_seq: u64,
+    binding_active_head_set: Vec<String>,
+}
+
+fn project_coordination_intent_onto_binding(
+    backend: &mut impl McpGraphBackend,
+    intent: &CoordinationIntentState,
+) -> Result<McpBindingProjection, McpError> {
+    let mut binding = match load_coordination_agent_binding(backend, &intent.binding_id)? {
+        Some(binding) => binding,
+        None => default_mcp_coordination_binding(
+            &intent.agent_id,
+            &intent.binding_id,
+            &intent.actor_id,
+        )?,
+    };
+    binding.lifecycle.run_id = intent.binding_id.clone();
+    ensure_session_actor_head(&mut binding, &intent.actor_id);
+
+    let payload = coordination_footprint_payload(intent);
+    let content_hash = stable_value_hash(&Value::Object(payload.clone()));
+    let revision = binding
+        .append_scratchpad_revision(
+            &intent.actor_id,
+            format!(
+                "coordination footprint {} in {}",
+                intent.status, intent.room_id
+            ),
+            content_hash,
+            payload,
+            intent.updated_at.clone(),
+        )
+        .map_err(|error| McpError::internal(error.to_string()))?;
+    let scratchpad_document_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    let state_hash = hash_agent_binding(&binding);
+    persist_coordination_agent_binding(backend, &binding, &state_hash)?;
+
+    Ok(McpBindingProjection {
+        scratchpad_revision_id: revision.revision_id,
+        scratchpad_document_id,
+        scratchpad_seq: revision.seq,
+        binding_active_head_set: binding.identity.active_head_set.clone(),
+    })
+}
+
+fn persist_coordination_intent_binding_projection(
+    backend: &mut impl McpGraphBackend,
+    state: &CoordinationIntentState,
+) -> Result<(), McpError> {
+    upsert_edge_if_changed(backend, coordination_room_binding_edge(state))?;
+    if state.scratchpad_seq > 0 && !state.scratchpad_document_id.is_empty() {
+        upsert_edge_if_changed(backend, coordination_intent_scratchpad_edge(state))?;
+    }
+    Ok(())
+}
+
+fn load_coordination_agent_binding(
+    backend: &impl McpGraphBackend,
+    binding_id: &str,
+) -> Result<Option<AgentBinding>, McpError> {
+    backend
+        .get_node(&binding_node_id(binding_id))?
+        .map(|node| parse_node_properties::<AgentBinding>(node.properties))
+        .transpose()
+}
+
+fn persist_coordination_agent_binding(
+    backend: &mut impl McpGraphBackend,
+    binding: &AgentBinding,
+    state_hash: &str,
+) -> Result<(), McpError> {
+    upsert_node_if_changed(
+        backend,
+        coordination_agent_binding_node(binding, state_hash)?,
+    )?;
+    let document_id = &binding.working_memory_scope.scratchpad.document_id;
+    let run_id = &binding.lifecycle.run_id;
+    for revision in &binding.working_memory_scope.scratchpad.revisions {
+        upsert_node_if_changed(
+            backend,
+            coordination_scratchpad_revision_node(document_id, revision)?,
+        )?;
+        upsert_edge_if_changed(
+            backend,
+            coordination_scratchpad_revision_of_edge(document_id, run_id, revision),
+        )?;
+        if revision.seq > 1 {
+            upsert_edge_if_changed(
+                backend,
+                coordination_previous_scratchpad_revision_edge(document_id, revision),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn coordination_agent_binding_node(
+    binding: &AgentBinding,
+    state_hash: &str,
+) -> Result<NodeRecord, McpError> {
+    let mut properties =
+        serde_json::to_value(binding).map_err(|error| McpError::internal(error.to_string()))?;
+    properties["state_hash"] = Value::String(state_hash.to_string());
+    Ok(NodeRecord::new(
+        binding_node_id(&binding.lifecycle.run_id),
+        ["AgentBinding"],
+        properties,
+    ))
+}
+
+fn coordination_scratchpad_revision_node(
+    document_id: &str,
+    revision: &ScratchpadRevision,
+) -> Result<NodeRecord, McpError> {
+    let mut properties =
+        serde_json::to_value(revision).map_err(|error| McpError::internal(error.to_string()))?;
+    properties["document_id"] = Value::String(document_id.to_string());
+    Ok(NodeRecord::new(
+        scratchpad_revision_node_id(document_id, revision.seq),
+        ["ScratchpadRevision"],
+        properties,
+    ))
+}
+
+fn coordination_scratchpad_revision_of_edge(
+    document_id: &str,
+    run_id: &str,
+    revision: &ScratchpadRevision,
+) -> EdgeRecord {
+    EdgeRecord::new(
+        format!(
+            "harness:edge:scratchrev-of:{}:{:020}",
+            document_id, revision.seq
+        ),
+        scratchpad_revision_node_id(document_id, revision.seq),
+        "HARNESS_SCRATCHPAD_REVISION_OF",
+        binding_node_id(run_id),
+        json!({
+            "document_id": document_id,
+            "seq": revision.seq,
+            "actor_head_id": revision.actor_head_id,
+            "content_hash": revision.content_hash,
+        }),
+    )
+}
+
+fn coordination_previous_scratchpad_revision_edge(
+    document_id: &str,
+    revision: &ScratchpadRevision,
+) -> EdgeRecord {
+    EdgeRecord::new(
+        format!(
+            "harness:edge:scratchrev-next:{}:{:020}",
+            document_id, revision.seq
+        ),
+        scratchpad_revision_node_id(document_id, revision.seq - 1),
+        "HARNESS_SCRATCHPAD_REVISION_NEXT",
+        scratchpad_revision_node_id(document_id, revision.seq),
+        json!({
+            "document_id": document_id,
+            "from_seq": revision.seq - 1,
+            "to_seq": revision.seq,
+        }),
+    )
+}
+
+fn default_mcp_coordination_binding(
+    agent_id: &str,
+    binding_id: &str,
+    actor_id: &str,
+) -> Result<AgentBinding, McpError> {
+    if agent_id == "theorem" {
+        return default_theorem_binding(binding_id)
+            .map_err(|error| McpError::internal(error.to_string()));
+    }
+
+    let actor_head = session_actor_head(actor_id);
+    let mut binding = AgentBinding::new(
+        BindingIdentity {
+            agent_id: agent_id.to_string(),
+            owner_id: "travis".to_string(),
+            agent_name: agent_id.to_string(),
+            composition_hash: String::new(),
+            version: 1,
+            trust_tier: "first_party".to_string(),
+            active_head_set: vec![actor_head.head_id.clone()],
+        },
+        BindingComposition {
+            heads: vec![actor_head],
+        },
+        BindingBudgetScope::new(agent_id, 32_000.0, 8),
+    )
+    .map_err(|error| McpError::internal(error.to_string()))?;
+    binding.lifecycle.run_id = binding_id.to_string();
+    Ok(binding)
+}
+
+fn ensure_session_actor_head(binding: &mut AgentBinding, actor_id: &str) {
+    if binding.head(actor_id).is_none() {
+        binding.composition.heads.push(session_actor_head(actor_id));
+    }
+    let mut active = binding
+        .identity
+        .active_head_set
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    active.insert(actor_id.to_string());
+    binding.identity.active_head_set = active.into_iter().collect();
+    binding.identity.composition_hash = composition_hash(binding);
+}
+
+fn session_actor_head(actor_id: &str) -> AgentHead {
+    AgentHead {
+        head_id: actor_id.to_string(),
+        display_name: actor_id.to_string(),
+        provider: "session".to_string(),
+        model: "session-actor".to_string(),
+        credential_ref: "local:none".to_string(),
+        transport: HeadTransport::Local,
+        kind: HeadKind::SpecializedCoder,
+        capabilities: vec!["coordination".to_string()],
+        cost_profile: HeadCostProfile::default(),
+        reliability_profile: HeadReliabilityProfile::default(),
+        allowed_tools: vec!["coordination_intent".to_string()],
+        trace_tier: TraceTier::Receipt,
+    }
+}
+
+fn coordination_footprint_payload(intent: &CoordinationIntentState) -> Payload {
+    let mut payload = Payload::new();
+    payload.insert(
+        "type".to_string(),
+        Value::String("coordination_footprint".to_string()),
+    );
+    payload.insert(
+        "tenant_slug".to_string(),
+        Value::String(intent.tenant_slug.clone()),
+    );
+    payload.insert(
+        "agent_id".to_string(),
+        Value::String(intent.agent_id.clone()),
+    );
+    payload.insert(
+        "binding_id".to_string(),
+        Value::String(intent.binding_id.clone()),
+    );
+    payload.insert("room_id".to_string(), Value::String(intent.room_id.clone()));
+    payload.insert(
+        "actor_id".to_string(),
+        Value::String(intent.actor_id.clone()),
+    );
+    payload.insert("status".to_string(), Value::String(intent.status.clone()));
+    payload.insert("summary".to_string(), Value::String(intent.summary.clone()));
+    payload.insert("footprint".to_string(), json!(intent.footprint));
+    payload.insert(
+        "expected_completion".to_string(),
+        Value::String(intent.expected_completion.clone()),
+    );
+    payload.insert("repo".to_string(), Value::String(intent.repo.clone()));
+    payload.insert("branch".to_string(), Value::String(intent.branch.clone()));
+    payload.insert("task".to_string(), Value::String(intent.task.clone()));
+    payload.insert(
+        "started_at".to_string(),
+        Value::String(intent.started_at.clone()),
+    );
+    payload.insert(
+        "updated_at".to_string(),
+        Value::String(intent.updated_at.clone()),
+    );
+    payload
+}
+
+fn normalize_binding_agent_id(agent_id: &str, binding_id: &str) -> String {
+    let explicit = agent_id.trim();
+    let candidate = if !explicit.is_empty() {
+        explicit
+    } else {
+        binding_id
+            .trim()
+            .strip_prefix("agent:")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("theorem")
+    };
+    coordination_binding_id(candidate)
+        .strip_prefix("agent:")
+        .unwrap_or("theorem")
+        .to_string()
+}
+
+fn resolve_coordination_binding_id(binding_id: &str, agent_id: &str) -> String {
+    let binding_id = binding_id.trim();
+    if binding_id.is_empty() {
+        coordination_binding_id(agent_id)
+    } else {
+        binding_id.to_string()
+    }
 }
 
 fn write_coordination_presence(
@@ -4616,6 +5032,47 @@ fn coordination_intent_edge(state: &CoordinationIntentState) -> EdgeRecord {
     )
 }
 
+fn coordination_room_binding_edge(state: &CoordinationIntentState) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_room_binding_edge_id(&state.tenant_slug, &state.room_id, &state.binding_id),
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        "COORDINATION_ROOM_PROJECTS_TO_BINDING",
+        binding_node_id(&state.binding_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "agent_id": state.agent_id,
+            "binding_id": state.binding_id,
+            "room_id": state.room_id,
+            "updated_at": state.updated_at,
+        }),
+    )
+}
+
+fn coordination_intent_scratchpad_edge(state: &CoordinationIntentState) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_intent_scratchpad_edge_id(
+            &state.tenant_slug,
+            &state.room_id,
+            &state.actor_id,
+            &state.scratchpad_revision_id,
+        ),
+        coordination_intent_node_id(&state.tenant_slug, &state.room_id, &state.actor_id),
+        "COORDINATION_INTENT_APPENDED_SCRATCHPAD_REVISION",
+        scratchpad_revision_node_id(&state.scratchpad_document_id, state.scratchpad_seq),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "agent_id": state.agent_id,
+            "binding_id": state.binding_id,
+            "room_id": state.room_id,
+            "actor_id": state.actor_id,
+            "scratchpad_document_id": state.scratchpad_document_id,
+            "scratchpad_revision_id": state.scratchpad_revision_id,
+            "scratchpad_seq": state.scratchpad_seq,
+            "updated_at": state.updated_at,
+        }),
+    )
+}
+
 fn coordination_message_room_edge(state: &CoordinationMessageState) -> EdgeRecord {
     EdgeRecord::new(
         coordination_message_edge_id(&state.tenant_slug, &state.room_id, &state.message_id),
@@ -4965,6 +5422,15 @@ fn coordination_policy_receipt(
     arguments: &Value,
     tool_name: &str,
 ) -> Value {
+    let agent_id = normalize_binding_agent_id(
+        &argument_text(arguments, &["agent_id", "agentId"]).unwrap_or_default(),
+        &argument_text(arguments, &["binding_id", "bindingId"]).unwrap_or_default(),
+    );
+    let binding_id = resolve_coordination_binding_id(
+        &argument_text(arguments, &["binding_id", "bindingId"]).unwrap_or_default(),
+        &agent_id,
+    );
+    let room_id = resolved_coordination_room_id(arguments);
     let required_scopes = string_array_any(
         arguments,
         &[
@@ -5009,7 +5475,13 @@ fn coordination_policy_receipt(
         .map(|budget| estimated_cost_units <= budget.max(0.0))
         .unwrap_or(true);
     let scope_allowed = missing_scopes.is_empty();
-    let decision = if scope_allowed && budget_allowed {
+    let publication_gate = session_publication_gate_receipt(arguments);
+    let publication_allowed = publication_gate
+        .get("decision")
+        .and_then(Value::as_str)
+        .map(|decision| decision != "deny")
+        .unwrap_or(true);
+    let decision = if scope_allowed && budget_allowed && publication_allowed {
         "allow"
     } else {
         "deny"
@@ -5017,13 +5489,17 @@ fn coordination_policy_receipt(
     json!({
         "tool": tool_name,
         "decision": decision,
+        "agent_id": agent_id,
+        "binding_id": binding_id,
+        "room_id": room_id,
         "required_scopes": required_scopes,
         "granted_scopes": context.scopes.clone(),
         "missing_scopes": missing_scopes,
         "scope_allowed": scope_allowed,
         "estimated_cost_units": estimated_cost_units,
         "budget_units": budget_units,
-        "budget_allowed": budget_allowed
+        "budget_allowed": budget_allowed,
+        "publication_gate": publication_gate
     })
 }
 
@@ -5045,10 +5521,18 @@ fn coordination_policy_error(policy_receipt: &Value) -> Option<Value> {
         .get("budget_allowed")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let publication_allowed = policy_receipt
+        .get("publication_gate")
+        .and_then(|gate| gate.get("decision"))
+        .and_then(Value::as_str)
+        .map(|decision| decision != "deny")
+        .unwrap_or(true);
     let code = if missing_scopes {
         "coordination_scope_denied"
     } else if !budget_allowed {
         "coordination_budget_exceeded"
+    } else if !publication_allowed {
+        "coordination_publication_denied"
     } else {
         "coordination_policy_denied"
     };
@@ -5057,6 +5541,135 @@ fn coordination_policy_error(policy_receipt: &Value) -> Option<Value> {
         "message": "Native coordination policy denied this write.",
         "policy_receipt": policy_receipt
     }))
+}
+
+fn session_publication_gate_receipt(arguments: &Value) -> Value {
+    let publication_flag = [
+        "publication",
+        "publish",
+        "publication_gate",
+        "publicationGate",
+    ]
+    .iter()
+    .any(|key| {
+        arguments
+            .get(*key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    let claims = argument_array(
+        arguments,
+        &[
+            "claims",
+            "grounded_claims",
+            "groundedClaims",
+            "publication_claims",
+            "publicationClaims",
+        ],
+    );
+    let pr_url = argument_text(
+        arguments,
+        &["pr_url", "prUrl", "pull_request_url", "pullRequestUrl"],
+    );
+    let applies = publication_flag || claims.is_some() || pr_url.is_some();
+    if !applies {
+        return json!({
+            "applies": false,
+            "decision": "not_applicable"
+        });
+    }
+
+    let synthesis_heads = publication_synthesis_heads(arguments);
+    let mut payload = Payload::new();
+    payload.insert(
+        "claims".to_string(),
+        Value::Array(claims.unwrap_or_default()),
+    );
+    if let Some(action_tier) = argument_text(arguments, &["action_tier", "actionTier"]) {
+        payload.insert("action_tier".to_string(), Value::String(action_tier));
+    }
+    if let Some(human_authorized) = ["human_authorized", "humanAuthorized"]
+        .iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_bool))
+    {
+        payload.insert(
+            "human_authorized".to_string(),
+            Value::Bool(human_authorized),
+        );
+    }
+    if let Some(pr_url) = pr_url {
+        payload.insert("pr_url".to_string(), Value::String(pr_url));
+    }
+
+    match evaluate_publication(
+        &synthesis_heads,
+        &coordination_publication_action_tiers(),
+        &payload,
+    ) {
+        Ok(()) => json!({
+            "applies": true,
+            "decision": "allow",
+            "synthesis_heads": synthesis_heads
+        }),
+        Err(error) => json!({
+            "applies": true,
+            "decision": "deny",
+            "reason": error.to_string(),
+            "synthesis_heads": synthesis_heads
+        }),
+    }
+}
+
+fn publication_synthesis_heads(arguments: &Value) -> Vec<String> {
+    let mut heads = string_array_any(
+        arguments,
+        &[
+            "synthesis_heads",
+            "synthesisHeads",
+            "contributing_heads",
+            "contributingHeads",
+            "peer_review_heads",
+            "peerReviewHeads",
+        ],
+    );
+    if let Some(actor) = argument_text(arguments, &["actor", "actor_id", "actorId"]) {
+        heads.push(actor);
+    }
+    if let Some(reviewer) = argument_text(
+        arguments,
+        &[
+            "reviewer",
+            "peer_reviewer",
+            "peerReviewer",
+            "reviewer_head",
+            "reviewerHead",
+        ],
+    ) {
+        heads.push(reviewer);
+    }
+    if let Some(peer_review) = arguments
+        .get("peer_review")
+        .or_else(|| arguments.get("peerReview"))
+        .and_then(Value::as_object)
+    {
+        if let Some(reviewer) = peer_review
+            .get("reviewer")
+            .or_else(|| peer_review.get("reviewer_head"))
+            .or_else(|| peer_review.get("reviewerHead"))
+            .and_then(Value::as_str)
+        {
+            heads.push(reviewer.to_string());
+        }
+    }
+    normalize_string_vec(heads)
+}
+
+fn coordination_publication_action_tiers() -> Vec<ActionTierPolicy> {
+    vec![
+        ActionTierPolicy::new("tier_one", "reversible substrate action", false),
+        ActionTierPolicy::new("tier_two", "consequential commit action", true),
+        ActionTierPolicy::new("tier_three", "irreversible external action", true),
+    ]
 }
 
 fn argument_f64_any(arguments: &Value, keys: &[&str]) -> Option<f64> {
@@ -6206,12 +6819,143 @@ fn tool_result(payload: Value) -> Value {
     })
 }
 
+fn tool_result_with_budget(payload: Value, config: &McpServerConfig, tool_name: &str) -> Value {
+    let budget = tool_result_budget_for(config, tool_name);
+    if budget == 0 {
+        return tool_result(payload);
+    }
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    if text.len() <= budget {
+        return json!({
+            "content": [{
+                "type": "text",
+                "text": text
+            }],
+            "structuredContent": payload
+        });
+    }
+
+    let handle = store_tool_result_body(tool_name, &text);
+    let preview = truncate_utf8_with_marker(&text, budget, &handle);
+    let structured = json!({
+        "budgeted": true,
+        "truncated": true,
+        "tool_name": tool_name,
+        "family": tool_result_family(tool_name),
+        "original_bytes": text.len(),
+        "returned_bytes": preview.len(),
+        "fetch_handle": handle.clone(),
+        "next_cursor": {
+            "handle": handle.clone(),
+            "offset": preview.len(),
+        },
+        "message": "Tool result exceeded the configured MCP boundary budget; call tool_result_fetch with the fetch_handle and offset to retrieve more bytes."
+    });
+    json!({
+        "content": [{
+            "type": "text",
+            "text": preview
+        }],
+        "structuredContent": structured
+    })
+}
+
 fn tool_result_error(payload: Value) -> Value {
     let mut result = tool_result(payload);
     if let Value::Object(map) = &mut result {
         map.insert("isError".to_string(), Value::Bool(true));
     }
     result
+}
+
+fn tool_result_budget_for(config: &McpServerConfig, tool_name: &str) -> usize {
+    let family = tool_result_family(tool_name);
+    config
+        .tool_result_family_budgets
+        .get(family)
+        .copied()
+        .unwrap_or(config.tool_result_budget_bytes)
+}
+
+fn tool_result_family(tool_name: &str) -> &'static str {
+    match tool_name {
+        "compute_code" | "rustyred_thg_compute_code" | "theorem_harness_compute_code" => "code",
+        name if name.contains("code") => "code",
+        name if name.contains("fractal") => "fractal",
+        "recall"
+        | "theorem_harness_recall"
+        | "self_recall_archive"
+        | "theorem_harness_self_recall_archive" => "recall",
+        "coordination_context" | "theorem_harness_coordination_context" => "coordination",
+        name if name.contains("graph") || name.contains("neighbors") => "graph",
+        _ => "default",
+    }
+}
+
+fn store_tool_result_body(tool_name: &str, body: &str) -> String {
+    let handle = format!(
+        "tool-result:{}:{}",
+        rustyred_thg_core::normalize_plugin_command(tool_name),
+        rustyred_thg_core::stable_hash(body)
+    );
+    let store = TOOL_RESULT_BODIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut bodies) = store.lock() {
+        bodies.insert(handle.clone(), body.to_string());
+    }
+    handle
+}
+
+fn tool_result_fetch_payload(arguments: &Value) -> Result<Value, McpError> {
+    let handle = arguments
+        .get("fetch_handle")
+        .or_else(|| arguments.get("handle"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::invalid_params("tool_result_fetch requires fetch_handle"))?;
+    let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let max_bytes = arguments
+        .get("max_bytes")
+        .or_else(|| arguments.get("maxBytes"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TOOL_RESULT_BUDGET_BYTES as u64) as usize;
+    let store = TOOL_RESULT_BODIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let bodies = store
+        .lock()
+        .map_err(|_| McpError::internal("tool result body store lock poisoned"))?;
+    let body = bodies.get(handle).ok_or_else(|| {
+        McpError::invalid_params(format!("tool result fetch_handle was not found: {handle}"))
+    })?;
+    let start = floor_char_boundary(body, offset.min(body.len()));
+    let end = floor_char_boundary(body, start.saturating_add(max_bytes).min(body.len()));
+    let next_offset = (end < body.len()).then_some(end);
+    Ok(json!({
+        "fetch_handle": handle,
+        "offset": start,
+        "next_offset": next_offset,
+        "total_bytes": body.len(),
+        "text": &body[start..end],
+    }))
+}
+
+fn truncate_utf8_with_marker(content: &str, budget: usize, handle: &str) -> String {
+    let head_capacity = budget
+        .saturating_sub(TOOL_RESULT_MARKER_RESERVED_BYTES)
+        .max(1);
+    let cut = floor_char_boundary(content, head_capacity.min(content.len()));
+    let dropped = content.len().saturating_sub(cut);
+    let mut out = content[..cut].to_string();
+    out.push_str(&format!(
+        "\n\n[{} bytes truncated by tool_result_budget; fetch_handle={handle}]",
+        dropped
+    ));
+    out
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn jsonrpc_error(id: Option<Value>, error: McpError) -> Value {
@@ -6249,6 +6993,32 @@ fn harness_run_detail_from_store<S: GraphStore>(
             Ok(Some(json!({ "run": run, "events": events })))
         }
     }
+}
+
+fn composed_agent_run_to_store<S: GraphStore>(
+    store: &mut S,
+    binding_id: String,
+    task: String,
+    claims: Vec<GroundedClaim>,
+) -> Result<Value, McpError> {
+    let invoker = FakeHeadInvoker::default();
+    let result = if claims.is_empty() {
+        theorem_harness_runtime::run_composed_agent(store, &binding_id, &task, &invoker)
+    } else {
+        theorem_harness_runtime::run_composed_agent_with_claims(
+            store,
+            &binding_id,
+            &task,
+            claims,
+            &invoker,
+        )
+    }
+    .map_err(mcp_composed_agent_error)?;
+    serde_json::to_value(result).map_err(|error| {
+        McpError::internal(format!(
+            "composed_agent_run payload serialization failed: {error}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6439,6 +7209,14 @@ fn mcp_harness_runtime_error(error: HarnessRuntimeError) -> McpError {
         code: -32603,
         message: error.to_string(),
         data: Some(json!({ "code": "harness_runtime_error" })),
+    }
+}
+
+fn mcp_composed_agent_error(error: theorem_harness_runtime::ComposedAgentRuntimeError) -> McpError {
+    McpError {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({ "code": "composed_agent_runtime_error" })),
     }
 }
 
@@ -6710,6 +7488,23 @@ fn resource_templates() -> Vec<Value> {
 
 fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
     let mut tools = vec![
+        tool(
+            "tool_result_fetch",
+            "Fetch a byte slice from a tool result that exceeded the MCP boundary budget.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "fetch_handle": { "type": "string" },
+                    "handle": { "type": "string" },
+                    "offset": { "type": "integer", "default": 0 },
+                    "max_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESULT_BUDGET_BYTES },
+                    "maxBytes": { "type": "integer", "default": DEFAULT_TOOL_RESULT_BUDGET_BYTES }
+                },
+                "required": ["fetch_handle"]
+            }),
+        ),
         tool(
             "rustyred_thg_graph_neighbors",
             "Read graph neighbors through THG adjacency indexes.",
@@ -7252,6 +8047,32 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool_write(
+            "composed_agent_run",
+            "Run one composed-agent turn through the binding scratchpad and alignment gate.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "binding_id": { "type": "string", "default": "agent:theorem" },
+                    "bindingId": { "type": "string" },
+                    "task": { "type": "string" },
+                    "claims": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "provenance": { "type": "string" }
+                            },
+                            "required": ["text", "provenance"]
+                        }
+                    }
+                },
+                "required": ["task"]
+            }),
+        ),
+        tool_write(
             "job_submit",
             "Dispatch v2: create or upsert a pending Job thread. Duplicate idempotency_key returns the existing job.",
             json!({
@@ -7342,6 +8163,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "include_extensions": { "type": "array", "items": { "type": "string" } },
                     "exclude_dirs": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
+                    "cursor": { "type": "integer", "default": 0 },
+                    "next_cursor": { "type": "integer" },
                     "max_depth": { "type": "integer", "default": 1 },
                     "max_files": { "type": "integer" },
                     "max_file_bytes": { "type": "integer" },
@@ -7386,6 +8209,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "include_extensions": { "type": "array", "items": { "type": "string" } },
                     "exclude_dirs": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
+                    "cursor": { "type": "integer", "default": 0 },
+                    "next_cursor": { "type": "integer" },
                     "max_depth": { "type": "integer", "default": 1 },
                     "max_files": { "type": "integer" },
                     "max_file_bytes": { "type": "integer" },
@@ -8054,7 +8879,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ));
         tools.push(tool_write(
             "coordination_intent",
-            "Write this actor's native Theorem harness room intent.",
+            "Write your live footprint for this room: what you are doing now and which files your hands are on, for peers to build on (a footprint, not a lock).",
             json!({
                 "type": "object",
                 "properties": {
@@ -8065,7 +8890,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "actor_id": { "type": "string" },
                     "status": { "type": "string", "enum": ["working", "paused", "done"], "default": "working" },
                     "summary": { "type": "string" },
-                    "claimed_files": { "type": "array", "items": { "type": "string" } },
+                    "footprint": { "type": "array", "items": { "type": "string" }, "description": "Files your hands are on right now; a footprint peers build on, not a claim. Accepts legacy claimed_files." },
                     "expected_completion": { "type": "string" },
                     "repo": { "type": "string" },
                     "branch": { "type": "string" },
@@ -8811,6 +9636,15 @@ impl McpGraphBackend for InMemoryGraphStore {
         harness_run_detail_from_store(self, run_id)
     }
 
+    fn composed_agent_run(
+        &mut self,
+        binding_id: String,
+        task: String,
+        claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        composed_agent_run_to_store(self, binding_id, task, claims)
+    }
+
     fn job_submit(
         &mut self,
         submission: JobSubmission,
@@ -8982,6 +9816,15 @@ impl McpGraphBackend for RedCoreGraphStore {
 
     fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
         harness_run_detail_from_store(self, run_id)
+    }
+
+    fn composed_agent_run(
+        &mut self,
+        binding_id: String,
+        task: String,
+        claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        composed_agent_run_to_store(self, binding_id, task, claims)
     }
 
     fn job_submit(
@@ -9273,12 +10116,13 @@ mod tests {
         RedCoreGraphStore, VectorDesignation, VerifyReport,
     };
     use serde_json::{json, Value};
-    use theorem_harness_core::TransitionInput;
+    use theorem_harness_core::{GroundedClaim, TransitionInput};
 
     use super::{
-        append_harness_transition_to_store, handle_mcp_request, handle_mcp_request_with_context,
-        harness_run_detail_from_store, subscribe_coordination_room_events, AppAffordanceInvocation,
-        McpError, McpGraphBackend, McpGraphProvider, McpRequestContext, McpServerConfig,
+        append_harness_transition_to_store, composed_agent_run_to_store, handle_mcp_request,
+        handle_mcp_request_with_context, harness_run_detail_from_store,
+        subscribe_coordination_room_events, AppAffordanceInvocation, McpError, McpGraphBackend,
+        McpGraphProvider, McpRequestContext, McpServerConfig,
     };
 
     struct FixtureProvider(Rc<RefCell<InMemoryGraphStore>>);
@@ -9461,6 +10305,16 @@ mod tests {
         fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
             let store = self.0.borrow();
             harness_run_detail_from_store(&*store, run_id)
+        }
+
+        fn composed_agent_run(
+            &mut self,
+            binding_id: String,
+            task: String,
+            claims: Vec<GroundedClaim>,
+        ) -> Result<Value, McpError> {
+            let mut store = self.0.borrow_mut();
+            composed_agent_run_to_store(&mut *store, binding_id, task, claims)
         }
 
         fn dispatch_handoff(&self, _dispatch: super::HandoffDispatch) -> Result<(), McpError> {
@@ -9781,6 +10635,38 @@ mod tests {
         let config = McpServerConfig::default();
         assert!(!config.read_only);
         assert!(!config.allow_admin);
+        assert_eq!(
+            config.tool_result_budget_bytes,
+            super::DEFAULT_TOOL_RESULT_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn tool_result_budget_caps_payload_and_exposes_fetch_handle() {
+        let config = McpServerConfig {
+            tool_result_budget_bytes: 1024,
+            ..McpServerConfig::default()
+        };
+        let result = super::tool_result_with_budget(
+            json!({ "blob": "x".repeat(10_000) }),
+            &config,
+            "compute_code",
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= 1024);
+        assert!(text.contains("truncated by tool_result_budget"));
+        let handle = result["structuredContent"]["fetch_handle"]
+            .as_str()
+            .unwrap();
+
+        let fetched = super::tool_result_fetch_payload(&json!({
+            "fetch_handle": handle,
+            "offset": 0,
+            "max_bytes": 32
+        }))
+        .unwrap();
+        assert_eq!(fetched["offset"], json!(0));
+        assert_eq!(fetched["text"].as_str().unwrap().len(), 32);
     }
 
     #[test]
@@ -9831,6 +10717,7 @@ mod tests {
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
+        assert!(has_tool(tools, "composed_agent_run"));
         assert!(has_tool(tools, "multihead_run"));
         assert!(has_tool(tools, "multihead_next"));
         assert!(has_tool(tools, "skill_list"));
@@ -10592,6 +11479,23 @@ mod tests {
         );
         assert_eq!(intent["intent"]["actor_id"], "codex");
         assert_eq!(intent["intent"]["status"], "working");
+        assert_eq!(intent["intent"]["agent_id"], "theorem");
+        assert_eq!(intent["intent"]["binding_id"], "agent:theorem");
+        // Legacy `claimed_files` input (sent above) must populate the renamed
+        // `footprint` output field, proving the serde alias keeps old callers working.
+        assert_eq!(
+            intent["intent"]["footprint"],
+            json!(["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"])
+        );
+        assert_eq!(
+            intent["intent"]["scratchpad_document_id"],
+            "scratchpad:theorem"
+        );
+        assert_eq!(intent["intent"]["scratchpad_seq"], 1);
+        assert_eq!(
+            intent["intent"]["binding_active_head_set"],
+            json!(["claude", "codex", "deepseek"])
+        );
 
         let mut room_events = subscribe_coordination_room_events();
         let receipt = call_tool_json(
@@ -10676,6 +11580,8 @@ mod tests {
             intents["intents"][0]["summary"],
             "Wire native coordination into MCP"
         );
+        assert_eq!(intents["intents"][0]["binding_id"], "agent:theorem");
+        assert_eq!(intents["intents"][0]["scratchpad_seq"], 1);
 
         let messages = call_tool_json(
             &provider,
@@ -10756,6 +11662,11 @@ mod tests {
         assert_eq!(context["counts"]["intents"], 1);
         assert_eq!(context["counts"]["messages"], 1);
         assert_eq!(context["counts"]["records"], 1);
+        assert_eq!(context["intents"][0]["binding_id"], "agent:theorem");
+        assert_eq!(
+            context["intents"][0]["scratchpad_document_id"],
+            "scratchpad:theorem"
+        );
 
         let contribution = call_tool_json(
             &provider,
@@ -11059,6 +11970,7 @@ mod tests {
     fn native_harness_run_transitions_round_trip_through_mcp() {
         let (provider, mut config) = fixture();
         config.read_only = false;
+        config.tool_result_budget_bytes = 0;
         let run_id = "run-mcp-0001";
 
         let created = append_harness_event(
@@ -11213,20 +12125,54 @@ mod tests {
         let events = detail["detail"]["events"].as_array().unwrap();
         assert_eq!(
             detail["detail"]["run"]["last_event_seq"],
-            events.len() as u64
+            json!(events.len() as u64)
         );
-        let packed_event = events
+        assert!(events.len() >= 11);
+        let context_packed = events
             .iter()
-            .find(|event| event["type"] == "CONTEXT.PACKED")
-            .expect("CONTEXT.PACKED event present");
-        assert_eq!(packed_event["payload"]["token_ledger"]["saved"], 300);
-        let outcome_event = events
+            .find(|event| event["type"] == json!("CONTEXT.PACKED"))
+            .expect("CONTEXT.PACKED event should be present");
+        assert_eq!(context_packed["payload"]["token_ledger"]["saved"], 300);
+        let outcome_recorded = events
             .iter()
-            .find(|event| event["type"] == "OUTCOME.RECORDED")
-            .expect("OUTCOME.RECORDED event present");
+            .find(|event| event["type"] == json!("OUTCOME.RECORDED"))
+            .expect("OUTCOME.RECORDED event should be present");
         assert_eq!(
-            outcome_event["payload"]["validator_results"][0]["status"],
+            outcome_recorded["payload"]["validator_results"][0]["status"],
             "passed"
+        );
+    }
+
+    #[test]
+    fn composed_agent_run_round_trips_through_mcp_with_fake_heads() {
+        let provider = FixtureProvider(Rc::new(RefCell::new(InMemoryGraphStore::new())));
+        let mut config = McpServerConfig::default();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let result = call_tool_json(
+            &provider,
+            &config,
+            "composed_agent_run",
+            json!({
+                "tenant": "smoke",
+                "binding_id": "agent:mcp-test",
+                "task": "publish composed agent result",
+                "claims": [{
+                    "text": "composed agent result is grounded",
+                    "provenance": "test:composed-agent"
+                }]
+            }),
+        );
+
+        assert_eq!(result["tenant"], "smoke");
+        assert_eq!(result["result"]["run_id"], "agent:mcp-test");
+        assert_eq!(
+            result["result"]["consensus_head_set"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 
@@ -11292,8 +12238,68 @@ mod tests {
         );
         assert_eq!(allowed["policy_receipt"]["decision"], "allow");
         assert_eq!(
+            allowed["policy_receipt"]["publication_gate"]["decision"],
+            "not_applicable"
+        );
+        assert_eq!(
             allowed["contribution"]["metadata"]["policy_receipt"]["required_scopes"],
             json!(["coordination:write"])
+        );
+
+        let publication_denied = call_tool_json_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["coordination:write"]),
+            "coordination_contribution",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "summary": "Publish a claim without peer review",
+                "required_scope": "coordination:write",
+                "publication": true,
+                "claims": [{
+                    "text": "Slice 2 is complete",
+                    "provenance": "test:coordination-policy"
+                }]
+            }),
+        );
+        assert_eq!(
+            publication_denied["error"],
+            "coordination_publication_denied"
+        );
+        assert_eq!(
+            publication_denied["policy_receipt"]["publication_gate"]["decision"],
+            "deny"
+        );
+
+        let publication_allowed = call_tool_json_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["coordination:write"]),
+            "coordination_contribution",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "reviewer": "claude-code",
+                "room_id": "harness-rust-port",
+                "summary": "Publish a reviewed claim",
+                "required_scope": "coordination:write",
+                "publication": true,
+                "claims": [{
+                    "text": "Slice 2 is peer reviewed",
+                    "provenance": "test:coordination-policy"
+                }]
+            }),
+        );
+        assert_eq!(publication_allowed["policy_receipt"]["decision"], "allow");
+        assert_eq!(
+            publication_allowed["policy_receipt"]["publication_gate"]["decision"],
+            "allow"
+        );
+        assert_eq!(
+            publication_allowed["policy_receipt"]["publication_gate"]["synthesis_heads"],
+            json!(["codex", "claude-code"])
         );
     }
 

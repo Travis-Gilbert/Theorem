@@ -13,7 +13,7 @@ use crate::agent_binding::{
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
 use crate::head_invocation::{
     FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
-    HeadInvocationRequest, HeadInvoker,
+    HeadInvocationRequest, HeadInvoker, RevisionContext,
 };
 use crate::state_hash::stable_value_hash;
 use crate::types::Payload;
@@ -398,18 +398,43 @@ fn invoke_head<I: HeadInvoker>(
         .iter()
         .map(|revision| revision.revision_id.clone())
         .collect();
-    let request = HeadInvocationRequest::new(
+    let prior_context = revisions.iter().filter_map(revision_context).collect();
+    let request = HeadInvocationRequest::new_with_context(
         head,
         kind,
         input.task.clone(),
         binding.working_memory_scope.scratchpad.version,
         prior_revision_ids,
+        prior_context,
         input.claims.clone(),
         input.started_at.clone(),
     );
     invoker
         .invoke(request)
         .map_err(IntraAgentLoopError::Invocation)
+}
+
+fn revision_context(revision: &ScratchpadRevision) -> Option<RevisionContext> {
+    let kind = revision
+        .payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(parse_invocation_kind)?;
+    Some(RevisionContext {
+        revision_id: revision.revision_id.clone(),
+        kind,
+        output_summary: revision.summary.clone(),
+        payload: revision.payload.clone(),
+    })
+}
+
+fn parse_invocation_kind(kind: &str) -> Option<HeadInvocationKind> {
+    match kind {
+        "proposal" => Some(HeadInvocationKind::Proposal),
+        "critique" => Some(HeadInvocationKind::Critique),
+        "synthesis" => Some(HeadInvocationKind::Synthesis),
+        _ => None,
+    }
 }
 
 fn contribute_from_receipt(

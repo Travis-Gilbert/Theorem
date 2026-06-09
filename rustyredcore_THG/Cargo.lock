@@ -3303,6 +3303,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-memory"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-resp-server"
 version = "0.5.0"
 dependencies = [
@@ -4003,6 +4012,7 @@ name = "theorem-harness-runtime"
 version = "0.1.0"
 dependencies = [
  "prose-check",
+ "reqwest",
  "rustyred-thg-core",
  "serde",
  "serde_json",

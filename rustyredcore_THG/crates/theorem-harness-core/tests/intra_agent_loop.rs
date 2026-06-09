@@ -1,8 +1,11 @@
+use std::cell::RefCell;
+
+use serde_json::json;
 use theorem_harness_core::{
     run_fake_intra_agent_loop, AgentBinding, AgentHead, BindingBudgetScope, BindingComposition,
     BindingError, BindingIdentity, FakeIntraAgentLoopInput, GroundedClaim, HeadCostProfile,
-    HeadInvocationKind, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError,
-    TraceTier,
+    HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
+    HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError, TraceTier,
 };
 
 #[test]
@@ -83,6 +86,36 @@ fn fake_loop_records_two_distinct_synthesis_heads() {
         result.binding.trace_scope.synthesis_heads,
         vec!["claude", "deepseek"]
     );
+}
+
+#[test]
+fn synthesis_receives_proposal_and_critique_context() {
+    let invoker = RecordingInvoker::default();
+    let input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+
+    theorem_harness_core::run_intra_agent_loop_with_invoker(fixture_binding(), input, &invoker)
+        .unwrap();
+
+    let requests = invoker.requests.into_inner();
+    let synthesis = requests
+        .iter()
+        .find(|request| request.kind == HeadInvocationKind::Synthesis)
+        .unwrap();
+    assert_eq!(synthesis.prior_context.len(), 2);
+    assert_eq!(
+        synthesis.prior_context[0].kind,
+        HeadInvocationKind::Proposal
+    );
+    assert_eq!(
+        synthesis.prior_context[1].kind,
+        HeadInvocationKind::Critique
+    );
+    assert!(synthesis.prior_context[0]
+        .payload
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
 }
 
 #[test]
@@ -201,5 +234,34 @@ fn assert_guard(error: IntraAgentLoopError, expected_code: &str) {
             assert_eq!(violation.code, expected_code);
         }
         other => panic!("expected binding guard {expected_code}, got {other:?}"),
+    }
+}
+
+#[derive(Default)]
+struct RecordingInvoker {
+    requests: RefCell<Vec<HeadInvocationRequest>>,
+}
+
+impl HeadInvoker for RecordingInvoker {
+    fn invoke(
+        &self,
+        request: HeadInvocationRequest,
+    ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
+        self.requests.borrow_mut().push(request.clone());
+        let output_summary = match request.kind {
+            HeadInvocationKind::Proposal => "recorded proposal",
+            HeadInvocationKind::Critique => "recorded critique",
+            HeadInvocationKind::Synthesis => "recorded synthesis",
+        };
+        let mut payload = serde_json::Map::new();
+        payload.insert("kind".to_string(), json!(request.kind.as_str()));
+        payload.insert("task".to_string(), json!(request.task));
+        payload.insert("prior_context".to_string(), json!(request.prior_context));
+        Ok(HeadInvocationReceipt::from_request(
+            &request,
+            output_summary,
+            payload,
+            1.0,
+        ))
     }
 }

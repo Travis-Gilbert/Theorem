@@ -38,6 +38,36 @@ THEOREM_HARNESS_TOKEN=<bearer> cargo run -p theorem-receiver -- ./theorem-receiv
 
 Deploy via `docker run` with a restart policy or launchd. Kubernetes is ruled out.
 
+## Wake courier mode
+
+The receiver can also act as the local wake courier for coordination-room
+messages. This is intentionally a nudge transport, not a second job queue: it
+reads recent room messages with `delivery = "wake"`, resolves the mentioned
+actor to a local head command, marks a local ledger, and spawns the head in the
+mapped worktree.
+
+Inspect what would run without touching the ledger:
+
+```bash
+THEOREM_HARNESS_TOKEN=<bearer> \
+  cargo run -p theorem-receiver -- --wake-dry-run <room_id> codex ./theorem-receiver.toml
+```
+
+Run one bounded wake pass:
+
+```bash
+THEOREM_HARNESS_TOKEN=<bearer> \
+  cargo run -p theorem-receiver -- --wake-run <room_id> codex ./theorem-receiver.toml
+```
+
+The ledger defaults to `.theorem/wake-ledger.json` next to the receiver config
+and can be overridden with `THEOREM_WAKE_LEDGER` or a fifth positional argument:
+
+```bash
+THEOREM_HARNESS_TOKEN=<bearer> \
+  cargo run -p theorem-receiver -- --wake-run <room_id> codex ./theorem-receiver.toml /tmp/wake-ledger.json
+```
+
 ## Embed it (Option A: a capability of the local RustyRed node)
 
 The crate is a library (`theorem_receiver`) as well as a binary. To make the
