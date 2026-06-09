@@ -36,8 +36,10 @@ pub const DECLARES_SYMBOL: &str = "DECLARES_SYMBOL";
 pub const CALLS_SYMBOL: &str = "CALLS_SYMBOL";
 pub const DEPENDS_ON_SYMBOL: &str = "DEPENDS_ON_SYMBOL";
 const DEFAULT_TRUST_TIER: &str = "advisory";
-const DEFAULT_MAX_FILES: usize = 2_500;
-const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
+const DEFAULT_MAX_FILES: usize = 25_000;
+const ABSOLUTE_MAX_FILES: u64 = 100_000;
+const DEFAULT_MAX_FILE_BYTES: u64 = 5_000_000;
+const ABSOLUTE_MAX_FILE_BYTES: u64 = 25_000_000;
 const DEFAULT_LIMIT: usize = 20;
 const DEFAULT_CONTEXT_LINES: u64 = 20;
 const DEFAULT_MAX_CONTEXT_CHARS: usize = 20_000;
@@ -507,25 +509,27 @@ fn handle_ingest_code_operation(
         exclude_dirs: code_plugin_arg_string_vec(&arguments, &["exclude_dirs", "excludeDirs"]),
         max_files: code_plugin_arg_u64(&arguments, &["max_files", "maxFiles"]),
         max_file_bytes: code_plugin_arg_u64(&arguments, &["max_file_bytes", "maxFileBytes"]),
+        max_total_bytes: code_plugin_arg_u64(
+            &arguments,
+            &[
+                "max_total_bytes",
+                "maxTotalBytes",
+                "max_clone_bytes",
+                "maxCloneBytes",
+                "max_repo_bytes",
+                "maxRepoBytes",
+            ],
+        ),
         actor: code_plugin_arg_string(&arguments, &["actor", "actor_id", "actorId"]),
     };
     let output = if !repo_url.trim().is_empty() {
         // CA-1: ingest by URL -> shallow clone into a quarantined tempdir ->
         // ingest the local checkout (the clone is removed afterward).
+        let fetch_caps = RepoFetchCaps::from_requested(input.max_total_bytes);
         if context.operation == "reindex" {
-            reindex_codebase_from_url_in_store(
-                context.store,
-                &repo_url,
-                input,
-                &RepoFetchCaps::default(),
-            )?
+            reindex_codebase_from_url_in_store(context.store, &repo_url, input, &fetch_caps)?
         } else {
-            ingest_codebase_from_url_in_store(
-                context.store,
-                &repo_url,
-                input,
-                &RepoFetchCaps::default(),
-            )?
+            ingest_codebase_from_url_in_store(context.store, &repo_url, input, &fetch_caps)?
         }
     } else if context.operation == "reindex" {
         reindex_codebase_in_store(context.store, input)?
@@ -707,6 +711,7 @@ pub struct IngestCodebaseInput {
     pub exclude_dirs: Vec<String>,
     pub max_files: u64,
     pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
     pub actor: String,
 }
 
@@ -2125,12 +2130,12 @@ pub fn resolve_ingest_config(input: IngestCodebaseInput) -> Result<IngestConfig,
     let max_files = if input.max_files == 0 {
         DEFAULT_MAX_FILES
     } else {
-        input.max_files.min(DEFAULT_MAX_FILES as u64) as usize
+        input.max_files.min(ABSOLUTE_MAX_FILES) as usize
     };
     let max_file_bytes = if input.max_file_bytes == 0 {
         DEFAULT_MAX_FILE_BYTES
     } else {
-        input.max_file_bytes.min(DEFAULT_MAX_FILE_BYTES)
+        input.max_file_bytes.min(ABSOLUTE_MAX_FILE_BYTES)
     };
 
     Ok(IngestConfig {
@@ -3374,6 +3379,49 @@ mod tests {
             && run(&["config", "user.name", "Fixture"])
             && run(&["add", "."])
             && run(&["commit", "--quiet", "-m", "fixture"])
+    }
+
+    #[test]
+    fn repo_fetch_caps_cover_large_public_repos_without_unbounded_fetches() {
+        assert!(repo_fetch::DEFAULT_MAX_TOTAL_BYTES >= 771_959_844);
+
+        let servo_sized = RepoFetchCaps::from_requested(771_959_844);
+        assert_eq!(servo_sized.max_total_bytes, 771_959_844);
+        assert_eq!(
+            servo_sized.clone_timeout_ms,
+            RepoFetchCaps::default().clone_timeout_ms
+        );
+
+        let capped = RepoFetchCaps::from_requested(u64::MAX);
+        assert_eq!(capped.max_total_bytes, repo_fetch::ABSOLUTE_MAX_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn resolve_ingest_config_honors_explicit_large_budgets() {
+        let (repo_dir, _store_dir) = write_fixture_repo();
+        let config = resolve_ingest_config(IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo_dir.display().to_string(),
+            max_files: 50_000,
+            max_file_bytes: 10_000_000,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(config.max_files, 50_000);
+        assert_eq!(config.max_file_bytes, 10_000_000);
+
+        let capped = resolve_ingest_config(IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo_dir.display().to_string(),
+            max_files: u64::MAX,
+            max_file_bytes: u64::MAX,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(capped.max_files, ABSOLUTE_MAX_FILES as usize);
+        assert_eq!(capped.max_file_bytes, ABSOLUTE_MAX_FILE_BYTES);
+
+        fs::remove_dir_all(&repo_dir).ok();
     }
 
     #[test]

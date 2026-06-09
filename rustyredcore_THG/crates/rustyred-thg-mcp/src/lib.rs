@@ -10749,6 +10749,16 @@ mod tests {
             tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo_url"]["type"],
             "string"
         );
+        assert_eq!(
+            tool_by_name(tools, "code_search")["inputSchema"]["properties"]["max_total_bytes"]
+                ["type"],
+            "integer"
+        );
+        assert_eq!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["max_clone_bytes"]
+                ["type"],
+            "integer"
+        );
         assert!(has_tool(tools, "ensemble_select"));
         assert!(tools
             .iter()

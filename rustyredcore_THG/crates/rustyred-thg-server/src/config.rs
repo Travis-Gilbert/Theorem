@@ -233,7 +233,7 @@ impl Config {
         let mcp_enabled = env_bool(&["RUSTY_RED_MCP_ENABLED", "RUSTYRED_THG_MCP_ENABLED"], true);
         let mcp_read_only = env_bool(
             &["RUSTY_RED_MCP_READ_ONLY", "RUSTYRED_THG_MCP_READ_ONLY"],
-            true,
+            false,
         );
         let mcp_allow_admin = env_bool(
             &["RUSTY_RED_MCP_ALLOW_ADMIN", "RUSTYRED_THG_MCP_ALLOW_ADMIN"],
@@ -324,7 +324,7 @@ impl Config {
             api_title: "Test".to_string(),
             public_url: None,
             mcp_enabled: false,
-            mcp_read_only: true,
+            mcp_read_only: false,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
             ttl_sweep_ms: 50,
@@ -557,7 +557,7 @@ mod tests {
             api_title: "Rusty Red".to_string(),
             public_url: None,
             mcp_enabled: true,
-            mcp_read_only: true,
+            mcp_read_only: false,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
             ttl_sweep_ms: 1000,
