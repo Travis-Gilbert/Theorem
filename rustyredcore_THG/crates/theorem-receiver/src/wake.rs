@@ -18,7 +18,12 @@ use crate::config::ReceiverConfig;
 use crate::spawn::{build_spawn_plan, command_from_plan, SpawnPlan};
 use crate::ReceiverResult;
 
-pub const DEFAULT_WAKE_MESSAGE_LIMIT: usize = 50;
+// Wake planning only needs the recent window. Kept small also because the
+// harness read_messages_for_room currently emits unescaped control chars/quotes
+// in some older message bodies, which breaks strict JSON parse over large
+// windows (harness serialization bug; the client sanitizes control chars but
+// cannot recover unescaped quotes).
+pub const DEFAULT_WAKE_MESSAGE_LIMIT: usize = 8;
 pub const DEFAULT_WAKE_MAX_PLANS: usize = 5;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]

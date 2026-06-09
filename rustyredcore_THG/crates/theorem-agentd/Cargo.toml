@@ -1,0 +1,23 @@
+[package]
+name = "theorem-agentd"
+version = "0.1.0"
+edition = "2021"
+description = "Local Theorem assistant daemon: OpenAI-compatible model loop, MCP tool host, receiver sidecar, and compute-offload ledger."
+license = "MIT"
+rust-version = "1.85"
+
+[lib]
+name = "theorem_agentd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "theorem-agentd"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+theorem-receiver = { path = "../theorem-receiver" }
+toml = "0.8"
+

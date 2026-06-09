@@ -155,22 +155,55 @@ fn parse_tool_response(value: &Value) -> ReceiverResult<Value> {
         .ok_or_else(|| {
             ReceiverError::Protocol("response missing result.content[0].text".to_string())
         })?;
-    let payload: Value = serde_json::from_str(text)?;
+    let payload: Value = serde_json::from_str(&escape_raw_control_chars(text))?;
 
-    // A tool-level error (e.g. read-only mode) comes back as a result whose text
-    // is `{error, message}` with no `result` envelope.
-    if payload.get("result").is_none() {
-        if let Some(message) = payload.get("message").and_then(Value::as_str) {
-            return Err(ReceiverError::Protocol(format!("tool error: {message}")));
-        }
-        if payload.get("error").is_some() {
-            return Err(ReceiverError::Protocol(format!("tool error: {payload}")));
-        }
+    // A tool-level error (e.g. read-only mode) comes back as `{error, message}`.
+    if payload.get("error").is_some() {
+        let message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("tool error");
+        return Err(ReceiverError::Protocol(format!("tool error: {message}")));
     }
 
-    payload.get("result").cloned().ok_or_else(|| {
-        ReceiverError::Protocol("tool payload missing 'result' envelope".to_string())
-    })
+    // Some tools wrap the backend value in `{result: ...}` (job_list); others
+    // return it directly (read_messages_for_room -> {messages, room_id, tenant}).
+    Ok(payload.get("result").cloned().unwrap_or(payload))
+}
+
+/// Escape raw control characters (unescaped newlines etc.) that appear *inside*
+/// JSON string literals. Some harness tool payloads embed raw newlines in record
+/// and message bodies, which strict JSON rejects; this keeps the parse resilient
+/// without disturbing structural whitespace between tokens.
+fn escape_raw_control_chars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => {
+                out.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                in_string = !in_string;
+                out.push(ch);
+            }
+            c if in_string && (c as u32) < 0x20 => match c {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                other => out.push_str(&format!("\\u{:04x}", other as u32)),
+            },
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Interpret a `job_list` backend payload.
