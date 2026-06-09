@@ -20,31 +20,37 @@ use rustyred_thg_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{
-    next_for_head, spawn_verify_node, stable_value_hash, submit_verify_receipt, ClaimOutcome,
-    FakeHeadInvoker, GroundedClaim, HeadFitness, JobStatus, JobSubmission, Millis, NodeStatus,
-    Priority, Receipt, TaskNode, TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
+    composition_hash, evaluate_publication, hash_agent_binding, next_for_head, spawn_verify_node,
+    stable_value_hash, submit_verify_receipt, ActionTierPolicy, AgentBinding, AgentHead,
+    BindingBudgetScope, BindingComposition, BindingIdentity, ClaimOutcome, FakeHeadInvoker,
+    GroundedClaim, HeadCostProfile, HeadFitness, HeadKind, HeadReliabilityProfile, HeadTransport,
+    JobStatus, JobSubmission, Millis, NodeStatus, Payload, Priority, Receipt, ScratchpadRevision,
+    TaskNode, TraceTier, TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
 };
 #[cfg(test)]
 use theorem_harness_runtime::subscribe_coordination_room_events;
 use theorem_harness_runtime::{
-    append_transition_from_store, apply_skill_pack, archive_memory_document,
-    coordination_intent_edge_id, coordination_intent_node_id, coordination_member_edge_id,
+    append_transition_from_store, apply_skill_pack, archive_memory_document, binding_node_id,
+    coordination_binding_id, coordination_intent_edge_id, coordination_intent_node_id,
+    coordination_intent_scratchpad_edge_id, coordination_member_edge_id,
     coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
     coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
-    coordination_record_node_id, coordination_room_node_id, encode_memory, forget_memory,
-    get_skill_pack, handoff_memory, infer_coordination_room_id, list_skill_packs, load_events,
-    load_run, normalize_coordination_urgency, parse_coordination_mentions,
+    coordination_record_node_id, coordination_room_binding_edge_id, coordination_room_node_id,
+    default_theorem_binding, encode_memory, forget_memory, get_skill_pack, handoff_memory,
+    infer_coordination_room_id, list_skill_packs, load_events, load_run,
+    normalize_coordination_urgency, parse_coordination_mentions,
     publish_coordination_room_event_from_state, publish_skill_pack, recall_archived_memory,
-    recall_memory, relate_memory, remember_memory, revise_memory_document, self_note_memory,
-    stable_coordination_message_id, stable_coordination_record_id, task_node_graph_id, upsert_note,
-    ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
-    CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
-    CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
-    HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
-    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
-    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
-    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
-    WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
+    recall_memory, relate_memory, remember_memory, revise_memory_document,
+    scratchpad_revision_node_id, self_note_memory, stable_coordination_message_id,
+    stable_coordination_record_id, task_node_graph_id, upsert_note, ArchiveMemoryInput,
+    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
+    CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
+    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult, JobCompletion,
+    JobNoteInput, JobOutcome, JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput,
+    PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput,
+    SkillPackError, SkillPackGetInput, SkillPackGraphStore, SkillPackListInput,
+    SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
+    EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -2706,6 +2712,8 @@ fn write_intent_payload(
         backend,
         WriteIntentInput {
             tenant_slug: tenant.to_string(),
+            agent_id: argument_text(arguments, &["agent_id", "agentId"]).unwrap_or_default(),
+            binding_id: argument_text(arguments, &["binding_id", "bindingId"]).unwrap_or_default(),
             room_id: resolved_coordination_room_id(arguments),
             actor_id: required_text_any(
                 arguments,
@@ -4186,6 +4194,8 @@ fn write_coordination_intent(
     input: WriteIntentInput,
 ) -> Result<CoordinationIntentState, McpError> {
     let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let agent_id = normalize_binding_agent_id(&input.agent_id, &input.binding_id);
+    let binding_id = resolve_coordination_binding_id(&input.binding_id, &agent_id);
     let room_id = if input.room_id.trim().is_empty() {
         "room:ungrouped".to_string()
     } else {
@@ -4207,8 +4217,10 @@ fn write_coordination_intent(
         .map(|intent| intent.started_at.clone())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| now.clone());
-    let intent = CoordinationIntentState {
+    let mut intent = CoordinationIntentState {
         tenant_slug,
+        agent_id,
+        binding_id,
         room_id,
         actor_id,
         status,
@@ -4220,9 +4232,323 @@ fn write_coordination_intent(
         task: input.task.trim().to_string(),
         started_at,
         updated_at: now,
+        scratchpad_revision_id: String::new(),
+        scratchpad_document_id: String::new(),
+        scratchpad_seq: 0,
+        binding_active_head_set: Vec::new(),
     };
+    let projection = project_coordination_intent_onto_binding(backend, &intent)?;
+    intent.scratchpad_revision_id = projection.scratchpad_revision_id;
+    intent.scratchpad_document_id = projection.scratchpad_document_id;
+    intent.scratchpad_seq = projection.scratchpad_seq;
+    intent.binding_active_head_set = projection.binding_active_head_set;
     persist_coordination_intent(backend, &intent)?;
+    persist_coordination_intent_binding_projection(backend, &intent)?;
     Ok(intent)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct McpBindingProjection {
+    scratchpad_revision_id: String,
+    scratchpad_document_id: String,
+    scratchpad_seq: u64,
+    binding_active_head_set: Vec<String>,
+}
+
+fn project_coordination_intent_onto_binding(
+    backend: &mut impl McpGraphBackend,
+    intent: &CoordinationIntentState,
+) -> Result<McpBindingProjection, McpError> {
+    let mut binding = match load_coordination_agent_binding(backend, &intent.binding_id)? {
+        Some(binding) => binding,
+        None => default_mcp_coordination_binding(
+            &intent.agent_id,
+            &intent.binding_id,
+            &intent.actor_id,
+        )?,
+    };
+    binding.lifecycle.run_id = intent.binding_id.clone();
+    ensure_session_actor_head(&mut binding, &intent.actor_id);
+
+    let payload = coordination_footprint_payload(intent);
+    let content_hash = stable_value_hash(&Value::Object(payload.clone()));
+    let revision = binding
+        .append_scratchpad_revision(
+            &intent.actor_id,
+            format!(
+                "coordination footprint {} in {}",
+                intent.status, intent.room_id
+            ),
+            content_hash,
+            payload,
+            intent.updated_at.clone(),
+        )
+        .map_err(|error| McpError::internal(error.to_string()))?;
+    let scratchpad_document_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    let state_hash = hash_agent_binding(&binding);
+    persist_coordination_agent_binding(backend, &binding, &state_hash)?;
+
+    Ok(McpBindingProjection {
+        scratchpad_revision_id: revision.revision_id,
+        scratchpad_document_id,
+        scratchpad_seq: revision.seq,
+        binding_active_head_set: binding.identity.active_head_set.clone(),
+    })
+}
+
+fn persist_coordination_intent_binding_projection(
+    backend: &mut impl McpGraphBackend,
+    state: &CoordinationIntentState,
+) -> Result<(), McpError> {
+    upsert_edge_if_changed(backend, coordination_room_binding_edge(state))?;
+    if state.scratchpad_seq > 0 && !state.scratchpad_document_id.is_empty() {
+        upsert_edge_if_changed(backend, coordination_intent_scratchpad_edge(state))?;
+    }
+    Ok(())
+}
+
+fn load_coordination_agent_binding(
+    backend: &impl McpGraphBackend,
+    binding_id: &str,
+) -> Result<Option<AgentBinding>, McpError> {
+    backend
+        .get_node(&binding_node_id(binding_id))?
+        .map(|node| parse_node_properties::<AgentBinding>(node.properties))
+        .transpose()
+}
+
+fn persist_coordination_agent_binding(
+    backend: &mut impl McpGraphBackend,
+    binding: &AgentBinding,
+    state_hash: &str,
+) -> Result<(), McpError> {
+    upsert_node_if_changed(
+        backend,
+        coordination_agent_binding_node(binding, state_hash)?,
+    )?;
+    let document_id = &binding.working_memory_scope.scratchpad.document_id;
+    let run_id = &binding.lifecycle.run_id;
+    for revision in &binding.working_memory_scope.scratchpad.revisions {
+        upsert_node_if_changed(
+            backend,
+            coordination_scratchpad_revision_node(document_id, revision)?,
+        )?;
+        upsert_edge_if_changed(
+            backend,
+            coordination_scratchpad_revision_of_edge(document_id, run_id, revision),
+        )?;
+        if revision.seq > 1 {
+            upsert_edge_if_changed(
+                backend,
+                coordination_previous_scratchpad_revision_edge(document_id, revision),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn coordination_agent_binding_node(
+    binding: &AgentBinding,
+    state_hash: &str,
+) -> Result<NodeRecord, McpError> {
+    let mut properties =
+        serde_json::to_value(binding).map_err(|error| McpError::internal(error.to_string()))?;
+    properties["state_hash"] = Value::String(state_hash.to_string());
+    Ok(NodeRecord::new(
+        binding_node_id(&binding.lifecycle.run_id),
+        ["AgentBinding"],
+        properties,
+    ))
+}
+
+fn coordination_scratchpad_revision_node(
+    document_id: &str,
+    revision: &ScratchpadRevision,
+) -> Result<NodeRecord, McpError> {
+    let mut properties =
+        serde_json::to_value(revision).map_err(|error| McpError::internal(error.to_string()))?;
+    properties["document_id"] = Value::String(document_id.to_string());
+    Ok(NodeRecord::new(
+        scratchpad_revision_node_id(document_id, revision.seq),
+        ["ScratchpadRevision"],
+        properties,
+    ))
+}
+
+fn coordination_scratchpad_revision_of_edge(
+    document_id: &str,
+    run_id: &str,
+    revision: &ScratchpadRevision,
+) -> EdgeRecord {
+    EdgeRecord::new(
+        format!(
+            "harness:edge:scratchrev-of:{}:{:020}",
+            document_id, revision.seq
+        ),
+        scratchpad_revision_node_id(document_id, revision.seq),
+        "HARNESS_SCRATCHPAD_REVISION_OF",
+        binding_node_id(run_id),
+        json!({
+            "document_id": document_id,
+            "seq": revision.seq,
+            "actor_head_id": revision.actor_head_id,
+            "content_hash": revision.content_hash,
+        }),
+    )
+}
+
+fn coordination_previous_scratchpad_revision_edge(
+    document_id: &str,
+    revision: &ScratchpadRevision,
+) -> EdgeRecord {
+    EdgeRecord::new(
+        format!(
+            "harness:edge:scratchrev-next:{}:{:020}",
+            document_id, revision.seq
+        ),
+        scratchpad_revision_node_id(document_id, revision.seq - 1),
+        "HARNESS_SCRATCHPAD_REVISION_NEXT",
+        scratchpad_revision_node_id(document_id, revision.seq),
+        json!({
+            "document_id": document_id,
+            "from_seq": revision.seq - 1,
+            "to_seq": revision.seq,
+        }),
+    )
+}
+
+fn default_mcp_coordination_binding(
+    agent_id: &str,
+    binding_id: &str,
+    actor_id: &str,
+) -> Result<AgentBinding, McpError> {
+    if agent_id == "theorem" {
+        return default_theorem_binding(binding_id)
+            .map_err(|error| McpError::internal(error.to_string()));
+    }
+
+    let actor_head = session_actor_head(actor_id);
+    let mut binding = AgentBinding::new(
+        BindingIdentity {
+            agent_id: agent_id.to_string(),
+            owner_id: "travis".to_string(),
+            agent_name: agent_id.to_string(),
+            composition_hash: String::new(),
+            version: 1,
+            trust_tier: "first_party".to_string(),
+            active_head_set: vec![actor_head.head_id.clone()],
+        },
+        BindingComposition {
+            heads: vec![actor_head],
+        },
+        BindingBudgetScope::new(agent_id, 32_000.0, 8),
+    )
+    .map_err(|error| McpError::internal(error.to_string()))?;
+    binding.lifecycle.run_id = binding_id.to_string();
+    Ok(binding)
+}
+
+fn ensure_session_actor_head(binding: &mut AgentBinding, actor_id: &str) {
+    if binding.head(actor_id).is_none() {
+        binding.composition.heads.push(session_actor_head(actor_id));
+    }
+    let mut active = binding
+        .identity
+        .active_head_set
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    active.insert(actor_id.to_string());
+    binding.identity.active_head_set = active.into_iter().collect();
+    binding.identity.composition_hash = composition_hash(binding);
+}
+
+fn session_actor_head(actor_id: &str) -> AgentHead {
+    AgentHead {
+        head_id: actor_id.to_string(),
+        display_name: actor_id.to_string(),
+        provider: "session".to_string(),
+        model: "session-actor".to_string(),
+        credential_ref: "local:none".to_string(),
+        transport: HeadTransport::Local,
+        kind: HeadKind::SpecializedCoder,
+        capabilities: vec!["coordination".to_string()],
+        cost_profile: HeadCostProfile::default(),
+        reliability_profile: HeadReliabilityProfile::default(),
+        allowed_tools: vec!["coordination_intent".to_string()],
+        trace_tier: TraceTier::Receipt,
+    }
+}
+
+fn coordination_footprint_payload(intent: &CoordinationIntentState) -> Payload {
+    let mut payload = Payload::new();
+    payload.insert(
+        "type".to_string(),
+        Value::String("coordination_footprint".to_string()),
+    );
+    payload.insert(
+        "tenant_slug".to_string(),
+        Value::String(intent.tenant_slug.clone()),
+    );
+    payload.insert(
+        "agent_id".to_string(),
+        Value::String(intent.agent_id.clone()),
+    );
+    payload.insert(
+        "binding_id".to_string(),
+        Value::String(intent.binding_id.clone()),
+    );
+    payload.insert("room_id".to_string(), Value::String(intent.room_id.clone()));
+    payload.insert(
+        "actor_id".to_string(),
+        Value::String(intent.actor_id.clone()),
+    );
+    payload.insert("status".to_string(), Value::String(intent.status.clone()));
+    payload.insert("summary".to_string(), Value::String(intent.summary.clone()));
+    payload.insert("claimed_files".to_string(), json!(intent.claimed_files));
+    payload.insert(
+        "expected_completion".to_string(),
+        Value::String(intent.expected_completion.clone()),
+    );
+    payload.insert("repo".to_string(), Value::String(intent.repo.clone()));
+    payload.insert("branch".to_string(), Value::String(intent.branch.clone()));
+    payload.insert("task".to_string(), Value::String(intent.task.clone()));
+    payload.insert(
+        "started_at".to_string(),
+        Value::String(intent.started_at.clone()),
+    );
+    payload.insert(
+        "updated_at".to_string(),
+        Value::String(intent.updated_at.clone()),
+    );
+    payload
+}
+
+fn normalize_binding_agent_id(agent_id: &str, binding_id: &str) -> String {
+    let explicit = agent_id.trim();
+    let candidate = if !explicit.is_empty() {
+        explicit
+    } else {
+        binding_id
+            .trim()
+            .strip_prefix("agent:")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("theorem")
+    };
+    coordination_binding_id(candidate)
+        .strip_prefix("agent:")
+        .unwrap_or("theorem")
+        .to_string()
+}
+
+fn resolve_coordination_binding_id(binding_id: &str, agent_id: &str) -> String {
+    let binding_id = binding_id.trim();
+    if binding_id.is_empty() {
+        coordination_binding_id(agent_id)
+    } else {
+        binding_id.to_string()
+    }
 }
 
 fn write_coordination_presence(
@@ -4703,6 +5029,47 @@ fn coordination_intent_edge(state: &CoordinationIntentState) -> EdgeRecord {
     )
 }
 
+fn coordination_room_binding_edge(state: &CoordinationIntentState) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_room_binding_edge_id(&state.tenant_slug, &state.room_id, &state.binding_id),
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        "COORDINATION_ROOM_PROJECTS_TO_BINDING",
+        binding_node_id(&state.binding_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "agent_id": state.agent_id,
+            "binding_id": state.binding_id,
+            "room_id": state.room_id,
+            "updated_at": state.updated_at,
+        }),
+    )
+}
+
+fn coordination_intent_scratchpad_edge(state: &CoordinationIntentState) -> EdgeRecord {
+    EdgeRecord::new(
+        coordination_intent_scratchpad_edge_id(
+            &state.tenant_slug,
+            &state.room_id,
+            &state.actor_id,
+            &state.scratchpad_revision_id,
+        ),
+        coordination_intent_node_id(&state.tenant_slug, &state.room_id, &state.actor_id),
+        "COORDINATION_INTENT_APPENDED_SCRATCHPAD_REVISION",
+        scratchpad_revision_node_id(&state.scratchpad_document_id, state.scratchpad_seq),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "agent_id": state.agent_id,
+            "binding_id": state.binding_id,
+            "room_id": state.room_id,
+            "actor_id": state.actor_id,
+            "scratchpad_document_id": state.scratchpad_document_id,
+            "scratchpad_revision_id": state.scratchpad_revision_id,
+            "scratchpad_seq": state.scratchpad_seq,
+            "updated_at": state.updated_at,
+        }),
+    )
+}
+
 fn coordination_message_room_edge(state: &CoordinationMessageState) -> EdgeRecord {
     EdgeRecord::new(
         coordination_message_edge_id(&state.tenant_slug, &state.room_id, &state.message_id),
@@ -5052,6 +5419,15 @@ fn coordination_policy_receipt(
     arguments: &Value,
     tool_name: &str,
 ) -> Value {
+    let agent_id = normalize_binding_agent_id(
+        &argument_text(arguments, &["agent_id", "agentId"]).unwrap_or_default(),
+        &argument_text(arguments, &["binding_id", "bindingId"]).unwrap_or_default(),
+    );
+    let binding_id = resolve_coordination_binding_id(
+        &argument_text(arguments, &["binding_id", "bindingId"]).unwrap_or_default(),
+        &agent_id,
+    );
+    let room_id = resolved_coordination_room_id(arguments);
     let required_scopes = string_array_any(
         arguments,
         &[
@@ -5096,7 +5472,13 @@ fn coordination_policy_receipt(
         .map(|budget| estimated_cost_units <= budget.max(0.0))
         .unwrap_or(true);
     let scope_allowed = missing_scopes.is_empty();
-    let decision = if scope_allowed && budget_allowed {
+    let publication_gate = session_publication_gate_receipt(arguments);
+    let publication_allowed = publication_gate
+        .get("decision")
+        .and_then(Value::as_str)
+        .map(|decision| decision != "deny")
+        .unwrap_or(true);
+    let decision = if scope_allowed && budget_allowed && publication_allowed {
         "allow"
     } else {
         "deny"
@@ -5104,13 +5486,17 @@ fn coordination_policy_receipt(
     json!({
         "tool": tool_name,
         "decision": decision,
+        "agent_id": agent_id,
+        "binding_id": binding_id,
+        "room_id": room_id,
         "required_scopes": required_scopes,
         "granted_scopes": context.scopes.clone(),
         "missing_scopes": missing_scopes,
         "scope_allowed": scope_allowed,
         "estimated_cost_units": estimated_cost_units,
         "budget_units": budget_units,
-        "budget_allowed": budget_allowed
+        "budget_allowed": budget_allowed,
+        "publication_gate": publication_gate
     })
 }
 
@@ -5132,10 +5518,18 @@ fn coordination_policy_error(policy_receipt: &Value) -> Option<Value> {
         .get("budget_allowed")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let publication_allowed = policy_receipt
+        .get("publication_gate")
+        .and_then(|gate| gate.get("decision"))
+        .and_then(Value::as_str)
+        .map(|decision| decision != "deny")
+        .unwrap_or(true);
     let code = if missing_scopes {
         "coordination_scope_denied"
     } else if !budget_allowed {
         "coordination_budget_exceeded"
+    } else if !publication_allowed {
+        "coordination_publication_denied"
     } else {
         "coordination_policy_denied"
     };
@@ -5144,6 +5538,135 @@ fn coordination_policy_error(policy_receipt: &Value) -> Option<Value> {
         "message": "Native coordination policy denied this write.",
         "policy_receipt": policy_receipt
     }))
+}
+
+fn session_publication_gate_receipt(arguments: &Value) -> Value {
+    let publication_flag = [
+        "publication",
+        "publish",
+        "publication_gate",
+        "publicationGate",
+    ]
+    .iter()
+    .any(|key| {
+        arguments
+            .get(*key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    let claims = argument_array(
+        arguments,
+        &[
+            "claims",
+            "grounded_claims",
+            "groundedClaims",
+            "publication_claims",
+            "publicationClaims",
+        ],
+    );
+    let pr_url = argument_text(
+        arguments,
+        &["pr_url", "prUrl", "pull_request_url", "pullRequestUrl"],
+    );
+    let applies = publication_flag || claims.is_some() || pr_url.is_some();
+    if !applies {
+        return json!({
+            "applies": false,
+            "decision": "not_applicable"
+        });
+    }
+
+    let synthesis_heads = publication_synthesis_heads(arguments);
+    let mut payload = Payload::new();
+    payload.insert(
+        "claims".to_string(),
+        Value::Array(claims.unwrap_or_default()),
+    );
+    if let Some(action_tier) = argument_text(arguments, &["action_tier", "actionTier"]) {
+        payload.insert("action_tier".to_string(), Value::String(action_tier));
+    }
+    if let Some(human_authorized) = ["human_authorized", "humanAuthorized"]
+        .iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_bool))
+    {
+        payload.insert(
+            "human_authorized".to_string(),
+            Value::Bool(human_authorized),
+        );
+    }
+    if let Some(pr_url) = pr_url {
+        payload.insert("pr_url".to_string(), Value::String(pr_url));
+    }
+
+    match evaluate_publication(
+        &synthesis_heads,
+        &coordination_publication_action_tiers(),
+        &payload,
+    ) {
+        Ok(()) => json!({
+            "applies": true,
+            "decision": "allow",
+            "synthesis_heads": synthesis_heads
+        }),
+        Err(error) => json!({
+            "applies": true,
+            "decision": "deny",
+            "reason": error.to_string(),
+            "synthesis_heads": synthesis_heads
+        }),
+    }
+}
+
+fn publication_synthesis_heads(arguments: &Value) -> Vec<String> {
+    let mut heads = string_array_any(
+        arguments,
+        &[
+            "synthesis_heads",
+            "synthesisHeads",
+            "contributing_heads",
+            "contributingHeads",
+            "peer_review_heads",
+            "peerReviewHeads",
+        ],
+    );
+    if let Some(actor) = argument_text(arguments, &["actor", "actor_id", "actorId"]) {
+        heads.push(actor);
+    }
+    if let Some(reviewer) = argument_text(
+        arguments,
+        &[
+            "reviewer",
+            "peer_reviewer",
+            "peerReviewer",
+            "reviewer_head",
+            "reviewerHead",
+        ],
+    ) {
+        heads.push(reviewer);
+    }
+    if let Some(peer_review) = arguments
+        .get("peer_review")
+        .or_else(|| arguments.get("peerReview"))
+        .and_then(Value::as_object)
+    {
+        if let Some(reviewer) = peer_review
+            .get("reviewer")
+            .or_else(|| peer_review.get("reviewer_head"))
+            .or_else(|| peer_review.get("reviewerHead"))
+            .and_then(Value::as_str)
+        {
+            heads.push(reviewer.to_string());
+        }
+    }
+    normalize_string_vec(heads)
+}
+
+fn coordination_publication_action_tiers() -> Vec<ActionTierPolicy> {
+    vec![
+        ActionTierPolicy::new("tier_one", "reversible substrate action", false),
+        ActionTierPolicy::new("tier_two", "consequential commit action", true),
+        ActionTierPolicy::new("tier_three", "irreversible external action", true),
+    ]
 }
 
 fn argument_f64_any(arguments: &Value, keys: &[&str]) -> Option<f64> {
@@ -10939,6 +11462,17 @@ mod tests {
         );
         assert_eq!(intent["intent"]["actor_id"], "codex");
         assert_eq!(intent["intent"]["status"], "working");
+        assert_eq!(intent["intent"]["agent_id"], "theorem");
+        assert_eq!(intent["intent"]["binding_id"], "agent:theorem");
+        assert_eq!(
+            intent["intent"]["scratchpad_document_id"],
+            "scratchpad:theorem"
+        );
+        assert_eq!(intent["intent"]["scratchpad_seq"], 1);
+        assert_eq!(
+            intent["intent"]["binding_active_head_set"],
+            json!(["claude", "codex", "deepseek"])
+        );
 
         let mut room_events = subscribe_coordination_room_events();
         let receipt = call_tool_json(
@@ -11023,6 +11557,8 @@ mod tests {
             intents["intents"][0]["summary"],
             "Wire native coordination into MCP"
         );
+        assert_eq!(intents["intents"][0]["binding_id"], "agent:theorem");
+        assert_eq!(intents["intents"][0]["scratchpad_seq"], 1);
 
         let messages = call_tool_json(
             &provider,
@@ -11103,6 +11639,11 @@ mod tests {
         assert_eq!(context["counts"]["intents"], 1);
         assert_eq!(context["counts"]["messages"], 1);
         assert_eq!(context["counts"]["records"], 1);
+        assert_eq!(context["intents"][0]["binding_id"], "agent:theorem");
+        assert_eq!(
+            context["intents"][0]["scratchpad_document_id"],
+            "scratchpad:theorem"
+        );
 
         let contribution = call_tool_json(
             &provider,
@@ -11665,8 +12206,68 @@ mod tests {
         );
         assert_eq!(allowed["policy_receipt"]["decision"], "allow");
         assert_eq!(
+            allowed["policy_receipt"]["publication_gate"]["decision"],
+            "not_applicable"
+        );
+        assert_eq!(
             allowed["contribution"]["metadata"]["policy_receipt"]["required_scopes"],
             json!(["coordination:write"])
+        );
+
+        let publication_denied = call_tool_json_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["coordination:write"]),
+            "coordination_contribution",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "harness-rust-port",
+                "summary": "Publish a claim without peer review",
+                "required_scope": "coordination:write",
+                "publication": true,
+                "claims": [{
+                    "text": "Slice 2 is complete",
+                    "provenance": "test:coordination-policy"
+                }]
+            }),
+        );
+        assert_eq!(
+            publication_denied["error"],
+            "coordination_publication_denied"
+        );
+        assert_eq!(
+            publication_denied["policy_receipt"]["publication_gate"]["decision"],
+            "deny"
+        );
+
+        let publication_allowed = call_tool_json_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["coordination:write"]),
+            "coordination_contribution",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "reviewer": "claude-code",
+                "room_id": "harness-rust-port",
+                "summary": "Publish a reviewed claim",
+                "required_scope": "coordination:write",
+                "publication": true,
+                "claims": [{
+                    "text": "Slice 2 is peer reviewed",
+                    "provenance": "test:coordination-policy"
+                }]
+            }),
+        );
+        assert_eq!(publication_allowed["policy_receipt"]["decision"], "allow");
+        assert_eq!(
+            publication_allowed["policy_receipt"]["publication_gate"]["decision"],
+            "allow"
+        );
+        assert_eq!(
+            publication_allowed["policy_receipt"]["publication_gate"]["synthesis_heads"],
+            json!(["codex", "claude-code"])
         );
     }
 
