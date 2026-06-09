@@ -394,10 +394,17 @@ impl ContextWebPack {
         let policy = policy.unwrap_or(&default_policy);
         let mut selected = Vec::new();
         let mut packed_tokens = 0;
+        let mut hydration_tokens_avoided = self.token_ledger.hydration_tokens_avoided;
         let mut why_included = Map::new();
         let mut why_excluded = Map::new();
-        let mut atoms = self.atoms.clone();
+        let (mut atoms, candidate_edges, merged_atom_ids) =
+            merge_duplicate_atoms_and_edges(self.atoms.clone(), self.edges.clone());
 
+        for atom in &mut atoms {
+            if atom.estimated_tokens <= 0 {
+                atom.estimated_tokens = calibrated_atom_tokens(atom);
+            }
+        }
         atoms.sort_by(|left, right| {
             right
                 .score
@@ -423,6 +430,19 @@ impl ContextWebPack {
                 continue;
             }
             if packed_tokens + next_tokens > effective_budget.max_tokens {
+                if let Some(summary_atom) = summary_fidelity_atom(&atom) {
+                    let summary_tokens = summary_atom.estimated_tokens.max(0);
+                    if packed_tokens + summary_tokens <= effective_budget.max_tokens {
+                        hydration_tokens_avoided += (next_tokens - summary_tokens).max(0);
+                        packed_tokens += summary_tokens;
+                        why_included.insert(
+                            summary_atom.id.clone(),
+                            Value::String("included_as_summary".to_string()),
+                        );
+                        selected.push(summary_atom);
+                        continue;
+                    }
+                }
                 why_excluded.insert(
                     atom.id.clone(),
                     Value::String("token_budget_exhausted".to_string()),
@@ -441,8 +461,7 @@ impl ContextWebPack {
             .iter()
             .map(|atom| atom.id.as_str())
             .collect::<Vec<_>>();
-        let edges = self
-            .edges
+        let edges = candidate_edges
             .iter()
             .take(effective_budget.max_edges)
             .filter(|edge| {
@@ -476,19 +495,21 @@ impl ContextWebPack {
             packed_tokens,
             saved_tokens: (raw_tokens - packed_tokens).max(0),
             tool_schema_tokens_avoided: self.token_ledger.tool_schema_tokens_avoided,
-            hydration_tokens_avoided: self.token_ledger.hydration_tokens_avoided,
+            hydration_tokens_avoided,
             cache_hits: self.token_ledger.cache_hits,
         };
 
         let mut provenance = self.provenance.clone();
-        let policies_applied = existing_string_list(&provenance, "policies_applied")
-            .into_iter()
-            .chain([
-                "generated_artifact_quarantine".to_string(),
-                "token_budget".to_string(),
-            ])
-            .map(Value::String)
-            .collect::<Vec<_>>();
+        let mut policies = existing_string_list(&provenance, "policies_applied");
+        push_unique(&mut policies, "generated_artifact_quarantine".to_string());
+        push_unique(&mut policies, "token_budget".to_string());
+        if hydration_tokens_avoided > self.token_ledger.hydration_tokens_avoided {
+            push_unique(&mut policies, "summary_hydration".to_string());
+        }
+        if !merged_atom_ids.is_empty() {
+            push_unique(&mut policies, "atom_dedup_merge".to_string());
+        }
+        let policies_applied = policies.into_iter().map(Value::String).collect::<Vec<_>>();
         let external_quarantined = why_excluded
             .values()
             .any(|reason| reason.as_str() == Some("generated_artifact_quarantined"));
@@ -502,6 +523,12 @@ impl ContextWebPack {
             "external_content_quarantined".to_string(),
             Value::Bool(external_quarantined),
         );
+        if !merged_atom_ids.is_empty() {
+            provenance.insert(
+                "merged_atom_ids".to_string(),
+                Value::Array(merged_atom_ids.into_iter().map(Value::String).collect()),
+            );
+        }
 
         Self {
             run_id: self.run_id.clone(),
@@ -533,6 +560,134 @@ impl ContextWebPack {
             deferred_ingestion: self.deferred_ingestion.clone(),
             state_hash: self.state_hash.clone(),
         }
+    }
+}
+
+fn merge_duplicate_atoms_and_edges(
+    atoms: Vec<ContextWebAtom>,
+    edges: Vec<ContextWebEdge>,
+) -> (Vec<ContextWebAtom>, Vec<ContextWebEdge>, Vec<String>) {
+    let mut merged_by_key: BTreeMap<String, ContextWebAtom> = BTreeMap::new();
+    let mut representative_by_id: HashMap<String, String> = HashMap::new();
+    let mut merged_atom_ids = Vec::new();
+
+    for mut atom in atoms {
+        let key = merge_key(&atom);
+        if let Some(existing) = merged_by_key.get_mut(&key) {
+            let representative_id = existing.id.clone();
+            representative_by_id.insert(atom.id.clone(), representative_id);
+            push_unique(&mut merged_atom_ids, atom.id.clone());
+            push_unique(&mut merged_atom_ids, existing.id.clone());
+            merge_atom(existing, &mut atom);
+        } else {
+            representative_by_id.insert(atom.id.clone(), atom.id.clone());
+            merged_by_key.insert(key, atom);
+        }
+    }
+
+    let mut merged_edges = Vec::new();
+    for mut edge in edges {
+        if let Some(from_id) = representative_by_id.get(&edge.from_id) {
+            edge.from_id = from_id.clone();
+        }
+        if let Some(to_id) = representative_by_id.get(&edge.to_id) {
+            edge.to_id = to_id.clone();
+        }
+        if edge.from_id == edge.to_id {
+            continue;
+        }
+        if !merged_edges.iter().any(|existing: &ContextWebEdge| {
+            existing.from_id == edge.from_id
+                && existing.to_id == edge.to_id
+                && existing.relation == edge.relation
+        }) {
+            merged_edges.push(edge);
+        }
+    }
+
+    (
+        merged_by_key.into_values().collect(),
+        merged_edges,
+        merged_atom_ids,
+    )
+}
+
+fn merge_key(atom: &ContextWebAtom) -> String {
+    let source_ref = atom.source_ref.trim();
+    if !source_ref.is_empty() {
+        return format!("source:{source_ref}");
+    }
+    let title = atom.title.trim();
+    if !title.is_empty() {
+        return format!("title:{}", title.to_lowercase());
+    }
+    format!("id:{}", atom.id)
+}
+
+fn merge_atom(target: &mut ContextWebAtom, source: &mut ContextWebAtom) {
+    if source.score > target.score {
+        target.score = source.score;
+    }
+    if target.summary.trim().is_empty()
+        || source.summary.len() > target.summary.len()
+            && target.hydration_level.eq_ignore_ascii_case("summary")
+    {
+        target.summary = source.summary.clone();
+    }
+    if target.source_ref.trim().is_empty() {
+        target.source_ref = source.source_ref.clone();
+    }
+    if target.why_relevant.trim().is_empty() {
+        target.why_relevant = source.why_relevant.clone();
+    }
+    if target.trigger_description.trim().is_empty() {
+        target.trigger_description = source.trigger_description.clone();
+    }
+    if target.hydration_handle.trim().is_empty() {
+        target.hydration_handle = source.hydration_handle.clone();
+    }
+    for channel in source.channels.drain(..) {
+        push_unique(&mut target.channels, channel);
+    }
+    for label in source.labels.drain(..) {
+        push_unique(&mut target.labels, label);
+    }
+    for citation in source.citations.drain(..) {
+        if !target.citations.contains(&citation) {
+            target.citations.push(citation);
+        }
+    }
+}
+
+fn summary_fidelity_atom(atom: &ContextWebAtom) -> Option<ContextWebAtom> {
+    if atom.summary.trim().is_empty() || atom.hydration_level.eq_ignore_ascii_case("summary") {
+        return None;
+    }
+    let mut summary = atom.clone();
+    summary.hydration_level = "summary".to_string();
+    summary.estimated_tokens = calibrated_text_tokens(&summary.summary)
+        .saturating_add(calibrated_text_tokens(&summary.title))
+        .max(1);
+    Some(summary)
+}
+
+fn calibrated_atom_tokens(atom: &ContextWebAtom) -> i64 {
+    let citation_tokens = (atom.citations.len() as i64) * 8;
+    let label_tokens = (atom.labels.len() as i64) * 2;
+    let body_tokens = calibrated_text_tokens(&atom.title)
+        + calibrated_text_tokens(&atom.summary)
+        + calibrated_text_tokens(&atom.source_ref)
+        + calibrated_text_tokens(&atom.why_relevant)
+        + calibrated_text_tokens(&atom.trigger_description);
+    (body_tokens + citation_tokens + label_tokens).max(1)
+}
+
+fn calibrated_text_tokens(value: &str) -> i64 {
+    let bytes = value.trim().len() as i64;
+    if bytes == 0 {
+        0
+    } else {
+        ((bytes + 3) / 4).max(1)
     }
 }
 
@@ -859,4 +1014,128 @@ fn default_generated_artifact_paths() -> Vec<String> {
 
 fn standard_mode() -> String {
     "standard".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn atom(id: &str, kind: &str, source_ref: &str, title: &str, score: f64) -> ContextWebAtom {
+        ContextWebAtom {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            source_ref: source_ref.to_string(),
+            title: title.to_string(),
+            summary: format!("summary for {title}"),
+            score,
+            estimated_tokens: 1_000,
+            hydration_level: "full".to_string(),
+            hydration_handle: format!("hydrate:{id}"),
+            channels: Vec::new(),
+            citations: Vec::new(),
+            labels: Vec::new(),
+            trigger_description: String::new(),
+            why_relevant: String::new(),
+        }
+    }
+
+    #[test]
+    fn bounded_merges_duplicate_sources_and_repoints_edges() {
+        let pack = ContextWebPack {
+            run_id: "run".to_string(),
+            query: "query".to_string(),
+            mode: "standard".to_string(),
+            budget: ContextWebBudget {
+                max_tokens: 100,
+                max_atoms: 10,
+                max_edges: 10,
+                max_paths: 10,
+                max_tools: 5,
+            },
+            atoms: vec![
+                atom("a", "file", "src/lib.rs", "Lib", 0.9),
+                atom("b", "symbol", "src/lib.rs", "Lib", 0.7),
+                atom("c", "file", "src/main.rs", "Main", 0.8),
+            ],
+            edges: vec![ContextWebEdge {
+                from_id: "b".to_string(),
+                to_id: "c".to_string(),
+                relation: "MENTIONS".to_string(),
+                reason: String::new(),
+                score: 1.0,
+            }],
+            paths: Vec::new(),
+            tools_used: Vec::new(),
+            source_mix: BTreeMap::new(),
+            token_ledger: ContextWebTokenLedger::default(),
+            provenance: Map::new(),
+            spend_plan: ContextWebSpendPlan::default(),
+            validation: ContextWebValidationSummary::default(),
+            evaluation: ContextWebEvaluation::default(),
+            index: ContextWebIndex::default(),
+            structural_bank: Vec::new(),
+            solution_cards: Vec::new(),
+            deferred_ingestion: Vec::new(),
+            state_hash: String::new(),
+        };
+
+        let bounded = pack.bounded(None);
+
+        assert_eq!(bounded.atoms.len(), 2);
+        assert!(bounded
+            .edges
+            .iter()
+            .any(|edge| edge.from_id == "a" && edge.to_id == "c"));
+        assert!(!bounded
+            .validation
+            .findings
+            .iter()
+            .any(|finding| finding.validator_id == "context_clash_detector"));
+    }
+
+    #[test]
+    fn bounded_tries_summary_hydration_before_dropping_atom() {
+        let mut large = atom("large", "file", "src/large.rs", "Large", 1.0);
+        large.summary = "short".to_string();
+        large.trigger_description = "x".repeat(8_000);
+        large.estimated_tokens = 8_000;
+
+        let pack = ContextWebPack {
+            run_id: "run".to_string(),
+            query: "query".to_string(),
+            mode: "standard".to_string(),
+            budget: ContextWebBudget {
+                max_tokens: 20,
+                max_atoms: 2,
+                max_edges: 0,
+                max_paths: 0,
+                max_tools: 0,
+            },
+            atoms: vec![large],
+            edges: Vec::new(),
+            paths: Vec::new(),
+            tools_used: Vec::new(),
+            source_mix: BTreeMap::new(),
+            token_ledger: ContextWebTokenLedger::default(),
+            provenance: Map::new(),
+            spend_plan: ContextWebSpendPlan::default(),
+            validation: ContextWebValidationSummary::default(),
+            evaluation: ContextWebEvaluation::default(),
+            index: ContextWebIndex::default(),
+            structural_bank: Vec::new(),
+            solution_cards: Vec::new(),
+            deferred_ingestion: Vec::new(),
+            state_hash: String::new(),
+        };
+
+        let bounded = pack.bounded(None);
+
+        assert_eq!(bounded.atoms.len(), 1);
+        assert_eq!(bounded.atoms[0].hydration_level, "summary");
+        assert!(bounded.token_ledger.hydration_tokens_avoided > 0);
+        assert_eq!(
+            bounded.provenance["why_included"]["large"].as_str(),
+            Some("included_as_summary")
+        );
+    }
 }

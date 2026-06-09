@@ -33,7 +33,8 @@ use rustyred_thg_fractal::{
     run_fractal_expansion, run_fractal_expansion_with_search_providers, FractalExpansionRequest,
 };
 use rustyred_thg_mcp::{
-    agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpRequestContext,
+    agent_manifest, handle_mcp_request_with_context, mcp_manifest, McpGraphBackend,
+    McpGraphProvider, McpRequestContext,
 };
 use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
@@ -51,7 +52,7 @@ use theorem_browser_agent::{
     resolve_context_command, BrowserSurface, ContextCommandRequest, ObservedElement,
     PageObservation, PerceptionInput, PerceptionMode, RetrievalMode, RiskMode,
 };
-use theorem_harness_core::TransitionInput;
+use theorem_harness_core::{GroundedClaim, TransitionInput};
 use theorem_harness_runtime::{
     append_transition_from_store, memory_content_hash, normalize_tenant_slug, publish_skill_pack,
     subscribe_coordination_room_events, MemoryDocumentState, SkillPackPublishInput,
@@ -638,6 +639,9 @@ async fn mcp_post(
     if let Some(response) = maybe_handle_live_fractal_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
     }
+    if let Some(response) = maybe_handle_composed_agent_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
     Json(handle_mcp_request_with_context(
         &state,
         &config,
@@ -645,6 +649,85 @@ async fn mcp_post(
         payload,
     ))
     .into_response()
+}
+
+async fn maybe_handle_composed_agent_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "composed_agent_run" | "theorem_composed_agent_run") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let result = if config.read_only {
+        mcp_tool_result_error(json!({
+            "error": "mcp_read_only",
+            "message": "composed_agent_run is unavailable while read-only mode is active."
+        }))
+    } else {
+        let arguments = payload
+            .get("params")
+            .and_then(|params| params.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        match composed_agent_run_payload(state.clone(), config, &arguments).await {
+            Ok(payload) => mcp_tool_result(payload),
+            Err(payload) => mcp_tool_result_error(payload),
+        }
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn composed_agent_run_payload(
+    state: AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let task = argument_text_any(arguments, &["task", "query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_composed_agent_run",
+            "message": "composed_agent_run requires task"
+        })
+    })?;
+    let binding_id = argument_text_any(arguments, &["binding_id", "bindingId"])
+        .unwrap_or_else(|| theorem_harness_runtime::DEFAULT_BINDING_ID.to_string());
+    let claims = grounded_claims_argument(arguments);
+    let tenant_for_blocking = tenant.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut backend = state
+            .backend_for_tenant(&tenant_for_blocking)
+            .map_err(mcp_error_payload)?;
+        let result = backend
+            .composed_agent_run(binding_id, task, claims)
+            .map_err(mcp_error_payload)?;
+        Ok(json!({
+            "tenant": tenant_for_blocking,
+            "result": result
+        }))
+    })
+    .await
+    .map_err(|error| {
+        json!({
+            "error": "composed_agent_join_failed",
+            "message": error.to_string()
+        })
+    })?
 }
 
 async fn coordination_events(
@@ -1992,6 +2075,48 @@ fn argument_bool_any(arguments: &Value, keys: &[&str]) -> Option<bool> {
             },
             _ => None,
         }
+    })
+}
+
+fn grounded_claims_argument(arguments: &Value) -> Vec<GroundedClaim> {
+    arguments
+        .get("claims")
+        .and_then(Value::as_array)
+        .map(|claims| {
+            claims
+                .iter()
+                .filter_map(|claim| {
+                    let text = claim
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    let provenance = claim
+                        .get("provenance")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if text.is_empty() || provenance.is_empty() {
+                        None
+                    } else {
+                        Some(GroundedClaim::new(text, provenance))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mcp_error_payload(error: rustyred_thg_mcp::McpError) -> Value {
+    json!({
+        "error": error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("mcp_error"),
+        "message": error.message,
+        "data": error.data
     })
 }
 
@@ -6653,12 +6778,12 @@ mod tests {
         graph_fulltext_search, graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge,
         instant_kg_impact, instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command,
         is_graph_command, live_search_budget, live_search_is_sparse, maybe_handle_browser_use_mcp,
-        maybe_handle_live_search_acquisition_mcp, mcp_origin_allowed, memory_docs_list,
-        public_cypher, required_scope_for_command, search_live, transaction_begin,
-        transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
-        FullTextSearchBody, MemoryDocsQuery,
-        HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
-        InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, PageRankBody, PprBody,
+        maybe_handle_composed_agent_mcp, maybe_handle_live_search_acquisition_mcp,
+        mcp_origin_allowed, memory_docs_list, public_cypher, required_scope_for_command,
+        search_live, transaction_begin, transaction_commit, transaction_rollback, BulkQuery,
+        CommunitiesBody, ComponentsBody, FullTextSearchBody, HybridSearchBody,
+        InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody, InstantKgSearchBody,
+        InstantKgViewBody, LiveSearchRequest, MemoryDocsQuery, PageRankBody, PprBody,
         PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
@@ -6865,6 +6990,33 @@ mod tests {
         )
         .await
         .expect("web_consume MCP route should be intercepted");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_composed_agent_read_only_blocks_provider_invocation() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+
+        let response = maybe_handle_composed_agent_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "composed-agent",
+                "method": "tools/call",
+                "params": {
+                    "name": "composed_agent_run",
+                    "arguments": { "task": "publish a grounded answer" }
+                }
+            }),
+        )
+        .await
+        .expect("composed-agent MCP route should be intercepted");
+
         assert_eq!(
             response["result"]["structuredContent"]["error"],
             "mcp_read_only"
@@ -7110,9 +7262,7 @@ mod tests {
             .expect("source doc present");
         assert_eq!(source["tags"].as_array().unwrap().len(), 2);
         assert_eq!(
-            source["links"].as_array().unwrap()[0]
-                .as_str()
-                .unwrap(),
+            source["links"].as_array().unwrap()[0].as_str().unwrap(),
             target_doc_id
         );
     }

@@ -3,6 +3,7 @@ pub mod agent_binding;
 pub mod agent_head_registry;
 pub mod alignment;
 pub mod budget;
+pub mod context_manager;
 pub mod context_web;
 pub mod federated_signals;
 pub mod head_fitness;
@@ -40,6 +41,13 @@ pub use agent_head_registry::{
 };
 pub use alignment::{evaluate_publication, MIN_CONSENSUS_HEADS};
 pub use budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
+pub use context_manager::{
+    autocompact_with_summary, microcompact, ContextCheckResult, ContextGuard, ContextManager,
+    ContextManagerConfig, ContextManagerStats, ContextMessage, ContextReduction, MicrocompactStats,
+    ProviderUsage, ToolCallEnvelope, ToolResultEnvelope, CLEARED_TOOL_RESULT_PLACEHOLDER,
+    COMPACTION_TRIGGER_THRESHOLD, DEFAULT_KEEP_RECENT_TOOL_RESULTS, HARD_LIMIT_THRESHOLD,
+    MAX_CONSECUTIVE_REDUCTION_FAILURES,
+};
 pub use context_web::{
     is_generated_artifact, normalize_context_web_node_id, ContextWebAtom, ContextWebBudget,
     ContextWebCitation, ContextWebEdge, ContextWebEvaluation, ContextWebIndex, ContextWebPack,
@@ -55,7 +63,7 @@ pub use federated_signals::{
 pub use head_fitness::{FitnessCounter, HeadFitness, NodeResult, RoutingPolicy};
 pub use head_invocation::{
     FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
-    HeadInvocationRequest, HeadInvoker,
+    HeadInvocationRequest, HeadInvoker, RevisionContext,
 };
 pub use intra_agent_loop::{
     run_fake_intra_agent_loop, run_intra_agent_loop_with_invoker, FakeIntraAgentLoopInput,

@@ -1,4 +1,8 @@
-use crate::writing_style;
+use crate::binding_store::{
+    binding_node_id, load_binding, persist_binding, scratchpad_revision_node_id,
+    BindingRuntimeError,
+};
+use crate::{default_theorem_binding, writing_style, DEFAULT_BINDING_ID};
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord,
 };
@@ -8,7 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
-use theorem_harness_core::stable_value_hash;
+use theorem_harness_core::{
+    composition_hash, hash_agent_binding, stable_value_hash, AgentBinding, AgentHead,
+    BindingBudgetScope, BindingComposition, BindingError, BindingIdentity, HeadCostProfile,
+    HeadKind, HeadReliabilityProfile, HeadTransport, Payload, TraceTier,
+};
 
 pub type CoordinationResult<T> = Result<T, CoordinationError>;
 
@@ -24,6 +32,8 @@ const RECORD_TYPES: &[&str] = &["event", "decision", "tension", "reflection"];
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoordinationError {
     Store(GraphStoreError),
+    Binding(BindingError),
+    BindingStore(BindingRuntimeError),
     Serialization(String),
     Deserialization(String),
     InvalidInput { field: String, message: String },
@@ -33,6 +43,8 @@ impl fmt::Display for CoordinationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(error) => write!(f, "{}: {}", error.code, error.message),
+            Self::Binding(error) => write!(f, "{error}"),
+            Self::BindingStore(error) => write!(f, "{error}"),
             Self::Serialization(error) => write!(f, "serialization failed: {error}"),
             Self::Deserialization(error) => write!(f, "deserialization failed: {error}"),
             Self::InvalidInput { field, message } => {
@@ -47,6 +59,18 @@ impl Error for CoordinationError {}
 impl From<GraphStoreError> for CoordinationError {
     fn from(value: GraphStoreError) -> Self {
         Self::Store(value)
+    }
+}
+
+impl From<BindingError> for CoordinationError {
+    fn from(value: BindingError) -> Self {
+        Self::Binding(value)
+    }
+}
+
+impl From<BindingRuntimeError> for CoordinationError {
+    fn from(value: BindingRuntimeError) -> Self {
+        Self::BindingStore(value)
     }
 }
 
@@ -84,6 +108,10 @@ pub struct JoinRoomInput {
 pub struct WriteIntentInput {
     #[serde(default)]
     pub tenant_slug: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub binding_id: String,
     #[serde(default)]
     pub room_id: String,
     #[serde(default)]
@@ -262,6 +290,10 @@ pub struct CoordinationRoomState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CoordinationIntentState {
     pub tenant_slug: String,
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub binding_id: String,
     pub room_id: String,
     pub actor_id: String,
     pub status: String,
@@ -280,6 +312,14 @@ pub struct CoordinationIntentState {
     pub started_at: String,
     #[serde(default)]
     pub updated_at: String,
+    #[serde(default)]
+    pub scratchpad_revision_id: String,
+    #[serde(default)]
+    pub scratchpad_document_id: String,
+    #[serde(default)]
+    pub scratchpad_seq: u64,
+    #[serde(default)]
+    pub binding_active_head_set: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -425,6 +465,8 @@ pub fn write_intent<S: GraphStore>(
     input: WriteIntentInput,
 ) -> CoordinationResult<CoordinationIntentState> {
     let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let agent_id = normalize_binding_agent_id(&input.agent_id, &input.binding_id);
+    let binding_id = resolve_coordination_binding_id(&input.binding_id, &agent_id);
     let room_id = normalize_room_id(&input.room_id);
     let actor_id = require_text("actor_id", &input.actor_id)?;
     let summary = require_text("summary", &input.summary)?;
@@ -442,8 +484,10 @@ pub fn write_intent<S: GraphStore>(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| now.clone());
 
-    let intent = CoordinationIntentState {
+    let mut intent = CoordinationIntentState {
         tenant_slug,
+        agent_id,
+        binding_id,
         room_id,
         actor_id,
         status,
@@ -455,8 +499,18 @@ pub fn write_intent<S: GraphStore>(
         task: input.task.trim().to_string(),
         started_at,
         updated_at: now,
+        scratchpad_revision_id: String::new(),
+        scratchpad_document_id: String::new(),
+        scratchpad_seq: 0,
+        binding_active_head_set: Vec::new(),
     };
+    let projection = project_intent_onto_binding(store, &intent)?;
+    intent.scratchpad_revision_id = projection.scratchpad_revision_id;
+    intent.scratchpad_document_id = projection.scratchpad_document_id;
+    intent.scratchpad_seq = projection.scratchpad_seq;
+    intent.binding_active_head_set = projection.binding_active_head_set;
     persist_intent_state(store, &intent)?;
+    persist_intent_binding_projection(store, &intent)?;
     Ok(intent)
 }
 
@@ -941,6 +995,205 @@ pub fn coordination_record_edge_id(tenant_slug: &str, room_id: &str, record_id: 
     )
 }
 
+pub fn coordination_binding_id(agent_id: &str) -> String {
+    let agent_id = normalize_agent_id(agent_id);
+    if agent_id == "theorem" {
+        DEFAULT_BINDING_ID.to_string()
+    } else {
+        format!("agent:{agent_id}")
+    }
+}
+
+pub fn coordination_room_binding_edge_id(
+    tenant_slug: &str,
+    room_id: &str,
+    binding_id: &str,
+) -> String {
+    format!(
+        "harness:coordination:edge:room-binding:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(binding_id).if_empty("binding")
+    )
+}
+
+pub fn coordination_intent_scratchpad_edge_id(
+    tenant_slug: &str,
+    room_id: &str,
+    actor_id: &str,
+    scratchpad_revision_id: &str,
+) -> String {
+    format!(
+        "harness:coordination:edge:intent-scratchrev:{}:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(room_id).if_empty("ungrouped"),
+        slugify_room_part(actor_id).if_empty("unknown"),
+        slugify_room_part(scratchpad_revision_id).if_empty("scratchrev")
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BindingProjection {
+    scratchpad_revision_id: String,
+    scratchpad_document_id: String,
+    scratchpad_seq: u64,
+    binding_active_head_set: Vec<String>,
+}
+
+fn project_intent_onto_binding<S: GraphStore>(
+    store: &mut S,
+    intent: &CoordinationIntentState,
+) -> CoordinationResult<BindingProjection> {
+    let mut binding = match load_binding(store, &intent.binding_id)? {
+        Some(binding) => binding,
+        None => {
+            default_coordination_binding(&intent.agent_id, &intent.binding_id, &intent.actor_id)?
+        }
+    };
+    binding.lifecycle.run_id = intent.binding_id.clone();
+    ensure_session_actor_head(&mut binding, &intent.actor_id);
+
+    let payload = coordination_footprint_payload(intent);
+    let content_hash = stable_value_hash(&Value::Object(payload.clone()));
+    let revision = binding.append_scratchpad_revision(
+        &intent.actor_id,
+        format!(
+            "coordination footprint {} in {}",
+            intent.status, intent.room_id
+        ),
+        content_hash,
+        payload,
+        intent.updated_at.clone(),
+    )?;
+    let scratchpad_document_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    let state_hash = hash_agent_binding(&binding);
+    persist_binding(store, &binding, &state_hash)?;
+
+    Ok(BindingProjection {
+        scratchpad_revision_id: revision.revision_id,
+        scratchpad_document_id,
+        scratchpad_seq: revision.seq,
+        binding_active_head_set: binding.identity.active_head_set.clone(),
+    })
+}
+
+fn persist_intent_binding_projection<S: GraphStore>(
+    store: &mut S,
+    state: &CoordinationIntentState,
+) -> CoordinationResult<()> {
+    upsert_edge_if_changed(store, room_binding_edge(state)?)?;
+    if state.scratchpad_seq > 0 && !state.scratchpad_document_id.is_empty() {
+        upsert_edge_if_changed(store, intent_scratchpad_revision_edge(state)?)?;
+    }
+    Ok(())
+}
+
+fn default_coordination_binding(
+    agent_id: &str,
+    binding_id: &str,
+    actor_id: &str,
+) -> Result<AgentBinding, BindingError> {
+    if normalize_agent_id(agent_id) == "theorem" {
+        return default_theorem_binding(binding_id);
+    }
+
+    let actor_head = session_actor_head(actor_id);
+    let mut binding = AgentBinding::new(
+        BindingIdentity {
+            agent_id: normalize_agent_id(agent_id),
+            owner_id: "travis".to_string(),
+            agent_name: agent_id.to_string(),
+            composition_hash: String::new(),
+            version: 1,
+            trust_tier: "first_party".to_string(),
+            active_head_set: vec![actor_head.head_id.clone()],
+        },
+        BindingComposition {
+            heads: vec![actor_head],
+        },
+        BindingBudgetScope::new(&normalize_agent_id(agent_id), 32_000.0, 8),
+    )?;
+    binding.lifecycle.run_id = binding_id.to_string();
+    Ok(binding)
+}
+
+fn ensure_session_actor_head(binding: &mut AgentBinding, actor_id: &str) {
+    if binding.head(actor_id).is_none() {
+        binding.composition.heads.push(session_actor_head(actor_id));
+    }
+    let mut active = binding
+        .identity
+        .active_head_set
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    active.insert(actor_id.to_string());
+    binding.identity.active_head_set = active.into_iter().collect();
+    binding.identity.composition_hash = composition_hash(binding);
+}
+
+fn session_actor_head(actor_id: &str) -> AgentHead {
+    AgentHead {
+        head_id: actor_id.to_string(),
+        display_name: actor_id.to_string(),
+        provider: "session".to_string(),
+        model: "session-actor".to_string(),
+        credential_ref: "local:none".to_string(),
+        transport: HeadTransport::Local,
+        kind: HeadKind::SpecializedCoder,
+        capabilities: vec!["coordination".to_string()],
+        cost_profile: HeadCostProfile::default(),
+        reliability_profile: HeadReliabilityProfile::default(),
+        allowed_tools: vec!["coordination_intent".to_string()],
+        trace_tier: TraceTier::Receipt,
+    }
+}
+
+fn coordination_footprint_payload(intent: &CoordinationIntentState) -> Payload {
+    let mut payload = Payload::new();
+    payload.insert(
+        "type".to_string(),
+        Value::String("coordination_footprint".to_string()),
+    );
+    payload.insert(
+        "tenant_slug".to_string(),
+        Value::String(intent.tenant_slug.clone()),
+    );
+    payload.insert(
+        "agent_id".to_string(),
+        Value::String(intent.agent_id.clone()),
+    );
+    payload.insert(
+        "binding_id".to_string(),
+        Value::String(intent.binding_id.clone()),
+    );
+    payload.insert("room_id".to_string(), Value::String(intent.room_id.clone()));
+    payload.insert(
+        "actor_id".to_string(),
+        Value::String(intent.actor_id.clone()),
+    );
+    payload.insert("status".to_string(), Value::String(intent.status.clone()));
+    payload.insert("summary".to_string(), Value::String(intent.summary.clone()));
+    payload.insert("claimed_files".to_string(), json!(intent.claimed_files));
+    payload.insert(
+        "expected_completion".to_string(),
+        Value::String(intent.expected_completion.clone()),
+    );
+    payload.insert("repo".to_string(), Value::String(intent.repo.clone()));
+    payload.insert("branch".to_string(), Value::String(intent.branch.clone()));
+    payload.insert("task".to_string(), Value::String(intent.task.clone()));
+    payload.insert(
+        "started_at".to_string(),
+        Value::String(intent.started_at.clone()),
+    );
+    payload.insert(
+        "updated_at".to_string(),
+        Value::String(intent.updated_at.clone()),
+    );
+    payload
+}
+
 fn persist_room_state<S: GraphStore>(
     store: &mut S,
     state: &CoordinationRoomState,
@@ -1105,6 +1358,49 @@ fn intent_room_edge(state: &CoordinationIntentState) -> CoordinationResult<EdgeR
     ))
 }
 
+fn room_binding_edge(state: &CoordinationIntentState) -> CoordinationResult<EdgeRecord> {
+    Ok(EdgeRecord::new(
+        coordination_room_binding_edge_id(&state.tenant_slug, &state.room_id, &state.binding_id),
+        coordination_room_node_id(&state.tenant_slug, &state.room_id),
+        "COORDINATION_ROOM_PROJECTS_TO_BINDING",
+        binding_node_id(&state.binding_id),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "agent_id": state.agent_id,
+            "binding_id": state.binding_id,
+            "room_id": state.room_id,
+            "updated_at": state.updated_at,
+        }),
+    ))
+}
+
+fn intent_scratchpad_revision_edge(
+    state: &CoordinationIntentState,
+) -> CoordinationResult<EdgeRecord> {
+    Ok(EdgeRecord::new(
+        coordination_intent_scratchpad_edge_id(
+            &state.tenant_slug,
+            &state.room_id,
+            &state.actor_id,
+            &state.scratchpad_revision_id,
+        ),
+        coordination_intent_node_id(&state.tenant_slug, &state.room_id, &state.actor_id),
+        "COORDINATION_INTENT_APPENDED_SCRATCHPAD_REVISION",
+        scratchpad_revision_node_id(&state.scratchpad_document_id, state.scratchpad_seq),
+        json!({
+            "tenant_slug": state.tenant_slug,
+            "agent_id": state.agent_id,
+            "binding_id": state.binding_id,
+            "room_id": state.room_id,
+            "actor_id": state.actor_id,
+            "scratchpad_document_id": state.scratchpad_document_id,
+            "scratchpad_revision_id": state.scratchpad_revision_id,
+            "scratchpad_seq": state.scratchpad_seq,
+            "updated_at": state.updated_at,
+        }),
+    ))
+}
+
 fn presence_node(state: &CoordinationPresenceState) -> CoordinationResult<NodeRecord> {
     let properties = serde_json::to_value(state)
         .map_err(|error| CoordinationError::Serialization(error.to_string()))?;
@@ -1210,6 +1506,41 @@ fn empty_room_state(tenant_slug: &str, room_id: &str, now: &str) -> Coordination
         last_packet_doc_id: String::new(),
         degraded: false,
         degraded_reason: String::new(),
+    }
+}
+
+fn normalize_binding_agent_id(agent_id: &str, binding_id: &str) -> String {
+    let explicit = agent_id.trim();
+    if !explicit.is_empty() {
+        return normalize_agent_id(explicit);
+    }
+    let binding_id = binding_id.trim();
+    if let Some(agent_id) = binding_id.strip_prefix("agent:") {
+        normalize_agent_id(agent_id)
+    } else {
+        normalize_agent_id("theorem")
+    }
+}
+
+fn normalize_agent_id(agent_id: &str) -> String {
+    let trimmed = agent_id
+        .trim()
+        .strip_prefix("agent:")
+        .unwrap_or(agent_id.trim());
+    let slug = slugify_room_part(trimmed);
+    if slug.is_empty() {
+        "theorem".to_string()
+    } else {
+        slug
+    }
+}
+
+fn resolve_coordination_binding_id(binding_id: &str, agent_id: &str) -> String {
+    let binding_id = binding_id.trim();
+    if binding_id.is_empty() {
+        coordination_binding_id(agent_id)
+    } else {
+        binding_id.to_string()
     }
 }
 
@@ -1648,13 +1979,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(first.started_at, T1);
+        assert_eq!(first.agent_id, "theorem");
+        assert_eq!(first.binding_id, DEFAULT_BINDING_ID);
+        assert_eq!(first.scratchpad_document_id, "scratchpad:theorem");
+        assert_eq!(first.scratchpad_seq, 1);
+        assert_eq!(
+            first.binding_active_head_set,
+            vec!["claude", "codex", "deepseek"]
+        );
         assert_eq!(second.started_at, T1);
         assert_eq!(second.updated_at, T2);
+        assert_eq!(second.binding_id, DEFAULT_BINDING_ID);
+        assert_eq!(second.scratchpad_document_id, "scratchpad:theorem");
+        assert_eq!(second.scratchpad_seq, 2);
+        assert_eq!(
+            second.binding_active_head_set,
+            vec!["claude", "codex", "deepseek"]
+        );
 
         let all = read_intents_for_room(&store, TENANT, ROOM, &[]).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].status, "done");
         assert_eq!(all[0].summary, "Coordination runtime landed");
+        assert_eq!(all[0].scratchpad_seq, 2);
 
         let working =
             read_intents_for_room(&store, TENANT, ROOM, &["working".to_string()]).unwrap();
@@ -1667,6 +2014,27 @@ mod tests {
             .is_some());
         assert!(store
             .get_node(&coordination_intent_node_id(TENANT, ROOM, "codex"))
+            .is_some());
+        assert!(store
+            .get_node(&binding_node_id(DEFAULT_BINDING_ID))
+            .is_some());
+        assert!(store
+            .get_node(&scratchpad_revision_node_id("scratchpad:theorem", 2))
+            .is_some());
+        assert!(store
+            .get_edge(&coordination_room_binding_edge_id(
+                TENANT,
+                ROOM,
+                DEFAULT_BINDING_ID
+            ))
+            .is_some());
+        assert!(store
+            .get_edge(&coordination_intent_scratchpad_edge_id(
+                TENANT,
+                ROOM,
+                "codex",
+                &second.scratchpad_revision_id
+            ))
             .is_some());
     }
 
