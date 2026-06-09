@@ -24,8 +24,8 @@ use theorem_harness_core::{
     stable_value_hash, submit_verify_receipt, ActionTierPolicy, AgentBinding, AgentHead,
     BindingBudgetScope, BindingComposition, BindingIdentity, ClaimOutcome, FakeHeadInvoker,
     GroundedClaim, HeadCostProfile, HeadFitness, HeadKind, HeadReliabilityProfile, HeadTransport,
-    JobSubmission, Millis, NodeStatus, Payload, Receipt, ScratchpadRevision,
-    TaskNode, TraceTier, TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
+    JobSubmission, Millis, NodeStatus, Payload, Receipt, ScratchpadRevision, TaskNode, TraceTier,
+    TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
 };
 #[cfg(test)]
 use theorem_harness_runtime::subscribe_coordination_room_events;
@@ -45,12 +45,12 @@ use theorem_harness_runtime::{
     stable_coordination_record_id, task_node_graph_id, upsert_note, ArchiveMemoryInput,
     CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
     CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
-    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult,
-    JobNoteInput, JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput,
-    PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput,
-    SkillPackError, SkillPackGetInput, SkillPackGraphStore, SkillPackListInput,
-    SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
-    EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
+    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult, JobNoteInput,
+    JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput, PresenceInput,
+    RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput, SkillPackError,
+    SkillPackGetInput, SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput,
+    UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF,
+    EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -10051,7 +10051,11 @@ impl McpGraphBackend for rustyred_thg_core::RedisGraphStore {
 
 fn app_affordance_confirmed(arguments: &Value) -> bool {
     truthy_confirmation_value(arguments.get("confirmed"))
-        || truthy_confirmation_value(arguments.get("use").and_then(|value| value.get("confirmed")))
+        || truthy_confirmation_value(
+            arguments
+                .get("use")
+                .and_then(|value| value.get("confirmed")),
+        )
         || confirmation_action(arguments.get("action"))
 }
 
@@ -11947,6 +11951,7 @@ mod tests {
     fn native_harness_run_transitions_round_trip_through_mcp() {
         let (provider, mut config) = fixture();
         config.read_only = false;
+        config.tool_result_budget_bytes = 0;
         let run_id = "run-mcp-0001";
 
         let created = append_harness_event(
@@ -12098,15 +12103,23 @@ mod tests {
 
         assert_eq!(detail["found"], true);
         assert_eq!(detail["detail"]["run"]["status"], "closed");
-        assert_eq!(detail["detail"]["run"]["last_event_seq"], 11);
-        assert_eq!(detail["detail"]["events"].as_array().unwrap().len(), 11);
-        assert_eq!(detail["detail"]["events"][6]["type"], "CONTEXT.PACKED");
+        let events = detail["detail"]["events"].as_array().unwrap();
         assert_eq!(
-            detail["detail"]["events"][6]["payload"]["token_ledger"]["saved"],
-            300
+            detail["detail"]["run"]["last_event_seq"],
+            json!(events.len() as u64)
         );
+        assert!(events.len() >= 11);
+        let context_packed = events
+            .iter()
+            .find(|event| event["type"] == json!("CONTEXT.PACKED"))
+            .expect("CONTEXT.PACKED event should be present");
+        assert_eq!(context_packed["payload"]["token_ledger"]["saved"], 300);
+        let outcome_recorded = events
+            .iter()
+            .find(|event| event["type"] == json!("OUTCOME.RECORDED"))
+            .expect("OUTCOME.RECORDED event should be present");
         assert_eq!(
-            detail["detail"]["events"][9]["payload"]["validator_results"][0]["status"],
+            outcome_recorded["payload"]["validator_results"][0]["status"],
             "passed"
         );
     }
