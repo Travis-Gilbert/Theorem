@@ -24,7 +24,7 @@ use theorem_harness_core::{
     stable_value_hash, submit_verify_receipt, ActionTierPolicy, AgentBinding, AgentHead,
     BindingBudgetScope, BindingComposition, BindingIdentity, ClaimOutcome, FakeHeadInvoker,
     GroundedClaim, HeadCostProfile, HeadFitness, HeadKind, HeadReliabilityProfile, HeadTransport,
-    JobStatus, JobSubmission, Millis, NodeStatus, Payload, Priority, Receipt, ScratchpadRevision,
+    JobSubmission, Millis, NodeStatus, Payload, Receipt, ScratchpadRevision,
     TaskNode, TraceTier, TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
 };
 #[cfg(test)]
@@ -45,8 +45,8 @@ use theorem_harness_runtime::{
     stable_coordination_record_id, task_node_graph_id, upsert_note, ArchiveMemoryInput,
     CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
     CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
-    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult, JobCompletion,
-    JobNoteInput, JobOutcome, JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput,
+    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult,
+    JobNoteInput, JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput,
     PresenceInput, RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput,
     SkillPackError, SkillPackGetInput, SkillPackGraphStore, SkillPackListInput,
     SkillPackPublishInput, UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
