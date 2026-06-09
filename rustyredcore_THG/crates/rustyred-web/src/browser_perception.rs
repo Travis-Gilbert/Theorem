@@ -388,7 +388,8 @@ fn interactive_element_for(node: &A11yNode) -> Option<InteractiveElement> {
     // The engine knows it is actionable but has not given it a proper role yet
     // (D5): a GenericContainer that nonetheless has a click/default action or is
     // focusable.
-    let actionable_unrolled = is_generic_role(&node.role) && (node.supports_default_action || node.focusable);
+    let actionable_unrolled =
+        is_generic_role(&node.role) && (node.supports_default_action || node.focusable);
 
     if !interactive && !actionable_unrolled {
         return None;
@@ -417,10 +418,10 @@ fn interactive_element_for(node: &A11yNode) -> Option<InteractiveElement> {
         .clone()
         .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| role.clone());
-    let value = node
-        .value
-        .clone()
-        .or_else(|| node.toggled.map(|on| if on { "true".into() } else { "false".into() }));
+    let value = node.value.clone().or_else(|| {
+        node.toggled
+            .map(|on| if on { "true".into() } else { "false".into() })
+    });
 
     Some(InteractiveElement {
         element_id: node.id.to_string(),
@@ -640,7 +641,10 @@ fn validate_node(value: &Value, schema: &Value, path: &str, errors: &mut Vec<Str
     }
 
     if !type_matches(value, ty) {
-        errors.push(format!("{path}: expected {ty}, found {}", json_type_name(value)));
+        errors.push(format!(
+            "{path}: expected {ty}, found {}",
+            json_type_name(value)
+        ));
         return;
     }
 
@@ -799,7 +803,14 @@ fn normalize_path(path: &str) -> String {
     let prefix = if trimmed.starts_with('/') { "/" } else { "" };
     // Preserve a single ".." token so the traversal check above can reject it.
     if trimmed.contains("..") {
-        return format!("{prefix}{}", trimmed.split('/').filter(|p| !p.is_empty() && *p != ".").collect::<Vec<_>>().join("/"));
+        return format!(
+            "{prefix}{}",
+            trimmed
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != ".")
+                .collect::<Vec<_>>()
+                .join("/")
+        );
     }
     format!("{prefix}{}", out.join("/"))
 }
@@ -926,7 +937,12 @@ impl SensitiveData {
     }
 
     /// Register a secret for a domain (use `"*"` for all domains).
-    pub fn set(&mut self, domain: impl Into<String>, key: impl Into<String>, value: impl Into<String>) {
+    pub fn set(
+        &mut self,
+        domain: impl Into<String>,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) {
         self.domain_scoped
             .entry(domain.into())
             .or_default()
@@ -1222,7 +1238,11 @@ impl TabSet {
         self.tabs.iter().find(|tab| tab.active)
     }
 
-    pub fn update_active(&mut self, url: impl Into<String>, title: impl Into<String>) -> Option<String> {
+    pub fn update_active(
+        &mut self,
+        url: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Option<String> {
         let tab = self.tabs.iter_mut().find(|tab| tab.active)?;
         tab.url = url.into();
         tab.title = title.into();
@@ -1483,7 +1503,10 @@ mod tests {
         assert_eq!(diff.removed, vec![4]);
         assert_eq!(reader.live_node_count(), 4);
         let page = reader.page_state();
-        assert!(page.interactive_elements.iter().all(|el| el.element_id != "4"));
+        assert!(page
+            .interactive_elements
+            .iter()
+            .all(|el| el.element_id != "4"));
     }
 
     // ---- D5 / acceptance criterion 10 -------------------------------------
@@ -1648,7 +1671,9 @@ mod tests {
         let allow = vec!["/var/uploads".to_string()];
         assert_eq!(
             resolve_upload_path("/var/uploads/report.pdf", &allow),
-            UploadDecision::Allowed { path: "/var/uploads/report.pdf".into() }
+            UploadDecision::Allowed {
+                path: "/var/uploads/report.pdf".into()
+            }
         );
         assert!(matches!(
             resolve_upload_path("/etc/passwd", &allow),
@@ -1714,7 +1739,10 @@ mod tests {
     #[test]
     fn domain_policy_permits_allowlisted_and_subdomains_refuses_others() {
         let policy = DomainPolicy::new(vec!["example.com".to_string()]);
-        assert_eq!(policy.evaluate("https://example.com/x"), NavigationDecision::Permitted);
+        assert_eq!(
+            policy.evaluate("https://example.com/x"),
+            NavigationDecision::Permitted
+        );
         assert_eq!(
             policy.evaluate("https://docs.example.com/y"),
             NavigationDecision::Permitted
@@ -1824,12 +1852,16 @@ mod tests {
     fn schema_required_without_type_rejects_a_non_object() {
         let schema = json!({ "required": ["mustExist"] });
         let errors = validate_against_schema(&json!("a string"), &schema);
-        assert!(!errors.is_empty(), "non-object must fail a required-bearing schema");
+        assert!(
+            !errors.is_empty(),
+            "non-object must fail a required-bearing schema"
+        );
     }
 
     #[test]
     fn schema_tuple_form_items_are_validated_positionally() {
-        let schema = json!({ "type": "array", "items": [ { "type": "integer" }, { "type": "string" } ] });
+        let schema =
+            json!({ "type": "array", "items": [ { "type": "integer" }, { "type": "string" } ] });
         assert!(validate_against_schema(&json!([1, "two"]), &schema).is_empty());
         let errors = validate_against_schema(&json!(["one", "two"]), &schema);
         assert!(errors.iter().any(|e| e.contains("[0]")));

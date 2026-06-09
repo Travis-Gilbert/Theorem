@@ -170,6 +170,7 @@ fn input_from_ingest(req: pb::IngestCodebaseRequest) -> IngestCodebaseInput {
         exclude_dirs: req.exclude_dirs,
         max_files: req.max_files,
         max_file_bytes: req.max_file_bytes,
+        max_total_bytes: 0,
         actor: req.actor,
     }
 }
@@ -183,6 +184,7 @@ fn input_from_reindex(req: pb::ReindexCodebaseRequest) -> IngestCodebaseInput {
         exclude_dirs: req.exclude_dirs,
         max_files: req.max_files,
         max_file_bytes: req.max_file_bytes,
+        max_total_bytes: 0,
         actor: req.actor,
     }
 }

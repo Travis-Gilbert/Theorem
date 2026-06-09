@@ -153,7 +153,7 @@ fn missing_tools_array_surfaces_a_protocol_error() {
 
     let mut store = InMemoryGraphStore::default();
     let mut transport = BadTransport;
-    let err = connect_and_register(&mut transport, &mut store, "acme", "bad", "Bad", None)
-        .unwrap_err();
+    let err =
+        connect_and_register(&mut transport, &mut store, "acme", "bad", "Bad", None).unwrap_err();
     assert!(matches!(err, ConnectorError::Protocol(_)));
 }

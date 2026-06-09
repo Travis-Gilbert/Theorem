@@ -66,7 +66,9 @@ pub fn connect_and_register_with_target<T: McpTransport, S: AffordanceGraphStore
     let manifest = connector_manifest(tenant_id, server_id, label, &descriptors);
 
     let target_value = match target {
-        Some(target) => Some(to_value(target).map_err(|e| ConnectorError::Protocol(e.to_string()))?),
+        Some(target) => {
+            Some(to_value(target).map_err(|e| ConnectorError::Protocol(e.to_string()))?)
+        }
         None => None,
     };
     let registration = register_connector_with_target(store, manifest, target_value, actor)

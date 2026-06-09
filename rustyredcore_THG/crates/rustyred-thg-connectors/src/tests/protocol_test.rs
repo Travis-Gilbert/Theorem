@@ -73,7 +73,10 @@ fn annotations_map_to_writeback_policy() {
         tool_manifest_from_descriptor(&d[1]).writeback_policy,
         "destructive"
     );
-    assert_eq!(tool_manifest_from_descriptor(&d[2]).writeback_policy, "write");
+    assert_eq!(
+        tool_manifest_from_descriptor(&d[2]).writeback_policy,
+        "write"
+    );
     // No annotation maps to "unknown", NOT "read-only": the firing gate must not
     // assume a tool with no declared side-effect profile is safe to auto-fire.
     assert_eq!(

@@ -678,7 +678,10 @@ mod tests {
     fn fixture_fractal_expansion_attaches_query_ranked_excerpt() {
         let mut store = InMemoryGraphStore::new();
         let mut initial = build_v2_fixture_crawl(
-            CrawlRequest::new("excerpt-initial", vec!["https://example.com/seed".to_string()]),
+            CrawlRequest::new(
+                "excerpt-initial",
+                vec!["https://example.com/seed".to_string()],
+            ),
             &[FetchedPage::html(
                 "https://example.com/seed",
                 "<html><body>tokio asynchronous runtime seed page</body></html>",

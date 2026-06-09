@@ -13,6 +13,7 @@ use turbovec::IdMapIndex;
 use crate::state::stable_hash;
 
 const VECTOR_INDEX_BIT_WIDTH: usize = 4;
+const VECTOR_EAGER_REBUILD_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct VectorPoint(Vec<f32>);
@@ -41,14 +42,12 @@ pub struct VectorIndex {
 
 impl Clone for VectorIndex {
     fn clone(&self) -> Self {
-        let mut cloned = Self {
+        Self {
             points: self.points.clone(),
             node_ids: self.node_ids.clone(),
             turbovec: None,
             dimension: self.dimension,
-        };
-        cloned.rebuild();
-        cloned
+        }
     }
 }
 
@@ -78,7 +77,15 @@ impl VectorIndex {
             self.points.push(VectorPoint::new(vector));
             self.node_ids.push(node_id.to_string());
         }
-        self.rebuild();
+        // Rebuilding the accelerated index on every insert turns large AOF
+        // replay and bulk designation into repeated whole-index construction.
+        // Keep eager acceleration for tiny indexes; exact search remains
+        // available when the accelerated index is absent.
+        if self.points.len() <= VECTOR_EAGER_REBUILD_LIMIT {
+            self.rebuild();
+        } else {
+            self.turbovec = None;
+        }
     }
 
     fn rebuild(&mut self) {
@@ -2380,23 +2387,26 @@ impl RedCoreGraphStore {
         property_name: &str,
         dimension: usize,
     ) -> GraphStoreResult<()> {
-        self.store
-            .designate_vector_property(label, property_name, dimension)?;
         let designation = VectorDesignation {
             label: label.to_string(),
             property: property_name.to_string(),
             dimension,
         };
         let txn_id = self.last_txn_id + 1;
-        let staged = self.store.clone();
+        let mut staged = self.store.clone();
+        staged.designate_vector_property(label, property_name, dimension)?;
         let graph_version = staged.stats().version;
-        self.persist_before_publish(
+        let prepublished_snapshot_txn_id = self.persist_before_publish(
             txn_id,
             graph_version,
             &staged,
             RedCoreMutation::VectorDesignation(designation),
         )?;
+        self.store = staged;
         self.last_txn_id = txn_id;
+        if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
+            self.snapshot_txn_id = snapshot_txn_id;
+        }
         Ok(())
     }
 
@@ -5816,6 +5826,11 @@ mod tests {
                     json!({ "embedding": [1.0, 0.0, 0.0] }),
                 ))
                 .unwrap();
+            let results = store
+                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 1)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, "doc:1");
         }
 
         {
