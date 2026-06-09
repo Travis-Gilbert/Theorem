@@ -120,8 +120,8 @@ pub struct WriteIntentInput {
     pub status: String,
     #[serde(default)]
     pub summary: String,
-    #[serde(default)]
-    pub claimed_files: Vec<String>,
+    #[serde(default, alias = "claimed_files", alias = "claimedFiles", alias = "touched_files")]
+    pub footprint: Vec<String>,
     #[serde(default)]
     pub expected_completion: String,
     #[serde(default)]
@@ -298,8 +298,8 @@ pub struct CoordinationIntentState {
     pub actor_id: String,
     pub status: String,
     pub summary: String,
-    #[serde(default)]
-    pub claimed_files: Vec<String>,
+    #[serde(default, alias = "claimed_files", alias = "claimedFiles", alias = "touched_files")]
+    pub footprint: Vec<String>,
     #[serde(default)]
     pub expected_completion: String,
     #[serde(default)]
@@ -492,7 +492,7 @@ pub fn write_intent<S: GraphStore>(
         actor_id,
         status,
         summary,
-        claimed_files: normalize_files(&input.claimed_files),
+        footprint: normalize_files(&input.footprint),
         expected_completion: input.expected_completion.trim().to_string(),
         repo: input.repo.trim().to_string(),
         branch: input.branch.trim().to_string(),
@@ -1175,7 +1175,7 @@ fn coordination_footprint_payload(intent: &CoordinationIntentState) -> Payload {
     );
     payload.insert("status".to_string(), Value::String(intent.status.clone()));
     payload.insert("summary".to_string(), Value::String(intent.summary.clone()));
-    payload.insert("claimed_files".to_string(), json!(intent.claimed_files));
+    payload.insert("footprint".to_string(), json!(intent.footprint));
     payload.insert(
         "expected_completion".to_string(),
         Value::String(intent.expected_completion.clone()),
@@ -1957,7 +1957,7 @@ mod tests {
                 actor_id: "codex".to_string(),
                 status: "working".to_string(),
                 summary: "Port coordination runtime".to_string(),
-                claimed_files: vec!["src/coordination.rs".to_string()],
+                footprint: vec!["src/coordination.rs".to_string()],
                 updated_at: T1.to_string(),
                 ..WriteIntentInput::default()
             },
@@ -1971,7 +1971,7 @@ mod tests {
                 actor_id: "codex".to_string(),
                 status: "done".to_string(),
                 summary: "Coordination runtime landed".to_string(),
-                claimed_files: Vec::new(),
+                footprint: Vec::new(),
                 updated_at: T2.to_string(),
                 ..WriteIntentInput::default()
             },
