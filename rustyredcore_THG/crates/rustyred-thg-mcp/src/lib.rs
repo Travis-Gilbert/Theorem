@@ -2722,7 +2722,10 @@ fn write_intent_payload(
             )?,
             status: argument_text(arguments, &["status"]).unwrap_or_else(|| "working".to_string()),
             summary: required_text_any(arguments, &["summary"], "write_intent")?,
-            claimed_files: string_array_any(arguments, &["claimed_files", "claimedFiles"]),
+            footprint: string_array_any(
+                arguments,
+                &["footprint", "touched_files", "claimed_files", "claimedFiles"],
+            ),
             expected_completion: argument_text(
                 arguments,
                 &["expected_completion", "expectedCompletion"],
@@ -4225,7 +4228,7 @@ fn write_coordination_intent(
         actor_id,
         status,
         summary,
-        claimed_files: normalize_string_vec(input.claimed_files),
+        footprint: normalize_string_vec(input.footprint),
         expected_completion: input.expected_completion.trim().to_string(),
         repo: input.repo.trim().to_string(),
         branch: input.branch.trim().to_string(),
@@ -4506,7 +4509,7 @@ fn coordination_footprint_payload(intent: &CoordinationIntentState) -> Payload {
     );
     payload.insert("status".to_string(), Value::String(intent.status.clone()));
     payload.insert("summary".to_string(), Value::String(intent.summary.clone()));
-    payload.insert("claimed_files".to_string(), json!(intent.claimed_files));
+    payload.insert("footprint".to_string(), json!(intent.footprint));
     payload.insert(
         "expected_completion".to_string(),
         Value::String(intent.expected_completion.clone()),
@@ -8876,7 +8879,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ));
         tools.push(tool_write(
             "coordination_intent",
-            "Write this actor's native Theorem harness room intent.",
+            "Write your live footprint for this room: what you are doing now and which files your hands are on, for peers to build on (a footprint, not a lock).",
             json!({
                 "type": "object",
                 "properties": {
@@ -8887,7 +8890,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "actor_id": { "type": "string" },
                     "status": { "type": "string", "enum": ["working", "paused", "done"], "default": "working" },
                     "summary": { "type": "string" },
-                    "claimed_files": { "type": "array", "items": { "type": "string" } },
+                    "footprint": { "type": "array", "items": { "type": "string" }, "description": "Files your hands are on right now; a footprint peers build on, not a claim. Accepts legacy claimed_files." },
                     "expected_completion": { "type": "string" },
                     "repo": { "type": "string" },
                     "branch": { "type": "string" },
@@ -11468,6 +11471,12 @@ mod tests {
         assert_eq!(intent["intent"]["status"], "working");
         assert_eq!(intent["intent"]["agent_id"], "theorem");
         assert_eq!(intent["intent"]["binding_id"], "agent:theorem");
+        // Legacy `claimed_files` input (sent above) must populate the renamed
+        // `footprint` output field, proving the serde alias keeps old callers working.
+        assert_eq!(
+            intent["intent"]["footprint"],
+            json!(["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs"])
+        );
         assert_eq!(
             intent["intent"]["scratchpad_document_id"],
             "scratchpad:theorem"

@@ -258,7 +258,7 @@ mod tests {
                 actor_id: "codex".to_string(),
                 status: "working".to_string(),
                 summary: "Expose coordination HTTP endpoints".to_string(),
-                claimed_files: vec!["apps/theorem-harness-server/src/lib.rs".to_string()],
+                footprint: vec!["apps/theorem-harness-server/src/lib.rs".to_string()],
                 updated_at: "2026-06-01T16:02:00Z".to_string(),
                 ..WriteIntentInput::default()
             },
