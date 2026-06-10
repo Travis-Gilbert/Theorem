@@ -635,7 +635,10 @@ pub fn enrich_context_candidates_from_store<S: crate::reflexive_executor::Reflex
             .iter()
             .filter(|hit| hit.edge_type == CONTEXT_ATOM_SELECTED)
         {
-            let Some(pack) = store.read_node(&hit.node_id).map_err(thg_error_from_store)? else {
+            let Some(pack) = store
+                .read_node(&hit.node_id)
+                .map_err(thg_error_from_store)?
+            else {
                 continue;
             };
             if property_str(&pack.properties, "tenant_id") != Some(tenant_id.as_str()) {

@@ -6,6 +6,8 @@
 
 #[cfg(feature = "pairformer-burn-cubecl")]
 pub mod burn_mpnn;
+#[cfg(feature = "pairformer-burn-cubecl")]
+pub mod burn_pairformer;
 pub mod commands;
 pub mod edge_mpnn;
 pub mod fitness;
@@ -24,6 +26,13 @@ pub mod upsert;
 
 #[cfg(feature = "pairformer-burn-cubecl")]
 pub use burn_mpnn::{aggregate_messages_burn, BurnAggregator, BurnEdgeMpnnLayer};
+#[cfg(feature = "pairformer-burn-cubecl")]
+pub use burn_pairformer::{
+    featurize_pairformer_input, load_pairformer_file,
+    rank_trained_pairformer_densification_candidates, register_trained_pairformer_artifact,
+    save_pairformer_file, score_links_with_trained, train_pairformer, BurnPairformer,
+    BurnPairformerConfig, PairformerTrainingConfig, PairformerTrainingReport,
+};
 pub use commands::{execute_adapter_command, AdapterCommandResponse};
 pub use edge_mpnn::{
     rank_global_completion_candidates, rank_global_completion_candidates_default,
@@ -82,12 +91,12 @@ pub use situation_search::{
     SimilarSituationSearchRequest, SimilarSituationSearchResult, SituationSearchGraphStore,
     CODE_FILE_LABEL, CODE_OBJECT_LABEL, CODE_SYMBOL_LABEL, CONTEXT_ATOM_LABEL,
     CONTEXT_ATOM_SELECTED, CONTEXT_PACK_LABEL, CONTEXT_PACK_OUTCOME, CONTEXT_USE_RECEIPT_LABEL,
-    DEFAULT_CONTEXT_MAX_ATOMS,
-    DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_CONTEXT_TOKEN_COST, EMBEDDING_CODEGRAPHBERT_768,
-    EMBEDDING_CODE_UNIXCODER_768, EMBEDDING_SITUATION_SBERT_384, EMBEDDING_TRAINING_SBERT_384,
-    EMBEDDING_USER_SBERT_384, ESCALATED_TO_SEARCH, HARNESS_EVENT_LABEL, HARNESS_RUN_LABEL,
-    MATCHED_SIMILAR_SITUATION, SEARCH_ESCALATION_PLAN_LABEL, SIMILAR_SITUATION_SEARCH_LABEL,
-    USER_MODEL_LABEL, USER_PREFERENCE_LABEL,
+    DEFAULT_CONTEXT_MAX_ATOMS, DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_CONTEXT_TOKEN_COST,
+    EMBEDDING_CODEGRAPHBERT_768, EMBEDDING_CODE_UNIXCODER_768, EMBEDDING_SITUATION_SBERT_384,
+    EMBEDDING_TRAINING_SBERT_384, EMBEDDING_USER_SBERT_384, ESCALATED_TO_SEARCH,
+    HARNESS_EVENT_LABEL, HARNESS_RUN_LABEL, MATCHED_SIMILAR_SITUATION,
+    SEARCH_ESCALATION_PLAN_LABEL, SIMILAR_SITUATION_SEARCH_LABEL, USER_MODEL_LABEL,
+    USER_PREFERENCE_LABEL,
 };
 pub use training_runner::{
     export_training_snapshot_files, import_gnn_export_dir, open_training_store,
@@ -145,6 +154,10 @@ mod reflexive_executor_test;
 #[cfg(all(test, feature = "pairformer-burn-cubecl"))]
 #[path = "tests/burn_mpnn_test.rs"]
 mod burn_mpnn_test;
+
+#[cfg(all(test, feature = "pairformer-burn-cubecl"))]
+#[path = "tests/burn_pairformer_test.rs"]
+mod burn_pairformer_test;
 
 #[cfg(test)]
 #[path = "tests/pairformer_test.rs"]

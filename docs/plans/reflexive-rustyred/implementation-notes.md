@@ -138,13 +138,50 @@ Both deferrals from the first slice are closed, plus the remaining spec seams:
   `success_count`/`failure_count`, graph degree, age, and pin state now feed
   the scorer from graph truth, and receipts measurably move rankings.
 
+## Trainable Pairformer (2026-06-10, second pass)
+
+`rustyred-thg-adapters::burn_pairformer` (behind `pairformer-burn-cubecl`,
+which now enables burn `autodiff`) is the learned counterpart to the
+deterministic scorer:
+
+- Real `Param` weights in the AF3 block structure: sigmoid-gated triangle
+  multiplicative updates (outgoing/incoming as separate module instances),
+  multi-head triangle attention with logits biased by the third edge
+  (ending-node orientation runs its own weights on the transposed grid),
+  SwiGLU transitions, single attention with pair bias, and no pair
+  flow-back from the single stream. Pair grid math is per-channel batched
+  matmul over `[C, N, N]`.
+- Self-supervised masked-edge training: per epoch, a fraction of observed
+  directed edges is hidden from the input grid; the model scores hidden
+  pairs against sampled non-edges under BCE-with-logits (stable
+  `log_sigmoid` form), AdamW steps, deterministic xorshift sampling, and
+  `B::seed` for reproducible init. The graph is its own label source.
+- Proof of learning in tests: on a planted compositional rule
+  (`a -r1-> b -r2-> c` implies `a -r3-> c`) with two triples' closures
+  held out entirely, training reduces the smoothed loss and the trained
+  model ranks held-out closures above structural negatives, beating an
+  untrained baseline.
+- Persistence and registry: `save_pairformer_file` / `load_pairformer_file`
+  (BinFileRecorder, exact score round-trip verified) and
+  `register_trained_pairformer_artifact` writing a `ModelArtifact` node
+  (weights pointer; metrics live on the linked `EvaluationReceipt`). Nodes
+  never carry tensors.
+- Inference: `rank_trained_pairformer_densification_candidates` mirrors the
+  deterministic path (same bounded neighborhood, direct-edge suppression,
+  provenance-required candidates, quarantine pipeline); only the scorer is
+  learned.
+
+Burn gotchas encoded in the tests: `Param` initialization is lazy (random
+draws happen at first forward, so seed-then-materialize per model), and the
+backend RNG is process-global (seeded tests serialize behind a lock).
+
 ## Still Deferred (named, not cut)
 
-- Trained weights everywhere: the Pairformer, EdgeMPNN scorer, and context
-  scorer all run deterministic hash-seeded weights. They are inference
-  shells with the right shapes and bounds; learned parameters arrive via the
-  training-substrate lane (`GraphLoRA` factors and gate vectors are the
-  intended load points).
+- Default inference still runs the deterministic floors; the trained
+  Pairformer becomes the scorer once a promoted artifact exists for the
+  tenant (load by config + artifact pointer). The EdgeMPNN scorer and
+  context scorer remain deterministic; the same training pattern (Burn
+  modules + masked-recovery / use-receipt labels) is the intended path.
 - Pairformer candidates remain limited to two-hop-supported pairs by
   construction (`score_links` caps unsupported pairs below threshold). The
   N-hop provenance lane is the EdgeMPNN scorer.

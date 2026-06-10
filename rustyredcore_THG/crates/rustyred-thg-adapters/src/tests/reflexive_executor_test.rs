@@ -200,13 +200,8 @@ fn match_inference_joins_sidecar_applies_adapters_and_stays_advisory() {
         "node:b".to_string(),
         "node:c".to_string(),
     ];
-    let result = reflexive_match_inference(
-        &store,
-        &node_ids,
-        match_request(),
-        pairformer_config(),
-    )
-    .unwrap();
+    let result =
+        reflexive_match_inference(&store, &node_ids, match_request(), pairformer_config()).unwrap();
 
     assert_eq!(result.representations_joined, 3);
     assert_eq!(result.adapters_applied, 3);
@@ -252,13 +247,8 @@ fn match_inference_records_skips_for_missing_or_mismatched_factors() {
         "node:b".to_string(),
         "node:c".to_string(),
     ];
-    let result = reflexive_match_inference(
-        &store,
-        &node_ids,
-        match_request(),
-        pairformer_config(),
-    )
-    .unwrap();
+    let result =
+        reflexive_match_inference(&store, &node_ids, match_request(), pairformer_config()).unwrap();
 
     assert_eq!(result.adapters_applied, 0);
     assert_eq!(result.adapter_skips.len(), 3);

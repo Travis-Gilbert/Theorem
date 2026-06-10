@@ -60,10 +60,8 @@ pub fn aggregate_messages_burn<B: Backend>(
         .iter()
         .flat_map(|row| row.iter().copied())
         .collect::<Vec<f32>>();
-    let message_tensor = Tensor::<B, 2>::from_data(
-        TensorData::new(flat, [num_edges, feature_dim]),
-        device,
-    );
+    let message_tensor =
+        Tensor::<B, 2>::from_data(TensorData::new(flat, [num_edges, feature_dim]), device);
     let dst_indices = Tensor::<B, 1, Int>::from_data(
         TensorData::new(
             edge_dst.iter().map(|dst| *dst as i64).collect::<Vec<_>>(),
@@ -142,8 +140,14 @@ pub struct BurnEdgeMpnnLayer<B: Backend> {
 impl<B: Backend> BurnEdgeMpnnLayer<B> {
     pub fn from_gates(device: &B::Device, self_gate: &[f32], agg_gate: &[f32]) -> Self {
         Self {
-            self_gate: Tensor::from_data(TensorData::new(self_gate.to_vec(), [self_gate.len()]), device),
-            agg_gate: Tensor::from_data(TensorData::new(agg_gate.to_vec(), [agg_gate.len()]), device),
+            self_gate: Tensor::from_data(
+                TensorData::new(self_gate.to_vec(), [self_gate.len()]),
+                device,
+            ),
+            agg_gate: Tensor::from_data(
+                TensorData::new(agg_gate.to_vec(), [agg_gate.len()]),
+                device,
+            ),
         }
     }
 
@@ -445,7 +449,11 @@ pub mod wgpu_launch {
         let agg_values = f32::from_bytes(&agg_bytes);
         let degrees_raw = f32::from_bytes(&deg_bytes);
 
-        let degrees = degrees_raw.iter().take(num_nodes).copied().collect::<Vec<_>>();
+        let degrees = degrees_raw
+            .iter()
+            .take(num_nodes)
+            .copied()
+            .collect::<Vec<_>>();
         let mut aggregated = Vec::with_capacity(num_nodes);
         for node_idx in 0..num_nodes {
             let divisor = if mean_aggregate {

@@ -403,8 +403,7 @@ pub fn rank_global_completion_candidates(
                 }
             }
 
-            let aggregated =
-                aggregator.aggregate(&messages, &message_dst, num_nodes, false)?;
+            let aggregated = aggregator.aggregate(&messages, &message_dst, num_nodes, false)?;
             // Sparse update: only message destinations and already-active
             // nodes change state; everything else stays zero untouched.
             let mut touched = message_dst
@@ -444,7 +443,8 @@ pub fn rank_global_completion_candidates(
             if l1_norm(&hidden[target_idx]) <= ACTIVATION_EPSILON {
                 continue;
             }
-            let Some(support) = walk_support_path(&graph, &parents, seed_idx, target_idx, config.layers)
+            let Some(support) =
+                walk_support_path(&graph, &parents, seed_idx, target_idx, config.layers)
             else {
                 continue;
             };

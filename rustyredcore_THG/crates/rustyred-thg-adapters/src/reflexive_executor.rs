@@ -283,7 +283,10 @@ pub fn load_node_representation<S: ReflexiveReadStore>(
 
     let mut best: Option<NodeRepresentation> = None;
     for hit in hits {
-        let Some(sidecar) = store.read_node(&hit.node_id).map_err(thg_error_from_store)? else {
+        let Some(sidecar) = store
+            .read_node(&hit.node_id)
+            .map_err(thg_error_from_store)?
+        else {
             continue;
         };
         if sidecar.tombstone
@@ -316,7 +319,10 @@ pub fn load_node_representation<S: ReflexiveReadStore>(
         best = match best {
             Some(prior)
                 if (prior.graph_version, &prior.representation_node_id)
-                    >= (representation.graph_version, &representation.representation_node_id) =>
+                    >= (
+                        representation.graph_version,
+                        &representation.representation_node_id,
+                    ) =>
             {
                 Some(prior)
             }
@@ -382,7 +388,10 @@ pub fn score_match_neighborhood(
             candidates: Vec::new(),
         });
     }
-    let node_ids = nodes.iter().map(|node| node.id.clone()).collect::<BTreeSet<_>>();
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
 
     let representations_by_node = input
         .representations
@@ -414,15 +423,12 @@ pub fn score_match_neighborhood(
                                     adapters_applied += 1;
                                 }
                                 Err(error) => {
-                                    adapter_skips.push(format!(
-                                        "{}: {}",
-                                        adapter_id, error.message
-                                    ));
+                                    adapter_skips
+                                        .push(format!("{}: {}", adapter_id, error.message));
                                 }
                             },
                             None => {
-                                adapter_skips
-                                    .push(format!("{adapter_id}: factors_not_loaded"));
+                                adapter_skips.push(format!("{adapter_id}: factors_not_loaded"));
                             }
                         }
                     }
@@ -475,11 +481,7 @@ pub fn score_match_neighborhood(
         .link_scores
         .iter()
         .filter_map(|score| {
-            crate::reflexive::pairformer_score_to_candidate(
-                &request,
-                score,
-                &existing_direct_pairs,
-            )
+            crate::reflexive::pairformer_score_to_candidate(&request, score, &existing_direct_pairs)
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -536,7 +538,10 @@ pub fn reflexive_match_inference<S: ReflexiveReadStore>(
             if !id_set.contains(&hit.node_id) {
                 continue;
             }
-            if let Some(edge) = store.read_edge(&hit.edge_id).map_err(thg_error_from_store)? {
+            if let Some(edge) = store
+                .read_edge(&hit.edge_id)
+                .map_err(thg_error_from_store)?
+            {
                 edges.insert(edge.id.clone(), edge);
             }
         }
@@ -594,10 +599,7 @@ fn property_string(properties: &Value, key: &str) -> Option<String> {
 }
 
 fn property_usize(properties: &Value, key: &str) -> usize {
-    properties
-        .get(key)
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize
+    properties.get(key).and_then(Value::as_u64).unwrap_or(0) as usize
 }
 
 fn property_f32(properties: &Value, key: &str) -> Option<f32> {

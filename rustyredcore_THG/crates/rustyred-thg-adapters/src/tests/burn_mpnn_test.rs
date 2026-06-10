@@ -135,11 +135,7 @@ fn burn_aggregator_drives_global_completion_to_the_same_candidates() {
 #[test]
 fn burn_edge_mpnn_layer_forward_matches_manual_update() {
     let device = NdArrayDevice::default();
-    let node_states_rows = vec![
-        vec![0.5_f32, -0.25],
-        vec![0.1, 0.9],
-        vec![0.0, 0.0],
-    ];
+    let node_states_rows = vec![vec![0.5_f32, -0.25], vec![0.1, 0.9], vec![0.0, 0.0]];
     let edge_src = vec![0_usize, 1];
     let edge_dst = vec![1_usize, 2];
     let relation_rows = vec![vec![1.0_f32, 0.5], vec![-0.5, 1.0]];
@@ -186,7 +182,13 @@ fn burn_edge_mpnn_layer_forward_matches_manual_update() {
         &device,
     );
     let updated = layer
-        .forward(node_states, &edge_src, &edge_dst, relations, &edge_confidence)
+        .forward(
+            node_states,
+            &edge_src,
+            &edge_dst,
+            relations,
+            &edge_confidence,
+        )
         .unwrap();
     let updated_rows = updated
         .into_data()

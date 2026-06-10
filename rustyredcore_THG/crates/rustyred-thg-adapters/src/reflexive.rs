@@ -682,7 +682,7 @@ fn ensure_edge_exists<S: AdapterGraphStore>(store: &S, edge_id: &str) -> ThgResu
     }
 }
 
-fn bounded_neighborhood(
+pub(crate) fn bounded_neighborhood(
     request: &DensificationRequest,
     edges: &[&EdgeRecord],
 ) -> (BTreeSet<String>, bool) {
@@ -761,7 +761,7 @@ fn make_candidate(
     }
 }
 
-fn pairformer_input_from_graph(
+pub(crate) fn pairformer_input_from_graph(
     considered: &BTreeSet<String>,
     nodes_by_id: &BTreeMap<String, &NodeRecord>,
     edges: &[&EdgeRecord],

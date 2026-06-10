@@ -464,7 +464,7 @@ fn single_attention_with_pair_bias(
     updated
 }
 
-fn best_two_hop_support_paths(
+pub(crate) fn best_two_hop_support_paths(
     input: &PairformerInput,
 ) -> BTreeMap<(String, String), PairformerSupportPath> {
     let mut by_source = BTreeMap::<String, Vec<&PairformerEdgeInput>>::new();

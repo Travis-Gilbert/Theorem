@@ -310,8 +310,7 @@ fn use_receipts_round_trip_from_selection_to_enriched_scoring() {
         context_candidate("atom:proven", 0.7, 64),
         context_candidate("atom:fresh", 0.7, 64),
     ];
-    let enriched =
-        enrich_context_candidates_from_store(&store, "theorem", zero_filled).unwrap();
+    let enriched = enrich_context_candidates_from_store(&store, "theorem", zero_filled).unwrap();
     let proven = enriched
         .iter()
         .find(|candidate| candidate.node_id == "atom:proven")
