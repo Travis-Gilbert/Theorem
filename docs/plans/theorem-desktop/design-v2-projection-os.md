@@ -95,8 +95,14 @@ ProjectionDirective {
   flagged-error edge) that the projector maps to token-backed classes
   (`.is-error`, `.is-flagged`), not inline styles. Raw inline style is the
   rare escape hatch, never the mechanism.
-- `scene`: the existing cosmos.gl SceneDirective, unchanged, now formally one
-  kind in the envelope.
+- `scene`: a `ScenePackageV2` from scene-os-core, the existing Rust-native
+  director seam (atoms, relations, projection and chrome bindings selected
+  from the trusted catalogs by `compile_scene_package`, actions defaulting
+  `proposal_only`). The envelope does not reinvent the scene contract; it
+  carries it. The cosmos.gl SceneDirective remains the renderer-side contract
+  for graph projections; the reconstruction engine is the generative member
+  of the projection class (atoms generated from facts plus a learned prior,
+  per its crate README), pending its strip session.
 - `canvas`: a JSON Canvas 1.0 document, section 4.
 - `splat`: reserved for the brush surface, section 5.
 
@@ -319,18 +325,26 @@ since it touches nothing shared.
 
 ---
 
-## 7. Decisions requiring sign-off, and what is settled
+## 7. Decisions: settled, and the home-surface resolution
 
 Settled by this doc (named choices): JSON Canvas 1.0 verbatim as the canvas
 format; presets-only writing policy; the preset-to-token table; cosmos.gl
 retained as the standard graph surface; brush scoped to the geometric surface
 behind gates; advisory styling as stroke-plus-color, never color alone; the
-ProjectionDirective envelope with schema validation; projections hosted in
-wry, live-web and agent surfaces in Servo, geometry native.
+ProjectionDirective envelope with schema validation (scene kind =
+ScenePackageV2 from scene-os-core); projections hosted in wry, live-web and
+agent surfaces in Servo, geometry native.
 
-Open for Travis: whether the canvas workbench is the desktop's home surface
-(the thing that opens on launch, with the omnibox over it) or a peer tab to
-the browser surface. The harness UI spec's "the browser is the ambient
-environment" suggests browser-as-home; the workbench model suggests
-canvas-as-home with the browser one card-tap away. Both are coherent; the
-choice shapes the launch frame and belongs to you.
+Resolved (2026-06-09, Travis): the home surface is neither canvas-as-home nor
+browser-as-home as originally posed. The omnibox is the center of the canvas,
+and the canvas and the SERP are one surface: a query does not navigate to a
+results page, it materializes results as cards around the omnibox. The
+application is not a browser; it is an application that has a browser, and
+the omnibox-centered canvas is the shell that exposes the full feature
+surface (agent runs, instant KG, code crawl, skill encoding,
+auto-organization) as card-producing verbs. The execution articulation of
+this resolution lives in `projection-shell-plan.md` and
+`projection-shell-checklist.md` in this directory, grounded in the
+scene-os-core selection pipeline (`classify_goal`, `detect_shape`,
+`select_projection`, `select_chrome`, `compile_scene_package`) and the
+reconstruction engine as the generative projection class.
