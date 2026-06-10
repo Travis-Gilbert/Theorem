@@ -7086,7 +7086,7 @@ dependencies = [
  "serde",
  "serde_json",
  "theorem-receiver",
- "toml",
+ "toml 0.8.23",
 ]
 
 [[package]]

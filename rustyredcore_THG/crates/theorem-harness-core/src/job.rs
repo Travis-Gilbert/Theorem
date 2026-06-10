@@ -73,6 +73,14 @@ pub struct JobSubmission {
     pub target_head: Option<TargetHead>,
     #[serde(default)]
     pub not_before: Option<String>,
+    /// TickTick task id this job was captured from (Agent Queue capture path).
+    /// Carried so the loop can relay milestones back to the originating task
+    /// without inferring it. See `docs/plans/local-loop/`.
+    #[serde(default)]
+    pub source_task_id: Option<String>,
+    /// TickTick project (list) id the source task lived in.
+    #[serde(default)]
+    pub source_project_id: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -132,6 +140,13 @@ pub struct Job {
     pub target_head: TargetHead,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
+    /// TickTick task id this job was captured from, when it came in through the
+    /// Agent Queue capture path. The loop resolves the task to relay back to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<String>,
+    /// TickTick project (list) id the source task lived in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_project_id: Option<String>,
     /// actor_id of the submitter.
     pub submitted_by: String,
     pub submitted_at: String,
@@ -179,6 +194,12 @@ impl Job {
             target_head: submission.target_head.unwrap_or_default(),
             not_before: submission
                 .not_before
+                .filter(|value| !value.trim().is_empty()),
+            source_task_id: submission
+                .source_task_id
+                .filter(|value| !value.trim().is_empty()),
+            source_project_id: submission
+                .source_project_id
                 .filter(|value| !value.trim().is_empty()),
             submitted_by: submitted_by.into(),
             submitted_at: now_string(),
@@ -246,6 +267,8 @@ mod tests {
             priority: None,
             target_head: None,
             not_before: None,
+            source_task_id: None,
+            source_project_id: None,
             idempotency_key: None,
         }
     }
@@ -270,6 +293,32 @@ mod tests {
         submission.spec_ref = None;
         let error = Job::from_submission(submission, "x").unwrap_err();
         assert!(error.contains("spec_ref or spec_inline"));
+    }
+
+    #[test]
+    fn from_submission_carries_source_correspondence() {
+        let mut submission = submission();
+        submission.source_task_id = Some("tt-task-123".to_string());
+        submission.source_project_id = Some("tt-list-agent-queue".to_string());
+        let job = Job::from_submission(submission, "theorem-agentd").unwrap();
+        assert_eq!(job.source_task_id.as_deref(), Some("tt-task-123"));
+        assert_eq!(
+            job.source_project_id.as_deref(),
+            Some("tt-list-agent-queue")
+        );
+        // Blank correspondence ids are treated as absent, like other hints.
+        let mut blank = submission_with_source("", "");
+        blank.title = "blank".to_string();
+        let job = Job::from_submission(blank, "theorem-agentd").unwrap();
+        assert!(job.source_task_id.is_none());
+        assert!(job.source_project_id.is_none());
+    }
+
+    fn submission_with_source(task_id: &str, project_id: &str) -> JobSubmission {
+        let mut s = submission();
+        s.source_task_id = Some(task_id.to_string());
+        s.source_project_id = Some(project_id.to_string());
+        s
     }
 
     #[test]

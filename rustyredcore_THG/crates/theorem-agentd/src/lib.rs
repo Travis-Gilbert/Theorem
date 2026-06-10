@@ -5,11 +5,13 @@
 //! tool, and the existing `theorem-receiver` remains the only component that
 //! launches Claude or Codex sessions.
 
+pub mod capture;
 pub mod config;
 pub mod ledger;
 pub mod mcp;
 pub mod model;
 pub mod receiver_sidecar;
+pub mod relay;
 pub mod tools;
 pub mod turn_loop;
 

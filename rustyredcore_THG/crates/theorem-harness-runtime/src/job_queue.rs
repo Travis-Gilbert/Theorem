@@ -289,6 +289,8 @@ fn legacy_node_to_job(properties: &Value) -> Result<Job, serde_json::Error> {
                 .unwrap_or(json!("either")),
         )?,
         not_before: text_property(properties, "not_before"),
+        source_task_id: text_property(properties, "source_task_id"),
+        source_project_id: text_property(properties, "source_project_id"),
         submitted_by: text_property(properties, "submitted_by")
             .unwrap_or_else(|| "unknown".to_string()),
         submitted_at: text_property(properties, "submitted_at").unwrap_or_else(now_string),
@@ -461,6 +463,8 @@ mod tests {
             priority: None,
             target_head: None,
             not_before: None,
+            source_task_id: None,
+            source_project_id: None,
             idempotency_key: None,
         }
     }
@@ -520,6 +524,35 @@ mod tests {
             Some("2099-01-01T00:00:00Z")
         );
         assert_eq!(job_list(&store, None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn source_correspondence_round_trips_through_job_list() {
+        let mut store = InMemoryGraphStore::new();
+        let mut s = submission("captured");
+        s.spec_ref = None;
+        s.spec_inline = Some("Fix the failing test.".to_string());
+        s.source_task_id = Some("tt-task-42".to_string());
+        s.source_project_id = Some("tt-list-agent-queue".to_string());
+        let submitted = job_submit(&mut store, s, "theorem-agentd").unwrap();
+        assert_eq!(submitted.job.source_task_id.as_deref(), Some("tt-task-42"));
+
+        // job_list (what Gemma reads) surfaces the source task id so it can
+        // resolve the task from the job without inference (CHK003).
+        let jobs = job_list(&store, None, None).unwrap();
+        let job = jobs
+            .iter()
+            .find(|job| job.job_id == submitted.job.job_id)
+            .unwrap();
+        assert_eq!(job.source_task_id.as_deref(), Some("tt-task-42"));
+        assert_eq!(
+            job.source_project_id.as_deref(),
+            Some("tt-list-agent-queue")
+        );
+
+        // And it survives a load by id.
+        let loaded = load_job(&store, &submitted.job.job_id).unwrap().unwrap();
+        assert_eq!(loaded.source_task_id.as_deref(), Some("tt-task-42"));
     }
 
     #[test]

@@ -53,6 +53,26 @@ impl McpRouter {
     }
 }
 
+/// The seam mechanical flows (capture, relay) use to reach MCP servers directly,
+/// without routing through the model's tool catalog or its validation. Calling a
+/// named tool on a named server is all capture/relay need; faking this trait lets
+/// the deterministic loop logic be unit-tested with no network. `McpRouter` is the
+/// production implementation.
+pub trait ToolGateway {
+    /// Call `name` on the MCP server registered as `server` with `arguments`.
+    fn call_server(&self, server: &str, name: &str, arguments: Value) -> AgentdResult<Value>;
+}
+
+impl ToolGateway for McpRouter {
+    fn call_server(&self, server: &str, name: &str, arguments: Value) -> AgentdResult<Value> {
+        let client = self
+            .clients
+            .get(server)
+            .ok_or_else(|| AgentdError::Mcp(format!("no MCP server '{server}' configured")))?;
+        client.call_tool(name, arguments)
+    }
+}
+
 pub struct McpClient {
     http: reqwest::blocking::Client,
     url: String,

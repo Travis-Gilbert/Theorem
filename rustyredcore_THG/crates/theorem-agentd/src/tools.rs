@@ -85,7 +85,8 @@ impl ToolCatalog {
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "You are {actor}, the local Theorem assistant daemon. You are a co-member of the harness coordination room, not a process that embeds other agents. Default room_id: {default_room_id}.\n\nReturn exactly one JSON object. For a final reply, return {{\"type\":\"final\",\"text\":\"...\"}}. For a tool call, return {{\"type\":\"tool_call\",\"name\":\"<tool name>\",\"arguments\":{{...}}}}.\n\nUse `coordinate` or `job_submit` when another head should act. Do not spawn Claude or Codex directly.\n\nAvailable tools:\n{tools}"
+            "You are {actor}, the local Theorem assistant daemon. You are a co-member of the harness coordination room, not a process that embeds other agents. Default room_id: {default_room_id}.\n\n{charter}\n\nReturn exactly one JSON object. For a final reply, return {{\"type\":\"final\",\"text\":\"...\"}}. For a tool call, return {{\"type\":\"tool_call\",\"name\":\"<tool name>\",\"arguments\":{{...}}}}.\n\nUse `coordinate` or `job_submit` when another head should act. Do not spawn Claude or Codex directly.\n\nAvailable tools:\n{tools}",
+            charter = charter(),
         )
     }
 
@@ -131,6 +132,18 @@ ws ::= [ \t\n\r]*
             })
             .collect()
     }
+}
+
+/// The daemon's charter: principles and reasoning that shape how it acts, folded
+/// into the system prompt (CHK030-032). Deliberately not tone instructions, and
+/// deliberately not optimized for the operator's approval.
+pub fn charter() -> &'static str {
+    "Charter:\n\
+- You steer and rank within bounded, enumerated choices. You submit jobs and relay milestones; you do not edit the graph's topology or another head's work directly. The receiver, not you, launches Claude or Codex.\n\
+- You coordinate by footprint over the shared substrate: read others' live intent before acting, declare your own, and reserve @mentions for blocks and forks.\n\
+- Capture, completion, and the job board are mechanical truth. Never let a task read more finished than the run actually is: a status is a claim you must be able to back with a receipt.\n\
+- Disagreement is licensed. When the evidence or the operator's own stated goals point against a request, say so plainly and propose the better path. Do not shade your reasoning to win approval; an honest objection is worth more than an agreeable one.\n\
+- Prefer the smallest action that moves the work, and leave a legible trace of why you took it."
 }
 
 fn default_tools() -> Vec<ToolDefinition> {
@@ -288,58 +301,129 @@ fn default_tools() -> Vec<ToolDefinition> {
                 }
             }),
         ),
+        // TickTick tools mirror the live MCP exactly: every call wraps its fields
+        // in a `params` object, the task body is `content`, the list is
+        // `project_id`, and priority is the int enum 0/1/3/5. Capture and relay
+        // call these mechanically; these definitions also let the model run them
+        // for ad-hoc operator requests.
         tool(
-            "ticktick_list_tasks",
+            "ticktick_list_projects",
             "ticktick",
-            "List TickTick tasks.",
+            "List all TickTick projects/lists with their ids. Call first to discover a project_id.",
             json!({
                 "type": "object",
-                "required": [],
+                "required": ["params"],
                 "properties": {
-                    "query": {"type": "string"},
-                    "project": {"type": "string"}
+                    "params": {
+                        "type": "object",
+                        "properties": {
+                            "response_format": {"type": "string", "enum": ["markdown", "json"]}
+                        }
+                    }
+                }
+            }),
+        ),
+        tool(
+            "ticktick_get_project",
+            "ticktick",
+            "Get a TickTick project and all its tasks (with subtasks under `items`).",
+            json!({
+                "type": "object",
+                "required": ["params"],
+                "properties": {
+                    "params": {
+                        "type": "object",
+                        "required": ["project_id"],
+                        "properties": {
+                            "project_id": {"type": "string"},
+                            "response_format": {"type": "string", "enum": ["markdown", "json"]}
+                        }
+                    }
+                }
+            }),
+        ),
+        tool(
+            "ticktick_search_tasks",
+            "ticktick",
+            "Search tasks within one TickTick project by text/priority/completion.",
+            json!({
+                "type": "object",
+                "required": ["params"],
+                "properties": {
+                    "params": {
+                        "type": "object",
+                        "required": ["project_id"],
+                        "properties": {
+                            "project_id": {"type": "string"},
+                            "query": {"type": "string"},
+                            "priority": {"type": "integer", "enum": [0, 1, 3, 5]},
+                            "include_completed": {"type": "boolean"},
+                            "response_format": {"type": "string", "enum": ["markdown", "json"]}
+                        }
+                    }
                 }
             }),
         ),
         tool(
             "ticktick_create_task",
             "ticktick",
-            "Create a TickTick task.",
+            "Create a TickTick task. `content` is the body; priority is 0/1/3/5.",
             json!({
                 "type": "object",
-                "required": ["title"],
+                "required": ["params"],
                 "properties": {
-                    "title": {"type": "string"},
-                    "notes": {"type": "string"},
-                    "due": {"type": "string"},
-                    "project": {"type": "string"}
+                    "params": {
+                        "type": "object",
+                        "required": ["title", "project_id"],
+                        "properties": {
+                            "title": {"type": "string"},
+                            "project_id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "priority": {"type": "integer", "enum": [0, 1, 3, 5]},
+                            "due_date": {"type": "string"}
+                        }
+                    }
                 }
             }),
         ),
         tool(
             "ticktick_update_task",
             "ticktick",
-            "Update a TickTick task.",
+            "Update a TickTick task. Provide task_id and project_id; only provided fields change. `content` is the body.",
             json!({
                 "type": "object",
-                "required": ["task_id"],
+                "required": ["params"],
                 "properties": {
-                    "task_id": {"type": "string"},
-                    "title": {"type": "string"},
-                    "notes": {"type": "string"},
-                    "due": {"type": "string"}
+                    "params": {
+                        "type": "object",
+                        "required": ["task_id", "project_id"],
+                        "properties": {
+                            "task_id": {"type": "string"},
+                            "project_id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "content": {"type": "string"},
+                            "priority": {"type": "integer", "enum": [0, 1, 3, 5]}
+                        }
+                    }
                 }
             }),
         ),
         tool(
             "ticktick_complete_task",
             "ticktick",
-            "Complete a TickTick task.",
+            "Mark a TickTick task complete. Requires project_id and task_id.",
             json!({
                 "type": "object",
-                "required": ["task_id"],
+                "required": ["params"],
                 "properties": {
-                    "task_id": {"type": "string"}
+                    "params": {
+                        "type": "object",
+                        "required": ["project_id", "task_id"],
+                        "properties": {
+                            "project_id": {"type": "string"},
+                            "task_id": {"type": "string"}
+                        }
+                    }
                 }
             }),
         ),
@@ -470,5 +554,35 @@ mod tests {
                 }),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn system_prompt_contains_the_charter() {
+        // CHK032: the charter is inspectable in the prompt the daemon builds.
+        let catalog = ToolCatalog::default_catalog();
+        let prompt = catalog.system_prompt("theorem-agentd", "repo:theorem:branch:main");
+        assert!(prompt.contains("Charter:"));
+        assert!(prompt.contains("Disagreement is licensed"));
+        assert!(prompt.contains("mechanical truth"));
+    }
+
+    #[test]
+    fn ticktick_tools_match_the_live_params_shape() {
+        // The live TickTick MCP wraps every call in `params`; a flat schema would
+        // make the model's calls fail. The catalog must require `params`.
+        let catalog = ToolCatalog::default_catalog();
+        for name in [
+            "ticktick_get_project",
+            "ticktick_update_task",
+            "ticktick_complete_task",
+        ] {
+            let tool = catalog.get(name).expect("ticktick tool present");
+            assert_eq!(
+                tool.schema["required"][0], "params",
+                "{name} requires params"
+            );
+        }
+        // The drifted name is gone.
+        assert!(catalog.get("ticktick_list_tasks").is_none());
     }
 }

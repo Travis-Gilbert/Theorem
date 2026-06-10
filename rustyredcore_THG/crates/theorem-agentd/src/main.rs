@@ -6,7 +6,7 @@ use theorem_agentd::mcp::McpRouter;
 use theorem_agentd::model::ModelClient;
 use theorem_agentd::receiver_sidecar::spawn_receiver_sidecar;
 use theorem_agentd::tools::ToolCatalog;
-use theorem_agentd::turn_loop::run_once;
+use theorem_agentd::turn_loop::{run_once, run_tick};
 use theorem_agentd::{AgentdError, AgentdResult};
 
 fn main() {
@@ -43,10 +43,12 @@ fn run() -> AgentdResult<()> {
     }
 
     loop {
+        // Each tick: capture Agent Queue tasks into jobs, relay run milestones
+        // back to TickTick, then take a proactive coordination turn.
         let prompt = "timer tick: poll coordination room and inbox for proactive work";
-        match run_once(&config, &model, &router, &catalog, prompt) {
-            Ok(transcript) => println!("{}", serde_json::to_string(&transcript)?),
-            Err(error) => eprintln!("[theorem-agentd] tick error: {error}"),
+        let report = run_tick(&config, &model, &router, &catalog, prompt);
+        if let Some(transcript) = &report.transcript {
+            println!("{}", serde_json::to_string(transcript)?);
         }
         std::thread::sleep(Duration::from_secs(config.loop_config.tick_interval_secs));
     }

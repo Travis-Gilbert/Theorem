@@ -60,4 +60,35 @@ storm_guard_window_secs = 600
 
 [ledger]
 path = ".theorem/agentd-token-ledger.jsonl"
+# Mirror each ledger line into the graph as a self_note receipt (the label
+# factory). The JSONL ledger remains the source of truth and is never rotated.
+mirror_to_graph = true
+
+# The operator's personal memory (recall/remember/encode) is routed to this
+# named tenant. Coordination rooms, jobs, runs, and shared substrate stay on the
+# harness server's own tenant. Defaults to "default" so a misrouted personal
+# write lands visibly in an empty default. Set this to a named tenant.
+operator_memory_tenant = "operator:travis"
+
+# Agent Queue capture: the local loop's inbound edge. A dedicated TickTick list
+# is the ONLY capture trigger; tasks anywhere else are never converted. On each
+# tick every task here becomes a job (title -> title, content -> spec_inline,
+# TickTick priority -> P0/P1/P2), the job id is stamped into the task, its
+# `dispatched` subtask is checked, and it is moved to the product list.
+[capture]
+enabled = true
+agent_queue_project_id = "6a2911688f08a8907c774531"   # the "Agent Queue" list
+# agent_queue_project_name = "Agent Queue"             # resolve the id by name instead
+dispatched_project_id = "689cdbfd8f083a8c93d0134e"     # "Work in Progress" list
+repo = "Travis-Gilbert/theorem"
+# target_head = "either"                               # claude | codex | either
+dispatched_subtask_title = "dispatched"
+
+# Milestone relay: the local loop's return edge. The daemon relays the sparse
+# milestones a run produces - started, PR-opened (with the PR link), merged,
+# failed - onto the originating task, and completes the task only when the job
+# records the merge. The milestone prose is model-written; the transitions,
+# dedup, and completion are mechanical.
+[relay]
+enabled = true
 

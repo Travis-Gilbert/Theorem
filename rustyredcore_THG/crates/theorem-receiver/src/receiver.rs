@@ -370,6 +370,8 @@ mod tests {
             priority: Priority::P0,
             target_head: TargetHead::Either,
             not_before: None,
+            source_task_id: None,
+            source_project_id: None,
             submitted_by: "claude.ai".to_string(),
             submitted_at: "1.000000000Z".to_string(),
             started_at: None,
