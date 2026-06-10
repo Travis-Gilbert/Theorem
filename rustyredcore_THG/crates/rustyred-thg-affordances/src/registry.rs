@@ -18,7 +18,18 @@ use crate::types::{
 };
 
 pub const THEOREM_GRPC_SERVER_ID: &str = "theorem_grpc";
+/// Per-call transport deadline for interactive theorem_grpc affordances.
 pub const THEOREM_GRPC_TIMEOUT_MS: u64 = 30_000;
+/// Deadline budget reconciliation (the three budgets, aligned):
+/// - the repo clone is capped server-side at 20s (`repo_fetch`),
+/// - the harness MCP enforces 120s per tool call, matched here,
+/// - the heavy ingest path itself carries NO client deadline: ingest and
+///   reindex are job SUBMISSIONS that return a `job_id` immediately, and the
+///   parse runs server-side under `THEOREM_CODE_INGEST_PARSE_BUDGET_MS`
+///   (default 120s), committing partial progress with a `budget_exceeded`
+///   status instead of surfacing a transport `Cancelled`.
+/// This constant remains the RPC ceiling for the submission round-trip and
+/// for `code_search.ingest_status` polls, both of which are sub-second.
 pub const THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS: u64 = 120_000;
 pub const THEOREM_GRPC_MAX_TIMEOUT_MS: u64 = 300_000;
 
@@ -507,6 +518,19 @@ fn theseus_app_specs() -> &'static [TheseusAppAffordanceSpec] {
             cost_class: "low",
             write_class: "graph",
             tags: &["code", "ingest", "reindex", "writeback"],
+        },
+        TheseusAppAffordanceSpec {
+            tool_name: "code_search.ingest_status",
+            family: "code_search",
+            label: "Ingest Job Status",
+            description:
+                "Read the status and event log of a submitted code ingest or reindex job.",
+            permissions: &["code_read", "graph_read", "receipt_write"],
+            writeback_policy: "receipt-only",
+            latency_class: "interactive",
+            cost_class: "low",
+            write_class: "receipt",
+            tags: &["code", "ingest", "job", "read", "status"],
         },
         TheseusAppAffordanceSpec {
             tool_name: "code_search.search",

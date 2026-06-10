@@ -42,6 +42,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the engine (empty substrate is the honest slice-1 default) and wrap
     // it in an Arc so the owned store outlives every borrowing handler call.
     let engine = Arc::new(Engine::new());
+    // ONE code store for the whole service: this CodeIndexRuntime (RedCore at
+    // code_index_data_dir()) is shared by BOTH CodeCrawlerService and
+    // AppAffordanceService below. The harness MCP `compute_code` reaches it
+    // through ProductMcpBackend's default `invoke_code_search`, which wraps
+    // the call as a `theorem_grpc.code_search.*` app affordance and dials this
+    // server, so MCP ingest writes and MCP search reads land on the same
+    // store the gRPC verbs use. (The in-process plugin MCP path writes its
+    // own tenant store directly; both routes keep ingest and search on one
+    // store.)
     let code_index = CodeIndexRuntime::try_new().map_err(std::io::Error::other)?;
     let search_svc = SearchServiceServer::new(TheoremSearchService::new(engine));
     let code_svc =

@@ -3622,6 +3622,9 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
         "ingest" | "reindex" | "search" | "context" | "recognize" | "explore" | "explain" => {
             Ok(raw)
         }
+        // D1: ingest/reindex are job submissions that return a job_id; this
+        // read-only operation polls a submitted job's status and event log.
+        "ingest_status" | "status" | "job_status" => Ok("ingest_status".to_string()),
         "record_use" | "use_receipt" | "record_use_receipt" => Ok("record_use_receipt".to_string()),
         _ => Err(McpError::invalid_params(format!(
             "unsupported code_search operation `{raw}`"
@@ -3658,6 +3661,18 @@ fn redcore_code_search_payload(
     arguments: &Value,
     operation: &str,
 ) -> Result<Value, McpError> {
+    // The in-process plugin path runs ingest/reindex synchronously against
+    // the caller's store (there is no background job to poll); job status
+    // belongs to the theorem_grpc submit-plus-stream route.
+    if operation == "ingest_status" {
+        return Ok(json!({
+            "tenant": tenant,
+            "operation": "ingest_status",
+            "engine": "rustyred_thg_code",
+            "state": "not_applicable",
+            "message": "in-process code ingest is synchronous and returned its result inline; ingest_status applies to the theorem_grpc submit-plus-stream route",
+        }));
+    }
     let output = rustyred_thg_code::execute_code_plugin_operation(
         store,
         tenant,
@@ -8155,11 +8170,12 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "tenant_slug": { "type": "string" },
                     "operation": {
                         "type": "string",
-                        "enum": ["ingest", "reindex", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
+                        "enum": ["ingest", "reindex", "ingest_status", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
                         "default": "search"
                     },
                     "repo_path": { "type": "string" },
                     "repo_url": { "type": "string" },
+                    "job_id": { "type": "string" },
                     "query": { "type": "string" },
                     "node_id": { "type": "string" },
                     "repo_id": { "type": "string" },
@@ -8201,11 +8217,12 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "tenant_slug": { "type": "string" },
                     "operation": {
                         "type": "string",
-                        "enum": ["ingest", "reindex", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
+                        "enum": ["ingest", "reindex", "ingest_status", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
                         "default": "search"
                     },
                     "repo_path": { "type": "string" },
                     "repo_url": { "type": "string" },
+                    "job_id": { "type": "string" },
                     "query": { "type": "string" },
                     "node_id": { "type": "string" },
                     "repo_id": { "type": "string" },

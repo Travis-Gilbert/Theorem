@@ -1,15 +1,28 @@
 //! theorem_code.v1.CodeCrawlerService implementation.
+//!
+//! Ingest and reindex are job submissions: the unary call returns a `job_id`
+//! immediately and the heavy path (clone, walk, parse, commit) runs on the
+//! code-index worker with no client deadline. `WatchIngest` streams the job's
+//! ordered event log; `GetIngestStatus` is the poll variant.
 
+use std::pin::Pin;
+use std::time::Duration;
+
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::code_index::{
     CodeContextInput, CodeContextOutput, CodeGraphEdgeRecord, CodeHitRecord, CodeIndexError,
     CodeIndexRuntime, CodeSymbolRecord, ExplainCodeInput, ExplainCodeOutput, ExploreCodeInput,
-    ExploreCodeOutput, IngestCodebaseInput, IngestCodebaseOutput, RecognizeCodeInput,
-    RecognizeCodeOutput, RecordUseReceiptInput, RecordUseReceiptOutput, SearchCodeInput,
-    SearchCodeOutput,
+    ExploreCodeOutput, IngestCodebaseInput, IngestCodebaseOutput, IngestJobEvent,
+    IngestJobEventKind, IngestJobRequest, IngestJobStatus, IngestStageTimings, RecognizeCodeInput,
+    RecognizeCodeOutput, RecordUseReceiptInput, RecordUseReceiptOutput, RepoFetchCaps,
+    SearchCodeInput, SearchCodeOutput,
 };
 use crate::pb;
+
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct TheoremCodeCrawlerService {
@@ -20,6 +33,18 @@ impl TheoremCodeCrawlerService {
     pub fn new(runtime: CodeIndexRuntime) -> Self {
         Self { runtime }
     }
+
+    fn submit(&self, input: IngestCodebaseInput, repo_url: String, operation: &str) -> IngestJobStatus {
+        let caps = RepoFetchCaps::from_requested(input.max_total_bytes);
+        self.runtime.submit_ingest_job(IngestJobRequest {
+            input,
+            operation: operation.to_string(),
+            repo_url,
+            caps,
+            parse_budget_ms: None,
+            ..Default::default()
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -28,22 +53,82 @@ impl pb::CodeCrawlerService for TheoremCodeCrawlerService {
         &self,
         request: Request<pb::IngestCodebaseRequest>,
     ) -> Result<Response<pb::IngestCodebaseResponse>, Status> {
-        let output = self
-            .runtime
-            .ingest_codebase(input_from_ingest(request.into_inner()))
-            .map_err(status_from_code_error)?;
-        Ok(Response::new(ingest_to_pb(output)))
+        let req = request.into_inner();
+        let repo_url = req.repo_url.clone();
+        let submitted = self.submit(input_from_ingest(req), repo_url, "ingest");
+        Ok(Response::new(submission_ack(submitted)))
     }
 
     async fn reindex_codebase(
         &self,
         request: Request<pb::ReindexCodebaseRequest>,
     ) -> Result<Response<pb::IngestCodebaseResponse>, Status> {
-        let output = self
+        let req = request.into_inner();
+        let repo_url = req.repo_url.clone();
+        let submitted = self.submit(input_from_reindex(req), repo_url, "reindex");
+        Ok(Response::new(submission_ack(submitted)))
+    }
+
+    type WatchIngestStream =
+        Pin<Box<dyn Stream<Item = Result<pb::IngestEvent, Status>> + Send + 'static>>;
+
+    async fn watch_ingest(
+        &self,
+        request: Request<pb::code::WatchIngestRequest>,
+    ) -> Result<Response<Self::WatchIngestStream>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id.trim().to_string();
+        let registry = self.runtime.ingest_jobs();
+        let Some(status) = registry.status(&job_id) else {
+            return Err(Status::not_found(format!(
+                "ingest job {job_id} was not found"
+            )));
+        };
+        guard_job_tenant(&req.tenant_id, &status)?;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<pb::IngestEvent, Status>>(32);
+        tokio::task::spawn_blocking(move || {
+            let mut after_sequence = 0u64;
+            loop {
+                match registry.wait_events(&job_id, after_sequence, WATCH_POLL_INTERVAL) {
+                    None => {
+                        let _ = sender.blocking_send(Err(Status::not_found(
+                            "ingest job was evicted from the registry",
+                        )));
+                        return;
+                    }
+                    Some((events, terminal)) => {
+                        for event in events {
+                            after_sequence = event.sequence;
+                            if sender
+                                .blocking_send(Ok(ingest_event_to_pb(&job_id, &event)))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        if terminal {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn get_ingest_status(
+        &self,
+        request: Request<pb::code::GetIngestStatusRequest>,
+    ) -> Result<Response<pb::code::IngestStatus>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id.trim();
+        let status = self
             .runtime
-            .reindex_codebase(input_from_reindex(request.into_inner()))
-            .map_err(status_from_code_error)?;
-        Ok(Response::new(ingest_to_pb(output)))
+            .ingest_job_status(job_id)
+            .ok_or_else(|| Status::not_found(format!("ingest job {job_id} was not found")))?;
+        guard_job_tenant(&req.tenant_id, &status)?;
+        Ok(Response::new(job_status_to_pb(status)))
     }
 
     async fn search_code(
@@ -170,7 +255,7 @@ fn input_from_ingest(req: pb::IngestCodebaseRequest) -> IngestCodebaseInput {
         exclude_dirs: req.exclude_dirs,
         max_files: req.max_files,
         max_file_bytes: req.max_file_bytes,
-        max_total_bytes: 0,
+        max_total_bytes: req.max_total_bytes,
         actor: req.actor,
     }
 }
@@ -184,12 +269,41 @@ fn input_from_reindex(req: pb::ReindexCodebaseRequest) -> IngestCodebaseInput {
         exclude_dirs: req.exclude_dirs,
         max_files: req.max_files,
         max_file_bytes: req.max_file_bytes,
-        max_total_bytes: 0,
+        max_total_bytes: req.max_total_bytes,
         actor: req.actor,
     }
 }
 
-fn ingest_to_pb(output: IngestCodebaseOutput) -> pb::IngestCodebaseResponse {
+/// A submission acknowledgement rides the same response message: `status` is
+/// "submitted", `job_id` identifies the background job, counts stay zero.
+fn submission_ack(status: IngestJobStatus) -> pb::IngestCodebaseResponse {
+    pb::IngestCodebaseResponse {
+        tenant_id: status.tenant_id,
+        repo_id: status.repo_id,
+        status: "submitted".to_string(),
+        message:
+            "ingest job submitted; stream WatchIngest(job_id) or poll GetIngestStatus(job_id)"
+                .to_string(),
+        job_id: status.job_id,
+        ..Default::default()
+    }
+}
+
+/// Reject a watch/status read when the caller names a different tenant than
+/// the one the job was submitted for. An empty tenant skips the check.
+fn guard_job_tenant(requested_tenant: &str, status: &IngestJobStatus) -> Result<(), Status> {
+    let requested = requested_tenant.trim();
+    if requested.is_empty() || requested == status.tenant_id {
+        Ok(())
+    } else {
+        Err(Status::not_found(format!(
+            "ingest job {} was not found",
+            status.job_id
+        )))
+    }
+}
+
+fn ingest_to_pb(output: IngestCodebaseOutput, job_id: &str) -> pb::IngestCodebaseResponse {
     pb::IngestCodebaseResponse {
         tenant_id: output.tenant_id,
         repo_id: output.repo_id,
@@ -203,6 +317,76 @@ fn ingest_to_pb(output: IngestCodebaseOutput) -> pb::IngestCodebaseResponse {
         receipt_json: output.receipt_json,
         status: output.status,
         message: output.message,
+        job_id: job_id.to_string(),
+        files_parsed: output.files_parsed,
+        files_carried: output.files_carried,
+    }
+}
+
+fn stage_timings_to_pb(timings: &IngestStageTimings) -> pb::code::IngestStageTimings {
+    pb::code::IngestStageTimings {
+        clone_ms: timings.clone_ms,
+        resolve_ms: timings.resolve_ms,
+        walk_ms: timings.walk_ms,
+        parse_ms: timings.parse_ms,
+        mutation_ms: timings.mutation_ms,
+        write_ms: timings.write_ms,
+        total_ms: timings.total_ms,
+    }
+}
+
+fn job_status_to_pb(status: IngestJobStatus) -> pb::code::IngestStatus {
+    pb::code::IngestStatus {
+        job_id: status.job_id.clone(),
+        state: status.state.as_str().to_string(),
+        stage: status.stage.clone(),
+        files_total: status.files_total,
+        files_done: status.files_done,
+        submitted_at_ms: status.submitted_at_ms,
+        updated_at_ms: status.updated_at_ms,
+        output: status
+            .output
+            .as_ref()
+            .map(|output| ingest_to_pb(output.clone(), &status.job_id)),
+        error_code: status.error_code,
+        error_message: status.error_message,
+    }
+}
+
+fn ingest_event_to_pb(job_id: &str, event: &IngestJobEvent) -> pb::IngestEvent {
+    use pb::code::ingest_event::Event;
+    let payload = match &event.kind {
+        IngestJobEventKind::CloneDone { ms } => {
+            Event::CloneDone(pb::code::IngestCloneDone { ms: *ms })
+        }
+        IngestJobEventKind::WalkDone { files_found } => Event::WalkDone(pb::code::IngestWalkDone {
+            files_found: *files_found,
+        }),
+        IngestJobEventKind::ParseProgress { done, total } => {
+            Event::ParseProgress(pb::code::IngestParseProgress {
+                done: *done,
+                total: *total,
+            })
+        }
+        IngestJobEventKind::CommitDone { graph_version } => {
+            Event::CommitDone(pb::code::IngestCommitDone {
+                graph_version: *graph_version,
+            })
+        }
+        IngestJobEventKind::Finished { output } => Event::Finished(pb::code::IngestFinished {
+            stage_timings: Some(stage_timings_to_pb(&output.stage_timings)),
+            output: Some(ingest_to_pb(output.clone(), job_id)),
+        }),
+        IngestJobEventKind::Failed { code, message } => Event::Failed(pb::code::IngestFailed {
+            code: code.clone(),
+            message: message.clone(),
+        }),
+    };
+    pb::IngestEvent {
+        job_id: job_id.to_string(),
+        sequence: event.sequence,
+        recorded_at_ms: event.recorded_at_ms,
+        event: Some(payload),
     }
 }
 
@@ -341,5 +525,147 @@ fn status_from_code_error(error: CodeIndexError) -> Status {
             Status::failed_precondition(error.message)
         }
         _ => Status::internal(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rustyred_thg_core::{RedCoreDurability, RedCoreOptions};
+    use tokio_stream::StreamExt;
+    use tonic::Request;
+
+    use super::*;
+    use crate::pb::CodeCrawlerService as _;
+
+    fn test_options() -> RedCoreOptions {
+        RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: true,
+        }
+    }
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "theorem-code-service-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    /// D1 + D6: ingest is a job submission that returns immediately;
+    /// WatchIngest streams ordered events ending in `finished`;
+    /// GetIngestStatus agrees; and the SAME service's search reads the store
+    /// the ingest wrote (one `CodeIndexRuntime`, exactly how main.rs wires
+    /// the crawler and app-affordance services together).
+    #[tokio::test]
+    async fn ingest_submits_streams_and_search_reads_the_store_ingest_wrote() {
+        let repo_dir = unique_dir("repo");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn native_fixture_helper() -> usize {\n    1\n}\n\npub fn native_fixture_fn() -> usize {\n    native_fixture_helper()\n}\n",
+        )
+        .unwrap();
+        let store_dir = unique_dir("store");
+        let runtime = CodeIndexRuntime::try_new_at(&store_dir, test_options()).unwrap();
+        let service = TheoremCodeCrawlerService::new(runtime.clone());
+
+        let submitted = service
+            .ingest_codebase(Request::new(pb::IngestCodebaseRequest {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:code-service-fixture".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(submitted.status, "submitted");
+        assert!(!submitted.job_id.is_empty());
+        assert_eq!(submitted.files_indexed, 0, "the ack carries no counts");
+
+        let mut stream = service
+            .watch_ingest(Request::new(pb::code::WatchIngestRequest {
+                tenant_id: "theorem".to_string(),
+                job_id: submitted.job_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut labels = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            assert_eq!(event.job_id, submitted.job_id);
+            let label = match event.event.expect("event payload") {
+                pb::code::ingest_event::Event::CloneDone(_) => "clone_done",
+                pb::code::ingest_event::Event::WalkDone(_) => "walk_done",
+                pb::code::ingest_event::Event::ParseProgress(_) => "parse_progress",
+                pb::code::ingest_event::Event::CommitDone(_) => "commit_done",
+                pb::code::ingest_event::Event::Finished(finished) => {
+                    let output = finished.output.expect("finished output");
+                    assert_eq!(output.status, "ok");
+                    assert_eq!(output.files_indexed, 1);
+                    assert_eq!(output.files_parsed, 1);
+                    assert!(finished.stage_timings.is_some(), "stage timings ride the final event");
+                    "finished"
+                }
+                pb::code::ingest_event::Event::Failed(failed) => {
+                    panic!("ingest failed: {} {}", failed.code, failed.message)
+                }
+            };
+            labels.push(label);
+        }
+        let position = |label: &str| labels.iter().position(|item| *item == label);
+        assert!(position("walk_done") < position("parse_progress"), "{labels:?}");
+        assert!(position("parse_progress") < position("commit_done"), "{labels:?}");
+        assert_eq!(labels.last(), Some(&"finished"), "{labels:?}");
+
+        let status = service
+            .get_ingest_status(Request::new(pb::code::GetIngestStatusRequest {
+                tenant_id: "theorem".to_string(),
+                job_id: submitted.job_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.state, "finished");
+        let output = status.output.expect("finished status output");
+        assert_eq!(output.job_id, submitted.job_id);
+        assert_eq!(output.symbols_indexed, 2);
+
+        // D6: search on the same tenant returns hits from the store the
+        // ingest job wrote. One runtime, one store.
+        let search = service
+            .search_code(Request::new(pb::SearchCodeRequest {
+                tenant_id: "theorem".to_string(),
+                query: "native_fixture_fn".to_string(),
+                repo_id: "repo:code-service-fixture".to_string(),
+                limit: 5,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(search.hits[0].name, "native_fixture_fn");
+
+        let missing = service
+            .get_ingest_status(Request::new(pb::code::GetIngestStatusRequest {
+                tenant_id: "theorem".to_string(),
+                job_id: "code:ingest-job:unknown".to_string(),
+            }))
+            .await;
+        assert_eq!(missing.unwrap_err().code(), tonic::Code::NotFound);
+
+        drop(service);
+        drop(runtime);
+        std::fs::remove_dir_all(repo_dir).ok();
+        std::fs::remove_dir_all(store_dir).ok();
     }
 }
