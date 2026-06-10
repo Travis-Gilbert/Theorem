@@ -241,6 +241,54 @@ fn default_tools() -> Vec<ToolDefinition> {
             }),
         ),
         tool(
+            "coordination_intent",
+            "harness",
+            "Declare your live intent and footprint in the coordination room: what you are doing now and which files your hands are on. Set status=done to close it.",
+            json!({
+                "type": "object",
+                "required": ["actor", "summary"],
+                "properties": {
+                    "actor": {"type": "string"},
+                    "room_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["working", "paused", "done"]},
+                    "summary": {"type": "string"},
+                    "footprint": {"type": "array", "items": {"type": "string"}}
+                }
+            }),
+        ),
+        tool(
+            "presence",
+            "harness",
+            "Heartbeat your presence in the coordination room so peers know you are live right now.",
+            json!({
+                "type": "object",
+                "required": [],
+                "properties": {
+                    "actor": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["get", "heartbeat", "end"]},
+                    "status": {"type": "string"},
+                    "ttl_seconds": {"type": "integer"}
+                }
+            }),
+        ),
+        tool(
+            "encode",
+            "harness",
+            "Write a durable memory: a feedback signal, solution, decision, or postmortem learned this turn that should survive into future sessions.",
+            json!({
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                    "content": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "title": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "actor": {"type": "string"}
+                }
+            }),
+        ),
+        tool(
             "ticktick_list_tasks",
             "ticktick",
             "List TickTick tasks.",

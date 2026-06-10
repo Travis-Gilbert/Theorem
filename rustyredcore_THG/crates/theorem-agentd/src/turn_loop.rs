@@ -61,6 +61,33 @@ pub fn run_once(
     prompt: &str,
 ) -> AgentdResult<Transcript> {
     let mut transcript = Transcript::new(prompt);
+
+    // Harness gossip scaffolding: heartbeat presence + open a live intent for
+    // this turn, so the daemon is a real co-member of the room, not just a tool
+    // caller. Best-effort: never let coordination noise break the turn.
+    let _ = router.best_effort_call(
+        "presence",
+        json!({
+            "actor": config.actor,
+            "mode": "heartbeat",
+            "status": "working",
+            "surface": "theorem-agentd",
+            "ttl_seconds": 120
+        }),
+    );
+    let _ = router.best_effort_call(
+        "coordination_intent",
+        json!({
+            "actor": config.actor,
+            "room_id": config.default_room_id,
+            "status": "working",
+            "summary": format!(
+                "theorem-agentd turn: {}",
+                prompt.chars().take(160).collect::<String>()
+            )
+        }),
+    );
+
     let grammar = catalog.gbnf_grammar();
     let system_prompt = catalog.system_prompt(&config.actor, &config.default_room_id);
     let context = router.best_effort_call(
@@ -96,6 +123,19 @@ pub fn run_once(
         });
         match output.decision {
             ModelDecision::Final { text } => {
+                // Turn-end: close the intent as done with the reply as the handoff.
+                let _ = router.best_effort_call(
+                    "coordination_intent",
+                    json!({
+                        "actor": config.actor,
+                        "room_id": config.default_room_id,
+                        "status": "done",
+                        "summary": format!(
+                            "theorem-agentd: {}",
+                            text.chars().take(160).collect::<String>()
+                        )
+                    }),
+                );
                 transcript.events.push(TranscriptEvent::Final { text });
                 append_ledger_entry(
                     &config.ledger.path,
@@ -143,6 +183,15 @@ pub fn run_once(
             }
         }
     }
+    let _ = router.best_effort_call(
+        "coordination_intent",
+        json!({
+            "actor": config.actor,
+            "room_id": config.default_room_id,
+            "status": "paused",
+            "summary": "theorem-agentd: max_iterations reached without final reply"
+        }),
+    );
     Err(AgentdError::Model(format!(
         "max_iterations {} reached without final reply",
         config.loop_config.max_iterations
