@@ -10,10 +10,14 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "pairformer-burn-cubecl")]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[cfg(feature = "pairformer-burn-cubecl")]
+use rustyred_thg_core::stable_hash;
 use rustyred_thg_core::{
     Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStoreResult, NeighborHit,
     NeighborQuery, NodeRecord, ThgError, ThgResult,
@@ -23,6 +27,10 @@ use crate::pairformer::{run_pairformer, PairformerConfig, PairformerEdgeInput, P
 use crate::reflexive::{
     DensificationRequest, InferredEdgeCandidate, REPRESENTATION_SIDECAR_LABEL, REPRESENTS_NODE,
 };
+#[cfg(feature = "pairformer-burn-cubecl")]
+use crate::training_substrate::{EVALUATED_BY, MODEL_ARTIFACT_LABEL, PROMOTED_TO_ACTIVE};
+#[cfg(feature = "pairformer-burn-cubecl")]
+use crate::types::tenant_node_id;
 use crate::types::{
     adapter_node_id, edge_with_adapter_provenance, normalize_tenant_id, thg_error_from_store,
     AdapterGraphStore, THG_ADAPTER_SOURCE,
@@ -343,14 +351,34 @@ pub struct MatchNeighborhoodInput {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchInferenceScorer {
+    LearnedBurnPairformer,
+    DeterministicPairformer,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MatchInferenceResult {
     pub tenant_id: String,
     pub considered_node_ids: Vec<String>,
     pub representations_joined: usize,
     pub adapters_applied: usize,
     pub adapter_skips: Vec<String>,
+    pub scorer: MatchInferenceScorer,
+    pub scorer_model_id: String,
+    pub scorer_notes: Vec<String>,
     pub bounded: bool,
     pub candidates: Vec<InferredEdgeCandidate>,
+}
+
+struct PreparedMatchNeighborhood {
+    considered_node_ids: Vec<String>,
+    representations_joined: usize,
+    adapters_applied: usize,
+    adapter_skips: Vec<String>,
+    bounded: bool,
+    pairformer_input: PairformerInput,
+    existing_direct_pairs: BTreeSet<(String, String)>,
 }
 
 /// Run the Pairformer over a bounded MATCH neighborhood with sidecar-fed,
@@ -361,6 +389,25 @@ pub fn score_match_neighborhood(
     request: DensificationRequest,
     config: PairformerConfig,
 ) -> ThgResult<MatchInferenceResult> {
+    let (request, config, prepared) = prepare_match_neighborhood(input, request, config)?;
+    score_prepared_match_with_deterministic(
+        &request,
+        config,
+        prepared,
+        Vec::new(),
+        request.model_id.clone(),
+    )
+}
+
+fn prepare_match_neighborhood(
+    input: &MatchNeighborhoodInput,
+    request: DensificationRequest,
+    config: PairformerConfig,
+) -> ThgResult<(
+    DensificationRequest,
+    PairformerConfig,
+    PreparedMatchNeighborhood,
+)> {
     let request = request.normalized();
     let config = config.normalized();
 
@@ -378,20 +425,25 @@ pub fn score_match_neighborhood(
         nodes.truncate(config.max_nodes);
     }
     if nodes.is_empty() {
-        return Ok(MatchInferenceResult {
-            tenant_id: request.tenant_id,
-            considered_node_ids: Vec::new(),
-            representations_joined: 0,
-            adapters_applied: 0,
-            adapter_skips: Vec::new(),
-            bounded,
-            candidates: Vec::new(),
-        });
+        return Ok((
+            request,
+            config,
+            PreparedMatchNeighborhood {
+                considered_node_ids: Vec::new(),
+                representations_joined: 0,
+                adapters_applied: 0,
+                adapter_skips: Vec::new(),
+                bounded,
+                pairformer_input: PairformerInput {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                },
+                existing_direct_pairs: BTreeSet::new(),
+            },
+        ));
     }
-    let node_ids = nodes
-        .iter()
-        .map(|node| node.id.clone())
-        .collect::<BTreeSet<_>>();
+    let considered_node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+    let node_ids = considered_node_ids.iter().cloned().collect::<BTreeSet<_>>();
 
     let representations_by_node = input
         .representations
@@ -469,19 +521,102 @@ pub fn score_match_neighborhood(
         })
         .collect::<Vec<_>>();
 
-    let output = run_pairformer(
-        &PairformerInput {
-            nodes: pairformer_nodes,
-            edges: pairformer_edges,
-        },
+    Ok((
+        request,
         config,
-    )?;
+        PreparedMatchNeighborhood {
+            considered_node_ids,
+            representations_joined,
+            adapters_applied,
+            adapter_skips,
+            bounded,
+            pairformer_input: PairformerInput {
+                nodes: pairformer_nodes,
+                edges: pairformer_edges,
+            },
+            existing_direct_pairs,
+        },
+    ))
+}
 
-    let mut candidates = output
-        .link_scores
+fn score_prepared_match_with_deterministic(
+    request: &DensificationRequest,
+    config: PairformerConfig,
+    prepared: PreparedMatchNeighborhood,
+    scorer_notes: Vec<String>,
+    scorer_model_id: String,
+) -> ThgResult<MatchInferenceResult> {
+    if prepared.pairformer_input.nodes.is_empty() {
+        return Ok(MatchInferenceResult {
+            tenant_id: request.tenant_id.clone(),
+            considered_node_ids: prepared.considered_node_ids,
+            representations_joined: prepared.representations_joined,
+            adapters_applied: prepared.adapters_applied,
+            adapter_skips: prepared.adapter_skips,
+            scorer: MatchInferenceScorer::DeterministicPairformer,
+            scorer_model_id,
+            scorer_notes,
+            bounded: prepared.bounded,
+            candidates: Vec::new(),
+        });
+    }
+
+    let output = run_pairformer(&prepared.pairformer_input, config)?;
+    let candidates = candidates_from_link_scores(
+        request,
+        &prepared.existing_direct_pairs,
+        &output.link_scores,
+    );
+
+    Ok(MatchInferenceResult {
+        tenant_id: request.tenant_id.clone(),
+        considered_node_ids: prepared.considered_node_ids,
+        representations_joined: prepared.representations_joined,
+        adapters_applied: prepared.adapters_applied,
+        adapter_skips: prepared.adapter_skips,
+        scorer: MatchInferenceScorer::DeterministicPairformer,
+        scorer_model_id,
+        scorer_notes,
+        bounded: prepared.bounded,
+        candidates,
+    })
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn score_prepared_match_with_link_scores(
+    request: &DensificationRequest,
+    prepared: PreparedMatchNeighborhood,
+    link_scores: &[crate::pairformer::PairformerLinkScore],
+    scorer: MatchInferenceScorer,
+    scorer_model_id: String,
+    scorer_notes: Vec<String>,
+) -> MatchInferenceResult {
+    let candidates =
+        candidates_from_link_scores(request, &prepared.existing_direct_pairs, link_scores);
+
+    MatchInferenceResult {
+        tenant_id: request.tenant_id.clone(),
+        considered_node_ids: prepared.considered_node_ids,
+        representations_joined: prepared.representations_joined,
+        adapters_applied: prepared.adapters_applied,
+        adapter_skips: prepared.adapter_skips,
+        scorer,
+        scorer_model_id,
+        scorer_notes,
+        bounded: prepared.bounded,
+        candidates,
+    }
+}
+
+fn candidates_from_link_scores(
+    request: &DensificationRequest,
+    existing_direct_pairs: &BTreeSet<(String, String)>,
+    link_scores: &[crate::pairformer::PairformerLinkScore],
+) -> Vec<InferredEdgeCandidate> {
+    let mut candidates = link_scores
         .iter()
         .filter_map(|score| {
-            crate::reflexive::pairformer_score_to_candidate(&request, score, &existing_direct_pairs)
+            crate::reflexive::pairformer_score_to_candidate(request, score, existing_direct_pairs)
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -492,16 +627,505 @@ pub fn score_match_neighborhood(
             .then_with(|| left.candidate_id.cmp(&right.candidate_id))
     });
     candidates.truncate(request.max_candidates);
+    candidates
+}
 
-    Ok(MatchInferenceResult {
-        tenant_id: request.tenant_id,
-        considered_node_ids: nodes.into_iter().map(|node| node.id).collect(),
-        representations_joined,
-        adapters_applied,
-        adapter_skips,
-        bounded,
-        candidates,
-    })
+#[cfg(feature = "pairformer-burn-cubecl")]
+struct PromotedPairformerArtifact {
+    model_id: String,
+    config: crate::burn_pairformer::BurnPairformerConfig,
+    local_path: Option<PathBuf>,
+    source_graph_version: u64,
+    ranking_accuracy: Option<f32>,
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+const ONLINE_PAIRFORMER_MODEL_ID: &str = "pairformer-burn/online-bootstrap";
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+const ONLINE_PAIRFORMER_EPOCHS: usize = 8;
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+static ONLINE_PAIRFORMER_SEED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn score_prepared_match_with_default_learning_model<S: ReflexiveReadStore>(
+    store: &S,
+    request: &DensificationRequest,
+    config: PairformerConfig,
+    prepared: PreparedMatchNeighborhood,
+) -> ThgResult<MatchInferenceResult> {
+    if prepared.pairformer_input.nodes.is_empty() {
+        return Ok(score_prepared_match_with_link_scores(
+            request,
+            prepared,
+            &[],
+            MatchInferenceScorer::LearnedBurnPairformer,
+            ONLINE_PAIRFORMER_MODEL_ID.to_string(),
+            vec!["empty_pairformer_neighborhood".to_string()],
+        ));
+    }
+
+    use burn::backend::ndarray::NdArrayDevice;
+    type InferenceBackend = burn::backend::NdArray<f32>;
+
+    let artifact = load_promoted_pairformer_artifact(store, &request.tenant_id)?;
+    let burn_config = artifact
+        .as_ref()
+        .map(|artifact| artifact.config)
+        .unwrap_or_else(|| burn_config_from_pairformer_config(&config, &prepared.pairformer_input));
+    let mut scorer_notes = Vec::new();
+    let device = NdArrayDevice::default();
+
+    if let Some(artifact) = artifact {
+        if let Some(local_path) = artifact.local_path.clone() {
+            match crate::burn_pairformer::load_pairformer_file::<InferenceBackend>(
+                &artifact.config,
+                &local_path,
+                &device,
+            ) {
+                Ok(model) => match crate::burn_pairformer::score_links_with_trained(
+                    &model,
+                    &device,
+                    &prepared.pairformer_input,
+                    &artifact.config,
+                ) {
+                    Ok(link_scores) => {
+                        return Ok(score_prepared_match_with_link_scores(
+                            request,
+                            prepared,
+                            &link_scores,
+                            MatchInferenceScorer::LearnedBurnPairformer,
+                            artifact.model_id,
+                            vec!["promoted_pairformer_artifact_loaded".to_string()],
+                        ));
+                    }
+                    Err(error) => scorer_notes.push(format!(
+                        "promoted_pairformer_score_failed:{}:{}",
+                        artifact.model_id, error.message
+                    )),
+                },
+                Err(error) => scorer_notes.push(format!(
+                    "promoted_pairformer_load_failed:{}:{}",
+                    artifact.model_id, error.message
+                )),
+            }
+        } else {
+            scorer_notes.push(format!(
+                "promoted_pairformer_artifact_remote_only:{}",
+                artifact.model_id
+            ));
+        }
+    } else {
+        scorer_notes.push("no_promoted_pairformer_artifact_using_online_training".to_string());
+    }
+
+    score_prepared_match_with_online_pairformer(
+        request,
+        config,
+        prepared,
+        burn_config,
+        scorer_notes,
+    )
+}
+
+#[cfg(not(feature = "pairformer-burn-cubecl"))]
+fn score_prepared_match_with_default_learning_model<S: ReflexiveReadStore>(
+    _store: &S,
+    request: &DensificationRequest,
+    config: PairformerConfig,
+    prepared: PreparedMatchNeighborhood,
+) -> ThgResult<MatchInferenceResult> {
+    score_prepared_match_with_deterministic(
+        request,
+        config,
+        prepared,
+        vec!["pairformer_burn_cubecl_feature_disabled".to_string()],
+        request.model_id.clone(),
+    )
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn score_prepared_match_with_online_pairformer(
+    request: &DensificationRequest,
+    deterministic_config: PairformerConfig,
+    prepared: PreparedMatchNeighborhood,
+    burn_config: crate::burn_pairformer::BurnPairformerConfig,
+    mut scorer_notes: Vec<String>,
+) -> ThgResult<MatchInferenceResult> {
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::module::AutodiffModule;
+    type InferenceBackend = burn::backend::NdArray<f32>;
+    type TrainingBackend = burn::backend::Autodiff<InferenceBackend>;
+
+    let burn_config = burn_config.normalized();
+    let device = NdArrayDevice::default();
+    let seed = online_pairformer_seed(request, &prepared.pairformer_input);
+    let training = crate::burn_pairformer::PairformerTrainingConfig {
+        epochs: ONLINE_PAIRFORMER_EPOCHS,
+        learning_rate: 4e-3,
+        mask_fraction: 0.3,
+        negatives_per_positive: 2,
+        seed,
+    };
+
+    let trained = {
+        let _seed_guard = ONLINE_PAIRFORMER_SEED_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::burn_pairformer::train_pairformer::<TrainingBackend>(
+            &device,
+            &prepared.pairformer_input,
+            burn_config,
+            training,
+        )
+    };
+
+    match trained {
+        Ok((model, report)) => {
+            let model = model.valid();
+            match crate::burn_pairformer::score_links_with_trained(
+                &model,
+                &device,
+                &prepared.pairformer_input,
+                &burn_config,
+            ) {
+                Ok(link_scores) => {
+                    let link_scores = blend_online_scores_with_structural_prior(
+                        &prepared.pairformer_input,
+                        &link_scores,
+                        &deterministic_config,
+                    )?;
+                    scorer_notes.push(format!(
+                        "online_pairformer_trained:epochs={}:ranking_accuracy={:.3}",
+                        report.epochs, report.final_ranking_accuracy
+                    ));
+                    scorer_notes.push("online_pairformer_structural_prior_blended".to_string());
+                    Ok(score_prepared_match_with_link_scores(
+                        request,
+                        prepared,
+                        &link_scores,
+                        MatchInferenceScorer::LearnedBurnPairformer,
+                        ONLINE_PAIRFORMER_MODEL_ID.to_string(),
+                        scorer_notes,
+                    ))
+                }
+                Err(error) => score_prepared_match_with_deterministic(
+                    request,
+                    deterministic_config,
+                    prepared,
+                    with_note(
+                        scorer_notes,
+                        format!("online_pairformer_score_failed:{}", error.message),
+                    ),
+                    request.model_id.clone(),
+                ),
+            }
+        }
+        Err(error) if error.code == "invalid_pairformer_training" => {
+            score_prepared_match_with_seeded_burn_model(
+                request,
+                deterministic_config,
+                prepared,
+                burn_config,
+                with_note(
+                    scorer_notes,
+                    format!("online_pairformer_training_unavailable:{}", error.message),
+                ),
+                seed,
+            )
+        }
+        Err(error) => score_prepared_match_with_seeded_burn_model(
+            request,
+            deterministic_config,
+            prepared,
+            burn_config,
+            with_note(
+                scorer_notes,
+                format!("online_pairformer_training_failed:{}", error.message),
+            ),
+            seed,
+        ),
+    }
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn score_prepared_match_with_seeded_burn_model(
+    request: &DensificationRequest,
+    deterministic_config: PairformerConfig,
+    prepared: PreparedMatchNeighborhood,
+    burn_config: crate::burn_pairformer::BurnPairformerConfig,
+    mut scorer_notes: Vec<String>,
+    seed: u64,
+) -> ThgResult<MatchInferenceResult> {
+    use burn::backend::ndarray::NdArrayDevice;
+    type InferenceBackend = burn::backend::NdArray<f32>;
+
+    let device = NdArrayDevice::default();
+    let model = {
+        let _seed_guard = ONLINE_PAIRFORMER_SEED_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        <InferenceBackend as burn::tensor::backend::Backend>::seed(&device, seed);
+        burn_config.init::<InferenceBackend>(&device)
+    };
+    match crate::burn_pairformer::score_links_with_trained(
+        &model,
+        &device,
+        &prepared.pairformer_input,
+        &burn_config,
+    ) {
+        Ok(link_scores) => {
+            let link_scores = blend_online_scores_with_structural_prior(
+                &prepared.pairformer_input,
+                &link_scores,
+                &deterministic_config,
+            )?;
+            scorer_notes.push("online_pairformer_initialized".to_string());
+            scorer_notes.push("online_pairformer_structural_prior_blended".to_string());
+            Ok(score_prepared_match_with_link_scores(
+                request,
+                prepared,
+                &link_scores,
+                MatchInferenceScorer::LearnedBurnPairformer,
+                ONLINE_PAIRFORMER_MODEL_ID.to_string(),
+                scorer_notes,
+            ))
+        }
+        Err(error) => score_prepared_match_with_deterministic(
+            request,
+            deterministic_config,
+            prepared,
+            with_note(
+                scorer_notes,
+                format!("online_pairformer_init_score_failed:{}", error.message),
+            ),
+            request.model_id.clone(),
+        ),
+    }
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn blend_online_scores_with_structural_prior(
+    input: &PairformerInput,
+    online_scores: &[crate::pairformer::PairformerLinkScore],
+    config: &PairformerConfig,
+) -> ThgResult<Vec<crate::pairformer::PairformerLinkScore>> {
+    let mut blended = run_pairformer(input, config.clone())?
+        .link_scores
+        .into_iter()
+        .map(|score| ((score.source_id.clone(), score.target_id.clone()), score))
+        .collect::<BTreeMap<_, _>>();
+
+    for score in online_scores {
+        blended
+            .entry((score.source_id.clone(), score.target_id.clone()))
+            .and_modify(|prior| {
+                prior.score = prior.score.max(score.score);
+                if prior.support_path.is_none() {
+                    prior.support_path = score.support_path.clone();
+                }
+            })
+            .or_insert_with(|| score.clone());
+    }
+
+    Ok(blended.into_values().collect())
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn burn_config_from_pairformer_config(
+    config: &PairformerConfig,
+    input: &PairformerInput,
+) -> crate::burn_pairformer::BurnPairformerConfig {
+    let config = config.clone().normalized();
+    let node_in_dim = input
+        .nodes
+        .iter()
+        .map(|node| node.features.len())
+        .max()
+        .unwrap_or(16)
+        .max(1);
+    let edge_in_dim = input
+        .edges
+        .iter()
+        .map(|edge| edge.features.len())
+        .max()
+        .unwrap_or(8)
+        .max(1);
+    let pair_dim = config.pair_dim.max(1);
+    let single_dim = config.single_dim.max(1);
+    let mut heads = pair_dim.min(single_dim).min(4).max(1);
+    while heads > 1 && (pair_dim % heads != 0 || single_dim % heads != 0) {
+        heads -= 1;
+    }
+    let transition_base = pair_dim.max(single_dim).max(1);
+    let transition_mult =
+        (config.transition_hidden_dim.max(transition_base) + transition_base - 1) / transition_base;
+
+    crate::burn_pairformer::BurnPairformerConfig {
+        node_in_dim,
+        edge_in_dim,
+        pair_dim,
+        single_dim,
+        heads,
+        blocks: config.blocks.max(1),
+        transition_mult: transition_mult.max(1),
+        max_nodes: config.max_nodes.max(1),
+    }
+    .normalized()
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn online_pairformer_seed(request: &DensificationRequest, input: &PairformerInput) -> u64 {
+    let digest = stable_hash(json!({
+        "tenant_id": request.tenant_id,
+        "seed_node_ids": request.seed_node_ids,
+        "nodes": input.nodes.iter().map(|node| &node.node_id).collect::<Vec<_>>(),
+        "edges": input.edges.iter().map(|edge| &edge.edge_id).collect::<Vec<_>>(),
+    }));
+    digest
+        .strip_prefix("sha256:")
+        .and_then(|hex| hex.get(..16))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .unwrap_or(17)
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn with_note(mut notes: Vec<String>, note: impl Into<String>) -> Vec<String> {
+    notes.push(note.into());
+    notes
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn load_promoted_pairformer_artifact<S: ReflexiveReadStore>(
+    store: &S,
+    tenant_id: &str,
+) -> ThgResult<Option<PromotedPairformerArtifact>> {
+    let tenant_id = normalize_tenant_id(tenant_id);
+    let hits = store
+        .read_neighbors(NeighborQuery {
+            node_id: tenant_node_id(&tenant_id),
+            direction: Direction::Out,
+            edge_type: Some(PROMOTED_TO_ACTIVE.to_string()),
+            include_expired: false,
+        })
+        .map_err(thg_error_from_store)?;
+
+    let mut artifacts = Vec::new();
+    for hit in hits {
+        let Some(node) = store
+            .read_node(&hit.node_id)
+            .map_err(thg_error_from_store)?
+        else {
+            continue;
+        };
+        if node.tombstone
+            || !node
+                .labels
+                .iter()
+                .any(|label| label == MODEL_ARTIFACT_LABEL)
+        {
+            continue;
+        }
+        let properties = &node.properties;
+        if property_string(properties, "tenant_id").as_deref() != Some(tenant_id.as_str())
+            || property_string(properties, "model_type").as_deref() != Some("pairformer-burn")
+            || property_string(properties, "promotion_decision").as_deref() != Some("active")
+        {
+            continue;
+        }
+
+        let (config, ranking_accuracy) =
+            promoted_pairformer_metrics(store, &node.id)?.unwrap_or_default();
+        artifacts.push(PromotedPairformerArtifact {
+            model_id: property_string(properties, "model_id").unwrap_or_else(|| node.id.clone()),
+            config,
+            local_path: promoted_pairformer_local_path(properties),
+            source_graph_version: properties
+                .get("source_graph_version")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            ranking_accuracy,
+        });
+    }
+
+    artifacts.sort_by(|left, right| {
+        right
+            .source_graph_version
+            .cmp(&left.source_graph_version)
+            .then_with(|| {
+                right
+                    .ranking_accuracy
+                    .partial_cmp(&left.ranking_accuracy)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+    Ok(artifacts.into_iter().next())
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn promoted_pairformer_metrics<S: ReflexiveReadStore>(
+    store: &S,
+    model_node_id: &str,
+) -> ThgResult<Option<(crate::burn_pairformer::BurnPairformerConfig, Option<f32>)>> {
+    let hits = store
+        .read_neighbors(NeighborQuery {
+            node_id: model_node_id.to_string(),
+            direction: Direction::Out,
+            edge_type: Some(EVALUATED_BY.to_string()),
+            include_expired: false,
+        })
+        .map_err(thg_error_from_store)?;
+
+    for hit in hits {
+        let Some(node) = store
+            .read_node(&hit.node_id)
+            .map_err(thg_error_from_store)?
+        else {
+            continue;
+        };
+        let Some(metrics) = node.properties.get("metrics") else {
+            continue;
+        };
+        let config = metrics
+            .get("config")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let ranking_accuracy = metrics
+            .get("final_ranking_accuracy")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32);
+        return Ok(Some((config, ranking_accuracy)));
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "pairformer-burn-cubecl")]
+fn promoted_pairformer_local_path(properties: &Value) -> Option<PathBuf> {
+    for key in ["local_path", "artifact_path", "weights_path", "cache_path"] {
+        if let Some(path) = property_string(properties, key).filter(|path| !path.is_empty()) {
+            return Some(PathBuf::from(path));
+        }
+    }
+    if let Some(file_uri) = property_string(properties, "s3_uri")
+        .filter(|uri| uri.starts_with("file://"))
+        .and_then(|uri| uri.strip_prefix("file://").map(str::to_string))
+    {
+        return Some(PathBuf::from(file_uri));
+    }
+    let s3_uri = property_string(properties, "s3_uri")?;
+    let s3_key = s3_uri.strip_prefix("s3://")?;
+    for env_key in ["THEOREM_MODEL_CACHE_DIR", "RUSTYRED_MODEL_CACHE_DIR"] {
+        if let Ok(cache_root) = std::env::var(env_key) {
+            let candidate = PathBuf::from(cache_root).join(s3_key);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Store-generic convenience wrapper: gather the bounded neighborhood's
@@ -563,16 +1187,14 @@ pub fn reflexive_match_inference<S: ReflexiveReadStore>(
         }
     }
 
-    score_match_neighborhood(
-        &MatchNeighborhoodInput {
-            nodes,
-            edges: edges.into_values().collect(),
-            representations,
-            adapter_factors,
-        },
-        request,
-        config,
-    )
+    let input = MatchNeighborhoodInput {
+        nodes,
+        edges: edges.into_values().collect(),
+        representations,
+        adapter_factors,
+    };
+    let (request, config, prepared) = prepare_match_neighborhood(&input, request, config)?;
+    score_prepared_match_with_default_learning_model(store, &request, config, prepared)
 }
 
 fn fallback_node_features(node: &NodeRecord) -> Vec<f32> {

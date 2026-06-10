@@ -18,9 +18,9 @@ use crate::state::TenantGraphStore;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1_000;
-/// Bound on the neighborhood handed to the reflexive Pairformer when a MATCH
-/// opts into in-database inference. Keeps the dense scorer on extracted
-/// subgraphs, never the whole graph.
+/// Bound on the neighborhood handed to the default-on reflexive Pairformer
+/// when a MATCH runs in-database inference. Keeps the dense scorer on
+/// extracted subgraphs, never the whole graph.
 const REFLEXIVE_MATCH_MAX_NODES: usize = 64;
 
 /// Join the bounded MATCH neighborhood with the representation/adapter
@@ -62,6 +62,9 @@ fn reflexive_advisory_block(
             "representations_joined": result.representations_joined,
             "adapters_applied": result.adapters_applied,
             "adapter_skips": result.adapter_skips,
+            "scorer": result.scorer,
+            "scorer_model_id": result.scorer_model_id,
+            "scorer_notes": result.scorer_notes,
             "bounded": result.bounded || walk_capped,
             "candidates": result.candidates,
         }),
@@ -82,11 +85,16 @@ pub struct PublicCypherBody {
     pub params: BTreeMap<String, Value>,
     #[serde(default)]
     pub tx_id: Option<String>,
-    /// Opt-in: run the bounded reflexive Pairformer over the MATCH
+    /// Default-on: run the bounded reflexive Pairformer over the MATCH
     /// neighborhood (sidecar-joined) and attach advisory candidates to the
-    /// response. Never adds rows and never writes edges.
-    #[serde(default)]
+    /// response. Explicit `false` disables it. Never adds rows and never
+    /// writes edges.
+    #[serde(default = "default_reflexive_inference")]
     pub reflexive_inference: bool,
+}
+
+fn default_reflexive_inference() -> bool {
+    true
 }
 
 #[derive(Clone, Debug)]
@@ -2997,6 +3005,15 @@ mod tests {
         let reflexive = &response["reflexive"];
         assert_eq!(reflexive["advisory"], json!(true));
         assert_eq!(reflexive["representations_joined"], json!(3));
+        assert_eq!(reflexive["scorer"], json!("learned_burn_pairformer"));
+        let scorer_notes = reflexive["scorer_notes"].as_array().unwrap();
+        assert!(scorer_notes
+            .iter()
+            .any(|note| note.as_str()
+                == Some("no_promoted_pairformer_artifact_using_online_training")));
+        assert!(scorer_notes.iter().any(|note| note
+            .as_str()
+            .is_some_and(|note| note.starts_with("online_pairformer_trained:"))));
         let candidates = reflexive["candidates"].as_array().unwrap();
         let lib_to_extra = candidates
             .iter()
@@ -3012,7 +3029,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Without the opt-in flag, the response carries no reflexive block.
+        // Explicit opt-out suppresses the advisory block.
         let plain_body = PublicCypherBody {
             reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
@@ -3023,6 +3040,24 @@ mod tests {
         };
         let plain = execute_cypher_query(&mut store, "demo", &plain_body).unwrap();
         assert!(plain.get("reflexive").is_none());
+    }
+
+    #[test]
+    fn cypher_reflexive_inference_is_default_on_unless_explicitly_disabled() {
+        let body: PublicCypherBody = serde_json::from_value(json!({
+            "tenant_id": "demo",
+            "query": "MATCH (n:File) RETURN n LIMIT 10"
+        }))
+        .unwrap();
+        assert!(body.reflexive_inference);
+
+        let body: PublicCypherBody = serde_json::from_value(json!({
+            "tenant_id": "demo",
+            "query": "MATCH (n:File) RETURN n LIMIT 10",
+            "reflexive_inference": false
+        }))
+        .unwrap();
+        assert!(!body.reflexive_inference);
     }
 
     #[test]

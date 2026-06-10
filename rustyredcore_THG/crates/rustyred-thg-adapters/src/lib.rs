@@ -73,8 +73,8 @@ pub use reflexive_executor::{
     adapter_factors_node_id, apply_low_rank_adapter, load_adapter_factors,
     load_node_representation, reflexive_match_inference, score_match_neighborhood,
     upsert_adapter_factors_sidecar, LowRankAdapterFactors, MatchInferenceResult,
-    MatchNeighborhoodInput, NodeRepresentation, ReflexiveReadStore, ADAPTER_FACTORS_LABEL,
-    FACTORS_FOR_ADAPTER,
+    MatchInferenceScorer, MatchNeighborhoodInput, NodeRepresentation, ReflexiveReadStore,
+    ADAPTER_FACTORS_LABEL, FACTORS_FOR_ADAPTER,
 };
 pub use routing::{
     adapter_training_centroid, find_adapters_by_query_embedding, find_adapters_for,

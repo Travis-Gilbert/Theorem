@@ -21,7 +21,7 @@ rustyred-thg-core = { path = "../rustyred-thg-core", features = ["redis-store"] 
 theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }
 theorem-browser-agent = { path = "../theorem-browser-agent" }
-rustyred-thg-adapters = { path = "../rustyred-thg-adapters" }
+rustyred-thg-adapters = { path = "../rustyred-thg-adapters", features = ["pairformer-burn-cubecl"] }
 rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
 rustyred-thg-mcp = { path = "../rustyred-thg-mcp", features = ["redis-store"] }
 rustyred-thg-fractal = { path = "../rustyred-thg-fractal" }

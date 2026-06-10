@@ -511,7 +511,7 @@ impl GraphDatabase for GraphDatabaseService {
             )?
         };
         let body = PublicCypherBody {
-            reflexive_inference: false,
+            reflexive_inference: true,
             tenant_id: Some(tenant_id.clone()),
             query: request.cypher,
             params,
@@ -581,7 +581,7 @@ impl GraphDatabase for GraphDatabaseService {
             )?
         };
         let body = PublicCypherBody {
-            reflexive_inference: false,
+            reflexive_inference: true,
             tenant_id: Some(tenant_id.clone()),
             query: request.cypher,
             params,

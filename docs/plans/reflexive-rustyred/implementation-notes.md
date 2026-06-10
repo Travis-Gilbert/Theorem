@@ -170,6 +170,24 @@ deterministic scorer:
   deterministic path (same bounded neighborhood, direct-edge suppression,
   provenance-required candidates, quarantine pipeline); only the scorer is
   learned.
+- Default MATCH inference: `rustyred-thg-server` enables
+  `pairformer-burn-cubecl` on `rustyred-thg-adapters`, and the public Cypher
+  body now defaults `reflexive_inference` to true. Callers must explicitly
+  send `false` to turn the learning advisory block off.
+- Learned scoring is no longer gated on each user having a local checkpoint.
+  `reflexive_match_inference` still prefers the tenant's active
+  `pairformer-burn` `ModelArtifact` when the shared service has resolvable
+  weights. Artifact config comes from the linked `EvaluationReceipt`; weights
+  load from `local_path`, `artifact_path`, `weights_path`, `cache_path`,
+  `file://`, or an `s3://...` key resolved under `THEOREM_MODEL_CACHE_DIR` /
+  `RUSTYRED_MODEL_CACHE_DIR`.
+- When no active artifact exists, the active artifact is remote-only, or a
+  checkpoint fails to load/score, the query path bootstraps the Burn
+  Pairformer directly from the bounded MATCH neighborhood with the same
+  masked-edge objective used by training. Neighborhoods with no trainable
+  edges still run a seeded Burn Pairformer, so deterministic scoring is now a
+  hard-error or feature-disabled fallback rather than the normal default.
+  The response exposes `scorer`, `scorer_model_id`, and `scorer_notes`.
 
 Burn gotchas encoded in the tests: `Param` initialization is lazy (random
 draws happen at first forward, so seed-then-materialize per model), and the
@@ -177,11 +195,9 @@ backend RNG is process-global (seeded tests serialize behind a lock).
 
 ## Still Deferred (named, not cut)
 
-- Default inference still runs the deterministic floors; the trained
-  Pairformer becomes the scorer once a promoted artifact exists for the
-  tenant (load by config + artifact pointer). The EdgeMPNN scorer and
-  context scorer remain deterministic; the same training pattern (Burn
-  modules + masked-recovery / use-receipt labels) is the intended path.
+- The EdgeMPNN scorer and context scorer remain deterministic; the same
+  training pattern (Burn modules + masked-recovery / use-receipt labels) is
+  the intended path.
 - Pairformer candidates remain limited to two-hop-supported pairs by
   construction (`score_links` caps unsupported pairs below threshold). The
   N-hop provenance lane is the EdgeMPNN scorer.

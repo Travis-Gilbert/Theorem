@@ -12,9 +12,10 @@ use crate::burn_pairformer::ranking_accuracy;
 use crate::pairformer::{PairformerEdgeInput, PairformerInput, PairformerNodeInput};
 use crate::{
     featurize_pairformer_input, load_pairformer_file, quarantine_densification_candidates,
-    rank_trained_pairformer_densification_candidates, register_trained_pairformer_artifact,
-    save_pairformer_file, train_pairformer, BurnPairformerConfig, DensificationRequest,
-    PairformerTrainingConfig,
+    rank_trained_pairformer_densification_candidates, reflexive_match_inference,
+    register_model_artifact, register_trained_pairformer_artifact, save_pairformer_file,
+    score_links_with_trained, train_pairformer, BurnPairformerConfig, DensificationRequest,
+    MatchInferenceScorer, ModelArtifactInput, PairformerConfig, PairformerTrainingConfig,
 };
 
 /// Burn's backend RNG is a process-global mutex; these tests seed it, so
@@ -250,6 +251,13 @@ fn trained_model_drives_densification_and_artifact_registration() {
 
     // Build the same planted graph in a store for the snapshot path.
     let mut store = InMemoryGraphStore::new();
+    store
+        .upsert_node(NodeRecord::new(
+            "tenant:theorem",
+            ["Tenant"],
+            json!({ "tenant_id": "theorem" }),
+        ))
+        .unwrap();
     for node in &input.nodes {
         store
             .upsert_node(NodeRecord::new(
@@ -344,4 +352,297 @@ fn trained_model_drives_densification_and_artifact_registration() {
         json!(report.final_ranking_accuracy)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reflexive_match_inference_defaults_to_promoted_burn_pairformer() {
+    let _serial = seed_guard();
+    let device = NdArrayDevice::default();
+    let config = small_config();
+    let input = planted_rule_input(1, 1);
+
+    <Inference as Backend>::seed(&device, 2026);
+    let model = config.init::<Inference>(&device);
+    let scores = score_links_with_trained(&model, &device, &input, &config).unwrap();
+    assert!(scores.iter().all(|score| score.score.is_finite()));
+
+    let dir = std::env::temp_dir().join("burn_pairformer_promoted_default_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pairformer-active");
+    save_pairformer_file(model, &path).unwrap();
+
+    let mut store = InMemoryGraphStore::new();
+    store
+        .upsert_node(NodeRecord::new(
+            "tenant:theorem",
+            ["Tenant"],
+            json!({ "tenant_id": "theorem" }),
+        ))
+        .unwrap();
+    for node in &input.nodes {
+        store
+            .upsert_node(NodeRecord::new(
+                &node.node_id,
+                ["Object"],
+                json!({ "features": node.features }),
+            ))
+            .unwrap();
+    }
+    for edge in &input.edges {
+        store
+            .upsert_edge(
+                EdgeRecord::new(
+                    &edge.edge_id,
+                    &edge.source_id,
+                    edge.edge_type.as_str(),
+                    &edge.target_id,
+                    json!({ "features": edge.features }),
+                )
+                .with_confidence(edge.confidence as f64),
+            )
+            .unwrap();
+    }
+    let graph_version = store.snapshot().version;
+    let trained_on_node_ids = input
+        .nodes
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect::<Vec<_>>();
+    let writeback = register_model_artifact(
+        &mut store,
+        ModelArtifactInput {
+            model_id: "pairformer-burn/active-default".to_string(),
+            tenant_id: "theorem".to_string(),
+            model_type: "pairformer-burn".to_string(),
+            s3_uri: "s3://theorem-models/pairformer/active-default.bin".to_string(),
+            dataset_hash: "fixture-dataset".to_string(),
+            source_graph_version: graph_version,
+            trained_on_node_ids,
+            metrics: json!({
+                "final_ranking_accuracy": 1.0,
+                "config": config,
+            }),
+            promotion_decision: "active".to_string(),
+            manifest_version: 1,
+        },
+        Some("test"),
+    )
+    .unwrap();
+    let mut artifact = store.get_node(&writeback.model_node_id).unwrap().clone();
+    artifact.properties["local_path"] = json!(path.to_string_lossy().to_string());
+    store.upsert_node(artifact).unwrap();
+
+    let result = reflexive_match_inference(
+        &store,
+        &[
+            "node:a0".to_string(),
+            "node:b0".to_string(),
+            "node:c0".to_string(),
+        ],
+        DensificationRequest {
+            tenant_id: "theorem".to_string(),
+            seed_node_ids: vec!["node:a0".to_string()],
+            max_nodes: 16,
+            max_depth: 2,
+            min_path_confidence: 0.0,
+            confidence_threshold: 0.0,
+            confidence_ceiling: 0.72,
+            max_candidates: 8,
+            admission_tier: "advisory_inferred".to_string(),
+            model_id: "pairformer-match-inference/fallback".to_string(),
+            allowed_edge_types: vec![],
+        },
+        PairformerConfig {
+            max_nodes: 16,
+            ..PairformerConfig::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.scorer, MatchInferenceScorer::LearnedBurnPairformer);
+    assert_eq!(result.scorer_model_id, "pairformer-burn/active-default");
+    assert!(result
+        .scorer_notes
+        .contains(&"promoted_pairformer_artifact_loaded".to_string()));
+    assert!(result
+        .candidates
+        .iter()
+        .any(|candidate| candidate.source_id == "node:a0" && candidate.target_id == "node:c0"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reflexive_match_inference_bootstraps_learned_pairformer_without_artifact() {
+    let _serial = seed_guard();
+    let input = planted_rule_input(1, 1);
+    let mut store = InMemoryGraphStore::new();
+    store
+        .upsert_node(NodeRecord::new(
+            "tenant:theorem",
+            ["Tenant"],
+            json!({ "tenant_id": "theorem" }),
+        ))
+        .unwrap();
+    for node in &input.nodes {
+        store
+            .upsert_node(NodeRecord::new(
+                &node.node_id,
+                ["Object"],
+                json!({ "features": node.features }),
+            ))
+            .unwrap();
+    }
+    for edge in &input.edges {
+        store
+            .upsert_edge(
+                EdgeRecord::new(
+                    &edge.edge_id,
+                    &edge.source_id,
+                    edge.edge_type.as_str(),
+                    &edge.target_id,
+                    json!({ "features": edge.features }),
+                )
+                .with_confidence(edge.confidence as f64),
+            )
+            .unwrap();
+    }
+
+    let result = reflexive_match_inference(
+        &store,
+        &[
+            "node:a0".to_string(),
+            "node:b0".to_string(),
+            "node:c0".to_string(),
+        ],
+        DensificationRequest {
+            tenant_id: "theorem".to_string(),
+            seed_node_ids: vec!["node:a0".to_string()],
+            max_nodes: 16,
+            max_depth: 2,
+            min_path_confidence: 0.0,
+            confidence_threshold: 0.0,
+            confidence_ceiling: 0.72,
+            max_candidates: 8,
+            admission_tier: "advisory_inferred".to_string(),
+            model_id: "pairformer-match-inference/fallback".to_string(),
+            allowed_edge_types: vec![],
+        },
+        PairformerConfig {
+            max_nodes: 16,
+            ..PairformerConfig::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.scorer, MatchInferenceScorer::LearnedBurnPairformer);
+    assert_eq!(result.scorer_model_id, "pairformer-burn/online-bootstrap");
+    assert!(result
+        .scorer_notes
+        .contains(&"no_promoted_pairformer_artifact_using_online_training".to_string()));
+    assert!(result
+        .scorer_notes
+        .iter()
+        .any(|note| note.starts_with("online_pairformer_trained:")));
+}
+
+#[test]
+fn reflexive_match_inference_bootstraps_when_promoted_artifact_is_remote_only() {
+    let _serial = seed_guard();
+    let config = small_config();
+    let input = planted_rule_input(1, 1);
+    let mut store = InMemoryGraphStore::new();
+    store
+        .upsert_node(NodeRecord::new(
+            "tenant:theorem",
+            ["Tenant"],
+            json!({ "tenant_id": "theorem" }),
+        ))
+        .unwrap();
+    for node in &input.nodes {
+        store
+            .upsert_node(NodeRecord::new(
+                &node.node_id,
+                ["Object"],
+                json!({ "features": node.features }),
+            ))
+            .unwrap();
+    }
+    for edge in &input.edges {
+        store
+            .upsert_edge(
+                EdgeRecord::new(
+                    &edge.edge_id,
+                    &edge.source_id,
+                    edge.edge_type.as_str(),
+                    &edge.target_id,
+                    json!({ "features": edge.features }),
+                )
+                .with_confidence(edge.confidence as f64),
+            )
+            .unwrap();
+    }
+    let trained_on_node_ids = input
+        .nodes
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect::<Vec<_>>();
+    let graph_version = store.snapshot().version;
+    register_model_artifact(
+        &mut store,
+        ModelArtifactInput {
+            model_id: "pairformer-burn/shared-active".to_string(),
+            tenant_id: "theorem".to_string(),
+            model_type: "pairformer-burn".to_string(),
+            s3_uri: "s3://theorem-models/pairformer/shared-active.bin".to_string(),
+            dataset_hash: "fixture-dataset".to_string(),
+            source_graph_version: graph_version,
+            trained_on_node_ids,
+            metrics: json!({
+                "final_ranking_accuracy": 0.9,
+                "config": config,
+            }),
+            promotion_decision: "active".to_string(),
+            manifest_version: 1,
+        },
+        Some("test"),
+    )
+    .unwrap();
+
+    let result = reflexive_match_inference(
+        &store,
+        &[
+            "node:a0".to_string(),
+            "node:b0".to_string(),
+            "node:c0".to_string(),
+        ],
+        DensificationRequest {
+            tenant_id: "theorem".to_string(),
+            seed_node_ids: vec!["node:a0".to_string()],
+            max_nodes: 16,
+            max_depth: 2,
+            min_path_confidence: 0.0,
+            confidence_threshold: 0.0,
+            confidence_ceiling: 0.72,
+            max_candidates: 8,
+            admission_tier: "advisory_inferred".to_string(),
+            model_id: "pairformer-match-inference/fallback".to_string(),
+            allowed_edge_types: vec![],
+        },
+        PairformerConfig {
+            max_nodes: 16,
+            ..PairformerConfig::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.scorer, MatchInferenceScorer::LearnedBurnPairformer);
+    assert_eq!(result.scorer_model_id, "pairformer-burn/online-bootstrap");
+    assert!(result.scorer_notes.contains(
+        &"promoted_pairformer_artifact_remote_only:pairformer-burn/shared-active".to_string()
+    ));
+    assert!(result
+        .scorer_notes
+        .iter()
+        .any(|note| note.starts_with("online_pairformer_trained:")));
 }
