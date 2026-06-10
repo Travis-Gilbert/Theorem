@@ -1,0 +1,63 @@
+# theorem-agentd configuration.
+#
+# Secrets stay in environment variables. The daemon reads THEOREM_MODEL_API_KEY
+# and THEOREM_HARNESS_TOKEN when those env vars are configured below.
+
+default_room_id = "repo:theorem:branch:main"
+actor = "theorem-agentd"
+
+[model]
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:8080"
+model = "gemma-4-12b-it-q4"
+api_key_env = "THEOREM_MODEL_API_KEY"
+temperature = 0.2
+max_tokens = 1200
+request_timeout_secs = 120
+grammar_constrained = true
+
+[harness]
+name = "harness"
+url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
+token_env = "THEOREM_HARNESS_TOKEN"
+tenant_slug = "default"
+
+# Bucket B local tools. Set session = true for any spec-compliant streamable-HTTP
+# MCP server (initialize -> mcp-session-id -> notifications/initialized ->
+# tools/call over SSE). TickTick below is a real, verified example.
+[[mcp_servers]]
+name = "ticktick"
+url = "https://ticktick-mcp-production-8a84.up.railway.app/mcp"
+session = true
+tenant_slug = "default"
+
+[[mcp_servers]]
+name = "gmail"
+url = "http://127.0.0.1:7332/mcp"
+# session = true   # enable if your Gmail MCP is a streamable-HTTP server
+tenant_slug = "default"
+
+[[mcp_servers]]
+name = "calendar"
+url = "http://127.0.0.1:7333/mcp"
+# session = true
+tenant_slug = "default"
+
+[[mcp_servers]]
+name = "filesystem"
+url = "http://127.0.0.1:7334/mcp"
+# session = true
+tenant_slug = "default"
+
+[receiver]
+enabled = true
+config_path = "theorem-receiver.toml"
+
+[loop_config]
+max_iterations = 8
+tick_interval_secs = 60
+storm_guard_window_secs = 600
+
+[ledger]
+path = ".theorem/agentd-token-ledger.jsonl"
+

@@ -3976,6 +3976,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "theorem-agentd"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "theorem-receiver",
+ "toml",
+]
+
+[[package]]
 name = "theorem-browser-agent"
 version = "0.1.0"
 dependencies = [

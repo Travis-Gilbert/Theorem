@@ -1,67 +1,83 @@
 {
   "schema_version": 1,
   "source": "theorems-harness hook checklist-contract",
-  "created_at": "2026-06-08T05:19:19Z",
-  "task": "\n# Files mentioned by the user:\n\n## COMPOUND-ENGINEERING-HARNESS-HANDOFF.md: /Users/travisgilbert/Downloads/COMPOUND-ENGINEERING-HARNESS-HANDOFF.md\n\n## LIBRARY-ENCODING-PLAN.md: /Users/travisgilbert/Downloads/LIBRARY-ENCODING-PLAN.md\n\n## My request for Codex:\nPerfect!! can you commit and push then do the same process with these. again ignore the gates just deliver also I think 'theseus-pro' skill its probably not needed here",
-  "source_hash": "6ae95bf4d707e624be9f19cd52afcae17fc1b00e664e335b7fd799b454b19fbb",
+  "created_at": "2026-06-09T21:24:00Z",
+  "task": "Implement /Users/travisgilbert/Downloads/theorem-agentd-handoff (2).md on main: local theorem-agentd daemon, MCP tool-use loop, receiver sidecar shape, grammar guardrail, transcript mode, launchd example, and token ledger.",
+  "source_hash": "e938291f5d8b14efb02fc331545a6bafc096fb0061b5ddc36e13a0f0f27854d8",
   "repo": "Theorem",
   "branch": "main",
   "items": [
     {
-      "id": "HH-001",
-      "deliverable": "The run-close hook",
-      "acceptance_criterion": "closing one real run appends the COMPOUND.* events to that run's log, visible in `harness_replay`; replaying the same run appends nothing new.",
+      "id": "AGD-001",
+      "deliverable": "Workspace crate",
+      "acceptance_criterion": "A new `theorem-agentd` Rust crate is a `rustyredcore_THG` workspace member beside `theorem-receiver` and builds as a lib plus bin.",
       "status": "completed",
-      "verification": "cargo test -p theorem-harness -p theorem-harness-core -p theorem-harness-runtime passed; compound_engineering::tests::run_close_hook_appends_compound_events_and_replay_does_not_double_capture verifies COMPOUND.CAPTURED, COMPOUND.FITNESS_APPLIED, COMPOUND.GATE_PROPOSED, and COMPOUND.DECAYED append after RUN.CLOSED, while RUN.REPLAYED adds no second compound sequence.",
+      "verification": "`cargo metadata --no-deps --format-version 1` lists `theorem-agentd`; `cargo check -p theorem-agentd` passed.",
       "deferral_reason": ""
     },
     {
-      "id": "HH-002",
-      "deliverable": "Auto-capture",
-      "acceptance_criterion": "a qualifying run produces exactly one `auto_triggered` memory whose kind matches its outcome and whose links contain the run id, findable via `recall`; a trivial two-step run produces zero.",
+      "id": "AGD-002",
+      "deliverable": "`--once` transcript mode",
+      "acceptance_criterion": "`theorem-agentd --once \"<prompt>\"` runs one tool-use turn and prints a full transcript with tool calls and results.",
       "status": "completed",
-      "verification": "cargo test -p theorem-harness-runtime --lib passed; compound_engineering::tests::auto_capture_writes_one_memory_and_trivial_run_writes_zero verifies one auto_triggered solution memory for a qualifying positive run and zero memories for a trivial two-step failed run.",
+      "verification": "Local fixture MCP smoke passed: `CLI_ONCE_SMOKE_PASS`, events=`context,context,model_decision,tool_call,tool_result,model_decision,final,ledger`.",
       "deferral_reason": ""
     },
     {
-      "id": "HH-003",
-      "deliverable": "Usage attribution and fitness update",
-      "acceptance_criterion": "a positive run that applied pack X shows X's fitness aggregate incremented (visible via `skill_get`); a negative run produces a tension record naming its used items, with no fitness decrement on any of them.",
+      "id": "AGD-003",
+      "deliverable": "Room-aware harness tools",
+      "acceptance_criterion": "The daemon can read room context and can emit a schema-valid wake `coordinate` call for a coding head.",
       "status": "completed",
-      "verification": "cargo test -p theorem-harness-runtime --lib passed; compound_engineering::tests::positive_run_updates_pack_and_memory_negative_run_writes_tension_without_decrement verifies positive pack and memory fitness increments, negative run tension creation, and no positive-count decrement.",
+      "verification": "`turn_loop::tests::deterministic_coordinate_call_is_schema_valid` verifies `delivery=\"wake\"`, `mentions[0]=\"codex\"`, and schema-required coordinate arguments; local fixture MCP smoke verifies `coordination_context` dispatch in the transcript loop.",
       "deferral_reason": ""
     },
     {
-      "id": "HH-004",
-      "deliverable": "Gate feed, promotion, decay",
-      "acceptance_criterion": "a shadow pack whose ledger shows a passed gate produces a promotion-proposal record; a memory untouched across the decay window surfaces only under `include_low_fitness` recall; a forced hard-axis regression on a canonical pack produces a demotion plus tension.",
+      "id": "AGD-004",
+      "deliverable": "Grammar-constrained tool calls",
+      "acceptance_criterion": "Tool-call output is closed over known tool names and malformed tool names are rejected before MCP dispatch.",
       "status": "completed",
-      "verification": "cargo test -p theorem-harness-runtime --lib passed; compound_engineering::tests::gate_proposal_decay_cluster_and_config_hash_are_data_driven verifies shadow promotion proposals, low-fitness decay with include_low_fitness recall, and rehearsal on retrieval; compound_engineering::tests::canonical_hard_axis_regression_demotes_and_records_tension verifies canonical hard-axis demotion plus tension.",
+      "verification": "`cargo run -q -p theorem-agentd -- --print-tool-grammar crates/theorem-agentd/theorem-agentd.example.toml` printed a GBNF grammar with the closed tool-name set; `tools::tests::grammar_is_closed_over_catalog_names` and `tools::tests::validates_required_arguments` passed.",
       "deferral_reason": ""
     },
     {
-      "id": "HH-005",
-      "deliverable": "The cluster rule",
-      "acceptance_criterion": "two runs with the same task produce captures sharing one cluster key; two unrelated runs do not.",
+      "id": "AGD-005",
+      "deliverable": "Embedded receiver sidecar",
+      "acceptance_criterion": "Long-running daemon mode starts `theorem_receiver::run_loop` on its own OS thread and communicates only through the room.",
       "status": "completed",
-      "verification": "cargo test -p theorem-harness-runtime --lib passed; compound_engineering::tests::gate_proposal_decay_cluster_and_config_hash_are_data_driven verifies two same-task runs share one cluster_key and an unrelated task gets a different cluster_key.",
+      "verification": "`receiver_sidecar::spawn_receiver_sidecar` loads `ReceiverConfig`, builds `HarnessClient`, and spawns `theorem_receiver::run_loop` on a named OS thread; `cargo check -p theorem-agentd` passed against the receiver library API.",
       "deferral_reason": ""
     },
     {
-      "id": "HH-006",
-      "deliverable": "Config as data",
-      "acceptance_criterion": "changing one threshold changes the config hash on subsequent events; no recompile needed to retune.",
+      "id": "AGD-006",
+      "deliverable": "Launchd shape",
+      "acceptance_criterion": "A single launchd job can run the daemon, while receiver embedding is controlled by daemon config.",
       "status": "completed",
-      "verification": "cargo test -p theorem-harness-runtime --lib passed; persist_compound_config stores threshold config as graph data, and compound_engineering::tests::gate_proposal_decay_cluster_and_config_hash_are_data_driven verifies changing capture_step_floor changes subsequent COMPOUND.* config_hash values without recompilation.",
+      "verification": "`crates/theorem-agentd/theorem-agentd.launchd.plist.example` added with one `theorem-agentd` program invocation; README documents no secrets in the plist.",
       "deferral_reason": ""
     },
     {
-      "id": "HH-007",
-      "deliverable": "First consumer",
-      "acceptance_criterion": "after both land, exactly one code path folds receipts into fitness, and three real writing-styled runs show StyleReceipt aggregates on the writing pack's fitness.",
+      "id": "AGD-007",
+      "deliverable": "Token ledger",
+      "acceptance_criterion": "The daemon writes one JSONL ledger entry per model decision/tool turn for compute-offload and context A/B accounting.",
       "status": "completed",
-      "verification": "cargo test -p prose-check and cargo test -p theorem-harness-runtime --lib passed; rg found no fold_style_receipts_into_pack_fitness symbol, and style receipts now summarize in writing_style while compound_engineering::apply_usage_fitness owns the single fitness fold path.",
+      "verification": "`ledger::tests::writes_jsonl_ledger` passed; local fixture `--once` smoke wrote 2 ledger lines for one tool call plus final reply.",
       "deferral_reason": ""
+    },
+    {
+      "id": "AGD-008",
+      "deliverable": "Real local model and personal-tool proof",
+      "acceptance_criterion": "Gemma local serving and real TickTick/Gmail/Calendar MCP calls are proven against Travis's local services.",
+      "status": "deferred",
+      "verification": "Code paths and config stanzas exist for OpenAI-compatible model serving plus TickTick, Gmail, Calendar, and filesystem MCP servers.",
+      "deferral_reason": "No local Gemma server, TickTick/Gmail/Calendar MCP endpoint, or personal credential surface was provided in this session. Live personal-tool mutation was not attempted."
+    },
+    {
+      "id": "AGD-009",
+      "deliverable": "Live wake plus receiver dry-run proof",
+      "acceptance_criterion": "A daemon-emitted wake message lands in the room and `theorem-receiver --wake-dry-run <room_id> codex` plans a Codex spawn for it.",
+      "status": "deferred",
+      "verification": "Manual harness coordination wake to `claude-code` was sent for collaboration; daemon coordinate emission is schema-tested and fixture-dispatched.",
+      "deferral_reason": "A live daemon-fired wake would intentionally queue another local head. It should be run only with the desired receiver config and token for the target checkout."
     }
   ]
 }
