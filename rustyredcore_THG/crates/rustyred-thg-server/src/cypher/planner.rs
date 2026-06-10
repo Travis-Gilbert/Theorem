@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::cypher::ast::{AggOp, OrderBy};
@@ -25,6 +26,127 @@ pub struct AggregateOutput {
 pub struct AggregateSpec {
     pub group_keys: Vec<String>,
     pub aggs: Vec<AggregateOutput>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlanCandidate {
+    pub candidate_id: String,
+    pub summary: String,
+    pub native_rank: u32,
+    pub estimated_cost_units: f64,
+    pub hints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlanObservationMetrics {
+    pub candidate_id: String,
+    pub observations: u32,
+    pub mean_cost_units: f64,
+    pub success_rate: f64,
+    pub uncertainty: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlannerSteeringPolicy {
+    pub min_observations: u32,
+    pub exploration_weight: f64,
+    pub max_tail_risk_multiplier: f64,
+}
+
+impl Default for PlannerSteeringPolicy {
+    fn default() -> Self {
+        Self {
+            min_observations: 20,
+            exploration_weight: 0.25,
+            max_tail_risk_multiplier: 2.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlannerSteeringDecision {
+    pub selected_candidate_id: String,
+    pub native_candidate_id: String,
+    pub abstained: bool,
+    pub reason: String,
+    pub score: f64,
+    pub observed_candidate_count: usize,
+}
+
+/// Bao-style steering over a bounded candidate set. The rule planner proposes
+/// candidates; this ranker may choose among them only after enough observations
+/// exist. It never creates a plan that is absent from `candidates`.
+pub fn steer_plan_candidates(
+    candidates: &[PlanCandidate],
+    metrics: &[PlanObservationMetrics],
+    policy: PlannerSteeringPolicy,
+) -> Option<PlannerSteeringDecision> {
+    let native = candidates
+        .iter()
+        .min_by_key(|candidate| candidate.native_rank)?;
+    if candidates.len() <= 1 {
+        return Some(native_decision(native, "single_candidate"));
+    }
+
+    let policy = normalize_policy(policy);
+    let metrics_by_id = metrics
+        .iter()
+        .filter(|item| item.observations > 0)
+        .map(|item| (item.candidate_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    let total_observations = candidates
+        .iter()
+        .filter_map(|candidate| metrics_by_id.get(candidate.candidate_id.as_str()))
+        .map(|item| item.observations)
+        .sum::<u32>();
+    if total_observations < policy.min_observations {
+        return Some(native_decision(native, "cold_start_native_floor"));
+    }
+
+    let native_mean = metrics_by_id
+        .get(native.candidate_id.as_str())
+        .map(|item| item.mean_cost_units)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(native.estimated_cost_units.max(1.0));
+    let tail_risk_ceiling = native_mean * policy.max_tail_risk_multiplier;
+
+    let mut best: Option<(&PlanCandidate, f64)> = None;
+    for candidate in candidates {
+        let Some(observed) = metrics_by_id.get(candidate.candidate_id.as_str()) else {
+            continue;
+        };
+        if observed.mean_cost_units <= 0.0
+            || !observed.mean_cost_units.is_finite()
+            || observed.success_rate <= 0.0
+            || observed.mean_cost_units > tail_risk_ceiling
+        {
+            continue;
+        }
+        let score = observed.mean_cost_units / observed.success_rate.clamp(0.01, 1.0)
+            - policy.exploration_weight * observed.uncertainty.max(0.0);
+        match best {
+            Some((prior, prior_score))
+                if prior_score < score
+                    || (prior_score == score && prior.native_rank <= candidate.native_rank) => {}
+            _ => best = Some((candidate, score)),
+        }
+    }
+
+    let Some((candidate, score)) = best else {
+        return Some(native_decision(native, "all_learned_candidates_too_risky"));
+    };
+    Some(PlannerSteeringDecision {
+        selected_candidate_id: candidate.candidate_id.clone(),
+        native_candidate_id: native.candidate_id.clone(),
+        abstained: candidate.candidate_id == native.candidate_id,
+        reason: if candidate.candidate_id == native.candidate_id {
+            "native_candidate_ranked_best".to_string()
+        } else {
+            "learned_ranker_selected_enumerated_candidate".to_string()
+        },
+        score,
+        observed_candidate_count: metrics_by_id.len(),
+    })
 }
 
 pub fn aggregate(rows: &[Map<String, Value>], spec: &AggregateSpec) -> Vec<Map<String, Value>> {
@@ -72,6 +194,30 @@ pub fn aggregate(rows: &[Map<String, Value>], spec: &AggregateSpec) -> Vec<Map<S
         out_rows.push(row);
     }
     out_rows
+}
+
+fn normalize_policy(mut policy: PlannerSteeringPolicy) -> PlannerSteeringPolicy {
+    if policy.min_observations == 0 {
+        policy.min_observations = 20;
+    }
+    if !policy.exploration_weight.is_finite() || policy.exploration_weight < 0.0 {
+        policy.exploration_weight = 0.0;
+    }
+    if !policy.max_tail_risk_multiplier.is_finite() || policy.max_tail_risk_multiplier < 1.0 {
+        policy.max_tail_risk_multiplier = 1.0;
+    }
+    policy
+}
+
+fn native_decision(native: &PlanCandidate, reason: &str) -> PlannerSteeringDecision {
+    PlannerSteeringDecision {
+        selected_candidate_id: native.candidate_id.clone(),
+        native_candidate_id: native.candidate_id.clone(),
+        abstained: true,
+        reason: reason.to_string(),
+        score: native.estimated_cost_units,
+        observed_candidate_count: 0,
+    }
 }
 
 pub fn sort_rows(rows: &mut [Map<String, Value>], order: &[OrderBy]) {
@@ -322,5 +468,113 @@ mod tests {
         let blue = out.iter().find(|r| r["cat"] == "blue").unwrap();
         assert_eq!(blue["lo"], json!(5.0));
         assert_eq!(blue["hi"], json!(7.0));
+    }
+
+    #[test]
+    fn steering_abstains_to_native_until_enough_observations_exist() {
+        let candidates = plan_candidates();
+        let decision = steer_plan_candidates(
+            &candidates,
+            &[PlanObservationMetrics {
+                candidate_id: "hinted-index-first".to_string(),
+                observations: 3,
+                mean_cost_units: 20.0,
+                success_rate: 1.0,
+                uncertainty: 1.0,
+            }],
+            PlannerSteeringPolicy::default(),
+        )
+        .unwrap();
+
+        assert!(decision.abstained);
+        assert_eq!(decision.selected_candidate_id, "native");
+        assert_eq!(decision.reason, "cold_start_native_floor");
+    }
+
+    #[test]
+    fn steering_selects_only_enumerated_lower_cost_candidate() {
+        let candidates = plan_candidates();
+        let decision = steer_plan_candidates(
+            &candidates,
+            &[
+                PlanObservationMetrics {
+                    candidate_id: "native".to_string(),
+                    observations: 24,
+                    mean_cost_units: 100.0,
+                    success_rate: 1.0,
+                    uncertainty: 0.0,
+                },
+                PlanObservationMetrics {
+                    candidate_id: "hinted-index-first".to_string(),
+                    observations: 24,
+                    mean_cost_units: 40.0,
+                    success_rate: 0.95,
+                    uncertainty: 1.0,
+                },
+                PlanObservationMetrics {
+                    candidate_id: "not-enumerated".to_string(),
+                    observations: 100,
+                    mean_cost_units: 1.0,
+                    success_rate: 1.0,
+                    uncertainty: 0.0,
+                },
+            ],
+            PlannerSteeringPolicy::default(),
+        )
+        .unwrap();
+
+        assert!(!decision.abstained);
+        assert_eq!(decision.selected_candidate_id, "hinted-index-first");
+    }
+
+    #[test]
+    fn steering_rejects_tail_risk_even_when_mean_looks_learned() {
+        let candidates = plan_candidates();
+        let decision = steer_plan_candidates(
+            &candidates,
+            &[
+                PlanObservationMetrics {
+                    candidate_id: "native".to_string(),
+                    observations: 24,
+                    mean_cost_units: 100.0,
+                    success_rate: 1.0,
+                    uncertainty: 0.0,
+                },
+                PlanObservationMetrics {
+                    candidate_id: "hinted-index-first".to_string(),
+                    observations: 24,
+                    mean_cost_units: 500.0,
+                    success_rate: 1.0,
+                    uncertainty: 0.0,
+                },
+            ],
+            PlannerSteeringPolicy {
+                max_tail_risk_multiplier: 2.0,
+                ..PlannerSteeringPolicy::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(decision.selected_candidate_id, "native");
+        assert_eq!(decision.reason, "native_candidate_ranked_best");
+    }
+
+    fn plan_candidates() -> Vec<PlanCandidate> {
+        vec![
+            PlanCandidate {
+                candidate_id: "native".to_string(),
+                summary: "native rule plan".to_string(),
+                native_rank: 0,
+                estimated_cost_units: 100.0,
+                hints: vec![],
+            },
+            PlanCandidate {
+                candidate_id: "hinted-index-first".to_string(),
+                summary: "index-first hinted plan".to_string(),
+                native_rank: 1,
+                estimated_cost_units: 80.0,
+                hints: vec!["index_first".to_string()],
+            },
+        ]
     }
 }
