@@ -1,58 +1,138 @@
 # Theorem
 
-Theorem planning and implementation spine for Rust-native substrate work.
+Theorem is the **Rust-native Graph based**: the programmable Rust projection that mirrors Theseus The Epistemic Engine workspace. It carries the RustyRed/THG substrate engine, the  bridge and parity surfaces that exercise it, the Graph native browser crawler/search engine, the RustyWeb, and, Theseus' symbolic-engine.
 
-This repository mirrors the programmable Rust projection from the Theseus /
-Index-API workspace. It is intentionally narrow: it carries the RustyRed/THG
-substrate code, the Python bridge and parity surfaces that exercise it, the
-Rust theorem symbolic-engine plan, the Rusty Red Web plans, and the
-reconciliation notes that explain the current sequencing.
+This file is the navigation truth for the repo. Read it first. Order of truth: this map, then the actual code, then the plan docs (plans lag code). If a session changes architecture (new crate, renamed module, removed subsystem, new entrypoint), update this file before ending the session.
 
-## Contents
+## The Mirror Rule (read this before touching anything)
 
-- `rustyredcore_THG/` - RustyRed / THG Rust workspace and PyO3 bridge code.
-- `apps/notebook/inference_engines/` - symbolic-engine contracts, Python
-  reference engines, native bridge adapters, affordance gates, and tests.
-- `apps/notebook/inference_kernel/` - routing and execution layer for native
-  versus Python engine strategy.
-- `apps/notebook/benchmarks/` - parity and cost gates for native symbolic work.
-- `apps/notebook/discovery_runs/` - Rust theorem callers that currently route
-  archive and policy-evolution work through the native evolution engine.
-- `apps/orchestrate/runtime/map_elites_tick.py` - orchestration tick for native
-  MAP-Elites archive throughput.
-- `docs/plans/rust-theorem-symbolic-engines/` - Rust Theorem: Native Symbolic Engines, including RT-0 through RT-5 status and parity discipline.
-- `docs/plans/rusty-red-web/` - Rusty Red Web / RustyWeb implementation plan.
-- `docs/plans/rustyweb-v1-design/` - RustyWeb V1 design and AnswerDraft contract.
-- `docs/plans/commonplace-substrate-reconciliation/` - reconciliation notes that route work between Rust theorem, RustyWeb, and kernel-object lanes.
-- `Theseus/Theorem.md` - source framing for Theseus as canonical substrate and
-  Theorem as the Rust projection/mirror.
-- `docs/reference/commonplace-substrate-architecture-part-4-1.md` - source
-  architecture context for symbolic compute offload and substrate design.
+- **Theseus is canonical.** Theseus = the Python + Memgraph + Postgres application/runtime (separate repo: `github.com/Travis-Gilbert/Theseus`, the local `Index-API` checkout). Theorem **mirrors** the Rust projection and its bridge contracts so Rust-side work can move at its own cadence while staying auditable against the source workspace.
+- **Do not let Theorem and Theseus diverge silently.** The Python files here (`apps/notebook/`, `apps/orchestrate/`) are mirrors of their Theseus counterparts. Changes that affect the contract (parity receipts, affordance gates, the PyO3 surface) must stay reconciled with Theseus.
+- Last sync recorded in `README.md` (2026-05-29 at time of writing). Bump it when you re-sync.
+- Open question still live in `Theseus/Theorem.md`: whether a good tool built on the Theorem (Rust) layer becomes a **promotion candidate** to the canonical Theseus layer. Treat Rust-side tools as candidates, not canon.
 
-## Current Direction
+## Repository Layout
 
-Rust theorem hot-path work is implemented through RT-5.2a. Remaining RT-5 ports
-stay profile/use-case gated.
+| Path | What it is |
+|------|------------|
+| `rustyredcore_THG/` | The RustyRed / THG Rust workspace this database is Theorems Harness (`Cargo.toml [workspace]`). Root lib (`src/`) is the  module exported to Python as `theseus_native` (maturin). Has its own `Dockerfile` + `railway.toml`. |
+| `rustyredcore_THG/crates/` | The graph-engine crates (see table below). |
+| `apps/browser/` | `theorem-browser`: the Servo-embedded substrate-native browser. Standalone Cargo crate (NOT in the rustyredcore_THG workspace). |
+| `apps/browser-substrate/` | `theorem-browser-substrate`: the Servo-free page->substrate seam. Standalone crate; depends only on `rustyred-web` + `rustyred-thg-core` (no Servo), so it builds + tests in seconds. |
+| `apps/theorem-ios/` | SwiftPM scaffold for the native Theorem iOS client. Holds the SwiftUI shell, Dynamic Island control surface, ScenePackageV2 models, mobile projection switcher, local smoke executable, and the pre-Xcode compile path. Full simulator/archive work still needs Xcode. |
+| `apps/theorem-harness-server/` | Standalone Axum JSON/HTTP transport over `theorem-harness-runtime` and `RedCoreGraphStore`. Serves run list/detail plus room status, presence, live intents, actor mentions, and room records for iOS/web harness surfaces. Own Cargo root, not a `rustyredcore_THG` member. |
+| `apps/theorem-grpc/` | `theorem-grpc`: Theorem's first gRPC server. Serves `theseus_search.v1.SearchService` in pure Rust over the RustyRed substrate (`rustyred-web` search + `rustyred-thg-core` store/PPR). No PyO3, no Django. Standalone Cargo root (NOT a `rustyredcore_THG` member); own `Dockerfile` + `railway.toml` (its own Railway service). URL-swap target for civic-atlas-server's `SearchServiceClient` via `THEOREM_SEARCH_URL`. Binds `0.0.0.0:$PORT` (default `50071` local). |
+| `apps/ios/TheoremKit/` | Swift Package (`TheoremKit`), distinct from `apps/theorem-ios`. Shared kit layer. |
+| `apps/obsidian-sync/` | `theorem-harness-sync`: device-side Obsidian community plugin (TypeScript, esbuild). Mirrors the tenant's memory docs into a vault (Phase 1 pull) and writes note edits + `[[wikilinks]]` back into the graph (Phase 2 write-back). Talks to the harness over `requestUrl`: `GET /v1/tenants/:tenant/memory/docs` for read and the `upsert_note` MCP tool over `POST /mcp` for write. Three echo guards (content-hash gate, remote-write suppression, conflict copies). Standalone npm package, not a Cargo member. Plan: `docs/plans/obsidian-sync/`. |
+| `apps/notebook/` | **Python** mirror of Theseus's inference layer: `inference_engines/` (symbolic-engine contracts, Python reference engines, native bridge adapters, Gate-0 affordance coverage, tests), `inference_kernel/` (native-vs-Python routing/execution), `benchmarks/` (byte-parity + cost gates), `discovery_runs/` (Rust-theorem callers routing archive/policy-evolution through the native evolution engine). |
+| `apps/orchestrate/runtime/` | **Python**: `map_elites_tick.py`, the orchestration tick for native MAP-Elites archive throughput. |
+| `Theseus/Theorem.md` | Source framing: Theseus-as-canonical / Theorem-as-Rust-projection, and the promotion-candidate idea. The "why this repo exists" doc. |
+| `docs/plans/` | The plan tree (see Status). `rust-theorem-symbolic-engines/`, `rusty-red-web/`, `rustyweb-v1-design/`, `commonplace-substrate-reconciliation/`. |
+| `docs/reference/` | Source architecture context, incl. `commonplace-substrate-architecture-part-4-1.md` (symbolic compute offload). |
+| `.github/workflows/servo-browser.yml` | CI build for the Servo embedder (heavy; manual trigger). |
 
-RustyWeb is now active work. The first implementation move is to recover the
-burst-crawler scaffold as seed code, then build the real product as a RustyRed-
-backed graph crawler rather than treating the fetcher scaffold as complete.
+### RustyRed/THG crates (`rustyredcore_THG/crates/`)
 
-## Current Code
+| Crate | Purpose |
+|-------|---------|
+| `rustyred-thg-core` | The graph engine core: `GraphStore` trait, the store impls, mutations/transactions, indexes, TTL, AOF durability, symbolic engines (`symbolic.rs`). The heart of the substrate. |
+| `rustyred-web` | RustyWeb. V0 fixture crawler kernel + V2 hardening: URL canonicalization, `a[href]` extraction, BLAKE3 content snapshots, page->graph emission (`build_fixture_crawl_graph` / `build_v2_fixture_crawl`), application into a `GraphStore`, plus the browser-use web primitives (`PageState`, `BrowserAction`, `web_consume_to_graph`) under `browser_engine.rs`. |
+| `rustyred-thg-server` / `-resp-server` / `-compat-server` | The Redis/RESP-protocol server surfaces over the core. |
+| `rustyred-thg-adapters` | Adapters into the core. |
+| `rustyred-thg-affordances` | Connector-as-substrate learning registry: MCP connector tools become first-class `Affordance` graph nodes; the substrate learns which affordance to reach for from accumulated invocation outcomes (PPR over `SERVED_TASK`/`PRODUCED_OUTCOME` edges plus fitness), scoped per agent by a `CapabilityScope`. Structural sibling of `rustyred-thg-adapters`; reuses `theorem-harness-core` for the pairformer A/B validation gate. 15 tests green. |
+| `rustyred-thg-connectors` | Live MCP connector transport: the outbound mirror of `rustyred-thg-mcp`. Connects to an external MCP server over stdio, performs the handshake, walks `tools/list`, and registers each tool as a learnable `Affordance` node via `rustyred-thg-affordances::register_connector`. Pure JSON-RPC protocol layer + thin `BufRead`/`Write` stdio transport (tokio-free, in-memory testable) + `connect_and_register` bridge. Slice 2 adds the invoke bridge (`invoke.rs`): `tools/call` -> `record_invocation` gated by `InvokePolicy` (dry-run default, `FireAllowlist` opt-in), with the `ConnectionTarget` persisted on the `Connector` node so a selected tool is reachable again. Closes the affordances plan's "Live MCP tools/list ingestion" seam. 19 tests green. Plan: `docs/plans/mcp-learning-layer/connector-transport-plan.md`. |
+| `rustyred-thg-geotemporal` | Geo + temporal indexing. |
+| `rustyred-thg-mcp` | Native Rust MCP server (graph reads/algorithms without a Python process in the loop). |
+| `theorem-harness-core` | Rust-native harness kernel: pure run state, transition executor, guard table, state hashing, replay/fork-ready event receipts, and toolgraph toolkit selection ported from Theseus `apps/orchestrate/runtime/`. Pure logic and parity-tested against Python reference corpora. |
+| `theorem-harness-runtime` | GraphStore-backed harness runtime seam: persists `theorem-harness-core` transition receipts as `HarnessRun` / `HarnessEvent` graph nodes plus append-chain edges, keeping storage out of the parity kernel. Also holds `job_queue` (Dispatch v2 job-board persistence: submit/list/note/archive over any `GraphStore`). Tests cover memory and RedCore reopen persistence. |
+| `theorem-browser-agent` | Rust-native browser-use perceive/govern/afford kernel: `ContextCommandState`, `PerceptionBundle`, `ActionRailBundle`, playbook and `BrowsingRun` receipt contracts. Servo-free and graph-adjacent; low-level web I/O routes through `rustyred-web`. |
+| `theorem-receiver` | Dispatch v2 receiver (replaces the rejected GitHub-Actions dispatcher): an outbound-only launcher loop against the cloud harness that reads pending jobs, starts one exactly once with `job_note(start_session_ref)`, and spawns the locally-installed `claude` / `codex` CLI in a mapped worktree. Lane detection via PATH scan; `claude -p` / `codex exec`; `ANTHROPIC_API_KEY` stripped from the child env; child exit is appended as a `job_note` receipt. No engine state, no inbound port, no stored tokens. Heads are shaped as adapters behind one `HeadAdapter` trait (`head.rs`, the FDW-for-models pattern): a future head lands as config plus one impl (head_id/detect/spawn_cmd/intent_template/env_policy/receipt_parser), not a rewrite; trust tiers + selection priors live in the Ensemble registry, not a parallel one. Builds as a lib (Option A embed) and a bin (Option B standalone). Plan: `docs/plans/dispatch-queue/dispatch-v2.md`. |
+| `reconstruction-engine` | Generative reconstruction engine (in `crates/` but NOT a workspace member; built separately). |
 
-- `rustyredcore_THG/` - mirrored Rust theorem projection from Theseus.
-- `rustyredcore_THG/crates/rustyred-web/` - first RustyWeb crate. It currently
-  contains the V0 fixture crawler kernel: URL canonicalization, streaming
-  `a[href]` extraction, BLAKE3 content snapshots, V0 graph node/edge emission,
-  and application into a RustyRed `GraphStore`.
+## The Two Language Sides + the Bridge
 
-## Mirror Rule
+- **Rust** (`rustyredcore_THG/` + `apps/browser*/`): the substrate engine, the browser, RustyWeb, native symbolic engines.
+- **Python** (`apps/notebook/`, `apps/orchestrate/`): the mirror of Theseus's inference layer (reference engines, routing kernel, parity + cost gates, evolution callers).
+- **Swift** (`apps/theorem-ios/`): the native phone client surface over ScenePackageV2. It currently builds as a Swift Package so Command Line Tools can validate the core before Xcode is available.
+- **PyO3 bridge**: `rustyredcore_THG/src/lib.rs` is a `#[pymodule]` exported to Python as **`theseus_native`** (maturin, `pyproject.toml`). The Rust fn is named `rustyredcore_THG` but `#[pyo3(name = "theseus_native")]` overrides the Python-visible module name. Do NOT remove that name override: without it the symbol is `PyInit_rustyredcore_THG` and Python's `import theseus_native` fails silently into the slow Python fallback path.
 
-Theseus remains the canonical application/runtime workspace. Theorem mirrors the
-Rust projection and its bridge contracts so Rust-side work can move at its own
-cadence while staying auditable against the source workspace.
+## GraphStore: three stores, one trait
 
-Last sync: 2026-05-29. This sync includes the Rust theorem commits for Datalog
-rules and byte parity, native Datalog/probabilistic receipts, Gate-0 affordance
-coverage, symbolic-side CPU cost measurement, RT-5.2a native evolution parity,
-and RustyWeb V1 planning.
+`rustyred-thg-core` defines the `GraphStore` trait. Three impls, used for different durability needs:
+
+- **`InMemoryGraphStore`** - ephemeral, in-process. Tests + scratch.
+- **`RedCoreGraphStore`** - durable, file-backed, in-process (AOF + snapshots). `open(data_dir, RedCoreOptions)`; `RedCoreOptions::default()` is `AofEverysec`, use `AofAlways` when you need fsync-per-commit determinism. **This is the "in-process substrate with no API boundary" the browser persists to.** It implements `GraphStore` (writes delegate to the inherent AOF-backed durable upserts; reads serve from an in-memory mirror that `recover()` rebuilds from the AOF on open). TTL methods keep the trait defaults (durable TTL is a follow-up; delegating TTL writes to the mirror would skip the AOF).
+- **`RedisGraphStore`** - connects to a Redis/RustyRed server (an API boundary, out-of-process).
+
+`RedCoreGraphStore` and `RedisGraphStore` also expose inherent `get_node`/`upsert_node` etc. that can **shadow** the trait methods. When you need the trait method on those types, call it via UFCS: `GraphStore::get_node(&store, id)`.
+
+## The substrate-native browser
+
+- **`apps/browser/`** embeds Servo as a Cargo **git dependency** pinned to a known-good rev (NOT a fork). It builds `libservo` via plain `cargo` after `./mach bootstrap` provides system libs (the external-embed path, like Verso). The embedder constructs `ServoBuilder::default().event_loop_waker(...).build()`, a headless `SoftwareRenderingContext`, and a `WebView` via `WebViewBuilder::new(&servo, rendering_context)`.
+- **Substrate seam 1 (DOM -> graph state)**: `WebViewDelegate::load_web_resource(&self, webview, WebResourceLoad)` (NOT `ServoDelegate`, which fires only for non-WebView loads). On `notify_load_status_changed(LoadStatus::Complete)`, build a `LoadedPage` and call `theorem_browser_substrate::ingest_loaded_pages` / `durable_browser_session_with_options`, which writes the page into a `GraphStore` (use `RedCoreGraphStore` for persistence).
+- **`apps/browser-substrate/`** is the Servo-free seam: `LoadedPage -> rustyred-web (build_v2_fixture_crawl) -> CrawlGraph::apply_to_store`. Keep it Servo-free so it stays cheap to iterate.
+
+## Build & Dev Commands
+
+There is **no root Cargo workspace**. Pick the right workspace/crate:
+
+```bash
+# RustyRed/THG core workspace (the engine + bridge)
+cd rustyredcore_THG && cargo build            # build the workspace
+cd rustyredcore_THG && cargo test -p rustyred-thg-core   # test the core
+cd rustyredcore_THG && cargo test --no-run -p rustyred-thg-core  # compile-only coherence check
+cd rustyredcore_THG && cargo test -p theorem-harness-core # test the Rust-native harness kernel
+cd rustyredcore_THG && cargo test -p theorem-harness-runtime # test GraphStore-backed harness event persistence
+cd rustyredcore_THG && cargo test -p theorem-browser-agent # test browser-use policy/perception/action contracts
+cd rustyredcore_THG && cargo test -p rustyred-web # test crawl/search plus browser-use web primitives
+
+# The seam crate (Servo-free, fast: no libservo)
+cargo test --manifest-path apps/browser-substrate/Cargo.toml
+
+# The gRPC search server (standalone Cargo root, NOT a rustyredcore_THG member)
+cd apps/theorem-grpc && cargo build -p theorem-grpc   # binds 0.0.0.0:$PORT (default 50071 local)
+
+# The harness HTTP transport (standalone Cargo root, NOT a rustyredcore_THG member)
+cd apps/theorem-harness-server && cargo test
+cd apps/theorem-harness-server && PORT=50080 THEOREM_HARNESS_DATA_DIR=harness-data cargo run
+
+# The native iOS client scaffold (CLT-friendly; full simulator/archive needs Xcode)
+swift build --package-path apps/theorem-ios
+swift run --package-path apps/theorem-ios TheoremIOSSmoke
+
+# The Servo embedder builds in CI only (heavy: ~30 min libservo from cold).
+# Trigger: gh workflow run servo-browser.yml --ref main
+#   - servo pinned in apps/browser/Cargo.toml (rev) + apps/browser/rust-toolchain.toml (1.95.0)
+#   - the workflow reclaims ~20-25GB of preinstalled SDKs + sets CARGO_PROFILE_DEV_DEBUG=0
+
+# PyO3 wheel (theseus_native) via maturin, from rustyredcore_THG
+cd rustyredcore_THG && maturin develop        # build + install the wheel into the active venv
+
+# Python parity / cost gates (mirror of Theseus inference)
+#   live under apps/notebook/benchmarks/ and apps/notebook/inference_engines/.../tests/
+```
+
+## Conventions & Gotchas
+
+- **Mirror discipline**: this is the projection, not the canon. Keep parity receipts + the PyO3 surface reconciled with Theseus. Surface drift, don't bury it.
+- **No root workspace**: `-p <crate>` only works inside the relevant workspace (e.g. `cd rustyredcore_THG`); `apps/browser*` are standalone crates reached via `--manifest-path`. Path deps cross from `apps/` into `rustyredcore_THG/crates/`.
+- **Byte-parity discipline**: native Rust symbolic engines must byte-match the Python reference receipts. The differential gates live in `apps/notebook/benchmarks/`. A native port is not done until its parity gate is green over the reference set.
+- **Servo build is the long pole**: it is CI-only and heavy. Pin the `servo` rev deliberately; bump on evidence. The embedder's `rust-toolchain.toml` must match Servo's (the whole graph builds with one toolchain). `mach` needs its Python deps (`toml`) in the invoking interpreter before its venv activates.
+- **Editing a file another agent (Codex) is on**: Codex is frequently active in this repo. Commit only with an explicit pathspec (`git commit -- <paths>`), never a bare `git commit` (the shared index can carry another agent's staged files). Claim a seam before overlapping. The harness `coordinate` endpoint has been returning 503 (down); use git history + commit messages as the coordination channel meanwhile.
+- **No emojis. No em/en dashes** (match the user's style across repos: use colons, parens, semicolons).
+- **No time/effort estimates** in plans or reports.
+- **Dependencies named in a spec are information for you, not gates.** Check the tree, decide, and note your reasoning on the job.
+
+## Status / Current Direction
+
+- **Rust theorem symbolic engines**: implemented through RT-5.2a (native evolution parity). Remaining RT-5 ports (e-graph generalization, the cold engines) stay demand-driven / profile-gated. Plan: `docs/plans/rust-theorem-symbolic-engines/`.
+- **Connector-as-substrate affordance learning**: `rustyredcore_THG/crates/rustyred-thg-affordances` is a new workspace member that turns MCP connector tools into learnable `Affordance` graph nodes (registry, invocation receipts, proactive scoped selection via PPR plus cosine with a cold-start forwarding fallback, training export plus pairformer writeback). 15 unit tests green, including durability across a `RedCoreGraphStore` reopen. Plan/spec: `docs/plans/mcp-learning-layer/`. Note the surface overlap with the model-training substrate Codex committed in `rustyred-thg-adapters` (`training_substrate.rs`, commit `8d696e0`): different subject (tool selection vs model-training data) but duplicated graph-vocabulary constants (`EVALUATED_BY`, `PROMOTED_TO_ACTIVE`, `TRAINED_ON`, `MODEL_ARTIFACT_LABEL`, `EVALUATION_RECEIPT_LABEL`) and structurally parallel fitness/selection machinery. Open decision (Travis): keep as a sibling crate vs fold into adapters, and hoist the shared edge/label vocabulary into `theorem-harness-core`.
+- **Live MCP connector transport (the affordance layer's transport half)**: `rustyredcore_THG/crates/rustyred-thg-connectors` is the outbound mirror of the inbound `rustyred-thg-mcp` adapter. It connects to an external MCP server over stdio, performs the `initialize` -> `notifications/initialized` -> `tools/list` handshake, and feeds each tool through `rustyred-thg-affordances::register_connector` so it becomes a learnable `Affordance` node. Pure JSON-RPC protocol layer (request builders, response parsers, `ToolDescriptor` -> `ConnectorManifest` mapping) + a thin `BufRead`/`Write` stdio transport with id correlation (tokio-free; framing tested over in-memory buffers) + the `connect_and_register` bridge. 14 tests green; the affordances crate is untouched (its 15 tests still green). Closes the affordances plan's named "Live MCP tools/list ingestion" seam. Deferred next slices (named, not cut): the `tools/call` invoke bridge + `record_invocation` (needs persisting the `ConnectionTarget`); a driving surface (admin MCP tool on `rustyred-thg-mcp` or an HTTP route); and iOS consumption (the Connectors surface stays an honest empty state until the backend is real). Plan: `docs/plans/mcp-learning-layer/connector-transport-plan.md`.
+- **Rust-native harness port**: Phase 1 kernel plus replay/fork and toolgraph selection are implemented in `rustyredcore_THG/crates/theorem-harness-core`. The crate ports the pure Theseus harness kernel (`contracts.py`, `state_hash.py`, `state_machine.py`, `replay.py`, `toolgraph.py`) into Rust: run state, transition guards, content-addressed hashes, cache/oracle/CUA side events, CMH handoff transitions, replay/fork helpers, and permission-aware toolkit compilation. `theorem-harness-runtime` persists transition receipts into a `GraphStore` as run/event nodes and append-chain edges, and now carries native coordination room/intent/presence/message plus event/decision/tension/reflection record primitives. `rustyred-thg-mcp` exposes the native coordination tools, durable write/readback, bundled turn-start context packets, structured contribution capture, optional policy receipts for durable writes, and `harness_append_transition` / `harness_run` over the runtime event log. `apps/theorem-harness-server` exposes run list/detail plus coordination read endpoints over HTTP. For one populated store across MCP and HTTP, point the harness HTTP server at the same RedCore tenant directory the MCP server writes. Coordination is tracked in `docs/plans/harness-rust-port/` while direct THG mirror writes still report tenant resolution degradation.
+- **RustyWeb**: active. `rustyred-web` holds the V0 fixture crawler kernel + V2 hardening (budget, URL guard, scope, `CrawlReceipt`) plus the first browser-use web route: `web_consume_to_graph` fetches a page through the fetch cascade, observes it as `PageState`, extracts links/text, and can ingest it into the quarantined `open_web_unverified` graph layer. The designed **V1 search layer** (graph-yielding broker, two-fidelity AnswerDraft, license-tiering) is still **unbuilt** (design: `docs/plans/rustyweb-v1-design/`). "V0->V2" refers to the crawler only.
+- **Substrate-native browser / browser-use agent**: the external Servo embedder builds green in CI (`apps/browser`, libservo as a pinned Cargo git-dep). The page->substrate seam (`apps/browser-substrate`) ingests pages into a `GraphStore`, and `RedCoreGraphStore` now implements `GraphStore`, so browser-ingested pages persist durably to the in-process substrate. `theorem-browser-agent` now ports the browser-use policy/perception/action contracts, while `rustyred-thg-mcp` and `rustyred-thg-server` expose `web_consume`, `browse_with_me`, and `browse_for_me` through MCP/HTTP. Current low-level arbitrary-page execution uses RustyWeb's fetch cascade; Servo remains the heavy render/embedder path until true completed-document extraction is available from the embedder hook.
+- **Theorem iOS v1**: first scaffold landed. `scene-os-core` exposes the mobile projection catalog plus layout-only reprojection, availability, and center-node helpers for `force_graph`, `radial_rings`, `tree_layout`, and `fractal_expansion`. `apps/theorem-ios` compiles locally with SwiftPM and includes the SwiftUI shell, Dynamic Island, projection picker, and smoke executable. Next: Xcode project, UniFFI/staticlib `.xcframework`, hosted streaming API wiring, and Grape-backed force renderer.
+- **Dispatch v2**: implemented per `docs/plans/dispatch-queue/dispatch-v2.md` (supersedes the strict claim/status lifecycle in `HANDOFF.md`). A typed `Job` node lives in the GraphStore beside `RunState`: pure domain in `theorem-harness-core/job.rs` (Job + Priority/TargetHead, optional `spec_ref` or `spec_inline`, derived state from `started_at`/`archived_at`, append-only receipts), persistence + the four board verbs in `theorem-harness-runtime/job_queue.rs` (submit/list/note/archive over any `GraphStore`, with read-time migration for legacy statuses). The verbs are exposed as MCP tools in `rustyred-thg-mcp` and wired on the product server's `ProductMcpBackend` (`rustyred-thg-server`) through the `RuntimeTenantMirror`. Execution is `theorem-receiver`: a local spawn of the already-authenticated `claude`/`codex` CLI after a set-once start note, zero GitHub Actions/runners/PATs/OAuth tokens. `spawn_session` + `.github/workflows/theorem-handoff.yml` stay as an untouched legacy lane. Deferred (named): SSE jobs-channel wake (polling meanwhile), parallel `capacity > 1` launch.
+- **theorem-grpc**: Theorem's first gRPC server is live as its own standalone crate + Railway service. Serves `theseus_search.v1.SearchService` in pure Rust over the RustyRed substrate (no PyO3, no Django). URL-swap target for civic-atlas-server (`THEOREM_SEARCH_URL`); `Search` is real graph rank. Build from `apps/theorem-grpc/` (standalone root).
+- **Obsidian sync**: Phase 1 (pull) + Phase 2 (write-back) implemented. Harness side adds one read endpoint (`GET /v1/tenants/:tenant/memory/docs`, since/include_inactive, server-computed `content_hash`) in `rustyred-thg-server` plus the `upsert_note` MCP tool in `rustyred-thg-mcp` (create-or-update by stable doc_id + `MEMORY_RELATES` link reconciliation: resolved links become edges, removed links tombstoned, forward refs recorded unresolved and reconciled on target creation). Core lives in `theorem-harness-runtime::memory` (`list_memory_documents_since`, `upsert_note`, `memory_content_hash`); 39 runtime + 41 MCP + 157 server tests green. Device-side plugin is `apps/obsidian-sync/` (TS, typecheck + esbuild bundle green). Confirmed build decisions: folder-or-flag capture scope, record-unresolved dangling links, conflict-copy default, add `upsert_note`. Spec divergences (code-grounded, documented in the plugin README): tenant is path-scoped not token-scoped (auth maps token->scopes, not tenant); edits use in-place `upsert_note` not `self_revise` (which mints a new doc_id); link edge is `MEMORY_RELATES` not `LINKS_TO`. Plan: `docs/plans/obsidian-sync/`.
+- **Reconciliation** between the Rust-theorem, RustyWeb, and kernel-object lanes: `docs/plans/commonplace-substrate-reconciliation/`.
