@@ -86,10 +86,35 @@ verified; the Burn spike is the named follow-on the spec sequences after it.
 
 ## Verification
 
-`cargo test -p theorem-agentd` (33), `-p theorem-harness-core` (71),
-`-p theorem-harness-runtime` (83), `-p theorem-receiver`, `-p rustyred-thg-mcp`
-(job tools) all green. The production server and the standalone harness HTTP server
-build green against the new `Job`. Acceptance criteria that require a live daemon +
-a real head + a merged PR are exercised offline with the deterministic `rule`
-provider and grounded against the real TickTick schemas; the final live run is the
-operator's.
+`cargo test -p theorem-agentd` (43), `-p theorem-harness-core` (71),
+`-p theorem-harness-runtime` (83), `-p theorem-receiver` (41),
+`-p rustyred-thg-mcp` (job tools) all green. The production server and the
+standalone harness HTTP server build green against the new `Job`. Acceptance
+criteria that require a live daemon + a real head + a merged PR are exercised
+offline with the deterministic `rule` provider and grounded against the real
+TickTick schemas.
+
+## Live capture smoke (CHK008, partial)
+
+Ran one real capture of the seed task ("Add a /health endpoint to theorem-grpc")
+via `--capture-once`'s sequence against the live services. Findings:
+
+- job_submit created a real pending job (`job-01KTRTRPSJ90DF8PC2MDTW8HN1`, P1)
+  with `spec_inline` = the task content. The priority map (TickTick 3 -> P1) held
+  live.
+- The stamp + checked `dispatched` subtask landed on the task (live
+  `ticktick_update_task`).
+- The move to the product list FAILED: the TickTick Open API does not honor moves
+  on this token ("the Open API may not honor moves on this token"). The MCP
+  correctly detected the no-op rather than reporting false success. capture.rs
+  calls the move best-effort, so the daemon degrades gracefully: the task stays
+  stamped + dispatched-checked, and the next sweep's `is_already_captured` guard
+  skips it (no duplicate job). Operator action: use a token with move permission,
+  or treat the stamp + checked subtask as the dispatched signal and leave the move
+  off.
+- `source_task_id`/`source_project_id` did NOT persist on the board: the deployed
+  `rustyred-thg-mcp` predates the field (serde accept-and-ignore). They persist
+  once the mcp change deploys; verified offline by the runtime round-trip test.
+
+`--capture-once` was added to the daemon (`theorem-agentd --capture-once`) as the
+reusable, model-free way to run exactly this sweep with the operator's token.

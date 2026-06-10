@@ -10,6 +10,7 @@
 //! itself dedupes by idempotency_key, so a task that fails to move stays capturable
 //! without creating a duplicate job.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::config::CaptureConfig;
@@ -26,7 +27,7 @@ pub const TICKTICK: &str = "ticktick";
 pub const STAMP_PREFIX: &str = "[agentd] dispatched as ";
 
 /// One task converted to a job in a sweep.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CapturedTask {
     pub task_id: String,
     pub job_id: String,
@@ -35,7 +36,7 @@ pub struct CapturedTask {
 }
 
 /// Outcome of one Agent Queue sweep.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CaptureReport {
     pub project_id: String,
     pub captured: Vec<CapturedTask>,

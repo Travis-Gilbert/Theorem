@@ -190,7 +190,7 @@ fn relay_one_job(
 }
 
 /// The un-relayed milestones a job has reached, in relay order.
-pub fn relay_agenda(job: &JobView) -> Vec<Milestone> {
+fn relay_agenda(job: &JobView) -> Vec<Milestone> {
     let relayed = relayed_kinds(job);
     reached_milestones(job)
         .into_iter()
