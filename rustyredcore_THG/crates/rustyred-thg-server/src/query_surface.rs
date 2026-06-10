@@ -781,10 +781,7 @@ impl EdgeExecution {
     }
 }
 
-fn pattern_property_keys(
-    pattern: &NodePattern,
-    filter: Option<&PropertyFilter>,
-) -> Vec<String> {
+fn pattern_property_keys(pattern: &NodePattern, filter: Option<&PropertyFilter>) -> Vec<String> {
     let mut keys: Vec<String> = pattern.properties.keys().cloned().collect();
     if let Some(filter) = filter {
         keys.push(filter.key.clone());
@@ -831,7 +828,12 @@ fn execute_edge_anchor_left(
                     continue;
                 }
             }
-            rows.push(project_edge_row(&parsed.returns, edge_pattern, seed, &target)?);
+            rows.push(project_edge_row(
+                &parsed.returns,
+                edge_pattern,
+                seed,
+                &target,
+            )?);
             if rows.len() > parsed.limit {
                 break;
             }
@@ -2856,8 +2858,7 @@ mod tests {
         let body = PublicCypherBody {
             reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
-            query: "MATCH (a:File)-[:IMPORTS]->(b:File {path: $path}) RETURN a.path"
-                .to_string(),
+            query: "MATCH (a:File)-[:IMPORTS]->(b:File {path: $path}) RETURN a.path".to_string(),
             params: BTreeMap::from([(String::from("path"), json!("src/main.rs"))]),
             tx_id: None,
         };
@@ -2897,14 +2898,8 @@ mod tests {
             warm["stats"]["plan_candidate"],
             PLAN_CANDIDATE_EXPAND_RIGHT_IN
         );
-        assert_eq!(
-            warm["stats"]["plan_operation"],
-            "node_index_seek_expand_in"
-        );
-        assert_eq!(
-            warm["stats"]["plan_steering"]["abstained"],
-            json!(false)
-        );
+        assert_eq!(warm["stats"]["plan_operation"], "node_index_seek_expand_in");
+        assert_eq!(warm["stats"]["plan_steering"]["abstained"], json!(false));
         // The selected enumerated candidate returns the same row set.
         assert_eq!(warm["rows"], cold["rows"]);
 
@@ -3012,7 +3007,8 @@ mod tests {
         assert_eq!(lib_to_extra["proposed_edge_type"], "INFERRED_IMPORTS");
         assert_eq!(lib_to_extra["admission_tier"], "advisory_inferred");
         // Advisory only: the inferred edge was not materialized.
-        assert!(store.get_edge("edge:file:lib:INFERRED_IMPORTS:file:extra")
+        assert!(store
+            .get_edge("edge:file:lib:INFERRED_IMPORTS:file:extra")
             .unwrap()
             .is_none());
 

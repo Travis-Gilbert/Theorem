@@ -70,8 +70,7 @@ use crate::observability::{
 };
 use crate::query_surface::{
     execute_cypher_query_with_steering, execute_public_query, explain_cypher_query,
-    parse_tx_cypher_mutations,
-    resolve_tenant_id, PublicCypherBody, QuerySurfaceError,
+    parse_tx_cypher_mutations, resolve_tenant_id, PublicCypherBody, QuerySurfaceError,
 };
 use crate::state::{AppState, StoreAccessError, TenantGraphStore};
 
@@ -7132,7 +7131,13 @@ mod tests {
                 }],
             ),
         )]);
-        let config = state.mcp_config();
+        // harness_run returns the run plus its full lifecycle event log; a populated
+        // run exceeds the default MCP boundary budget and would be truncated into a
+        // tool_result_fetch handle (dropping the inline found/detail fields the poll
+        // below asserts on). Disable the budget so the poll reads the run inline,
+        // matching native_harness_run_transitions_round_trip_through_mcp.
+        let mut config = state.mcp_config();
+        config.tool_result_budget_bytes = 0;
         let response = maybe_handle_live_search_acquisition_mcp(
             &state,
             &config,
@@ -7160,9 +7165,13 @@ mod tests {
         assert_eq!(payload["run_id"], "search-run-async-test");
         assert_eq!(payload["poll"]["tool"], "harness_run");
 
+        // Poll until the spawned background task closes the run. The loop exits as
+        // soon as the run reports closed (typically the first iteration once the
+        // background task is scheduled); the generous ceiling only guards against
+        // slow task scheduling on a loaded CI host, so it never re-flakes.
         let mut run_payload = Value::Null;
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             let response = handle_mcp_request_with_context(
                 &state,
                 &config,

@@ -27,13 +27,12 @@ use rustyred_web::{
 };
 use serde_json::{json, Value};
 use theorem_harness_core::{
-    GroundedClaim, HeadInvocationError, JobSubmission, Priority, TransitionInput,
-    TransitionResult,
+    GroundedClaim, HeadInvocationError, JobSubmission, Priority, TransitionInput, TransitionResult,
 };
 use theorem_harness_runtime::{
     append_transition_from_store, load_events, load_run, run_composed_agent,
-    run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError,
-    JobNoteInput, ProviderHeadInvoker,
+    run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError, JobNoteInput,
+    ProviderHeadInvoker,
 };
 
 use crate::config::{Config, StorageMode};

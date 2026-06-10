@@ -131,14 +131,11 @@ impl PlanSteeringState {
             .expect("plan steering observations lock");
         observations
             .iter()
-            .filter(|((shape, _), accumulator)| {
-                shape == shape_key && accumulator.observations > 0
-            })
+            .filter(|((shape, _), accumulator)| shape == shape_key && accumulator.observations > 0)
             .map(|((_, candidate_id), accumulator)| {
                 let count = accumulator.observations as f64;
                 let mean = accumulator.total_cost / count;
-                let variance =
-                    (accumulator.total_cost_squared / count - mean * mean).max(0.0);
+                let variance = (accumulator.total_cost_squared / count - mean * mean).max(0.0);
                 PlanObservationMetrics {
                     candidate_id: candidate_id.clone(),
                     observations: accumulator.observations,
