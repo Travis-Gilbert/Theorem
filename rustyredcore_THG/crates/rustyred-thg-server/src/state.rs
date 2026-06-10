@@ -27,13 +27,12 @@ use rustyred_web::{
 };
 use serde_json::{json, Value};
 use theorem_harness_core::{
-    GroundedClaim, HeadInvocationError, JobSubmission, Priority, TransitionInput,
-    TransitionResult,
+    GroundedClaim, HeadInvocationError, JobSubmission, Priority, TransitionInput, TransitionResult,
 };
 use theorem_harness_runtime::{
     append_transition_from_store, load_events, load_run, run_composed_agent,
-    run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError,
-    JobNoteInput, ProviderHeadInvoker,
+    run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError, JobNoteInput,
+    ProviderHeadInvoker,
 };
 
 use crate::config::{Config, StorageMode};
@@ -77,6 +76,10 @@ pub struct AppState {
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
     fulltext_indexes: Arc<Mutex<FullTextIndexes>>,
+    /// Bao-style steered-optimizer observations: per query shape and
+    /// enumerated candidate, measured execution cost units. Read by the
+    /// Cypher query surface before choosing among native plan candidates.
+    pub plan_steering: Arc<crate::cypher::planner::PlanSteeringState>,
 }
 
 impl AppState {
@@ -114,6 +117,7 @@ impl AppState {
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            plan_steering: Arc::new(crate::cypher::planner::PlanSteeringState::default()),
         }
     }
 
@@ -1164,6 +1168,26 @@ fn now_millis() -> u64 {
 pub enum TenantGraphStore {
     RedCore(Arc<RedCoreTenantExecutor>),
     Redis(RedisGraphStore),
+}
+
+/// Read-only surface for the reflexive executor: lets the Cypher query
+/// surface join topology with the representation/adapter sidecars through
+/// the adapters crate without the tenant store becoming an adapter store.
+impl rustyred_thg_adapters::ReflexiveReadStore for TenantGraphStore {
+    fn read_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.get_node(id)
+    }
+
+    fn read_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.get_edge(id)
+    }
+
+    fn read_neighbors(
+        &self,
+        query: rustyred_thg_core::NeighborQuery,
+    ) -> GraphStoreResult<Vec<rustyred_thg_core::NeighborHit>> {
+        self.neighbors(query)
+    }
 }
 
 impl TenantGraphStore {

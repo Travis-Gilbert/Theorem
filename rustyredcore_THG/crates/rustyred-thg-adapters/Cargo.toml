@@ -6,7 +6,14 @@ description = "LoRA adapter catalog and routing over RustyRedCore-THG graph reco
 license = "MIT"
 rust-version = "1.85"
 
+[features]
+default = []
+# Enables the tensor/GPU Pairformer lane. Burn 0.21 requires rustc 1.92+.
+pairformer-burn-cubecl = ["dep:burn", "dep:cubecl"]
+
 [dependencies]
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "wgpu", "fusion", "cubecl", "autodiff"], optional = true }
+cubecl = { version = "0.10.0", default-features = false, features = ["std", "stdlib", "wgpu"], optional = true }

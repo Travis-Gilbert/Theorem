@@ -489,6 +489,13 @@ impl Default for McpServerConfig {
 
 pub const DEFAULT_TOOL_RESULT_BUDGET_BYTES: usize = 16 * 1024;
 
+/// Budget for harness run-detail tool results (the run plus its full lifecycle
+/// event log). The async-handoff contract advertises `harness_run` as its poll
+/// tool, so a populated run must be returned inline for realistic runs instead
+/// of truncating into a tool_result_fetch handle that drops the found/detail
+/// fields a poller reads. The fetch fallback still applies above this ceiling.
+pub const DEFAULT_HARNESS_TOOL_RESULT_BUDGET_BYTES: usize = 512 * 1024;
+
 const TOOL_RESULT_MARKER_RESERVED_BYTES: usize = 512;
 
 fn default_tool_result_budget_bytes() -> usize {
@@ -6876,11 +6883,16 @@ fn tool_result_error(payload: Value) -> Value {
 
 fn tool_result_budget_for(config: &McpServerConfig, tool_name: &str) -> usize {
     let family = tool_result_family(tool_name);
-    config
-        .tool_result_family_budgets
-        .get(family)
-        .copied()
-        .unwrap_or(config.tool_result_budget_bytes)
+    if let Some(budget) = config.tool_result_family_budgets.get(family).copied() {
+        return budget;
+    }
+    match family {
+        // harness_run is the advertised async-handoff poll tool; give the run-detail
+        // family enough room to return the run inline instead of truncating into a
+        // fetch handle. An explicit per-family config budget above still wins.
+        "harness" => DEFAULT_HARNESS_TOOL_RESULT_BUDGET_BYTES,
+        _ => config.tool_result_budget_bytes,
+    }
 }
 
 fn tool_result_family(tool_name: &str) -> &'static str {
@@ -6893,6 +6905,7 @@ fn tool_result_family(tool_name: &str) -> &'static str {
         | "self_recall_archive"
         | "theorem_harness_self_recall_archive" => "recall",
         "coordination_context" | "theorem_harness_coordination_context" => "coordination",
+        "harness_run" | "theorem_harness_run" => "harness",
         name if name.contains("graph") || name.contains("neighbors") => "graph",
         _ => "default",
     }
@@ -10673,6 +10686,28 @@ mod tests {
         .unwrap();
         assert_eq!(fetched["offset"], json!(0));
         assert_eq!(fetched["text"].as_str().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn harness_run_results_use_the_generous_harness_budget() {
+        // harness_run is the advertised async-handoff poll tool: a populated run
+        // (the run plus its full event log) must stay inline rather than truncate
+        // into a fetch handle that drops the found/detail fields the poll reads.
+        let config = McpServerConfig {
+            tool_result_budget_bytes: 1024,
+            ..McpServerConfig::default()
+        };
+        let payload = json!({ "found": true, "detail": { "blob": "x".repeat(40_000) } });
+        let result = super::tool_result_with_budget(payload, &config, "harness_run");
+        assert_eq!(result["structuredContent"]["found"], json!(true));
+        assert!(result["structuredContent"].get("fetch_handle").is_none());
+        assert_ne!(result["structuredContent"]["truncated"], json!(true));
+
+        // A non-harness tool with the same oversized payload still truncates at the
+        // default budget, so the larger ceiling is scoped to the harness poll family.
+        let payload = json!({ "found": true, "detail": { "blob": "y".repeat(40_000) } });
+        let other = super::tool_result_with_budget(payload, &config, "rustyred_thg_graph_query");
+        assert_eq!(other["structuredContent"]["truncated"], json!(true));
     }
 
     #[test]
