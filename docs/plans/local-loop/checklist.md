@@ -62,11 +62,21 @@ Status legend: [x] done + verified, [~] partial, [ ] not done.
 ## Burn serving path (the one real gap)
 
 - [x] CHK018 llama-server stays the production loop (config `provider = "openai-compatible"`).
-- [~] CHK019-022 See implementation-notes "Burn serving path". The openai-compatible
-  seam is reversible per-config today; a Burn server behind it is a from-scratch
-  inference sub-project (no burn-lm/CubeK/llama-burn present in-repo) that the plan
-  sequences last ("once the loop is generating traces"). Status and the constrained-
-  decoding plan are recorded in the notes rather than silently cut.
+- [ ] CHK019 Burn server behind the openai-compatible seam: needs the external
+  `burn-lm` + `CubeK` crates (not in-repo) and a Gemma inference stack. Sequenced
+  next per the plan's own build order. The reversible seam (per-config base_url
+  swap, llama-server left installed) already exists.
+- [x] CHK020 Constrained decoding: `constrained_decoding.rs` compiles the
+  `ToolCatalog` into a token-level logit mask (`ToolGrammar::token_mask`), the
+  catalog-specific part being the enumerated tool names. 10 tests green, incl. the
+  "every prefix of a valid envelope is viable" invariant and the mask projection.
+  Wiring it into the Burn sampler is the remaining step once CHK019 lands.
+- [ ] CHK021 Import Gemma 4 12B safetensors (llama-burn reference shape): on-disk
+  weights are GGUF, not safetensors; needs conversion + the Burn model. Blocked on
+  CHK019.
+- [~] CHK022 Parity before cutover: the per-config reversible seam is in place;
+  parity itself needs a working Burn server (CHK019) + a GPU run. Not achievable in
+  this environment (no burn-lm/CubeK/weights/GPU); recorded, not cut.
 
 ## Tenant (before multi-user)
 

@@ -7,6 +7,7 @@
 
 pub mod capture;
 pub mod config;
+pub mod constrained_decoding;
 pub mod ledger;
 pub mod mcp;
 pub mod model;
