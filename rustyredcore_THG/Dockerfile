@@ -4,7 +4,12 @@
 # `rustyred-thg-server` (was `thg-product-server` before the C1 cutover
 # at commit 26282991) and copy-renaming the output.
 
-FROM rust:1.88-bookworm AS builder
+# Rust 1.95: rustyred-thg-server enables the pairformer-burn-cubecl lane, and
+# burn 0.21 / cubecl 0.10 require rustc >= 1.92. Cargo enforces rust-version at
+# resolution time, so the previous rust:1.88 image failed
+# `cargo build -p rustyred-thg-server --release` before compiling. Keep this at
+# >= 1.92 (1.95 matches the repo's servo rust-toolchain pin).
+FROM rust:1.95-bookworm AS builder
 
 WORKDIR /app
 
