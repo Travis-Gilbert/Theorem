@@ -326,6 +326,7 @@ mod tests {
     ) -> CapabilityPack {
         CapabilityPack {
             tenant_slug: "default".to_string(),
+            origin_tenant_slug: String::new(),
             pack_content_hash: hash.to_string(),
             kind: kind.to_string(),
             title: title.to_string(),

@@ -2724,7 +2724,12 @@ fn write_intent_payload(
             summary: required_text_any(arguments, &["summary"], "write_intent")?,
             footprint: string_array_any(
                 arguments,
-                &["footprint", "touched_files", "claimed_files", "claimedFiles"],
+                &[
+                    "footprint",
+                    "touched_files",
+                    "claimed_files",
+                    "claimedFiles",
+                ],
             ),
             expected_completion: argument_text(
                 arguments,
@@ -3521,6 +3526,7 @@ fn capability_pack_from_arguments(
 
     Ok(CapabilityPack {
         tenant_slug,
+        origin_tenant_slug: String::new(),
         pack_content_hash,
         kind,
         title,

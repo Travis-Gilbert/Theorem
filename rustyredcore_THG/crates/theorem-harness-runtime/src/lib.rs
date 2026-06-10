@@ -112,6 +112,7 @@ pub use skill_pack::{
 };
 pub use writing_style::{
     check_boundary_text, enrich_binding_transition, enrich_run_transition,
-    metadata_with_style_receipt, register_for_boundary, summarize_style_receipts_for_fitness,
-    BoundaryStyleReceipt, WritingStyleFitnessSummary, STYLE_FITNESS_FIELD, STYLE_RECEIPTS_FIELD,
+    metadata_with_style_receipt, prepare_run_transition, register_for_boundary,
+    summarize_style_receipts_for_fitness, BoundaryStyleReceipt, WritingStyleFitnessSummary,
+    STYLE_FITNESS_FIELD, STYLE_RECEIPTS_FIELD, WRITING_ENGINEERING_STATUS_FIELD,
 };

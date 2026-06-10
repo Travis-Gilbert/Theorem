@@ -4,7 +4,7 @@ use crate::memory::{
     encode_memory, load_memory_document, memory_document_node_id, MemoryDocumentState,
     MemoryWriteInput,
 };
-use crate::skill_pack::{skill_pack_node_id, SkillPackState};
+use crate::skill_pack::{get_skill_pack, skill_pack_node_id, SkillPackGetInput, SkillPackState};
 use crate::writing_style::{summarize_style_receipts_for_fitness, STYLE_RECEIPTS_FIELD};
 use crate::{HarnessRuntimeError, RuntimeResult};
 use rustyred_thg_core::{GraphStore, NodeQuery, NodeRecord};
@@ -465,14 +465,16 @@ fn apply_usage_fitness<S: GraphStore>(
     let mut proposals = Vec::new();
     let mut demotions = Vec::new();
     for pack in used.packs.values() {
-        let Some(node) = store
-            .get_node(&skill_pack_node_id(tenant, &pack.pack_content_hash))
-            .cloned()
-        else {
+        let Ok(mut state) = get_skill_pack(
+            store,
+            SkillPackGetInput {
+                tenant_slug: tenant.to_string(),
+                pack_id: pack.pack_id.clone(),
+                pack_content_hash: pack.pack_content_hash.clone(),
+            },
+        ) else {
             continue;
         };
-        let mut state: SkillPackState = serde_json::from_value(node.properties.clone())
-            .map_err(|error| HarnessRuntimeError::Deserialization(error.to_string()))?;
         let gate_axes = gate_axes_for_pack(&pack.pack_content_hash, events);
         update_pack_compound_metadata(
             &mut state,
@@ -1757,6 +1759,40 @@ mod tests {
             .any(|record| record.title == "Compound canonical demotion"));
     }
 
+    #[test]
+    fn run_created_registry_status_drives_next_close_receipt_action() {
+        let mut store = InMemoryGraphStore::new();
+        publish_writing_pack(&mut store, "advisory", true);
+
+        close_successful_run_for_tenant(
+            &mut store,
+            "Travis-Gilbert",
+            "run-status-bridge",
+            "Encode writing engineering",
+            "Patch done. Tests pass.",
+            &["must-preserve-id"],
+            &[],
+        );
+
+        let run = crate::event_log::load_run(&store, "run-status-bridge")
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.scope["writing_engineering_status"], json!("advisory"));
+        assert_eq!(
+            run.scope["writing_engineering_origin_tenant"],
+            json!("default")
+        );
+
+        let close = load_events(&store, "run-status-bridge")
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "RUN.CLOSED")
+            .unwrap();
+        let receipt = &close.payload[STYLE_RECEIPTS_FIELD][0];
+        assert_eq!(receipt["pack_status"], json!("advisory"));
+        assert_eq!(receipt["action"], json!("advisory_context"));
+    }
+
     fn publish_writing_pack(store: &mut InMemoryGraphStore, status: &str, benchmark_passed: bool) {
         let mut pack = writing_engineering_pack_payload(None);
         pack["metadata"]["benchmark_gate_passed"] = json!(benchmark_passed);
@@ -1781,6 +1817,26 @@ mod tests {
         source_identifiers: &[&str],
         memory_doc_ids: &[&str],
     ) {
+        close_successful_run_for_tenant(
+            store,
+            "default",
+            run_id,
+            task,
+            close_summary,
+            source_identifiers,
+            memory_doc_ids,
+        );
+    }
+
+    fn close_successful_run_for_tenant(
+        store: &mut InMemoryGraphStore,
+        tenant_slug: &str,
+        run_id: &str,
+        task: &str,
+        close_summary: &str,
+        source_identifiers: &[&str],
+        memory_doc_ids: &[&str],
+    ) {
         append_transition_from_store(
             store,
             transition(
@@ -1790,7 +1846,7 @@ mod tests {
                     "task": task,
                     "actor": "codex",
                     "scope": {
-                        "tenant_slug": "default",
+                        "tenant_slug": tenant_slug,
                         "repo": "Theorem",
                         "agent_host": "codex"
                     }
@@ -1925,8 +1981,7 @@ mod tests {
                 json!({
                     "summary": close_summary,
                     "closed_by": "codex",
-                    "source_identifiers": source_identifiers,
-                    "writing_engineering_status": "canonical"
+                    "source_identifiers": source_identifiers
                 }),
             ),
         )

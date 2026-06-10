@@ -156,6 +156,8 @@ pub struct SkillPackApplyInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct SkillPackState {
     pub tenant_slug: String,
+    #[serde(default)]
+    pub origin_tenant_slug: String,
     pub pack_id: String,
     pub pack_content_hash: String,
     pub kind: String,
@@ -253,6 +255,7 @@ pub fn publish_skill_pack<S: SkillPackGraphStore>(
     let artifact_hashes = resolve_artifact_hashes(&pack, &metadata, input.artifact_hashes);
     let state = SkillPackState {
         tenant_slug: tenant.clone(),
+        origin_tenant_slug: tenant.clone(),
         pack_id: pack_id(&pack, &pack_content_hash),
         pack_content_hash: pack_content_hash.clone(),
         kind: pack
@@ -317,6 +320,7 @@ pub fn list_skill_packs<S: SkillPackGraphStore>(
     input: SkillPackListInput,
 ) -> SkillPackResult<Vec<SkillPackState>> {
     let tenant = normalize_tenant(&input.tenant_slug);
+    let tenants = read_tenant_order(&tenant);
     let status = input.status.trim().to_lowercase();
     let limit = input.limit.clamp(1, MAX_PACK_LIST_LIMIT);
     let mut packs = store
@@ -324,18 +328,20 @@ pub fn list_skill_packs<S: SkillPackGraphStore>(
         .into_iter()
         .map(skill_pack_from_node)
         .collect::<SkillPackResult<Vec<_>>>()?;
-    packs.retain(|pack| pack.tenant_slug == tenant);
+    packs.retain(|pack| tenants.contains(&normalize_tenant(&pack.tenant_slug)));
     if !status.is_empty() {
         packs.retain(|pack| pack.status == status);
     } else if !input.include_retired {
         packs.retain(|pack| pack.status != "retired");
     }
     packs.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
+        tenant_priority(&tenants, &left.tenant_slug)
+            .cmp(&tenant_priority(&tenants, &right.tenant_slug))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
             .then_with(|| left.pack_id.cmp(&right.pack_id))
     });
+    let mut seen_hashes = BTreeSet::new();
+    packs.retain(|pack| seen_hashes.insert(pack.pack_content_hash.clone()));
     packs.truncate(limit);
     Ok(packs)
 }
@@ -345,6 +351,7 @@ pub fn get_skill_pack<S: SkillPackGraphStore>(
     input: SkillPackGetInput,
 ) -> SkillPackResult<SkillPackState> {
     let tenant = normalize_tenant(&input.tenant_slug);
+    let tenants = read_tenant_order(&tenant);
     let key = input
         .pack_content_hash
         .trim()
@@ -356,8 +363,12 @@ pub fn get_skill_pack<S: SkillPackGraphStore>(
             message: "skill_get requires pack_id or pack_content_hash".to_string(),
         });
     }
-    if let Some(node) = store.skill_pack_get_node(&skill_pack_node_id(&tenant, &key))? {
-        return skill_pack_from_node(node);
+    for candidate_tenant in &tenants {
+        if let Some(node) =
+            store.skill_pack_get_node(&skill_pack_node_id(candidate_tenant, &key))?
+        {
+            return skill_pack_from_node(node);
+        }
     }
     let packs = list_skill_packs(
         store,
@@ -476,8 +487,12 @@ fn skill_pack_use_receipt_edge(
 }
 
 fn skill_pack_from_node(node: NodeRecord) -> SkillPackResult<SkillPackState> {
-    serde_json::from_value::<SkillPackState>(node.properties)
-        .map_err(|error| SkillPackError::Deserialization(error.to_string()))
+    let mut state = serde_json::from_value::<SkillPackState>(node.properties)
+        .map_err(|error| SkillPackError::Deserialization(error.to_string()))?;
+    if state.origin_tenant_slug.trim().is_empty() {
+        state.origin_tenant_slug = state.tenant_slug.clone();
+    }
+    Ok(state)
 }
 
 fn persist_hash_node_and_edge<S: SkillPackGraphStore>(
@@ -1148,6 +1163,23 @@ fn normalize_tenant(tenant: &str) -> String {
     }
 }
 
+fn read_tenant_order(tenant: &str) -> Vec<String> {
+    let tenant = normalize_tenant(tenant);
+    if tenant == DEFAULT_TENANT {
+        vec![tenant]
+    } else {
+        vec![tenant, DEFAULT_TENANT.to_string()]
+    }
+}
+
+fn tenant_priority(tenants: &[String], tenant: &str) -> usize {
+    let tenant = normalize_tenant(tenant);
+    tenants
+        .iter()
+        .position(|candidate| candidate == &tenant)
+        .unwrap_or(usize::MAX)
+}
+
 fn timestamp_or_now(value: &str) -> String {
     let value = value.trim();
     if !value.is_empty() {
@@ -1276,6 +1308,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(packs.len(), 1);
+    }
+
+    #[test]
+    fn personal_tenant_reads_union_with_default_commons() {
+        let mut store = InMemoryGraphStore::new();
+        let mut commons = sample_pack();
+        commons["id"] = json!("commons-pack");
+        commons["metadata"]["pack_content_hash"] = json!("hash-commons");
+        publish_skill_pack(
+            &mut store,
+            SkillPackPublishInput {
+                tenant_slug: "default".to_string(),
+                status: "advisory".to_string(),
+                pack: commons,
+                created_at: "t1".to_string(),
+                ..SkillPackPublishInput::default()
+            },
+        )
+        .unwrap();
+        publish_skill_pack(
+            &mut store,
+            SkillPackPublishInput {
+                tenant_slug: "tenant-a".to_string(),
+                status: "validated".to_string(),
+                pack: sample_pack(),
+                created_at: "t2".to_string(),
+                ..SkillPackPublishInput::default()
+            },
+        )
+        .unwrap();
+
+        let packs = list_skill_packs(
+            &store,
+            SkillPackListInput {
+                tenant_slug: "tenant-a".to_string(),
+                limit: 10,
+                ..SkillPackListInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[0].tenant_slug, "tenant-a");
+        assert_eq!(packs[1].tenant_slug, "default");
+        assert_eq!(packs[1].origin_tenant_slug, "default");
+
+        let loaded = get_skill_pack(
+            &store,
+            SkillPackGetInput {
+                tenant_slug: "tenant-a".to_string(),
+                pack_content_hash: "hash-commons".to_string(),
+                ..SkillPackGetInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(loaded.tenant_slug, "default");
+        assert_eq!(loaded.status, "advisory");
+    }
+
+    #[test]
+    fn writes_stay_under_calling_tenant() {
+        let mut store = InMemoryGraphStore::new();
+        publish_skill_pack(
+            &mut store,
+            SkillPackPublishInput {
+                tenant_slug: "tenant-a".to_string(),
+                status: "validated".to_string(),
+                pack: sample_pack(),
+                ..SkillPackPublishInput::default()
+            },
+        )
+        .unwrap();
+
+        let private = get_skill_pack(
+            &store,
+            SkillPackGetInput {
+                tenant_slug: "tenant-a".to_string(),
+                pack_content_hash: "hash-pack".to_string(),
+                ..SkillPackGetInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(private.tenant_slug, "tenant-a");
+
+        let missing_from_default = get_skill_pack(
+            &store,
+            SkillPackGetInput {
+                tenant_slug: "default".to_string(),
+                pack_content_hash: "hash-pack".to_string(),
+                ..SkillPackGetInput::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing_from_default,
+            SkillPackError::NotFound { .. }
+        ));
     }
 
     #[test]

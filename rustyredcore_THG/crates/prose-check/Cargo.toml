@@ -10,3 +10,7 @@ rust-version = "1.85"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+
+[[bin]]
+name = "prose-check"
+path = "src/bin/prose-check.rs"

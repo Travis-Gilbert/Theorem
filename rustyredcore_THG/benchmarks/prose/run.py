@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import shlex
 import statistics
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -85,6 +88,59 @@ def response_for(prompt: dict, mode: str) -> str:
     }[mode]
 
 
+def live_prompt_for(prompt: dict, mode: str) -> str:
+    identifiers = ", ".join(prompt["identifiers"])
+    if mode == "normal":
+        return prompt["prompt"]
+    directive = (RULES_DIR / "directive.txt").read_text().strip()
+    register_note = {
+        "plain": "Use plain register.",
+        "spare": "Use spare register.",
+        "wire": "Use wire register.",
+        "caveman-full": "Use the tightest wire-compatible register while preserving every identifier.",
+    }[mode]
+    return (
+        f"{directive}\n\n"
+        f"{register_note}\n"
+        f"Keep these identifiers exact: {identifiers}\n\n"
+        f"Task: {prompt['prompt']}"
+    )
+
+
+def live_command(template: str | None) -> list[str]:
+    raw = template or os.environ.get("PROSE_BENCH_COMMAND", "").strip()
+    if raw:
+        return shlex.split(raw)
+    return [os.environ.get("CLAUDE_BIN", "claude"), "-p"]
+
+
+def call_live_model(prompt_text: str, command_template: list[str], timeout: int) -> str:
+    if any("{prompt}" in arg for arg in command_template):
+        command = [arg.replace("{prompt}", prompt_text) for arg in command_template]
+    else:
+        command = [*command_template, prompt_text]
+    try:
+        output = subprocess.run(
+            command,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except FileNotFoundError as error:
+        raise SystemExit(
+            f"live model command not found: {command[0]}. Set --live-command or PROSE_BENCH_COMMAND."
+        ) from error
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(
+            f"live model command failed with exit {error.returncode}: {error.stderr.strip()}"
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(f"live model command timed out after {timeout}s") from error
+    return output.stdout.strip()
+
+
 def estimate_tokens(text: str) -> int:
     words = re.findall(r"[A-Za-z0-9_./:@'()-]+", text)
     punctuation = len(re.findall(r"[^\w\s]", text))
@@ -122,7 +178,13 @@ def syllable_count(word: str) -> int:
     return max(1, count)
 
 
-def run_benchmark(prompts: list[dict], trials: int) -> list[dict]:
+def run_benchmark(
+    prompts: list[dict],
+    trials: int,
+    mode_kind: str,
+    command_template: list[str] | None = None,
+    live_timeout: int = 120,
+) -> list[dict]:
     clutter_phrases = load_clutter_phrases()
     rows = []
     for prompt in prompts:
@@ -137,7 +199,14 @@ def run_benchmark(prompts: list[dict], trials: int) -> list[dict]:
         for mode in MODES:
             trials_out = []
             for trial in range(1, trials + 1):
-                text = response_for(prompt, mode)
+                if mode_kind == "live":
+                    text = call_live_model(
+                        live_prompt_for(prompt, mode),
+                        command_template or live_command(None),
+                        live_timeout,
+                    )
+                else:
+                    text = response_for(prompt, mode)
                 trials_out.append(
                     {
                         "trial": trial,
@@ -223,7 +292,13 @@ def gate_passed(summary: dict) -> bool:
     )
 
 
-def save_results(results: list[dict], summary: dict, trials: int) -> Path:
+def save_results(
+    results: list[dict],
+    summary: dict,
+    trials: int,
+    mode_kind: str,
+    command_template: list[str] | None = None,
+) -> Path:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = RESULTS_DIR / f"writing_engineering_{timestamp}.json"
@@ -236,7 +311,9 @@ def save_results(results: list[dict], summary: dict, trials: int) -> Path:
             "modes": MODES,
             "pack_content_hash": pack_hash(),
             "tokenizer": "cl100k_base_estimate",
-            "offline_fixture": True,
+            "offline_fixture": mode_kind == "fixture",
+            "benchmark_mode": mode_kind,
+            "live_command": command_template if mode_kind == "live" else None,
         },
         "summary": summary,
         "raw": results,
@@ -247,20 +324,34 @@ def save_results(results: list[dict], summary: dict, trials: int) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark writing-engineering prose modes")
+    parser.add_argument("--mode", choices=["fixture", "live"], default="fixture")
     parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--live-command")
+    parser.add_argument("--live-timeout", type=int, default=120)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     prompts = load_prompts()
+    command_template = live_command(args.live_command) if args.mode == "live" else None
     if args.dry_run:
         print(f"Prompts: {len(prompts)}")
         print(f"Modes: {', '.join(MODES)}")
         print(f"Trials: {args.trials}")
-        print(f"API calls: 0 (offline fixture mode)")
+        api_calls = 0 if args.mode == "fixture" else len(prompts) * len(MODES) * args.trials
+        print(f"Mode: {args.mode}")
+        print(f"API calls: {api_calls}")
+        if command_template is not None:
+            print(f"Live command: {' '.join(command_template)}")
         print(f"Pack hash: {pack_hash()}")
         return
-    results = run_benchmark(prompts, args.trials)
+    results = run_benchmark(
+        prompts,
+        args.trials,
+        args.mode,
+        command_template,
+        args.live_timeout,
+    )
     summary = summarize(results)
-    path = save_results(results, summary, args.trials)
+    path = save_results(results, summary, args.trials, args.mode, command_template)
     print(json.dumps({"results": str(path), "summary": summary}, indent=2))
     if not summary["gate_passed"]:
         raise SystemExit(1)
