@@ -10,6 +10,7 @@ use theorem_harness_core::stable_value_hash;
 pub const PACK_LABEL: &str = "CapabilityPack";
 pub const PACK_SOURCE_EDGE: &str = "PACK_SOURCE";
 pub const PACK_ARTIFACT_EDGE: &str = "PACK_ARTIFACT";
+const DEFAULT_TENANT: &str = "default";
 const PACK_QUERY_LIMIT: usize = 10_000;
 
 /// The kind discriminator carried by a `CapabilityPackSpec` JSON contract. `CapabilityPackSpec`
@@ -101,6 +102,8 @@ impl Default for PackExposure {
 pub struct CapabilityPack {
     pub tenant_slug: String,
     #[serde(default)]
+    pub origin_tenant_slug: String,
+    #[serde(default)]
     pub pack_content_hash: String,
     #[serde(default)]
     pub kind: String,
@@ -180,10 +183,27 @@ impl<T: GraphStore> EnsembleGraphStore for T {
 fn normalize_tenant(tenant: &str) -> String {
     let trimmed = tenant.trim();
     if trimmed.is_empty() {
-        "default".to_string()
+        DEFAULT_TENANT.to_string()
     } else {
         trimmed.to_string()
     }
+}
+
+fn read_tenant_order(tenant: &str) -> Vec<String> {
+    let tenant = normalize_tenant(tenant);
+    if tenant == DEFAULT_TENANT {
+        vec![tenant]
+    } else {
+        vec![tenant, DEFAULT_TENANT.to_string()]
+    }
+}
+
+fn tenant_priority(tenants: &[String], tenant: &str) -> usize {
+    let tenant = normalize_tenant(tenant);
+    tenants
+        .iter()
+        .position(|candidate| candidate == &tenant)
+        .unwrap_or(usize::MAX)
 }
 
 /// Deterministic node id for a registered pack.
@@ -224,6 +244,9 @@ pub fn register_pack<S: EnsembleGraphStore>(
     }
     let tenant = normalize_tenant(&pack.tenant_slug);
     pack.tenant_slug = tenant.clone();
+    if pack.origin_tenant_slug.trim().is_empty() {
+        pack.origin_tenant_slug = tenant.clone();
+    }
     if pack.title.trim().is_empty() {
         pack.title = text_at(&pack.spec, &["title", "name"]);
     }
@@ -286,15 +309,13 @@ pub fn get_pack<S: EnsembleGraphStore>(
     tenant: &str,
     pack_content_hash: &str,
 ) -> EnsembleResult<Option<CapabilityPack>> {
-    let node_id = pack_node_id(tenant, pack_content_hash);
-    match store.pack_get_node(&node_id)? {
-        Some(node) => {
-            let pack: CapabilityPack = serde_json::from_value(node.properties)
-                .map_err(|e| EnsembleError::InvalidPack(e.to_string()))?;
-            Ok(Some(pack))
+    for candidate_tenant in read_tenant_order(tenant) {
+        let node_id = pack_node_id(&candidate_tenant, pack_content_hash);
+        if let Some(node) = store.pack_get_node(&node_id)? {
+            return Ok(Some(pack_from_node(node)?));
         }
-        None => Ok(None),
     }
+    Ok(None)
 }
 
 /// List registered packs for a tenant, optionally filtered to a single [`PackKind`]. Queries by the
@@ -307,20 +328,35 @@ pub fn list_packs<S: EnsembleGraphStore>(
     tenant: &str,
     kind: Option<PackKind>,
 ) -> EnsembleResult<Vec<CapabilityPack>> {
-    let want_tenant = normalize_tenant(tenant);
+    let tenants = read_tenant_order(tenant);
     let nodes =
         store.pack_query_nodes(NodeQuery::label(PACK_LABEL).with_limit(PACK_QUERY_LIMIT))?;
     let mut packs: Vec<CapabilityPack> = nodes
         .into_iter()
-        .filter_map(|node| serde_json::from_value::<CapabilityPack>(node.properties).ok())
-        .filter(|pack| normalize_tenant(&pack.tenant_slug) == want_tenant)
+        .filter_map(|node| pack_from_node(node).ok())
+        .filter(|pack| tenants.contains(&normalize_tenant(&pack.tenant_slug)))
         .filter(|pack| match kind {
             Some(want) => PackKind::parse(&pack.kind) == Some(want),
             None => true,
         })
         .collect();
-    packs.sort_by(|a, b| a.pack_content_hash.cmp(&b.pack_content_hash));
+    packs.sort_by(|a, b| {
+        tenant_priority(&tenants, &a.tenant_slug)
+            .cmp(&tenant_priority(&tenants, &b.tenant_slug))
+            .then_with(|| a.pack_content_hash.cmp(&b.pack_content_hash))
+    });
+    let mut seen_hashes = std::collections::BTreeSet::new();
+    packs.retain(|pack| seen_hashes.insert(pack.pack_content_hash.clone()));
     Ok(packs)
+}
+
+fn pack_from_node(node: NodeRecord) -> EnsembleResult<CapabilityPack> {
+    let mut pack: CapabilityPack = serde_json::from_value(node.properties)
+        .map_err(|e| EnsembleError::InvalidPack(e.to_string()))?;
+    if pack.origin_tenant_slug.trim().is_empty() {
+        pack.origin_tenant_slug = pack.tenant_slug.clone();
+    }
+    Ok(pack)
 }
 
 fn text_at(spec: &Value, keys: &[&str]) -> String {
@@ -351,6 +387,7 @@ mod tests {
     fn pack_from(spec: Value) -> CapabilityPack {
         CapabilityPack {
             tenant_slug: "default".to_string(),
+            origin_tenant_slug: String::new(),
             pack_content_hash: String::new(),
             kind: String::new(),
             title: String::new(),
@@ -428,5 +465,42 @@ mod tests {
 
         let packs = list_packs(&store, "default", Some(PackKind::Skill)).expect("list");
         assert_eq!(packs.len(), 125);
+    }
+
+    #[test]
+    fn list_packs_unions_personal_tenant_with_default_commons() {
+        let mut store = InMemoryGraphStore::new();
+        register_pack(&mut store, pack_from(skill_spec())).unwrap();
+
+        let mut personal = pack_from(json!({
+            "kind": "skill",
+            "title": "Tenant Skill",
+            "capabilities": ["private"]
+        }));
+        personal.tenant_slug = "tenant-a".to_string();
+        personal.pack_content_hash = "personal-hash".to_string();
+        register_pack(&mut store, personal).unwrap();
+
+        let packs = list_packs(&store, "tenant-a", Some(PackKind::Skill)).expect("list");
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[0].tenant_slug, "tenant-a");
+        assert_eq!(packs[1].tenant_slug, "default");
+        assert_eq!(packs[1].origin_tenant_slug, "default");
+
+        let default_only = list_packs(&store, "default", Some(PackKind::Skill)).expect("list");
+        assert_eq!(default_only.len(), 1);
+        assert_eq!(default_only[0].tenant_slug, "default");
+    }
+
+    #[test]
+    fn get_pack_falls_back_to_default_commons() {
+        let mut store = InMemoryGraphStore::new();
+        let registered = register_pack(&mut store, pack_from(skill_spec())).unwrap();
+
+        let fetched = get_pack(&store, "tenant-a", &registered.pack_content_hash)
+            .expect("get")
+            .expect("present");
+        assert_eq!(fetched.tenant_slug, "default");
+        assert_eq!(fetched.origin_tenant_slug, "default");
     }
 }

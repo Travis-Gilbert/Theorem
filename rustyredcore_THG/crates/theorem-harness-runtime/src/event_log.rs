@@ -76,6 +76,7 @@ pub fn append_transition<S: GraphStore>(
     state: Option<RunState>,
     transition: TransitionInput,
 ) -> RuntimeResult<TransitionResult> {
+    let transition = writing_style::prepare_run_transition(store, state.as_ref(), transition);
     let transition = writing_style::enrich_run_transition(transition);
     let result = apply_transition(state, transition)?;
     persist_transition_result(store, &result)?;

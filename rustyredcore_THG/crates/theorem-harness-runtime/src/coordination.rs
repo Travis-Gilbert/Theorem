@@ -120,7 +120,12 @@ pub struct WriteIntentInput {
     pub status: String,
     #[serde(default)]
     pub summary: String,
-    #[serde(default, alias = "claimed_files", alias = "claimedFiles", alias = "touched_files")]
+    #[serde(
+        default,
+        alias = "claimed_files",
+        alias = "claimedFiles",
+        alias = "touched_files"
+    )]
     pub footprint: Vec<String>,
     #[serde(default)]
     pub expected_completion: String,
@@ -298,7 +303,12 @@ pub struct CoordinationIntentState {
     pub actor_id: String,
     pub status: String,
     pub summary: String,
-    #[serde(default, alias = "claimed_files", alias = "claimedFiles", alias = "touched_files")]
+    #[serde(
+        default,
+        alias = "claimed_files",
+        alias = "claimedFiles",
+        alias = "touched_files"
+    )]
     pub footprint: Vec<String>,
     #[serde(default)]
     pub expected_completion: String,

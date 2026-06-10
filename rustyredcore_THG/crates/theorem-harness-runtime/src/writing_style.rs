@@ -1,10 +1,12 @@
+use crate::skill_pack::{get_skill_pack, SkillPackGetInput, SkillPackGraphStore};
 use prose_check::{check, pack_hash, Register, StyleReceipt, PACK_ID};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use theorem_harness_core::{BindingTransitionInput, Payload, TransitionInput};
+use serde_json::{json, Map, Value};
+use theorem_harness_core::{BindingTransitionInput, Payload, RunState, TransitionInput};
 
 pub const STYLE_RECEIPTS_FIELD: &str = "style_receipts";
 pub const STYLE_FITNESS_FIELD: &str = "writing_engineering_fitness";
+pub const WRITING_ENGINEERING_STATUS_FIELD: &str = "writing_engineering_status";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoundaryStyleReceipt {
@@ -28,6 +30,19 @@ pub struct WritingStyleFitnessSummary {
     pub average_reduction: f32,
     pub last_register: String,
     pub last_hard_axis_failed: bool,
+}
+
+pub fn prepare_run_transition<S: SkillPackGraphStore>(
+    store: &S,
+    state: Option<&RunState>,
+    mut transition: TransitionInput,
+) -> TransitionInput {
+    if transition.event_type == "RUN.CREATED" {
+        stamp_run_created_status(store, &mut transition.payload);
+    } else if run_boundary_text(&transition.event_type, &transition.payload).is_some() {
+        carry_status_from_run_scope(state, &mut transition.payload);
+    }
+    transition
 }
 
 pub fn enrich_run_transition(mut transition: TransitionInput) -> TransitionInput {
@@ -77,6 +92,107 @@ pub fn metadata_with_style_receipt(
         pack_status,
     );
     metadata
+}
+
+fn stamp_run_created_status<S: SkillPackGraphStore>(store: &S, payload: &mut Payload) {
+    let scope = payload
+        .entry("scope".to_string())
+        .or_insert_with(|| json!({}));
+    if !scope.is_object() {
+        *scope = json!({});
+    }
+    let Some(scope) = scope.as_object_mut() else {
+        return;
+    };
+    let tenant = first_text(
+        scope,
+        &[
+            "tenant_slug",
+            "tenantSlug",
+            "tenant",
+            "tenant_id",
+            "tenantId",
+        ],
+    )
+    .unwrap_or_else(|| "default".to_string());
+    match get_skill_pack(
+        store,
+        SkillPackGetInput {
+            tenant_slug: tenant,
+            pack_id: PACK_ID.to_string(),
+            pack_content_hash: pack_hash(),
+        },
+    ) {
+        Ok(pack) => {
+            scope.insert(
+                WRITING_ENGINEERING_STATUS_FIELD.to_string(),
+                Value::String(normalize_pack_status(&pack.status)),
+            );
+            scope.insert(
+                "writing_engineering_status_source".to_string(),
+                Value::String("registry".to_string()),
+            );
+            scope.insert(
+                "writing_engineering_pack_id".to_string(),
+                Value::String(pack.pack_id),
+            );
+            scope.insert(
+                "writing_engineering_pack_hash".to_string(),
+                Value::String(pack.pack_content_hash),
+            );
+            scope.insert(
+                "writing_engineering_origin_tenant".to_string(),
+                Value::String(if pack.origin_tenant_slug.trim().is_empty() {
+                    pack.tenant_slug
+                } else {
+                    pack.origin_tenant_slug
+                }),
+            );
+        }
+        Err(error) => {
+            scope.insert(
+                WRITING_ENGINEERING_STATUS_FIELD.to_string(),
+                Value::String("shadow".to_string()),
+            );
+            scope.insert(
+                "writing_engineering_status_source".to_string(),
+                Value::String("fallback".to_string()),
+            );
+            scope.insert(
+                "writing_engineering_pack_id".to_string(),
+                Value::String(PACK_ID.to_string()),
+            );
+            scope.insert(
+                "writing_engineering_pack_hash".to_string(),
+                Value::String(pack_hash()),
+            );
+            scope.insert(
+                "writing_engineering_status_error".to_string(),
+                Value::String(error.to_string()),
+            );
+        }
+    }
+}
+
+fn carry_status_from_run_scope(state: Option<&RunState>, payload: &mut Payload) {
+    let Some(state) = state else {
+        return;
+    };
+    for key in [
+        WRITING_ENGINEERING_STATUS_FIELD,
+        "writing_engineering_status_source",
+        "writing_engineering_pack_id",
+        "writing_engineering_pack_hash",
+        "writing_engineering_origin_tenant",
+        "writing_engineering_status_error",
+    ] {
+        if payload.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = state.scope.get(key) {
+            payload.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 pub fn check_boundary_text(
