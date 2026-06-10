@@ -12,22 +12,31 @@
 //! `Weak` store reference so dropping the runtime lets it exit instead of
 //! pinning the store open forever.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use rustyred_thg_core::{now_ms, stable_hash, RedCoreGraphStore};
+use rustyred_thg_core::{
+    now_ms, stable_hash, GraphMutation, GraphMutationBatch, NodeQuery, NodeRecord,
+    RedCoreGraphStore,
+};
 use serde_json::{json, Value};
 
 use crate::{
-    commit_prepared_ingest, default_parse_budget_ms, normalize_tenant,
+    commit_prepared_ingest, default_parse_budget_ms, load_file_texts, normalize_tenant,
     prepare_codebase_ingest_resolved, resolve_ingest_config, snapshot_for_operation,
     stage_repo_for_ingest, CodeIndexError, IngestCodebaseInput, IngestCodebaseOutput,
-    IngestPipelineOptions, RepoFetchCaps,
+    IngestPipelineOptions, RepoFetchCaps, SOURCE,
 };
 
 const MAX_RETAINED_JOBS: usize = 64;
 const WORKER_IDLE_POLL: Duration = Duration::from_secs(2);
+/// Label for the durable ingest-job mirror node.
+pub const CODE_INGEST_JOB_LABEL: &str = "CodeIngestJob";
+/// Cap on durably-persisted TERMINAL jobs; older ones are TTL-expired on submit
+/// so the mirror does not grow without bound. Queued/running jobs are never
+/// pruned.
+const MAX_PERSISTED_TERMINAL_JOBS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IngestJobState {
@@ -55,8 +64,22 @@ impl IngestJobState {
             IngestJobState::Finished | IngestJobState::Failed | IngestJobState::BudgetExceeded
         )
     }
+
+    fn from_str(raw: &str) -> IngestJobState {
+        match raw {
+            "running" => IngestJobState::Running,
+            "finished" => IngestJobState::Finished,
+            "failed" => IngestJobState::Failed,
+            "budget_exceeded" => IngestJobState::BudgetExceeded,
+            _ => IngestJobState::Queued,
+        }
+    }
 }
 
+// The `Finished` variant intentionally carries the full ingest output so the
+// terminal stream event and the durable mirror need no second lookup; the
+// milestone event list is short (one per stage), so the size spread is benign.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum IngestJobEventKind {
     CloneDone { ms: u64 },
@@ -101,6 +124,42 @@ impl IngestJobEventKind {
     }
 }
 
+impl IngestJobEventKind {
+    /// Rebuild a milestone event kind from its persisted JSON (D-jobs recovery).
+    /// `ParseProgress` is never persisted, so it is not parsed here.
+    fn from_json(value: &Value) -> Option<IngestJobEventKind> {
+        let u64_at = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let str_at = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        match value.get("event").and_then(Value::as_str)? {
+            "clone_done" => Some(IngestJobEventKind::CloneDone { ms: u64_at("ms") }),
+            "walk_done" => Some(IngestJobEventKind::WalkDone {
+                files_found: u64_at("files_found"),
+            }),
+            "parse_progress" => Some(IngestJobEventKind::ParseProgress {
+                done: u64_at("done"),
+                total: u64_at("total"),
+            }),
+            "commit_done" => Some(IngestJobEventKind::CommitDone {
+                graph_version: u64_at("graph_version"),
+            }),
+            "finished" => Some(IngestJobEventKind::Finished {
+                output: crate::ingest_output_from_json(value.get("output")?)?,
+            }),
+            "failed" => Some(IngestJobEventKind::Failed {
+                code: str_at("code"),
+                message: str_at("message"),
+            }),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IngestJobEvent {
     pub sequence: u64,
@@ -116,6 +175,17 @@ impl IngestJobEvent {
             object.insert("recorded_at_ms".to_string(), json!(self.recorded_at_ms));
         }
         payload
+    }
+
+    fn from_json(value: &Value) -> Option<IngestJobEvent> {
+        Some(IngestJobEvent {
+            sequence: value.get("sequence").and_then(Value::as_u64).unwrap_or(0),
+            recorded_at_ms: value
+                .get("recorded_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            kind: IngestJobEventKind::from_json(value)?,
+        })
     }
 }
 
@@ -216,7 +286,22 @@ impl TestIngestPause {
 struct IngestJobRecord {
     status: IngestJobStatus,
     events: Vec<IngestJobEvent>,
+    /// Takeable by the worker when the job starts running.
     request: Option<IngestJobRequest>,
+    /// Immutable serialized request, kept so a durable mirror write (and a
+    /// post-restart re-run of an interrupted job) has the inputs even after the
+    /// worker has taken `request`.
+    request_json: Value,
+}
+
+/// What a persist write needs, captured under the registry lock and written to
+/// the store after the lock is dropped (so the store lock is never taken while
+/// holding the registry lock).
+struct PersistSnapshot {
+    status: IngestJobStatus,
+    milestone_events: Vec<IngestJobEvent>,
+    request_json: Value,
+    prune: bool,
 }
 
 #[derive(Default)]
@@ -230,6 +315,10 @@ struct RegistryInner {
 pub struct IngestJobRegistry {
     inner: Mutex<RegistryInner>,
     signal: Condvar,
+    /// When set, job lifecycle transitions mirror into this RedCore store as
+    /// `CodeIngestJob` nodes so submitted jobs survive a process restart. Held
+    /// weakly so the registry never keeps the store alive on its own.
+    persist: Option<Weak<Mutex<RedCoreGraphStore>>>,
 }
 
 impl Default for IngestJobRegistry {
@@ -243,6 +332,52 @@ impl IngestJobRegistry {
         Self {
             inner: Mutex::new(RegistryInner::default()),
             signal: Condvar::new(),
+            persist: None,
+        }
+    }
+
+    /// A registry that durably mirrors job state into `store`.
+    pub(crate) fn with_persistence(store: Weak<Mutex<RedCoreGraphStore>>) -> Self {
+        Self {
+            inner: Mutex::new(RegistryInner::default()),
+            signal: Condvar::new(),
+            persist: Some(store),
+        }
+    }
+
+    /// Capture a persist snapshot from a record (milestone events only; the
+    /// high-frequency ParseProgress is never persisted, keeping the store lock
+    /// off the parse loop).
+    fn snapshot(record: &IngestJobRecord, prune: bool) -> PersistSnapshot {
+        PersistSnapshot {
+            status: record.status.clone(),
+            milestone_events: record
+                .events
+                .iter()
+                .filter(|event| !matches!(event.kind, IngestJobEventKind::ParseProgress { .. }))
+                .cloned()
+                .collect(),
+            request_json: record.request_json.clone(),
+            prune,
+        }
+    }
+
+    /// Write a snapshot to the durable mirror. Acquires the store lock briefly
+    /// and only outside the registry lock; a dropped store is a silent no-op.
+    fn persist(&self, snapshot: PersistSnapshot) {
+        let Some(weak) = self.persist.as_ref() else {
+            return;
+        };
+        let Some(store) = weak.upgrade() else {
+            return;
+        };
+        let Ok(mut store) = store.lock() else {
+            return;
+        };
+        let node = job_node(&snapshot);
+        let _ = store.commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(node)]));
+        if snapshot.prune {
+            prune_persisted_terminal_jobs(&mut store);
         }
     }
 
@@ -280,18 +415,20 @@ impl IngestJobRegistry {
             error_code: String::new(),
             error_message: String::new(),
         };
-        inner.jobs.insert(
-            job_id.clone(),
-            IngestJobRecord {
-                status: status.clone(),
-                events: Vec::new(),
-                request: Some(request),
-            },
-        );
+        let request_json = request_to_json(&request);
+        let record = IngestJobRecord {
+            status: status.clone(),
+            events: Vec::new(),
+            request: Some(request),
+            request_json,
+        };
+        let snapshot = Self::snapshot(&record, true);
+        inner.jobs.insert(job_id.clone(), record);
         inner.order.push_back(job_id.clone());
         inner.queue.push_back(job_id);
         prune_retained_jobs(&mut inner);
         drop(inner);
+        self.persist(snapshot);
         self.signal.notify_all();
         status
     }
@@ -396,12 +533,23 @@ impl IngestJobRegistry {
         }
         let sequence = record.events.len() as u64 + 1;
         record.status.updated_at_ms = now_ms().max(0) as u64;
+        let persist_event = !matches!(kind, IngestJobEventKind::ParseProgress { .. });
         record.events.push(IngestJobEvent {
             sequence,
             recorded_at_ms: now_ms().max(0) as u64,
             kind,
         });
+        // Persist milestones and terminals (which carry the output/error), and
+        // prune on terminal. ParseProgress stays in memory only, so the store
+        // lock is never taken inside the parse loop.
+        let snapshot = persist_event.then(|| {
+            let prune = record.status.state.is_terminal();
+            Self::snapshot(record, prune)
+        });
         drop(inner);
+        if let Some(snapshot) = snapshot {
+            self.persist(snapshot);
+        }
         self.signal.notify_all();
     }
 
@@ -417,12 +565,16 @@ impl IngestJobRegistry {
 
     fn mark_running(&self, job_id: &str) {
         let mut inner = self.inner.lock().expect("ingest job registry");
-        if let Some(record) = inner.jobs.get_mut(job_id) {
+        let snapshot = inner.jobs.get_mut(job_id).map(|record| {
             record.status.state = IngestJobState::Running;
             record.status.stage = "start".to_string();
             record.status.updated_at_ms = now_ms().max(0) as u64;
-        }
+            Self::snapshot(record, false)
+        });
         drop(inner);
+        if let Some(snapshot) = snapshot {
+            self.persist(snapshot);
+        }
         self.signal.notify_all();
     }
 
@@ -448,6 +600,52 @@ impl IngestJobRegistry {
             }
         }
     }
+
+    /// Load durably-mirrored jobs from the store into the in-memory registry on
+    /// startup. Terminal jobs are restored read-only (queryable, streamable);
+    /// jobs that were queued or running when the process died are re-enqueued
+    /// (stage `recovered`) to run again, since their in-memory parse state did
+    /// not survive and the final commit is atomic (a re-run either redoes work
+    /// that never committed or re-commits a fresh, superseding generation).
+    /// Returns the number of re-enqueued (runnable) jobs.
+    pub(crate) fn recover_from_store(&self, store: &RedCoreGraphStore) -> usize {
+        let nodes = store
+            .query_nodes(NodeQuery::label(CODE_INGEST_JOB_LABEL).with_limit(100_000))
+            .unwrap_or_default();
+        let mut recovered: Vec<(u64, String, IngestJobRecord, bool)> = Vec::new();
+        for node in nodes {
+            if let Some((record, runnable)) = job_record_from_node(&node) {
+                recovered.push((
+                    record.status.submitted_at_ms,
+                    record.status.job_id.clone(),
+                    record,
+                    runnable,
+                ));
+            }
+        }
+        // Oldest first so the in-memory retention order matches submit order.
+        recovered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut inner = self.inner.lock().expect("ingest job registry");
+        let mut runnable_count = 0;
+        for (_, job_id, record, runnable) in recovered {
+            if inner.jobs.contains_key(&job_id) {
+                continue;
+            }
+            inner.order.push_back(job_id.clone());
+            if runnable {
+                inner.queue.push_back(job_id.clone());
+                runnable_count += 1;
+            }
+            inner.jobs.insert(job_id, record);
+        }
+        prune_retained_jobs(&mut inner);
+        drop(inner);
+        if runnable_count > 0 {
+            self.signal.notify_all();
+        }
+        runnable_count
+    }
 }
 
 /// Evict the oldest TERMINAL jobs beyond the retention cap. Queued/running
@@ -468,6 +666,239 @@ fn prune_retained_jobs(inner: &mut RegistryInner) {
             inner.jobs.remove(&job_id);
         }
     }
+}
+
+/// Build the durable `CodeIngestJob` mirror node for a snapshot. The request is
+/// stored so an interrupted job can re-run after a restart; the output (when
+/// finished) and the milestone events are stored so a recovered job is
+/// queryable and streamable.
+fn job_node(snapshot: &PersistSnapshot) -> NodeRecord {
+    let status = &snapshot.status;
+    let events: Vec<Value> = snapshot
+        .milestone_events
+        .iter()
+        .map(IngestJobEvent::to_json)
+        .collect();
+    NodeRecord::new(
+        &status.job_id,
+        [CODE_INGEST_JOB_LABEL],
+        json!({
+            "tenant_id": status.tenant_id,
+            "repo_id": status.repo_id,
+            "operation": status.operation,
+            "state": status.state.as_str(),
+            "stage": status.stage,
+            "files_total": status.files_total,
+            "files_done": status.files_done,
+            "submitted_at_ms": status.submitted_at_ms,
+            "updated_at_ms": status.updated_at_ms,
+            "error_code": status.error_code,
+            "error_message": status.error_message,
+            "request": snapshot.request_json,
+            "output": status.output.as_ref().map(IngestCodebaseOutput::to_json),
+            "milestone_events": events,
+            "source": SOURCE,
+        }),
+    )
+}
+
+/// Rebuild an in-memory record from a persisted `CodeIngestJob` node. Returns
+/// `(record, runnable)`; a non-terminal (interrupted) job comes back as
+/// `Queued`/`recovered` with its request restored so it can re-run.
+fn job_record_from_node(node: &NodeRecord) -> Option<(IngestJobRecord, bool)> {
+    let props = &node.properties;
+    let str_at = |key: &str| {
+        props
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let u64_at = |key: &str| props.get(key).and_then(Value::as_u64).unwrap_or(0);
+
+    let persisted_state = IngestJobState::from_str(&str_at("state"));
+    let terminal = persisted_state.is_terminal();
+    let output = props
+        .get("output")
+        .filter(|value| !value.is_null())
+        .and_then(crate::ingest_output_from_json);
+    let events: Vec<IngestJobEvent> = props
+        .get("milestone_events")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(IngestJobEvent::from_json).collect())
+        .unwrap_or_default();
+    let request_json = props.get("request").cloned().unwrap_or_else(|| json!({}));
+
+    let mut status = IngestJobStatus {
+        job_id: node.id.clone(),
+        tenant_id: str_at("tenant_id"),
+        repo_id: str_at("repo_id"),
+        operation: str_at("operation"),
+        state: persisted_state,
+        stage: str_at("stage"),
+        files_total: u64_at("files_total"),
+        files_done: u64_at("files_done"),
+        submitted_at_ms: u64_at("submitted_at_ms"),
+        updated_at_ms: u64_at("updated_at_ms"),
+        output,
+        error_code: str_at("error_code"),
+        error_message: str_at("error_message"),
+    };
+
+    let (request, runnable) = if terminal {
+        (None, false)
+    } else {
+        // Interrupted: re-run from the persisted request, or drop if it cannot
+        // be reconstructed (no inputs to re-run from).
+        match request_from_json(&request_json) {
+            Some(request) => {
+                status.state = IngestJobState::Queued;
+                status.stage = "recovered".to_string();
+                (Some(request), true)
+            }
+            None => return None,
+        }
+    };
+
+    Some((
+        IngestJobRecord {
+            status,
+            events,
+            request,
+            request_json,
+        },
+        runnable,
+    ))
+}
+
+/// TTL-expire durable terminal jobs beyond the cap so the mirror stays bounded.
+/// Queued/running jobs are never expired. Runs on submit (bounded frequency).
+fn prune_persisted_terminal_jobs(store: &mut RedCoreGraphStore) {
+    let Ok(nodes) =
+        store.query_nodes(NodeQuery::label(CODE_INGEST_JOB_LABEL).with_limit(100_000))
+    else {
+        return;
+    };
+    let mut terminal: Vec<(u64, String)> = nodes
+        .into_iter()
+        .filter(|node| {
+            IngestJobState::from_str(
+                node.properties
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("queued"),
+            )
+            .is_terminal()
+        })
+        .map(|node| {
+            (
+                node.properties
+                    .get("submitted_at_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                node.id,
+            )
+        })
+        .collect();
+    if terminal.len() <= MAX_PERSISTED_TERMINAL_JOBS {
+        return;
+    }
+    // Newest first; expire everything past the cap.
+    terminal.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let expired_boundary = now_ms().saturating_sub(1);
+    let mut expired_any = false;
+    for (_, job_id) in terminal.into_iter().skip(MAX_PERSISTED_TERMINAL_JOBS) {
+        if store.set_node_ttl(&job_id, Some(expired_boundary)).is_ok() {
+            expired_any = true;
+        }
+    }
+    if expired_any {
+        let _ = store.purge_expired_nodes();
+    }
+}
+
+/// Serialize a job request for the durable mirror. The `#[cfg(test)]` pause
+/// barrier is intentionally not serialized.
+fn request_to_json(request: &IngestJobRequest) -> Value {
+    let input = &request.input;
+    json!({
+        "input": {
+            "tenant_id": input.tenant_id,
+            "repo_path": input.repo_path,
+            "repo_id": input.repo_id,
+            "include_extensions": input.include_extensions,
+            "exclude_dirs": input.exclude_dirs,
+            "max_files": input.max_files,
+            "max_file_bytes": input.max_file_bytes,
+            "max_total_bytes": input.max_total_bytes,
+            "actor": input.actor,
+        },
+        "operation": request.operation,
+        "repo_url": request.repo_url,
+        "caps": {
+            "max_total_bytes": request.caps.max_total_bytes,
+            "clone_timeout_ms": request.caps.clone_timeout_ms,
+        },
+        "parse_budget_ms": request.parse_budget_ms,
+    })
+}
+
+fn request_from_json(value: &Value) -> Option<IngestJobRequest> {
+    let input_value = value.get("input")?;
+    let str_at = |source: &Value, key: &str| {
+        source
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let u64_at = |source: &Value, key: &str| source.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let string_vec = |source: &Value, key: &str| {
+        source
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let input = IngestCodebaseInput {
+        tenant_id: str_at(input_value, "tenant_id"),
+        repo_path: str_at(input_value, "repo_path"),
+        repo_id: str_at(input_value, "repo_id"),
+        include_extensions: string_vec(input_value, "include_extensions"),
+        exclude_dirs: string_vec(input_value, "exclude_dirs"),
+        max_files: u64_at(input_value, "max_files"),
+        max_file_bytes: u64_at(input_value, "max_file_bytes"),
+        max_total_bytes: u64_at(input_value, "max_total_bytes"),
+        actor: str_at(input_value, "actor"),
+    };
+    let caps_value = value.get("caps").cloned().unwrap_or_else(|| json!({}));
+    let caps = RepoFetchCaps {
+        max_total_bytes: caps_value
+            .get("max_total_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| RepoFetchCaps::default().max_total_bytes),
+        clone_timeout_ms: caps_value
+            .get("clone_timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| RepoFetchCaps::default().clone_timeout_ms),
+    };
+    // `..Default::default()` fills the `#[cfg(test)]` pause field; in non-test
+    // builds every field is already named, so the update is a no-op there.
+    #[cfg_attr(not(test), allow(clippy::needless_update))]
+    Some(IngestJobRequest {
+        input,
+        operation: str_at(value, "operation"),
+        repo_url: str_at(value, "repo_url"),
+        caps,
+        parse_budget_ms: value.get("parse_budget_ms").and_then(Value::as_u64),
+        ..Default::default()
+    })
 }
 
 /// The single ingest worker. Holds the store WEAKLY: once every runtime clone
@@ -546,9 +977,22 @@ fn run_ingest_job(
     // concurrent searches on the same store proceed during the parse.
     registry.set_stage(job_id, "walk");
     let sink = |kind: IngestJobEventKind| registry.record_event(job_id, kind);
+    // Carried-text loader for incremental edge reinference: takes the store
+    // lock for exactly one batch read after the change split, off the parse
+    // path. Upgrades the Weak so a dropped runtime yields an empty map.
+    let text_store = store.clone();
+    let text_tenant = config.tenant_id.clone();
+    let carried_text_loader = move |hashes: &[String]| match text_store.upgrade() {
+        Some(store) => match store.lock() {
+            Ok(store) => load_file_texts(&store, &text_tenant, hashes),
+            Err(_) => HashMap::new(),
+        },
+        None => HashMap::new(),
+    };
     let options = IngestPipelineOptions {
         prior,
         sink: Some(&sink),
+        carried_text_loader: Some(&carried_text_loader),
         parse_budget_ms: request
             .parse_budget_ms
             .unwrap_or_else(default_parse_budget_ms),
@@ -566,10 +1010,15 @@ fn run_ingest_job(
     }
 
     registry.set_stage(job_id, "commit");
-    let Some(store) = store.upgrade() else {
-        return fail(store_dropped_error());
-    };
+    // Scope the upgraded (strong) store handle to JUST the commit so the worker
+    // does not pin the store open while it records the terminal events: once
+    // every runtime clone is dropped the store can release its directory lock
+    // promptly (the event recording below only re-upgrades transiently inside
+    // the durable mirror write).
     let output = {
+        let Some(store) = store.upgrade() else {
+            return fail(store_dropped_error());
+        };
         let mut guard = match store.lock() {
             Ok(guard) => guard,
             Err(_) => return fail(store_poisoned_error()),

@@ -25,7 +25,7 @@ mod ingest_jobs;
 mod repo_fetch;
 pub use ingest_jobs::{
     IngestJobEvent, IngestJobEventKind, IngestJobRegistry, IngestJobRequest, IngestJobState,
-    IngestJobStatus,
+    IngestJobStatus, CODE_INGEST_JOB_LABEL,
 };
 pub use repo_fetch::{
     fetch_repo, is_fetchable_repo_url, FetchedRepo, RepoFetchCaps, RepoFetchError,
@@ -304,11 +304,24 @@ impl CodeIndexRuntime {
     }
 
     pub fn try_new_with_store(store: RedCoreGraphStore) -> Result<Self, CodeIndexError> {
-        Ok(Self {
-            store: Arc::new(Mutex::new(store)),
-            jobs: Arc::new(IngestJobRegistry::new()),
+        let store = Arc::new(Mutex::new(store));
+        let jobs = Arc::new(IngestJobRegistry::with_persistence(Arc::downgrade(&store)));
+        let runtime = Self {
+            store,
+            jobs,
             worker_started: Arc::new(std::sync::Once::new()),
-        })
+        };
+        // D-jobs: recover durably-mirrored ingest jobs. Terminal jobs become
+        // queryable again; jobs interrupted mid-flight (queued/running at the
+        // crash) are re-enqueued and the worker is started to run them.
+        let runnable = {
+            let store = runtime.lock_store()?;
+            runtime.jobs.recover_from_store(&store)
+        };
+        if runnable > 0 {
+            runtime.ensure_ingest_worker();
+        }
+        Ok(runtime)
     }
 
     pub fn ingest_codebase(
@@ -363,12 +376,21 @@ impl CodeIndexRuntime {
             let store = self.lock_store()?;
             snapshot_for_operation(&store, operation, &config)?
         };
+        let tenant_id = config.tenant_id.clone();
+        let store_handle = Arc::clone(&self.store);
+        let loader = move |hashes: &[String]| match store_handle.lock() {
+            Ok(store) => load_file_texts(&store, &tenant_id, hashes),
+            Err(_) => HashMap::new(),
+        };
         let prepared = prepare_codebase_ingest_resolved(
             config,
             clone_ms,
             resolve_ms,
             started,
-            IngestPipelineOptions::sync_default(prior),
+            IngestPipelineOptions {
+                carried_text_loader: Some(&loader),
+                ..IngestPipelineOptions::sync_default(prior)
+            },
         )?;
         let mut store = self.lock_store()?;
         commit_prepared_ingest(&mut store, prepared, operation)
@@ -519,13 +541,23 @@ fn run_codebase_ingest_in_store(
     let config = resolve_ingest_config(input)?;
     let resolve_ms = elapsed_ms(resolve_started);
     let prior = snapshot_for_operation(store, operation, &config)?;
-    let prepared = prepare_codebase_ingest_resolved(
-        config,
-        clone_ms,
-        resolve_ms,
-        started,
-        IngestPipelineOptions::sync_default(prior),
-    )?;
+    // Carried-text loads read the same `&store` immutably; the borrow ends when
+    // prepare returns, before the `&mut store` commit below.
+    let prepared = {
+        let tenant_id = config.tenant_id.clone();
+        let store_ref: &RedCoreGraphStore = store;
+        let loader = |hashes: &[String]| load_file_texts(store_ref, &tenant_id, hashes);
+        prepare_codebase_ingest_resolved(
+            config,
+            clone_ms,
+            resolve_ms,
+            started,
+            IngestPipelineOptions {
+                carried_text_loader: Some(&loader),
+                ..IngestPipelineOptions::sync_default(prior)
+            },
+        )?
+    };
     commit_prepared_ingest(store, prepared, operation)
 }
 
@@ -884,6 +916,73 @@ impl IngestCodebaseOutput {
             "skip_stats": self.skip_stats.to_json(),
         })
     }
+}
+
+/// Rebuild an `IngestCodebaseOutput` from the JSON shape `to_json` emits, used
+/// to recover a durably-persisted finished job (D-jobs). `receipt_json` is the
+/// one field `to_json` omits; a recovered output leaves it empty (the receipt
+/// node itself is durable in the graph).
+pub(crate) fn ingest_output_from_json(value: &Value) -> Option<IngestCodebaseOutput> {
+    let u64_at = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let str_at = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let timings = value.get("stage_timings").cloned().unwrap_or(json!({}));
+    let timing = |key: &str| timings.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let skips = value.get("skip_stats").cloned().unwrap_or(json!({}));
+    let skip = |key: &str| skips.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut language_stats = BTreeMap::new();
+    if let Some(map) = value.get("language_stats").and_then(Value::as_object) {
+        for (language, stats) in map {
+            language_stats.insert(
+                language.clone(),
+                LanguageIngestStats {
+                    files_indexed: stats.get("files_indexed").and_then(Value::as_u64).unwrap_or(0),
+                    symbols_indexed: stats
+                        .get("symbols_indexed")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                },
+            );
+        }
+    }
+    Some(IngestCodebaseOutput {
+        tenant_id: str_at("tenant_id"),
+        repo_id: str_at("repo_id"),
+        repo_root: str_at("repo_root"),
+        generation: u64_at("generation"),
+        files_indexed: u64_at("files_indexed"),
+        symbols_indexed: u64_at("symbols_indexed"),
+        files_skipped: u64_at("files_skipped"),
+        files_parsed: u64_at("files_parsed"),
+        files_carried: u64_at("files_carried"),
+        graph_version: u64_at("graph_version"),
+        receipt_hash: str_at("receipt_hash"),
+        receipt_json: String::new(),
+        status: str_at("status"),
+        message: str_at("message"),
+        stage_timings: IngestStageTimings {
+            clone_ms: timing("clone_ms"),
+            resolve_ms: timing("resolve_ms"),
+            walk_ms: timing("walk_ms"),
+            parse_ms: timing("parse_ms"),
+            mutation_ms: timing("mutation_ms"),
+            write_ms: timing("write_ms"),
+            total_ms: timing("total_ms"),
+        },
+        language_stats,
+        skip_stats: IngestSkipStats {
+            unsupported_extension: skip("unsupported_extension"),
+            filename: skip("filename"),
+            too_large: skip("too_large"),
+            binary: skip("binary"),
+            read_error: skip("read_error"),
+        },
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1380,17 +1479,24 @@ pub(crate) struct IndexedSymbol {
 /// sequence is identical to the original inline build, so the committed graph is
 /// byte-for-byte unchanged.
 pub fn build_code_mutations(config: &IngestConfig, files: &[IndexedFile]) -> Vec<GraphMutation> {
-    build_code_mutations_with_carried(config, files, &[])
+    let mut mutations = build_node_mutations(config, files);
+    for edge in infer_symbol_call_edges(files, config) {
+        mutations.push(GraphMutation::EdgeUpsert(edge));
+    }
+    mutations
 }
 
-/// `build_code_mutations` plus carried-forward edge targets from a prior
-/// generation (D4 incremental reindex). The plain builder delegates here with
-/// no carried targets, so the instant-KG delta path and full ingest share one
-/// mutation builder.
-pub(crate) fn build_code_mutations_with_carried(
+/// Build only the node-and-structural mutations (repo node, per-file CodeFile +
+/// CodeFileText + CONTAINS_FILE, per-symbol CodeSymbol + DECLARES_SYMBOL) for a
+/// set of indexed files, WITHOUT the inferred CALLS/DEPENDS edges. The
+/// incremental-reindex path (D4) emits nodes for freshly parsed files only,
+/// then infers edges over the FULL symbol set (fresh plus carried) so a
+/// reindex produces the same edge graph as a full ingest. `build_code_mutations`
+/// is this plus edge inference over the same files; the instant-KG session
+/// delta (`session_delta.rs`) uses `build_code_mutations` unchanged.
+pub(crate) fn build_node_mutations(
     config: &IngestConfig,
     files: &[IndexedFile],
-    carried_targets: &[EdgeTargetStub],
 ) -> Vec<GraphMutation> {
     let repo_node = NodeRecord::new(
         &config.repo_id,
@@ -1494,10 +1600,6 @@ pub(crate) fn build_code_mutations_with_carried(
             )));
         }
     }
-    for edge in infer_symbol_call_edges(files, carried_targets, config) {
-        mutations.push(GraphMutation::EdgeUpsert(edge));
-    }
-
     mutations
 }
 
@@ -1626,13 +1728,23 @@ fn snapshot_for_operation(
     }
 }
 
+/// Loads carried files' text by `content_hash` from the CodeFileText side
+/// records (D3) so the incremental reindex can reconstruct carried symbols'
+/// bodies as edge sources without re-reading the working tree. Returns a map
+/// `content_hash -> text`; missing hashes are simply absent. Called once,
+/// sequentially, after the change split, so the runtime path can take the
+/// store lock for one brief batch read off the heavy parse path.
+pub(crate) type CarriedTextLoader<'a> = &'a dyn Fn(&[String]) -> HashMap<String, String>;
+
 /// Controls threaded through the prepare pipeline: the prior-generation
 /// snapshot (D4 incremental reindex), an optional progress sink (D1 streaming
-/// jobs), and the parse budget (D7: commit partial progress instead of dying
-/// on a transport deadline). `parse_budget_ms == 0` means unlimited.
+/// jobs), the carried-text loader (incremental edge reinference), and the parse
+/// budget (D7: commit partial progress instead of dying on a transport
+/// deadline). `parse_budget_ms == 0` means unlimited.
 pub(crate) struct IngestPipelineOptions<'a> {
     pub(crate) prior: Option<PriorGenerationSnapshot>,
     pub(crate) sink: Option<&'a (dyn Fn(IngestJobEventKind) + Sync)>,
+    pub(crate) carried_text_loader: Option<CarriedTextLoader<'a>>,
     pub(crate) parse_budget_ms: u64,
 }
 
@@ -1641,6 +1753,7 @@ impl IngestPipelineOptions<'static> {
         Self {
             prior,
             sink: None,
+            carried_text_loader: None,
             parse_budget_ms: default_parse_budget_ms(),
         }
     }
@@ -1680,6 +1793,7 @@ pub(crate) fn prepare_codebase_ingest_resolved(
     let IngestPipelineOptions {
         prior,
         sink,
+        carried_text_loader,
         parse_budget_ms,
     } = options;
     // A reindex in the same millisecond as the prior generation would collide
@@ -1756,28 +1870,39 @@ pub(crate) fn prepare_codebase_ingest_resolved(
     }
     let parse_ms = elapsed_ms(parse_started);
 
+    // RECONSTRUCT (D4 incremental edges): rebuild carried files as full edge
+    // SOURCES from their persisted nodes plus, for non-parser-backed (body
+    // tokenized) symbols, their text from the D3 side records. Parser-backed
+    // (Rust) carried symbols carry their call/dependency names on the node, so
+    // they need no text. Running edge inference over fresh PLUS carried makes a
+    // reindex's edge graph identical to a full ingest of the same tree, which
+    // closes the carried-symbol-to-changed-target and carried-symbol-to-newly-
+    // defined-name seams.
+    let carried_text = load_carried_text(&carried_entries, &config, carried_text_loader);
+    let carried_files: Vec<IndexedFile> = carried_entries
+        .iter()
+        .map(|entry| reconstruct_carried_file(entry, &carried_text))
+        .collect();
+    let carried_symbol_count = carried_files
+        .iter()
+        .map(|file| file.symbols.len() as u64)
+        .sum::<u64>();
+
     let mutation_started = Instant::now();
-    let mut carried_stubs: Vec<EdgeTargetStub> = Vec::new();
-    let mut carried_symbol_count = 0u64;
-    for entry in &carried_entries {
-        for node in &entry.symbol_nodes {
-            carried_symbol_count += 1;
-            let (Some(name), Some(file_path)) = (
-                property_string(&node.properties, "name"),
-                property_string(&node.properties, "file_path"),
-            ) else {
-                continue;
-            };
-            carried_stubs.push(EdgeTargetStub {
-                symbol_id: node.id.clone(),
-                name,
-                file_path,
-                line: property_u64(&node.properties, "line").unwrap_or(0),
-            });
-        }
-    }
-    let mut mutations = build_code_mutations_with_carried(&config, &files, &carried_stubs);
+    let mut all_files: Vec<IndexedFile> = Vec::with_capacity(files.len() + carried_files.len());
+    all_files.extend(files.iter().cloned());
+    all_files.extend(carried_files);
+
+    // Node mutations: fresh files emit their nodes + text records; carried
+    // files restamp their existing nodes onto the new generation. Edges are
+    // inferred over the FULL symbol set so every current edge is re-emitted at
+    // the new generation (moved-target stale edges are left at the old
+    // generation and retired by the latest-generation traversal filter).
+    let mut mutations = build_node_mutations(&config, &files);
     mutations.extend(carried_forward_mutations(&carried_entries, config.generation));
+    for edge in infer_symbol_call_edges(&all_files, &config) {
+        mutations.push(GraphMutation::EdgeUpsert(edge));
+    }
     let mutation_ms = elapsed_ms(mutation_started);
 
     let files_parsed = files.len() as u64;
@@ -1836,6 +1961,109 @@ fn restamped_node(node: &NodeRecord, generation: u64) -> NodeRecord {
         properties.insert("indexed_at_ms".to_string(), json!(generation));
     }
     node
+}
+
+/// True when a carried file has any non-parser-backed symbol: those infer
+/// edges by tokenizing their body, so the file's text must be reconstructed.
+/// A purely parser-backed (Rust) carried file needs no text.
+fn carried_file_needs_text(entry: &PriorFileEntry) -> bool {
+    entry
+        .symbol_nodes
+        .iter()
+        .any(|node| !property_bool(&node.properties, "parser_backed"))
+}
+
+/// Batch-load text for carried files that need it (one call into the injected
+/// loader, so the runtime path takes the store lock once). Keyed by content
+/// hash, which a carried file shares with its existing CodeFileText record.
+fn load_carried_text(
+    carried_entries: &[&PriorFileEntry],
+    config: &IngestConfig,
+    loader: Option<CarriedTextLoader<'_>>,
+) -> HashMap<String, String> {
+    let Some(loader) = loader else {
+        return HashMap::new();
+    };
+    let mut hashes: Vec<String> = carried_entries
+        .iter()
+        .filter(|entry| carried_file_needs_text(entry))
+        .map(|entry| entry.content_hash.clone())
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    if hashes.is_empty() {
+        return HashMap::new();
+    }
+    let _ = config;
+    loader(&hashes)
+}
+
+/// Rebuild a carried file as a full `IndexedFile` (an edge SOURCE) from its
+/// persisted file/symbol nodes plus, when present, its reconstructed text.
+/// Symbol identity, name, kind, line, and the parser-backed call/dependency
+/// names all come straight off the persisted symbol nodes; the body is sliced
+/// from the text for the inverted-index path. This reproduces exactly what a
+/// fresh parse of the same (unchanged) file would yield for edge inference.
+fn reconstruct_carried_file(
+    entry: &PriorFileEntry,
+    carried_text: &HashMap<String, String>,
+) -> IndexedFile {
+    let file_props = &entry.file_node.properties;
+    let rel_path = property_string(file_props, "path").unwrap_or_default();
+    let language = property_string(file_props, "language").unwrap_or_default();
+    let extension = property_string(file_props, "extension").unwrap_or_default();
+    let file_id = property_string(file_props, "file_id").unwrap_or_else(|| entry.file_node.id.clone());
+
+    let text = carried_text.get(&entry.content_hash).cloned();
+    let lines: Vec<&str> = text.as_deref().map(|t| t.lines().collect()).unwrap_or_default();
+
+    let mut symbols = Vec::with_capacity(entry.symbol_nodes.len());
+    for (index, node) in entry.symbol_nodes.iter().enumerate() {
+        let props = &node.properties;
+        let line = property_u64(props, "line").unwrap_or(0);
+        // Bodies run from this symbol's line to just before the next symbol's,
+        // matching `extract_line_symbols`. Only needed for the tokenized path.
+        let next_line = entry
+            .symbol_nodes
+            .get(index + 1)
+            .map(|next| property_u64(&next.properties, "line").unwrap_or(0).saturating_sub(1))
+            .unwrap_or(lines.len() as u64);
+        let body = if lines.is_empty() {
+            String::new()
+        } else {
+            body_between_lines(&lines, line, next_line)
+        };
+        symbols.push(IndexedSymbol {
+            symbol_id: property_string(props, "symbol_id").unwrap_or_else(|| node.id.clone()),
+            file_id: property_string(props, "file_id").unwrap_or_else(|| file_id.clone()),
+            file_path: property_string(props, "file_path").unwrap_or_else(|| rel_path.clone()),
+            kind: property_string(props, "kind").unwrap_or_default(),
+            name: property_string(props, "name").unwrap_or_default(),
+            language: property_string(props, "language").unwrap_or_else(|| language.clone()),
+            line,
+            signature: property_string(props, "signature").unwrap_or_default(),
+            snippet: property_string(props, "snippet").unwrap_or_default(),
+            body,
+            trust_tier: property_string(props, "trust_tier")
+                .unwrap_or_else(|| DEFAULT_TRUST_TIER.to_string()),
+            community_id: property_string(props, "community_id").unwrap_or_default(),
+            call_names: property_string_set(props, "call_names"),
+            dependency_names: property_string_set(props, "dependency_names"),
+            parser_backed: property_bool(props, "parser_backed"),
+        });
+    }
+
+    IndexedFile {
+        file_id,
+        rel_path,
+        language,
+        extension,
+        content_hash: entry.content_hash.clone(),
+        // Carried files do not re-emit their text record (it already exists at
+        // the same content hash); this field is unused for carried files.
+        text: String::new(),
+        symbols,
+    }
 }
 
 pub(crate) fn commit_prepared_ingest(
@@ -2061,7 +2289,7 @@ fn code_context_with_store(
     let max_chars = nonzero_or(input.max_chars, DEFAULT_MAX_CONTEXT_CHARS as u64) as usize;
     let (start_line, end_line, context) =
         line_context(&text, target_line, before, after, max_chars);
-    let symbols = symbols_for_file(store, &tenant_id, &file_id, &repo_id, latest.get(&repo_id))?;
+    let symbols = symbols_for_file(store, &tenant_id, &file_id, &repo_id, &latest)?;
 
     let receipt_payload = json!({
         "tenant_id": tenant_id,
@@ -2165,6 +2393,7 @@ fn explore_code_with_store(
     } else {
         input.max_depth.min(4) as usize
     };
+    let latest = latest_repo_generations(store)?;
     let mut edges = Vec::new();
     let mut related_ids = BTreeSet::new();
     expand_symbol_edges(
@@ -2172,6 +2401,7 @@ fn explore_code_with_store(
         &focus_node.id,
         max_depth,
         limit,
+        &latest,
         &mut related_ids,
         &mut edges,
     )?;
@@ -2183,14 +2413,14 @@ fn explore_code_with_store(
             .map_err(CodeIndexError::from_store)?
         {
             if let Some(mut symbol) = symbol_record_from_node(&node) {
-                enrich_symbol_graph(store, &mut symbol)?;
+                enrich_symbol_graph(store, &mut symbol, &latest)?;
                 related_symbols.push(symbol);
             }
         }
     }
     let mut focus = symbol_record_from_node(&focus_node);
     if let Some(symbol) = focus.as_mut() {
-        enrich_symbol_graph(store, symbol)?;
+        enrich_symbol_graph(store, symbol, &latest)?;
     }
     let payload = json!({
         "tenant_id": tenant_id,
@@ -2242,7 +2472,8 @@ fn explain_code_with_store(
     };
     let mut symbol = symbol_record_from_node(&focus_node)
         .ok_or_else(|| CodeIndexError::invalid("resolved code node is missing symbol metadata"))?;
-    enrich_symbol_graph(store, &mut symbol)?;
+    let latest = latest_repo_generations(store)?;
+    enrich_symbol_graph(store, &mut symbol, &latest)?;
     let context = code_context_with_store(
         store,
         CodeContextInput {
@@ -2259,6 +2490,7 @@ fn explain_code_with_store(
         &focus_node.id,
         1,
         DEFAULT_LIMIT,
+        &latest,
         &mut related_ids,
         &mut edges,
     )?;
@@ -2761,18 +2993,6 @@ fn extract_line_symbols(
     symbols
 }
 
-/// An edge target a symbol name can resolve to. Freshly parsed symbols and
-/// carried-forward symbols from a prior generation (D4 incremental reindex)
-/// both project into this shape, so edge inference over changed files can link
-/// against the whole live generation, not only the files parsed in this pass.
-#[derive(Clone, Debug)]
-pub(crate) struct EdgeTargetStub {
-    pub(crate) symbol_id: String,
-    pub(crate) name: String,
-    pub(crate) file_path: String,
-    pub(crate) line: u64,
-}
-
 #[derive(Clone, Copy)]
 struct EdgeTargetRef<'a> {
     symbol_id: &'a str,
@@ -2787,11 +3007,14 @@ struct EdgeTargetRef<'a> {
 /// against the body. Cost drops from `symbols x distinct_names x body_length`
 /// to `symbols x body_tokens`. The Rust `syn` extraction path is unchanged;
 /// the fan-out caps live in `push_symbol_edges` and apply to both branches.
-fn infer_symbol_call_edges(
-    files: &[IndexedFile],
-    carried_targets: &[EdgeTargetStub],
-    config: &IngestConfig,
-) -> Vec<EdgeRecord> {
+///
+/// `files` is the FULL current symbol set for the generation: on a full ingest
+/// it is every parsed file; on an incremental reindex (D4) it is the freshly
+/// parsed files plus the reconstructed carried files, so a reindex produces the
+/// same edge graph as a full ingest of the same tree (carried symbols are edge
+/// sources, not just targets, which is what closes the carried-to-changed and
+/// carried-to-new-name seams).
+fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<EdgeRecord> {
     let mut symbols_by_name: HashMap<&str, Vec<EdgeTargetRef<'_>>> = HashMap::new();
     for symbol in files.iter().flat_map(|file| file.symbols.iter()) {
         symbols_by_name
@@ -2802,17 +3025,6 @@ fn infer_symbol_call_edges(
                 name: &symbol.name,
                 file_path: &symbol.file_path,
                 line: symbol.line,
-            });
-    }
-    for stub in carried_targets {
-        symbols_by_name
-            .entry(stub.name.as_str())
-            .or_default()
-            .push(EdgeTargetRef {
-                symbol_id: &stub.symbol_id,
-                name: &stub.name,
-                file_path: &stub.file_path,
-                line: stub.line,
             });
     }
     for targets in symbols_by_name.values_mut() {
@@ -3270,8 +3482,9 @@ fn symbols_for_file(
     tenant_id: &str,
     file_id: &str,
     repo_id: &str,
-    latest_generation: Option<&u64>,
+    latest: &HashMap<String, u64>,
 ) -> Result<Vec<CodeSymbolRecord>, CodeIndexError> {
+    let latest_generation = latest.get(repo_id);
     let symbols = store
         .query_nodes(
             NodeQuery::label(CODE_SYMBOL_LABEL)
@@ -3290,7 +3503,7 @@ fn symbols_for_file(
         .filter_map(|node| symbol_record_from_node(&node))
         .collect::<Vec<_>>();
     for symbol in &mut out {
-        enrich_symbol_graph(store, symbol)?;
+        enrich_symbol_graph(store, symbol, latest)?;
     }
     out.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
@@ -3325,7 +3538,7 @@ fn recognize_indexed_symbols(
         .filter_map(|node| symbol_record_from_node(&node))
         .collect::<Vec<_>>();
     for symbol in &mut out {
-        enrich_symbol_graph(store, symbol)?;
+        enrich_symbol_graph(store, symbol, &latest)?;
     }
     out.sort_by(|a, b| {
         a.file_path
@@ -3386,11 +3599,28 @@ fn resolve_symbol_node(
     Ok(scored.into_iter().next().map(|(node, _)| node))
 }
 
+/// A code node is "current" when its generation matches its repo's latest
+/// generation. Incremental reindex re-emits every live edge at the new
+/// generation but leaves moved-target stale edges pointing at superseded
+/// (old-generation) symbol nodes; filtering traversal neighbors by this
+/// retires those stale edges without an edge-delete mutation (the store has
+/// none) and without rewriting the read path's generation model.
+fn node_is_current_generation(node: &NodeRecord, latest: &HashMap<String, u64>) -> bool {
+    match property_string(&node.properties, "repo_id") {
+        Some(repo_id) => match latest.get(&repo_id) {
+            Some(generation) => property_u64(&node.properties, "generation") == Some(*generation),
+            None => true,
+        },
+        None => true,
+    }
+}
+
 fn expand_symbol_edges(
     store: &RedCoreGraphStore,
     focus_id: &str,
     max_depth: usize,
     limit: usize,
+    latest: &HashMap<String, u64>,
     related_ids: &mut BTreeSet<String>,
     edges: &mut Vec<CodeGraphEdgeRecord>,
 ) -> Result<(), CodeIndexError> {
@@ -3412,6 +3642,16 @@ fn expand_symbol_edges(
                     })
                     .map_err(CodeIndexError::from_store)?;
                 for neighbor in neighbors {
+                    // Skip stale-generation neighbors (moved/superseded targets).
+                    let Some(neighbor_node) = store
+                        .get_node(&neighbor.node_id)
+                        .map_err(CodeIndexError::from_store)?
+                    else {
+                        continue;
+                    };
+                    if !node_is_current_generation(&neighbor_node, latest) {
+                        continue;
+                    }
                     if !seen_edges.insert(neighbor.edge_id.clone()) {
                         continue;
                     }
@@ -3419,7 +3659,7 @@ fn expand_symbol_edges(
                         .get_edge(&neighbor.edge_id)
                         .map_err(CodeIndexError::from_store)?
                     {
-                        if let Some(record) = graph_edge_record(store, &edge)? {
+                        if let Some(record) = graph_edge_record(store, &edge, latest)? {
                             edges.push(record);
                         }
                     }
@@ -3441,13 +3681,16 @@ fn expand_symbol_edges(
 fn enrich_symbol_graph(
     store: &RedCoreGraphStore,
     symbol: &mut CodeSymbolRecord,
+    latest: &HashMap<String, u64>,
 ) -> Result<(), CodeIndexError> {
-    symbol.callees = neighbor_symbol_names(store, &symbol.node_id, Direction::Out, CALLS_SYMBOL)?;
-    symbol.callers = neighbor_symbol_names(store, &symbol.node_id, Direction::In, CALLS_SYMBOL)?;
+    symbol.callees =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, CALLS_SYMBOL, latest)?;
+    symbol.callers =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::In, CALLS_SYMBOL, latest)?;
     symbol.dependencies =
-        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, DEPENDS_ON_SYMBOL)?;
+        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, DEPENDS_ON_SYMBOL, latest)?;
     symbol.dependents =
-        neighbor_symbol_names(store, &symbol.node_id, Direction::In, DEPENDS_ON_SYMBOL)?;
+        neighbor_symbol_names(store, &symbol.node_id, Direction::In, DEPENDS_ON_SYMBOL, latest)?;
     Ok(())
 }
 
@@ -3456,6 +3699,7 @@ fn neighbor_symbol_names(
     node_id: &str,
     direction: Direction,
     edge_type: &str,
+    latest: &HashMap<String, u64>,
 ) -> Result<Vec<String>, CodeIndexError> {
     let mut names = store
         .neighbors(NeighborQuery {
@@ -3467,6 +3711,7 @@ fn neighbor_symbol_names(
         .map_err(CodeIndexError::from_store)?
         .into_iter()
         .filter_map(|hit| store.get_node(&hit.node_id).ok().flatten())
+        .filter(|node| node_is_current_generation(node, latest))
         .filter_map(|node| property_string(&node.properties, "name"))
         .collect::<Vec<_>>();
     names.sort();
@@ -3477,6 +3722,7 @@ fn neighbor_symbol_names(
 fn graph_edge_record(
     store: &RedCoreGraphStore,
     edge: &EdgeRecord,
+    latest: &HashMap<String, u64>,
 ) -> Result<Option<CodeGraphEdgeRecord>, CodeIndexError> {
     let Some(from) = store
         .get_node(&edge.from_id)
@@ -3490,6 +3736,10 @@ fn graph_edge_record(
     else {
         return Ok(None);
     };
+    // Both endpoints must be current: a stale (moved) target retires the edge.
+    if !node_is_current_generation(&from, latest) || !node_is_current_generation(&to, latest) {
+        return Ok(None);
+    }
     Ok(Some(CodeGraphEdgeRecord {
         from_node_id: edge.from_id.clone(),
         to_node_id: edge.to_id.clone(),
@@ -3833,6 +4083,26 @@ fn file_text_node_id(tenant_id: &str, content_hash: &str) -> String {
     )
 }
 
+/// Batch-read CodeFileText side records by content hash for one tenant. The
+/// incremental-reindex carried-text loader wraps this with the store handle
+/// (Arc for the runtime, &store for the in-store path), so prepare stays
+/// store-agnostic and the runtime takes the lock for exactly one batch read.
+pub(crate) fn load_file_texts(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+    content_hashes: &[String],
+) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(content_hashes.len());
+    for hash in content_hashes {
+        if let Ok(Some(node)) = store.get_node(&file_text_node_id(tenant_id, hash)) {
+            if let Some(text) = property_string(&node.properties, "text") {
+                out.insert(hash.clone(), text);
+            }
+        }
+    }
+    out
+}
+
 /// Read a file's text from its CodeFileText side record. Falls back to the
 /// legacy `text` property on the CodeFile node for generations ingested before
 /// the side record existed.
@@ -3912,6 +4182,29 @@ fn property_u64(properties: &Value, key: &str) -> Option<u64> {
             .as_u64()
             .or_else(|| value.as_i64().and_then(|v| v.try_into().ok()))
     })
+}
+
+fn property_bool(properties: &Value, key: &str) -> bool {
+    properties
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Read a JSON string array property back into a `BTreeSet<String>` (the shape
+/// `call_names` / `dependency_names` are persisted in).
+fn property_string_set(properties: &Value, key: &str) -> BTreeSet<String> {
+    properties
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_optional_json(raw: &str) -> Result<Value, CodeIndexError> {
@@ -4339,6 +4632,179 @@ mod tests {
         fs::remove_dir_all(repo_dir).ok();
     }
 
+    /// Collect every CALLS/DEPENDS edge currently visible for a repo as
+    /// (from_name, edge_type, to_name) at the latest generation, the same way
+    /// traversal sees them (stale-generation neighbors filtered out).
+    fn collect_visible_edges(
+        store: &RedCoreGraphStore,
+        repo_id: &str,
+    ) -> BTreeSet<(String, String, String)> {
+        let latest = latest_repo_generations(store).unwrap();
+        let symbols = store
+            .query_nodes(
+                NodeQuery::label(CODE_SYMBOL_LABEL)
+                    .with_property("repo_id", json!(repo_id))
+                    .with_limit(100_000),
+            )
+            .unwrap();
+        let mut edges = BTreeSet::new();
+        for node in symbols {
+            if !node_is_current_generation(&node, &latest) {
+                continue;
+            }
+            let Some(from_name) = property_string(&node.properties, "name") else {
+                continue;
+            };
+            for edge_type in [CALLS_SYMBOL, DEPENDS_ON_SYMBOL] {
+                let names =
+                    neighbor_symbol_names(store, &node.id, Direction::Out, edge_type, &latest)
+                        .unwrap();
+                for to_name in names {
+                    edges.insert((from_name.clone(), edge_type.to_string(), to_name));
+                }
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn reindex_edges_match_a_full_ingest_after_a_moved_target() {
+        // v1: caller.py calls helper; helper.py defines helper at line 1.
+        let repo_dir = unique_dir("moved-target-repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(
+            repo_dir.join("caller.py"),
+            "def caller():\n    return helper()\n",
+        )
+        .unwrap();
+        fs::write(repo_dir.join("helper.py"), "def helper():\n    return 1\n").unwrap();
+
+        let input = |repo: &PathBuf| IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            repo_id: "repo:moved".to_string(),
+            ..Default::default()
+        };
+
+        let mut incremental = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut incremental, input(&repo_dir)).unwrap();
+
+        // Edit ONLY helper.py: a leading comment shifts `helper` to line 2, so
+        // its node id changes. caller.py is unchanged (carried).
+        fs::write(
+            repo_dir.join("helper.py"),
+            "# shifted down\ndef helper():\n    return 1\n",
+        )
+        .unwrap();
+        let reindexed = reindex_codebase_in_store(&mut incremental, input(&repo_dir)).unwrap();
+        assert_eq!(reindexed.files_parsed, 1, "only helper.py re-extracted");
+        assert_eq!(reindexed.files_carried, 1, "caller.py carried");
+
+        // A full ingest of the SAME final tree into a clean store.
+        let mut full = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut full, input(&repo_dir)).unwrap();
+
+        // The carried caller's edge follows the moved target: caller -> helper
+        // is present and points at the new (line-2) symbol, and the visible
+        // edge set is identical to a full ingest (no stale caller->old_helper).
+        let incremental_edges = collect_visible_edges(&incremental, "repo:moved");
+        let full_edges = collect_visible_edges(&full, "repo:moved");
+        assert!(
+            incremental_edges.contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "helper".to_string()
+            )),
+            "carried caller links to the moved helper: {incremental_edges:?}"
+        );
+        assert_eq!(
+            incremental_edges, full_edges,
+            "incremental reindex edges == full ingest edges"
+        );
+
+        // Explore from caller shows exactly one helper neighbor (not a stale one).
+        let caller = search_code_in_store(
+            &mut incremental,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "caller".to_string(),
+                repo_id: "repo:moved".to_string(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let explored = explore_code_in_store(
+            &mut incremental,
+            ExploreCodeInput {
+                tenant_id: "theorem".to_string(),
+                node_id: caller.hits[0].node_id.clone(),
+                max_depth: 1,
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let helper_neighbors = explored
+            .related_symbols
+            .iter()
+            .filter(|symbol| symbol.name == "helper")
+            .count();
+        assert_eq!(helper_neighbors, 1, "no stale duplicate helper neighbor");
+        assert_eq!(explored.related_symbols[0].line, 2, "the line-2 helper");
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn reindex_links_carried_symbol_to_a_newly_defined_name() {
+        // v1: caller.py references `mystery`, which is defined nowhere yet, so
+        // no edge exists. This is the case that needs the carried body, not
+        // just persisted matched names.
+        let repo_dir = unique_dir("new-name-repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(
+            repo_dir.join("caller.py"),
+            "def caller():\n    return mystery()\n",
+        )
+        .unwrap();
+        let input = |repo: &PathBuf| IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            repo_id: "repo:newname".to_string(),
+            ..Default::default()
+        };
+        let mut store = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut store, input(&repo_dir)).unwrap();
+        assert!(
+            !collect_visible_edges(&store, "repo:newname").contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "mystery".to_string()
+            )),
+            "no edge before mystery is defined"
+        );
+
+        // v2: add mystery.py defining `mystery`. caller.py is unchanged (carried).
+        fs::write(repo_dir.join("mystery.py"), "def mystery():\n    return 7\n").unwrap();
+        let reindexed = reindex_codebase_in_store(&mut store, input(&repo_dir)).unwrap();
+        assert_eq!(reindexed.files_parsed, 1, "only mystery.py extracted");
+        assert_eq!(reindexed.files_carried, 1, "caller.py carried");
+
+        // The carried caller now links to the newly defined mystery, because
+        // its body was reconstructed from the D3 text side record and retokenized.
+        assert!(
+            collect_visible_edges(&store, "repo:newname").contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "mystery".to_string()
+            )),
+            "carried caller links to the newly defined mystery"
+        );
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
     #[test]
     fn reindex_retires_removed_files_from_the_latest_generation() {
         let (repo_dir, _store_dir) = write_fixture_repo();
@@ -4679,6 +5145,168 @@ mod tests {
         fs::remove_dir_all(store_dir).ok();
     }
 
+    /// Open a runtime over `store_dir`, retrying the in-process RedCore
+    /// directory lock briefly. A real restart is a fresh process so the lock
+    /// never conflicts; simulating restart in one process can momentarily race
+    /// the prior runtime's worker releasing its transient store handle.
+    fn open_runtime_with_retry(store_dir: &Path) -> CodeIndexRuntime {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match CodeIndexRuntime::try_new_at(store_dir, test_options()) {
+                Ok(runtime) => return runtime,
+                Err(error) if error.code == "redcore_lock_unavailable" => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "store dir never released: {error}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => panic!("unexpected open error: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn finished_job_survives_a_runtime_restart() {
+        let (repo_dir, store_dir) = write_fixture_repo();
+        // First runtime: submit a job and let it finish.
+        let first = CodeIndexRuntime::try_new_at(&store_dir, test_options()).unwrap();
+        let submitted = first.submit_ingest_job(IngestJobRequest {
+            input: IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:durable-finished".to_string(),
+                ..Default::default()
+            },
+            operation: "ingest".to_string(),
+            ..Default::default()
+        });
+        let job_id = submitted.job_id.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = first.ingest_job_status(&job_id).unwrap();
+            if status.state.is_terminal() {
+                assert_eq!(status.state, IngestJobState::Finished);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "job did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(first);
+
+        // Second runtime over the SAME store dir: the finished job is recovered,
+        // queryable, and its event log replays through the terminal event.
+        let second = open_runtime_with_retry(&store_dir);
+        let recovered = second
+            .ingest_job_status(&job_id)
+            .expect("finished job recovered after restart");
+        assert_eq!(recovered.state, IngestJobState::Finished);
+        let output = recovered.output.expect("recovered finished output");
+        assert_eq!(output.files_indexed, 2);
+        assert_eq!(output.repo_id, "repo:durable-finished");
+        let (events, terminal) = second.ingest_jobs().events_after(&job_id, 0).unwrap();
+        assert!(terminal);
+        assert_eq!(events.last().map(|event| event.kind.label()), Some("finished"));
+
+        drop(second);
+        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(store_dir).ok();
+    }
+
+    #[test]
+    fn interrupted_job_reruns_after_a_restart() {
+        use crate::ingest_jobs::CODE_INGEST_JOB_LABEL;
+
+        let (repo_dir, store_dir) = write_fixture_repo();
+
+        // Simulate a crash mid-flight: write a durable CodeIngestJob node in the
+        // `running` state directly (the request persisted, no terminal event),
+        // exactly the shape a process that died during parse leaves behind.
+        {
+            let mut store = RedCoreGraphStore::open(&store_dir, test_options()).unwrap();
+            let request = json!({
+                "input": {
+                    "tenant_id": "theorem",
+                    "repo_path": repo_dir.display().to_string(),
+                    "repo_id": "repo:durable-interrupted",
+                    "include_extensions": [],
+                    "exclude_dirs": [],
+                    "max_files": 0,
+                    "max_file_bytes": 0,
+                    "max_total_bytes": 0,
+                    "actor": "",
+                },
+                "operation": "ingest",
+                "repo_url": "",
+                "caps": { "max_total_bytes": 0, "clone_timeout_ms": 20000 },
+                "parse_budget_ms": null,
+            });
+            let node = NodeRecord::new(
+                "code:ingest-job:interrupted-fixture",
+                [CODE_INGEST_JOB_LABEL],
+                json!({
+                    "tenant_id": "theorem",
+                    "repo_id": "repo:durable-interrupted",
+                    "operation": "ingest",
+                    "state": "running",
+                    "stage": "parse",
+                    "files_total": 2,
+                    "files_done": 0,
+                    "submitted_at_ms": 1,
+                    "updated_at_ms": 1,
+                    "error_code": "",
+                    "error_message": "",
+                    "request": request,
+                    "output": Value::Null,
+                    "milestone_events": [],
+                    "source": SOURCE,
+                }),
+            );
+            store
+                .commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(node)]))
+                .unwrap();
+        }
+
+        // Restart: recovery re-enqueues the interrupted job and runs it to
+        // completion against the real repo.
+        let runtime = open_runtime_with_retry(&store_dir);
+        let job_id = "code:ingest-job:interrupted-fixture";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = runtime
+                .ingest_job_status(job_id)
+                .expect("interrupted job recovered");
+            if status.state.is_terminal() {
+                assert_eq!(status.state, IngestJobState::Finished, "{:?}", status.stage);
+                let output = status.output.expect("re-run produced output");
+                assert_eq!(output.files_indexed, 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recovered job did not re-run: stage {}",
+                status.stage
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // The re-run actually wrote the code graph: search finds a symbol.
+        let search = runtime
+            .search_code(SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "helper_len".to_string(),
+                repo_id: "repo:durable-interrupted".to_string(),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(search.hits[0].name, "helper_len");
+
+        drop(runtime);
+        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(store_dir).ok();
+    }
+
     #[test]
     fn ingest_commits_partial_progress_when_parse_budget_exceeded() {
         let repo_dir = unique_dir("budget-repo");
@@ -4714,6 +5342,7 @@ mod tests {
             IngestPipelineOptions {
                 prior: None,
                 sink: None,
+                carried_text_loader: None,
                 parse_budget_ms: 1,
             },
         )
