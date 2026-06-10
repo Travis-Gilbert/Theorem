@@ -44,6 +44,8 @@ pub const EMBEDDING_CODEGRAPHBERT_768: &str = "embedding_codegraphbert_768";
 pub const MATCHED_SIMILAR_SITUATION: &str = "MATCHED_SIMILAR_SITUATION";
 pub const ESCALATED_TO_SEARCH: &str = "ESCALATED_TO_SEARCH";
 pub const CONTEXT_ATOM_SELECTED: &str = "CONTEXT_ATOM_SELECTED";
+pub const CONTEXT_USE_RECEIPT_LABEL: &str = "ContextUseReceipt";
+pub const CONTEXT_PACK_OUTCOME: &str = "CONTEXT_PACK_OUTCOME";
 
 pub const DEFAULT_CONTEXT_TOKEN_BUDGET: usize = 4_096;
 pub const DEFAULT_CONTEXT_MAX_ATOMS: usize = 32;
@@ -509,6 +511,182 @@ pub fn record_context_scoring_result<S: AdapterGraphStore>(
         selected_edge_ids,
         transaction,
     })
+}
+
+/// Record the outcome of using a context pack: the use-receipt that the
+/// plan names as the label source for the memory scorer. One receipt node
+/// per (pack, outcome occurrence), linked from the pack.
+pub fn record_context_use_outcome<S: AdapterGraphStore>(
+    store: &mut S,
+    tenant_id: &str,
+    context_pack_node_id: &str,
+    outcome_id: &str,
+    success: bool,
+    note: Option<&str>,
+    actor: Option<&str>,
+) -> ThgResult<String> {
+    let tenant_id = normalize_tenant_id(tenant_id);
+    let context_pack_node_id = context_pack_node_id.trim();
+    let outcome_id = outcome_id.trim();
+    if context_pack_node_id.is_empty() || outcome_id.is_empty() {
+        return Err(ThgError::new(
+            "invalid_context_use_outcome",
+            "context_pack_node_id and outcome_id are required",
+        ));
+    }
+    if store
+        .get_node(context_pack_node_id)
+        .map_err(thg_error_from_store)?
+        .is_none()
+    {
+        return Err(ThgError::new(
+            "missing_graph_endpoint",
+            format!("context pack {context_pack_node_id} does not exist"),
+        ));
+    }
+    let receipt_node_id = format!(
+        "context_use_receipt:{}:{}:{}",
+        tenant_id,
+        slug_segment(context_pack_node_id),
+        slug_segment(outcome_id)
+    );
+    let mutations = vec![
+        GraphMutation::NodeUpsert(NodeRecord::new(
+            &receipt_node_id,
+            [CONTEXT_USE_RECEIPT_LABEL],
+            json!({
+                "tenant_id": tenant_id,
+                "context_pack_node_id": context_pack_node_id,
+                "outcome_id": outcome_id,
+                "success": success,
+                "note": note.map(str::trim).filter(|text| !text.is_empty()),
+                "recorded_at_ms": now_ms(),
+                "source": THG_ADAPTER_SOURCE,
+            }),
+        )),
+        GraphMutation::EdgeUpsert(edge_with_adapter_provenance(
+            format!(
+                "edge:{}:{}:{}",
+                context_pack_node_id, CONTEXT_PACK_OUTCOME, receipt_node_id
+            ),
+            context_pack_node_id,
+            CONTEXT_PACK_OUTCOME,
+            &receipt_node_id,
+            json!({
+                "tenant_id": tenant_id,
+                "success": success,
+            }),
+            actor,
+        )),
+    ];
+    store
+        .commit_batch(GraphMutationBatch::new(mutations))
+        .map_err(thg_error_from_store)?;
+    Ok(receipt_node_id)
+}
+
+/// Close the read-back loop: feed prior selection edges and use-receipts
+/// back into candidate features before scoring, so the scorer's
+/// receipt/recency/degree terms run on graph truth instead of zero-fill.
+/// Read-only and bounded by the candidate list it is given.
+pub fn enrich_context_candidates_from_store<S: crate::reflexive_executor::ReflexiveReadStore>(
+    store: &S,
+    tenant_id: &str,
+    candidates: Vec<ContextAtomCandidate>,
+) -> ThgResult<Vec<ContextAtomCandidate>> {
+    use rustyred_thg_core::{Direction, NeighborQuery};
+
+    let tenant_id = normalize_tenant_id(tenant_id);
+    let now = u64::try_from(now_ms()).unwrap_or(0);
+    let mut enriched = Vec::with_capacity(candidates.len());
+    for mut candidate in candidates {
+        let node_id = candidate.node_id.trim().to_string();
+        if node_id.is_empty() {
+            enriched.push(candidate);
+            continue;
+        }
+
+        // Graph degree: out plus in neighbors of the atom itself.
+        let out_degree = store
+            .read_neighbors(NeighborQuery {
+                node_id: node_id.clone(),
+                direction: Direction::Out,
+                edge_type: None,
+                include_expired: false,
+            })
+            .map_err(thg_error_from_store)?
+            .len();
+        let in_hits = store
+            .read_neighbors(NeighborQuery {
+                node_id: node_id.clone(),
+                direction: Direction::In,
+                edge_type: None,
+                include_expired: false,
+            })
+            .map_err(thg_error_from_store)?;
+        candidate.graph_degree = candidate.graph_degree.max(out_degree + in_hits.len());
+
+        // Selection history: packs that selected this atom, and the
+        // outcomes recorded against those packs.
+        let mut use_count = 0u32;
+        let mut success_count = 0u32;
+        let mut failure_count = 0u32;
+        for hit in in_hits
+            .iter()
+            .filter(|hit| hit.edge_type == CONTEXT_ATOM_SELECTED)
+        {
+            let Some(pack) = store.read_node(&hit.node_id).map_err(thg_error_from_store)? else {
+                continue;
+            };
+            if property_str(&pack.properties, "tenant_id") != Some(tenant_id.as_str()) {
+                continue;
+            }
+            use_count = use_count.saturating_add(1);
+            let outcomes = store
+                .read_neighbors(NeighborQuery {
+                    node_id: pack.id.clone(),
+                    direction: Direction::Out,
+                    edge_type: Some(CONTEXT_PACK_OUTCOME.to_string()),
+                    include_expired: false,
+                })
+                .map_err(thg_error_from_store)?;
+            for outcome_hit in outcomes {
+                let Some(receipt) = store
+                    .read_node(&outcome_hit.node_id)
+                    .map_err(thg_error_from_store)?
+                else {
+                    continue;
+                };
+                match receipt.properties.get("success").and_then(Value::as_bool) {
+                    Some(true) => success_count = success_count.saturating_add(1),
+                    Some(false) => failure_count = failure_count.saturating_add(1),
+                    None => {}
+                }
+            }
+        }
+        candidate.use_count = candidate.use_count.saturating_add(use_count);
+        candidate.success_count = candidate.success_count.saturating_add(success_count);
+        candidate.failure_count = candidate.failure_count.saturating_add(failure_count);
+
+        // Age and pin state from the atom node itself.
+        if let Some(atom) = store.read_node(&node_id).map_err(thg_error_from_store)? {
+            if candidate.age_ms.is_none() {
+                let recorded = atom
+                    .properties
+                    .get("recorded_at_ms")
+                    .or_else(|| atom.properties.get("created_at_ms"))
+                    .and_then(Value::as_u64);
+                if let Some(recorded_at) = recorded {
+                    candidate.age_ms = Some(now.saturating_sub(recorded_at));
+                }
+            }
+            if let Some(pinned) = atom.properties.get("pinned").and_then(Value::as_bool) {
+                candidate.pinned |= pinned;
+            }
+        }
+        enriched.push(candidate);
+    }
+    Ok(enriched)
 }
 
 pub fn similar_situation_search<S: SituationSearchGraphStore>(

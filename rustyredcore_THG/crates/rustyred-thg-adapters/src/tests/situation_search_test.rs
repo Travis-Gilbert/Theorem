@@ -261,6 +261,104 @@ fn context_candidates_from_similar_situation_can_be_recorded_as_pack() {
     );
 }
 
+#[test]
+fn use_receipts_round_trip_from_selection_to_enriched_scoring() {
+    use crate::{enrich_context_candidates_from_store, record_context_use_outcome};
+
+    let mut store = InMemoryGraphStore::new();
+    for atom_id in ["atom:proven", "atom:fresh"] {
+        store
+            .upsert_node(NodeRecord::new(
+                atom_id,
+                [POSTMORTEM_LABEL],
+                json!({ "tenant_id": "theorem", "summary": "fixture atom" }),
+            ))
+            .unwrap();
+    }
+
+    // Round 1: a pack selects atom:proven; outcomes get recorded against it.
+    let first = score_context_atoms(
+        "theorem",
+        vec![context_candidate("atom:proven", 0.9, 64)],
+        ContextScoringPolicy::default(),
+    )
+    .unwrap();
+    let receipt = record_context_scoring_result(&mut store, &first, Some("test")).unwrap();
+    record_context_use_outcome(
+        &mut store,
+        "theorem",
+        &receipt.context_pack_node_id,
+        "outcome-1",
+        true,
+        Some("task succeeded with this context"),
+        Some("test"),
+    )
+    .unwrap();
+    record_context_use_outcome(
+        &mut store,
+        "theorem",
+        &receipt.context_pack_node_id,
+        "outcome-2",
+        true,
+        None,
+        Some("test"),
+    )
+    .unwrap();
+
+    // Round 2: zero-filled retrieval candidates get enriched from the graph.
+    let zero_filled = vec![
+        context_candidate("atom:proven", 0.7, 64),
+        context_candidate("atom:fresh", 0.7, 64),
+    ];
+    let enriched =
+        enrich_context_candidates_from_store(&store, "theorem", zero_filled).unwrap();
+    let proven = enriched
+        .iter()
+        .find(|candidate| candidate.node_id == "atom:proven")
+        .unwrap();
+    assert_eq!(proven.use_count, 1);
+    assert_eq!(proven.success_count, 2);
+    assert_eq!(proven.failure_count, 0);
+    assert!(proven.graph_degree >= 1);
+    let fresh = enriched
+        .iter()
+        .find(|candidate| candidate.node_id == "atom:fresh")
+        .unwrap();
+    assert_eq!(fresh.use_count, 0);
+    assert_eq!(fresh.success_count, 0);
+
+    // The enriched receipts now move the ranking at equal similarity.
+    let scored = score_context_atoms("theorem", enriched, ContextScoringPolicy::default()).unwrap();
+    let proven_rank = scored
+        .ranked_atoms
+        .iter()
+        .find(|atom| atom.node_id == "atom:proven")
+        .unwrap();
+    let fresh_rank = scored
+        .ranked_atoms
+        .iter()
+        .find(|atom| atom.node_id == "atom:fresh")
+        .unwrap();
+    assert!(proven_rank.score > fresh_rank.score);
+    assert!(proven_rank
+        .reasons
+        .iter()
+        .any(|reason| reason == "receipt_success"));
+
+    // Missing pack id is rejected rather than silently minting receipts.
+    let missing = record_context_use_outcome(
+        &mut store,
+        "theorem",
+        "context_pack:theorem:missing",
+        "outcome-x",
+        false,
+        None,
+        Some("test"),
+    )
+    .unwrap_err();
+    assert_eq!(missing.code, "missing_graph_endpoint");
+}
+
 fn context_candidate(node_id: &str, similarity: f32, token_cost: usize) -> ContextAtomCandidate {
     ContextAtomCandidate {
         node_id: node_id.to_string(),

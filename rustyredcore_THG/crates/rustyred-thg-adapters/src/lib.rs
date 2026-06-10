@@ -4,13 +4,17 @@
 //! stores, and PPR, while keeping adapter-specific routing and fitness logic
 //! out of the core executor.
 
+#[cfg(feature = "pairformer-burn-cubecl")]
+pub mod burn_mpnn;
 pub mod commands;
+pub mod edge_mpnn;
 pub mod fitness;
 pub mod grounded_skill;
 pub mod pairformer;
 #[cfg(feature = "pairformer-burn-cubecl")]
 pub mod pairformer_cubecl;
 pub mod reflexive;
+pub mod reflexive_executor;
 pub mod routing;
 pub mod situation_search;
 pub mod training_runner;
@@ -18,7 +22,15 @@ pub mod training_substrate;
 pub mod types;
 pub mod upsert;
 
+#[cfg(feature = "pairformer-burn-cubecl")]
+pub use burn_mpnn::{aggregate_messages_burn, BurnAggregator, BurnEdgeMpnnLayer};
 pub use commands::{execute_adapter_command, AdapterCommandResponse};
+pub use edge_mpnn::{
+    rank_global_completion_candidates, rank_global_completion_candidates_default,
+    FixedPointAggregator, GlobalCompletionConfig, GlobalCompletionRequest, GlobalCompletionResult,
+    MessageAggregator, DEFAULT_COMPLETION_HIDDEN_DIM, DEFAULT_COMPLETION_LAYERS,
+    DEFAULT_COMPLETION_MAX_FRONTIER_NODES, DEFAULT_COMPLETION_MAX_SEEDS,
+};
 pub use fitness::{
     effective_fitness, find_adapter_by_id, list_adapters, record_fitness, supersede_adapter,
 };
@@ -48,20 +60,29 @@ pub use reflexive::{
     REFLEXIVE_CANDIDATE_TARGET, REFLEXIVE_DENSIFICATION_RUN_LABEL, REFLEXIVE_EDGE_CANDIDATE_LABEL,
     REPRESENTATION_SIDECAR_LABEL, REPRESENTS_NODE,
 };
+pub use reflexive_executor::{
+    adapter_factors_node_id, apply_low_rank_adapter, load_adapter_factors,
+    load_node_representation, reflexive_match_inference, score_match_neighborhood,
+    upsert_adapter_factors_sidecar, LowRankAdapterFactors, MatchInferenceResult,
+    MatchNeighborhoodInput, NodeRepresentation, ReflexiveReadStore, ADAPTER_FACTORS_LABEL,
+    FACTORS_FOR_ADAPTER,
+};
 pub use routing::{
     adapter_training_centroid, find_adapters_by_query_embedding, find_adapters_for,
     recompute_embedding,
 };
 pub use situation_search::{
     context_candidates_from_similar_situation, default_situation_target_labels,
-    record_context_scoring_result, record_similar_situation_search,
+    enrich_context_candidates_from_store, record_context_scoring_result,
+    record_context_use_outcome, record_similar_situation_search,
     register_semantic_vector_designations, score_context_atoms, semantic_vector_designations,
     similar_situation_search, ContextAtomCandidate, ContextScoringPolicy, ContextScoringReceipt,
     ContextScoringResult, RankedContextAtom, SimilarSituationDecision, SimilarSituationHit,
     SimilarSituationSearchMode, SimilarSituationSearchPolicy, SimilarSituationSearchReceipt,
     SimilarSituationSearchRequest, SimilarSituationSearchResult, SituationSearchGraphStore,
     CODE_FILE_LABEL, CODE_OBJECT_LABEL, CODE_SYMBOL_LABEL, CONTEXT_ATOM_LABEL,
-    CONTEXT_ATOM_SELECTED, CONTEXT_PACK_LABEL, DEFAULT_CONTEXT_MAX_ATOMS,
+    CONTEXT_ATOM_SELECTED, CONTEXT_PACK_LABEL, CONTEXT_PACK_OUTCOME, CONTEXT_USE_RECEIPT_LABEL,
+    DEFAULT_CONTEXT_MAX_ATOMS,
     DEFAULT_CONTEXT_TOKEN_BUDGET, DEFAULT_CONTEXT_TOKEN_COST, EMBEDDING_CODEGRAPHBERT_768,
     EMBEDDING_CODE_UNIXCODER_768, EMBEDDING_SITUATION_SBERT_384, EMBEDDING_TRAINING_SBERT_384,
     EMBEDDING_USER_SBERT_384, ESCALATED_TO_SEARCH, HARNESS_EVENT_LABEL, HARNESS_RUN_LABEL,
@@ -112,6 +133,18 @@ mod grounded_skill_test;
 #[cfg(test)]
 #[path = "tests/reflexive_test.rs"]
 mod reflexive_test;
+
+#[cfg(test)]
+#[path = "tests/edge_mpnn_test.rs"]
+mod edge_mpnn_test;
+
+#[cfg(test)]
+#[path = "tests/reflexive_executor_test.rs"]
+mod reflexive_executor_test;
+
+#[cfg(all(test, feature = "pairformer-burn-cubecl"))]
+#[path = "tests/burn_mpnn_test.rs"]
+mod burn_mpnn_test;
 
 #[cfg(test)]
 #[path = "tests/pairformer_test.rs"]

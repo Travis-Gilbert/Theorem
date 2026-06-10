@@ -69,7 +69,8 @@ use crate::observability::{
     KIND_FULLTEXT_SEARCH, KIND_VECTOR_SEARCH,
 };
 use crate::query_surface::{
-    execute_cypher_query, execute_public_query, explain_cypher_query, parse_tx_cypher_mutations,
+    execute_cypher_query_with_steering, execute_public_query, explain_cypher_query,
+    parse_tx_cypher_mutations,
     resolve_tenant_id, PublicCypherBody, QuerySurfaceError,
 };
 use crate::state::{AppState, StoreAccessError, TenantGraphStore};
@@ -3691,7 +3692,12 @@ async fn public_cypher(
     };
     state.observability.record_cypher();
     let start = std::time::Instant::now();
-    let outcome = execute_cypher_query(&mut store, &tenant_id, &body);
+    let outcome = execute_cypher_query_with_steering(
+        &mut store,
+        &tenant_id,
+        &body,
+        Some(state.plan_steering.as_ref()),
+    );
     let nanos = start.elapsed().as_nanos() as u64;
     let detail = body.query.chars().take(120).collect::<String>();
     state
@@ -8047,6 +8053,7 @@ mod tests {
             axum::extract::State(state.clone()),
             HeaderMap::new(),
             Json(PublicCypherBody {
+                reflexive_inference: false,
                 tenant_id: Some("tenant-tx".to_string()),
                 query: "CREATE (n:File {id: $id, path: $path})".to_string(),
                 params: BTreeMap::from([
@@ -8107,6 +8114,7 @@ mod tests {
             axum::extract::State(state.clone()),
             HeaderMap::new(),
             Json(PublicCypherBody {
+                reflexive_inference: false,
                 tenant_id: Some("tenant-tx".to_string()),
                 query: "CREATE (n:File {id: $id, path: $path})".to_string(),
                 params: BTreeMap::from([
@@ -8364,6 +8372,7 @@ mod tests {
             axum::extract::State(state.clone()),
             HeaderMap::new(),
             Json(PublicCypherBody {
+                reflexive_inference: false,
                 tenant_id: Some("tenant-w".to_string()),
                 query: "CREATE (n:Doc {id: 'a', path: 'src/lib.rs'})".to_string(),
                 params: BTreeMap::new(),
@@ -8387,6 +8396,7 @@ mod tests {
             axum::extract::State(state.clone()),
             HeaderMap::new(),
             Json(PublicCypherBody {
+                reflexive_inference: false,
                 tenant_id: Some("tenant-merge".to_string()),
                 query:
                     "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1"
@@ -8403,6 +8413,7 @@ mod tests {
             axum::extract::State(state.clone()),
             HeaderMap::new(),
             Json(PublicCypherBody {
+                reflexive_inference: false,
                 tenant_id: Some("tenant-merge".to_string()),
                 query:
                     "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1"

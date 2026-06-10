@@ -792,7 +792,7 @@ fn pairformer_input_from_graph(
     PairformerInput { nodes, edges }
 }
 
-fn pairformer_score_to_candidate(
+pub(crate) fn pairformer_score_to_candidate(
     request: &DensificationRequest,
     score: &PairformerLinkScore,
     existing_direct_pairs: &BTreeSet<(String, String)>,

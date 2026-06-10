@@ -37,6 +37,120 @@ pub struct PlanCandidate {
     pub hints: Vec<String>,
 }
 
+pub const PLAN_CANDIDATE_EXPAND_LEFT_OUT: &str = "expand_left_out";
+pub const PLAN_CANDIDATE_EXPAND_RIGHT_IN: &str = "expand_right_in";
+
+/// Enumerate the native candidate set for a single-hop relationship MATCH.
+/// The native rule plan anchors on the left node and expands outward; when
+/// the right node is independently anchorable (label or property filter),
+/// the reversed anchor is a second enumerated candidate. The learned ranker
+/// may only pick among these.
+pub fn enumerate_edge_pattern_candidates(right_anchorable: bool) -> Vec<PlanCandidate> {
+    let mut candidates = vec![PlanCandidate {
+        candidate_id: PLAN_CANDIDATE_EXPAND_LEFT_OUT.to_string(),
+        summary: "scan left anchor, expand outgoing edges".to_string(),
+        native_rank: 0,
+        estimated_cost_units: 100.0,
+        hints: vec![],
+    }];
+    if right_anchorable {
+        candidates.push(PlanCandidate {
+            candidate_id: PLAN_CANDIDATE_EXPAND_RIGHT_IN.to_string(),
+            summary: "scan right anchor, expand incoming edges".to_string(),
+            native_rank: 1,
+            estimated_cost_units: 100.0,
+            hints: vec!["anchor_right".to_string()],
+        });
+    }
+    candidates
+}
+
+/// Stable key for "queries of this shape": structure only, never parameter
+/// values, so observations pool across runs of the same plan family.
+pub fn edge_pattern_shape_key(
+    left_label: Option<&str>,
+    left_property_keys: &[String],
+    edge_type: &str,
+    right_label: Option<&str>,
+    right_property_keys: &[String],
+) -> String {
+    format!(
+        "edge_pattern|l:{}|lp:{}|e:{}|r:{}|rp:{}",
+        left_label.unwrap_or("*"),
+        left_property_keys.join(","),
+        edge_type,
+        right_label.unwrap_or("*"),
+        right_property_keys.join(","),
+    )
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlanObservationAccumulator {
+    observations: u32,
+    successes: u32,
+    total_cost: f64,
+    total_cost_squared: f64,
+}
+
+/// In-process observation store for the steered optimizer: per query shape
+/// and candidate, the measured cost units of real executions. This is the
+/// `metrics` feed for [`steer_plan_candidates`]; until it accumulates past
+/// the cold-start floor, the native plan runs unconditionally.
+#[derive(Debug, Default)]
+pub struct PlanSteeringState {
+    observations: std::sync::Mutex<BTreeMap<(String, String), PlanObservationAccumulator>>,
+}
+
+impl PlanSteeringState {
+    pub fn record(&self, shape_key: &str, candidate_id: &str, cost_units: f64, success: bool) {
+        if !cost_units.is_finite() || cost_units < 0.0 {
+            return;
+        }
+        let mut observations = self
+            .observations
+            .lock()
+            .expect("plan steering observations lock");
+        let slot = observations
+            .entry((shape_key.to_string(), candidate_id.to_string()))
+            .or_default();
+        slot.observations = slot.observations.saturating_add(1);
+        if success {
+            slot.successes = slot.successes.saturating_add(1);
+        }
+        slot.total_cost += cost_units;
+        slot.total_cost_squared += cost_units * cost_units;
+    }
+
+    /// Snapshot metrics for one query shape. Uncertainty is the standard
+    /// error of the mean cost: it shrinks as observations accumulate, which
+    /// is what the exploration term in the steering score expects.
+    pub fn metrics_for(&self, shape_key: &str) -> Vec<PlanObservationMetrics> {
+        let observations = self
+            .observations
+            .lock()
+            .expect("plan steering observations lock");
+        observations
+            .iter()
+            .filter(|((shape, _), accumulator)| {
+                shape == shape_key && accumulator.observations > 0
+            })
+            .map(|((_, candidate_id), accumulator)| {
+                let count = accumulator.observations as f64;
+                let mean = accumulator.total_cost / count;
+                let variance =
+                    (accumulator.total_cost_squared / count - mean * mean).max(0.0);
+                PlanObservationMetrics {
+                    candidate_id: candidate_id.clone(),
+                    observations: accumulator.observations,
+                    mean_cost_units: mean,
+                    success_rate: accumulator.successes as f64 / count,
+                    uncertainty: (variance / count).sqrt(),
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PlanObservationMetrics {
     pub candidate_id: String,

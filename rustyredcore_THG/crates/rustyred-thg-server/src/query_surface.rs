@@ -18,6 +18,60 @@ use crate::state::TenantGraphStore;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1_000;
+/// Bound on the neighborhood handed to the reflexive Pairformer when a MATCH
+/// opts into in-database inference. Keeps the dense scorer on extracted
+/// subgraphs, never the whole graph.
+const REFLEXIVE_MATCH_MAX_NODES: usize = 64;
+
+/// Join the bounded MATCH neighborhood with the representation/adapter
+/// sidecars and run the Pairformer. Always advisory: failures degrade to an
+/// error note in the advisory block; rows are never affected and no edge is
+/// ever written.
+fn reflexive_advisory_block(
+    store: &TenantGraphStore,
+    tenant: &str,
+    node_ids: &std::collections::BTreeSet<String>,
+    walk_capped: bool,
+) -> Value {
+    use rustyred_thg_adapters::{
+        reflexive_match_inference, DensificationRequest, PairformerConfig,
+    };
+
+    let ids = node_ids.iter().cloned().collect::<Vec<_>>();
+    let request = DensificationRequest {
+        tenant_id: tenant.to_string(),
+        seed_node_ids: ids.clone(),
+        max_nodes: REFLEXIVE_MATCH_MAX_NODES,
+        max_depth: 2,
+        min_path_confidence: 0.0,
+        confidence_threshold: 0.5,
+        confidence_ceiling: 0.0,
+        max_candidates: 16,
+        admission_tier: String::new(),
+        model_id: "pairformer-match-inference/v1".to_string(),
+        allowed_edge_types: vec![],
+    };
+    let config = PairformerConfig {
+        max_nodes: REFLEXIVE_MATCH_MAX_NODES,
+        ..PairformerConfig::default()
+    };
+    match reflexive_match_inference(store, &ids, request, config) {
+        Ok(result) => json!({
+            "advisory": true,
+            "considered_nodes": result.considered_node_ids.len(),
+            "representations_joined": result.representations_joined,
+            "adapters_applied": result.adapters_applied,
+            "adapter_skips": result.adapter_skips,
+            "bounded": result.bounded || walk_capped,
+            "candidates": result.candidates,
+        }),
+        Err(error) => json!({
+            "advisory": true,
+            "error": error.code,
+            "message": error.message,
+        }),
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PublicCypherBody {
@@ -28,6 +82,11 @@ pub struct PublicCypherBody {
     pub params: BTreeMap<String, Value>,
     #[serde(default)]
     pub tx_id: Option<String>,
+    /// Opt-in: run the bounded reflexive Pairformer over the MATCH
+    /// neighborhood (sidecar-joined) and attach advisory candidates to the
+    /// response. Never adds rows and never writes edges.
+    #[serde(default)]
+    pub reflexive_inference: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +295,26 @@ pub fn execute_cypher_query(
     tenant: &str,
     body: &PublicCypherBody,
 ) -> Result<Value, QuerySurfaceError> {
+    execute_cypher_query_with_steering(store, tenant, body, None)
+}
+
+/// Cost the steering loop records when a selected plan fails outright. The
+/// magnitude only needs to be punitive relative to ordinary scans; the
+/// success-rate drop is what actually disqualifies a flaky candidate.
+const EDGE_PLAN_FAILURE_COST: f64 = 10_000.0;
+
+/// [`execute_cypher_query`] with the steered-optimizer observation store
+/// attached. When present, single-hop relationship MATCH execution
+/// enumerates its native plan candidates, lets the Bao-style ranker pick
+/// among them once observations pass the cold-start floor, and records the
+/// measured execution cost back into the store. Absent or cold, the native
+/// anchor-left plan runs unconditionally.
+pub fn execute_cypher_query_with_steering(
+    store: &mut TenantGraphStore,
+    tenant: &str,
+    body: &PublicCypherBody,
+    steering: Option<&planner::PlanSteeringState>,
+) -> Result<Value, QuerySurfaceError> {
     let parsed = parse_cypher(&body.query, &body.params)?;
     if !parsed.writes.is_empty() {
         return execute_write_cypher(store, tenant, &parsed);
@@ -375,52 +454,79 @@ pub fn execute_cypher_query(
                     "relationship MATCH requires at least a left label or left property filter in this slice",
                 ));
             }
-            let seeds = store.query_nodes(seed_query.clone())?;
-            let mut rows = Vec::new();
-            let mut edges_touched = 0usize;
-            for seed in &seeds {
-                if let Some(filter) = left_filter {
-                    if !node_matches_filter(seed, filter) {
-                        continue;
-                    }
-                }
-                let neighbors = store.neighbors(NeighborQuery {
-                    node_id: seed.id.clone(),
-                    direction: Direction::Out,
-                    edge_type: Some(edge_pattern.edge_type.clone()),
-                    include_expired: false,
-                })?;
-                edges_touched += neighbors.len();
-                for hit in neighbors {
-                    let Some(target) = store.get_node(&hit.node_id)? else {
-                        continue;
-                    };
-                    if !node_matches_pattern(&target, &edge_pattern.right) {
-                        continue;
-                    }
-                    if let Some(filter) = right_filter {
-                        if !node_matches_filter(&target, filter) {
-                            continue;
-                        }
-                    }
-                    rows.push(project_edge_row(
-                        &parsed.returns,
-                        edge_pattern,
-                        seed,
-                        &target,
-                    )?);
-                    if rows.len() > parsed.limit {
-                        break;
-                    }
-                }
-                if rows.len() > parsed.limit {
-                    break;
-                }
+
+            // Steered optimizer (Bao-style): the rule planner enumerates the
+            // candidate set; recorded execution observations may pick among
+            // them once past the cold-start floor. The learned ranker never
+            // sees a plan that is not enumerated here.
+            let right_query = node_query_for_pattern(
+                &edge_pattern.right,
+                right_filter,
+                parsed.limit.saturating_add(1),
+            )?;
+            let right_anchorable =
+                right_query.label.is_some() || !right_query.properties.is_empty();
+            let candidates = planner::enumerate_edge_pattern_candidates(right_anchorable);
+            let shape_key = planner::edge_pattern_shape_key(
+                edge_pattern.left.label.as_deref(),
+                &pattern_property_keys(&edge_pattern.left, left_filter),
+                &edge_pattern.edge_type,
+                edge_pattern.right.label.as_deref(),
+                &pattern_property_keys(&edge_pattern.right, right_filter),
+            );
+            let decision = steering.and_then(|state| {
+                planner::steer_plan_candidates(
+                    &candidates,
+                    &state.metrics_for(&shape_key),
+                    planner::PlannerSteeringPolicy::default(),
+                )
+            });
+            let selected = decision
+                .as_ref()
+                .map(|item| item.selected_candidate_id.clone())
+                .unwrap_or_else(|| planner::PLAN_CANDIDATE_EXPAND_LEFT_OUT.to_string());
+
+            let execution = if selected == planner::PLAN_CANDIDATE_EXPAND_RIGHT_IN {
+                execute_edge_anchor_right(
+                    store,
+                    &parsed,
+                    edge_pattern,
+                    left_filter,
+                    right_filter,
+                    &right_query,
+                )
+            } else {
+                execute_edge_anchor_left(
+                    store,
+                    &parsed,
+                    edge_pattern,
+                    left_filter,
+                    right_filter,
+                    &seed_query,
+                )
+            };
+            if let (Some(state), Err(_)) = (steering, &execution) {
+                state.record(&shape_key, &selected, EDGE_PLAN_FAILURE_COST, false);
             }
+            let execution = execution?;
+            if let Some(state) = steering {
+                state.record(&shape_key, &selected, execution.cost_units(), true);
+            }
+
+            let mut rows = execution.rows;
             let truncated = rows.len() > parsed.limit;
             if truncated {
                 rows.truncate(parsed.limit);
             }
+            let plan_operation = match (
+                selected == planner::PLAN_CANDIDATE_EXPAND_RIGHT_IN,
+                execution.index_seek,
+            ) {
+                (false, false) => "node_by_label_expand_out",
+                (false, true) => "node_index_seek_expand_out",
+                (true, false) => "node_by_label_expand_in",
+                (true, true) => "node_index_seek_expand_in",
+            };
             Ok(json!({
                 "ok": true,
                 "tenant": tenant,
@@ -431,13 +537,17 @@ pub fn execute_cypher_query(
                 "stats": {
                     "returned": rows.len(),
                     "truncated": truncated,
-                    "seed_nodes": seeds.len(),
-                    "edges_touched": edges_touched,
-                    "plan_operation": if seed_query.properties.is_empty() {
-                        "node_by_label_expand_out"
-                    } else {
-                        "node_index_seek_expand_out"
-                    }
+                    "seed_nodes": execution.seed_count,
+                    "edges_touched": execution.edges_touched,
+                    "plan_operation": plan_operation,
+                    "plan_candidate": selected,
+                    "plan_steering": decision
+                        .map(|item| json!({
+                            "abstained": item.abstained,
+                            "reason": item.reason,
+                            "observed_candidate_count": item.observed_candidate_count,
+                        }))
+                        .unwrap_or(Value::Null),
                 },
                 "explain": explain,
             }))
@@ -460,6 +570,7 @@ pub fn execute_cypher_query(
             let seeds = store.query_nodes(seed_query.clone())?;
             let mut rows: Vec<Value> = Vec::new();
             let mut hops_touched: usize = 0;
+            let mut reflexive_nodes: std::collections::BTreeSet<String> = Default::default();
 
             // Recursive walk via an explicit stack: each frame holds the
             // current step index and the bindings accumulated so far.
@@ -468,6 +579,9 @@ pub fn execute_cypher_query(
                     if !node_matches_filter(seed, filter) {
                         continue;
                     }
+                }
+                if body.reflexive_inference && reflexive_nodes.len() < REFLEXIVE_MATCH_MAX_NODES {
+                    reflexive_nodes.insert(seed.id.clone());
                 }
                 walk_chain(
                     store,
@@ -478,6 +592,7 @@ pub fn execute_cypher_query(
                     &mut Vec::from([(chain.start.binding.clone(), seed.clone())]),
                     &mut rows,
                     &mut hops_touched,
+                    body.reflexive_inference.then_some(&mut reflexive_nodes),
                 )?;
                 if rows.len() > parsed.limit {
                     break;
@@ -487,7 +602,7 @@ pub fn execute_cypher_query(
             if truncated {
                 rows.truncate(parsed.limit);
             }
-            Ok(json!({
+            let mut response = json!({
                 "ok": true,
                 "tenant": tenant,
                 "query": parsed.normalized,
@@ -502,7 +617,13 @@ pub fn execute_cypher_query(
                     "plan_operation": "multi_hop_chain_walk",
                 },
                 "explain": explain,
-            }))
+            });
+            if body.reflexive_inference {
+                let capped = reflexive_nodes.len() >= REFLEXIVE_MATCH_MAX_NODES;
+                response["reflexive"] =
+                    reflexive_advisory_block(store, tenant, &reflexive_nodes, capped);
+            }
+            Ok(response)
         }
         CypherPattern::EdgeVarLength(var) => {
             let from_filter = parsed
@@ -534,6 +655,8 @@ pub fn execute_cypher_query(
             }
             let mut rows: Vec<Value> = Vec::new();
             let mut endpoints_touched: usize = 0;
+            let mut reflexive_nodes: std::collections::BTreeSet<String> = Default::default();
+            let mut reflexive_capped = false;
 
             for from_node in &froms {
                 if let Some(filter) = from_filter {
@@ -598,6 +721,15 @@ pub fn execute_cypher_query(
                         break;
                     }
                 }
+                if body.reflexive_inference {
+                    for node_id in &visited {
+                        if reflexive_nodes.len() >= REFLEXIVE_MATCH_MAX_NODES {
+                            reflexive_capped = true;
+                            break;
+                        }
+                        reflexive_nodes.insert(node_id.clone());
+                    }
+                }
                 if rows.len() > parsed.limit {
                     break;
                 }
@@ -606,7 +738,7 @@ pub fn execute_cypher_query(
             if truncated {
                 rows.truncate(parsed.limit);
             }
-            Ok(json!({
+            let mut response = json!({
                 "ok": true,
                 "tenant": tenant,
                 "query": parsed.normalized,
@@ -622,11 +754,162 @@ pub fn execute_cypher_query(
                     "plan_operation": "variable_length_expand",
                 },
                 "explain": explain,
-            }))
+            });
+            if body.reflexive_inference {
+                response["reflexive"] =
+                    reflexive_advisory_block(store, tenant, &reflexive_nodes, reflexive_capped);
+            }
+            Ok(response)
         }
     }
 }
 
+/// Result of one single-hop relationship execution, shared by the anchor
+/// candidates so the steering loop can compare them on equal terms.
+struct EdgeExecution {
+    rows: Vec<Value>,
+    seed_count: usize,
+    edges_touched: usize,
+    index_seek: bool,
+}
+
+impl EdgeExecution {
+    /// Cost units recorded into the steering observations: scanned seeds
+    /// plus touched edges plus emitted rows. Deterministic, backend-free.
+    fn cost_units(&self) -> f64 {
+        (self.seed_count + self.edges_touched + self.rows.len()) as f64
+    }
+}
+
+fn pattern_property_keys(
+    pattern: &NodePattern,
+    filter: Option<&PropertyFilter>,
+) -> Vec<String> {
+    let mut keys: Vec<String> = pattern.properties.keys().cloned().collect();
+    if let Some(filter) = filter {
+        keys.push(filter.key.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Native plan: scan the left anchor, expand outgoing edges.
+fn execute_edge_anchor_left(
+    store: &TenantGraphStore,
+    parsed: &ParsedCypher,
+    edge_pattern: &EdgePattern,
+    left_filter: Option<&PropertyFilter>,
+    right_filter: Option<&PropertyFilter>,
+    seed_query: &NodeQuery,
+) -> Result<EdgeExecution, QuerySurfaceError> {
+    let seeds = store.query_nodes(seed_query.clone())?;
+    let mut rows = Vec::new();
+    let mut edges_touched = 0usize;
+    for seed in &seeds {
+        if let Some(filter) = left_filter {
+            if !node_matches_filter(seed, filter) {
+                continue;
+            }
+        }
+        let neighbors = store.neighbors(NeighborQuery {
+            node_id: seed.id.clone(),
+            direction: Direction::Out,
+            edge_type: Some(edge_pattern.edge_type.clone()),
+            include_expired: false,
+        })?;
+        edges_touched += neighbors.len();
+        for hit in neighbors {
+            let Some(target) = store.get_node(&hit.node_id)? else {
+                continue;
+            };
+            if !node_matches_pattern(&target, &edge_pattern.right) {
+                continue;
+            }
+            if let Some(filter) = right_filter {
+                if !node_matches_filter(&target, filter) {
+                    continue;
+                }
+            }
+            rows.push(project_edge_row(&parsed.returns, edge_pattern, seed, &target)?);
+            if rows.len() > parsed.limit {
+                break;
+            }
+        }
+        if rows.len() > parsed.limit {
+            break;
+        }
+    }
+    Ok(EdgeExecution {
+        rows,
+        seed_count: seeds.len(),
+        edges_touched,
+        index_seek: !seed_query.properties.is_empty(),
+    })
+}
+
+/// Enumerated alternative: scan the right anchor, expand incoming edges.
+/// Produces the same row set as the native plan (ordering grouped by the
+/// right anchor instead of the left).
+fn execute_edge_anchor_right(
+    store: &TenantGraphStore,
+    parsed: &ParsedCypher,
+    edge_pattern: &EdgePattern,
+    left_filter: Option<&PropertyFilter>,
+    right_filter: Option<&PropertyFilter>,
+    right_query: &NodeQuery,
+) -> Result<EdgeExecution, QuerySurfaceError> {
+    let seeds = store.query_nodes(right_query.clone())?;
+    let mut rows = Vec::new();
+    let mut edges_touched = 0usize;
+    for right_node in &seeds {
+        if let Some(filter) = right_filter {
+            if !node_matches_filter(right_node, filter) {
+                continue;
+            }
+        }
+        let neighbors = store.neighbors(NeighborQuery {
+            node_id: right_node.id.clone(),
+            direction: Direction::In,
+            edge_type: Some(edge_pattern.edge_type.clone()),
+            include_expired: false,
+        })?;
+        edges_touched += neighbors.len();
+        for hit in neighbors {
+            let Some(left_node) = store.get_node(&hit.node_id)? else {
+                continue;
+            };
+            if !node_matches_pattern(&left_node, &edge_pattern.left) {
+                continue;
+            }
+            if let Some(filter) = left_filter {
+                if !node_matches_filter(&left_node, filter) {
+                    continue;
+                }
+            }
+            rows.push(project_edge_row(
+                &parsed.returns,
+                edge_pattern,
+                &left_node,
+                right_node,
+            )?);
+            if rows.len() > parsed.limit {
+                break;
+            }
+        }
+        if rows.len() > parsed.limit {
+            break;
+        }
+    }
+    Ok(EdgeExecution {
+        rows,
+        seed_count: seeds.len(),
+        edges_touched,
+        index_seek: !right_query.properties.is_empty(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk_chain(
     store: &TenantGraphStore,
     chain: &crate::cypher::ast::EdgeChain,
@@ -636,6 +919,7 @@ fn walk_chain(
     path_bindings: &mut Vec<(String, NodeRecord)>,
     rows: &mut Vec<Value>,
     hops_touched: &mut usize,
+    mut reflexive_nodes: Option<&mut std::collections::BTreeSet<String>>,
 ) -> Result<(), QuerySurfaceError> {
     if step_index >= chain.steps.len() {
         rows.push(project_chain_row(&parsed.returns, chain, path_bindings)?);
@@ -675,6 +959,11 @@ fn walk_chain(
                 continue;
             }
         }
+        if let Some(collector) = reflexive_nodes.as_deref_mut() {
+            if collector.len() < REFLEXIVE_MATCH_MAX_NODES {
+                collector.insert(target_node.id.clone());
+            }
+        }
         path_bindings.push((step.target.binding.clone(), target_node.clone()));
         walk_chain(
             store,
@@ -685,6 +974,7 @@ fn walk_chain(
             path_bindings,
             rows,
             hops_touched,
+            reflexive_nodes.as_deref_mut(),
         )?;
         path_bindings.pop();
     }
@@ -2366,6 +2656,7 @@ mod tests {
     fn cypher_count_star_aggregates_to_scalar() {
         let mut store = graph_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:File) RETURN COUNT(*)".to_string(),
             params: BTreeMap::new(),
@@ -2381,6 +2672,7 @@ mod tests {
     fn cypher_count_binding_aggregates_filtered_rows() {
         let mut store = graph_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:Symbol) RETURN COUNT(n)".to_string(),
             params: BTreeMap::new(),
@@ -2421,6 +2713,7 @@ mod tests {
     fn cypher_sum_aggregates_across_match_set() {
         let mut store = doc_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:Doc) RETURN sum(n.score)".to_string(),
             params: BTreeMap::new(),
@@ -2439,6 +2732,7 @@ mod tests {
     fn cypher_with_clause_groups_count_and_orders_desc() {
         let mut store = doc_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query:
                 "MATCH (n:Doc) WITH n.category AS cat, count(n) AS c RETURN cat, c ORDER BY c DESC LIMIT 10"
@@ -2461,6 +2755,7 @@ mod tests {
     fn cypher_order_by_desc_without_with_still_pipelines() {
         let mut store = doc_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:Doc) RETURN n ORDER BY n.score DESC LIMIT 2".to_string(),
             params: BTreeMap::new(),
@@ -2477,6 +2772,7 @@ mod tests {
     fn cypher_skip_drops_leading_rows() {
         let mut store = doc_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:Doc) RETURN n ORDER BY n.score ASC SKIP 1 LIMIT 5".to_string(),
             params: BTreeMap::new(),
@@ -2494,6 +2790,7 @@ mod tests {
     fn cypher_subset_executes_node_match_with_where() {
         let mut store = graph_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:File) WHERE n.path = $path RETURN n LIMIT 5".to_string(),
             params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
@@ -2510,6 +2807,7 @@ mod tests {
     fn cypher_subset_executes_relationship_projection() {
         let mut store = graph_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query:
                 "MATCH (a:File {path: $path})-[:IMPORTS]->(b:File) RETURN a.path, b.path LIMIT 10"
@@ -2528,6 +2826,7 @@ mod tests {
     fn cypher_subset_executes_variable_length_path_projection() {
         let mut store = graph_store();
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH p = (a:File {path: $path})-[:IMPORTS*1..2]->(b:File) RETURN p LIMIT 10"
                 .to_string(),
@@ -2546,8 +2845,194 @@ mod tests {
     }
 
     #[test]
+    fn steered_edge_match_abstains_cold_then_switches_anchor_warm() {
+        use crate::cypher::planner::{
+            edge_pattern_shape_key, PlanSteeringState, PLAN_CANDIDATE_EXPAND_LEFT_OUT,
+            PLAN_CANDIDATE_EXPAND_RIGHT_IN,
+        };
+
+        let mut store = graph_store();
+        let steering = PlanSteeringState::default();
+        let body = PublicCypherBody {
+            reflexive_inference: false,
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH (a:File)-[:IMPORTS]->(b:File {path: $path}) RETURN a.path"
+                .to_string(),
+            params: BTreeMap::from([(String::from("path"), json!("src/main.rs"))]),
+            tx_id: None,
+        };
+
+        // Cold start: the ranker abstains to the native anchor-left plan.
+        let cold =
+            super::execute_cypher_query_with_steering(&mut store, "demo", &body, Some(&steering))
+                .unwrap();
+        assert_eq!(
+            cold["stats"]["plan_candidate"],
+            PLAN_CANDIDATE_EXPAND_LEFT_OUT
+        );
+        assert_eq!(
+            cold["stats"]["plan_steering"]["reason"],
+            "cold_start_native_floor"
+        );
+        assert_eq!(cold["rows"][0]["a.path"], "src/lib.rs");
+
+        // Warm the observation store: the same query shape has seen the
+        // reversed anchor run much cheaper, often enough to clear the floor.
+        let shape_key = edge_pattern_shape_key(
+            Some("File"),
+            &[],
+            "IMPORTS",
+            Some("File"),
+            &["path".to_string()],
+        );
+        for _ in 0..24 {
+            steering.record(&shape_key, PLAN_CANDIDATE_EXPAND_LEFT_OUT, 120.0, true);
+            steering.record(&shape_key, PLAN_CANDIDATE_EXPAND_RIGHT_IN, 8.0, true);
+        }
+
+        let warm =
+            super::execute_cypher_query_with_steering(&mut store, "demo", &body, Some(&steering))
+                .unwrap();
+        assert_eq!(
+            warm["stats"]["plan_candidate"],
+            PLAN_CANDIDATE_EXPAND_RIGHT_IN
+        );
+        assert_eq!(
+            warm["stats"]["plan_operation"],
+            "node_index_seek_expand_in"
+        );
+        assert_eq!(
+            warm["stats"]["plan_steering"]["abstained"],
+            json!(false)
+        );
+        // The selected enumerated candidate returns the same row set.
+        assert_eq!(warm["rows"], cold["rows"]);
+
+        // The execution was recorded back into the observation store.
+        let observed = steering.metrics_for(&shape_key);
+        let right = observed
+            .iter()
+            .find(|metric| metric.candidate_id == PLAN_CANDIDATE_EXPAND_RIGHT_IN)
+            .unwrap();
+        assert_eq!(right.observations, 25);
+    }
+
+    #[test]
+    fn steering_without_anchorable_right_keeps_single_candidate() {
+        use crate::cypher::planner::enumerate_edge_pattern_candidates;
+
+        let candidates = enumerate_edge_pattern_candidates(false);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidate_id, "expand_left_out");
+        let candidates = enumerate_edge_pattern_candidates(true);
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn reflexive_inference_attaches_advisory_block_to_var_length_match() {
+        use rustyred_thg_adapters::{representation_sidecar_node_id, REPRESENTS_NODE};
+
+        let mut store = graph_store();
+        store
+            .upsert_node(NodeRecord::new(
+                "file:extra",
+                ["File"],
+                json!({ "path": "src/extra.rs", "repo": "rusty-red" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:imports-extra",
+                "file:main",
+                "IMPORTS",
+                "file:extra",
+                json!({}),
+            ))
+            .unwrap();
+        for (target, repr_id, embedding) in [
+            ("file:lib", "repr-lib", json!([1.0, 0.0, 0.2])),
+            ("file:main", "repr-main", json!([0.4, 0.6, 0.1])),
+            ("file:extra", "repr-extra", json!([0.1, 0.9, 0.4])),
+        ] {
+            let sidecar_id = representation_sidecar_node_id("demo", repr_id);
+            store
+                .upsert_node(NodeRecord::new(
+                    &sidecar_id,
+                    ["RepresentationSidecar"],
+                    json!({
+                        "tenant_id": "demo",
+                        "representation_id": repr_id,
+                        "target_kind": "node",
+                        "target_id": target,
+                        "model_id": "graphlora-base/test",
+                        "embedding": embedding,
+                        "adapter_ids": [],
+                        "graph_version": 1,
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    format!("edge:{sidecar_id}:{REPRESENTS_NODE}:{target}"),
+                    &sidecar_id,
+                    REPRESENTS_NODE,
+                    target,
+                    json!({ "tenant_id": "demo", "target_kind": "node" }),
+                ))
+                .unwrap();
+        }
+
+        let body = PublicCypherBody {
+            reflexive_inference: true,
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH p = (a:File {path: $path})-[:IMPORTS*1..2]->(b:File) RETURN p LIMIT 10"
+                .to_string(),
+            params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
+            tx_id: None,
+        };
+        let response = execute_cypher_query(&mut store, "demo", &body).unwrap();
+
+        // Rows are the normal pointer-chase output, untouched by inference.
+        assert_eq!(
+            response["stats"]["plan_operation"],
+            "variable_length_expand"
+        );
+        assert_eq!(response["row_count"], 2);
+
+        let reflexive = &response["reflexive"];
+        assert_eq!(reflexive["advisory"], json!(true));
+        assert_eq!(reflexive["representations_joined"], json!(3));
+        let candidates = reflexive["candidates"].as_array().unwrap();
+        let lib_to_extra = candidates
+            .iter()
+            .find(|candidate| {
+                candidate["source_id"] == "file:lib" && candidate["target_id"] == "file:extra"
+            })
+            .expect("advisory lib->extra candidate");
+        assert_eq!(lib_to_extra["proposed_edge_type"], "INFERRED_IMPORTS");
+        assert_eq!(lib_to_extra["admission_tier"], "advisory_inferred");
+        // Advisory only: the inferred edge was not materialized.
+        assert!(store.get_edge("edge:file:lib:INFERRED_IMPORTS:file:extra")
+            .unwrap()
+            .is_none());
+
+        // Without the opt-in flag, the response carries no reflexive block.
+        let plain_body = PublicCypherBody {
+            reflexive_inference: false,
+            tenant_id: Some("demo".to_string()),
+            query: "MATCH p = (a:File {path: $path})-[:IMPORTS*1..2]->(b:File) RETURN p LIMIT 10"
+                .to_string(),
+            params: BTreeMap::from([(String::from("path"), json!("src/lib.rs"))]),
+            tx_id: None,
+        };
+        let plain = execute_cypher_query(&mut store, "demo", &plain_body).unwrap();
+        assert!(plain.get("reflexive").is_none());
+    }
+
+    #[test]
     fn cypher_explain_includes_compatibility_matrix() {
         let body = PublicCypherBody {
+            reflexive_inference: false,
             tenant_id: Some("demo".to_string()),
             query: "MATCH (n:File) RETURN n LIMIT 10".to_string(),
             params: BTreeMap::new(),

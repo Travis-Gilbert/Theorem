@@ -1,6 +1,7 @@
 # Reflexive RustyRed Implementation Notes
 
-Status: implementation slice on `Travis-Gilbert/Reflexive-red`, 2026-06-09.
+Status: implementation slices on `Travis-Gilbert/Reflexive-red`, 2026-06-09 (Codex)
+plus 2026-06-10 completion pass (Claude Code) closing the deferred seams below.
 
 Source inputs:
 
@@ -49,7 +50,109 @@ The implementation keeps the shared invariant from the plan:
 
 Burn and CubeCL are optional integration dependencies, not storage dependencies. The RustyRed graph crates compile without a tensor backend by default. Enabling `pairformer-burn-cubecl` brings in the tensor/GPU lane and validates the CubeCL kernels without making `NodeRecord`, `EdgeRecord`, or `GraphStore` backend-parametric.
 
-## Deferred With Reason
+## Completion Pass (2026-06-10)
 
-- The actual Burn-to-CubeCL kernel launch bridge is not wired in this slice. It depends on extracting backend primitives as `TensorArg` handles and checking runtime atomic support. The portable fixed-point path and policy gate are in place first so the native fast path cannot become the only path by accident.
-- Live Cypher execution does not call the steered optimizer yet. The current server planner module owns post-MATCH row-shape operators, not a full candidate-plan enumerator. The steering function is tested and ready for the later candidate enumeration seam.
+Both deferrals from the first slice are closed, plus the remaining spec seams:
+
+### `rustyred-thg-adapters::edge_mpnn` (new)
+
+- `rank_global_completion_candidates` is the sparse NBFNet-style global
+  completion scorer: per-seed generalized Bellman-Ford message passing over
+  COO edges with layer and frontier caps, DistMult-style relation
+  composition, parent-pointer provenance chains, and advisory
+  `InferredEdgeCandidate` output feeding the existing quarantine pipeline.
+  Candidates without a provenance chain back to the seed are dropped.
+- The `MessageAggregator` trait is the aggregation seam: the default
+  `FixedPointAggregator` IS `aggregate_messages_fixed_point` (the formerly
+  dangling fallback is now the consumed primitive), and the policy decision
+  from `choose_scatter_aggregation_path` is consulted per layer and reported
+  in the result.
+
+### `rustyred-thg-adapters::burn_mpnn` (new, behind `pairformer-burn-cubecl`)
+
+- `aggregate_messages_burn` is the actual Burn tensor path: `select` row
+  gather, `scatter(0, indices, values, IndexingUpdateOp::Add)` accumulation,
+  clamped-degree mean. Parity-tested against the fixed-point oracle on the
+  NdArray backend (`ndarray` added to the burn feature set).
+- `BurnAggregator<B>` implements `MessageAggregator`, so the sparse
+  completion scorer runs its aggregation on Burn tensors and produces the
+  same candidates as the deterministic path (verified by test).
+- `BurnEdgeMpnnLayer<B>` is the relation-aware EdgeMPNN layer over tensors.
+- `wgpu_launch` LAUNCHES the CubeCL kernels (they were previously compiled
+  but never invoked): `launch_fixed_point_aggregate` and
+  `launch_float_atomic_aggregate` build `TensorArg` handles, dispatch over
+  the wgpu runtime, and read results back; `float_atomic_add_supported`
+  probes `atomic_type_usage(...).contains(AtomicUsage::Add)` so the float
+  path runs only where the device advertises it; `launch_selected_aggregate`
+  honors the scatter policy. Verified green on Metal via wgpu on 2026-06-10.
+
+### `rustyred-thg-adapters::reflexive_executor` (new)
+
+- The sidecar READ path: `load_node_representation` joins a topology node
+  with its `RepresentationSidecar` via incoming `REPRESENTS_NODE` edges
+  (highest `graph_version` wins). The sidecar write existed; nothing read it.
+- GraphLoRA-pattern adapter application: `LowRankAdapterFactors` (rank,
+  alpha, down/up factor matrices) live in their own `AdapterFactorSidecar`
+  node keyed by adapter id, never in the node struct;
+  `apply_low_rank_adapter` adds `up @ (down @ x) * alpha/rank` to the frozen
+  base representation. Dimension mismatches are recorded skips, not silent
+  identity.
+- `score_match_neighborhood` is the pure executor scorer (topology + sidecar
+  + adapters -> bounded Pairformer -> advisory candidates);
+  `reflexive_match_inference` is the store-generic wrapper over the new
+  read-only `ReflexiveReadStore` trait (explicit impls; a blanket impl over
+  `AdapterGraphStore` would block downstream store wrappers).
+
+### `rustyred-thg-server` in-DB inference during MATCH
+
+- `PublicCypherBody.reflexive_inference` (default false) opts a read query
+  into reflexive inference. The `EdgeVarLength` and `EdgeChain` arms collect
+  the walked neighborhood (capped at 64 nodes), join it with the
+  representation sidecar through `TenantGraphStore`'s `ReflexiveReadStore`
+  impl, run the Pairformer, and attach a `reflexive` advisory block to the
+  response. Rows are never modified; no edge is ever written; advisory
+  failures degrade to an error note inside the block.
+
+### `rustyred-thg-server` live steered optimizer
+
+- `planner::enumerate_edge_pattern_candidates` enumerates the real candidate
+  set for single-hop relationship MATCH: native anchor-left expand-out, plus
+  anchor-right expand-in when the right node is independently anchorable.
+- `planner::PlanSteeringState` (on `AppState.plan_steering`) records measured
+  execution cost units per `(query shape, candidate)` and snapshots
+  `PlanObservationMetrics` (uncertainty = standard error of mean cost).
+- `execute_cypher_query_with_steering` runs the loop live: enumerate ->
+  `steer_plan_candidates` behind the cold-start floor -> execute the selected
+  enumerated plan (`execute_edge_anchor_left` / `execute_edge_anchor_right`)
+  -> record the observation -> expose `plan_candidate` + `plan_steering` in
+  response stats. The HTTP router feeds it; the ranker cannot produce a plan
+  shape that was not enumerated.
+
+### Context scorer receipt read-back (`situation_search`)
+
+- `record_context_use_outcome` writes `ContextUseReceipt` nodes linked from
+  context packs (`CONTEXT_PACK_OUTCOME`): the use-receipt label source the
+  plan names.
+- `enrich_context_candidates_from_store` closes the loop that previously
+  zero-filled: selection edges -> `use_count`, pack outcomes ->
+  `success_count`/`failure_count`, graph degree, age, and pin state now feed
+  the scorer from graph truth, and receipts measurably move rankings.
+
+## Still Deferred (named, not cut)
+
+- Trained weights everywhere: the Pairformer, EdgeMPNN scorer, and context
+  scorer all run deterministic hash-seeded weights. They are inference
+  shells with the right shapes and bounds; learned parameters arrive via the
+  training-substrate lane (`GraphLoRA` factors and gate vectors are the
+  intended load points).
+- Pairformer candidates remain limited to two-hop-supported pairs by
+  construction (`score_links` caps unsupported pairs below threshold). The
+  N-hop provenance lane is the EdgeMPNN scorer.
+- Candidate promotion: quarantined `ReflexiveEdgeCandidate` nodes have no
+  corroboration/promotion path into live topology yet (insertion stays
+  gated off entirely).
+- Steering covers the single-hop edge-pattern anchor decision; chain and
+  var-length arms have one enumerated plan today.
+- Known pre-existing failure unrelated to this work:
+  `router::tests::mcp_search_acquisition_async_handoff_persists_pollable_harness_run`
+  fails on the base commit (6b21ea60) as well; tracked separately.
