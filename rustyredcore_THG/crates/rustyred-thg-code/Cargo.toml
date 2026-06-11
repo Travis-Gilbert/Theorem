@@ -1,6 +1,6 @@
 [package]
 name = "rustyred-thg-code"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Code parsing plugin/runtime for RustyRedCore-THG tenant graph stores."
 license = "MIT"
