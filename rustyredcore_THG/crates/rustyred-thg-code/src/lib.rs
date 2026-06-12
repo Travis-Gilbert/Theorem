@@ -4,7 +4,7 @@
 //! independent of tonic/MCP/HTTP so every transport can call the same parser
 //! and write into the caller's `RedCoreGraphStore`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,10 +13,11 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use rustyred_thg_core::{
-    now_ms, stable_hash, Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphStoreError,
-    GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord, PluginCapability, PluginCapabilityKind,
-    PluginExecutionOutput, PluginOperationContext, PluginOperationRegistration, PluginRegistry,
-    RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RustyRedPlugin,
+    now_ms, stable_hash, CodeKgManifest, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
+    GraphSnapshot, GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord,
+    PluginCapability, PluginCapabilityKind, PluginExecutionOutput, PluginOperationContext,
+    PluginOperationRegistration, PluginRegistry, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+    RustyRedPlugin,
 };
 use serde_json::{json, Value};
 use syn::visit::Visit;
@@ -263,6 +264,30 @@ impl RustyRedPlugin for CodeParsingPlugin {
                 writes_graph: true,
                 handler: handle_record_use_receipt_code_operation,
             },
+            PluginOperationRegistration {
+                operation: "list_repos",
+                command: "RUSTYRED_THG.CODE.LIST_REPOS",
+                aliases: &[
+                    "code.list_repos",
+                    "rustyred.thg.code.list_repos",
+                    "RUSTYRED.CODE.LIST_REPOS",
+                ],
+                summary: "List the code repositories indexed in the tenant with per-repo file and symbol counts.",
+                writes_graph: false,
+                handler: handle_list_repos_code_operation,
+            },
+            PluginOperationRegistration {
+                operation: "kg_status",
+                command: "RUSTYRED_THG.CODE.KG_STATUS",
+                aliases: &[
+                    "code.kg_status",
+                    "rustyred.thg.code.kg_status",
+                    "RUSTYRED.CODE.KG_STATUS",
+                ],
+                summary: "Report the code-graph-backed Instant KG base and manifest for a repo.",
+                writes_graph: false,
+                handler: handle_kg_status_code_operation,
+            },
         ]
     }
 }
@@ -330,6 +355,27 @@ impl CodeIndexRuntime {
     pub fn search_code(&self, input: SearchCodeInput) -> Result<SearchCodeOutput, CodeIndexError> {
         let mut store = self.lock_store()?;
         search_code_with_store(&mut store, input)
+    }
+
+    pub fn list_repos(&self, input: ListReposInput) -> Result<ListReposOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        list_repos_in_store(&mut store, input)
+    }
+
+    pub fn code_kg_status(
+        &self,
+        input: CodeKgStatusInput,
+    ) -> Result<CodeKgStatusOutput, CodeIndexError> {
+        let store = self.lock_store()?;
+        Ok(code_kg_status_in_store(&store, input))
+    }
+
+    /// AM2 bridge accessor: the code-graph-backed base snapshot for a repo, for
+    /// callers (theorem-grpc session_reingest / context_pack) that overlay a
+    /// `SessionDelta` on it via `HarnessInstantKg`.
+    pub fn code_graph_snapshot(&self, tenant_id: &str, repo_id: &str) -> Result<GraphSnapshot, CodeIndexError> {
+        let store = self.lock_store()?;
+        Ok(code_graph_snapshot_in_store(&store, tenant_id, repo_id))
     }
 
     pub fn code_context(
@@ -444,6 +490,225 @@ pub fn search_code_in_store(
     search_code_with_store(store, input)
 }
 
+/// Fix-handoff F8: a read-only inventory of the code repos indexed in a tenant.
+/// Answers "what repos are indexed here" without a `job_id`. Per repo it reports
+/// the latest generation, the file/symbol counts at that generation, and the
+/// last `indexed_at_ms`. `repo_url`/`head_sha` come from the `CodeRepository`
+/// node when the AM6 manifest registry recorded them.
+pub fn list_repos_in_store(
+    store: &mut RedCoreGraphStore,
+    input: ListReposInput,
+) -> Result<ListReposOutput, CodeIndexError> {
+    let tenant_id = normalize_tenant(&input.tenant_id);
+
+    let repo_nodes = store
+        .query_nodes(NodeQuery::label(CODE_REPO_LABEL).with_limit(100_000))
+        .map_err(CodeIndexError::from_store)?;
+    let mut summaries: HashMap<String, RepoSummary> = HashMap::new();
+    for node in repo_nodes {
+        if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id.as_str()) {
+            continue;
+        }
+        let Some(repo_id) = property_string(&node.properties, "repo_id") else {
+            continue;
+        };
+        let latest_generation = property_u64(&node.properties, "latest_generation").unwrap_or(0);
+        summaries.insert(
+            repo_id.clone(),
+            RepoSummary {
+                repo_id,
+                repo_url: property_string(&node.properties, "repo_url").unwrap_or_default(),
+                head_sha: property_string(&node.properties, "head_sha").unwrap_or_default(),
+                latest_generation,
+                indexed_at_ms: property_u64(&node.properties, "indexed_at_ms")
+                    .unwrap_or(latest_generation),
+                repo_root: property_string(&node.properties, "repo_root").unwrap_or_default(),
+                files_indexed: 0,
+                symbols_indexed: 0,
+            },
+        );
+    }
+
+    let latest: HashMap<String, u64> = summaries
+        .iter()
+        .map(|(id, summary)| (id.clone(), summary.latest_generation))
+        .collect();
+    let file_counts = count_code_nodes_by_repo(store, &tenant_id, CODE_FILE_LABEL, &latest)?;
+    let symbol_counts = count_code_nodes_by_repo(store, &tenant_id, CODE_SYMBOL_LABEL, &latest)?;
+    for (repo_id, summary) in summaries.iter_mut() {
+        summary.files_indexed = file_counts.get(repo_id).copied().unwrap_or(0);
+        summary.symbols_indexed = symbol_counts.get(repo_id).copied().unwrap_or(0);
+    }
+
+    let mut repos: Vec<RepoSummary> = summaries.into_values().collect();
+    repos.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    let total_repos = repos.len() as u64;
+
+    let receipt_payload = json!({
+        "tenant_id": tenant_id,
+        "operation": "code_list_repos",
+        "total_repos": total_repos,
+        "repo_ids": repos.iter().map(|r| r.repo_id.clone()).collect::<Vec<_>>(),
+    });
+    let receipt = record_receipt(store, &tenant_id, "code_list_repos", &receipt_payload)?;
+
+    Ok(ListReposOutput {
+        tenant_id,
+        repos,
+        total_repos,
+        receipt_hash: receipt.receipt_hash,
+        receipt_json: receipt.receipt_json,
+    })
+}
+
+/// Count code nodes of `label` per repo, tenant-scoped and limited to each
+/// repo's current generation (so stale generations do not inflate the count,
+/// matching `search_code_with_store`'s generation gate).
+fn count_code_nodes_by_repo(
+    store: &mut RedCoreGraphStore,
+    tenant_id: &str,
+    label: &str,
+    latest: &HashMap<String, u64>,
+) -> Result<HashMap<String, u64>, CodeIndexError> {
+    let nodes = store
+        .query_nodes(NodeQuery::label(label).with_limit(100_000))
+        .map_err(CodeIndexError::from_store)?;
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for node in nodes {
+        if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id) {
+            continue;
+        }
+        let Some(repo_id) = property_string(&node.properties, "repo_id") else {
+            continue;
+        };
+        let Some(&generation) = latest.get(&repo_id) else {
+            continue;
+        };
+        if property_u64(&node.properties, "generation") != Some(generation) {
+            continue;
+        }
+        *counts.entry(repo_id).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+/// AM2 bridge: build the base `GraphSnapshot` for `HarnessInstantKg` from the
+/// tenant code graph filtered to `repo_id` at its latest generation. This is the
+/// seam that connects the CodeCrawler code graph to the Instant KG surface, so a
+/// session delta overlays the real indexed base rather than an empty graph. Edges
+/// are kept only when both endpoints survive the node filter.
+pub fn code_graph_snapshot_in_store(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+    repo_id: &str,
+) -> GraphSnapshot {
+    let tenant = normalize_tenant(tenant_id);
+    let repo_id = repo_id.trim();
+    let snapshot = store.graph_snapshot();
+
+    let latest_generation = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.labels.iter().any(|label| label == CODE_REPO_LABEL))
+        .filter(|node| {
+            node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant.as_str())
+                && node.properties.get("repo_id").and_then(Value::as_str) == Some(repo_id)
+        })
+        .filter_map(|node| property_u64(&node.properties, "latest_generation"))
+        .max();
+
+    let mut nodes: Vec<NodeRecord> = Vec::new();
+    for node in &snapshot.nodes {
+        if node.tombstone {
+            continue;
+        }
+        let is_code = node.labels.iter().any(|label| {
+            label == CODE_REPO_LABEL || label == CODE_FILE_LABEL || label == CODE_SYMBOL_LABEL
+        });
+        if !is_code {
+            continue;
+        }
+        if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant.as_str()) {
+            continue;
+        }
+        if node.properties.get("repo_id").and_then(Value::as_str) != Some(repo_id) {
+            continue;
+        }
+        let is_repo = node.labels.iter().any(|label| label == CODE_REPO_LABEL);
+        if !is_repo {
+            // File/symbol nodes are gated to the repo's current generation.
+            if let Some(latest) = latest_generation {
+                if property_u64(&node.properties, "generation") != Some(latest) {
+                    continue;
+                }
+            }
+        }
+        nodes.push(node.clone());
+    }
+
+    let node_ids: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let edges: Vec<EdgeRecord> = snapshot
+        .edges
+        .iter()
+        .filter(|edge| !edge.tombstone)
+        .filter(|edge| {
+            node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+        })
+        .cloned()
+        .collect();
+
+    GraphSnapshot {
+        version: snapshot.version,
+        nodes,
+        edges,
+    }
+}
+
+/// AM2/AM3: report the code-graph-backed Instant KG base for a repo plus a
+/// `CodeKgManifest` provenance record. Read-only (no receipt write).
+pub fn code_kg_status_in_store(
+    store: &RedCoreGraphStore,
+    input: CodeKgStatusInput,
+) -> CodeKgStatusOutput {
+    let tenant = normalize_tenant(&input.tenant_id);
+    let repo_id = input.repo_id.trim().to_string();
+    let base = code_graph_snapshot_in_store(store, &tenant, &repo_id);
+
+    let repo_node = base
+        .nodes
+        .iter()
+        .find(|node| node.labels.iter().any(|label| label == CODE_REPO_LABEL));
+    let repo_url = repo_node
+        .and_then(|node| property_string(&node.properties, "repo_url"))
+        .unwrap_or_default();
+    let head_sha = repo_node
+        .and_then(|node| property_string(&node.properties, "head_sha"))
+        .unwrap_or_default();
+    let latest_generation = repo_node
+        .and_then(|node| property_u64(&node.properties, "latest_generation"))
+        .unwrap_or(0);
+    let indexed_at_ms = repo_node
+        .and_then(|node| property_u64(&node.properties, "indexed_at_ms"))
+        .unwrap_or(latest_generation);
+
+    let manifest = CodeKgManifest::from_base_snapshot(&repo_id, head_sha.clone(), &base);
+
+    CodeKgStatusOutput {
+        tenant_id: tenant,
+        repo_id,
+        repo_url,
+        head_sha,
+        base_objects: manifest.objects_total as u64,
+        base_edges: manifest.edges_total as u64,
+        base_graph_hash: manifest.base_graph_hash,
+        encoder_version: manifest.encoder_version,
+        ingest_version: manifest.ingest_version,
+        latest_generation,
+        indexed_at_ms,
+        indexed: repo_node.is_some(),
+    }
+}
+
 pub fn code_context_in_store(
     store: &mut RedCoreGraphStore,
     input: CodeContextInput,
@@ -536,6 +801,33 @@ fn handle_ingest_code_operation(
     } else {
         ingest_codebase_in_store(context.store, input)?
     };
+    Ok(output.to_json())
+}
+
+fn handle_list_repos_code_operation(
+    context: PluginOperationContext<'_>,
+    _arguments: Value,
+) -> GraphStoreResult<Value> {
+    let output = list_repos_in_store(
+        context.store,
+        ListReposInput {
+            tenant_id: context.tenant_id.to_string(),
+        },
+    )?;
+    Ok(output.to_json())
+}
+
+fn handle_kg_status_code_operation(
+    context: PluginOperationContext<'_>,
+    arguments: Value,
+) -> GraphStoreResult<Value> {
+    let output = code_kg_status_in_store(
+        context.store,
+        CodeKgStatusInput {
+            tenant_id: context.tenant_id.to_string(),
+            repo_id: code_plugin_arg_string(&arguments, &["repo_id", "repoId"]),
+        },
+    );
     Ok(output.to_json())
 }
 
@@ -843,6 +1135,113 @@ impl SearchCodeOutput {
             "total_returned": self.total_returned,
             "latency_ms": self.latency_ms,
             "receipt_hash": self.receipt_hash,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ListReposInput {
+    pub tenant_id: String,
+}
+
+/// One row of the tenant code-repo inventory (F8 `list_repos`). `repo_url` and
+/// `head_sha` are populated by the AM6 manifest registry; empty when an ingest
+/// predates it.
+#[derive(Clone, Debug, Default)]
+pub struct RepoSummary {
+    pub repo_id: String,
+    pub repo_url: String,
+    pub head_sha: String,
+    pub latest_generation: u64,
+    pub files_indexed: u64,
+    pub symbols_indexed: u64,
+    pub indexed_at_ms: u64,
+    pub repo_root: String,
+}
+
+impl RepoSummary {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "repo_id": self.repo_id,
+            "repo_url": self.repo_url,
+            "head_sha": self.head_sha,
+            "latest_generation": self.latest_generation,
+            "files_indexed": self.files_indexed,
+            "symbols_indexed": self.symbols_indexed,
+            "indexed_at_ms": self.indexed_at_ms,
+            "repo_root": self.repo_root,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ListReposOutput {
+    pub tenant_id: String,
+    pub repos: Vec<RepoSummary>,
+    pub total_repos: u64,
+    pub receipt_hash: String,
+    pub receipt_json: String,
+}
+
+impl ListReposOutput {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tenant_id": self.tenant_id,
+            "repos": self.repos.iter().map(RepoSummary::to_json).collect::<Vec<_>>(),
+            "total_repos": self.total_repos,
+            "receipt_hash": self.receipt_hash,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CodeKgStatusInput {
+    pub tenant_id: String,
+    pub repo_id: String,
+}
+
+/// AM2/AM3: the code-graph-backed Instant KG base report plus a `CodeKgManifest`
+/// provenance record for a repo. `to_json` emits a `manifest` block the
+/// SessionStart hook mirrors to `.harness/code-kg-manifest.json`.
+#[derive(Clone, Debug, Default)]
+pub struct CodeKgStatusOutput {
+    pub tenant_id: String,
+    pub repo_id: String,
+    pub repo_url: String,
+    pub head_sha: String,
+    pub base_objects: u64,
+    pub base_edges: u64,
+    pub base_graph_hash: String,
+    pub encoder_version: String,
+    pub ingest_version: String,
+    pub latest_generation: u64,
+    pub indexed_at_ms: u64,
+    pub indexed: bool,
+}
+
+impl CodeKgStatusOutput {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tenant_id": self.tenant_id,
+            "repo_id": self.repo_id,
+            "indexed": self.indexed,
+            "base_objects": self.base_objects,
+            "base_edges": self.base_edges,
+            "base_graph_hash": self.base_graph_hash,
+            "latest_generation": self.latest_generation,
+            "indexed_at_ms": self.indexed_at_ms,
+            "manifest": {
+                "tenant_id": self.tenant_id,
+                "repo_id": self.repo_id,
+                "repo_url": self.repo_url,
+                "head_sha": self.head_sha,
+                "generation": self.latest_generation,
+                "base_graph_hash": self.base_graph_hash,
+                "encoder_version": self.encoder_version,
+                "ingest_version": self.ingest_version,
+                "objects_total": self.base_objects,
+                "edges_total": self.base_edges,
+            },
         })
     }
 }
@@ -1198,6 +1597,12 @@ pub struct IngestConfig {
     pub max_file_bytes: u64,
     pub actor: String,
     pub generation: u64,
+    /// AM6 provenance: the URL this repo was ingested from (empty for a purely
+    /// local-binding ingest) and the resolved HEAD commit sha. Stamped on the
+    /// `CodeRepository` node so `list_repos` / the KG manifest can answer
+    /// "is the base stale" without re-reading the working tree.
+    pub repo_url: String,
+    pub head_sha: String,
 }
 
 #[derive(Clone)]
@@ -1251,6 +1656,8 @@ pub fn build_code_mutations(config: &IngestConfig, files: &[IndexedFile]) -> Vec
             "latest_generation": config.generation,
             "indexed_at_ms": config.generation,
             "actor": config.actor.clone(),
+            "repo_url": config.repo_url,
+            "head_sha": config.head_sha,
             "source": SOURCE,
         }),
     );
@@ -1367,7 +1774,7 @@ fn prepare_codebase_ingest_from_url(
     }
     // `fetched` stays alive through preparation and removes the clone after
     // parsed mutations are materialized in memory.
-    prepare_codebase_ingest_started(input, clone_ms, started)
+    prepare_codebase_ingest_started(input, clone_ms, started, url)
 }
 
 fn prepare_codebase_ingest(
@@ -1375,16 +1782,21 @@ fn prepare_codebase_ingest(
     _operation: &str,
     clone_ms: u64,
 ) -> Result<PreparedCodebaseIngest, CodeIndexError> {
-    prepare_codebase_ingest_started(input, clone_ms, Instant::now())
+    prepare_codebase_ingest_started(input, clone_ms, Instant::now(), "")
 }
 
 fn prepare_codebase_ingest_started(
     input: IngestCodebaseInput,
     clone_ms: u64,
     started: Instant,
+    repo_url: &str,
 ) -> Result<PreparedCodebaseIngest, CodeIndexError> {
     let resolve_started = Instant::now();
-    let config = resolve_ingest_config(input)?;
+    let mut config = resolve_ingest_config(input)?;
+    // AM6 provenance: the ingest URL (if any) plus the resolved HEAD. The clone
+    // (URL path) and the local checkout (binding path) both retain `.git` here.
+    config.repo_url = repo_url.trim().to_string();
+    config.head_sha = git_head_sha(&config.repo_root);
     let resolve_ms = elapsed_ms(resolve_started);
 
     let walk_started = Instant::now();
@@ -2149,7 +2561,23 @@ pub fn resolve_ingest_config(input: IngestCodebaseInput) -> Result<IngestConfig,
         max_file_bytes,
         actor: input.actor.trim().to_string(),
         generation: now_ms().max(1) as u64,
+        repo_url: String::new(),
+        head_sha: String::new(),
     })
+}
+
+/// Best-effort `git rev-parse HEAD` in `path`. Empty string when the directory
+/// is not a git checkout or git is unavailable. Used to stamp AM6 provenance.
+fn git_head_sha(path: &Path) -> String {
+    std::process::Command::new("git")
+        .args(["-C"])
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 fn extract_symbols(

@@ -3630,6 +3630,12 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
             Ok(raw)
         }
         "record_use" | "use_receipt" | "record_use_receipt" => Ok("record_use_receipt".to_string()),
+        "list_repos" | "listrepos" | "repos" => Ok("list_repos".to_string()),
+        "kg_status" | "kgstatus" | "instant_kg_status" | "status" => Ok("kg_status".to_string()),
+        "session_reingest" | "sessionreingest" | "reingest_session" => {
+            Ok("session_reingest".to_string())
+        }
+        "context_pack" | "contextpack" | "pack" => Ok("context_pack".to_string()),
         _ => Err(McpError::invalid_params(format!(
             "unsupported code_search operation `{raw}`"
         ))),

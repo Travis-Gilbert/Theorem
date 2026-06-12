@@ -22,9 +22,11 @@ use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
 
 use crate::code_index::{
-    is_fetchable_repo_url, CodeContextInput, CodeIndexRuntime, ExplainCodeInput, ExploreCodeInput,
-    IngestCodebaseInput, RecognizeCodeInput, RecordUseReceiptInput, RepoFetchCaps, SearchCodeInput,
+    is_fetchable_repo_url, CodeContextInput, CodeIndexRuntime, CodeKgStatusInput, ExplainCodeInput,
+    ExploreCodeInput, IngestCodebaseInput, ListReposInput, RecognizeCodeInput, RecordUseReceiptInput,
+    RepoFetchCaps, SearchCodeInput,
 };
+use crate::code_kg::{self, ContextPackInput, SessionReingestInput};
 use crate::pb;
 
 #[derive(Clone)]
@@ -75,6 +77,7 @@ struct AppAffordanceRuntime {
     store: Arc<Mutex<RedCoreGraphStore>>,
     adapter: TheseusAppAdapter,
     code_index: CodeIndexRuntime,
+    session_kg: code_kg::SessionKgCache,
 }
 
 impl AppAffordanceRuntime {
@@ -101,6 +104,7 @@ impl AppAffordanceRuntime {
             store: Arc::new(Mutex::new(store)),
             adapter,
             code_index,
+            session_kg: code_kg::SessionKgCache::new(),
         })
     }
 
@@ -117,6 +121,7 @@ impl AppAffordanceRuntime {
             &mut *store,
             &self.adapter,
             &self.code_index,
+            &self.session_kg,
             req,
             started,
         ))
@@ -127,6 +132,7 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
     store: &mut S,
     adapter: &TheseusAppAdapter,
     code_index: &CodeIndexRuntime,
+    session_kg: &code_kg::SessionKgCache,
     req: pb::InvokeAffordanceRequest,
     started: Instant,
 ) -> pb::InvokeAffordanceResponse {
@@ -135,6 +141,33 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
     let timeout_ms = theorem_grpc_timeout_ms(&requested_id, req.timeout_ms);
     let request_json = parse_request_json(&req.request_json);
     let actor = req.actor.trim().to_string();
+
+    // Fix-handoff F5: code ops must not silently fall back to the `theorem`
+    // smoke tenant. An empty tenant on a `code_search.*` affordance is a caller
+    // error (the tenant default lands callers in the fixture tenant), so fail
+    // loud here, before `normalize_tenant` substitutes the default.
+    if is_code_op(&requested_id) && req.tenant_id.trim().is_empty() {
+        return response_with_receipt(ResponseParts {
+            tenant_id: String::new(),
+            affordance_id: requested_id,
+            server_id: "theorem_grpc".to_string(),
+            tool_name: String::new(),
+            status: "failed".to_string(),
+            executed: false,
+            output: json!({}),
+            error_code: "TENANT_REQUIRED".to_string(),
+            message: "tenant_id is required for code_search.* operations; set \
+                      THEOREM_TENANT_ID (code ops have no default tenant)"
+                .to_string(),
+            actor,
+            request: request_json.as_ref().ok().cloned().unwrap_or_else(|| json!({})),
+            dry_run: req.dry_run,
+            confirmed: req.confirmed,
+            timeout_ms,
+            elapsed_ms: elapsed_ms(started),
+            writeback_policy: "read-only".to_string(),
+        });
+    }
 
     if let Err(err) =
         register_theseus_app_affordances(store, &tenant_id, nonempty_actor(actor.as_str()))
@@ -271,6 +304,7 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
         timeout_ms,
         adapter,
         code_index,
+        session_kg,
         &tenant_id,
         actor.as_str(),
     );
@@ -321,6 +355,7 @@ fn handle_affordance(
     timeout_ms: u64,
     adapter: &TheseusAppAdapter,
     code_index: &CodeIndexRuntime,
+    session_kg: &code_kg::SessionKgCache,
     tenant_id: &str,
     actor: &str,
 ) -> HandlerOutcome {
@@ -373,6 +408,18 @@ fn handle_affordance(
         }
         "code_search.record_use_receipt" => {
             return code_record_use_handler(base, code_index, request, tenant_id, actor);
+        }
+        "code_search.list_repos" => {
+            return code_list_repos_handler(base, code_index, tenant_id);
+        }
+        "code_search.kg_status" => {
+            return code_kg_status_handler(base, code_index, request, tenant_id);
+        }
+        "code_search.session_reingest" => {
+            return code_session_reingest_handler(base, code_index, session_kg, request, tenant_id);
+        }
+        "code_search.context_pack" => {
+            return code_context_pack_handler(base, code_index, session_kg, request, tenant_id);
         }
         "anti_misinfo_algo.inspect_claim" => merge_json(
             base,
@@ -520,6 +567,31 @@ fn code_ingest_handler(
     } else {
         String::new()
     };
+    // Fix-handoff F6: a local `repo_path` is resolved on the SERVER filesystem.
+    // On the remote service that path does not exist; the old behavior accepted
+    // the submit and failed asynchronously, so the ack looked like success.
+    // Canonicalize synchronously at submit and fail loud with the URL hint.
+    if repo_url.is_empty() && !raw_repo_path.trim().is_empty() {
+        if let Err(err) = std::fs::canonicalize(raw_repo_path.trim()) {
+            return HandlerOutcome {
+                status: "failed".to_string(),
+                executed: false,
+                output: merge_json(
+                    base,
+                    json!({
+                        "code_index_error":
+                            format!("canonicalize repo path `{}`: {err}", raw_repo_path.trim()),
+                        "repo_path": raw_repo_path.trim(),
+                    }),
+                ),
+                error_code: "code_index_io_error".to_string(),
+                message: "path is resolved on the server; pass repo_url for remote ingest"
+                    .to_string(),
+                outcome_value: 0.0,
+                outcome_label: "code_ingest_failed".to_string(),
+            };
+        }
+    }
     let input = IngestCodebaseInput {
         tenant_id: tenant_id.to_string(),
         repo_path: if repo_url.is_empty() {
@@ -582,6 +654,34 @@ fn code_search_handler(
     request: &Value,
     tenant_id: &str,
 ) -> HandlerOutcome {
+    // Fix-handoff F7: search honors only `repo_id` (exact) and `path_prefix`
+    // (relative). `repo_path`/`repo_url` are silently dropped by the store, so a
+    // "scoped" search is actually global within the tenant. Reject them loudly
+    // instead of misleading the caller.
+    if let Some(unknown) = ["repo_path", "repoPath", "repo_url", "repoUrl"]
+        .into_iter()
+        .find(|key| request.get(*key).is_some())
+    {
+        return HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(
+                base,
+                json!({
+                    "invalid_filter": unknown,
+                    "supported_filters": ["repo_id", "path_prefix"],
+                }),
+            ),
+            error_code: "INVALID_REQUEST".to_string(),
+            message: format!(
+                "code_search.search does not support `{unknown}`; supported filters are \
+                 `repo_id` (exact match) and `path_prefix` (relative path)"
+            ),
+            outcome_value: 0.0,
+            outcome_label: "code_search_invalid_filter".to_string(),
+        };
+    }
+
     let result = code_index.search_code(SearchCodeInput {
         tenant_id: tenant_id.to_string(),
         query: request_string(request, &["query", "text", "symbol"]).unwrap_or_default(),
@@ -794,6 +894,171 @@ fn code_record_use_handler(
             message: "native code use receipt failed".to_string(),
             outcome_value: 0.0,
             outcome_label: "code_use_receipt_failed".to_string(),
+        },
+    }
+}
+
+fn code_list_repos_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let result = code_index.list_repos(ListReposInput {
+        tenant_id: tenant_id.to_string(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "native code repo inventory completed over RedCore".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_list_repos_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "native code repo inventory failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_list_repos_failed".to_string(),
+        },
+    }
+}
+
+fn code_kg_status_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let result = code_index.code_kg_status(CodeKgStatusInput {
+        tenant_id: tenant_id.to_string(),
+        repo_id: request_string(request, &["repo_id", "repoId"]).unwrap_or_default(),
+    });
+    match result {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output.to_json()),
+            error_code: String::new(),
+            message: "code KG status computed from the tenant code graph".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_kg_status_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "code KG status failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_kg_status_failed".to_string(),
+        },
+    }
+}
+
+fn parse_inline_files(request: &Value) -> Vec<(String, String)> {
+    request
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let path = item.get("path").and_then(Value::as_str)?;
+                    let text = item
+                        .get("text")
+                        .or_else(|| item.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    Some((path.to_string(), text.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn code_session_reingest_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    session_kg: &code_kg::SessionKgCache,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let input = SessionReingestInput {
+        tenant_id: tenant_id.to_string(),
+        repo_id: request_string(request, &["repo_id", "repoId"]).unwrap_or_default(),
+        session_id: request_string(request, &["session_id", "sessionId"]).unwrap_or_default(),
+        base_commit_sha: request_string(
+            request,
+            &["base_commit_sha", "baseCommitSha", "head_sha", "commit_sha"],
+        )
+        .unwrap_or_default(),
+        files: parse_inline_files(request),
+    };
+    match code_kg::session_reingest(code_index, session_kg, input) {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output),
+            error_code: String::new(),
+            message: "session delta computed against the code-graph base and cached".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_session_reingest_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "session reingest failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_session_reingest_failed".to_string(),
+        },
+    }
+}
+
+fn code_context_pack_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    session_kg: &code_kg::SessionKgCache,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let input = ContextPackInput {
+        tenant_id: tenant_id.to_string(),
+        repo_id: request_string(request, &["repo_id", "repoId"]).unwrap_or_default(),
+        session_id: request_string(request, &["session_id", "sessionId"]).unwrap_or_default(),
+        dirty_files: request_string_array(request, "dirty_files"),
+        footprint_files: request_string_array(request, "footprint_files"),
+        prompt_text: request_string(request, &["prompt_text", "promptText", "prompt", "query"])
+            .unwrap_or_default(),
+        top_k: request_u64(request, "top_k").unwrap_or(0) as usize,
+        budget_tokens: request_u64(request, "budget_tokens")
+            .or_else(|| request_u64(request, "budgetTokens"))
+            .unwrap_or(0) as usize,
+    };
+    match code_kg::context_pack(code_index, session_kg, input) {
+        Ok(output) => HandlerOutcome {
+            status: "ok".to_string(),
+            executed: true,
+            output: merge_json(base, output),
+            error_code: String::new(),
+            message: "context pack composed from the merged code KG".to_string(),
+            outcome_value: 1.0,
+            outcome_label: "code_context_pack_ok".to_string(),
+        },
+        Err(err) => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "code_index_error": err.message })),
+            error_code: err.code,
+            message: "context pack failed".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_context_pack_failed".to_string(),
         },
     }
 }
@@ -1184,6 +1449,13 @@ fn normalize_tenant(raw: &str) -> String {
     }
 }
 
+/// True for the code-graph affordances (`code_search.*`, namespaced or bare).
+/// Code ops must fail loud on an empty tenant rather than defaulting to the
+/// `theorem` fixture tenant; see the F5 guard in `invoke_registered_affordance`.
+fn is_code_op(requested_id: &str) -> bool {
+    requested_id.trim().contains("code_search.")
+}
+
 fn redcore_data_dir() -> PathBuf {
     std::env::var("THEOREM_GRPC_REDCORE_DIR")
         .or_else(|_| std::env::var("THEOREM_GRPC_DATA_DIR"))
@@ -1450,7 +1722,7 @@ mod tests {
     #[test]
     fn dry_run_returns_registered_affordance_receipt() {
         let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
-            tenant_id: "theorem".to_string(),
+            tenant_id: "smoke".to_string(),
             affordance_id: "theorem_grpc.publisher.publish".to_string(),
             actor: "test".to_string(),
             request_json: r#"{"artifact_id":"a1"}"#.to_string(),
@@ -1474,7 +1746,7 @@ mod tests {
     #[test]
     fn external_write_requires_confirmation_and_records_failure() {
         let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
-            tenant_id: "theorem".to_string(),
+            tenant_id: "smoke".to_string(),
             affordance_id: "theorem_grpc.publisher.publish".to_string(),
             actor: "test".to_string(),
             request_json: "{}".to_string(),
@@ -1505,7 +1777,7 @@ mod tests {
     #[test]
     fn read_only_affordance_runs_local_handler_and_records_feedback() {
         let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
-            tenant_id: "theorem".to_string(),
+            tenant_id: "smoke".to_string(),
             affordance_id: "theorem_grpc.observability.read_trace".to_string(),
             actor: "test".to_string(),
             request_json:
@@ -1537,7 +1809,7 @@ mod tests {
         let ingest = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.ingest".to_string(),
                     actor: "test".to_string(),
                     request_json: json!({
@@ -1560,7 +1832,7 @@ mod tests {
         let search = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.search".to_string(),
                     actor: "test".to_string(),
                     request_json: r#"{"query":"native_code_search"}"#.to_string(),
@@ -1584,7 +1856,7 @@ mod tests {
         let recognize = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.recognize".to_string(),
                     actor: "test".to_string(),
                     request_json:
@@ -1603,7 +1875,7 @@ mod tests {
         let explore = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.explore".to_string(),
                     actor: "test".to_string(),
                     request_json: json!({ "node_id": node_id, "max_depth": 1 }).to_string(),
@@ -1621,7 +1893,7 @@ mod tests {
         let explain = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.explain".to_string(),
                     actor: "test".to_string(),
                     request_json: r#"{"query":"native_code_search"}"#.to_string(),
@@ -1640,7 +1912,7 @@ mod tests {
         let use_receipt = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.record_use_receipt".to_string(),
                     actor: "test".to_string(),
                     request_json: json!({
@@ -1667,6 +1939,281 @@ mod tests {
     }
 
     #[test]
+    fn code_op_with_empty_tenant_is_rejected() {
+        // F5: a code op with no tenant must fail loud, never silently search the
+        // `theorem` fixture tenant.
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
+            tenant_id: String::new(),
+            affordance_id: "theorem_grpc.code_search.search".to_string(),
+            actor: "test".to_string(),
+            request_json: r#"{"query":"anything"}"#.to_string(),
+            dry_run: false,
+            confirmed: false,
+            timeout_ms: 0,
+        });
+        assert_eq!(response.status, "failed");
+        assert_eq!(response.error_code, "TENANT_REQUIRED");
+        assert!(!response.executed);
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn code_search_rejects_unknown_repo_path_filter() {
+        // F7: repo_path/repo_url are not search filters; a "scoped" search with
+        // them is actually global, so reject loudly.
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
+            tenant_id: "smoke".to_string(),
+            affordance_id: "theorem_grpc.code_search.search".to_string(),
+            actor: "test".to_string(),
+            request_json: r#"{"query":"x","repo_path":"/Users/me/dev/repo"}"#.to_string(),
+            dry_run: false,
+            confirmed: false,
+            timeout_ms: 0,
+        });
+        assert_eq!(response.status, "failed");
+        assert_eq!(response.error_code, "INVALID_REQUEST");
+        assert!(response.output_json.contains("repo_id"));
+        assert!(response.output_json.contains("path_prefix"));
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn code_ingest_local_path_fails_synchronously_with_url_hint() {
+        // F6: a nonexistent local path errors at submit, not async after an ok ack.
+        let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
+            tenant_id: "smoke".to_string(),
+            affordance_id: "theorem_grpc.code_search.ingest".to_string(),
+            actor: "test".to_string(),
+            request_json: r#"{"repo_path":"/no/such/path/theorem-fix-test"}"#.to_string(),
+            dry_run: false,
+            confirmed: true,
+            timeout_ms: 0,
+        });
+        assert_eq!(response.status, "failed");
+        assert_eq!(response.error_code, "code_index_io_error");
+        assert!(
+            response.message.contains("repo_url"),
+            "expected URL hint, got: {}",
+            response.message
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn list_repos_returns_indexed_repo_with_counts() {
+        // F8: after one ingest, list_repos returns exactly that repo with nonzero
+        // counts, no job_id needed.
+        let repo_dir = fixture_code_repo();
+        let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
+        let ingest = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "smoke".to_string(),
+                    affordance_id: "theorem_grpc.code_search.ingest".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_path": repo_dir.display().to_string(),
+                        "repo_id": "repo:list-repos-fixture",
+                        "include_extensions": ["rs"],
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: true,
+                    timeout_ms: 180_000,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ingest.status, "ok");
+
+        let listed = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "smoke".to_string(),
+                    affordance_id: "theorem_grpc.code_search.list_repos".to_string(),
+                    actor: "test".to_string(),
+                    request_json: "{}".to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(listed.status, "ok");
+        let output: Value = serde_json::from_str(&listed.output_json).unwrap();
+        assert_eq!(output["total_repos"].as_u64(), Some(1));
+        let repo = &output["repos"][0];
+        assert_eq!(repo["repo_id"].as_str(), Some("repo:list-repos-fixture"));
+        assert!(repo["files_indexed"].as_u64().unwrap_or(0) >= 1);
+        assert!(repo["symbols_indexed"].as_u64().unwrap_or(0) >= 1);
+
+        drop(runtime);
+        std::fs::remove_dir_all(repo_dir).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn code_kg_status_reports_code_graph_base() {
+        // AM2/AM3: after ingest, kg_status reports a nonzero code-graph base plus a
+        // CodeKgManifest. This is the bridge that connects the code graph to the
+        // Instant KG surface.
+        let repo_dir = fixture_code_repo();
+        let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
+        let ingest = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "smoke".to_string(),
+                    affordance_id: "theorem_grpc.code_search.ingest".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_path": repo_dir.display().to_string(),
+                        "repo_id": "repo:kg-status-fixture",
+                        "include_extensions": ["rs"],
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: true,
+                    timeout_ms: 180_000,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ingest.status, "ok");
+
+        let status = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "smoke".to_string(),
+                    affordance_id: "theorem_grpc.code_search.kg_status".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({ "repo_id": "repo:kg-status-fixture" }).to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(status.status, "ok");
+        let output: Value = serde_json::from_str(&status.output_json).unwrap();
+        assert_eq!(output["indexed"].as_bool(), Some(true));
+        // repo node + file node + >=1 symbol node.
+        assert!(output["base_objects"].as_u64().unwrap_or(0) >= 3);
+        assert_eq!(output["repo_id"].as_str(), Some("repo:kg-status-fixture"));
+        assert!(output["manifest"]["base_graph_hash"]
+            .as_str()
+            .map(|hash| !hash.is_empty())
+            .unwrap_or(false));
+
+        drop(runtime);
+        std::fs::remove_dir_all(repo_dir).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn context_pack_ranks_neighborhood_and_session_reingest_tombstones() {
+        // AM4 + AM5: ingest a base, compose a PPR context pack over it, then
+        // overlay a local deletion via session_reingest and confirm the tombstone.
+        let repo_dir = fixture_code_repo();
+        let (runtime, data_dir) = runtime_with_adapter(TheseusAppAdapter::new(None, None));
+        let ingest = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "smoke".to_string(),
+                    affordance_id: "theorem_grpc.code_search.ingest".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_path": repo_dir.display().to_string(),
+                        "repo_id": "repo:ambient-fixture",
+                        "include_extensions": ["rs"],
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: true,
+                    timeout_ms: 180_000,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ingest.status, "ok");
+
+        // AM5: context pack over the clean base, seeded by the dirty file + prompt.
+        let pack = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "smoke".to_string(),
+                    affordance_id: "theorem_grpc.code_search.context_pack".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_id": "repo:ambient-fixture",
+                        "session_id": "sess-ambient-1",
+                        "dirty_files": ["src/lib.rs"],
+                        "prompt_text": "look at native_code_search",
+                        "top_k": 10,
+                        "budget_tokens": 2000,
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(pack.status, "ok");
+        let pout: Value = serde_json::from_str(&pack.output_json).unwrap();
+        let markdown = pout["markdown"].as_str().unwrap_or("");
+        assert!(!markdown.is_empty(), "pack markdown should be non-empty");
+        assert!(
+            pout["seed_report"]["total_seeds"].as_u64().unwrap_or(0) >= 1,
+            "pack should resolve at least one seed: {pout}"
+        );
+        assert!(
+            markdown.contains("native_code"),
+            "pack should mention a code symbol from the dirty file: {markdown}"
+        );
+
+        // AM4: overlay a local deletion (native_code_helper removed) and confirm
+        // the tombstone is detected against the committed base.
+        let reingest = runtime
+            .invoke(
+                pb::InvokeAffordanceRequest {
+                    tenant_id: "smoke".to_string(),
+                    affordance_id: "theorem_grpc.code_search.session_reingest".to_string(),
+                    actor: "test".to_string(),
+                    request_json: json!({
+                        "repo_id": "repo:ambient-fixture",
+                        "session_id": "sess-ambient-1",
+                        "files": [{
+                            "path": "src/lib.rs",
+                            "text": "pub fn native_code_search(query: &str) -> usize {\n    query.len()\n}\n",
+                        }],
+                    })
+                    .to_string(),
+                    dry_run: false,
+                    confirmed: false,
+                    timeout_ms: 0,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(reingest.status, "ok");
+        let rout: Value = serde_json::from_str(&reingest.output_json).unwrap();
+        assert!(
+            rout["tombstoned_objects"].as_u64().unwrap_or(0) >= 1,
+            "deleting native_code_helper should tombstone it: {rout}"
+        );
+
+        drop(runtime);
+        std::fs::remove_dir_all(repo_dir).ok();
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn code_search_affordance_treats_repo_path_url_as_clone_target() {
         let repo_dir = fixture_code_repo();
         if !init_git_fixture(&repo_dir) {
@@ -1678,7 +2225,7 @@ mod tests {
         let ingest = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.ingest".to_string(),
                     actor: "test".to_string(),
                     request_json: json!({
@@ -1723,7 +2270,7 @@ mod tests {
         let ingest = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.ingest".to_string(),
                     actor: "test".to_string(),
                     request_json: json!({
@@ -1755,7 +2302,7 @@ mod tests {
         let search = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.code_search.search".to_string(),
                     actor: "test".to_string(),
                     request_json: json!({
@@ -1784,7 +2331,7 @@ mod tests {
     #[test]
     fn confirmed_side_effecting_affordance_requires_live_adapter_configuration() {
         let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
-            tenant_id: "theorem".to_string(),
+            tenant_id: "smoke".to_string(),
             affordance_id: "theorem_grpc.publisher.publish".to_string(),
             actor: "test".to_string(),
             request_json: r#"{"artifact_id":"a1"}"#.to_string(),
@@ -1828,7 +2375,7 @@ mod tests {
         let response = runtime
             .invoke(
                 pb::InvokeAffordanceRequest {
-                    tenant_id: "theorem".to_string(),
+                    tenant_id: "smoke".to_string(),
                     affordance_id: "theorem_grpc.publisher.publish".to_string(),
                     actor: "test".to_string(),
                     request_json: r#"{"artifact_id":"a1"}"#.to_string(),
@@ -1854,7 +2401,7 @@ mod tests {
     #[test]
     fn invalid_json_is_receipted_as_failure_and_graph_outcome() {
         let (runtime, response, data_dir) = invoke(pb::InvokeAffordanceRequest {
-            tenant_id: "theorem".to_string(),
+            tenant_id: "smoke".to_string(),
             affordance_id: "theorem_grpc.research.expand".to_string(),
             actor: "test".to_string(),
             request_json: "{broken".to_string(),
@@ -1895,7 +2442,7 @@ mod tests {
             let response = runtime
                 .invoke(
                     pb::InvokeAffordanceRequest {
-                        tenant_id: "theorem".to_string(),
+                        tenant_id: "smoke".to_string(),
                         affordance_id: "theorem_grpc.observability.read_trace".to_string(),
                         actor: "test".to_string(),
                         request_json: r#"{"run_id":"run:1"}"#.to_string(),
