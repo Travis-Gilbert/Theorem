@@ -2120,17 +2120,6 @@ pub(crate) fn load_prior_generation_snapshot(
                 .then_with(|| a.id.cmp(&b.id))
         });
     }
-    // `fetched` stays alive through preparation and removes the clone after
-    // parsed mutations are materialized in memory.
-    prepare_codebase_ingest_started(input, clone_ms, started, url)
-}
-
-fn prepare_codebase_ingest(
-    input: IngestCodebaseInput,
-    _operation: &str,
-    clone_ms: u64,
-) -> Result<PreparedCodebaseIngest, CodeIndexError> {
-    prepare_codebase_ingest_started(input, clone_ms, Instant::now(), "")
     Ok(Some(PriorGenerationSnapshot { generation, files }))
 }
 
