@@ -9,8 +9,18 @@ syntax = "proto3";
 package theorem_code.v1;
 
 service CodeCrawlerService {
+  // Job submission: returns immediately with `job_id` and status "submitted".
+  // The heavy work (clone, walk, parse, commit) runs on a server-side worker
+  // with no client deadline. Watch progress with WatchIngest or poll
+  // GetIngestStatus.
   rpc IngestCodebase(IngestCodebaseRequest) returns (IngestCodebaseResponse);
   rpc ReindexCodebase(ReindexCodebaseRequest) returns (IngestCodebaseResponse);
+  // Server-streaming progress for a submitted ingest/reindex job. Replays the
+  // job's full event log from the start, then streams live events; the stream
+  // ends after a terminal `finished` or `failed` event.
+  rpc WatchIngest(WatchIngestRequest) returns (stream IngestEvent);
+  // Poll variant for clients that do not stream.
+  rpc GetIngestStatus(GetIngestStatusRequest) returns (IngestStatus);
   rpc SearchCode(SearchCodeRequest) returns (SearchCodeResponse);
   rpc CodeContext(CodeContextRequest) returns (CodeContextResponse);
   rpc RecognizeCode(RecognizeCodeRequest) returns (RecognizeCodeResponse);
@@ -28,6 +38,9 @@ message IngestCodebaseRequest {
   uint64 max_files = 6;
   uint64 max_file_bytes = 7;
   string actor = 8;
+  // CA-1: clone a remote repository instead of reading repo_path.
+  string repo_url = 9;
+  uint64 max_total_bytes = 10;
 }
 
 message ReindexCodebaseRequest {
@@ -39,6 +52,8 @@ message ReindexCodebaseRequest {
   uint64 max_files = 6;
   uint64 max_file_bytes = 7;
   string actor = 8;
+  string repo_url = 9;
+  uint64 max_total_bytes = 10;
 }
 
 message IngestCodebaseResponse {
@@ -52,8 +67,91 @@ message IngestCodebaseResponse {
   uint64 graph_version = 8;
   string receipt_hash = 9;
   string receipt_json = 10;
+  // "submitted" on the submission ack; "ok" or "budget_exceeded" on the
+  // completed output carried by IngestStatus / the finished IngestEvent.
   string status = 11;
   string message = 12;
+  string job_id = 13;
+  // Files whose symbols were extracted in this pass vs files carried forward
+  // unchanged from the prior generation (incremental reindex).
+  uint64 files_parsed = 14;
+  uint64 files_carried = 15;
+}
+
+message WatchIngestRequest {
+  string tenant_id = 1;
+  string job_id = 2;
+}
+
+message GetIngestStatusRequest {
+  string tenant_id = 1;
+  string job_id = 2;
+}
+
+message IngestStageTimings {
+  uint64 clone_ms = 1;
+  uint64 resolve_ms = 2;
+  uint64 walk_ms = 3;
+  uint64 parse_ms = 4;
+  uint64 mutation_ms = 5;
+  uint64 write_ms = 6;
+  uint64 total_ms = 7;
+}
+
+message IngestEvent {
+  string job_id = 1;
+  uint64 sequence = 2;
+  uint64 recorded_at_ms = 3;
+  oneof event {
+    IngestCloneDone clone_done = 4;
+    IngestWalkDone walk_done = 5;
+    IngestParseProgress parse_progress = 6;
+    IngestCommitDone commit_done = 7;
+    IngestFinished finished = 8;
+    IngestFailed failed = 9;
+  }
+}
+
+message IngestCloneDone {
+  uint64 ms = 1;
+}
+
+message IngestWalkDone {
+  uint64 files_found = 1;
+}
+
+message IngestParseProgress {
+  uint64 done = 1;
+  uint64 total = 2;
+}
+
+message IngestCommitDone {
+  uint64 graph_version = 1;
+}
+
+message IngestFinished {
+  IngestCodebaseResponse output = 1;
+  IngestStageTimings stage_timings = 2;
+}
+
+message IngestFailed {
+  string code = 1;
+  string message = 2;
+}
+
+message IngestStatus {
+  string job_id = 1;
+  // queued | running | finished | failed | budget_exceeded
+  string state = 2;
+  // queued | start | clone | walk | parse | commit | done | failed
+  string stage = 3;
+  uint64 files_total = 4;
+  uint64 files_done = 5;
+  uint64 submitted_at_ms = 6;
+  uint64 updated_at_ms = 7;
+  IngestCodebaseResponse output = 8;
+  string error_code = 9;
+  string error_message = 10;
 }
 
 message SearchCodeRequest {

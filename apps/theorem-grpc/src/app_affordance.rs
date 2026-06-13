@@ -22,8 +22,8 @@ use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
 
 use crate::code_index::{
-    is_fetchable_repo_url, CodeContextInput, CodeIndexRuntime, CodeKgStatusInput, ExplainCodeInput,
-    ExploreCodeInput, IngestCodebaseInput, ListReposInput, RecognizeCodeInput, RecordUseReceiptInput,
+    is_fetchable_repo_url, CodeContextInput, CodeIndexRuntime, ExplainCodeInput, ExploreCodeInput,
+    IngestCodebaseInput, IngestJobRequest, RecognizeCodeInput, RecordUseReceiptInput,
     RepoFetchCaps, SearchCodeInput,
 };
 use crate::code_kg::{self, ContextPackInput, SessionReingestInput};
@@ -391,6 +391,9 @@ fn handle_affordance(
         "code_search.reindex" => {
             return code_ingest_handler(base, code_index, request, tenant_id, actor, true);
         }
+        "code_search.ingest_status" => {
+            return code_ingest_status_handler(base, code_index, request, tenant_id);
+        }
         "code_search.search" => {
             return code_search_handler(base, code_index, request, tenant_id);
         }
@@ -613,37 +616,105 @@ fn code_ingest_handler(
             .unwrap_or_default(),
         actor: actor.to_string(),
     };
-    let result = if !repo_url.is_empty() && reindex {
-        code_index.reindex_codebase_from_url(&repo_url, input, &RepoFetchCaps::default())
-    } else if !repo_url.is_empty() {
-        code_index.ingest_codebase_from_url(&repo_url, input, &RepoFetchCaps::default())
-    } else if reindex {
-        code_index.reindex_codebase(input)
-    } else {
-        code_index.ingest_codebase(input)
-    };
-    match result {
-        Ok(output) => HandlerOutcome {
-            status: "ok".to_string(),
-            executed: true,
-            output: merge_json(base, output.to_json()),
-            error_code: String::new(),
-            message: "native code index wrote codebase data into RedCore".to_string(),
-            outcome_value: 1.0,
-            outcome_label: if reindex {
-                "code_reindex_ok".to_string()
-            } else {
-                "code_ingest_ok".to_string()
-            },
+    // D1: submit and return immediately. The heavy path runs on the
+    // code-index worker with no client deadline; callers poll
+    // `code_search.ingest_status` (or stream WatchIngest over gRPC).
+    let operation = if reindex { "reindex" } else { "ingest" };
+    let caps = RepoFetchCaps::from_requested(input.max_total_bytes);
+    let parse_budget_ms = request_u64(request, "parse_budget_ms");
+    let submitted = code_index.submit_ingest_job(IngestJobRequest {
+        input,
+        operation: operation.to_string(),
+        repo_url,
+        caps,
+        parse_budget_ms,
+        ..Default::default()
+    });
+    HandlerOutcome {
+        status: "ok".to_string(),
+        executed: true,
+        output: merge_json(
+            base,
+            json!({
+                "job_id": submitted.job_id,
+                "state": submitted.state.as_str(),
+                "operation": operation,
+                "job": submitted.to_json(),
+                "submitted": true,
+                "next": "poll code_search.ingest_status with this job_id, or stream WatchIngest over gRPC",
+            }),
+        ),
+        error_code: String::new(),
+        message: "code ingest submitted as a background job".to_string(),
+        outcome_value: 1.0,
+        outcome_label: if reindex {
+            "code_reindex_submitted".to_string()
+        } else {
+            "code_ingest_submitted".to_string()
         },
-        Err(err) => HandlerOutcome {
+    }
+}
+
+fn code_ingest_status_handler(
+    base: Value,
+    code_index: &CodeIndexRuntime,
+    request: &Value,
+    tenant_id: &str,
+) -> HandlerOutcome {
+    let job_id = request_string(request, &["job_id", "jobId", "job"]).unwrap_or_default();
+    if job_id.trim().is_empty() {
+        return HandlerOutcome {
             status: "failed".to_string(),
             executed: false,
-            output: merge_json(base, json!({ "code_index_error": err.message })),
-            error_code: err.code,
-            message: "native code index failed to ingest codebase".to_string(),
+            output: base,
+            error_code: "INVALID_REQUEST".to_string(),
+            message: "job_id is required for code_search.ingest_status".to_string(),
             outcome_value: 0.0,
-            outcome_label: "code_ingest_failed".to_string(),
+            outcome_label: "code_ingest_status_invalid".to_string(),
+        };
+    }
+    let status = code_index
+        .ingest_job_status(job_id.trim())
+        .filter(|status| status.tenant_id == tenant_id);
+    match status {
+        Some(status) => {
+            let (events, terminal) = code_index
+                .ingest_jobs()
+                .events_after(job_id.trim(), 0)
+                .unwrap_or_default();
+            let event_tail: Vec<Value> = events
+                .iter()
+                .rev()
+                .take(20)
+                .rev()
+                .map(|event| event.to_json())
+                .collect();
+            HandlerOutcome {
+                status: "ok".to_string(),
+                executed: true,
+                output: merge_json(
+                    base,
+                    json!({
+                        "job": status.to_json(),
+                        "state": status.state.as_str(),
+                        "terminal": terminal,
+                        "events": event_tail,
+                    }),
+                ),
+                error_code: String::new(),
+                message: "ingest job status read".to_string(),
+                outcome_value: 1.0,
+                outcome_label: "code_ingest_status_ok".to_string(),
+            }
+        }
+        None => HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(base, json!({ "job_id": job_id })),
+            error_code: "JOB_NOT_FOUND".to_string(),
+            message: "ingest job was not found for this tenant".to_string(),
+            outcome_value: 0.0,
+            outcome_label: "code_ingest_status_missing".to_string(),
         },
     }
 }
@@ -1670,6 +1741,50 @@ mod tests {
         (runtime, response, data_dir)
     }
 
+    /// Submit-then-poll: take an ingest submission ack, poll
+    /// `code_search.ingest_status` until the job is terminal, and return the
+    /// finished output JSON.
+    fn wait_for_ingest_output(
+        runtime: &AppAffordanceRuntime,
+        tenant: &str,
+        submit_output_json: &str,
+    ) -> Value {
+        let submitted: Value = serde_json::from_str(submit_output_json).unwrap();
+        let job_id = submitted["job_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(!job_id.is_empty(), "submit ack carries a job_id: {submitted}");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = runtime
+                .invoke(
+                    pb::InvokeAffordanceRequest {
+                        tenant_id: tenant.to_string(),
+                        affordance_id: "theorem_grpc.code_search.ingest_status".to_string(),
+                        actor: "test".to_string(),
+                        request_json: json!({ "job_id": job_id }).to_string(),
+                        dry_run: false,
+                        confirmed: false,
+                        timeout_ms: 0,
+                    },
+                    Instant::now(),
+                )
+                .unwrap();
+            assert_eq!(status.status, "ok", "{}", status.output_json);
+            let payload: Value = serde_json::from_str(&status.output_json).unwrap();
+            if payload["terminal"].as_bool().unwrap_or(false) {
+                assert_eq!(payload["job"]["state"], json!("finished"), "{payload}");
+                return payload["job"]["output"].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ingest job did not finish: {payload}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn fixture_code_repo() -> PathBuf {
         let repo_dir = unique_test_dir("code-repo");
         std::fs::create_dir_all(repo_dir.join("src")).unwrap();
@@ -1825,9 +1940,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ingest.status, "ok");
-        assert!(ingest.output_json.contains("\"files_indexed\":1"));
+        assert!(ingest.output_json.contains("\"submitted\":true"));
         assert!(ingest.output_json.contains("\"timeout_ms\":180000"));
         assert!(ingest.output_json.contains("\"graph_invocation\""));
+        let ingest_output = wait_for_ingest_output(&runtime, "theorem", &ingest.output_json);
+        assert_eq!(ingest_output["files_indexed"], json!(1));
 
         let search = runtime
             .invoke(
@@ -2241,9 +2358,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ingest.status, "ok");
-        let output: Value = serde_json::from_str(&ingest.output_json).unwrap();
+        let submit_ack: Value = serde_json::from_str(&ingest.output_json).unwrap();
+        assert_eq!(submit_ack["timeout_ms"], THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS);
+        assert_eq!(submit_ack["submitted"], json!(true));
+        let output = wait_for_ingest_output(&runtime, "theorem", &ingest.output_json);
         assert_eq!(output["files_indexed"], json!(1));
-        assert_eq!(output["timeout_ms"], THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS);
         assert!(output["repo_id"]
             .as_str()
             .unwrap_or_default()
@@ -2286,7 +2405,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ingest.status, "ok");
-        let ingest_output: Value = serde_json::from_str(&ingest.output_json).unwrap();
+        let ingest_output = wait_for_ingest_output(&runtime, "theorem", &ingest.output_json);
         assert!(
             ingest_output["files_indexed"].as_u64().unwrap_or_default() >= 3,
             "{ingest_output}"

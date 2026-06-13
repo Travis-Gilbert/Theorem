@@ -22,7 +22,12 @@ use rustyred_thg_core::{
 use serde_json::{json, Value};
 use syn::visit::Visit;
 
+mod ingest_jobs;
 mod repo_fetch;
+pub use ingest_jobs::{
+    IngestJobEvent, IngestJobEventKind, IngestJobRegistry, IngestJobRequest, IngestJobState,
+    IngestJobStatus, CODE_INGEST_JOB_LABEL,
+};
 pub use repo_fetch::{
     fetch_repo, is_fetchable_repo_url, FetchedRepo, RepoFetchCaps, RepoFetchError,
 };
@@ -31,6 +36,11 @@ pub const CODE_REPO_LABEL: &str = "CodeRepository";
 pub const CODE_FILE_LABEL: &str = "CodeFile";
 pub const CODE_SYMBOL_LABEL: &str = "CodeSymbol";
 pub const CODE_RECEIPT_LABEL: &str = "CodeInvocationReceipt";
+/// Content-addressed side record holding a file's full text, keyed by the
+/// file's `content_hash`. Kept OFF the `CodeFile` node so symbol/file node
+/// loads (search, explore) never deserialize file contents; only
+/// `code_context` reads it back.
+pub const CODE_FILE_TEXT_LABEL: &str = "CodeFileText";
 pub const SOURCE: &str = "rustyred_thg_code";
 pub const CONTAINS_FILE: &str = "CONTAINS_FILE";
 pub const DECLARES_SYMBOL: &str = "DECLARES_SYMBOL";
@@ -45,10 +55,22 @@ const DEFAULT_LIMIT: usize = 20;
 const DEFAULT_CONTEXT_LINES: u64 = 20;
 const DEFAULT_MAX_CONTEXT_CHARS: usize = 20_000;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// Fan-out control for inferred symbol edges: a name whose `symbols_by_name`
+/// bucket exceeds this is too common (`new`, `get`, `handle`) to carry signal,
+/// so no edges are emitted for it at all.
+const EDGE_NAME_BUCKET_CAP: usize = 24;
+/// Within an admitted name, at most this many targets receive an edge from one
+/// source symbol. Buckets are sorted by (file_path, line, symbol_id) so the cap
+/// cuts deterministically.
+const EDGE_TARGETS_PER_NAME_CAP: usize = 8;
+/// Files parsed per progress/budget checkpoint during ingest.
+const PARSE_CHUNK_FILES: usize = 200;
 
 #[derive(Clone)]
 pub struct CodeIndexRuntime {
     store: Arc<Mutex<RedCoreGraphStore>>,
+    jobs: Arc<IngestJobRegistry>,
+    worker_started: Arc<std::sync::Once>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -307,18 +329,31 @@ impl CodeIndexRuntime {
     }
 
     pub fn try_new_with_store(store: RedCoreGraphStore) -> Result<Self, CodeIndexError> {
-        Ok(Self {
-            store: Arc::new(Mutex::new(store)),
-        })
+        let store = Arc::new(Mutex::new(store));
+        let jobs = Arc::new(IngestJobRegistry::with_persistence(Arc::downgrade(&store)));
+        let runtime = Self {
+            store,
+            jobs,
+            worker_started: Arc::new(std::sync::Once::new()),
+        };
+        // D-jobs: recover durably-mirrored ingest jobs. Terminal jobs become
+        // queryable again; jobs interrupted mid-flight (queued/running at the
+        // crash) are re-enqueued and the worker is started to run them.
+        let runnable = {
+            let store = runtime.lock_store()?;
+            runtime.jobs.recover_from_store(&store)
+        };
+        if runnable > 0 {
+            runtime.ensure_ingest_worker();
+        }
+        Ok(runtime)
     }
 
     pub fn ingest_codebase(
         &self,
         input: IngestCodebaseInput,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-        let prepared = prepare_codebase_ingest(input, "ingest", 0)?;
-        let mut store = self.lock_store()?;
-        commit_prepared_ingest(&mut store, prepared, "ingest")
+        self.run_codebase_ingest(input, "ingest", None)
     }
 
     pub fn ingest_codebase_from_url(
@@ -327,18 +362,14 @@ impl CodeIndexRuntime {
         input: IngestCodebaseInput,
         caps: &RepoFetchCaps,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-        let prepared = prepare_codebase_ingest_from_url(url, input, caps, "ingest")?;
-        let mut store = self.lock_store()?;
-        commit_prepared_ingest(&mut store, prepared, "ingest")
+        self.run_codebase_ingest(input, "ingest", Some((url, caps)))
     }
 
     pub fn reindex_codebase(
         &self,
         input: IngestCodebaseInput,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-        let prepared = prepare_codebase_ingest(input, "reindex", 0)?;
-        let mut store = self.lock_store()?;
-        commit_prepared_ingest(&mut store, prepared, "reindex")
+        self.run_codebase_ingest(input, "reindex", None)
     }
 
     pub fn reindex_codebase_from_url(
@@ -347,9 +378,91 @@ impl CodeIndexRuntime {
         input: IngestCodebaseInput,
         caps: &RepoFetchCaps,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-        let prepared = prepare_codebase_ingest_from_url(url, input, caps, "reindex")?;
+        self.run_codebase_ingest(input, "reindex", Some((url, caps)))
+    }
+
+    /// Synchronous ingest/reindex. The clone, walk, and parse run with NO
+    /// store lock; the lock is taken twice, briefly: once to snapshot the
+    /// prior generation (reindex only) and once for the final commit. The
+    /// async submit path (`submit_ingest_job`) follows the same shape on the
+    /// worker thread.
+    fn run_codebase_ingest(
+        &self,
+        input: IngestCodebaseInput,
+        operation: &str,
+        url: Option<(&str, &RepoFetchCaps)>,
+    ) -> Result<IngestCodebaseOutput, CodeIndexError> {
+        let started = Instant::now();
+        let (input, clone_ms, _fetched) = stage_repo_for_ingest(input, url)?;
+        let resolve_started = Instant::now();
+        let config = resolve_ingest_config(input)?;
+        let resolve_ms = elapsed_ms(resolve_started);
+        let prior = {
+            let store = self.lock_store()?;
+            snapshot_for_operation(&store, operation, &config)?
+        };
+        let tenant_id = config.tenant_id.clone();
+        let store_handle = Arc::clone(&self.store);
+        let loader = move |hashes: &[String]| match store_handle.lock() {
+            Ok(store) => load_file_texts(&store, &tenant_id, hashes),
+            Err(_) => HashMap::new(),
+        };
+        let prepared = prepare_codebase_ingest_resolved(
+            config,
+            clone_ms,
+            resolve_ms,
+            started,
+            IngestPipelineOptions {
+                carried_text_loader: Some(&loader),
+                ..IngestPipelineOptions::sync_default(prior)
+            },
+        )?;
         let mut store = self.lock_store()?;
-        commit_prepared_ingest(&mut store, prepared, "reindex")
+        commit_prepared_ingest(&mut store, prepared, operation)
+    }
+
+    /// D1: submit an ingest/reindex as a background job and return its status
+    /// (with `job_id`) immediately. The heavy path runs on a dedicated worker
+    /// thread; watch it with `wait_ingest_job_events` (streaming) or poll
+    /// `ingest_job_status`.
+    pub fn submit_ingest_job(&self, request: IngestJobRequest) -> IngestJobStatus {
+        self.ensure_ingest_worker();
+        self.jobs.submit(request)
+    }
+
+    pub fn ingest_job_status(&self, job_id: &str) -> Option<IngestJobStatus> {
+        self.jobs.status(job_id)
+    }
+
+    /// Events with `sequence > after_sequence`, blocking up to `timeout` for
+    /// new ones. Returns `None` for an unknown job; the bool is true once the
+    /// job reached a terminal state (no further events will arrive).
+    pub fn wait_ingest_job_events(
+        &self,
+        job_id: &str,
+        after_sequence: u64,
+        timeout: std::time::Duration,
+    ) -> Option<(Vec<IngestJobEvent>, bool)> {
+        self.jobs.wait_events(job_id, after_sequence, timeout)
+    }
+
+    pub fn ingest_jobs(&self) -> Arc<IngestJobRegistry> {
+        Arc::clone(&self.jobs)
+    }
+
+    fn ensure_ingest_worker(&self) {
+        let store = Arc::downgrade(&self.store);
+        let registry = Arc::clone(&self.jobs);
+        self.worker_started.call_once(move || {
+            if let Err(error) = std::thread::Builder::new()
+                .name("code-ingest-worker".to_string())
+                .spawn(move || ingest_jobs::ingest_worker_loop(store, registry))
+            {
+                // The registry stays usable; submitted jobs will sit queued.
+                // A second runtime clone cannot retry (Once), so surface it.
+                eprintln!("code-ingest-worker spawn failed: {error}");
+            }
+        });
     }
 
     pub fn search_code(&self, input: SearchCodeInput) -> Result<SearchCodeOutput, CodeIndexError> {
@@ -430,16 +543,14 @@ pub fn ingest_codebase_in_store(
     store: &mut RedCoreGraphStore,
     input: IngestCodebaseInput,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    let prepared = prepare_codebase_ingest(input, "ingest", 0)?;
-    commit_prepared_ingest(store, prepared, "ingest")
+    run_codebase_ingest_in_store(store, input, "ingest", None)
 }
 
 pub fn reindex_codebase_in_store(
     store: &mut RedCoreGraphStore,
     input: IngestCodebaseInput,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    let prepared = prepare_codebase_ingest(input, "reindex", 0)?;
-    commit_prepared_ingest(store, prepared, "reindex")
+    run_codebase_ingest_in_store(store, input, "reindex", None)
 }
 
 /// CA-1: ingest a repository given a remote URL. Shallow-clones it into a
@@ -452,7 +563,7 @@ pub fn ingest_codebase_from_url_in_store(
     input: IngestCodebaseInput,
     caps: &RepoFetchCaps,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    ingest_codebase_from_url_with_operation(store, url, input, caps, "ingest")
+    run_codebase_ingest_in_store(store, input, "ingest", Some((url, caps)))
 }
 
 pub fn reindex_codebase_from_url_in_store(
@@ -461,18 +572,63 @@ pub fn reindex_codebase_from_url_in_store(
     input: IngestCodebaseInput,
     caps: &RepoFetchCaps,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    ingest_codebase_from_url_with_operation(store, url, input, caps, "reindex")
+    run_codebase_ingest_in_store(store, input, "reindex", Some((url, caps)))
 }
 
-fn ingest_codebase_from_url_with_operation(
+fn run_codebase_ingest_in_store(
     store: &mut RedCoreGraphStore,
-    url: &str,
     input: IngestCodebaseInput,
-    caps: &RepoFetchCaps,
     operation: &str,
+    url: Option<(&str, &RepoFetchCaps)>,
 ) -> Result<IngestCodebaseOutput, CodeIndexError> {
-    let prepared = prepare_codebase_ingest_from_url(url, input, caps, operation)?;
+    let started = Instant::now();
+    let (input, clone_ms, _fetched) = stage_repo_for_ingest(input, url)?;
+    let resolve_started = Instant::now();
+    let config = resolve_ingest_config(input)?;
+    let resolve_ms = elapsed_ms(resolve_started);
+    let prior = snapshot_for_operation(store, operation, &config)?;
+    // Carried-text loads read the same `&store` immutably; the borrow ends when
+    // prepare returns, before the `&mut store` commit below.
+    let prepared = {
+        let tenant_id = config.tenant_id.clone();
+        let store_ref: &RedCoreGraphStore = store;
+        let loader = |hashes: &[String]| load_file_texts(store_ref, &tenant_id, hashes);
+        prepare_codebase_ingest_resolved(
+            config,
+            clone_ms,
+            resolve_ms,
+            started,
+            IngestPipelineOptions {
+                carried_text_loader: Some(&loader),
+                ..IngestPipelineOptions::sync_default(prior)
+            },
+        )?
+    };
     commit_prepared_ingest(store, prepared, operation)
+}
+
+/// Stage the repository for ingest. With a URL, shallow-clone it (CA-1) and
+/// point the input at the quarantined checkout; the returned `FetchedRepo`
+/// handle must stay alive until parsing has read all file text, after which
+/// dropping it removes the clone.
+pub(crate) fn stage_repo_for_ingest(
+    mut input: IngestCodebaseInput,
+    url: Option<(&str, &RepoFetchCaps)>,
+) -> Result<(IngestCodebaseInput, u64, Option<FetchedRepo>), CodeIndexError> {
+    let Some((url, caps)) = url else {
+        return Ok((input, 0, None));
+    };
+    let clone_started = Instant::now();
+    let fetched = fetch_repo(url, caps).map_err(|err| CodeIndexError::invalid(err.to_string()))?;
+    let clone_ms = elapsed_ms(clone_started);
+    input.repo_path = fetched.path().display().to_string();
+    if !input.exclude_dirs.iter().any(|dir| dir == ".git") {
+        input.exclude_dirs.push(".git".to_string());
+    }
+    if input.repo_id.trim().is_empty() {
+        input.repo_id = repo_id_from_url(url);
+    }
+    Ok((input, clone_ms, Some(fetched)))
 }
 
 /// Best-effort stable repo id from a clone URL: `repo:<last-path-segment>`.
@@ -1016,6 +1172,11 @@ pub struct IngestCodebaseOutput {
     pub files_indexed: u64,
     pub symbols_indexed: u64,
     pub files_skipped: u64,
+    /// Files whose symbols were extracted in this pass.
+    pub files_parsed: u64,
+    /// D4: unchanged files whose prior-generation nodes were carried forward
+    /// (restamped) without re-parsing. `files_indexed = parsed + carried`.
+    pub files_carried: u64,
     pub graph_version: u64,
     pub receipt_hash: String,
     pub receipt_json: String,
@@ -1036,6 +1197,8 @@ impl IngestCodebaseOutput {
             "files_indexed": self.files_indexed,
             "symbols_indexed": self.symbols_indexed,
             "files_skipped": self.files_skipped,
+            "files_parsed": self.files_parsed,
+            "files_carried": self.files_carried,
             "graph_version": self.graph_version,
             "receipt_hash": self.receipt_hash,
             "status": self.status,
@@ -1045,6 +1208,73 @@ impl IngestCodebaseOutput {
             "skip_stats": self.skip_stats.to_json(),
         })
     }
+}
+
+/// Rebuild an `IngestCodebaseOutput` from the JSON shape `to_json` emits, used
+/// to recover a durably-persisted finished job (D-jobs). `receipt_json` is the
+/// one field `to_json` omits; a recovered output leaves it empty (the receipt
+/// node itself is durable in the graph).
+pub(crate) fn ingest_output_from_json(value: &Value) -> Option<IngestCodebaseOutput> {
+    let u64_at = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let str_at = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let timings = value.get("stage_timings").cloned().unwrap_or(json!({}));
+    let timing = |key: &str| timings.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let skips = value.get("skip_stats").cloned().unwrap_or(json!({}));
+    let skip = |key: &str| skips.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut language_stats = BTreeMap::new();
+    if let Some(map) = value.get("language_stats").and_then(Value::as_object) {
+        for (language, stats) in map {
+            language_stats.insert(
+                language.clone(),
+                LanguageIngestStats {
+                    files_indexed: stats.get("files_indexed").and_then(Value::as_u64).unwrap_or(0),
+                    symbols_indexed: stats
+                        .get("symbols_indexed")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                },
+            );
+        }
+    }
+    Some(IngestCodebaseOutput {
+        tenant_id: str_at("tenant_id"),
+        repo_id: str_at("repo_id"),
+        repo_root: str_at("repo_root"),
+        generation: u64_at("generation"),
+        files_indexed: u64_at("files_indexed"),
+        symbols_indexed: u64_at("symbols_indexed"),
+        files_skipped: u64_at("files_skipped"),
+        files_parsed: u64_at("files_parsed"),
+        files_carried: u64_at("files_carried"),
+        graph_version: u64_at("graph_version"),
+        receipt_hash: str_at("receipt_hash"),
+        receipt_json: String::new(),
+        status: str_at("status"),
+        message: str_at("message"),
+        stage_timings: IngestStageTimings {
+            clone_ms: timing("clone_ms"),
+            resolve_ms: timing("resolve_ms"),
+            walk_ms: timing("walk_ms"),
+            parse_ms: timing("parse_ms"),
+            mutation_ms: timing("mutation_ms"),
+            write_ms: timing("write_ms"),
+            total_ms: timing("total_ms"),
+        },
+        language_stats,
+        skip_stats: IngestSkipStats {
+            unsupported_extension: skip("unsupported_extension"),
+            filename: skip("filename"),
+            too_large: skip("too_large"),
+            binary: skip("binary"),
+            read_error: skip("read_error"),
+        },
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1090,6 +1320,14 @@ pub struct IngestSkipStats {
 impl IngestSkipStats {
     pub fn total(&self) -> u64 {
         self.unsupported_extension + self.filename + self.too_large + self.binary + self.read_error
+    }
+
+    fn merge_from(&mut self, other: &IngestSkipStats) {
+        self.unsupported_extension += other.unsupported_extension;
+        self.filename += other.filename;
+        self.too_large += other.too_large;
+        self.binary += other.binary;
+        self.read_error += other.read_error;
     }
 
     pub fn to_json(&self) -> Value {
@@ -1646,6 +1884,25 @@ pub(crate) struct IndexedSymbol {
 /// sequence is identical to the original inline build, so the committed graph is
 /// byte-for-byte unchanged.
 pub fn build_code_mutations(config: &IngestConfig, files: &[IndexedFile]) -> Vec<GraphMutation> {
+    let mut mutations = build_node_mutations(config, files);
+    for edge in infer_symbol_call_edges(files, config) {
+        mutations.push(GraphMutation::EdgeUpsert(edge));
+    }
+    mutations
+}
+
+/// Build only the node-and-structural mutations (repo node, per-file CodeFile +
+/// CodeFileText + CONTAINS_FILE, per-symbol CodeSymbol + DECLARES_SYMBOL) for a
+/// set of indexed files, WITHOUT the inferred CALLS/DEPENDS edges. The
+/// incremental-reindex path (D4) emits nodes for freshly parsed files only,
+/// then infers edges over the FULL symbol set (fresh plus carried) so a
+/// reindex produces the same edge graph as a full ingest. `build_code_mutations`
+/// is this plus edge inference over the same files; the instant-KG session
+/// delta (`session_delta.rs`) uses `build_code_mutations` unchanged.
+pub(crate) fn build_node_mutations(
+    config: &IngestConfig,
+    files: &[IndexedFile],
+) -> Vec<GraphMutation> {
     let repo_node = NodeRecord::new(
         &config.repo_id,
         [CODE_REPO_LABEL],
@@ -1664,6 +1921,9 @@ pub fn build_code_mutations(config: &IngestConfig, files: &[IndexedFile]) -> Vec
 
     let mut mutations = vec![GraphMutation::NodeUpsert(repo_node)];
     for file in files {
+        // D3: the CodeFile node carries metadata only; the full text lives in
+        // a content-addressed CodeFileText side record so search/explore node
+        // loads never deserialize file contents.
         mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
             &file.file_id,
             [CODE_FILE_LABEL],
@@ -1676,9 +1936,20 @@ pub fn build_code_mutations(config: &IngestConfig, files: &[IndexedFile]) -> Vec
                 "extension": file.extension,
                 "language": file.language,
                 "content_hash": file.content_hash,
-                "text": file.text,
                 "generation": config.generation,
                 "indexed_at_ms": config.generation,
+                "source": SOURCE,
+            }),
+        )));
+        mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+            file_text_node_id(&config.tenant_id, &file.content_hash),
+            [CODE_FILE_TEXT_LABEL],
+            json!({
+                "tenant_id": config.tenant_id,
+                "repo_id": config.repo_id,
+                "content_hash": file.content_hash,
+                "path": file.rel_path,
+                "text": file.text,
                 "source": SOURCE,
             }),
         )));
@@ -1736,41 +2007,118 @@ pub fn build_code_mutations(config: &IngestConfig, files: &[IndexedFile]) -> Vec
             )));
         }
     }
-    for edge in infer_symbol_call_edges(files, config) {
-        mutations.push(GraphMutation::EdgeUpsert(edge));
-    }
-
     mutations
 }
 
-struct PreparedCodebaseIngest {
+pub(crate) struct PreparedCodebaseIngest {
     started: Instant,
     config: IngestConfig,
-    files: Vec<IndexedFile>,
     mutations: Vec<GraphMutation>,
     symbols_indexed: u64,
     files_skipped: u64,
+    files_parsed: u64,
+    files_carried: u64,
+    candidates_total: u64,
+    budget_exceeded: bool,
     stage_timings: IngestStageTimings,
     language_stats: BTreeMap<String, LanguageIngestStats>,
     skip_stats: IngestSkipStats,
 }
 
-fn prepare_codebase_ingest_from_url(
-    url: &str,
-    mut input: IngestCodebaseInput,
-    caps: &RepoFetchCaps,
-    _operation: &str,
-) -> Result<PreparedCodebaseIngest, CodeIndexError> {
-    let started = Instant::now();
-    let clone_started = started;
-    let fetched = fetch_repo(url, caps).map_err(|err| CodeIndexError::invalid(err.to_string()))?;
-    let clone_ms = elapsed_ms(clone_started);
-    input.repo_path = fetched.path().display().to_string();
-    if !input.exclude_dirs.iter().any(|dir| dir == ".git") {
-        input.exclude_dirs.push(".git".to_string());
+/// D4: everything a reindex needs to know about the prior generation, loaded
+/// in one brief store pass so the heavy walk/parse work runs without the
+/// store lock. Carried-forward files reuse their prior file/symbol nodes
+/// (restamped to the new generation) instead of being re-parsed.
+pub(crate) struct PriorGenerationSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) files: HashMap<String, PriorFileEntry>,
+}
+
+pub(crate) struct PriorFileEntry {
+    pub(crate) content_hash: String,
+    pub(crate) file_node: NodeRecord,
+    pub(crate) symbol_nodes: Vec<NodeRecord>,
+}
+
+pub(crate) fn load_prior_generation_snapshot(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+    repo_id: &str,
+) -> Result<Option<PriorGenerationSnapshot>, CodeIndexError> {
+    let repo_id = repo_id.trim();
+    if repo_id.is_empty() {
+        return Ok(None);
     }
-    if input.repo_id.trim().is_empty() {
-        input.repo_id = repo_id_from_url(url);
+    let Some(repo_node) = store.get_node(repo_id).map_err(CodeIndexError::from_store)? else {
+        return Ok(None);
+    };
+    if repo_node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id) {
+        return Ok(None);
+    }
+    let Some(generation) = property_u64(&repo_node.properties, "latest_generation") else {
+        return Ok(None);
+    };
+
+    let file_nodes = store
+        .query_nodes(
+            NodeQuery::label(CODE_FILE_LABEL)
+                .with_property("tenant_id", json!(tenant_id))
+                .with_property("repo_id", json!(repo_id))
+                .with_limit(200_000),
+        )
+        .map_err(CodeIndexError::from_store)?;
+    let mut files: HashMap<String, PriorFileEntry> = HashMap::new();
+    let mut paths_by_file_id: HashMap<String, String> = HashMap::new();
+    for node in file_nodes {
+        if property_u64(&node.properties, "generation") != Some(generation) {
+            continue;
+        }
+        let Some(path) = property_string(&node.properties, "path") else {
+            continue;
+        };
+        let Some(content_hash) = property_string(&node.properties, "content_hash") else {
+            continue;
+        };
+        paths_by_file_id.insert(node.id.clone(), path.clone());
+        files.insert(
+            path,
+            PriorFileEntry {
+                content_hash,
+                file_node: node,
+                symbol_nodes: Vec::new(),
+            },
+        );
+    }
+
+    let symbol_nodes = store
+        .query_nodes(
+            NodeQuery::label(CODE_SYMBOL_LABEL)
+                .with_property("tenant_id", json!(tenant_id))
+                .with_property("repo_id", json!(repo_id))
+                .with_limit(1_000_000),
+        )
+        .map_err(CodeIndexError::from_store)?;
+    for node in symbol_nodes {
+        if property_u64(&node.properties, "generation") != Some(generation) {
+            continue;
+        }
+        let Some(file_id) = property_string(&node.properties, "file_id") else {
+            continue;
+        };
+        let Some(path) = paths_by_file_id.get(&file_id) else {
+            continue;
+        };
+        if let Some(entry) = files.get_mut(path) {
+            entry.symbol_nodes.push(node);
+        }
+    }
+    for entry in files.values_mut() {
+        entry.symbol_nodes.sort_by(|a, b| {
+            property_u64(&a.properties, "line")
+                .unwrap_or(0)
+                .cmp(&property_u64(&b.properties, "line").unwrap_or(0))
+                .then_with(|| a.id.cmp(&b.id))
+        });
     }
     // `fetched` stays alive through preparation and removes the clone after
     // parsed mutations are materialized in memory.
@@ -1783,46 +2131,214 @@ fn prepare_codebase_ingest(
     clone_ms: u64,
 ) -> Result<PreparedCodebaseIngest, CodeIndexError> {
     prepare_codebase_ingest_started(input, clone_ms, Instant::now(), "")
+    Ok(Some(PriorGenerationSnapshot { generation, files }))
 }
 
-fn prepare_codebase_ingest_started(
-    input: IngestCodebaseInput,
+fn snapshot_for_operation(
+    store: &RedCoreGraphStore,
+    operation: &str,
+    config: &IngestConfig,
+) -> Result<Option<PriorGenerationSnapshot>, CodeIndexError> {
+    if operation == "reindex" {
+        load_prior_generation_snapshot(store, &config.tenant_id, &config.repo_id)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Loads carried files' text by `content_hash` from the CodeFileText side
+/// records (D3) so the incremental reindex can reconstruct carried symbols'
+/// bodies as edge sources without re-reading the working tree. Returns a map
+/// `content_hash -> text`; missing hashes are simply absent. Called once,
+/// sequentially, after the change split, so the runtime path can take the
+/// store lock for one brief batch read off the heavy parse path.
+pub(crate) type CarriedTextLoader<'a> = &'a dyn Fn(&[String]) -> HashMap<String, String>;
+
+/// Controls threaded through the prepare pipeline: the prior-generation
+/// snapshot (D4 incremental reindex), an optional progress sink (D1 streaming
+/// jobs), the carried-text loader (incremental edge reinference), and the parse
+/// budget (D7: commit partial progress instead of dying on a transport
+/// deadline). `parse_budget_ms == 0` means unlimited.
+pub(crate) struct IngestPipelineOptions<'a> {
+    pub(crate) prior: Option<PriorGenerationSnapshot>,
+    pub(crate) sink: Option<&'a (dyn Fn(IngestJobEventKind) + Sync)>,
+    pub(crate) carried_text_loader: Option<CarriedTextLoader<'a>>,
+    pub(crate) parse_budget_ms: u64,
+}
+
+impl IngestPipelineOptions<'static> {
+    pub(crate) fn sync_default(prior: Option<PriorGenerationSnapshot>) -> Self {
+        Self {
+            prior,
+            sink: None,
+            carried_text_loader: None,
+            parse_budget_ms: default_parse_budget_ms(),
+        }
+    }
+}
+
+pub(crate) fn default_parse_budget_ms() -> u64 {
+    std::env::var("THEOREM_CODE_INGEST_PARSE_BUDGET_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PARSE_BUDGET_MS)
+}
+
+/// Default server-side parse budget. Matches the harness MCP 120s ceiling so
+/// even the synchronous in-store path finishes (with partial progress and a
+/// `budget_exceeded` status) before any documented client deadline fires.
+/// With submit-plus-stream (D1) the heavy path has no client deadline at all;
+/// the budget protects the server from unbounded parses. Override with
+/// `THEOREM_CODE_INGEST_PARSE_BUDGET_MS`; `0` disables the budget.
+const DEFAULT_PARSE_BUDGET_MS: u64 = 120_000;
+
+fn emit_ingest_event(
+    sink: Option<&(dyn Fn(IngestJobEventKind) + Sync)>,
+    event: impl FnOnce() -> IngestJobEventKind,
+) {
+    if let Some(sink) = sink {
+        sink(event());
+    }
+}
+
+pub(crate) fn prepare_codebase_ingest_resolved(
+    mut config: IngestConfig,
     clone_ms: u64,
+    resolve_ms: u64,
     started: Instant,
-    repo_url: &str,
+    options: IngestPipelineOptions<'_>,
 ) -> Result<PreparedCodebaseIngest, CodeIndexError> {
-    let resolve_started = Instant::now();
-    let mut config = resolve_ingest_config(input)?;
-    // AM6 provenance: the ingest URL (if any) plus the resolved HEAD. The clone
-    // (URL path) and the local checkout (binding path) both retain `.git` here.
-    config.repo_url = repo_url.trim().to_string();
-    config.head_sha = git_head_sha(&config.repo_root);
-    let resolve_ms = elapsed_ms(resolve_started);
+    let IngestPipelineOptions {
+        prior,
+        sink,
+        carried_text_loader,
+        parse_budget_ms,
+    } = options;
+    // A reindex in the same millisecond as the prior generation would collide
+    // with it (generation is a timestamp); bump past the prior so the new
+    // generation always supersedes it.
+    if let Some(prior) = &prior {
+        if config.generation <= prior.generation {
+            config.generation = prior.generation + 1;
+        }
+    }
 
     let walk_started = Instant::now();
     let mut candidates = Vec::new();
     let mut skip_stats = IngestSkipStats::default();
     collect_code_file_candidates(&config.repo_root, &config, &mut candidates, &mut skip_stats)?;
     let walk_ms = elapsed_ms(walk_started);
+    emit_ingest_event(sink, || IngestJobEventKind::WalkDone {
+        files_found: candidates.len() as u64,
+    });
 
     let parse_started = Instant::now();
-    let (files, parse_skips) = parse_code_file_candidates(&config, &candidates);
-    skip_stats.read_error += parse_skips;
+    // LOAD: read and hash every candidate in parallel. Reading is cheap and
+    // the hash is what lets a reindex skip the expensive symbol extraction.
+    let loaded = load_code_file_candidates(&config, &candidates);
+    let mut work = Vec::with_capacity(loaded.len());
+    for item in loaded {
+        match item {
+            Some(loaded) => work.push(loaded),
+            None => skip_stats.read_error += 1,
+        }
+    }
+    let candidates_total = work.len() as u64;
+
+    // SPLIT (D4): unchanged files carry their prior nodes forward un-parsed.
+    let mut carried_entries: Vec<&PriorFileEntry> = Vec::new();
+    let mut to_extract: Vec<LoadedCandidate> = Vec::new();
+    if let Some(prior) = &prior {
+        for loaded in work {
+            match prior.files.get(&loaded.candidate.rel_path) {
+                Some(entry) if entry.content_hash == loaded.content_hash => {
+                    carried_entries.push(entry);
+                }
+                _ => to_extract.push(loaded),
+            }
+        }
+    } else {
+        to_extract = work;
+    }
+
+    // EXTRACT: symbol extraction in chunks, with progress events and the
+    // parse budget checked at every chunk boundary. A budget stop keeps the
+    // files parsed so far; the commit then reports `budget_exceeded` with
+    // honest partial counts instead of surfacing a transport timeout.
+    let extract_total = to_extract.len() as u64;
+    let mut files: Vec<IndexedFile> = Vec::with_capacity(to_extract.len());
+    let mut budget_exceeded = false;
+    let chunk_count = to_extract.len().div_ceil(PARSE_CHUNK_FILES);
+    for chunk_index in 0..chunk_count {
+        if parse_budget_ms > 0 && chunk_index > 0 && elapsed_ms(parse_started) > parse_budget_ms {
+            budget_exceeded = true;
+            break;
+        }
+        let start = chunk_index * PARSE_CHUNK_FILES;
+        let end = (start + PARSE_CHUNK_FILES).min(to_extract.len());
+        let mut parsed: Vec<IndexedFile> = to_extract[start..end]
+            .par_iter_mut()
+            .map(|loaded| indexed_file_from_loaded(&config, loaded))
+            .collect();
+        files.append(&mut parsed);
+        emit_ingest_event(sink, || IngestJobEventKind::ParseProgress {
+            done: end as u64,
+            total: extract_total,
+        });
+    }
     let parse_ms = elapsed_ms(parse_started);
 
+    // RECONSTRUCT (D4 incremental edges): rebuild carried files as full edge
+    // SOURCES from their persisted nodes plus, for non-parser-backed (body
+    // tokenized) symbols, their text from the D3 side records. Parser-backed
+    // (Rust) carried symbols carry their call/dependency names on the node, so
+    // they need no text. Running edge inference over fresh PLUS carried makes a
+    // reindex's edge graph identical to a full ingest of the same tree, which
+    // closes the carried-symbol-to-changed-target and carried-symbol-to-newly-
+    // defined-name seams.
+    let carried_text = load_carried_text(&carried_entries, &config, carried_text_loader);
+    let carried_files: Vec<IndexedFile> = carried_entries
+        .iter()
+        .map(|entry| reconstruct_carried_file(entry, &carried_text))
+        .collect();
+    let carried_symbol_count = carried_files
+        .iter()
+        .map(|file| file.symbols.len() as u64)
+        .sum::<u64>();
+
     let mutation_started = Instant::now();
-    let mutations = build_code_mutations(&config, &files);
+    let mut all_files: Vec<IndexedFile> = Vec::with_capacity(files.len() + carried_files.len());
+    all_files.extend(files.iter().cloned());
+    all_files.extend(carried_files);
+
+    // Node mutations: fresh files emit their nodes + text records; carried
+    // files restamp their existing nodes onto the new generation. Edges are
+    // inferred over the FULL symbol set so every current edge is re-emitted at
+    // the new generation (moved-target stale edges are left at the old
+    // generation and retired by the latest-generation traversal filter).
+    let mut mutations = build_node_mutations(&config, &files);
+    mutations.extend(carried_forward_mutations(&carried_entries, config.generation));
+    for edge in infer_symbol_call_edges(&all_files, &config) {
+        mutations.push(GraphMutation::EdgeUpsert(edge));
+    }
     let mutation_ms = elapsed_ms(mutation_started);
-    let symbols_indexed = files.iter().map(|file| file.symbols.len() as u64).sum();
+
+    let files_parsed = files.len() as u64;
+    let files_carried = carried_entries.len() as u64;
+    let symbols_indexed =
+        files.iter().map(|file| file.symbols.len() as u64).sum::<u64>() + carried_symbol_count;
     let language_stats = language_stats_for(&files);
 
     Ok(PreparedCodebaseIngest {
         started,
         config,
-        files,
         mutations,
         symbols_indexed,
         files_skipped: skip_stats.total(),
+        files_parsed,
+        files_carried,
+        candidates_total,
+        budget_exceeded,
         stage_timings: IngestStageTimings {
             clone_ms,
             resolve_ms,
@@ -1836,7 +2352,139 @@ fn prepare_codebase_ingest_started(
     })
 }
 
-fn commit_prepared_ingest(
+/// Restamp a prior generation's file and symbol nodes onto the new generation
+/// without re-parsing. Node ids are generation-free (`stable_hash(repo_id,
+/// path, kind, name, line)`), so the carried nodes keep their identities and
+/// every existing edge stays attached. Removed files are simply not carried:
+/// their nodes stay at the old generation, which the latest-generation filter
+/// on search/context retires (the tombstone semantics for this store).
+fn carried_forward_mutations(entries: &[&PriorFileEntry], generation: u64) -> Vec<GraphMutation> {
+    let mut mutations = Vec::new();
+    for entry in entries {
+        mutations.push(GraphMutation::NodeUpsert(restamped_node(
+            &entry.file_node,
+            generation,
+        )));
+        for symbol in &entry.symbol_nodes {
+            mutations.push(GraphMutation::NodeUpsert(restamped_node(symbol, generation)));
+        }
+    }
+    mutations
+}
+
+fn restamped_node(node: &NodeRecord, generation: u64) -> NodeRecord {
+    let mut node = node.clone();
+    if let Some(properties) = node.properties.as_object_mut() {
+        properties.insert("generation".to_string(), json!(generation));
+        properties.insert("indexed_at_ms".to_string(), json!(generation));
+    }
+    node
+}
+
+/// True when a carried file has any non-parser-backed symbol: those infer
+/// edges by tokenizing their body, so the file's text must be reconstructed.
+/// A purely parser-backed (Rust) carried file needs no text.
+fn carried_file_needs_text(entry: &PriorFileEntry) -> bool {
+    entry
+        .symbol_nodes
+        .iter()
+        .any(|node| !property_bool(&node.properties, "parser_backed"))
+}
+
+/// Batch-load text for carried files that need it (one call into the injected
+/// loader, so the runtime path takes the store lock once). Keyed by content
+/// hash, which a carried file shares with its existing CodeFileText record.
+fn load_carried_text(
+    carried_entries: &[&PriorFileEntry],
+    config: &IngestConfig,
+    loader: Option<CarriedTextLoader<'_>>,
+) -> HashMap<String, String> {
+    let Some(loader) = loader else {
+        return HashMap::new();
+    };
+    let mut hashes: Vec<String> = carried_entries
+        .iter()
+        .filter(|entry| carried_file_needs_text(entry))
+        .map(|entry| entry.content_hash.clone())
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    if hashes.is_empty() {
+        return HashMap::new();
+    }
+    let _ = config;
+    loader(&hashes)
+}
+
+/// Rebuild a carried file as a full `IndexedFile` (an edge SOURCE) from its
+/// persisted file/symbol nodes plus, when present, its reconstructed text.
+/// Symbol identity, name, kind, line, and the parser-backed call/dependency
+/// names all come straight off the persisted symbol nodes; the body is sliced
+/// from the text for the inverted-index path. This reproduces exactly what a
+/// fresh parse of the same (unchanged) file would yield for edge inference.
+fn reconstruct_carried_file(
+    entry: &PriorFileEntry,
+    carried_text: &HashMap<String, String>,
+) -> IndexedFile {
+    let file_props = &entry.file_node.properties;
+    let rel_path = property_string(file_props, "path").unwrap_or_default();
+    let language = property_string(file_props, "language").unwrap_or_default();
+    let extension = property_string(file_props, "extension").unwrap_or_default();
+    let file_id = property_string(file_props, "file_id").unwrap_or_else(|| entry.file_node.id.clone());
+
+    let text = carried_text.get(&entry.content_hash).cloned();
+    let lines: Vec<&str> = text.as_deref().map(|t| t.lines().collect()).unwrap_or_default();
+
+    let mut symbols = Vec::with_capacity(entry.symbol_nodes.len());
+    for (index, node) in entry.symbol_nodes.iter().enumerate() {
+        let props = &node.properties;
+        let line = property_u64(props, "line").unwrap_or(0);
+        // Bodies run from this symbol's line to just before the next symbol's,
+        // matching `extract_line_symbols`. Only needed for the tokenized path.
+        let next_line = entry
+            .symbol_nodes
+            .get(index + 1)
+            .map(|next| property_u64(&next.properties, "line").unwrap_or(0).saturating_sub(1))
+            .unwrap_or(lines.len() as u64);
+        let body = if lines.is_empty() {
+            String::new()
+        } else {
+            body_between_lines(&lines, line, next_line)
+        };
+        symbols.push(IndexedSymbol {
+            symbol_id: property_string(props, "symbol_id").unwrap_or_else(|| node.id.clone()),
+            file_id: property_string(props, "file_id").unwrap_or_else(|| file_id.clone()),
+            file_path: property_string(props, "file_path").unwrap_or_else(|| rel_path.clone()),
+            kind: property_string(props, "kind").unwrap_or_default(),
+            name: property_string(props, "name").unwrap_or_default(),
+            language: property_string(props, "language").unwrap_or_else(|| language.clone()),
+            line,
+            signature: property_string(props, "signature").unwrap_or_default(),
+            snippet: property_string(props, "snippet").unwrap_or_default(),
+            body,
+            trust_tier: property_string(props, "trust_tier")
+                .unwrap_or_else(|| DEFAULT_TRUST_TIER.to_string()),
+            community_id: property_string(props, "community_id").unwrap_or_default(),
+            call_names: property_string_set(props, "call_names"),
+            dependency_names: property_string_set(props, "dependency_names"),
+            parser_backed: property_bool(props, "parser_backed"),
+        });
+    }
+
+    IndexedFile {
+        file_id,
+        rel_path,
+        language,
+        extension,
+        content_hash: entry.content_hash.clone(),
+        // Carried files do not re-emit their text record (it already exists at
+        // the same content hash); this field is unused for carried files.
+        text: String::new(),
+        symbols,
+    }
+}
+
+pub(crate) fn commit_prepared_ingest(
     store: &mut RedCoreGraphStore,
     mut prepared: PreparedCodebaseIngest,
     operation: &str,
@@ -1849,13 +2497,33 @@ fn commit_prepared_ingest(
     prepared.stage_timings.write_ms = elapsed_ms(write_started);
     prepared.stage_timings.total_ms = elapsed_ms(prepared.started);
 
+    let files_indexed = prepared.files_parsed + prepared.files_carried;
+    let (status, message) = if prepared.budget_exceeded {
+        (
+            "budget_exceeded".to_string(),
+            format!(
+                "parse budget exhausted: parsed {} of {} candidate files (carried {} unchanged); committed partial progress",
+                prepared.files_parsed, prepared.candidates_total, prepared.files_carried
+            ),
+        )
+    } else {
+        (
+            "ok".to_string(),
+            "codebase indexed into RedCore".to_string(),
+        )
+    };
+
     let summary = json!({
         "tenant_id": prepared.config.tenant_id,
         "repo_id": prepared.config.repo_id,
         "repo_root": prepared.config.repo_root_display,
         "generation": prepared.config.generation,
         "operation": operation,
-        "files_indexed": prepared.files.len(),
+        "status": status,
+        "files_indexed": files_indexed,
+        "files_parsed": prepared.files_parsed,
+        "files_carried": prepared.files_carried,
+        "candidates_total": prepared.candidates_total,
         "symbols_indexed": prepared.symbols_indexed,
         "files_skipped": prepared.files_skipped,
         "graph_version": transaction.graph_version,
@@ -1878,14 +2546,16 @@ fn commit_prepared_ingest(
         repo_id: prepared.config.repo_id,
         repo_root: prepared.config.repo_root_display,
         generation: prepared.config.generation,
-        files_indexed: prepared.files.len() as u64,
+        files_indexed,
         symbols_indexed: prepared.symbols_indexed,
         files_skipped: prepared.files_skipped,
+        files_parsed: prepared.files_parsed,
+        files_carried: prepared.files_carried,
         graph_version: receipt.graph_version,
         receipt_hash: receipt.receipt_hash,
         receipt_json: receipt.receipt_json,
-        status: "ok".to_string(),
-        message: "codebase indexed into RedCore".to_string(),
+        status,
+        message,
         stage_timings: prepared.stage_timings,
         language_stats: prepared.language_stats,
         skip_stats: prepared.skip_stats,
@@ -2030,14 +2700,14 @@ fn code_context_with_store(
         }
     }
 
-    let text = property_string(&file.properties, "text").unwrap_or_default();
+    let text = file_text_for(store, &tenant_id, &file)?;
     let file_path = property_string(&file.properties, "path").unwrap_or_default();
     let before = nonzero_or(input.before_lines, DEFAULT_CONTEXT_LINES);
     let after = nonzero_or(input.after_lines, DEFAULT_CONTEXT_LINES);
     let max_chars = nonzero_or(input.max_chars, DEFAULT_MAX_CONTEXT_CHARS as u64) as usize;
     let (start_line, end_line, context) =
         line_context(&text, target_line, before, after, max_chars);
-    let symbols = symbols_for_file(store, &tenant_id, &file_id, &repo_id, latest.get(&repo_id))?;
+    let symbols = symbols_for_file(store, &tenant_id, &file_id, &repo_id, &latest)?;
 
     let receipt_payload = json!({
         "tenant_id": tenant_id,
@@ -2141,6 +2811,7 @@ fn explore_code_with_store(
     } else {
         input.max_depth.min(4) as usize
     };
+    let latest = latest_repo_generations(store)?;
     let mut edges = Vec::new();
     let mut related_ids = BTreeSet::new();
     expand_symbol_edges(
@@ -2148,6 +2819,7 @@ fn explore_code_with_store(
         &focus_node.id,
         max_depth,
         limit,
+        &latest,
         &mut related_ids,
         &mut edges,
     )?;
@@ -2159,14 +2831,14 @@ fn explore_code_with_store(
             .map_err(CodeIndexError::from_store)?
         {
             if let Some(mut symbol) = symbol_record_from_node(&node) {
-                enrich_symbol_graph(store, &mut symbol)?;
+                enrich_symbol_graph(store, &mut symbol, &latest)?;
                 related_symbols.push(symbol);
             }
         }
     }
     let mut focus = symbol_record_from_node(&focus_node);
     if let Some(symbol) = focus.as_mut() {
-        enrich_symbol_graph(store, symbol)?;
+        enrich_symbol_graph(store, symbol, &latest)?;
     }
     let payload = json!({
         "tenant_id": tenant_id,
@@ -2218,7 +2890,8 @@ fn explain_code_with_store(
     };
     let mut symbol = symbol_record_from_node(&focus_node)
         .ok_or_else(|| CodeIndexError::invalid("resolved code node is missing symbol metadata"))?;
-    enrich_symbol_graph(store, &mut symbol)?;
+    let latest = latest_repo_generations(store)?;
+    enrich_symbol_graph(store, &mut symbol, &latest)?;
     let context = code_context_with_store(
         store,
         CodeContextInput {
@@ -2235,6 +2908,7 @@ fn explain_code_with_store(
         &focus_node.id,
         1,
         DEFAULT_LIMIT,
+        &latest,
         &mut related_ids,
         &mut edges,
     )?;
@@ -2352,121 +3026,225 @@ struct CodeFileCandidate {
     language: String,
 }
 
+/// D5: parallel, gitignore-aware walk via the `ignore` crate. The repo's
+/// `.gitignore` and `.ignore` files prune `node_modules`/`target`/`dist`
+/// without a hardcoded list (`require_git(false)` so plain directories honor
+/// them too), and the walk fans out across threads. The extension allowlist,
+/// the file-size cap, the binary sniff, the lockfile/minified-name skip, and
+/// the dot-dir plus `exclude_dirs` pruning from the old manual walk all stay.
+/// Dot FILES stay eligible (matching the old walk, which only skipped dot
+/// directories). Per-entry IO errors count as `read_error` skips instead of
+/// failing the whole ingest; the repo root itself is validated upstream by
+/// `resolve_ingest_config`. When the tree holds more eligible files than
+/// `max_files`, the walk quits early, so WHICH files fill the cap follows
+/// discovery order; the surviving set is then sorted by relative path so the
+/// output stays deterministic for a given discovered set.
 fn collect_code_file_candidates(
     dir: &Path,
     config: &IngestConfig,
     out: &mut Vec<CodeFileCandidate>,
     skip_stats: &mut IngestSkipStats,
 ) -> Result<(), CodeIndexError> {
-    if out.len() >= config.max_files {
+    #[derive(Default)]
+    struct WalkAccumulator {
+        candidates: Vec<CodeFileCandidate>,
+        skips: IngestSkipStats,
+    }
+
+    let capacity = config.max_files.saturating_sub(out.len());
+    if capacity == 0 {
         return Ok(());
     }
-    let entries =
-        fs::read_dir(dir).map_err(|err| CodeIndexError::io("read directory", dir, err))?;
-    for entry in entries {
-        let entry = entry.map_err(|err| CodeIndexError::io("read directory entry", dir, err))?;
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let metadata = entry
-            .metadata()
-            .map_err(|err| CodeIndexError::io("read metadata", &path, err))?;
-        if metadata.is_dir() {
-            if should_skip_dir(&file_name, &config.exclude_dirs) {
-                continue;
+
+    let accumulator = Mutex::new(WalkAccumulator::default());
+    let exclude_dirs = config.exclude_dirs.clone();
+    let mut builder = ignore::WalkBuilder::new(dir);
+    builder
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .parents(false)
+        .require_git(false)
+        .follow_links(false)
+        .threads(walk_threads());
+    builder.filter_entry(move |entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        match entry.file_type() {
+            Some(file_type) if file_type.is_dir() => {
+                !should_skip_dir(&entry.file_name().to_string_lossy(), &exclude_dirs)
             }
-            collect_code_file_candidates(&path, config, out, skip_stats)?;
-            if out.len() >= config.max_files {
-                return Ok(());
+            _ => true,
+        }
+    });
+
+    builder.build_parallel().run(|| {
+        let accumulator = &accumulator;
+        Box::new(move |entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    accumulator.lock().expect("walk accumulator").skips.read_error += 1;
+                    return ignore::WalkState::Continue;
+                }
+            };
+            if entry.depth() == 0 {
+                return ignore::WalkState::Continue;
             }
-            continue;
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-        if should_skip_file_name(&file_name) {
-            skip_stats.filename += 1;
-            continue;
-        }
-        let extension = extension_for(&path);
-        if !config.include_extensions.contains(&extension) {
-            skip_stats.unsupported_extension += 1;
-            continue;
-        }
-        if metadata.len() > config.max_file_bytes {
-            skip_stats.too_large += 1;
-            continue;
-        }
-        match has_null_byte_prefix(&path) {
-            Ok(true) => {
-                skip_stats.binary += 1;
-                continue;
+            let Some(file_type) = entry.file_type() else {
+                return ignore::WalkState::Continue;
+            };
+            if !file_type.is_file() {
+                return ignore::WalkState::Continue;
             }
-            Ok(false) => {}
-            Err(_) => {
-                skip_stats.read_error += 1;
-                continue;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if should_skip_file_name(&file_name) {
+                accumulator.lock().expect("walk accumulator").skips.filename += 1;
+                return ignore::WalkState::Continue;
             }
-        }
-        let rel_path = relative_path(&config.repo_root, &path)?;
-        out.push(CodeFileCandidate {
-            path,
-            rel_path,
-            extension: extension.clone(),
-            language: language_for_extension(&extension).to_string(),
-        });
-        if out.len() >= config.max_files {
-            return Ok(());
-        }
-    }
+            let path = entry.path();
+            let extension = extension_for(path);
+            if !config.include_extensions.contains(&extension) {
+                accumulator
+                    .lock()
+                    .expect("walk accumulator")
+                    .skips
+                    .unsupported_extension += 1;
+                return ignore::WalkState::Continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    accumulator.lock().expect("walk accumulator").skips.read_error += 1;
+                    return ignore::WalkState::Continue;
+                }
+            };
+            if metadata.len() > config.max_file_bytes {
+                accumulator.lock().expect("walk accumulator").skips.too_large += 1;
+                return ignore::WalkState::Continue;
+            }
+            match has_null_byte_prefix(path) {
+                Ok(true) => {
+                    accumulator.lock().expect("walk accumulator").skips.binary += 1;
+                    return ignore::WalkState::Continue;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    accumulator.lock().expect("walk accumulator").skips.read_error += 1;
+                    return ignore::WalkState::Continue;
+                }
+            }
+            let Ok(rel_path) = relative_path(&config.repo_root, path) else {
+                accumulator.lock().expect("walk accumulator").skips.read_error += 1;
+                return ignore::WalkState::Continue;
+            };
+            let mut state = accumulator.lock().expect("walk accumulator");
+            state.candidates.push(CodeFileCandidate {
+                path: path.to_path_buf(),
+                rel_path,
+                extension: extension.clone(),
+                language: language_for_extension(&extension).to_string(),
+            });
+            if state.candidates.len() >= capacity {
+                return ignore::WalkState::Quit;
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    let WalkAccumulator {
+        mut candidates,
+        skips,
+    } = accumulator.into_inner().expect("walk accumulator");
+    candidates.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    candidates.truncate(capacity);
+    skip_stats.merge_from(&skips);
+    out.extend(candidates);
     Ok(())
+}
+
+fn walk_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(4)
+        .min(16)
+}
+
+struct LoadedCandidate {
+    candidate: CodeFileCandidate,
+    text: String,
+    content_hash: String,
+}
+
+/// LOAD stage: read and content-hash every candidate in parallel. Split from
+/// symbol extraction so the reindex path can compare hashes against the prior
+/// generation and skip extraction for unchanged files (D4).
+fn load_code_file_candidates(
+    config: &IngestConfig,
+    candidates: &[CodeFileCandidate],
+) -> Vec<Option<LoadedCandidate>> {
+    candidates
+        .par_iter()
+        .map(|candidate| {
+            let text = fs::read_to_string(&candidate.path).ok()?;
+            let content_hash = stable_hash(json!({
+                "repo_id": config.repo_id,
+                "path": candidate.rel_path,
+                "content": text,
+            }));
+            Some(LoadedCandidate {
+                candidate: candidate.clone(),
+                text,
+                content_hash,
+            })
+        })
+        .collect()
 }
 
 fn parse_code_file_candidates(
     config: &IngestConfig,
     candidates: &[CodeFileCandidate],
 ) -> (Vec<IndexedFile>, u64) {
-    let parsed = candidates
-        .par_iter()
-        .map(|candidate| parse_code_file_candidate(config, candidate))
-        .collect::<Vec<_>>();
+    let loaded = load_code_file_candidates(config, candidates);
     let mut read_skips = 0u64;
-    let mut files = Vec::with_capacity(parsed.len());
-    for item in parsed {
+    let mut work = Vec::with_capacity(loaded.len());
+    for item in loaded {
         match item {
-            Some(file) => files.push(file),
+            Some(loaded) => work.push(loaded),
             None => read_skips += 1,
         }
     }
+    let files = work
+        .par_iter_mut()
+        .map(|loaded| indexed_file_from_loaded(config, loaded))
+        .collect();
     (files, read_skips)
 }
 
-fn parse_code_file_candidate(
-    config: &IngestConfig,
-    candidate: &CodeFileCandidate,
-) -> Option<IndexedFile> {
-    let text = fs::read_to_string(&candidate.path).ok()?;
-    let file_id = file_node_id(&config.repo_id, &candidate.rel_path);
-    let content_hash = stable_hash(json!({
-        "repo_id": config.repo_id,
-        "path": candidate.rel_path,
-        "content": text,
-    }));
+/// EXTRACT stage: symbol extraction over already-loaded text. Takes the text
+/// out of the loaded candidate rather than cloning it.
+fn indexed_file_from_loaded(config: &IngestConfig, loaded: &mut LoadedCandidate) -> IndexedFile {
+    let text = std::mem::take(&mut loaded.text);
+    let file_id = file_node_id(&config.repo_id, &loaded.candidate.rel_path);
     let symbols = extract_symbols(
         &config.repo_id,
         &file_id,
-        &candidate.rel_path,
-        &candidate.language,
+        &loaded.candidate.rel_path,
+        &loaded.candidate.language,
         &text,
     );
-    Some(IndexedFile {
+    IndexedFile {
         file_id,
-        rel_path: candidate.rel_path.clone(),
-        language: candidate.language.clone(),
-        extension: candidate.extension.clone(),
-        content_hash,
+        rel_path: loaded.candidate.rel_path.clone(),
+        language: loaded.candidate.language.clone(),
+        extension: loaded.candidate.extension.clone(),
+        content_hash: loaded.content_hash.clone(),
         text,
         symbols,
-    })
+    }
 }
 
 fn has_null_byte_prefix(path: &Path) -> std::io::Result<bool> {
@@ -2503,7 +3281,7 @@ fn language_stats_json(stats: &BTreeMap<String, LanguageIngestStats>) -> Value {
     )
 }
 
-fn elapsed_ms(started: Instant) -> u64 {
+pub(crate) fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
@@ -2649,13 +3427,48 @@ fn extract_line_symbols(
     symbols
 }
 
+#[derive(Clone, Copy)]
+struct EdgeTargetRef<'a> {
+    symbol_id: &'a str,
+    name: &'a str,
+    file_path: &'a str,
+    line: u64,
+}
+
+/// D2: inverted-index edge inference. Each non-parser-backed symbol body is
+/// tokenized ONCE into identifier tokens, and each token is looked up in the
+/// name index, instead of scanning every distinct symbol name in the repo
+/// against the body. Cost drops from `symbols x distinct_names x body_length`
+/// to `symbols x body_tokens`. The Rust `syn` extraction path is unchanged;
+/// the fan-out caps live in `push_symbol_edges` and apply to both branches.
+///
+/// `files` is the FULL current symbol set for the generation: on a full ingest
+/// it is every parsed file; on an incremental reindex (D4) it is the freshly
+/// parsed files plus the reconstructed carried files, so a reindex produces the
+/// same edge graph as a full ingest of the same tree (carried symbols are edge
+/// sources, not just targets, which is what closes the carried-to-changed and
+/// carried-to-new-name seams).
 fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<EdgeRecord> {
-    let mut symbols_by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+    let mut symbols_by_name: HashMap<&str, Vec<EdgeTargetRef<'_>>> = HashMap::new();
     for symbol in files.iter().flat_map(|file| file.symbols.iter()) {
         symbols_by_name
             .entry(symbol.name.as_str())
             .or_default()
-            .push(symbol);
+            .push(EdgeTargetRef {
+                symbol_id: &symbol.symbol_id,
+                name: &symbol.name,
+                file_path: &symbol.file_path,
+                line: symbol.line,
+            });
+    }
+    for targets in symbols_by_name.values_mut() {
+        targets.sort_by(|a, b| {
+            a.file_path
+                .cmp(b.file_path)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.symbol_id.cmp(b.symbol_id))
+        });
+        targets.dedup_by(|a, b| a.symbol_id == b.symbol_id);
     }
 
     let mut edges = Vec::new();
@@ -2689,8 +3502,11 @@ fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<
                 );
             }
         } else {
-            for (name, _) in &symbols_by_name {
-                if *name == symbol.name.as_str() || !body_references_name(&symbol.body, name) {
+            for token in identifier_tokens(&symbol.body) {
+                if token == symbol.name {
+                    continue;
+                }
+                if !symbols_by_name.contains_key(token) {
                     continue;
                 }
                 push_symbol_edges(
@@ -2698,7 +3514,7 @@ fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<
                     &mut seen,
                     &symbols_by_name,
                     symbol,
-                    name,
+                    token,
                     CALLS_SYMBOL,
                     "code:edge:symbol_call",
                     "text_body_reference",
@@ -2710,11 +3526,20 @@ fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<
     edges
 }
 
+/// Split a symbol body into its distinct identifier tokens. Same character
+/// class the old `body_references_name` token match used, so token-level edge
+/// matches are unchanged; only the lookup direction flipped.
+fn identifier_tokens(body: &str) -> BTreeSet<&str> {
+    body.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '!')
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_symbol_edges(
     edges: &mut Vec<EdgeRecord>,
     seen: &mut BTreeSet<String>,
-    symbols_by_name: &HashMap<&str, Vec<&IndexedSymbol>>,
+    symbols_by_name: &HashMap<&str, Vec<EdgeTargetRef<'_>>>,
     symbol: &IndexedSymbol,
     name: &str,
     edge_type: &str,
@@ -2728,11 +3553,18 @@ fn push_symbol_edges(
     let Some(targets) = symbols_by_name.get(name) else {
         return;
     };
+    if targets.len() > EDGE_NAME_BUCKET_CAP {
+        return;
+    }
+    let mut emitted = 0usize;
     for target in targets {
+        if emitted >= EDGE_TARGETS_PER_NAME_CAP {
+            break;
+        }
         if target.symbol_id == symbol.symbol_id {
             continue;
         }
-        let symbol_edge_id = edge_id(edge_prefix, &symbol.symbol_id, &target.symbol_id);
+        let symbol_edge_id = edge_id(edge_prefix, &symbol.symbol_id, target.symbol_id);
         if !seen.insert(symbol_edge_id.clone()) {
             continue;
         }
@@ -2740,7 +3572,7 @@ fn push_symbol_edges(
             symbol_edge_id,
             &symbol.symbol_id,
             edge_type,
-            &target.symbol_id,
+            target.symbol_id,
             json!({
                 "tenant_id": config.tenant_id,
                 "repo_id": config.repo_id,
@@ -2749,6 +3581,7 @@ fn push_symbol_edges(
                 "source": SOURCE,
             }),
         ));
+        emitted += 1;
     }
 }
 
@@ -3083,8 +3916,9 @@ fn symbols_for_file(
     tenant_id: &str,
     file_id: &str,
     repo_id: &str,
-    latest_generation: Option<&u64>,
+    latest: &HashMap<String, u64>,
 ) -> Result<Vec<CodeSymbolRecord>, CodeIndexError> {
+    let latest_generation = latest.get(repo_id);
     let symbols = store
         .query_nodes(
             NodeQuery::label(CODE_SYMBOL_LABEL)
@@ -3103,7 +3937,7 @@ fn symbols_for_file(
         .filter_map(|node| symbol_record_from_node(&node))
         .collect::<Vec<_>>();
     for symbol in &mut out {
-        enrich_symbol_graph(store, symbol)?;
+        enrich_symbol_graph(store, symbol, latest)?;
     }
     out.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
@@ -3138,7 +3972,7 @@ fn recognize_indexed_symbols(
         .filter_map(|node| symbol_record_from_node(&node))
         .collect::<Vec<_>>();
     for symbol in &mut out {
-        enrich_symbol_graph(store, symbol)?;
+        enrich_symbol_graph(store, symbol, &latest)?;
     }
     out.sort_by(|a, b| {
         a.file_path
@@ -3199,11 +4033,28 @@ fn resolve_symbol_node(
     Ok(scored.into_iter().next().map(|(node, _)| node))
 }
 
+/// A code node is "current" when its generation matches its repo's latest
+/// generation. Incremental reindex re-emits every live edge at the new
+/// generation but leaves moved-target stale edges pointing at superseded
+/// (old-generation) symbol nodes; filtering traversal neighbors by this
+/// retires those stale edges without an edge-delete mutation (the store has
+/// none) and without rewriting the read path's generation model.
+fn node_is_current_generation(node: &NodeRecord, latest: &HashMap<String, u64>) -> bool {
+    match property_string(&node.properties, "repo_id") {
+        Some(repo_id) => match latest.get(&repo_id) {
+            Some(generation) => property_u64(&node.properties, "generation") == Some(*generation),
+            None => true,
+        },
+        None => true,
+    }
+}
+
 fn expand_symbol_edges(
     store: &RedCoreGraphStore,
     focus_id: &str,
     max_depth: usize,
     limit: usize,
+    latest: &HashMap<String, u64>,
     related_ids: &mut BTreeSet<String>,
     edges: &mut Vec<CodeGraphEdgeRecord>,
 ) -> Result<(), CodeIndexError> {
@@ -3225,6 +4076,16 @@ fn expand_symbol_edges(
                     })
                     .map_err(CodeIndexError::from_store)?;
                 for neighbor in neighbors {
+                    // Skip stale-generation neighbors (moved/superseded targets).
+                    let Some(neighbor_node) = store
+                        .get_node(&neighbor.node_id)
+                        .map_err(CodeIndexError::from_store)?
+                    else {
+                        continue;
+                    };
+                    if !node_is_current_generation(&neighbor_node, latest) {
+                        continue;
+                    }
                     if !seen_edges.insert(neighbor.edge_id.clone()) {
                         continue;
                     }
@@ -3232,7 +4093,7 @@ fn expand_symbol_edges(
                         .get_edge(&neighbor.edge_id)
                         .map_err(CodeIndexError::from_store)?
                     {
-                        if let Some(record) = graph_edge_record(store, &edge)? {
+                        if let Some(record) = graph_edge_record(store, &edge, latest)? {
                             edges.push(record);
                         }
                     }
@@ -3254,13 +4115,16 @@ fn expand_symbol_edges(
 fn enrich_symbol_graph(
     store: &RedCoreGraphStore,
     symbol: &mut CodeSymbolRecord,
+    latest: &HashMap<String, u64>,
 ) -> Result<(), CodeIndexError> {
-    symbol.callees = neighbor_symbol_names(store, &symbol.node_id, Direction::Out, CALLS_SYMBOL)?;
-    symbol.callers = neighbor_symbol_names(store, &symbol.node_id, Direction::In, CALLS_SYMBOL)?;
+    symbol.callees =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, CALLS_SYMBOL, latest)?;
+    symbol.callers =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::In, CALLS_SYMBOL, latest)?;
     symbol.dependencies =
-        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, DEPENDS_ON_SYMBOL)?;
+        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, DEPENDS_ON_SYMBOL, latest)?;
     symbol.dependents =
-        neighbor_symbol_names(store, &symbol.node_id, Direction::In, DEPENDS_ON_SYMBOL)?;
+        neighbor_symbol_names(store, &symbol.node_id, Direction::In, DEPENDS_ON_SYMBOL, latest)?;
     Ok(())
 }
 
@@ -3269,6 +4133,7 @@ fn neighbor_symbol_names(
     node_id: &str,
     direction: Direction,
     edge_type: &str,
+    latest: &HashMap<String, u64>,
 ) -> Result<Vec<String>, CodeIndexError> {
     let mut names = store
         .neighbors(NeighborQuery {
@@ -3280,6 +4145,7 @@ fn neighbor_symbol_names(
         .map_err(CodeIndexError::from_store)?
         .into_iter()
         .filter_map(|hit| store.get_node(&hit.node_id).ok().flatten())
+        .filter(|node| node_is_current_generation(node, latest))
         .filter_map(|node| property_string(&node.properties, "name"))
         .collect::<Vec<_>>();
     names.sort();
@@ -3290,6 +4156,7 @@ fn neighbor_symbol_names(
 fn graph_edge_record(
     store: &RedCoreGraphStore,
     edge: &EdgeRecord,
+    latest: &HashMap<String, u64>,
 ) -> Result<Option<CodeGraphEdgeRecord>, CodeIndexError> {
     let Some(from) = store
         .get_node(&edge.from_id)
@@ -3303,6 +4170,10 @@ fn graph_edge_record(
     else {
         return Ok(None);
     };
+    // Both endpoints must be current: a stale (moved) target retires the edge.
+    if !node_is_current_generation(&from, latest) || !node_is_current_generation(&to, latest) {
+        return Ok(None);
+    }
     Ok(Some(CodeGraphEdgeRecord {
         from_node_id: edge.from_id.clone(),
         to_node_id: edge.to_id.clone(),
@@ -3429,11 +4300,6 @@ fn body_between_lines(lines: &[&str], start_line: u64, end_line: u64) -> String 
     lines.get(start..end).unwrap_or(&[]).join("\n")
 }
 
-fn body_references_name(body: &str, name: &str) -> bool {
-    body.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '!')
-        .any(|token| token == name)
-}
-
 fn community_id(repo_id: &str, language: &str, kind: &str) -> String {
     format!(
         "code:community:{}",
@@ -3521,7 +4387,7 @@ fn code_index_options() -> RedCoreOptions {
     options
 }
 
-fn normalize_tenant(raw: &str) -> String {
+pub(crate) fn normalize_tenant(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         "theorem".to_string()
@@ -3641,6 +4507,57 @@ fn file_node_id(repo_id: &str, path: &str) -> String {
     )
 }
 
+/// D3: content-addressed id for a file's text side record. Keyed by tenant +
+/// content_hash (which already folds in repo_id and path), so an unchanged
+/// file shares one record across generations and a reindex never rewrites it.
+fn file_text_node_id(tenant_id: &str, content_hash: &str) -> String {
+    format!(
+        "code:filetext:{}",
+        stable_hash(json!({ "tenant_id": tenant_id, "content_hash": content_hash }))
+    )
+}
+
+/// Batch-read CodeFileText side records by content hash for one tenant. The
+/// incremental-reindex carried-text loader wraps this with the store handle
+/// (Arc for the runtime, &store for the in-store path), so prepare stays
+/// store-agnostic and the runtime takes the lock for exactly one batch read.
+pub(crate) fn load_file_texts(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+    content_hashes: &[String],
+) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(content_hashes.len());
+    for hash in content_hashes {
+        if let Ok(Some(node)) = store.get_node(&file_text_node_id(tenant_id, hash)) {
+            if let Some(text) = property_string(&node.properties, "text") {
+                out.insert(hash.clone(), text);
+            }
+        }
+    }
+    out
+}
+
+/// Read a file's text from its CodeFileText side record. Falls back to the
+/// legacy `text` property on the CodeFile node for generations ingested before
+/// the side record existed.
+fn file_text_for(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+    file_node: &NodeRecord,
+) -> Result<String, CodeIndexError> {
+    if let Some(content_hash) = property_string(&file_node.properties, "content_hash") {
+        if let Some(node) = store
+            .get_node(&file_text_node_id(tenant_id, &content_hash))
+            .map_err(CodeIndexError::from_store)?
+        {
+            if let Some(text) = property_string(&node.properties, "text") {
+                return Ok(text);
+            }
+        }
+    }
+    Ok(property_string(&file_node.properties, "text").unwrap_or_default())
+}
+
 fn symbol_node_id(repo_id: &str, path: &str, kind: &str, name: &str, line: u64) -> String {
     format!(
         "code:symbol:{}",
@@ -3699,6 +4616,29 @@ fn property_u64(properties: &Value, key: &str) -> Option<u64> {
             .as_u64()
             .or_else(|| value.as_i64().and_then(|v| v.try_into().ok()))
     })
+}
+
+fn property_bool(properties: &Value, key: &str) -> bool {
+    properties
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Read a JSON string array property back into a `BTreeSet<String>` (the shape
+/// `call_names` / `dependency_names` are persisted in).
+fn property_string_set(properties: &Value, key: &str) -> BTreeSet<String> {
+    properties
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_optional_json(raw: &str) -> Result<Value, CodeIndexError> {
@@ -4006,6 +4946,907 @@ mod tests {
         assert!(output["stage_timings"]["parse_ms"].is_u64());
         assert!(output["stage_timings"]["write_ms"].is_u64());
         assert!(output["stage_timings"]["total_ms"].is_u64());
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn reindex_unchanged_repo_carries_files_without_parsing() {
+        let (repo_dir, _store_dir) = write_fixture_repo();
+        let mut store = RedCoreGraphStore::memory();
+        let input = IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo_dir.display().to_string(),
+            repo_id: "repo:reindex-fixture".to_string(),
+            ..Default::default()
+        };
+        let ingest = ingest_codebase_in_store(&mut store, input.clone()).unwrap();
+        assert_eq!(ingest.files_parsed, 2);
+        assert_eq!(ingest.files_carried, 0);
+
+        let reindex = reindex_codebase_in_store(&mut store, input).unwrap();
+        assert_eq!(reindex.files_parsed, 0, "{:?}", reindex.to_json());
+        assert_eq!(reindex.files_carried, 2);
+        assert_eq!(reindex.files_indexed, 2);
+        assert!(reindex.generation > ingest.generation);
+        assert!(reindex.symbols_indexed >= ingest.symbols_indexed);
+
+        // Carried symbols are live at the NEW generation: search still hits.
+        let search = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "helper_len".to_string(),
+                repo_id: reindex.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(search.hits[0].name, "helper_len");
+
+        // Context still reads text through the content-addressed side record.
+        let context = code_context_in_store(
+            &mut store,
+            CodeContextInput {
+                tenant_id: "theorem".to_string(),
+                node_id: search.hits[0].node_id.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(context.context.contains("helper_len"));
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn reindex_after_single_file_edit_parses_exactly_one_file() {
+        let (repo_dir, _store_dir) = write_fixture_repo();
+        let mut store = RedCoreGraphStore::memory();
+        let input = IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo_dir.display().to_string(),
+            repo_id: "repo:edit-fixture".to_string(),
+            ..Default::default()
+        };
+        ingest_codebase_in_store(&mut store, input.clone()).unwrap();
+
+        // Edit ONE file: the python file now references the unchanged rust
+        // file's `search_code` symbol by name.
+        fs::write(
+            repo_dir.join("src/app.py"),
+            "class SearchAdapter:\n    pass\n\ndef code_helper():\n    return search_code\n",
+        )
+        .unwrap();
+
+        let reindex = reindex_codebase_in_store(&mut store, input).unwrap();
+        assert_eq!(reindex.files_parsed, 1, "{:?}", reindex.to_json());
+        assert_eq!(reindex.files_carried, 1);
+
+        // The fresh symbol links against a carried-forward target: the edge
+        // from the edited file resolves into the unchanged file's symbol.
+        let search = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "code_helper".to_string(),
+                repo_id: reindex.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(search.hits[0].name, "code_helper");
+        let explored = explore_code_in_store(
+            &mut store,
+            ExploreCodeInput {
+                tenant_id: "theorem".to_string(),
+                node_id: search.hits[0].node_id.clone(),
+                max_depth: 1,
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            explored.edges.iter().any(|edge| {
+                edge.edge_type == CALLS_SYMBOL
+                    && edge.from_name == "code_helper"
+                    && edge.to_name == "search_code"
+            }),
+            "cross-file edge into a carried symbol: {:?}",
+            explored
+                .edges
+                .iter()
+                .map(|edge| (&edge.from_name, &edge.to_name))
+                .collect::<Vec<_>>()
+        );
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    /// Collect every CALLS/DEPENDS edge currently visible for a repo as
+    /// (from_name, edge_type, to_name) at the latest generation, the same way
+    /// traversal sees them (stale-generation neighbors filtered out).
+    fn collect_visible_edges(
+        store: &RedCoreGraphStore,
+        repo_id: &str,
+    ) -> BTreeSet<(String, String, String)> {
+        let latest = latest_repo_generations(store).unwrap();
+        let symbols = store
+            .query_nodes(
+                NodeQuery::label(CODE_SYMBOL_LABEL)
+                    .with_property("repo_id", json!(repo_id))
+                    .with_limit(100_000),
+            )
+            .unwrap();
+        let mut edges = BTreeSet::new();
+        for node in symbols {
+            if !node_is_current_generation(&node, &latest) {
+                continue;
+            }
+            let Some(from_name) = property_string(&node.properties, "name") else {
+                continue;
+            };
+            for edge_type in [CALLS_SYMBOL, DEPENDS_ON_SYMBOL] {
+                let names =
+                    neighbor_symbol_names(store, &node.id, Direction::Out, edge_type, &latest)
+                        .unwrap();
+                for to_name in names {
+                    edges.insert((from_name.clone(), edge_type.to_string(), to_name));
+                }
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn reindex_edges_match_a_full_ingest_after_a_moved_target() {
+        // v1: caller.py calls helper; helper.py defines helper at line 1.
+        let repo_dir = unique_dir("moved-target-repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(
+            repo_dir.join("caller.py"),
+            "def caller():\n    return helper()\n",
+        )
+        .unwrap();
+        fs::write(repo_dir.join("helper.py"), "def helper():\n    return 1\n").unwrap();
+
+        let input = |repo: &PathBuf| IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            repo_id: "repo:moved".to_string(),
+            ..Default::default()
+        };
+
+        let mut incremental = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut incremental, input(&repo_dir)).unwrap();
+
+        // Edit ONLY helper.py: a leading comment shifts `helper` to line 2, so
+        // its node id changes. caller.py is unchanged (carried).
+        fs::write(
+            repo_dir.join("helper.py"),
+            "# shifted down\ndef helper():\n    return 1\n",
+        )
+        .unwrap();
+        let reindexed = reindex_codebase_in_store(&mut incremental, input(&repo_dir)).unwrap();
+        assert_eq!(reindexed.files_parsed, 1, "only helper.py re-extracted");
+        assert_eq!(reindexed.files_carried, 1, "caller.py carried");
+
+        // A full ingest of the SAME final tree into a clean store.
+        let mut full = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut full, input(&repo_dir)).unwrap();
+
+        // The carried caller's edge follows the moved target: caller -> helper
+        // is present and points at the new (line-2) symbol, and the visible
+        // edge set is identical to a full ingest (no stale caller->old_helper).
+        let incremental_edges = collect_visible_edges(&incremental, "repo:moved");
+        let full_edges = collect_visible_edges(&full, "repo:moved");
+        assert!(
+            incremental_edges.contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "helper".to_string()
+            )),
+            "carried caller links to the moved helper: {incremental_edges:?}"
+        );
+        assert_eq!(
+            incremental_edges, full_edges,
+            "incremental reindex edges == full ingest edges"
+        );
+
+        // Explore from caller shows exactly one helper neighbor (not a stale one).
+        let caller = search_code_in_store(
+            &mut incremental,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "caller".to_string(),
+                repo_id: "repo:moved".to_string(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let explored = explore_code_in_store(
+            &mut incremental,
+            ExploreCodeInput {
+                tenant_id: "theorem".to_string(),
+                node_id: caller.hits[0].node_id.clone(),
+                max_depth: 1,
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let helper_neighbors = explored
+            .related_symbols
+            .iter()
+            .filter(|symbol| symbol.name == "helper")
+            .count();
+        assert_eq!(helper_neighbors, 1, "no stale duplicate helper neighbor");
+        assert_eq!(explored.related_symbols[0].line, 2, "the line-2 helper");
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn reindex_links_carried_symbol_to_a_newly_defined_name() {
+        // v1: caller.py references `mystery`, which is defined nowhere yet, so
+        // no edge exists. This is the case that needs the carried body, not
+        // just persisted matched names.
+        let repo_dir = unique_dir("new-name-repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(
+            repo_dir.join("caller.py"),
+            "def caller():\n    return mystery()\n",
+        )
+        .unwrap();
+        let input = |repo: &PathBuf| IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            repo_id: "repo:newname".to_string(),
+            ..Default::default()
+        };
+        let mut store = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut store, input(&repo_dir)).unwrap();
+        assert!(
+            !collect_visible_edges(&store, "repo:newname").contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "mystery".to_string()
+            )),
+            "no edge before mystery is defined"
+        );
+
+        // v2: add mystery.py defining `mystery`. caller.py is unchanged (carried).
+        fs::write(repo_dir.join("mystery.py"), "def mystery():\n    return 7\n").unwrap();
+        let reindexed = reindex_codebase_in_store(&mut store, input(&repo_dir)).unwrap();
+        assert_eq!(reindexed.files_parsed, 1, "only mystery.py extracted");
+        assert_eq!(reindexed.files_carried, 1, "caller.py carried");
+
+        // The carried caller now links to the newly defined mystery, because
+        // its body was reconstructed from the D3 text side record and retokenized.
+        assert!(
+            collect_visible_edges(&store, "repo:newname").contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "mystery".to_string()
+            )),
+            "carried caller links to the newly defined mystery"
+        );
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn reindex_retires_removed_files_from_the_latest_generation() {
+        let (repo_dir, _store_dir) = write_fixture_repo();
+        let mut store = RedCoreGraphStore::memory();
+        let input = IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo_dir.display().to_string(),
+            repo_id: "repo:removal-fixture".to_string(),
+            ..Default::default()
+        };
+        ingest_codebase_in_store(&mut store, input.clone()).unwrap();
+        let before = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "SearchAdapter".to_string(),
+                repo_id: input.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(before.total_returned > 0);
+
+        fs::remove_file(repo_dir.join("src/app.py")).unwrap();
+        let reindex = reindex_codebase_in_store(&mut store, input.clone()).unwrap();
+        assert_eq!(reindex.files_parsed, 0);
+        assert_eq!(reindex.files_carried, 1);
+
+        // The removed file's symbols stay at the old generation, which the
+        // latest-generation filter retires from search.
+        let after = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "SearchAdapter".to_string(),
+                repo_id: input.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(after.total_returned, 0, "{:?}", after.to_json());
+        let survivor = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "helper_len".to_string(),
+                repo_id: input.repo_id,
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(survivor.hits[0].name, "helper_len");
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn walk_respects_gitignore_without_a_git_checkout() {
+        let repo_dir = unique_dir("gitignore-repo");
+        fs::create_dir_all(repo_dir.join("src")).unwrap();
+        fs::create_dir_all(repo_dir.join("generated")).unwrap();
+        fs::write(repo_dir.join(".gitignore"), "generated/\nsecret.py\n").unwrap();
+        fs::write(repo_dir.join("src/lib.rs"), "pub fn keep_me() {}\n").unwrap();
+        fs::write(repo_dir.join("generated/output.py"), "def drop_me():\n    pass\n").unwrap();
+        fs::write(repo_dir.join("secret.py"), "def also_dropped():\n    pass\n").unwrap();
+
+        let mut store = RedCoreGraphStore::memory();
+        let ingest = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:gitignore-fixture".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ingest.files_indexed, 1, "{:?}", ingest.to_json());
+
+        let files = store
+            .query_nodes(NodeQuery::label(CODE_FILE_LABEL).with_limit(100))
+            .unwrap();
+        assert!(files.iter().all(|node| {
+            let path = node.properties["path"].as_str().unwrap_or_default();
+            !path.starts_with("generated/") && path != "secret.py"
+        }));
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn edge_inference_caps_name_fanout() {
+        let repo_dir = unique_dir("fanout-repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        // 26 definitions of one name: beyond EDGE_NAME_BUCKET_CAP, the name is
+        // skipped outright. 10 definitions of another: admitted, but capped at
+        // EDGE_TARGETS_PER_NAME_CAP targets.
+        for index in 0..26 {
+            fs::write(
+                repo_dir.join(format!("shared_{index:02}.py")),
+                "def shared_helper():\n    pass\n",
+            )
+            .unwrap();
+        }
+        for index in 0..10 {
+            fs::write(
+                repo_dir.join(format!("ten_{index:02}.py")),
+                "def ten_helper():\n    pass\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            repo_dir.join("caller.py"),
+            "def caller():\n    shared_helper()\n    ten_helper()\n",
+        )
+        .unwrap();
+
+        let mut store = RedCoreGraphStore::memory();
+        let ingest = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:fanout-fixture".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ingest.files_indexed, 37);
+
+        let caller = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "caller".to_string(),
+                repo_id: ingest.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let caller_id = caller.hits[0].node_id.clone();
+        let callees = store
+            .neighbors(NeighborQuery {
+                node_id: caller_id,
+                direction: Direction::Out,
+                edge_type: Some(CALLS_SYMBOL.to_string()),
+                include_expired: false,
+            })
+            .unwrap();
+        let callee_names: Vec<String> = callees
+            .iter()
+            .filter_map(|hit| store.get_node(&hit.node_id).ok().flatten())
+            .filter_map(|node| node.properties["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            callees.len(),
+            EDGE_TARGETS_PER_NAME_CAP,
+            "ten_helper capped at {EDGE_TARGETS_PER_NAME_CAP}: {callee_names:?}"
+        );
+        assert!(callee_names.iter().all(|name| name == "ten_helper"));
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn file_text_lives_in_side_records_not_on_file_nodes() {
+        let (repo_dir, _store_dir) = write_fixture_repo();
+        let mut store = RedCoreGraphStore::memory();
+        let ingest = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:text-fixture".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let files = store
+            .query_nodes(NodeQuery::label(CODE_FILE_LABEL).with_limit(100))
+            .unwrap();
+        assert_eq!(files.len() as u64, ingest.files_indexed);
+        assert!(
+            files.iter().all(|node| node.properties.get("text").is_none()),
+            "CodeFile nodes carry no inline text"
+        );
+        let texts = store
+            .query_nodes(NodeQuery::label(CODE_FILE_TEXT_LABEL).with_limit(100))
+            .unwrap();
+        assert_eq!(texts.len() as u64, ingest.files_indexed);
+        assert!(texts
+            .iter()
+            .all(|node| node.properties["text"].as_str().is_some()));
+
+        // Context reads the side record and returns the correct window.
+        let context = code_context_in_store(
+            &mut store,
+            CodeContextInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: ingest.repo_id.clone(),
+                file_path: "src/lib.rs".to_string(),
+                after_lines: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(context.context.contains("helper_len(query)"));
+
+        // Legacy fallback: a pre-side-record CodeFile node with inline text
+        // (and no CodeFileText record) still serves context.
+        let legacy_repo = "repo:legacy-text";
+        store
+            .commit_batch(GraphMutationBatch::new([
+                GraphMutation::NodeUpsert(NodeRecord::new(
+                    legacy_repo,
+                    [CODE_REPO_LABEL],
+                    json!({
+                        "tenant_id": "theorem",
+                        "repo_id": legacy_repo,
+                        "latest_generation": 7,
+                        "source": SOURCE,
+                    }),
+                )),
+                GraphMutation::NodeUpsert(NodeRecord::new(
+                    "code:file:legacy-1",
+                    [CODE_FILE_LABEL],
+                    json!({
+                        "tenant_id": "theorem",
+                        "repo_id": legacy_repo,
+                        "file_id": "code:file:legacy-1",
+                        "path": "legacy.py",
+                        "content_hash": "legacy-hash-without-side-record",
+                        "text": "def legacy_symbol():\n    return 1\n",
+                        "generation": 7,
+                        "source": SOURCE,
+                    }),
+                )),
+            ]))
+            .unwrap();
+        let legacy = code_context_in_store(
+            &mut store,
+            CodeContextInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: legacy_repo.to_string(),
+                file_path: "legacy.py".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(legacy.context.contains("legacy_symbol"));
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn submitted_ingest_job_streams_events_and_search_runs_during_parse() {
+        use crate::ingest_jobs::TestIngestPause;
+
+        let (repo_dir, store_dir) = write_fixture_repo();
+        let runtime = CodeIndexRuntime::try_new_at(&store_dir, test_options()).unwrap();
+        let pause = std::sync::Arc::new(TestIngestPause::default());
+        let submitted = runtime.submit_ingest_job(IngestJobRequest {
+            input: IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:job-fixture".to_string(),
+                ..Default::default()
+            },
+            operation: "ingest".to_string(),
+            test_pause: Some(std::sync::Arc::clone(&pause)),
+            ..Default::default()
+        });
+        assert_eq!(submitted.state, IngestJobState::Queued);
+        assert!(!submitted.job_id.is_empty());
+
+        // The worker is paused AFTER walk/parse and BEFORE commit: the store
+        // lock is free, so a concurrent search returns instead of blocking.
+        pause.wait_until_arrived();
+        let concurrent = runtime
+            .search_code(SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "helper_len".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(concurrent.total_returned, 0, "nothing committed yet");
+        let mid = runtime.ingest_job_status(&submitted.job_id).unwrap();
+        assert!(!mid.state.is_terminal());
+        pause.release();
+
+        // Drain the stream: events arrive in order and end with `finished`.
+        let mut labels = Vec::new();
+        let mut after = 0u64;
+        loop {
+            let (events, terminal) = runtime
+                .wait_ingest_job_events(
+                    &submitted.job_id,
+                    after,
+                    std::time::Duration::from_secs(10),
+                )
+                .expect("job is known");
+            for event in events {
+                after = event.sequence;
+                labels.push(event.kind.label());
+            }
+            if terminal {
+                break;
+            }
+        }
+        let position = |label: &str| labels.iter().position(|item| *item == label);
+        assert!(position("walk_done") < position("parse_progress"), "{labels:?}");
+        assert!(position("parse_progress") < position("commit_done"), "{labels:?}");
+        assert_eq!(labels.last(), Some(&"finished"), "{labels:?}");
+
+        let done = runtime.ingest_job_status(&submitted.job_id).unwrap();
+        assert_eq!(done.state, IngestJobState::Finished);
+        let output = done.output.expect("finished output");
+        assert_eq!(output.files_indexed, 2);
+
+        let search = runtime
+            .search_code(SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "helper_len".to_string(),
+                repo_id: output.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(search.hits[0].name, "helper_len");
+
+        drop(runtime);
+        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(store_dir).ok();
+    }
+
+    /// Open a runtime over `store_dir`, retrying the in-process RedCore
+    /// directory lock briefly. A real restart is a fresh process so the lock
+    /// never conflicts; simulating restart in one process can momentarily race
+    /// the prior runtime's worker releasing its transient store handle.
+    fn open_runtime_with_retry(store_dir: &Path) -> CodeIndexRuntime {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match CodeIndexRuntime::try_new_at(store_dir, test_options()) {
+                Ok(runtime) => return runtime,
+                Err(error) if error.code == "redcore_lock_unavailable" => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "store dir never released: {error}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => panic!("unexpected open error: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn finished_job_survives_a_runtime_restart() {
+        let (repo_dir, store_dir) = write_fixture_repo();
+        // First runtime: submit a job and let it finish.
+        let first = CodeIndexRuntime::try_new_at(&store_dir, test_options()).unwrap();
+        let submitted = first.submit_ingest_job(IngestJobRequest {
+            input: IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:durable-finished".to_string(),
+                ..Default::default()
+            },
+            operation: "ingest".to_string(),
+            ..Default::default()
+        });
+        let job_id = submitted.job_id.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = first.ingest_job_status(&job_id).unwrap();
+            if status.state.is_terminal() {
+                assert_eq!(status.state, IngestJobState::Finished);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "job did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(first);
+
+        // Second runtime over the SAME store dir: the finished job is recovered,
+        // queryable, and its event log replays through the terminal event.
+        let second = open_runtime_with_retry(&store_dir);
+        let recovered = second
+            .ingest_job_status(&job_id)
+            .expect("finished job recovered after restart");
+        assert_eq!(recovered.state, IngestJobState::Finished);
+        let output = recovered.output.expect("recovered finished output");
+        assert_eq!(output.files_indexed, 2);
+        assert_eq!(output.repo_id, "repo:durable-finished");
+        let (events, terminal) = second.ingest_jobs().events_after(&job_id, 0).unwrap();
+        assert!(terminal);
+        assert_eq!(events.last().map(|event| event.kind.label()), Some("finished"));
+
+        drop(second);
+        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(store_dir).ok();
+    }
+
+    #[test]
+    fn interrupted_job_reruns_after_a_restart() {
+        use crate::ingest_jobs::CODE_INGEST_JOB_LABEL;
+
+        let (repo_dir, store_dir) = write_fixture_repo();
+
+        // Simulate a crash mid-flight: write a durable CodeIngestJob node in the
+        // `running` state directly (the request persisted, no terminal event),
+        // exactly the shape a process that died during parse leaves behind.
+        {
+            let mut store = RedCoreGraphStore::open(&store_dir, test_options()).unwrap();
+            let request = json!({
+                "input": {
+                    "tenant_id": "theorem",
+                    "repo_path": repo_dir.display().to_string(),
+                    "repo_id": "repo:durable-interrupted",
+                    "include_extensions": [],
+                    "exclude_dirs": [],
+                    "max_files": 0,
+                    "max_file_bytes": 0,
+                    "max_total_bytes": 0,
+                    "actor": "",
+                },
+                "operation": "ingest",
+                "repo_url": "",
+                "caps": { "max_total_bytes": 0, "clone_timeout_ms": 20000 },
+                "parse_budget_ms": null,
+            });
+            let node = NodeRecord::new(
+                "code:ingest-job:interrupted-fixture",
+                [CODE_INGEST_JOB_LABEL],
+                json!({
+                    "tenant_id": "theorem",
+                    "repo_id": "repo:durable-interrupted",
+                    "operation": "ingest",
+                    "state": "running",
+                    "stage": "parse",
+                    "files_total": 2,
+                    "files_done": 0,
+                    "submitted_at_ms": 1,
+                    "updated_at_ms": 1,
+                    "error_code": "",
+                    "error_message": "",
+                    "request": request,
+                    "output": Value::Null,
+                    "milestone_events": [],
+                    "source": SOURCE,
+                }),
+            );
+            store
+                .commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(node)]))
+                .unwrap();
+        }
+
+        // Restart: recovery re-enqueues the interrupted job and runs it to
+        // completion against the real repo.
+        let runtime = open_runtime_with_retry(&store_dir);
+        let job_id = "code:ingest-job:interrupted-fixture";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = runtime
+                .ingest_job_status(job_id)
+                .expect("interrupted job recovered");
+            if status.state.is_terminal() {
+                assert_eq!(status.state, IngestJobState::Finished, "{:?}", status.stage);
+                let output = status.output.expect("re-run produced output");
+                assert_eq!(output.files_indexed, 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recovered job did not re-run: stage {}",
+                status.stage
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // The re-run actually wrote the code graph: search finds a symbol.
+        let search = runtime
+            .search_code(SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "helper_len".to_string(),
+                repo_id: "repo:durable-interrupted".to_string(),
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(search.hits[0].name, "helper_len");
+
+        drop(runtime);
+        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(store_dir).ok();
+    }
+
+    #[test]
+    fn ingest_commits_partial_progress_when_parse_budget_exceeded() {
+        let repo_dir = unique_dir("budget-repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        // One big file that sorts FIRST guarantees chunk 0 takes measurable
+        // time, so the 1ms budget trips deterministically before chunk 1.
+        let mut big = String::new();
+        for index in 0..5_000 {
+            big.push_str(&format!("def big_symbol_{index}():\n    pass\n"));
+        }
+        fs::write(repo_dir.join("a_big.py"), big).unwrap();
+        for index in 0..220 {
+            fs::write(
+                repo_dir.join(format!("tiny_{index:03}.py")),
+                format!("def tiny_{index:03}():\n    pass\n"),
+            )
+            .unwrap();
+        }
+
+        let started = Instant::now();
+        let config = resolve_ingest_config(IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo_dir.display().to_string(),
+            repo_id: "repo:budget-fixture".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let prepared = prepare_codebase_ingest_resolved(
+            config,
+            0,
+            0,
+            started,
+            IngestPipelineOptions {
+                prior: None,
+                sink: None,
+                carried_text_loader: None,
+                parse_budget_ms: 1,
+            },
+        )
+        .unwrap();
+        let mut store = RedCoreGraphStore::memory();
+        let output = commit_prepared_ingest(&mut store, prepared, "ingest").unwrap();
+
+        assert_eq!(output.status, "budget_exceeded", "{:?}", output.to_json());
+        assert_eq!(output.files_parsed, PARSE_CHUNK_FILES as u64);
+        assert!(output.message.contains("221"), "{}", output.message);
+
+        // Partial progress is COMMITTED: a chunk-0 symbol is searchable.
+        let search = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "big_symbol_0".to_string(),
+                repo_id: output.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(search.total_returned > 0);
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn inverted_index_edge_inference_handles_20k_symbols() {
+        let repo_dir = unique_dir("scale-repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        // 200 files x 100 symbols = 20k symbols. Each symbol references one
+        // cross-file name (bucket size 1, inside every cap), so edges are
+        // emitted at scale through the inverted index.
+        for file_index in 0..200 {
+            let mut body = String::new();
+            let next_file = (file_index + 1) % 200;
+            for symbol_index in 0..100 {
+                body.push_str(&format!(
+                    "def fn_{file_index}_{symbol_index}():\n    return fn_{next_file}_{symbol_index}\n"
+                ));
+            }
+            fs::write(repo_dir.join(format!("module_{file_index:03}.py")), body).unwrap();
+        }
+
+        let mut store = RedCoreGraphStore::memory();
+        let output = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:scale-fixture".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(output.symbols_indexed, 20_000);
+        println!(
+            "20k-symbol fixture stage timings: {}",
+            output.stage_timings.to_json()
+        );
+        // The old quadratic branch was symbols x distinct_names x body scans
+        // (minutes at this size). The inverted index keeps mutation build in
+        // interactive range even in debug builds.
+        assert!(
+            output.stage_timings.mutation_ms < 30_000,
+            "mutation_ms regression: {}",
+            output.stage_timings.mutation_ms
+        );
 
         fs::remove_dir_all(repo_dir).ok();
     }
