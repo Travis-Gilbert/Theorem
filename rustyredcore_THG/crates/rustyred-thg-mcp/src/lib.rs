@@ -3633,6 +3633,12 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
         // read-only operation polls a submitted job's status and event log.
         "ingest_status" | "status" | "job_status" => Ok("ingest_status".to_string()),
         "record_use" | "use_receipt" | "record_use_receipt" => Ok("record_use_receipt".to_string()),
+        "list_repos" | "listrepos" | "repos" => Ok("list_repos".to_string()),
+        "kg_status" | "kgstatus" | "instant_kg_status" | "status" => Ok("kg_status".to_string()),
+        "session_reingest" | "sessionreingest" | "reingest_session" => {
+            Ok("session_reingest".to_string())
+        }
+        "context_pack" | "contextpack" | "pack" => Ok("context_pack".to_string()),
         _ => Err(McpError::invalid_params(format!(
             "unsupported code_search operation `{raw}`"
         ))),
@@ -8121,6 +8127,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
                     "target_head": { "type": "string", "enum": ["claude", "codex", "either"] },
                     "not_before": { "type": "string", "description": "optional timestamp hint; receivers skip future jobs" },
+                    "source_task_id": { "type": "string", "description": "TickTick task id this job was captured from (Agent Queue path); lets the loop relay milestones back to the task" },
+                    "source_project_id": { "type": "string", "description": "TickTick project (list) id the source task lived in" },
                     "idempotency_key": { "type": "string", "description": "defaults to hash(spec_ref + title)" },
                     "submitted_by": { "type": "string" }
                 },
@@ -10183,6 +10191,8 @@ mod tests {
             priority: Some(theorem_harness_core::Priority::P0),
             target_head: None,
             not_before: None,
+            source_task_id: None,
+            source_project_id: None,
             idempotency_key: None,
         }
     }

@@ -40,8 +40,9 @@ pub use work_graph_store::{
 
 pub use compound_engineering::{
     apply_run_close_hook, compound_config_hash, compound_config_node_id, compound_state_node_id,
-    load_compound_config, persist_compound_config, CompoundConfig, CompoundHookReceipt,
-    COMPOUND_CONFIG_NODE_LABEL, COMPOUND_ROOM_ID, COMPOUND_STATE_NODE_LABEL,
+    list_compound_captures, load_compound_config, persist_compound_config, CompoundConfig,
+    CompoundHookReceipt, COMPOUND_CAPTURE_TAG, COMPOUND_CONFIG_NODE_LABEL, COMPOUND_ROOM_ID,
+    COMPOUND_STATE_NODE_LABEL,
 };
 pub use coordination::{
     coordination_binding_id, coordination_intent_edge_id, coordination_intent_node_id,

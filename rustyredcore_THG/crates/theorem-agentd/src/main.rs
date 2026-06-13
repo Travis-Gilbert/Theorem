@@ -6,7 +6,7 @@ use theorem_agentd::mcp::McpRouter;
 use theorem_agentd::model::ModelClient;
 use theorem_agentd::receiver_sidecar::spawn_receiver_sidecar;
 use theorem_agentd::tools::ToolCatalog;
-use theorem_agentd::turn_loop::run_once;
+use theorem_agentd::turn_loop::{run_once, run_tick};
 use theorem_agentd::{AgentdError, AgentdResult};
 
 fn main() {
@@ -24,12 +24,24 @@ fn run() -> AgentdResult<()> {
         println!("{}", catalog.gbnf_grammar());
         return Ok(());
     }
-    let _receiver = if config.receiver.enabled && !args.no_receiver && args.once.is_none() {
+    let _receiver = if config.receiver.enabled
+        && !args.no_receiver
+        && args.once.is_none()
+        && !args.capture_once
+    {
         Some(spawn_receiver_sidecar(&config.receiver.config_path)?)
     } else {
         None
     };
     let router = McpRouter::from_configs(config.all_mcp_servers())?;
+
+    // One mechanical Agent Queue capture sweep, then exit. No model required.
+    if args.capture_once {
+        let report = theorem_agentd::capture::run_capture(&router, &config.capture, &config.actor)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
     let model = ModelClient::from_config(
         config.model.clone(),
         config.default_room_id.clone(),
@@ -43,10 +55,12 @@ fn run() -> AgentdResult<()> {
     }
 
     loop {
+        // Each tick: capture Agent Queue tasks into jobs, relay run milestones
+        // back to TickTick, then take a proactive coordination turn.
         let prompt = "timer tick: poll coordination room and inbox for proactive work";
-        match run_once(&config, &model, &router, &catalog, prompt) {
-            Ok(transcript) => println!("{}", serde_json::to_string(&transcript)?),
-            Err(error) => eprintln!("[theorem-agentd] tick error: {error}"),
+        let report = run_tick(&config, &model, &router, &catalog, prompt);
+        if let Some(transcript) = &report.transcript {
+            println!("{}", serde_json::to_string(transcript)?);
         }
         std::thread::sleep(Duration::from_secs(config.loop_config.tick_interval_secs));
     }
@@ -57,6 +71,7 @@ struct Args {
     once: Option<String>,
     no_receiver: bool,
     print_tool_grammar: bool,
+    capture_once: bool,
 }
 
 impl Args {
@@ -65,6 +80,7 @@ impl Args {
         let mut once = None;
         let mut no_receiver = false;
         let mut print_tool_grammar = false;
+        let mut capture_once = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -77,6 +93,9 @@ impl Args {
                 }
                 "--no-receiver" => {
                     no_receiver = true;
+                }
+                "--capture-once" => {
+                    capture_once = true;
                 }
                 "--print-tool-grammar" => {
                     print_tool_grammar = true;
@@ -99,13 +118,14 @@ impl Args {
             once,
             no_receiver,
             print_tool_grammar,
+            capture_once,
         })
     }
 }
 
 fn print_help() {
     println!(
-        "usage: theorem-agentd [--once <prompt>] [--no-receiver] [--print-tool-grammar] [config.toml]"
+        "usage: theorem-agentd [--once <prompt>] [--capture-once] [--no-receiver] [--print-tool-grammar] [config.toml]"
     );
 }
 

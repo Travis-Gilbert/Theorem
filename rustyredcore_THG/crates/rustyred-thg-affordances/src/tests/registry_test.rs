@@ -147,6 +147,7 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
     let code_explore_id = affordance_node_id("theorem", "theorem_grpc.code_search.explore");
     let code_explain_id = affordance_node_id("theorem", "theorem_grpc.code_search.explain");
     let code_use_id = affordance_node_id("theorem", "theorem_grpc.code_search.record_use_receipt");
+    let code_list_id = affordance_node_id("theorem", "theorem_grpc.code_search.list_repos");
     assert!(result.affordance_node_ids.contains(&publisher_id));
     assert!(result.affordance_node_ids.contains(&code_ingest_id));
     assert!(result.affordance_node_ids.contains(&code_ingest_status_id));
@@ -154,6 +155,7 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
     assert!(result.affordance_node_ids.contains(&code_explore_id));
     assert!(result.affordance_node_ids.contains(&code_explain_id));
     assert!(result.affordance_node_ids.contains(&code_use_id));
+    assert!(result.affordance_node_ids.contains(&code_list_id));
     let publisher = Affordance::from_node_record(store.get_node(&publisher_id).unwrap()).unwrap();
     let code_ingest =
         Affordance::from_node_record(store.get_node(&code_ingest_id).unwrap()).unwrap();

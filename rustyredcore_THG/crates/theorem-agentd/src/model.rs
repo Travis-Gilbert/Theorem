@@ -104,6 +104,35 @@ impl ModelClient {
             Self::Rule(client) => client.decide(messages),
         }
     }
+
+    /// Compose one terse status line for a milestone relay. The prose is the
+    /// model's (the loop keeps milestone summaries model-written); `fallback` is
+    /// returned verbatim for the rule provider and whenever the model errors, so
+    /// a relay always has a line. The caller still guarantees load-bearing facts
+    /// (e.g. that a PR-opened line contains the PR URL).
+    pub fn compose_line(&self, instruction: &str, fallback: &str) -> String {
+        match self {
+            Self::OpenAi(client) => client
+                .compose_line(instruction)
+                .ok()
+                .map(|line| sanitize_line(&line))
+                .filter(|line| !line.is_empty())
+                .unwrap_or_else(|| fallback.to_string()),
+            Self::Rule(_) => fallback.to_string(),
+        }
+    }
+}
+
+/// First non-empty line of a model reply, trimmed and length-capped, so a chatty
+/// completion cannot overflow a task tracker field.
+pub fn sanitize_line(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(280)
+        .collect()
 }
 
 pub struct OpenAiModelClient {
@@ -166,6 +195,42 @@ impl OpenAiModelClient {
         let response = request.send()?.error_for_status()?;
         let value: Value = response.json()?;
         parse_chat_completion(&value)
+    }
+
+    /// A no-tools completion that returns the model's text for a milestone line.
+    fn compose_line(&self, instruction: &str) -> AgentdResult<String> {
+        let url = chat_completions_url(&self.config.base_url);
+        let body = json!({
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You write one terse status line for a task tracker. Reply with a single line, no preamble, under 140 characters."
+                },
+                { "role": "user", "content": instruction }
+            ],
+            "temperature": self.config.temperature,
+            "max_tokens": 120
+        });
+        let mut request = self.http.post(url).json(&body);
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send()?.error_for_status()?;
+        let value: Value = response.json()?;
+        if let Some(error) = value.get("error") {
+            return Err(AgentdError::Model(format!("model error: {error}")));
+        }
+        let content = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok(content)
     }
 }
 
@@ -247,7 +312,9 @@ pub fn parse_chat_completion(value: &Value) -> AgentdResult<ModelOutput> {
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .ok_or_else(|| AgentdError::Model("chat completion missing choices[0].message".to_string()))?;
+        .ok_or_else(|| {
+            AgentdError::Model("chat completion missing choices[0].message".to_string())
+        })?;
 
     // Prefer structured tool calls: llama-server parses Gemma's native tool-call
     // tokens into this shape. `arguments` is a JSON string.

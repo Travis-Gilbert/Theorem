@@ -1,8 +1,8 @@
 use crate::coordination::{write_record, WriteRecordInput};
 use crate::event_log::{append_transition_from_store, load_events};
 use crate::memory::{
-    encode_memory, load_memory_document, memory_document_node_id, MemoryDocumentState,
-    MemoryWriteInput,
+    encode_memory, list_memory_documents_since, load_memory_document, memory_document_node_id,
+    MemoryDocumentState, MemoryWriteInput,
 };
 use crate::skill_pack::{get_skill_pack, skill_pack_node_id, SkillPackGetInput, SkillPackState};
 use crate::writing_style::{summarize_style_receipts_for_fitness, STYLE_RECEIPTS_FIELD};
@@ -16,6 +16,14 @@ use theorem_harness_core::{stable_value_hash, EventState, RunState, TransitionIn
 pub const COMPOUND_CONFIG_NODE_LABEL: &str = "CompoundEngineeringConfig";
 pub const COMPOUND_STATE_NODE_LABEL: &str = "CompoundEngineeringState";
 pub const COMPOUND_ROOM_ID: &str = "compound-engineering";
+/// Tag stamped on every compound-engineering capture (alongside `cluster:<key>`).
+/// The read-only `list_compound_captures` reader keys on this to separate compound
+/// captures from other `MemoryDocument` rows in the same tenant.
+pub const COMPOUND_CAPTURE_TAG: &str = "compound-engineering";
+const COMPOUND_CLUSTER_TAG_PREFIX: &str = "cluster:";
+/// Outcome `kind` values produced by `OutcomeClass::encode_kind`, the only kinds a
+/// compound capture can carry. Used to validate the `outcome` filter.
+const COMPOUND_OUTCOME_KINDS: &[&str] = &["solution", "postmortem", "feedback"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompoundConfig {
@@ -157,6 +165,82 @@ pub fn load_compound_config<S: GraphStore>(
 pub fn compound_config_hash(config: &CompoundConfig) -> String {
     let payload = serde_json::to_value(config).expect("compound config serializes");
     format!("sha256:{}", stable_value_hash(&payload))
+}
+
+/// Read-only consumer of the compound-engineering capture write-path (S4-TRACE-READER).
+///
+/// Returns the `MemoryDocument` captures `apply_run_close_hook` writes via
+/// `encode_memory` (doc_id `compound:capture:<run_id>`), newest first, filtered to
+/// the compound corpus by the [`COMPOUND_CAPTURE_TAG`] tag. Optional narrowing:
+///
+/// - `cluster_key`: keep captures whose `cluster:<key>` tag or `metadata["cluster_key"]`
+///   matches exactly.
+/// - `outcome`: keep captures whose `kind` equals one of `solution` / `postmortem` /
+///   `feedback` (the values [`OutcomeClass::encode_kind`] emits). An `outcome` outside
+///   that set matches nothing.
+/// - `since`: keep captures whose `updated_at` is at or after the watermark (lexical
+///   compare, matching the recall path), threaded through
+///   [`list_memory_documents_since`].
+///
+/// This reader never mutates: it does not touch fitness and does not route through the
+/// recall path (which calls `bump_recalled_compound_fitness`). It composes over
+/// `list_memory_documents_since` with `include_inactive = true` so the full capture
+/// history is visible (superseded/archived captures included; deleted always dropped).
+pub fn list_compound_captures<S: GraphStore>(
+    store: &S,
+    tenant: &str,
+    cluster_key: Option<&str>,
+    outcome: Option<&str>,
+    since: Option<&str>,
+) -> RuntimeResult<Vec<MemoryDocumentState>> {
+    let tenant = normalize_tenant(tenant);
+    let since = since.unwrap_or("");
+    let cluster_filter = cluster_key.map(str::trim).filter(|value| !value.is_empty());
+    let outcome_filter = outcome
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let documents = list_memory_documents_since(store, &tenant, since, true)
+        .map_err(|error| HarnessRuntimeError::Deserialization(error.to_string()))?;
+
+    Ok(documents
+        .into_iter()
+        .filter(|document| document_is_compound_capture(document))
+        .filter(|document| match cluster_filter {
+            Some(cluster) => document_matches_cluster(document, cluster),
+            None => true,
+        })
+        .filter(|document| match outcome_filter.as_deref() {
+            Some(kind) => {
+                COMPOUND_OUTCOME_KINDS.contains(&kind)
+                    && document.kind.eq_ignore_ascii_case(kind)
+            }
+            None => true,
+        })
+        .collect())
+}
+
+fn document_is_compound_capture(document: &MemoryDocumentState) -> bool {
+    document
+        .tags
+        .iter()
+        .any(|tag| tag.trim() == COMPOUND_CAPTURE_TAG)
+}
+
+fn document_matches_cluster(document: &MemoryDocumentState, cluster: &str) -> bool {
+    let tag_match = document.tags.iter().any(|tag| {
+        tag.trim()
+            .strip_prefix(COMPOUND_CLUSTER_TAG_PREFIX)
+            .map(|value| value == cluster)
+            .unwrap_or(false)
+    });
+    let metadata_match = document
+        .metadata
+        .get("cluster_key")
+        .and_then(Value::as_str)
+        .map(|value| value == cluster)
+        .unwrap_or(false);
+    tag_match || metadata_match
 }
 
 pub fn apply_run_close_hook<S: GraphStore>(
@@ -371,8 +455,8 @@ fn capture_run_if_qualifies<S: GraphStore>(
             content,
             summary,
             tags: vec![
-                "compound-engineering".to_string(),
-                format!("cluster:{cluster_key}"),
+                COMPOUND_CAPTURE_TAG.to_string(),
+                format!("{COMPOUND_CLUSTER_TAG_PREFIX}{cluster_key}"),
             ],
             links: vec![run.run_id.clone()],
             metadata: Map::from_iter([
@@ -1760,6 +1844,187 @@ mod tests {
     }
 
     #[test]
+    fn list_compound_captures_filters_by_compound_tag_cluster_outcome_and_since() {
+        let mut store = InMemoryGraphStore::new();
+        publish_writing_pack(&mut store, "shadow", true);
+
+        // Two positive (solution) captures in cluster A (same task signature ->
+        // same cluster_key), one positive in cluster B, and one failed run that
+        // qualifies for capture as a postmortem.
+        close_successful_run_at(
+            &mut store,
+            "run-alpha-1",
+            "Encode Django plugin pack",
+            "Patch done. Tests pass.",
+            "2026-06-08T00:00:00Z",
+        );
+        close_successful_run_at(
+            &mut store,
+            "run-alpha-2",
+            "Encode Django plugin pack",
+            "Patch done. Tests pass.",
+            "2026-06-08T01:00:00Z",
+        );
+        close_successful_run_at(
+            &mut store,
+            "run-bravo-1",
+            "Fix unrelated browser job",
+            "Patch done. Tests pass.",
+            "2026-06-08T02:00:00Z",
+        );
+        close_failed_qualifying_run_at(
+            &mut store,
+            "run-charlie-fail",
+            "Encode Django plugin pack",
+            "Tests failed hard.",
+            "2026-06-08T03:00:00Z",
+        );
+
+        // A non-compound MemoryDocument in the same tenant: must never appear.
+        create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: "default".to_string(),
+                doc_id: "doc-plain".to_string(),
+                kind: "solution".to_string(),
+                title: "Plain memory".to_string(),
+                content: "Not a compound capture.".to_string(),
+                tags: vec!["unrelated".to_string()],
+                created_at: "2026-06-08T04:00:00Z".to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        // (a) all compound captures: the four hook-written docs, newest first, and
+        // not the plain doc.
+        let all = list_compound_captures(&store, "default", None, None, None).unwrap();
+        let all_ids = all
+            .iter()
+            .map(|document| document.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_ids,
+            vec![
+                "compound:capture:run-charlie-fail",
+                "compound:capture:run-bravo-1",
+                "compound:capture:run-alpha-2",
+                "compound:capture:run-alpha-1",
+            ]
+        );
+        assert!(all
+            .iter()
+            .all(|document| document.tags.iter().any(|tag| tag == COMPOUND_CAPTURE_TAG)));
+        assert!(!all_ids.contains(&"doc-plain"));
+
+        // (b) a specific cluster_key: the two alpha runs plus the failed charlie run
+        // share the Django cluster; the browser run does not.
+        let cluster_key = all
+            .iter()
+            .find(|document| document.doc_id == "compound:capture:run-alpha-1")
+            .and_then(|document| document.metadata.get("cluster_key"))
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let by_cluster =
+            list_compound_captures(&store, "default", Some(&cluster_key), None, None).unwrap();
+        let mut by_cluster_ids = by_cluster
+            .iter()
+            .map(|document| document.doc_id.clone())
+            .collect::<Vec<_>>();
+        by_cluster_ids.sort();
+        assert_eq!(
+            by_cluster_ids,
+            vec![
+                "compound:capture:run-alpha-1".to_string(),
+                "compound:capture:run-alpha-2".to_string(),
+                "compound:capture:run-charlie-fail".to_string(),
+            ]
+        );
+        // Cluster filter also matches the `cluster:<key>` tag, independent of metadata.
+        assert!(by_cluster
+            .iter()
+            .all(|document| document.tags.contains(&format!("cluster:{cluster_key}"))));
+
+        // (c) a specific outcome kind: only the failed run is a postmortem; the
+        // positive runs are solutions.
+        let postmortems =
+            list_compound_captures(&store, "default", None, Some("postmortem"), None).unwrap();
+        assert_eq!(postmortems.len(), 1);
+        assert_eq!(postmortems[0].doc_id, "compound:capture:run-charlie-fail");
+        assert_eq!(postmortems[0].kind, "postmortem");
+
+        let solutions =
+            list_compound_captures(&store, "default", None, Some("solution"), None).unwrap();
+        assert_eq!(solutions.len(), 3);
+        assert!(solutions.iter().all(|document| document.kind == "solution"));
+
+        // An outcome outside the encode-kind set matches nothing.
+        assert!(
+            list_compound_captures(&store, "default", None, Some("not-a-kind"), None)
+                .unwrap()
+                .is_empty()
+        );
+
+        // (d) a since-watermark: only captures with updated_at >= the watermark.
+        let since = list_compound_captures(
+            &store,
+            "default",
+            None,
+            None,
+            Some("2026-06-08T02:00:00Z"),
+        )
+        .unwrap();
+        let since_ids = since
+            .iter()
+            .map(|document| document.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            since_ids,
+            vec![
+                "compound:capture:run-charlie-fail",
+                "compound:capture:run-bravo-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_compound_captures_is_read_only_and_does_not_change_fitness() {
+        let mut store = InMemoryGraphStore::new();
+        publish_writing_pack(&mut store, "shadow", true);
+        close_successful_run(
+            &mut store,
+            "run-readonly",
+            "Encode writing engineering",
+            "Patch done. Tests pass.",
+            &[],
+            &[],
+        );
+
+        let before = load_memory_document(&store, "default", "compound:capture:run-readonly")
+            .unwrap()
+            .unwrap();
+        let before_fitness = before.fitness.clone();
+        let before_updated_at = before.updated_at.clone();
+
+        // Read repeatedly: a recall path would bump compound fitness; this reader
+        // must not.
+        for _ in 0..3 {
+            let captures = list_compound_captures(&store, "default", None, None, None).unwrap();
+            assert!(captures
+                .iter()
+                .any(|document| document.doc_id == "compound:capture:run-readonly"));
+        }
+
+        let after = load_memory_document(&store, "default", "compound:capture:run-readonly")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.fitness, before_fitness);
+        assert_eq!(after.updated_at, before_updated_at);
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn run_created_registry_status_drives_next_close_receipt_action() {
         let mut store = InMemoryGraphStore::new();
         publish_writing_pack(&mut store, "advisory", true);
@@ -1989,14 +2254,223 @@ mod tests {
     }
 
     fn transition(run_id: &str, event_type: &str, payload: Value) -> TransitionInput {
+        transition_at(run_id, event_type, payload, TS)
+    }
+
+    fn transition_at(
+        run_id: &str,
+        event_type: &str,
+        payload: Value,
+        created_at: &str,
+    ) -> TransitionInput {
         TransitionInput {
             run_id: run_id.to_string(),
             event_type: event_type.to_string(),
             payload: payload.as_object().cloned().unwrap_or_default(),
             actor: "codex".to_string(),
             idempotency_key: format!("{run_id}:{event_type}"),
-            created_at: TS.to_string(),
+            created_at: created_at.to_string(),
         }
+    }
+
+    /// Drive a run through the full guard-valid preamble (RUN.CREATED through
+    /// AGENT.ACTING, including the PROFILE/TOOLKIT/CONTEXT phases the state machine
+    /// requires), up to but not including the terminal outcome/close events. The
+    /// packed context makes the run qualify for capture. Early events are stamped at
+    /// `TS`; ordering is by sequence, so a later terminal timestamp is fine. This
+    /// mirrors the event sequence in `close_successful_run_for_tenant`.
+    fn drive_run_preamble(store: &mut InMemoryGraphStore, run_id: &str, task: &str) {
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "RUN.CREATED",
+                json!({
+                    "task": task,
+                    "actor": "codex",
+                    "scope": {
+                        "tenant_slug": "default",
+                        "repo": "Theorem",
+                        "agent_host": "codex"
+                    }
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "HOST.OBSERVED",
+                json!({
+                    "repo": "Theorem",
+                    "branch": "main",
+                    "commit_sha": "abc123",
+                    "cwd": "/repo/Theorem"
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(run_id, "TASK.RESOLVED", json!({ "task_signature": task })),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "PROFILE.SELECTED",
+                json!({
+                    "profile_id": "codex",
+                    "profile_version": "1",
+                    "policy_hash": "policy:1"
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "TOOLKIT.COMPILED",
+                json!({
+                    "selected_tools": ["apply_patch", "cargo test"],
+                    "selected_plugins": [],
+                    "excluded_tools": [],
+                    "permission_reasons": {},
+                    "tool_permission_requirements": {},
+                    "policy_receipts": []
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "CONTEXT.PLANNED",
+                json!({
+                    "budget_tokens": 4000,
+                    "plan_hash": "plan:1",
+                    "candidate_token_count": 1200
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "CONTEXT.PACKED",
+                json!({
+                    "artifact_id": "ctx:1",
+                    "capsule_tokens": 1000,
+                    "budget_tokens": 4000,
+                    "included_atom_count": 2,
+                    "excluded_atom_count": 0,
+                    "token_ledger": {},
+                    "memory_doc_ids": []
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "CONTEXT.INJECTED",
+                json!({
+                    "artifact_id": "ctx:1",
+                    "adapter": "codex",
+                    "target": "active_context"
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "AGENT.ACTING",
+                json!({
+                    "adapter": "codex",
+                    "started_at": TS
+                }),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Drive the full positive run-close capture path, stamping the closing
+    /// transition (and therefore the capture's `updated_at`) at `closed_at` so the
+    /// `since` watermark can be exercised.
+    fn close_successful_run_at(
+        store: &mut InMemoryGraphStore,
+        run_id: &str,
+        task: &str,
+        close_summary: &str,
+        closed_at: &str,
+    ) {
+        drive_run_preamble(store, run_id, task);
+        append_transition_from_store(
+            store,
+            transition_at(
+                run_id,
+                "OUTCOME.RECORDED",
+                json!({
+                    "accepted": true,
+                    "tests_passed": true,
+                    "manual_override": true,
+                    "validator_results": [],
+                    "files_changed": [],
+                    "summary": "accepted"
+                }),
+                closed_at,
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition_at(
+                run_id,
+                "RUN.CLOSED",
+                json!({
+                    "summary": close_summary,
+                    "closed_by": "codex",
+                    "source_identifiers": []
+                }),
+                closed_at,
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Drive a failed run rich enough to qualify for capture (it carries a packed
+    /// context contribution plus a RUN.FAILED outcome), producing a `postmortem`
+    /// capture. The closing RUN.FAILED transition is stamped at `closed_at`.
+    fn close_failed_qualifying_run_at(
+        store: &mut InMemoryGraphStore,
+        run_id: &str,
+        task: &str,
+        close_summary: &str,
+        closed_at: &str,
+    ) {
+        drive_run_preamble(store, run_id, task);
+        append_transition_from_store(
+            store,
+            transition_at(
+                run_id,
+                "RUN.FAILED",
+                json!({
+                    "error_code": "test_failed",
+                    "message": close_summary,
+                    "summary": close_summary
+                }),
+                closed_at,
+            ),
+        )
+        .unwrap();
     }
 
     fn compound_event_types(events: &[EventState]) -> Vec<&str> {

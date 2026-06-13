@@ -9,6 +9,7 @@
 
 mod app_affordance;
 mod code_index;
+mod code_kg;
 mod code_service;
 mod engine;
 mod pb;
