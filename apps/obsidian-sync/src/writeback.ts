@@ -1,6 +1,6 @@
-import { App, TFile } from "obsidian";
+import { App, Notice, TFile } from "obsidian";
 import type { HarnessClient } from "./harness";
-import type { HarnessSyncSettings } from "./settings";
+import { isCommonsTenant, type HarnessSyncSettings } from "./settings";
 import type { SyncJournal, UpsertNoteArgs } from "./types";
 import { localHash } from "./hash";
 import { extractWikilinks, isCaptured, userBody } from "./notes";
@@ -14,6 +14,9 @@ const ENCODE_KINDS = new Set(["encode", "feedback", "solution", "postmortem"]);
  * link targets the harness reconciles into edges. Note-linking is graph construction.
  */
 export class WriteBack {
+  /** Tracks whether the commons-tenant block has been surfaced once this session. */
+  private commonsWarningShown = false;
+
   constructor(
     private app: App,
     private client: HarnessClient,
@@ -54,6 +57,11 @@ export class WriteBack {
     if (!body) {
       return false;
     }
+    // This note would push. Never let hand-written notes land in the commons
+    // ("default") tenant unless the user opted in. Surface the block once.
+    if (this.isCommonsBlocked()) {
+      return false;
+    }
 
     const args = this.buildArgs(file, frontmatter, body, existingDocId);
     const receipt = await this.client.upsertNote(args);
@@ -74,6 +82,53 @@ export class WriteBack {
       this.journal.watermark = receipt.document.updated_at;
     }
     await this.save();
+    return true;
+  }
+
+  /**
+   * A vault delete tombstones the bound doc. The file is already gone, so the
+   * metadata cache is unreliable; the doc_id is resolved from the journal by path.
+   * Returns true if a doc was tombstoned. The `guard` suppresses plugin-driven
+   * deletes so a tombstone never echoes.
+   */
+  async handleDelete(path: string): Promise<boolean> {
+    if (!this.settings.enableWriteBack) {
+      return false;
+    }
+    if (this.guard.isSuppressed(path)) {
+      return false;
+    }
+    const entry = Object.entries(this.journal.docs).find(
+      ([, state]) => state.path === path
+    );
+    if (!entry) {
+      return false;
+    }
+    const [docId] = entry;
+    await this.client.forget({ docId, reason: "deleted in vault" });
+    delete this.journal.docs[docId];
+    await this.save();
+    return true;
+  }
+
+  /**
+   * True when write-back is pointed at the commons ("default") tenant and the user
+   * has not opted in. Surfaces a single Notice the first time a push is blocked.
+   */
+  private isCommonsBlocked(): boolean {
+    if (this.settings.allowCommonsWriteback) {
+      return false;
+    }
+    if (!isCommonsTenant(this.settings.tenant)) {
+      return false;
+    }
+    if (!this.commonsWarningShown) {
+      this.commonsWarningShown = true;
+      new Notice(
+        'Theorem: write-back is blocked because the tenant is the commons ("default"). ' +
+          'Set a personal tenant, or enable "Allow commons write-back" in settings.'
+      );
+    }
     return true;
   }
 

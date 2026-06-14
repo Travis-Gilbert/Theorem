@@ -111,6 +111,61 @@ export class HarnessClient {
     return receipt;
   }
 
+  /**
+   * Tombstone a doc via the `forget` MCP tool. The server requires `id` and
+   * `reason`; the field is `id`, not `doc_id`. Tenant is sent the same way
+   * `upsert_note` sends it, so a delete targets the partition the write created.
+   */
+  async forget(args: { docId: string; reason: string }): Promise<void> {
+    const payload = {
+      jsonrpc: "2.0",
+      id: `obsidian-${Date.now()}`,
+      method: "tools/call",
+      params: {
+        name: "forget",
+        arguments: { id: args.docId, reason: args.reason, tenant: this.tenant },
+      },
+    };
+
+    const response = await this.send({
+      url: `${this.base}/mcp`,
+      method: "POST",
+      headers: this.authHeaders(true),
+      body: JSON.stringify(payload),
+    });
+
+    const body = this.parseJson(response.text);
+    if (body?.error) {
+      throw new HarnessError(
+        `Harness MCP error: ${body.error.message ?? JSON.stringify(body.error)}`
+      );
+    }
+    const result = body?.result;
+    const structured = result?.structuredContent ?? this.firstJsonContent(result);
+    if (structured?.error) {
+      throw new HarnessError(`forget rejected: ${structured.message ?? structured.error}`);
+    }
+  }
+
+  /**
+   * A lightweight reachability probe for the settings "Test connection" button:
+   * hit `/health`, then list the tenant's docs. Returns the health status plus
+   * the doc count and a sample title; throws a `HarnessError` on any failure.
+   */
+  async testConnection(): Promise<{ health: number; count: number; sampleTitle: string }> {
+    const health = await this.send({
+      url: `${this.base}/health`,
+      method: "GET",
+      headers: this.authHeaders(false),
+    });
+    const docs = await this.listDocs("");
+    return {
+      health: health.status,
+      count: docs.count,
+      sampleTitle: docs.docs[0]?.title ?? "",
+    };
+  }
+
   private async send(params: RequestUrlParam) {
     let response;
     try {
