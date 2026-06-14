@@ -2,9 +2,11 @@ use crate::binding_store::{
     binding_node_id, load_binding, persist_binding, scratchpad_revision_node_id,
     BindingRuntimeError,
 };
+use crate::overlap::{detect_and_emit_overlap_tensions, Footprint};
 use crate::{default_theorem_binding, writing_style, DEFAULT_BINDING_ID};
 use rustyred_thg_core::{
-    EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord,
+    EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, HarnessInstantKg, NodeQuery,
+    NodeRecord, SessionDelta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -521,7 +523,42 @@ pub fn write_intent<S: GraphStore>(
     intent.binding_active_head_set = projection.binding_active_head_set;
     persist_intent_state(store, &intent)?;
     persist_intent_binding_projection(store, &intent)?;
+    enrich_semantic_overlap_tensions(store, &intent);
     Ok(intent)
+}
+
+fn enrich_semantic_overlap_tensions<S: GraphStore>(
+    store: &mut S,
+    intent: &CoordinationIntentState,
+) {
+    if intent.status != "working" || intent.footprint.is_empty() {
+        return;
+    }
+    let Ok(snapshot) = store.graph_snapshot() else {
+        return;
+    };
+    let kg = HarnessInstantKg::new(snapshot, None, SessionDelta::default());
+    let statuses = ["working".to_string()];
+    let Ok(intents) = read_intents_for_room(store, &intent.tenant_slug, &intent.room_id, &statuses)
+    else {
+        return;
+    };
+    let footprints = intents
+        .into_iter()
+        .filter(|candidate| !candidate.footprint.is_empty())
+        .map(|candidate| Footprint {
+            actor: candidate.actor_id,
+            files: candidate.footprint,
+        })
+        .collect::<Vec<_>>();
+    let _ = detect_and_emit_overlap_tensions(
+        store,
+        &intent.tenant_slug,
+        &intent.room_id,
+        &kg,
+        &footprints,
+        1,
+    );
 }
 
 pub fn read_intents_for_room<S: GraphStore>(
@@ -2046,6 +2083,68 @@ mod tests {
                 &second.scratchpad_revision_id
             ))
             .is_some());
+    }
+
+    #[test]
+    fn write_intent_emits_semantic_overlap_tension_for_working_footprints() {
+        let mut store = InMemoryGraphStore::new();
+        for node in [
+            NodeRecord::new("file:a", ["CodeFile"], json!({ "file_path": "src/a.rs" })),
+            NodeRecord::new("file:b", ["CodeFile"], json!({ "file_path": "src/b.rs" })),
+            NodeRecord::new("sym:a", ["CodeSymbol"], json!({ "file_path": "src/a.rs" })),
+            NodeRecord::new("sym:b", ["CodeSymbol"], json!({ "file_path": "src/b.rs" })),
+            NodeRecord::new(
+                "sym:shared",
+                ["CodeSymbol"],
+                json!({ "file_path": "src/shared.rs" }),
+            ),
+        ] {
+            store.upsert_node(node).unwrap();
+        }
+        for edge in [
+            EdgeRecord::new("decl:a", "file:a", "DECLARES_SYMBOL", "sym:a", json!({})),
+            EdgeRecord::new("decl:b", "file:b", "DECLARES_SYMBOL", "sym:b", json!({})),
+            EdgeRecord::new("call:a", "sym:a", "CALLS_SYMBOL", "sym:shared", json!({})),
+            EdgeRecord::new("call:b", "sym:b", "CALLS_SYMBOL", "sym:shared", json!({})),
+        ] {
+            store.upsert_edge(edge).unwrap();
+        }
+
+        write_intent(
+            &mut store,
+            WriteIntentInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                status: "working".to_string(),
+                summary: "Touch a".to_string(),
+                footprint: vec!["src/a.rs".to_string()],
+                updated_at: T1.to_string(),
+                ..WriteIntentInput::default()
+            },
+        )
+        .unwrap();
+        write_intent(
+            &mut store,
+            WriteIntentInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "claude-code".to_string(),
+                status: "working".to_string(),
+                summary: "Touch b".to_string(),
+                footprint: vec!["src/b.rs".to_string()],
+                updated_at: T2.to_string(),
+                ..WriteIntentInput::default()
+            },
+        )
+        .unwrap();
+
+        let records =
+            read_records_for_room(&store, TENANT, ROOM, &["tension".to_string()], 10).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert!(records[0].body.contains("sym:shared"));
+        assert_eq!(records[0].record_type, "tension");
     }
 
     #[test]

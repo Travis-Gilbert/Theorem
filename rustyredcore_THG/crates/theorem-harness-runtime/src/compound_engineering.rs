@@ -212,8 +212,7 @@ pub fn list_compound_captures<S: GraphStore>(
         })
         .filter(|document| match outcome_filter.as_deref() {
             Some(kind) => {
-                COMPOUND_OUTCOME_KINDS.contains(&kind)
-                    && document.kind.eq_ignore_ascii_case(kind)
+                COMPOUND_OUTCOME_KINDS.contains(&kind) && document.kind.eq_ignore_ascii_case(kind)
             }
             None => true,
         })
@@ -1967,14 +1966,9 @@ mod tests {
         );
 
         // (d) a since-watermark: only captures with updated_at >= the watermark.
-        let since = list_compound_captures(
-            &store,
-            "default",
-            None,
-            None,
-            Some("2026-06-08T02:00:00Z"),
-        )
-        .unwrap();
+        let since =
+            list_compound_captures(&store, "default", None, None, Some("2026-06-08T02:00:00Z"))
+                .unwrap();
         let since_ids = since
             .iter()
             .map(|document| document.doc_id.as_str())

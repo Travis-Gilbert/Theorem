@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustyred_thg_core::{
-    now_ms, personalized_pagerank, stable_hash, EdgeRecord, EpistemicType, GraphStore,
-    GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
-    PluginCapabilityKind, PluginOperationContext, PluginOperationRegistration, PluginRegistry,
-    RustyRedPlugin,
+    edge_time_interval, now_ms, personalized_pagerank, stable_hash, ActorId, EdgeRecord,
+    EpistemicType, GraphStore, GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery,
+    NodeRecord, PluginCapability, PluginCapabilityKind, PluginOperationContext,
+    PluginOperationRegistration, PluginRegistry, RustyRedPlugin, TimeInterval,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -152,6 +152,57 @@ pub struct BeliefRevisionOutput {
     pub invalidated_edge_id: String,
     pub invalid_at_ms: i64,
     pub flagged_dependents: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContradictionPolicy {
+    #[serde(default)]
+    pub functional_edge_types: BTreeSet<String>,
+    #[serde(default)]
+    pub mutually_exclusive_edge_types: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl ContradictionPolicy {
+    pub fn functional(edge_types: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            functional_edge_types: edge_types.into_iter().map(Into::into).collect(),
+            mutually_exclusive_edge_types: BTreeMap::new(),
+        }
+    }
+
+    fn is_functional(&self, edge_type: &str) -> bool {
+        self.functional_edge_types.contains(edge_type)
+    }
+
+    fn is_mutually_exclusive(&self, left: &str, right: &str) -> bool {
+        self.mutually_exclusive_edge_types
+            .get(left)
+            .map(|values| values.contains(right))
+            .unwrap_or(false)
+            || self
+                .mutually_exclusive_edge_types
+                .get(right)
+                .map(|values| values.contains(left))
+                .unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Contradiction {
+    pub existing_edge_id: String,
+    pub invalidated_at_ms: i64,
+    pub by_actor: ActorId,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RecallQuery {
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub at_ms: Option<i64>,
+    #[serde(default = "default_ppr_alpha")]
+    pub alpha: f64,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -436,6 +487,103 @@ pub fn invalidate_memory_edge<S: GraphStore>(
     })
 }
 
+pub fn invalidate_on_contradiction<S: GraphStore>(
+    store: &mut S,
+    new_edge: &EdgeRecord,
+    policy: &ContradictionPolicy,
+) -> GraphStoreResult<Vec<Contradiction>> {
+    let invalidated_at_ms = edge_time_interval(new_edge)
+        .and_then(|interval| interval.start_ms)
+        .or_else(|| prop_i64(&new_edge.properties, "valid_at_ms"))
+        .unwrap_or_else(now_ms);
+    let by_actor = prop_str(&new_edge.properties, "actor")
+        .or_else(|| prop_str(&new_edge.properties, "actor_id"))
+        .map(|actor| ActorId::from_label(&actor))
+        .unwrap_or(ActorId::ZERO);
+    let mut contradictions = Vec::new();
+    for hit in store
+        .neighbors(
+            NeighborQuery::out(&new_edge.from_id)
+                .with_edge_type(new_edge.edge_type.clone())
+                .with_include_expired(true),
+        )
+        .into_iter()
+    {
+        if hit.edge_id == new_edge.id {
+            continue;
+        }
+        let Some(mut existing) = store.get_edge(&hit.edge_id).cloned() else {
+            continue;
+        };
+        if !edges_contradict(&existing, new_edge, policy) {
+            continue;
+        }
+        set_prop_i64(&mut existing.properties, "t_end_ms", invalidated_at_ms);
+        set_prop_i64(&mut existing.properties, "invalid_at_ms", invalidated_at_ms);
+        set_prop_str(
+            &mut existing.properties,
+            "invalidated_by_edge_id",
+            &new_edge.id,
+        );
+        store.upsert_edge(existing.clone())?;
+        contradictions.push(Contradiction {
+            existing_edge_id: existing.id,
+            invalidated_at_ms,
+            by_actor,
+        });
+    }
+    Ok(contradictions)
+}
+
+pub fn recall_valid_time<S: GraphStore>(store: &S, q: RecallQuery) -> Vec<(String, f64)> {
+    let at_ms = q.at_ms.unwrap_or_else(now_ms);
+    let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    let mut frontier = q.seeds.clone();
+    let mut seen = BTreeSet::new();
+    while let Some(node_id) = frontier.pop() {
+        if !seen.insert(node_id.clone()) {
+            continue;
+        }
+        let mut neighbors = Vec::new();
+        for hit in store.neighbors(NeighborQuery::out(&node_id).with_include_expired(true)) {
+            let Some(edge) = store.get_edge(&hit.edge_id) else {
+                continue;
+            };
+            if !edge_valid_at(edge, at_ms) {
+                continue;
+            }
+            if store.get_node(&hit.node_id).is_none() {
+                continue;
+            }
+            neighbors.push((hit.node_id.clone(), hit.confidence.unwrap_or(1.0)));
+            if !seen.contains(&hit.node_id) {
+                frontier.push(hit.node_id);
+            }
+        }
+        adjacency.insert(node_id, neighbors);
+        if seen.len() > 10_000 {
+            break;
+        }
+    }
+    let seeds = q
+        .seeds
+        .iter()
+        .map(|seed| (seed.clone(), 1.0))
+        .collect::<HashMap<_, _>>();
+    let mut scored = personalized_pagerank(&adjacency, &seeds, q.alpha, 1e-5, 20_000)
+        .into_iter()
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    scored.truncate(q.top_k.max(1));
+    scored
+}
+
 fn handle_recall_operation(
     context: PluginOperationContext<'_>,
     arguments: Value,
@@ -623,7 +771,40 @@ fn node_valid_at(properties: &Value, as_of_ms: i64) -> bool {
 }
 
 fn edge_valid_at(edge: &EdgeRecord, as_of_ms: i64) -> bool {
-    node_valid_at(&edge.properties, as_of_ms)
+    edge_time_interval(edge)
+        .map(|interval| interval.contains_ms(as_of_ms))
+        .unwrap_or_else(|| node_valid_at(&edge.properties, as_of_ms))
+}
+
+fn edge_interval(edge: &EdgeRecord) -> TimeInterval {
+    edge_time_interval(edge).unwrap_or(TimeInterval {
+        start_ms: prop_i64(&edge.properties, "valid_at_ms"),
+        end_ms: prop_i64(&edge.properties, "invalid_at_ms"),
+    })
+}
+
+fn edges_contradict(
+    existing: &EdgeRecord,
+    incoming: &EdgeRecord,
+    policy: &ContradictionPolicy,
+) -> bool {
+    if existing.from_id != incoming.from_id {
+        return false;
+    }
+    if existing.edge_type == incoming.edge_type {
+        if policy.is_functional(&incoming.edge_type) && existing.to_id != incoming.to_id {
+            return intervals_overlap(existing, incoming);
+        }
+        return false;
+    }
+    if policy.is_mutually_exclusive(&existing.edge_type, &incoming.edge_type) {
+        return intervals_overlap(existing, incoming);
+    }
+    false
+}
+
+fn intervals_overlap(left: &EdgeRecord, right: &EdgeRecord) -> bool {
+    edge_interval(left).overlaps(edge_interval(right))
 }
 
 fn consolidation_key(node: &NodeRecord) -> String {
@@ -773,6 +954,10 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 
 fn default_top_k() -> usize {
     10
+}
+
+fn default_ppr_alpha() -> f64 {
+    0.15
 }
 
 fn default_budget_tokens() -> i64 {
@@ -949,5 +1134,209 @@ mod tests {
             store.get_edge("edge:derived").unwrap().properties["invalid_at_ms"].as_i64(),
             Some(42)
         );
+    }
+
+    #[test]
+    fn contradiction_invalidates_old_functional_edge_without_deleting_it() {
+        let mut store = InMemoryGraphStore::new();
+        for id in ["person:1", "city:old", "city:new"] {
+            store
+                .upsert_node(NodeRecord::new(id, ["Entity"], json!({})))
+                .unwrap();
+        }
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:old",
+                "person:1",
+                "LIVES_IN",
+                "city:old",
+                json!({ "t_start_ms": 10 }),
+            ))
+            .unwrap();
+        let new_edge = EdgeRecord::new(
+            "edge:new",
+            "person:1",
+            "LIVES_IN",
+            "city:new",
+            json!({ "t_start_ms": 20, "actor": "codex" }),
+        );
+
+        let contradictions = invalidate_on_contradiction(
+            &mut store,
+            &new_edge,
+            &ContradictionPolicy::functional(["LIVES_IN"]),
+        )
+        .unwrap();
+        store.upsert_edge(new_edge).unwrap();
+
+        assert_eq!(contradictions.len(), 1);
+        assert_eq!(contradictions[0].existing_edge_id, "edge:old");
+        assert!(store.get_edge("edge:old").is_some());
+        assert!(store.get_edge("edge:new").is_some());
+        assert_eq!(
+            store.get_edge("edge:old").unwrap().properties["t_end_ms"].as_i64(),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn recall_valid_time_excludes_edges_after_invalidity() {
+        let mut store = InMemoryGraphStore::new();
+        for id in ["mem:a", "mem:b", "mem:c"] {
+            store.upsert_node(memory_doc(id, id, "fixture")).unwrap();
+        }
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:ab",
+                "mem:a",
+                SUPPORTS,
+                "mem:b",
+                json!({ "t_start_ms": 10, "t_end_ms": 20 }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:ac",
+                "mem:a",
+                SUPPORTS,
+                "mem:c",
+                json!({ "t_start_ms": 10 }),
+            ))
+            .unwrap();
+
+        let before = recall_valid_time(
+            &store,
+            RecallQuery {
+                seeds: vec!["mem:a".to_string()],
+                at_ms: Some(19),
+                alpha: 0.15,
+                top_k: 3,
+            },
+        );
+        let after = recall_valid_time(
+            &store,
+            RecallQuery {
+                seeds: vec!["mem:a".to_string()],
+                at_ms: Some(21),
+                alpha: 0.15,
+                top_k: 3,
+            },
+        );
+
+        assert!(before.iter().any(|(id, _)| id == "mem:b"));
+        assert!(!after.iter().any(|(id, _)| id == "mem:b"));
+        assert!(store.get_edge("edge:ab").is_some());
+    }
+
+    #[test]
+    fn recall_valid_time_concentrates_activation_near_seed() {
+        let mut store = InMemoryGraphStore::new();
+        for id in ["mem:a", "mem:b", "mem:c", "mem:d"] {
+            store.upsert_node(memory_doc(id, id, "fixture")).unwrap();
+        }
+        for (edge_id, from, to) in [
+            ("edge:ab", "mem:a", "mem:b"),
+            ("edge:bc", "mem:b", "mem:c"),
+            ("edge:cd", "mem:c", "mem:d"),
+        ] {
+            store
+                .upsert_edge(EdgeRecord::new(
+                    edge_id,
+                    from,
+                    SUPPORTS,
+                    to,
+                    json!({ "t_start_ms": 1 }),
+                ))
+                .unwrap();
+        }
+
+        let ranked = recall_valid_time(
+            &store,
+            RecallQuery {
+                seeds: vec!["mem:a".to_string()],
+                at_ms: Some(2),
+                alpha: 0.15,
+                top_k: 4,
+            },
+        );
+        let pos_b = ranked.iter().position(|(id, _)| id == "mem:b").unwrap();
+        let pos_d = ranked.iter().position(|(id, _)| id == "mem:d").unwrap();
+
+        assert!(pos_b < pos_d);
+    }
+
+    #[test]
+    fn concurrent_contradiction_converges_by_hlc() {
+        // SPEC Part 4 A4.4: two replicas concurrently invalidate the same
+        // functional edge. Shipped as Hlc-stamped facts through the CRDT join,
+        // both replicas converge to one deterministic validity (the Hlc-max
+        // invalidation), and the edge stays present - never deleted.
+        //
+        // FINDING (punch-list): production invalidate_on_contradiction writes
+        // invalid_at via plain upsert_edge WITHOUT an _crdt_hlc stamp, so
+        // diff_since skips it (merge.rs only ships records with record_max_hlc)
+        // and it will not propagate over the sync transport as-is. This test
+        // ships the invalidations as the Hlc-stamped facts the spec requires
+        // (Part 4 #2: "stamped with Hlc"); invalidate_on_contradiction should
+        // stamp likewise so the property holds end-to-end.
+        use rustyred_thg_core::{join_delta, GraphMutation, Hlc, StampedBatch, StampedMutation};
+
+        let invalidation = |end_ms: i64| {
+            EdgeRecord::new(
+                "e:1",
+                "person:1",
+                "LIVES_IN",
+                "city:a",
+                json!({ "t_start_ms": 10, "t_end_ms": end_ms, "invalid_at_ms": end_ms }),
+            )
+        };
+        let edge_delta = |edge: EdgeRecord, hlc: Hlc| {
+            StampedBatch::new([StampedMutation::new(GraphMutation::EdgeUpsert(edge), hlc)])
+        };
+        let base = EdgeRecord::new(
+            "e:1",
+            "person:1",
+            "LIVES_IN",
+            "city:a",
+            json!({ "t_start_ms": 10 }),
+        );
+        let base_hlc = Hlc::new(10, 0, ActorId::from_label("codex"));
+        let hlc_l = Hlc::new(50, 0, ActorId::from_label("codex"));
+        let hlc_r = Hlc::new(60, 0, ActorId::from_label("claude"));
+
+        let seed = || {
+            let mut store = InMemoryGraphStore::new();
+            for id in ["person:1", "city:a"] {
+                store
+                    .upsert_node(NodeRecord::new(id, ["Entity"], json!({})))
+                    .unwrap();
+            }
+            join_delta(&mut store, edge_delta(base.clone(), base_hlc));
+            store
+        };
+
+        // Replica L sees its own invalidation, then R's; replica R the reverse.
+        let mut left = seed();
+        join_delta(&mut left, edge_delta(invalidation(50), hlc_l));
+        join_delta(&mut left, edge_delta(invalidation(60), hlc_r));
+
+        let mut right = seed();
+        join_delta(&mut right, edge_delta(invalidation(60), hlc_r));
+        join_delta(&mut right, edge_delta(invalidation(50), hlc_l));
+
+        let edge_l = left.get_edge("e:1").expect("edge present on L");
+        let edge_r = right.get_edge("e:1").expect("edge present on R");
+
+        // Deterministic convergence regardless of receive order: the Hlc-max
+        // invalidation (60 @ claude) wins the validity LWW on both replicas.
+        assert_eq!(
+            edge_l.properties["invalid_at_ms"],
+            edge_r.properties["invalid_at_ms"]
+        );
+        assert_eq!(edge_l.properties["t_end_ms"], edge_r.properties["t_end_ms"]);
+        assert_eq!(edge_l.properties["invalid_at_ms"].as_i64(), Some(60));
+        // Contradiction invalidates, never deletes.
+        assert!(!edge_l.tombstone);
+        assert!(!edge_r.tombstone);
     }
 }

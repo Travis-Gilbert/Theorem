@@ -288,10 +288,22 @@ pub trait GraphStore {
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult>;
     fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult>;
     fn get_node(&self, id: &str) -> Option<&NodeRecord>;
+    fn get_node_record(&self, id: &str) -> Option<NodeRecord> {
+        self.get_node(id).cloned()
+    }
     fn get_node_interval(&self, id: &str) -> Option<TimeInterval> {
         self.get_node(id).and_then(node_time_interval)
     }
     fn get_edge(&self, id: &str) -> Option<&EdgeRecord>;
+    fn get_edge_record(&self, id: &str) -> Option<EdgeRecord> {
+        self.get_edge(id).cloned()
+    }
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Err(GraphStoreError::new(
+            "snapshot_not_supported",
+            "this GraphStore implementation does not expose graph snapshots",
+        ))
+    }
     fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord>;
     fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit>;
     fn stats(&self) -> GraphStats;
@@ -372,6 +384,15 @@ impl TimeInterval {
 pub fn node_time_interval(node: &NodeRecord) -> Option<TimeInterval> {
     let start_ms = property_i64(&node.properties, "t_start_ms");
     let end_ms = property_i64(&node.properties, "t_end_ms");
+    if start_ms.is_none() && end_ms.is_none() {
+        return None;
+    }
+    Some(TimeInterval { start_ms, end_ms })
+}
+
+pub fn edge_time_interval(edge: &EdgeRecord) -> Option<TimeInterval> {
+    let start_ms = property_i64(&edge.properties, "t_start_ms");
+    let end_ms = property_i64(&edge.properties, "t_end_ms");
     if start_ms.is_none() && end_ms.is_none() {
         return None;
     }
@@ -969,6 +990,70 @@ impl InMemoryGraphStore {
             version: self.version,
             checksum,
         })
+    }
+
+    /// Insert `node` only when no live record with the same id exists.
+    /// Returns `Ok(None)` for ordinary dedup contention.
+    pub fn insert_node_if_absent(
+        &mut self,
+        node: NodeRecord,
+    ) -> GraphStoreResult<Option<GraphWriteResult>> {
+        if node.id.trim().is_empty() {
+            return Err(GraphStoreError::empty_field("node.id"));
+        }
+        if self
+            .nodes
+            .get(&node.id)
+            .is_some_and(|existing| !existing.tombstone)
+        {
+            return Ok(None);
+        }
+        self.upsert_node(node).map(Some)
+    }
+
+    /// Atomically set a node property when its current value equals `expected`.
+    /// Missing properties compare as JSON null. `Value::Null` as `new_value`
+    /// removes the property.
+    pub fn compare_and_set_node_property(
+        &mut self,
+        id: &str,
+        property: &str,
+        expected: &Value,
+        new_value: Value,
+    ) -> GraphStoreResult<Option<GraphWriteResult>> {
+        let property = property.trim();
+        if property.is_empty() {
+            return Err(GraphStoreError::empty_field("node.property"));
+        }
+        let mut node = self
+            .nodes
+            .get(id)
+            .filter(|node| !node.tombstone)
+            .cloned()
+            .ok_or_else(|| {
+                GraphStoreError::new("missing_graph_node", format!("node {id} does not exist"))
+            })?;
+        let current = node
+            .properties
+            .as_object()
+            .and_then(|properties| properties.get(property))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if &current != expected {
+            return Ok(None);
+        }
+        let mut properties = node
+            .properties
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+        if new_value.is_null() {
+            properties.remove(property);
+        } else {
+            properties.insert(property.to_string(), new_value);
+        }
+        node.properties = Value::Object(properties);
+        self.upsert_node(node).map(Some)
     }
 
     fn apply_recovered_node(&mut self, mut node: NodeRecord) -> GraphStoreResult<()> {
@@ -2158,6 +2243,72 @@ impl RedCoreGraphStore {
             .into_iter()
             .next()
             .ok_or_else(|| GraphStoreError::new("redcore_missing_write", "node write vanished"))
+    }
+
+    /// Insert `node` only when no live record with the same id exists.
+    /// Returns `Ok(None)` for ordinary dedup contention and journals the
+    /// winning insert as a normal NodeUpsert AOF mutation.
+    pub fn insert_node_if_absent(
+        &mut self,
+        node: NodeRecord,
+    ) -> GraphStoreResult<Option<GraphWriteResult>> {
+        if node.id.trim().is_empty() {
+            return Err(GraphStoreError::empty_field("node.id"));
+        }
+        if self
+            .store
+            .get_node_including_expired(&node.id)
+            .is_some_and(|existing| !existing.tombstone)
+        {
+            return Ok(None);
+        }
+        self.upsert_node(node).map(Some)
+    }
+
+    /// Atomically set a node property when its current value equals `expected`.
+    /// Missing properties compare as JSON null. `Value::Null` as `new_value`
+    /// removes the property. The winning update journals as a NodeUpsert AOF
+    /// mutation, so replay reconstructs the claimed state.
+    pub fn compare_and_set_node_property(
+        &mut self,
+        id: &str,
+        property: &str,
+        expected: &Value,
+        new_value: Value,
+    ) -> GraphStoreResult<Option<GraphWriteResult>> {
+        let property = property.trim();
+        if property.is_empty() {
+            return Err(GraphStoreError::empty_field("node.property"));
+        }
+        let mut node = self
+            .store
+            .get_node_including_expired(id)
+            .filter(|node| !node.tombstone)
+            .cloned()
+            .ok_or_else(|| {
+                GraphStoreError::new("missing_graph_node", format!("node {id} does not exist"))
+            })?;
+        let current = node
+            .properties
+            .as_object()
+            .and_then(|properties| properties.get(property))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if &current != expected {
+            return Ok(None);
+        }
+        let mut properties = node
+            .properties
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+        if new_value.is_null() {
+            properties.remove(property);
+        } else {
+            properties.insert(property.to_string(), new_value);
+        }
+        node.properties = Value::Object(properties);
+        self.upsert_node(node).map(Some)
     }
 
     pub fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
@@ -3865,8 +4016,20 @@ impl GraphStore for RedCoreGraphStore {
         self.store.get_node(id)
     }
 
+    fn get_node_record(&self, id: &str) -> Option<NodeRecord> {
+        self.store.nodes.get(id).cloned()
+    }
+
     fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
         self.store.get_edge(id)
+    }
+
+    fn get_edge_record(&self, id: &str) -> Option<EdgeRecord> {
+        self.store.edges.get(id).cloned()
+    }
+
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Ok(RedCoreGraphStore::graph_snapshot(self))
     }
 
     fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
@@ -3908,8 +4071,20 @@ impl GraphStore for InMemoryGraphStore {
         InMemoryGraphStore::get_node(self, id)
     }
 
+    fn get_node_record(&self, id: &str) -> Option<NodeRecord> {
+        self.nodes.get(id).cloned()
+    }
+
     fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
         InMemoryGraphStore::get_edge(self, id)
+    }
+
+    fn get_edge_record(&self, id: &str) -> Option<EdgeRecord> {
+        self.edges.get(id).cloned()
+    }
+
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Ok(InMemoryGraphStore::snapshot(self))
     }
 
     fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
@@ -4942,6 +5117,90 @@ mod tests {
         let expiring = store.nodes_expiring_before(expires_at_ms + 1, 10);
         assert_eq!(expiring.len(), 1);
         assert_eq!(expiring[0].id, "node:atom");
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_guarded_insert_persists_only_winner() {
+        let data_dir = unique_test_dir("redcore-guarded-insert");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            let first = store
+                .insert_node_if_absent(NodeRecord::new(
+                    "node:url",
+                    ["url"],
+                    json!({ "state": "frontier" }),
+                ))
+                .unwrap();
+            let second = store
+                .insert_node_if_absent(NodeRecord::new(
+                    "node:url",
+                    ["url"],
+                    json!({ "state": "frontier" }),
+                ))
+                .unwrap();
+            assert!(first.is_some());
+            assert!(second.is_none());
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(store.get_node("node:url").unwrap().is_some());
+        assert_eq!(store.status().recovered_frames, 1);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_compare_and_set_node_property_claims_once() {
+        let data_dir = unique_test_dir("redcore-guarded-cas");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:url",
+                    ["url"],
+                    json!({ "state": "frontier" }),
+                ))
+                .unwrap();
+            let first = store
+                .compare_and_set_node_property(
+                    "node:url",
+                    "state",
+                    &json!("frontier"),
+                    json!("in_flight"),
+                )
+                .unwrap();
+            let second = store
+                .compare_and_set_node_property(
+                    "node:url",
+                    "state",
+                    &json!("frontier"),
+                    json!("in_flight"),
+                )
+                .unwrap();
+            assert!(first.is_some());
+            assert!(second.is_none());
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        let state = store
+            .get_node("node:url")
+            .unwrap()
+            .and_then(|node| node.properties.get("state").cloned());
+        assert_eq!(state, Some(json!("in_flight")));
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -6088,6 +6347,63 @@ mod tests {
             .set_node_ttl("nonexistent", Some(now_ms() + 60_000))
             .unwrap_err();
         assert_eq!(err.code, "missing_graph_node");
+    }
+
+    #[test]
+    fn guarded_insert_returns_none_for_existing_node() {
+        let mut store = InMemoryGraphStore::new();
+        let first = store
+            .insert_node_if_absent(NodeRecord::new(
+                "node:url",
+                ["url"],
+                json!({ "state": "frontier" }),
+            ))
+            .unwrap();
+        let second = store
+            .insert_node_if_absent(NodeRecord::new(
+                "node:url",
+                ["url"],
+                json!({ "state": "frontier" }),
+            ))
+            .unwrap();
+        assert!(first.is_some());
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn compare_and_set_node_property_returns_none_on_stale_state() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:url",
+                ["url"],
+                json!({ "state": "frontier" }),
+            ))
+            .unwrap();
+        let first = store
+            .compare_and_set_node_property(
+                "node:url",
+                "state",
+                &json!("frontier"),
+                json!("in_flight"),
+            )
+            .unwrap();
+        let second = store
+            .compare_and_set_node_property(
+                "node:url",
+                "state",
+                &json!("frontier"),
+                json!("in_flight"),
+            )
+            .unwrap();
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            store
+                .get_node("node:url")
+                .and_then(|node| node.properties.get("state")),
+            Some(&json!("in_flight"))
+        );
     }
 
     #[test]
