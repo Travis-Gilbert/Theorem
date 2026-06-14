@@ -9,6 +9,7 @@ pub mod job_queue;
 pub mod library_encoding;
 pub mod memory;
 pub mod node_type_binding;
+pub mod overlap;
 pub mod patch_sequencer;
 pub mod skill_pack;
 pub mod work_graph_store;
@@ -97,6 +98,10 @@ pub use node_type_binding::{
     NodeTypeSkillPackBindingReceipt, NodeTypeSkillPackBindingState, NodeTypeSkillPackRef,
     NodeTypeSkillPackResolution, ResolveNodeTypeSkillPacksInput, ResolvedNodeTypeSkillPack,
     EDGE_NODE_TYPE_USES_SKILL_PACK, NODE_TYPE_BINDING_LABEL,
+};
+pub use overlap::{
+    detect_and_emit_overlap_tensions, detect_overlaps, emit_overlap_tension, neighborhood_of,
+    Footprint, Neighborhood, Overlap,
 };
 pub use patch_sequencer::{
     PatchApplyReceipt, PatchApplyStatus, PatchProposal, PatchSequencer, PatchSequencerError,

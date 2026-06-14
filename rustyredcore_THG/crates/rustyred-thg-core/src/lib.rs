@@ -5,6 +5,7 @@
 //! executor.
 
 pub mod commands;
+pub mod crdt;
 pub mod errors;
 pub mod executor;
 pub mod fulltext;
@@ -23,6 +24,10 @@ pub mod symbolic;
 pub mod versioned_graph;
 
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
+pub use crdt::{
+    diff_since, join_delta, ActorId, Hlc, HlcClock, JoinReport, StampedBatch, StampedMutation,
+    VersionVector,
+};
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
 pub use fulltext::{
@@ -36,14 +41,14 @@ pub use graph::{
     pagerank, paths_shortest, paths_shortest_weighted, personalized_pagerank, EdgeTuple,
 };
 pub use graph_store::{
-    default_hybrid_edge_type_weights, manifest_version_compatible, node_is_expired,
-    node_ttl_expires_at_ms, now_ms, read_manifest, sanitize_tenant_segment, unix_ms, Direction,
-    EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch, GraphRebuildReport,
-    GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult, GraphTransaction,
-    GraphWriteResult, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, Provenance, RedCoreDurability, RedCoreGraphStore, RedCoreManifest,
-    RedCoreOptions, RedCoreStatus, TimeInterval, VectorDesignation, VectorIndex, VectorPoint,
-    VerifyProblem, VerifyReport, CURRENT_FORMAT_VERSION, TTL_PROPERTY,
+    default_hybrid_edge_type_weights, edge_time_interval, manifest_version_compatible,
+    node_is_expired, node_ttl_expires_at_ms, now_ms, read_manifest, sanitize_tenant_segment,
+    unix_ms, Direction, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch,
+    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
+    GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, Provenance, RedCoreDurability, RedCoreGraphStore,
+    RedCoreManifest, RedCoreOptions, RedCoreStatus, TimeInterval, VectorDesignation, VectorIndex,
+    VectorPoint, VerifyProblem, VerifyReport, CURRENT_FORMAT_VERSION, TTL_PROPERTY,
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
@@ -72,12 +77,12 @@ pub use symbolic::{
 };
 pub use versioned_graph::{
     build_prolly_tree, checkout_graph_version, compile_graph_pack, diff_graph_snapshots,
-    graph_version_log, merge_graph_snapshots, snapshot_content_objects, update_graph_ref,
-    CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
-    GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
-    GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide, GraphMergeStrategy,
-    GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefUpdate, GraphTreeChild,
-    GraphTreeEntry, GraphTreeNode, GraphVersionDiff, GraphVersionLog, GraphVersionRef,
-    GraphVersionRepository, DEFAULT_GRAPH_BRANCH, GRAPH_PACK_COMPILER_VERSION,
+    graph_version_log, merge_graph_snapshots, resolve_auto_confidence_edge,
+    snapshot_content_objects, update_graph_ref, CompiledGraphPack, GraphCheckoutResult,
+    GraphCommit, GraphCompileOptions, GraphCompilerCapability, GraphContentObject, GraphDiffEntry,
+    GraphMergeConflict, GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide,
+    GraphMergeStrategy, GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefUpdate,
+    GraphTreeChild, GraphTreeEntry, GraphTreeNode, GraphVersionDiff, GraphVersionLog,
+    GraphVersionRef, GraphVersionRepository, DEFAULT_GRAPH_BRANCH, GRAPH_PACK_COMPILER_VERSION,
     VERSIONED_GRAPH_PROTOCOL_VERSION,
 };
