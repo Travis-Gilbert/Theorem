@@ -27,7 +27,8 @@ plugin already runs. No delivery layer, no git repo, no cron, no Tailscale.
   capture scope, the plugin pushes it back. A note that carries a `doc_id` updates
   that document in place; a new note becomes a new document. Wikilinks become link
   targets the harness reconciles into `MEMORY_RELATES` edges. Note-linking is graph
-  construction.
+  construction. Deleting a synced note tombstones its doc (status `deleted`) via the
+  `forget` tool, so a following resync does not recreate the note.
 
 ## Harness endpoints it uses
 
@@ -37,6 +38,10 @@ plugin already runs. No delivery layer, no git repo, no cron, no Tailscale.
 - `POST /mcp` calling the `upsert_note` MCP tool - create-or-update by stable
   `doc_id` plus link reconciliation (resolved links become edges, removed links are
   tombstoned, forward references are recorded and resolved on target creation).
+- `POST /mcp` calling the `forget` MCP tool - tombstone a doc when its note is
+  deleted in the vault. The required arguments are `id` (the doc_id) and `reason`;
+  tenant is sent the same way `upsert_note` sends it, so a delete and the write that
+  created the doc always resolve to the same partition.
 
 Both are authenticated with the bearer token. The tenant comes from plugin
 settings and is sent in the request path, so a token only ever touches its own
@@ -65,11 +70,20 @@ Settings -> Theorem Harness Sync:
 
 - **Harness base URL**, **Bearer token**, **Tenant** - the connection. The token is
   scoped to your tenant; each user runs the plugin against their own tenant, which
-  is how "users write to the graph" works for more than one person.
+  is how "users write to the graph" works for more than one person. Tenant casing is
+  significant against the deployed harness: write with the exact slug every time.
+- **Test connection** - probes `/health` and the memory list endpoint and reports the
+  doc count (plus a sample title) or the HTTP error. Use it to catch a silent
+  misconfiguration before wondering why nothing syncs.
 - **Sync folder** - where mirrored notes are written.
 - **Include superseded / archived** - off keeps the vault to current notes.
 - **Auto-sync interval** - minutes; 0 makes sync manual only.
 - **Enable write-back** - off by default. Turn it on to push edits.
+- **Allow commons write-back** - off by default. While off, write-back refuses to push
+  into the commons (`default`, or an empty tenant) so hand-written notes never land in
+  the shared graph by accident; the first blocked push surfaces one notice and the
+  settings tab shows a warning banner. Turn it on only if you really mean to write the
+  commons.
 - **Capture folder** + **Capture flag** - which new notes write back: those inside
   the capture folder (defaults to the sync folder) OR those carrying the capture
   flag in frontmatter (`graph: true` by default). Arbitrary notes stay out of the
@@ -119,9 +133,39 @@ to match what the substrate actually supports (verified by reading the source):
 - **Tenant is path-scoped**, carried from settings, since the harness auth maps a
   token to scopes, not to a tenant.
 
+## Develop / test
+
+```bash
+npm run typecheck     # tsc over src/
+npm test              # bundles test/*.test.ts (obsidian aliased to a stub) and runs node --test
+```
+
+The test bundle aliases the `obsidian` import to `test/obsidian-stub.ts` because the
+real package ships only type declarations. `test/bundled/` is generated and ignored.
+
+## Vault git mirror (optional)
+
+To keep a versioned, diffable copy of the synced notes (the harness stays canonical;
+the repo is a mirror, not the source of truth), install the Obsidian Git community
+plugin and scope it to the sync folder. Put this `.gitignore` at the vault root so
+only the synced folder and nothing personal is tracked:
+
+```gitignore
+# Ignore everything by default...
+/*
+# ...except the synced folder.
+!/Theorem/
+# Never track Obsidian's own state or this plugin's local data.
+.obsidian/
+```
+
+(Replace `Theorem` with your sync folder if you changed it.) Point Obsidian Git at a
+dedicated repo and let it auto-commit on an interval.
+
 ## Limitations / not yet covered
 
-- Deleting a note in the vault does not delete the graph doc (no `forget` on delete).
+- A vault delete only tombstones a doc the plugin has a journal entry for (a note it
+  pulled or pushed). Deleting a note the plugin never tracked is a no-op.
 - Renames are followed by doc_id, not by a server-side title change event.
 - The unresolved-link match is by title or doc_id; renaming a dangling target before
   it is created can leave a stale forward reference until the next edit.

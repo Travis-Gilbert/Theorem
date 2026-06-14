@@ -1,7 +1,18 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { HarnessClient } from "./harness";
 import type TheoremHarnessSyncPlugin from "./main";
 
 export type ConflictMode = "conflict-copy" | "graph-wins" | "local-wins";
+
+/**
+ * The commons ("default") tenant is the shared graph; hand-written notes must
+ * never land there by accident. Empty is treated as commons too, since the
+ * client falls back to "default" when no tenant is set.
+ */
+export function isCommonsTenant(tenant: string): boolean {
+  const slug = tenant.trim().toLowerCase();
+  return slug === "" || slug === "default";
+}
 
 export interface HarnessSyncSettings {
   /** Harness base URL, e.g. https://rustyredcore-theorem-production.up.railway.app */
@@ -22,6 +33,11 @@ export interface HarnessSyncSettings {
   captureFlag: string;
   /** Master switch for Phase 2 write-back. Off by default until the user opts in. */
   enableWriteBack: boolean;
+  /**
+   * Allow write-back when the tenant is the commons ("default"). Off by default:
+   * hand-written notes are blocked from the shared graph unless explicitly opted in.
+   */
+  allowCommonsWriteback: boolean;
   /** Periodic pull interval in minutes. 0 disables the timer (manual sync only). */
   syncIntervalMinutes: number;
   /** Pull superseded and archived documents too, not just active ones. */
@@ -40,6 +56,7 @@ export const DEFAULT_SETTINGS: HarnessSyncSettings = {
   captureFolder: "",
   captureFlag: "graph",
   enableWriteBack: false,
+  allowCommonsWriteback: false,
   syncIntervalMinutes: 15,
   includeInactive: false,
   conflictMode: "conflict-copy",
@@ -100,6 +117,36 @@ export class HarnessSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Test connection")
+      .setDesc("Probe /health and the memory list endpoint, then report the doc count.")
+      .addButton((button) =>
+        button.setButtonText("Test").onClick(async () => {
+          button.setDisabled(true);
+          const notice = new Notice("Theorem: testing connection...", 0);
+          try {
+            const client = new HarnessClient(this.plugin.settings);
+            const result = await client.testConnection();
+            const sample = result.sampleTitle ? `, e.g. "${result.sampleTitle}"` : "";
+            notice.setMessage(
+              `Theorem: OK (health ${result.health}). Tenant ` +
+                `"${this.plugin.settings.tenant || "default"}" has ` +
+                `${result.count} doc(s)${sample}.`
+            );
+            window.setTimeout(() => notice.hide(), 6000);
+          } catch (error) {
+            notice.hide();
+            new Notice(
+              `Theorem: connection failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          } finally {
+            button.setDisabled(false);
+          }
+        })
+      );
+
     containerEl.createEl("h2", { text: "Vault layout" });
 
     new Setting(containerEl)
@@ -146,6 +193,21 @@ export class HarnessSyncSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "Write-back (Phase 2)" });
 
+    if (
+      this.plugin.settings.enableWriteBack &&
+      isCommonsTenant(this.plugin.settings.tenant) &&
+      !this.plugin.settings.allowCommonsWriteback
+    ) {
+      const warning = containerEl.createEl("p", {
+        text:
+          'Write-back is on but the tenant is the commons ("default"). ' +
+          "Hand-written notes will NOT be pushed. Set a personal tenant above, " +
+          'or enable "Allow commons write-back" below to override.',
+      });
+      warning.style.color = "var(--text-error)";
+      warning.style.fontWeight = "600";
+    }
+
     new Setting(containerEl)
       .setName("Enable write-back")
       .setDesc("Push note edits and new linked notes into the graph. Note-linking is graph construction.")
@@ -155,6 +217,23 @@ export class HarnessSyncSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.enableWriteBack = value;
             await this.plugin.saveSettings();
+            this.display();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Allow commons write-back")
+      .setDesc(
+        'Permit pushing into the commons ("default") tenant. Off by default so ' +
+          "hand-written notes never land in the shared graph by accident."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.allowCommonsWriteback)
+          .onChange(async (value) => {
+            this.plugin.settings.allowCommonsWriteback = value;
+            await this.plugin.saveSettings();
+            this.display();
           })
       );
 

@@ -110,6 +110,33 @@ export default class TheoremHarnessSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", onChange));
     this.registerEvent(this.app.vault.on("create", onChange));
     this.registerEvent(this.app.vault.on("rename", onChange));
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (file instanceof TFile) {
+          this.handleDelete(file);
+        }
+      })
+    );
+  }
+
+  private handleDelete(file: TFile): void {
+    if (!this.settings.enableWriteBack || file.extension !== "md") {
+      return;
+    }
+    if (this.guard.isSuppressed(file.path)) {
+      return;
+    }
+    // Cancel any debounced write-back for this path; the file is gone now.
+    const pending = this.debouncers.get(file.path);
+    if (pending !== undefined) {
+      window.clearTimeout(pending);
+      this.debouncers.delete(file.path);
+    }
+    void this.writeback
+      .handleDelete(file.path)
+      .catch((error) =>
+        new Notice(`Theorem delete sync failed: ${errorMessage(error)}`)
+      );
   }
 
   private scheduleWriteBack(file: TFile): void {
