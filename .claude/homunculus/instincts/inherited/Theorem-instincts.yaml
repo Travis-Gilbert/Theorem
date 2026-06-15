@@ -1,0 +1,300 @@
+# Instincts generated from https://github.com/Travis-Gilbert/Theorem
+# Generated: 2026-06-15T20:15:24.738Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: Theorem-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/Theorem
+---
+
+# Theorem Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat
+
+## Evidence
+
+- 1 commits analyzed
+- Detected conventional commit pattern
+- Examples: feat(servo-browser): wire embedder controls and trim BLAS edge
+
+---
+id: Theorem-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/Theorem
+---
+
+# Theorem Commit Length
+
+## Action
+
+Write moderate-length commit messages (~62 characters)
+
+## Evidence
+
+- Average commit message length: 62 chars
+- Based on 1 commits
+
+---
+id: Theorem-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/Theorem
+---
+
+# Theorem Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: Theorem-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/Theorem
+---
+
+# Theorem Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: Theorem-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/Theorem
+---
+
+# Theorem Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: Theorem-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Travis-Gilbert/Theorem
+---
+
+# Theorem Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: theorem-instinct-file-naming
+trigger: "When creating a new file in the repository"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct File Naming
+
+## Action
+
+Name the file using camelCase convention
+
+## Evidence
+
+- Pattern in namingConventions.files: camelCase
+
+---
+id: theorem-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Function Naming
+
+## Action
+
+Use camelCase for the function name
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: theorem-instinct-class-naming
+trigger: "When creating a new class or struct"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Class Naming
+
+## Action
+
+Use PascalCase for the class or struct name
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: theorem-instinct-constant-naming
+trigger: "When declaring a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for the constant name
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: theorem-instinct-import-style
+trigger: "When importing modules in Rust code"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: theorem-instinct-export-style
+trigger: "When exporting items from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: theorem-instinct-commit-format
+trigger: "When making a git commit"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Commit Format
+
+## Action
+
+Format the commit message using the conventional commit style with the 'feat' prefix for new features
+
+## Evidence
+
+- Pattern in commits.type: conventional
+- Pattern in commits.prefixes: feat
+- Seen in commit example: 'feat(servo-browser): wire embedder controls and trim BLAS edge'
+
+---
+id: theorem-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Commit Length
+
+## Action
+
+Keep the commit message concise, around 62 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength: 62
+
+---
+id: theorem-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Travis-Gilbert/Theorem
+---
+
+# Theorem Instinct Test Location
+
+## Action
+
+Place test files in a separate location from source files
+
+## Evidence
+
+- Pattern in architecture.testLocation: separate
+
