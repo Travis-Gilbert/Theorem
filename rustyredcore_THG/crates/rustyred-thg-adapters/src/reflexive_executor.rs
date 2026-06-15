@@ -168,7 +168,8 @@ pub fn upsert_adapter_factors_sidecar<S: AdapterGraphStore>(
     factors: LowRankAdapterFactors,
     actor: Option<&str>,
 ) -> ThgResult<String> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    // Keep tenant raw for the property; adapter_factors_node_id normalizes once.
+    let tenant_id = tenant_id.trim().to_string();
     let factors = factors.validated()?;
     let node_id = adapter_factors_node_id(&tenant_id, &factors.adapter_id);
     let mut mutations = vec![GraphMutation::NodeUpsert(NodeRecord::new(
@@ -279,7 +280,9 @@ pub fn load_node_representation<S: ReflexiveReadStore>(
     tenant_id: &str,
     node_id: &str,
 ) -> ThgResult<Option<NodeRepresentation>> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    // Compare against the raw tenant stored in the sidecar property; the sidecar
+    // node id is normalized once by representation_sidecar_node_id at write time.
+    let tenant_id = tenant_id.trim().to_string();
     let hits = store
         .read_neighbors(NeighborQuery {
             node_id: node_id.to_string(),
@@ -1001,7 +1004,7 @@ fn load_promoted_pairformer_artifact<S: ReflexiveReadStore>(
     store: &S,
     tenant_id: &str,
 ) -> ThgResult<Option<PromotedPairformerArtifact>> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let hits = store
         .read_neighbors(NeighborQuery {
             node_id: tenant_node_id(&tenant_id),
@@ -1138,7 +1141,9 @@ pub fn reflexive_match_inference<S: ReflexiveReadStore>(
     request: DensificationRequest,
     config: PairformerConfig,
 ) -> ThgResult<MatchInferenceResult> {
-    let tenant_id = normalize_tenant_id(&request.tenant_id);
+    // Pass the raw tenant through to load_node_representation / load_adapter_factors;
+    // they and the *_node_id builders apply the single normalization.
+    let tenant_id = request.tenant_id.trim().to_string();
     let mut nodes = Vec::new();
     let mut edges: BTreeMap<String, EdgeRecord> = BTreeMap::new();
     let id_set = node_ids.iter().cloned().collect::<BTreeSet<_>>();

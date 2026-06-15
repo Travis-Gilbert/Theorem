@@ -20,7 +20,6 @@ use crate::reflexive::{
     aggregate_messages_fixed_point, choose_scatter_aggregation_path, InferredEdgeCandidate,
     ScatterAggregationPath, ScatterAggregationRequest, DEFAULT_FIXED_POINT_SCALE,
 };
-use crate::types::normalize_tenant_id;
 
 pub const DEFAULT_COMPLETION_HIDDEN_DIM: usize = 16;
 pub const DEFAULT_COMPLETION_LAYERS: usize = 3;
@@ -138,7 +137,7 @@ pub struct GlobalCompletionRequest {
 
 impl GlobalCompletionRequest {
     pub fn normalized(mut self) -> Self {
-        self.tenant_id = normalize_tenant_id(&self.tenant_id);
+        self.tenant_id = self.tenant_id.trim().to_string();
         self.seed_node_ids = self
             .seed_node_ids
             .into_iter()

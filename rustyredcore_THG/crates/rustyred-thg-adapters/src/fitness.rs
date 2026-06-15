@@ -42,7 +42,7 @@ pub fn list_adapters<S: AdapterGraphStore>(
     store: &S,
     req: AdapterListRequest,
 ) -> ThgResult<Vec<LoraAdapter>> {
-    let tenant_id = crate::types::normalize_tenant_id(&req.tenant_id);
+    let tenant_id = req.tenant_id.trim().to_string();
     let min_fitness = req
         .min_fitness
         .unwrap_or(DEFAULT_MIN_FITNESS)

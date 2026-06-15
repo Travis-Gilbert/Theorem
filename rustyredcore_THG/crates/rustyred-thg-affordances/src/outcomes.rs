@@ -18,7 +18,7 @@ use theorem_harness_core::AffordanceReceipt;
 
 use crate::types::{
     affordance_node_id, edge_with_affordance_provenance, invocation_receipt_node_id,
-    normalize_tenant_id, property_f32, property_i64, task_type_node_id, thg_error_from_store,
+    property_f32, property_i64, task_type_node_id, thg_error_from_store,
     Affordance, AffordanceGraphStore, InvocationRecordRequest, InvocationRecordResult,
     AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS, DEFAULT_FITNESS_EPSILON, DEFAULT_HALF_LIFE_DAYS,
     INVOCATION_RECEIPT_LABEL, PRODUCED_OUTCOME, SEQUENCED_WITH, SERVED_TASK, TASK_TYPE_LABEL,
@@ -31,7 +31,7 @@ pub fn record_invocation<S: AffordanceGraphStore>(
     req: InvocationRecordRequest,
     actor: Option<&str>,
 ) -> ThgResult<InvocationRecordResult> {
-    let tenant_id = normalize_tenant_id(&req.tenant_id);
+    let tenant_id = req.tenant_id.trim().to_string();
     let task_type = req.task_type.trim().to_string();
     let selected_id = req.selected_affordance_id.trim().to_string();
     if task_type.is_empty() {

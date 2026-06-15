@@ -12,6 +12,7 @@ pub mod fulltext;
 #[cfg(feature = "tantivy")]
 pub mod fulltext_tantivy;
 pub mod graph;
+pub mod graph_csr;
 pub mod graph_store;
 pub mod instant_kg;
 pub mod plugin;
@@ -40,6 +41,7 @@ pub use graph::{
     connected_components, expand_bounded, expand_bounded_weighted, label_propagation_communities,
     pagerank, paths_shortest, paths_shortest_weighted, personalized_pagerank, EdgeTuple,
 };
+pub use graph_csr::CsrGraph;
 pub use graph_store::{
     default_hybrid_edge_type_weights, edge_time_interval, manifest_version_compatible,
     node_is_expired, node_ttl_expires_at_ms, now_ms, read_manifest, sanitize_tenant_segment,
@@ -68,6 +70,7 @@ pub use spatial::{
     SpatialError, SpatialIndex, RUSTY_RED_SPATIAL_BACKEND_ENV,
 };
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};
+pub use store::{InMemoryThgStore, ThgStore};
 pub use symbolic::{
     derive_datalog_receipt, derive_datalog_receipt_from_json, evolution_archive,
     evolution_archive_from_json, probabilistic_expected_value,
@@ -76,13 +79,14 @@ pub use symbolic::{
     DATALOG_RULE_IDS,
 };
 pub use versioned_graph::{
-    build_prolly_tree, checkout_graph_version, compile_graph_pack, diff_graph_snapshots,
-    graph_version_log, merge_graph_snapshots, resolve_auto_confidence_edge,
-    snapshot_content_objects, update_graph_ref, CompiledGraphPack, GraphCheckoutResult,
-    GraphCommit, GraphCompileOptions, GraphCompilerCapability, GraphContentObject, GraphDiffEntry,
-    GraphMergeConflict, GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide,
-    GraphMergeStrategy, GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefUpdate,
+    apply_graph_mutation_batch, build_prolly_tree, checkout_graph_version, compile_graph_pack,
+    compile_graph_pack_incremental, diff_graph_snapshots, graph_version_log, merge_graph_snapshots,
+    resolve_auto_confidence_edge, snapshot_content_objects, update_graph_ref, update_graph_ref_cas,
+    CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
+    GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
+    GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide, GraphMergeStrategy,
+    GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefConflict, GraphRefUpdate,
     GraphTreeChild, GraphTreeEntry, GraphTreeNode, GraphVersionDiff, GraphVersionLog,
-    GraphVersionRef, GraphVersionRepository, DEFAULT_GRAPH_BRANCH, GRAPH_PACK_COMPILER_VERSION,
-    VERSIONED_GRAPH_PROTOCOL_VERSION,
+    GraphVersionRef, GraphVersionRepository, IncrementalGraphPack, DEFAULT_GRAPH_BRANCH,
+    GRAPH_PACK_COMPILER_VERSION, VERSIONED_GRAPH_PROTOCOL_VERSION,
 };

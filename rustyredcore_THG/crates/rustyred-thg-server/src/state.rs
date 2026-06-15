@@ -2453,7 +2453,7 @@ mod tests {
 
         assert_eq!(
             state.tenant_state_key("Tenant.One!"),
-            "rusty-red:TenantOne:state:v1"
+            "rusty-red:pct_Tenant.One%21:state:v1"
         );
     }
 

@@ -11,7 +11,7 @@ use rustyred_thg_core::{GraphMutation, GraphMutationBatch, NodeRecord, ThgResult
 use theorem_harness_core::default_affordance_registry;
 
 use crate::types::{
-    connector_node_id, edge_with_affordance_provenance, normalize_tenant_id, tenant_node_id,
+    connector_node_id, edge_with_affordance_provenance, tenant_node_id,
     thg_error_from_store, Affordance, AffordanceGraphStore, AffordanceUpsertResult,
     ConnectorManifest, ConnectorRegisterResult, ToolManifest, CONNECTOR_LABEL,
     DEFAULT_HALF_LIFE_DAYS, OFFERS, TENANT_LABEL, THG_AFFORDANCE_SOURCE,
@@ -82,7 +82,7 @@ pub fn register_connector_with_target<S: AffordanceGraphStore>(
     connection_target: Option<Value>,
     actor: Option<&str>,
 ) -> ThgResult<ConnectorRegisterResult> {
-    let tenant_id = normalize_tenant_id(&manifest.tenant_id);
+    let tenant_id = manifest.tenant_id.trim().to_string();
     let server_id = manifest.server_id.trim().to_string();
     if server_id.is_empty() {
         return Err(rustyred_thg_core::ThgError::new(
@@ -226,7 +226,7 @@ pub fn register_theseus_app_affordances<S: AffordanceGraphStore>(
     tenant_id: &str,
     actor: Option<&str>,
 ) -> ThgResult<ConnectorRegisterResult> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let connector_node = connector_node_id(&tenant_id, THEOREM_GRPC_SERVER_ID);
     let affordances = theseus_app_affordances(&tenant_id);
 
@@ -294,7 +294,7 @@ pub fn register_theseus_app_affordances<S: AffordanceGraphStore>(
 }
 
 pub fn theseus_app_affordances(tenant_id: &str) -> Vec<Affordance> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     theseus_app_specs()
         .iter()
         .map(|spec| spec.to_affordance(&tenant_id))
@@ -310,7 +310,7 @@ pub fn connector_connection_target<S: AffordanceGraphStore>(
     tenant_id: &str,
     server_id: &str,
 ) -> ThgResult<Option<Value>> {
-    let connector_node = connector_node_id(&normalize_tenant_id(tenant_id), server_id.trim());
+    let connector_node = connector_node_id(tenant_id.trim(), server_id.trim());
     Ok(store
         .get_node(&connector_node)
         .map_err(thg_error_from_store)?
@@ -325,7 +325,7 @@ pub fn register_builtin_affordances<S: AffordanceGraphStore>(
     tenant_id: &str,
     actor: Option<&str>,
 ) -> ThgResult<ConnectorRegisterResult> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let mut mutations = vec![GraphMutation::NodeUpsert(NodeRecord::new(
         tenant_node_id(&tenant_id),
         [TENANT_LABEL],

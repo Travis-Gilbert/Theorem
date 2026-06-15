@@ -154,7 +154,9 @@ pub struct SimilarSituationSearchRequest {
 
 impl SimilarSituationSearchRequest {
     pub fn normalized(mut self) -> Self {
-        self.tenant_id = normalize_tenant_id(&self.tenant_id);
+        // Tenant stays raw; tenant_node_id / *_node_id builders normalize once
+        // when constructing keys, and property comparisons use the raw tenant.
+        self.tenant_id = self.tenant_id.trim().to_string();
         self.query_text = self
             .query_text
             .map(|text| text.trim().to_string())
@@ -381,7 +383,7 @@ pub fn score_context_atoms(
     candidates: Vec<ContextAtomCandidate>,
     policy: ContextScoringPolicy,
 ) -> ThgResult<ContextScoringResult> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let policy = normalize_context_scoring_policy(policy);
     let mut candidates_by_id = HashMap::new();
     for candidate in candidates {
@@ -525,7 +527,7 @@ pub fn record_context_use_outcome<S: AdapterGraphStore>(
     note: Option<&str>,
     actor: Option<&str>,
 ) -> ThgResult<String> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let context_pack_node_id = context_pack_node_id.trim();
     let outcome_id = outcome_id.trim();
     if context_pack_node_id.is_empty() || outcome_id.is_empty() {
@@ -596,7 +598,7 @@ pub fn enrich_context_candidates_from_store<S: crate::reflexive_executor::Reflex
 ) -> ThgResult<Vec<ContextAtomCandidate>> {
     use rustyred_thg_core::{Direction, NeighborQuery};
 
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let now = u64::try_from(now_ms()).unwrap_or(0);
     let mut enriched = Vec::with_capacity(candidates.len());
     for mut candidate in candidates {

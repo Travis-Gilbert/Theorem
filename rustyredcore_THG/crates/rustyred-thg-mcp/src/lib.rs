@@ -11,11 +11,11 @@ use ensemble::{
 };
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
-    merge_graph_snapshots, update_graph_ref, CodeKgManifest, Direction, EdgeRecord, EpistemicType,
-    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
-    GraphStoreResult, GraphVersionRepository, HarnessInstantKg, HybridScoringConfig,
-    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
-    SessionDelta, VectorDesignation, VerifyReport,
+    merge_graph_snapshots, update_graph_ref_cas, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore,
+    GraphStoreError, GraphStoreResult, GraphVersionRepository, HarnessInstantKg,
+    HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    RedCoreGraphStore, SessionDelta, VectorDesignation, VerifyReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -811,10 +811,26 @@ fn call_tool<P: McpGraphProvider>(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let updated_at_unix_ms = arguments.get("updated_at_unix_ms").and_then(Value::as_u64);
+            let expected_commit_hash = arguments
+                .get("expected_commit_hash")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let pack = compile_graph_pack(&snapshot, options);
+            let ref_update = update_graph_ref_cas(
+                repository,
+                pack,
+                branch,
+                expected_commit_hash,
+                updated_at_unix_ms.map(u128::from),
+            )
+            .map_err(|conflict| McpError {
+                code: -32009,
+                message: conflict.message.clone(),
+                data: Some(json!({ "conflict": conflict })),
+            })?;
             json!({
                 "tenant": tenant,
-                "ref_update": update_graph_ref(repository, pack, branch, updated_at_unix_ms.map(u128::from))
+                "ref_update": ref_update
             })
         }
         "rustyred_thg_graph_version_log"
