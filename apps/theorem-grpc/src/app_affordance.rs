@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use rustyred_thg_affordances::THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS;
 use rustyred_thg_affordances::{
     record_invocation, register_theseus_app_affordances, select_affordances,
     theorem_grpc_timeout_ms, theseus_app_affordances, Affordance, AffordanceGraphStore,
     CapabilityScope, InvocationRecordRequest, InvocationRecordResult, SelectionRequest,
-    THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS, THEOREM_GRPC_MAX_TIMEOUT_MS,
+    THEOREM_GRPC_MAX_TIMEOUT_MS,
 };
 use rustyred_thg_core::{stable_hash, RedCoreDurability, RedCoreGraphStore, RedCoreOptions};
 use serde_json::{json, Map, Value};
@@ -22,9 +24,9 @@ use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
 
 use crate::code_index::{
-    is_fetchable_repo_url, CodeContextInput, CodeIndexRuntime, ExplainCodeInput, ExploreCodeInput,
-    IngestCodebaseInput, IngestJobRequest, RecognizeCodeInput, RecordUseReceiptInput,
-    RepoFetchCaps, SearchCodeInput,
+    is_fetchable_repo_url, CodeContextInput, CodeIndexRuntime, CodeKgStatusInput, ExplainCodeInput,
+    ExploreCodeInput, IngestCodebaseInput, IngestJobRequest, ListReposInput, RecognizeCodeInput,
+    RecordUseReceiptInput, RepoFetchCaps, SearchCodeInput,
 };
 use crate::code_kg::{self, ContextPackInput, SessionReingestInput};
 use crate::pb;
@@ -160,7 +162,11 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
                       THEOREM_TENANT_ID (code ops have no default tenant)"
                 .to_string(),
             actor,
-            request: request_json.as_ref().ok().cloned().unwrap_or_else(|| json!({})),
+            request: request_json
+                .as_ref()
+                .ok()
+                .cloned()
+                .unwrap_or_else(|| json!({})),
             dry_run: req.dry_run,
             confirmed: req.confirmed,
             timeout_ms,
@@ -1750,11 +1756,11 @@ mod tests {
         submit_output_json: &str,
     ) -> Value {
         let submitted: Value = serde_json::from_str(submit_output_json).unwrap();
-        let job_id = submitted["job_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(!job_id.is_empty(), "submit ack carries a job_id: {submitted}");
+        let job_id = submitted["job_id"].as_str().unwrap_or_default().to_string();
+        assert!(
+            !job_id.is_empty(),
+            "submit ack carries a job_id: {submitted}"
+        );
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let status = runtime
@@ -1943,7 +1949,7 @@ mod tests {
         assert!(ingest.output_json.contains("\"submitted\":true"));
         assert!(ingest.output_json.contains("\"timeout_ms\":180000"));
         assert!(ingest.output_json.contains("\"graph_invocation\""));
-        let ingest_output = wait_for_ingest_output(&runtime, "theorem", &ingest.output_json);
+        let ingest_output = wait_for_ingest_output(&runtime, "smoke", &ingest.output_json);
         assert_eq!(ingest_output["files_indexed"], json!(1));
 
         let search = runtime
@@ -2359,9 +2365,12 @@ mod tests {
             .unwrap();
         assert_eq!(ingest.status, "ok");
         let submit_ack: Value = serde_json::from_str(&ingest.output_json).unwrap();
-        assert_eq!(submit_ack["timeout_ms"], THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS);
+        assert_eq!(
+            submit_ack["timeout_ms"],
+            THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS
+        );
         assert_eq!(submit_ack["submitted"], json!(true));
-        let output = wait_for_ingest_output(&runtime, "theorem", &ingest.output_json);
+        let output = wait_for_ingest_output(&runtime, "smoke", &ingest.output_json);
         assert_eq!(output["files_indexed"], json!(1));
         assert!(output["repo_id"]
             .as_str()
@@ -2405,7 +2414,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ingest.status, "ok");
-        let ingest_output = wait_for_ingest_output(&runtime, "theorem", &ingest.output_json);
+        let ingest_output = wait_for_ingest_output(&runtime, "smoke", &ingest.output_json);
         assert!(
             ingest_output["files_indexed"].as_u64().unwrap_or_default() >= 3,
             "{ingest_output}"

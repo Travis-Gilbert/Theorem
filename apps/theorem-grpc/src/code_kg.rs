@@ -13,9 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rustyred_thg_core::{
-    CodeKgManifest, Direction, HarnessInstantKg, NodeRecord, SessionDelta,
-};
+use rustyred_thg_core::{CodeKgManifest, Direction, HarnessInstantKg, NodeRecord, SessionDelta};
 use serde_json::{json, Value};
 
 use crate::code_index::{
@@ -257,7 +255,10 @@ fn is_symbol(node: &NodeRecord) -> bool {
 }
 
 fn prop_str<'a>(node: &'a NodeRecord, key: &str) -> &'a str {
-    node.properties.get(key).and_then(Value::as_str).unwrap_or("")
+    node.properties
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
 fn node_name(node: &NodeRecord) -> String {
@@ -278,7 +279,11 @@ fn file_line(node: &NodeRecord) -> String {
     } else {
         prop_str(node, "path")
     };
-    let line = node.properties.get("line").and_then(Value::as_u64).unwrap_or(0);
+    let line = node
+        .properties
+        .get("line")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if line > 0 {
         format!("{path}:{line}")
     } else {
@@ -429,8 +434,10 @@ pub fn context_pack(
     let base_building = base_objects == 0;
 
     if base_building {
-        lines.push("_Code KG base is still building (0 indexed objects); lexical fallback only._"
-            .to_string());
+        lines.push(
+            "_Code KG base is still building (0 indexed objects); lexical fallback only._"
+                .to_string(),
+        );
     }
 
     // Impact block first: the accuracy mechanism (load-bearing callers before edits).
@@ -511,7 +518,10 @@ fn impact_block(
         if names.is_empty() {
             continue;
         }
-        out.push(format!("- editing `{from_name}` reaches: {}", names.join(", ")));
+        out.push(format!(
+            "- editing `{from_name}` reaches: {}",
+            names.join(", ")
+        ));
     }
     out
 }
@@ -540,7 +550,10 @@ fn edge_why(
     for seed in seed_ids {
         for edge in kg.get_edges_from(seed) {
             if edge.to_id == hit_id {
-                let src = name_by_id.get(seed).cloned().unwrap_or_else(|| seed.clone());
+                let src = name_by_id
+                    .get(seed)
+                    .cloned()
+                    .unwrap_or_else(|| seed.clone());
                 return Some(format!("{src} {} this", edge.edge_type));
             }
         }

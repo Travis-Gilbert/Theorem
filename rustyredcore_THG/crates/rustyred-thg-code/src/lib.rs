@@ -16,8 +16,8 @@ use rustyred_thg_core::{
     now_ms, stable_hash, CodeKgManifest, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
     GraphSnapshot, GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord,
     PluginCapability, PluginCapabilityKind, PluginExecutionOutput, PluginOperationContext,
-    PluginOperationRegistration, PluginRegistry, RedCoreDurability, RedCoreGraphStore,
-    RedCoreOptions, RustyRedPlugin,
+    PluginOperationRegistration, PluginRegistry, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+    RustyRedPlugin,
 };
 use serde_json::{json, Value};
 use syn::visit::Visit;
@@ -486,11 +486,7 @@ impl CodeIndexRuntime {
     /// AM2 bridge accessor: the code-graph-backed base snapshot for a repo, for
     /// callers (theorem-grpc session_reingest / context_pack) that overlay a
     /// `SessionDelta` on it via `HarnessInstantKg`.
-    pub fn code_graph_snapshot(
-        &self,
-        tenant_id: &str,
-        repo_id: &str,
-    ) -> Result<GraphSnapshot, CodeIndexError> {
+    pub fn code_graph_snapshot(&self, tenant_id: &str, repo_id: &str) -> Result<GraphSnapshot, CodeIndexError> {
         let store = self.lock_store()?;
         Ok(code_graph_snapshot_in_store(&store, tenant_id, repo_id))
     }
@@ -1237,10 +1233,7 @@ pub(crate) fn ingest_output_from_json(value: &Value) -> Option<IngestCodebaseOut
             language_stats.insert(
                 language.clone(),
                 LanguageIngestStats {
-                    files_indexed: stats
-                        .get("files_indexed")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
+                    files_indexed: stats.get("files_indexed").and_then(Value::as_u64).unwrap_or(0),
                     symbols_indexed: stats
                         .get("symbols_indexed")
                         .and_then(Value::as_u64)
@@ -2056,18 +2049,10 @@ pub(crate) fn load_prior_generation_snapshot(
     if repo_id.is_empty() {
         return Ok(None);
     }
-    let Some(repo_node) = store
-        .get_node(repo_id)
-        .map_err(CodeIndexError::from_store)?
-    else {
+    let Some(repo_node) = store.get_node(repo_id).map_err(CodeIndexError::from_store)? else {
         return Ok(None);
     };
-    if repo_node
-        .properties
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        != Some(tenant_id)
-    {
+    if repo_node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id) {
         return Ok(None);
     }
     let Some(generation) = property_u64(&repo_node.properties, "latest_generation") else {
@@ -2136,24 +2121,6 @@ pub(crate) fn load_prior_generation_snapshot(
         });
     }
     Ok(Some(PriorGenerationSnapshot { generation, files }))
-}
-
-fn prepare_codebase_ingest(
-    input: IngestCodebaseInput,
-    _operation: &str,
-    clone_ms: u64,
-) -> Result<PreparedCodebaseIngest, CodeIndexError> {
-    let started = Instant::now();
-    let resolve_started = Instant::now();
-    let config = resolve_ingest_config(input)?;
-    let resolve_ms = elapsed_ms(resolve_started);
-    prepare_codebase_ingest_resolved(
-        config,
-        clone_ms,
-        resolve_ms,
-        started,
-        IngestPipelineOptions::sync_default(None),
-    )
 }
 
 fn snapshot_for_operation(
@@ -2339,10 +2306,7 @@ pub(crate) fn prepare_codebase_ingest_resolved(
     // the new generation (moved-target stale edges are left at the old
     // generation and retired by the latest-generation traversal filter).
     let mut mutations = build_node_mutations(&config, &files);
-    mutations.extend(carried_forward_mutations(
-        &carried_entries,
-        config.generation,
-    ));
+    mutations.extend(carried_forward_mutations(&carried_entries, config.generation));
     for edge in infer_symbol_call_edges(&all_files, &config) {
         mutations.push(GraphMutation::EdgeUpsert(edge));
     }
@@ -2350,11 +2314,8 @@ pub(crate) fn prepare_codebase_ingest_resolved(
 
     let files_parsed = files.len() as u64;
     let files_carried = carried_entries.len() as u64;
-    let symbols_indexed = files
-        .iter()
-        .map(|file| file.symbols.len() as u64)
-        .sum::<u64>()
-        + carried_symbol_count;
+    let symbols_indexed =
+        files.iter().map(|file| file.symbols.len() as u64).sum::<u64>() + carried_symbol_count;
     let language_stats = language_stats_for(&files);
 
     Ok(PreparedCodebaseIngest {
@@ -2394,9 +2355,7 @@ fn carried_forward_mutations(entries: &[&PriorFileEntry], generation: u64) -> Ve
             generation,
         )));
         for symbol in &entry.symbol_nodes {
-            mutations.push(GraphMutation::NodeUpsert(restamped_node(
-                symbol, generation,
-            )));
+            mutations.push(GraphMutation::NodeUpsert(restamped_node(symbol, generation)));
         }
     }
     mutations
@@ -2460,14 +2419,10 @@ fn reconstruct_carried_file(
     let rel_path = property_string(file_props, "path").unwrap_or_default();
     let language = property_string(file_props, "language").unwrap_or_default();
     let extension = property_string(file_props, "extension").unwrap_or_default();
-    let file_id =
-        property_string(file_props, "file_id").unwrap_or_else(|| entry.file_node.id.clone());
+    let file_id = property_string(file_props, "file_id").unwrap_or_else(|| entry.file_node.id.clone());
 
     let text = carried_text.get(&entry.content_hash).cloned();
-    let lines: Vec<&str> = text
-        .as_deref()
-        .map(|t| t.lines().collect())
-        .unwrap_or_default();
+    let lines: Vec<&str> = text.as_deref().map(|t| t.lines().collect()).unwrap_or_default();
 
     let mut symbols = Vec::with_capacity(entry.symbol_nodes.len());
     for (index, node) in entry.symbol_nodes.iter().enumerate() {
@@ -2478,11 +2433,7 @@ fn reconstruct_carried_file(
         let next_line = entry
             .symbol_nodes
             .get(index + 1)
-            .map(|next| {
-                property_u64(&next.properties, "line")
-                    .unwrap_or(0)
-                    .saturating_sub(1)
-            })
+            .map(|next| property_u64(&next.properties, "line").unwrap_or(0).saturating_sub(1))
             .unwrap_or(lines.len() as u64);
         let body = if lines.is_empty() {
             String::new()
@@ -3125,11 +3076,7 @@ fn collect_code_file_candidates(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
-                    accumulator
-                        .lock()
-                        .expect("walk accumulator")
-                        .skips
-                        .read_error += 1;
+                    accumulator.lock().expect("walk accumulator").skips.read_error += 1;
                     return ignore::WalkState::Continue;
                 }
             };
@@ -3160,20 +3107,12 @@ fn collect_code_file_candidates(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(_) => {
-                    accumulator
-                        .lock()
-                        .expect("walk accumulator")
-                        .skips
-                        .read_error += 1;
+                    accumulator.lock().expect("walk accumulator").skips.read_error += 1;
                     return ignore::WalkState::Continue;
                 }
             };
             if metadata.len() > config.max_file_bytes {
-                accumulator
-                    .lock()
-                    .expect("walk accumulator")
-                    .skips
-                    .too_large += 1;
+                accumulator.lock().expect("walk accumulator").skips.too_large += 1;
                 return ignore::WalkState::Continue;
             }
             match has_null_byte_prefix(path) {
@@ -3183,20 +3122,12 @@ fn collect_code_file_candidates(
                 }
                 Ok(false) => {}
                 Err(_) => {
-                    accumulator
-                        .lock()
-                        .expect("walk accumulator")
-                        .skips
-                        .read_error += 1;
+                    accumulator.lock().expect("walk accumulator").skips.read_error += 1;
                     return ignore::WalkState::Continue;
                 }
             }
             let Ok(rel_path) = relative_path(&config.repo_root, path) else {
-                accumulator
-                    .lock()
-                    .expect("walk accumulator")
-                    .skips
-                    .read_error += 1;
+                accumulator.lock().expect("walk accumulator").skips.read_error += 1;
                 return ignore::WalkState::Continue;
             };
             let mut state = accumulator.lock().expect("walk accumulator");
@@ -4179,20 +4110,10 @@ fn enrich_symbol_graph(
         neighbor_symbol_names(store, &symbol.node_id, Direction::Out, CALLS_SYMBOL, latest)?;
     symbol.callers =
         neighbor_symbol_names(store, &symbol.node_id, Direction::In, CALLS_SYMBOL, latest)?;
-    symbol.dependencies = neighbor_symbol_names(
-        store,
-        &symbol.node_id,
-        Direction::Out,
-        DEPENDS_ON_SYMBOL,
-        latest,
-    )?;
-    symbol.dependents = neighbor_symbol_names(
-        store,
-        &symbol.node_id,
-        Direction::In,
-        DEPENDS_ON_SYMBOL,
-        latest,
-    )?;
+    symbol.dependencies =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::Out, DEPENDS_ON_SYMBOL, latest)?;
+    symbol.dependents =
+        neighbor_symbol_names(store, &symbol.node_id, Direction::In, DEPENDS_ON_SYMBOL, latest)?;
     Ok(())
 }
 
@@ -5288,11 +5209,7 @@ mod tests {
         );
 
         // v2: add mystery.py defining `mystery`. caller.py is unchanged (carried).
-        fs::write(
-            repo_dir.join("mystery.py"),
-            "def mystery():\n    return 7\n",
-        )
-        .unwrap();
+        fs::write(repo_dir.join("mystery.py"), "def mystery():\n    return 7\n").unwrap();
         let reindexed = reindex_codebase_in_store(&mut store, input(&repo_dir)).unwrap();
         assert_eq!(reindexed.files_parsed, 1, "only mystery.py extracted");
         assert_eq!(reindexed.files_carried, 1, "caller.py carried");
@@ -5377,16 +5294,8 @@ mod tests {
         fs::create_dir_all(repo_dir.join("generated")).unwrap();
         fs::write(repo_dir.join(".gitignore"), "generated/\nsecret.py\n").unwrap();
         fs::write(repo_dir.join("src/lib.rs"), "pub fn keep_me() {}\n").unwrap();
-        fs::write(
-            repo_dir.join("generated/output.py"),
-            "def drop_me():\n    pass\n",
-        )
-        .unwrap();
-        fs::write(
-            repo_dir.join("secret.py"),
-            "def also_dropped():\n    pass\n",
-        )
-        .unwrap();
+        fs::write(repo_dir.join("generated/output.py"), "def drop_me():\n    pass\n").unwrap();
+        fs::write(repo_dir.join("secret.py"), "def also_dropped():\n    pass\n").unwrap();
 
         let mut store = RedCoreGraphStore::memory();
         let ingest = ingest_codebase_in_store(
@@ -5507,9 +5416,7 @@ mod tests {
             .unwrap();
         assert_eq!(files.len() as u64, ingest.files_indexed);
         assert!(
-            files
-                .iter()
-                .all(|node| node.properties.get("text").is_none()),
+            files.iter().all(|node| node.properties.get("text").is_none()),
             "CodeFile nodes carry no inline text"
         );
         let texts = store
@@ -5636,14 +5543,8 @@ mod tests {
             }
         }
         let position = |label: &str| labels.iter().position(|item| *item == label);
-        assert!(
-            position("walk_done") < position("parse_progress"),
-            "{labels:?}"
-        );
-        assert!(
-            position("parse_progress") < position("commit_done"),
-            "{labels:?}"
-        );
+        assert!(position("walk_done") < position("parse_progress"), "{labels:?}");
+        assert!(position("parse_progress") < position("commit_done"), "{labels:?}");
         assert_eq!(labels.last(), Some(&"finished"), "{labels:?}");
 
         let done = runtime.ingest_job_status(&submitted.job_id).unwrap();
@@ -5728,10 +5629,7 @@ mod tests {
         assert_eq!(output.repo_id, "repo:durable-finished");
         let (events, terminal) = second.ingest_jobs().events_after(&job_id, 0).unwrap();
         assert!(terminal);
-        assert_eq!(
-            events.last().map(|event| event.kind.label()),
-            Some("finished")
-        );
+        assert_eq!(events.last().map(|event| event.kind.label()), Some("finished"));
 
         drop(second);
         fs::remove_dir_all(repo_dir).ok();

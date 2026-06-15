@@ -34,7 +34,12 @@ impl TheoremCodeCrawlerService {
         Self { runtime }
     }
 
-    fn submit(&self, input: IngestCodebaseInput, repo_url: String, operation: &str) -> IngestJobStatus {
+    fn submit(
+        &self,
+        input: IngestCodebaseInput,
+        repo_url: String,
+        operation: &str,
+    ) -> IngestJobStatus {
         let caps = RepoFetchCaps::from_requested(input.max_total_bytes);
         self.runtime.submit_ingest_job(IngestJobRequest {
             input,
@@ -281,9 +286,8 @@ fn submission_ack(status: IngestJobStatus) -> pb::IngestCodebaseResponse {
         tenant_id: status.tenant_id,
         repo_id: status.repo_id,
         status: "submitted".to_string(),
-        message:
-            "ingest job submitted; stream WatchIngest(job_id) or poll GetIngestStatus(job_id)"
-                .to_string(),
+        message: "ingest job submitted; stream WatchIngest(job_id) or poll GetIngestStatus(job_id)"
+            .to_string(),
         job_id: status.job_id,
         ..Default::default()
     }
@@ -613,7 +617,10 @@ mod tests {
                     assert_eq!(output.status, "ok");
                     assert_eq!(output.files_indexed, 1);
                     assert_eq!(output.files_parsed, 1);
-                    assert!(finished.stage_timings.is_some(), "stage timings ride the final event");
+                    assert!(
+                        finished.stage_timings.is_some(),
+                        "stage timings ride the final event"
+                    );
                     "finished"
                 }
                 pb::code::ingest_event::Event::Failed(failed) => {
@@ -623,8 +630,14 @@ mod tests {
             labels.push(label);
         }
         let position = |label: &str| labels.iter().position(|item| *item == label);
-        assert!(position("walk_done") < position("parse_progress"), "{labels:?}");
-        assert!(position("parse_progress") < position("commit_done"), "{labels:?}");
+        assert!(
+            position("walk_done") < position("parse_progress"),
+            "{labels:?}"
+        );
+        assert!(
+            position("parse_progress") < position("commit_done"),
+            "{labels:?}"
+        );
         assert_eq!(labels.last(), Some(&"finished"), "{labels:?}");
 
         let status = service
