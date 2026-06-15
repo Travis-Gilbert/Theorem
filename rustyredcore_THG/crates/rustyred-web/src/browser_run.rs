@@ -21,6 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::browser_automation::ActionabilityVerdict;
 use crate::browser_engine::PageState;
 use crate::browser_perception::{A11yDiff, A11yTreeUpdate, AccessibilityReader};
 
@@ -33,7 +34,11 @@ pub enum BrowsingRunStep {
     /// An action was issued to the engine, recorded by its display label (e.g.
     /// `"Click 42"`). A marker, so the replay shows what the agent did between
     /// observations without coupling this module to the `BrowserAction` enum.
-    Action { label: String },
+    Action {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actionability: Option<ActionabilityVerdict>,
+    },
     /// The engine reported layout/paint quiescence (the job-008 D2 settle signal).
     Settle,
 }
@@ -59,6 +64,20 @@ impl BrowsingRunRecorder {
     pub fn record_action(&mut self, label: impl Into<String>) {
         self.steps.push(BrowsingRunStep::Action {
             label: label.into(),
+            actionability: None,
+        });
+    }
+
+    /// Record an action with its Playwright-style actionability verdict. This
+    /// is the flaky-action proof: the trace shows which check gated or passed.
+    pub fn record_actionability(
+        &mut self,
+        label: impl Into<String>,
+        actionability: ActionabilityVerdict,
+    ) {
+        self.steps.push(BrowsingRunStep::Action {
+            label: label.into(),
+            actionability: Some(actionability),
         });
     }
 
@@ -140,7 +159,7 @@ impl BrowsingRunRecord {
                     diffs.push(reader.apply_update(update.clone()));
                     page_states.push(reader.page_state());
                 }
-                BrowsingRunStep::Action { label } => actions.push(label.clone()),
+                BrowsingRunStep::Action { label, .. } => actions.push(label.clone()),
                 BrowsingRunStep::Settle => settle_at.push(index),
             }
         }
@@ -174,7 +193,7 @@ impl BrowsingRunRecord {
                         result.push(PostActionDiff { action, diff });
                     }
                 }
-                BrowsingRunStep::Action { label } => pending_action = Some(label.clone()),
+                BrowsingRunStep::Action { label, .. } => pending_action = Some(label.clone()),
                 BrowsingRunStep::Settle => {}
             }
         }
@@ -230,6 +249,7 @@ fn content_address(steps: &[BrowsingRunStep]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser_automation::{Actionability, ActionabilityCheck, ActionabilityVerdict};
     use crate::browser_perception::{A11yNode, A11yRect, A11yTreeUpdate};
 
     fn node(id: u64, role: &str) -> A11yNode {
@@ -413,6 +433,35 @@ mod tests {
         assert_eq!(pairs[0].diff.changed, vec![3]);
         assert!(pairs[0].diff.added.is_empty());
         assert!(pairs[0].diff.removed.is_empty());
+    }
+
+    #[test]
+    fn actionability_verdicts_are_recorded_on_action_steps() {
+        let verdict = ActionabilityVerdict {
+            passed: false,
+            attempts: 2,
+            checks: Actionability {
+                attached: true,
+                visible: true,
+                stable: true,
+                enabled: true,
+                editable: false,
+                receives_events: false,
+            },
+            missing: vec![ActionabilityCheck::ReceivesEvents],
+        };
+        let mut recorder = BrowsingRunRecorder::new();
+        recorder.record_observe(page("first", "Save"));
+        recorder.record_actionability("Click 3", verdict.clone());
+        let record = recorder.finish();
+        match &record.steps[1] {
+            BrowsingRunStep::Action {
+                actionability: Some(recorded),
+                ..
+            } => assert_eq!(recorded, &verdict),
+            other => panic!("expected actionability verdict, got {other:?}"),
+        }
+        assert_eq!(record.replay().actions, vec!["Click 3".to_string()]);
     }
 
     #[test]

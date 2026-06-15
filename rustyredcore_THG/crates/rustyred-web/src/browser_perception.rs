@@ -428,8 +428,11 @@ fn interactive_element_for(node: &A11yNode) -> Option<InteractiveElement> {
         role,
         name,
         value,
+        test_id: None,
         bbox,
         visible,
+        enabled: true,
+        editable: role_is_editable(&node.role),
         degraded,
     })
 }
@@ -531,6 +534,10 @@ fn normalize_role(role: &str) -> &'static str {
         "ColorWell" => "colorpicker",
         _ => "generic",
     }
+}
+
+fn role_is_editable(role: &str) -> bool {
+    matches!(normalize_role(role), "textbox" | "searchbox" | "password")
 }
 
 /// The median of a set of values (0.0 if empty). Sorts the slice in place.

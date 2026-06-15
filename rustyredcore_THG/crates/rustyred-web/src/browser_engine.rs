@@ -53,8 +53,14 @@ pub struct InteractiveElement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bbox: Option<ElementBox>,
     pub visible: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub editable: bool,
     /// job-007 D5: the engine has not yet rolled a proper interactive role or
     /// bounds for this node, so it is surfaced degraded. A degraded element is
     /// still operable (keyboard fallback), but the driving model should prefer
@@ -117,6 +123,9 @@ pub enum BrowserAction {
     SelectOption {
         element_id: String,
         value: String,
+    },
+    Hover {
+        element_id: String,
     },
     Scroll {
         delta: i32,
@@ -251,6 +260,10 @@ impl FetchCascadeBrowserEngine {
             .ok_or(BrowserEngineError::NoCurrentPage)
     }
 
+    pub fn seed_page_state(&mut self, page: PageState) {
+        self.replace_current_or_push(page);
+    }
+
     pub async fn act(
         &mut self,
         action: BrowserAction,
@@ -344,6 +357,24 @@ impl FetchCascadeBrowserEngine {
             }
             BrowserAction::SelectOption { element_id, value } => {
                 self.apply_select(element_id, value, &domain, policy, &mut receipt)?
+            }
+            BrowserAction::Hover { element_id } => {
+                let element = current
+                    .interactive_elements
+                    .iter()
+                    .find(|element| &element.element_id == element_id)
+                    .ok_or_else(|| BrowserEngineError::ElementNotFound {
+                        element_id: element_id.clone(),
+                    })?;
+                receipt = json!({
+                    "engine": "fetch_cascade_browser_engine",
+                    "executor": "hover",
+                    "element_id": element.element_id,
+                    "bbox": element.bbox,
+                    "degraded": element.degraded,
+                    "accesskit_action": "accesskit_action_request_pending"
+                });
+                current.clone()
             }
             BrowserAction::SendKeys { sequence } => {
                 let resolved = policy
@@ -516,6 +547,18 @@ impl FetchCascadeBrowserEngine {
         self.store_active_tab_page(&page);
         if let Some(slot) = self.history.get_mut(self.history_index) {
             *slot = page;
+        }
+    }
+
+    fn replace_current_or_push(&mut self, page: PageState) {
+        if self.history.is_empty() {
+            let mut page = page;
+            self.stamp_active_tab(&mut page);
+            self.history.push(page.clone());
+            self.history_index = 0;
+            self.store_active_tab_page(&page);
+        } else {
+            self.replace_current(page);
         }
     }
 
@@ -773,8 +816,11 @@ fn extract_interactive_elements(
                         role: "link".to_string(),
                         name: element_name(el, joined.as_deref().unwrap_or("link")),
                         value: joined,
+                        test_id: test_id(el),
                         bbox: None,
                         visible: !has_hidden_attribute(el),
+                        enabled: !has_disabled_attribute(el),
+                        editable: false,
                         degraded: false,
                     });
                     Ok(())
@@ -787,8 +833,11 @@ fn extract_interactive_elements(
                         role: "button".to_string(),
                         name: element_name(el, "button"),
                         value: el.get_attribute("value"),
+                        test_id: test_id(el),
                         bbox: None,
                         visible: !has_hidden_attribute(el),
+                        enabled: !has_disabled_attribute(el),
+                        editable: false,
                         degraded: false,
                     });
                     Ok(())
@@ -799,13 +848,17 @@ fn extract_interactive_elements(
                     let input_type = el
                         .get_attribute("type")
                         .unwrap_or_else(|| "text".to_string());
+                    let readonly = has_readonly_attribute(el);
                     borrowed.push(InteractiveElement {
                         element_id: format!("e{index}"),
-                        role: input_type,
+                        role: input_type.clone(),
                         name: element_name(el, "input"),
                         value: el.get_attribute("value"),
+                        test_id: test_id(el),
                         bbox: None,
                         visible: !has_hidden_attribute(el),
+                        enabled: !has_disabled_attribute(el),
+                        editable: !readonly && input_type_is_editable(&input_type),
                         degraded: false,
                     });
                     Ok(())
@@ -818,8 +871,11 @@ fn extract_interactive_elements(
                         role: "select".to_string(),
                         name: element_name(el, "select"),
                         value: el.get_attribute("value"),
+                        test_id: test_id(el),
                         bbox: None,
                         visible: !has_hidden_attribute(el),
+                        enabled: !has_disabled_attribute(el),
+                        editable: false,
                         degraded: false,
                     });
                     Ok(())
@@ -832,8 +888,11 @@ fn extract_interactive_elements(
                         role: "textbox".to_string(),
                         name: element_name(el, "textarea"),
                         value: None,
+                        test_id: test_id(el),
                         bbox: None,
                         visible: !has_hidden_attribute(el),
+                        enabled: !has_disabled_attribute(el),
+                        editable: !has_readonly_attribute(el),
                         degraded: false,
                     });
                     Ok(())
@@ -862,8 +921,11 @@ fn is_state_changing_action(action: &BrowserAction) -> bool {
 fn element_name(el: &lol_html::html_content::Element<'_, '_>, fallback: &str) -> String {
     el.get_attribute("aria-label")
         .or_else(|| el.get_attribute("title"))
+        .or_else(|| el.get_attribute("placeholder"))
+        .or_else(|| el.get_attribute("alt"))
         .or_else(|| el.get_attribute("name"))
         .or_else(|| el.get_attribute("id"))
+        .or_else(|| test_id(el))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| fallback.to_string())
@@ -875,6 +937,70 @@ fn has_hidden_attribute(el: &lol_html::html_content::Element<'_, '_>) -> bool {
             .get_attribute("aria-hidden")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+        || el
+            .get_attribute("style")
+            .map(|value| {
+                let lower = value.to_ascii_lowercase();
+                lower.contains("display:none")
+                    || lower.contains("display: none")
+                    || lower.contains("visibility:hidden")
+                    || lower.contains("visibility: hidden")
+            })
+            .unwrap_or(false)
+}
+
+fn has_disabled_attribute(el: &lol_html::html_content::Element<'_, '_>) -> bool {
+    el.get_attribute("disabled").is_some()
+        || el
+            .get_attribute("aria-disabled")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+fn has_readonly_attribute(el: &lol_html::html_content::Element<'_, '_>) -> bool {
+    el.get_attribute("readonly").is_some()
+        || el
+            .get_attribute("aria-readonly")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+fn test_id(el: &lol_html::html_content::Element<'_, '_>) -> Option<String> {
+    el.get_attribute("data-testid")
+        .or_else(|| el.get_attribute("data-test-id"))
+        .or_else(|| el.get_attribute("data-test"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn input_type_is_editable(input_type: &str) -> bool {
+    matches!(
+        input_type.to_ascii_lowercase().as_str(),
+        "text"
+            | "search"
+            | "email"
+            | "password"
+            | "url"
+            | "tel"
+            | "number"
+            | "date"
+            | "datetime-local"
+            | "month"
+            | "time"
+            | "week"
+    )
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn extract_title(html: &str) -> String {

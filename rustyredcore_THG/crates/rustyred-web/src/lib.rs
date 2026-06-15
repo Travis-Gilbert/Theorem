@@ -59,6 +59,24 @@ pub use browser_engine::{
     WebConsumeRequest,
 };
 
+pub mod browser_automation;
+pub use browser_automation::{
+    expect, perform_locator_action, selector_engine_provenance, ActionOptions, Actionability,
+    ActionabilityCheck, ActionabilityRequirement, ActionabilityVerdict, AssertionKind,
+    AssertionResult, AutomationActionReceipt, Context, ContextOptions, ElementHandle, Locator,
+    LocatorAction, LocatorExpectation, LocatorStep, RoleOptions, RouteAction, RouteDecision,
+    RouteRule, SelectorEngineProvenance, UrlPattern, PLAYWRIGHT_SELECTOR_LICENSE,
+    PLAYWRIGHT_SELECTOR_UPSTREAM, SELECTOR_BRIDGE_SCRIPT,
+};
+
+pub mod browser_driver;
+pub use browser_driver::{
+    build_actuation_plan, css_to_device_point, device_point_at_rect_center,
+    page_state_from_snapshot_json, rect_center_css, run_action, ActuationKind, ActuationPlan,
+    ActuationReceipt, BrowserDriver, DevicePoint, EmbedderControlPlan, PointerKind, SemanticAction,
+    GEOMETRY_SNAPSHOT_SCRIPT,
+};
+
 pub mod browser_perception;
 pub use browser_perception::{
     detect_download, extract_structured, keyboard_fallback_for, resolve_upload_path,

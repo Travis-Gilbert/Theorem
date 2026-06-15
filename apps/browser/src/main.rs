@@ -27,18 +27,25 @@ use embedder_traits::WebResourceResponse;
 use euclid::Scale;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
+use rustyred_web::{
+    build_actuation_plan, page_state_from_snapshot_json, A11yTreeUpdate, AccessibilityReader,
+    ActuationKind, ActuationPlan, ActuationReceipt, BrowserActionPolicy, BrowserDriver,
+    BrowserEngineError, BrowserEngineResult, DevicePoint as AutomationDevicePoint, Locator,
+    LocatorAction, PointerKind, RoleOptions, GEOMETRY_SNAPSHOT_SCRIPT,
+};
 use scene_os_core::{
     compile_scene_package, AtomLifecycle, SceneAtom, SceneCompileInput, SceneRelation, SceneScene,
     SourceRef,
 };
 use scene_os_web::render_scene;
 use serde_json::json;
+use serde_json::Value;
 use servo::{
-    EventLoopWaker, LoadStatus, Preferences, RenderingContext, ServoBuilder,
-    SoftwareRenderingContext, WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate,
-    WindowRenderingContext,
+    EventLoopWaker, InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, RenderingContext,
+    ServoBuilder, SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, WebResourceLoad,
+    WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
-use rustyred_web::{A11yTreeUpdate, AccessibilityReader};
 use theorem_browser_substrate::{
     browser_affordances, durable_browser_session, memory_browser_session,
     render_substrate_search_result_page, LiveFetchOptions, LoadedPage, RedCoreBrowserSessionStore,
@@ -52,11 +59,13 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 const SMOKE_URL: &str = "http://theorem.local/smoke";
+const AUTOMATION_SMOKE_URL: &str = "http://theorem.local/automation-smoke";
 const SEARCH_URL_PREFIX: &str = "http://theorem.local/search";
 const SCENE_URL_PREFIX: &str = "http://theorem.local/scene";
 const SCENE_SMOKE_URL: &str = "http://theorem.local/scene?q=substrate";
 const DEFAULT_SCENE_QUERY: &str = "substrate";
 const STORE_DIR_ENV: &str = "THEOREM_BROWSER_STORE_DIR";
+const AUTOMATION_SPIN_TIMEOUT_MS: u64 = 5_000;
 const SMOKE_HTML: &str = r#"<!doctype html>
 <html>
   <head><title>Theorem browser smoke</title></head>
@@ -66,6 +75,17 @@ const SMOKE_HTML: &str = r#"<!doctype html>
       <a href="/substrate">Substrate seam</a>
       <a href="/search?q=substrate">Search the substrate</a>
       <a href="/scene?q=substrate">SceneOS view</a>
+    </main>
+  </body>
+</html>"#;
+const AUTOMATION_SMOKE_HTML: &str = r#"<!doctype html>
+<html>
+  <head><title>Theorem automation smoke</title></head>
+  <body>
+    <main>
+      <h1>Theorem automation smoke</h1>
+      <button data-testid="automation-click" onclick="this.dataset.clicked='yes'">Run action</button>
+      <label>Search term <input data-testid="automation-input" aria-label="Search term" type="text"></label>
     </main>
   </body>
 </html>"#;
@@ -110,6 +130,7 @@ enum BrowserMode {
     HeadlessSmoke,
     HeadlessSceneSmoke,
     HeadlessA11ySmoke,
+    HeadlessAutomationSmoke,
     Windowed(Url),
 }
 
@@ -313,9 +334,382 @@ impl WebViewDelegate for A11ySmokeDelegate {
         let title = webview.page_title();
         let update = A11yTreeUpdate::from_accesskit(&tree_update, url, title);
         self.reader.borrow_mut().apply_update(update);
-        self.a11y_update_count
-            .set(self.a11y_update_count.get() + 1);
+        self.a11y_update_count.set(self.a11y_update_count.get() + 1);
     }
+}
+
+#[derive(Default)]
+struct ServoAutomationEvents {
+    input_results: RefCell<Vec<(InputEventId, InputEventResult)>>,
+}
+
+impl ServoAutomationEvents {
+    fn record_input_result(&self, event_id: InputEventId, result: InputEventResult) {
+        self.input_results.borrow_mut().push((event_id, result));
+    }
+
+    fn take_input_result(&self, event_id: InputEventId) -> Option<InputEventResult> {
+        let mut results = self.input_results.borrow_mut();
+        let position = results.iter().position(|(id, _)| *id == event_id)?;
+        Some(results.remove(position).1)
+    }
+}
+
+struct AutomationSmokeDelegate {
+    complete: Cell<bool>,
+    events: Rc<ServoAutomationEvents>,
+}
+
+impl AutomationSmokeDelegate {
+    fn new(events: Rc<ServoAutomationEvents>) -> Self {
+        Self {
+            complete: Cell::new(false),
+            events,
+        }
+    }
+}
+
+impl WebViewDelegate for AutomationSmokeDelegate {
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        intercept_local_automation_page(load);
+    }
+
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::Complete {
+            self.complete.set(true);
+        }
+    }
+
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        webview.paint();
+    }
+
+    fn notify_input_event_handled(
+        &self,
+        _webview: WebView,
+        event_id: InputEventId,
+        result: InputEventResult,
+    ) {
+        self.events.record_input_result(event_id, result);
+    }
+}
+
+struct ServoWebViewAutomationDriver {
+    servo: servo::Servo,
+    webview: WebView,
+    events: Rc<ServoAutomationEvents>,
+    origin: AutomationDevicePoint,
+}
+
+impl ServoWebViewAutomationDriver {
+    fn new(servo: servo::Servo, webview: WebView, events: Rc<ServoAutomationEvents>) -> Self {
+        Self {
+            servo,
+            webview,
+            events,
+            origin: AutomationDevicePoint::ZERO,
+        }
+    }
+
+    fn spin_until(
+        &self,
+        mut done: impl FnMut() -> bool,
+        timeout_reason: &str,
+    ) -> BrowserEngineResult<()> {
+        let deadline = Instant::now() + Duration::from_millis(AUTOMATION_SPIN_TIMEOUT_MS);
+        while !done() {
+            self.servo.spin_event_loop();
+            std::thread::sleep(Duration::from_millis(1));
+            if Instant::now() > deadline {
+                return Err(BrowserEngineError::UnsupportedAction {
+                    reason: timeout_reason.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_load_complete(&self) -> BrowserEngineResult<()> {
+        let webview = self.webview.clone();
+        self.spin_until(
+            move || webview.load_status() == LoadStatus::Complete,
+            "timed out waiting for Servo WebView load before automation",
+        )
+    }
+
+    fn evaluate_javascript_string(&self, script: impl ToString) -> BrowserEngineResult<String> {
+        self.wait_for_load_complete()?;
+        let saved_result = Rc::new(RefCell::new(None));
+        let callback_result = saved_result.clone();
+        self.webview.evaluate_javascript(script, move |result| {
+            *callback_result.borrow_mut() = Some(result)
+        });
+
+        let spin_result = saved_result.clone();
+        self.spin_until(
+            move || spin_result.borrow().is_some(),
+            "timed out waiting for Servo JavaScript evaluation",
+        )?;
+
+        let evaluation = saved_result
+            .borrow_mut()
+            .take()
+            .expect("spin_until waited for a result");
+        match evaluation {
+            Ok(JSValue::String(value)) => Ok(value),
+            Ok(other) => Err(BrowserEngineError::UnsupportedAction {
+                reason: format!("geometry script returned non-string JS value: {other:?}"),
+            }),
+            Err(error) => Err(BrowserEngineError::UnsupportedAction {
+                reason: format!("Servo JavaScript evaluation failed: {error:?}"),
+            }),
+        }
+    }
+
+    fn actuate_sync(
+        &mut self,
+        plan: ActuationPlan,
+        _policy: &BrowserActionPolicy,
+    ) -> BrowserEngineResult<ActuationReceipt> {
+        match &plan.kind {
+            ActuationKind::CoordinateSynthesis { point, pointer } => {
+                let detail = self.actuate_pointer(*point, *pointer)?;
+                Ok(ActuationReceipt {
+                    mechanism: "servo_notify_input_event".to_string(),
+                    detail,
+                })
+            }
+            ActuationKind::Keyboard { point, text } => {
+                let pointer_detail = self.actuate_pointer(*point, PointerKind::Click)?;
+                let value_detail = self.set_value_for_handle(&plan.target_handle, text)?;
+                Ok(ActuationReceipt {
+                    mechanism: "servo_focus_then_value_commit".to_string(),
+                    detail: json!({
+                        "pointer": pointer_detail,
+                        "valueCommit": value_detail,
+                    }),
+                })
+            }
+            ActuationKind::Scroll { .. } => {
+                let detail = self.scroll_handle_into_view(&plan.target_handle)?;
+                Ok(ActuationReceipt {
+                    mechanism: "servo_scroll_into_view".to_string(),
+                    detail,
+                })
+            }
+            ActuationKind::EmbedderControl { control } => {
+                Err(BrowserEngineError::UnsupportedAction {
+                    reason: format!("Servo EmbedderControl response is not wired in apps/browser yet: {control:?}"),
+                })
+            }
+            ActuationKind::SemanticActivation { .. } => {
+                Err(BrowserEngineError::UnsupportedAction {
+                    reason: "semantic activation requires the #4344 Servo fork route".to_string(),
+                })
+            }
+        }
+    }
+
+    fn actuate_pointer(
+        &self,
+        point: AutomationDevicePoint,
+        pointer: PointerKind,
+    ) -> BrowserEngineResult<Value> {
+        let mut events = Vec::new();
+        let servo_point = servo_device_point(point);
+        match pointer {
+            PointerKind::Hover => {
+                events.push(
+                    self.send_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                        servo_point.into(),
+                    )))?,
+                );
+            }
+            PointerKind::Click => {
+                self.push_mouse_click(servo_point, &mut events)?;
+            }
+            PointerKind::DoubleClick => {
+                self.push_mouse_click(servo_point, &mut events)?;
+                self.push_mouse_click(servo_point, &mut events)?;
+            }
+            PointerKind::Tap => {
+                events.push(self.send_input_event(InputEvent::Touch(TouchEvent::new(
+                    TouchEventType::Down,
+                    TouchId(1),
+                    servo_point.into(),
+                )))?);
+                events.push(self.send_input_event(InputEvent::Touch(TouchEvent::new(
+                    TouchEventType::Up,
+                    TouchId(1),
+                    servo_point.into(),
+                )))?);
+            }
+        }
+        Ok(json!({
+            "pointer": pointer,
+            "point": point,
+            "events": events,
+        }))
+    }
+
+    fn push_mouse_click(
+        &self,
+        point: servo::DevicePoint,
+        events: &mut Vec<Value>,
+    ) -> BrowserEngineResult<()> {
+        events
+            .push(self.send_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point.into())))?);
+        events.push(
+            self.send_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Down,
+                MouseButton::Left,
+                point.into(),
+            )))?,
+        );
+        events.push(
+            self.send_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Up,
+                MouseButton::Left,
+                point.into(),
+            )))?,
+        );
+        Ok(())
+    }
+
+    fn send_input_event(&self, event: InputEvent) -> BrowserEngineResult<Value> {
+        let event_id = self.webview.notify_input_event(event);
+        let result = self.wait_for_input_result(event_id)?;
+        Ok(input_event_receipt(event_id, result))
+    }
+
+    fn wait_for_input_result(
+        &self,
+        event_id: InputEventId,
+    ) -> BrowserEngineResult<InputEventResult> {
+        let saved_result = Rc::new(RefCell::new(None));
+        let spin_result = saved_result.clone();
+        let events = self.events.clone();
+        self.spin_until(
+            move || {
+                if let Some(result) = events.take_input_result(event_id) {
+                    *spin_result.borrow_mut() = Some(result);
+                    true
+                } else {
+                    false
+                }
+            },
+            "timed out waiting for Servo input event receipt",
+        )?;
+        let result = saved_result
+            .borrow_mut()
+            .take()
+            .expect("spin_until waited for an input result");
+        Ok(result)
+    }
+
+    fn set_value_for_handle(&self, handle: &str, value: &str) -> BrowserEngineResult<Value> {
+        let handle_json = json_string(handle)?;
+        let value_json = json_string(value)?;
+        let script = format!(
+            r#"(function () {{
+  var handle = {handle_json};
+  var value = {value_json};
+  var nodes = document.querySelectorAll("[data-theorem-id]");
+  var el = null;
+  for (var i = 0; i < nodes.length; i++) {{
+    if (nodes[i].getAttribute("data-theorem-id") === handle) {{
+      el = nodes[i];
+      break;
+    }}
+  }}
+  if (!el) return JSON.stringify({{ ok: false, error: "not_found", handle: handle }});
+  el.focus();
+  el.value = value;
+  el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  return JSON.stringify({{ ok: true, handle: handle, value: el.value }});
+}})()"#
+        );
+        let response = self.evaluate_javascript_string(script)?;
+        serde_json::from_str(&response).map_err(|error| BrowserEngineError::UnsupportedAction {
+            reason: format!("value commit receipt did not parse: {error}"),
+        })
+    }
+
+    fn scroll_handle_into_view(&self, handle: &str) -> BrowserEngineResult<Value> {
+        let handle_json = json_string(handle)?;
+        let script = format!(
+            r#"(function () {{
+  var handle = {handle_json};
+  var nodes = document.querySelectorAll("[data-theorem-id]");
+  var el = null;
+  for (var i = 0; i < nodes.length; i++) {{
+    if (nodes[i].getAttribute("data-theorem-id") === handle) {{
+      el = nodes[i];
+      break;
+    }}
+  }}
+  if (!el) return JSON.stringify({{ ok: false, error: "not_found", handle: handle }});
+  el.scrollIntoView({{ block: "center", inline: "center" }});
+  return JSON.stringify({{ ok: true, handle: handle }});
+}})()"#
+        );
+        let response = self.evaluate_javascript_string(script)?;
+        serde_json::from_str(&response).map_err(|error| BrowserEngineError::UnsupportedAction {
+            reason: format!("scroll receipt did not parse: {error}"),
+        })
+    }
+}
+
+impl BrowserDriver for ServoWebViewAutomationDriver {
+    fn snapshot(&self) -> BrowserEngineResult<rustyred_web::PageState> {
+        let json = self.evaluate_javascript_string(GEOMETRY_SNAPSHOT_SCRIPT)?;
+        let url = self
+            .webview
+            .url()
+            .map(|url| url.to_string())
+            .unwrap_or_else(|| "about:blank".to_string());
+        page_state_from_snapshot_json(&url, &json)
+    }
+
+    fn device_pixels_per_css_pixel(&self) -> f32 {
+        self.webview.device_pixels_per_css_pixel().0
+    }
+
+    fn webview_origin(&self) -> AutomationDevicePoint {
+        self.origin
+    }
+
+    async fn actuate(
+        &mut self,
+        plan: ActuationPlan,
+        policy: &BrowserActionPolicy,
+    ) -> BrowserEngineResult<ActuationReceipt> {
+        self.actuate_sync(plan, policy)
+    }
+}
+
+fn servo_device_point(point: AutomationDevicePoint) -> servo::DevicePoint {
+    servo::DevicePoint::new(point.x, point.y)
+}
+
+fn input_event_receipt(event_id: InputEventId, result: InputEventResult) -> Value {
+    json!({
+        "eventId": serde_json::to_value(event_id).unwrap_or(Value::Null),
+        "defaultPrevented": result.contains(InputEventResult::DefaultPrevented),
+        "consumed": result.contains(InputEventResult::Consumed),
+        "dispatchFailed": result.contains(InputEventResult::DispatchFailed),
+    })
+}
+
+fn json_string(value: &str) -> BrowserEngineResult<String> {
+    serde_json::to_string(value).map_err(|error| BrowserEngineError::UnsupportedAction {
+        reason: format!("could not encode JavaScript string literal: {error}"),
+    })
+}
+
+fn browser_error_box(error: BrowserEngineError) -> Box<dyn Error> {
+    format!("{error:?}").into()
 }
 
 struct WindowedState {
@@ -462,6 +856,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         BrowserMode::HeadlessSmoke => run_headless_smoke(&config.store),
         BrowserMode::HeadlessSceneSmoke => run_headless_scene_smoke(&config.store),
         BrowserMode::HeadlessA11ySmoke => run_headless_a11y_smoke(&config.store),
+        BrowserMode::HeadlessAutomationSmoke => run_headless_automation_smoke(),
         BrowserMode::Windowed(url) => run_windowed(url, config.store),
         BrowserMode::EngineConstructor => {
             run_engine_constructor(&config.store);
@@ -497,6 +892,7 @@ fn parse_config(args: impl IntoIterator<Item = String>) -> Result<BrowserConfig,
         Some("--headless-smoke") => BrowserMode::HeadlessSmoke,
         Some("--headless-scene-smoke") => BrowserMode::HeadlessSceneSmoke,
         Some("--headless-a11y-smoke") => BrowserMode::HeadlessA11ySmoke,
+        Some("--headless-automation-smoke") => BrowserMode::HeadlessAutomationSmoke,
         Some("--windowed") => {
             let url = mode_args
                 .get(1)
@@ -705,6 +1101,111 @@ fn run_headless_a11y_smoke(store_options: &BrowserStoreOptions) -> Result<(), Bo
     Ok(())
 }
 
+fn run_headless_automation_smoke() -> Result<(), Box<dyn Error>> {
+    eprintln!("theorem-browser: starting headless automation-driver smoke");
+    let rendering_context = software_rendering_context()?;
+
+    let servo = ServoBuilder::default()
+        .event_loop_waker(Box::new(HeadlessWaker))
+        .build();
+    servo.setup_logging();
+
+    let events = Rc::new(ServoAutomationEvents::default());
+    let delegate = Rc::new(AutomationSmokeDelegate::new(events.clone()));
+    let webview = WebViewBuilder::new(&servo, rendering_context)
+        .url(Url::parse(AUTOMATION_SMOKE_URL)?)
+        .hidpi_scale_factor(Scale::new(1.0))
+        .delegate(delegate.clone())
+        .build();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !delegate.complete.get() {
+        servo.spin_event_loop();
+        std::thread::sleep(Duration::from_millis(5));
+
+        if Instant::now() > deadline {
+            return Err("timed out waiting for Servo automation smoke load".into());
+        }
+    }
+
+    let mut driver = ServoWebViewAutomationDriver::new(servo.clone(), webview, events);
+    let page = driver.snapshot().map_err(browser_error_box)?;
+    if page.interactive_elements.len() < 2 {
+        return Err(format!(
+            "automation snapshot produced too few interactive elements: {}",
+            page.interactive_elements.len()
+        )
+        .into());
+    }
+
+    let button_locator = Locator::get_by_test_id("automation-click");
+    let button = button_locator
+        .resolve(&page)
+        .into_iter()
+        .next()
+        .ok_or("automation smoke button did not resolve by test id")?;
+    let click_plan =
+        build_actuation_plan(&driver, &button, &LocatorAction::Click).map_err(browser_error_box)?;
+    let click_receipt = driver
+        .actuate_sync(click_plan, &BrowserActionPolicy::default())
+        .map_err(browser_error_box)?;
+    let clicked = driver
+        .evaluate_javascript_string(
+            "document.querySelector('[data-testid=\"automation-click\"]').dataset.clicked || ''",
+        )
+        .map_err(browser_error_box)?;
+    if clicked != "yes" {
+        return Err(
+            format!("automation smoke click did not reach page handler: {clicked:?}").into(),
+        );
+    }
+
+    let input_locator = Locator::get_by_role(
+        "text",
+        RoleOptions {
+            name: Some("Search term".to_string()),
+        },
+    );
+    let input = input_locator
+        .resolve(&driver.snapshot().map_err(browser_error_box)?)
+        .into_iter()
+        .next()
+        .ok_or("automation smoke input did not resolve by role")?;
+    let fill_plan = build_actuation_plan(
+        &driver,
+        &input,
+        &LocatorAction::Fill {
+            value: "servo".to_string(),
+        },
+    )
+    .map_err(browser_error_box)?;
+    let fill_receipt = driver
+        .actuate_sync(fill_plan, &BrowserActionPolicy::default())
+        .map_err(browser_error_box)?;
+
+    let post_fill_page = driver.snapshot().map_err(browser_error_box)?;
+    let filled_value = input_locator
+        .resolve(&post_fill_page)
+        .into_iter()
+        .next()
+        .and_then(|handle| handle.value);
+    if filled_value.as_deref() != Some("servo") {
+        return Err(format!(
+            "automation smoke fill did not round-trip through snapshot: {filled_value:?}"
+        )
+        .into());
+    }
+
+    println!(
+        "theorem-browser: headless automation smoke OK; url={}, interactive_elements={}, click_mechanism={}, fill_mechanism={}",
+        page.url,
+        page.interactive_elements.len(),
+        click_receipt.mechanism,
+        fill_receipt.mechanism
+    );
+    Ok(())
+}
+
 fn run_windowed(
     initial_url: Url,
     store_options: BrowserStoreOptions,
@@ -819,6 +1320,26 @@ fn intercept_local_theorem_page(
         );
     let mut intercepted = load.intercept(response);
     intercepted.send_body_data(body);
+    intercepted.finish();
+}
+
+fn intercept_local_automation_page(load: WebResourceLoad) {
+    let url = load.request().url.clone();
+    if url.as_str() != AUTOMATION_SMOKE_URL {
+        return;
+    }
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    let response = WebResourceResponse::new(load.request().url.clone())
+        .headers(headers)
+        .status_code(StatusCode::OK)
+        .status_message(b"OK".to_vec());
+    let mut intercepted = load.intercept(response);
+    intercepted.send_body_data(AUTOMATION_SMOKE_HTML.as_bytes().to_vec());
     intercepted.finish();
 }
 

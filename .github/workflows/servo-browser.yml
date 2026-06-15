@@ -150,3 +150,18 @@ jobs:
         # acceptance criterion 1. Interactive roles are not asserted: Servo does
         # not roll Link/Button/Input at this rev (structural only).
         run: timeout 180s cargo run -- --headless-a11y-smoke
+
+      - name: Run theorem-browser headless Playwright-class automation smoke
+        working-directory: theorem/apps/browser
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        # Servo automation core (Playwright-class) live oracle. Implements the
+        # rustyred-web BrowserDriver trait over a live Servo WebView
+        # (ServoWebViewAutomationDriver), runs GEOMETRY_SNAPSHOT_SCRIPT through
+        # WebView::evaluate_javascript, parses it with page_state_from_snapshot_json
+        # (the data-theorem-id stamp is the actionable id, Option A), clicks a real
+        # button handler via notify_input_event coordinate synthesis, fills an
+        # input, and re-snapshots to assert the value round-tripped. This is the
+        # end-to-end runtime proof of the browser_driver.rs seam against a real
+        # engine; coordinate-transform landing is verified by Paint hit-testing.
+        run: timeout 180s cargo run -- --headless-automation-smoke
