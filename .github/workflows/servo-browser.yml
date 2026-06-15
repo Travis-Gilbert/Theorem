@@ -100,6 +100,15 @@ jobs:
           sudo apt-get clean || true
           echo "After:"; df -h /
 
+      - name: Install OpenBLAS (a transitive rustyred-web dep links -lopenblas)
+        # apps/browser now links more of rustyred-web (the BrowserDriver automation
+        # core), which pulls cblas-sys/ndarray transitively (via rustyred-thg-core's
+        # ML/embedding stack). cblas-sys's build script emits -lopenblas, so the
+        # runner needs OpenBLAS at link time. Follow-up (tracked in
+        # servo-automation-core-status.md): feature-gate the heavy rustyred-web
+        # transitive deps so the browser binary does not link BLAS at all.
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
       - name: Build theorem-browser embedder (cargo; builds libservo as a git dep)
         working-directory: theorem/apps/browser
         env:
