@@ -1,83 +1,59 @@
 {
   "schema_version": 1,
-  "source": "theorems-harness hook checklist-contract",
-  "created_at": "2026-06-09T21:24:00Z",
-  "task": "Implement /Users/travisgilbert/Downloads/theorem-agentd-handoff (2).md on main: local theorem-agentd daemon, MCP tool-use loop, receiver sidecar shape, grammar guardrail, transcript mode, launchd example, and token ledger.",
-  "source_hash": "e938291f5d8b14efb02fc331545a6bafc096fb0061b5ddc36e13a0f0f27854d8",
+  "source": "SPEC-harness-plugin-restructure.md",
+  "created_at": "2026-06-15T00:00:00Z",
+  "task": "Implement the harness plugin restructure: collapse the plugin MCP layer, move prepare/run/code surfaces to native Theorem MCP, add dark skills, and rewrite coordination around announce-over-room plus semantic overlap.",
+  "source_hash": "local:/Users/travisgilbert/Downloads/SPEC-harness-plugin-restructure.md",
   "repo": "Theorem",
-  "branch": "main",
+  "branch": "feat/crdt-substrate",
   "items": [
     {
-      "id": "AGD-001",
-      "deliverable": "Workspace crate",
-      "acceptance_criterion": "A new `theorem-agentd` Rust crate is a `rustyredcore_THG` workspace member beside `theorem-receiver` and builds as a lib plus bin.",
+      "id": "HPR-001",
+      "deliverable": "Single remote MCP registration",
+      "acceptance_criterion": "Plugin manifests register one HTTP MCP server named `theorems-harness`; the local Node MCP and RustyRed proxy are gone.",
       "status": "completed",
-      "verification": "`cargo metadata --no-deps --format-version 1` lists `theorem-agentd`; `cargo check -p theorem-agentd` passed.",
+      "verification": "`python3 scripts/sync-plugin-manifests.py theorems-harness --check` passed; `.mcp.json`, `.claude-plugin/plugin.json`, and `.codex-plugin/plugin.json` point at the single remote HTTP server; `mcp/` is absent; stale-route grep found no `mcp/server`, `rustyred-theorem-proxy`, or `mcp__rustyred-thg__` references in live plugin docs/scripts/manifests.",
       "deferral_reason": ""
     },
     {
-      "id": "AGD-002",
-      "deliverable": "`--once` transcript mode",
-      "acceptance_criterion": "`theorem-agentd --once \"<prompt>\"` runs one tool-use turn and prints a full transcript with tool calls and results.",
+      "id": "HPR-002",
+      "deliverable": "Native `harness_prepare`",
+      "acceptance_criterion": "`harness_prepare` composes Ensemble selection plus native memory recall and returns a structured brief with rendered markdown.",
       "status": "completed",
-      "verification": "Local fixture MCP smoke passed: `CLI_ONCE_SMOKE_PASS`, events=`context,context,model_decision,tool_call,tool_result,model_decision,final,ledger`.",
+      "verification": "`cargo test -p rustyred-thg-mcp native_harness_prepare_composes_ensemble_and_memory_brief` passed; full `cargo test -p rustyred-thg-mcp` passed.",
       "deferral_reason": ""
     },
     {
-      "id": "AGD-003",
-      "deliverable": "Room-aware harness tools",
-      "acceptance_criterion": "The daemon can read room context and can emit a schema-valid wake `coordinate` call for a coding head.",
+      "id": "HPR-003",
+      "deliverable": "Native run lifecycle hooks",
+      "acceptance_criterion": "Hook scripts use `harness_append_transition` / `harness_run` style native calls and no longer define or call Django helpers.",
       "status": "completed",
-      "verification": "`turn_loop::tests::deterministic_coordinate_call_is_schema_valid` verifies `delivery=\"wake\"`, `mentions[0]=\"codex\"`, and schema-required coordinate arguments; local fixture MCP smoke verifies `coordination_context` dispatch in the transcript loop.",
+      "verification": "`bash -n scripts/*.sh` passed; stale-route grep found no `theorem_post`, `theorem_get`, `THEOREM_CONTEXT_BASE_URL`, or `/api/v2/theseus` references in live plugin scripts/docs/manifests; `cargo test -p rustyred-thg-mcp native_harness_run_transitions_round_trip_through_mcp` passed.",
       "deferral_reason": ""
     },
     {
-      "id": "AGD-004",
-      "deliverable": "Grammar-constrained tool calls",
-      "acceptance_criterion": "Tool-call output is closed over known tool names and malformed tool names are rejected before MCP dispatch.",
+      "id": "HPR-004",
+      "deliverable": "`compute_code` / `code_ingest` split",
+      "acceptance_criterion": "The native MCP advertises `compute_code` once for reads, advertises `code_ingest` for ingest/reindex/session writes, and keeps old `code_search` dispatch compatibility without advertising it.",
       "status": "completed",
-      "verification": "`cargo run -q -p theorem-agentd -- --print-tool-grammar crates/theorem-agentd/theorem-agentd.example.toml` printed a GBNF grammar with the closed tool-name set; `tools::tests::grammar_is_closed_over_catalog_names` and `tools::tests::validates_required_arguments` passed.",
+      "verification": "`cargo test -p rustyred-thg-mcp tools_list_exposes_read_only_graph_tools`, `chatgpt_flagged_tools_advertise_receipt_output_schemas`, `code_search_routes_named_harness_verb_to_app_affordance`, `compute_code_alias_routes_to_code_search_app_affordance`, `code_search_forwards_confirmation_from_tool_control_shapes`, and `code_search_write_operations_are_read_only_gated` passed; full MCP crate suite passed.",
       "deferral_reason": ""
     },
     {
-      "id": "AGD-005",
-      "deliverable": "Embedded receiver sidecar",
-      "acceptance_criterion": "Long-running daemon mode starts `theorem_receiver::run_loop` on its own OS thread and communicates only through the room.",
+      "id": "HPR-005",
+      "deliverable": "Skills and docs updated",
+      "acceptance_criterion": "The plugin includes the four dark skills and docs teach the native MCP/code split rather than the removed local server.",
       "status": "completed",
-      "verification": "`receiver_sidecar::spawn_receiver_sidecar` loads `ReceiverConfig`, builds `HarnessClient`, and spawns `theorem_receiver::run_loop` on a named OS thread; `cargo check -p theorem-agentd` passed against the receiver library API.",
+      "verification": "`skills/graph-version/`, `skills/symbolic/`, `skills/dispatch/`, and `skills/browser-web/` are present; README, command docs, graph/code/research skills, and manifests were updated; stale-route grep passed.",
       "deferral_reason": ""
     },
     {
-      "id": "AGD-006",
-      "deliverable": "Launchd shape",
-      "acceptance_criterion": "A single launchd job can run the daemon, while receiver embedding is controlled by daemon config.",
+      "id": "HPR-006",
+      "deliverable": "Coordination rewrite",
+      "acceptance_criterion": "Coordination prompts and skills lead with announce-over-room and semantic overlap; patch/lease mechanics are documented as reconciliation, not ownership.",
       "status": "completed",
-      "verification": "`crates/theorem-agentd/theorem-agentd.launchd.plist.example` added with one `theorem-agentd` program invocation; README documents no secrets in the plist.",
+      "verification": "`AGENTS.md`, `skills/harness-coordinate/SKILL.md`, `skills/theorems-harness/SKILL.md`, `commands/coordinate.md`, `commands/harness.md`, and `scripts/inject-harness-directives.sh` were updated; `bash -n scripts/*.sh` passed; `references/SHARED_CODE_CRDT_DECISION.md` documents the no-shared-code-CRDT boundary.",
       "deferral_reason": ""
-    },
-    {
-      "id": "AGD-007",
-      "deliverable": "Token ledger",
-      "acceptance_criterion": "The daemon writes one JSONL ledger entry per model decision/tool turn for compute-offload and context A/B accounting.",
-      "status": "completed",
-      "verification": "`ledger::tests::writes_jsonl_ledger` passed; local fixture `--once` smoke wrote 2 ledger lines for one tool call plus final reply.",
-      "deferral_reason": ""
-    },
-    {
-      "id": "AGD-008",
-      "deliverable": "Real local model and personal-tool proof",
-      "acceptance_criterion": "Gemma local serving and real TickTick/Gmail/Calendar MCP calls are proven against Travis's local services.",
-      "status": "deferred",
-      "verification": "Code paths and config stanzas exist for OpenAI-compatible model serving plus TickTick, Gmail, Calendar, and filesystem MCP servers.",
-      "deferral_reason": "No local Gemma server, TickTick/Gmail/Calendar MCP endpoint, or personal credential surface was provided in this session. Live personal-tool mutation was not attempted."
-    },
-    {
-      "id": "AGD-009",
-      "deliverable": "Live wake plus receiver dry-run proof",
-      "acceptance_criterion": "A daemon-emitted wake message lands in the room and `theorem-receiver --wake-dry-run <room_id> codex` plans a Codex spawn for it.",
-      "status": "deferred",
-      "verification": "Manual harness coordination wake to `claude-code` was sent for collaboration; daemon coordinate emission is schema-tested and fixture-dispatched.",
-      "deferral_reason": "A live daemon-fired wake would intentionally queue another local head. It should be run only with the desired receiver config and token for the target checkout."
     }
   ]
 }

@@ -244,7 +244,7 @@ pub struct DensificationRequest {
 
 impl DensificationRequest {
     pub fn normalized(mut self) -> Self {
-        self.tenant_id = normalize_tenant_id(&self.tenant_id);
+        self.tenant_id = self.tenant_id.trim().to_string();
         self.seed_node_ids = self
             .seed_node_ids
             .into_iter()
@@ -502,7 +502,7 @@ pub fn quarantine_densification_candidates<S: AdapterGraphStore>(
     candidates: &[InferredEdgeCandidate],
     actor: Option<&str>,
 ) -> ThgResult<DensificationQuarantineResult> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let run_id = run_id.trim();
     if run_id.is_empty() {
         return Err(ThgError::new(
@@ -612,7 +612,10 @@ pub fn densification_candidate_node_id(tenant_id: &str, candidate_id: &str) -> S
 fn normalize_representation_input(
     mut input: RepresentationSidecarInput,
 ) -> ThgResult<RepresentationSidecarInput> {
-    input.tenant_id = normalize_tenant_id(&input.tenant_id);
+    // Tenant stays raw in the input/property; the *_node_id builders apply the
+    // single canonical normalization when constructing keys. Normalizing here as
+    // well would double-encode under the injective tenant scheme.
+    input.tenant_id = input.tenant_id.trim().to_string();
     input.representation_id = input.representation_id.trim().to_string();
     input.target_id = input.target_id.trim().to_string();
     input.model_id = input.model_id.trim().to_string();

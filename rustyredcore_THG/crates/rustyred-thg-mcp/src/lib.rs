@@ -5,17 +5,18 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ensemble::{
-    pack_node_id as ensemble_pack_node_id, register_pack as ensemble_register_pack,
-    select_from_store as ensemble_select_from_store, CapabilityPack, EnsembleError,
-    EnsembleGraphStore, EnsembleResult, EnsembleSelectRequest, PackExposure, PackKind, TrustTier,
+    get_pack as ensemble_get_pack, pack_node_id as ensemble_pack_node_id,
+    register_pack as ensemble_register_pack, select_from_store as ensemble_select_from_store,
+    CapabilityPack, EnsembleError, EnsembleGraphStore, EnsembleResult, EnsembleSelectRequest,
+    PackExposure, PackKind, TrustTier,
 };
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
-    merge_graph_snapshots, update_graph_ref, CodeKgManifest, Direction, EdgeRecord, EpistemicType,
-    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
-    GraphStoreResult, GraphVersionRepository, HarnessInstantKg, HybridScoringConfig,
-    InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore,
-    SessionDelta, VectorDesignation, VerifyReport,
+    merge_graph_snapshots, update_graph_ref_cas, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore,
+    GraphStoreError, GraphStoreResult, GraphVersionRepository, HarnessInstantKg,
+    HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    RedCoreGraphStore, SessionDelta, VectorDesignation, VerifyReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -811,10 +812,26 @@ fn call_tool<P: McpGraphProvider>(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let updated_at_unix_ms = arguments.get("updated_at_unix_ms").and_then(Value::as_u64);
+            let expected_commit_hash = arguments
+                .get("expected_commit_hash")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let pack = compile_graph_pack(&snapshot, options);
+            let ref_update = update_graph_ref_cas(
+                repository,
+                pack,
+                branch,
+                expected_commit_hash,
+                updated_at_unix_ms.map(u128::from),
+            )
+            .map_err(|conflict| McpError {
+                code: -32009,
+                message: conflict.message.clone(),
+                data: Some(json!({ "conflict": conflict })),
+            })?;
             json!({
                 "tenant": tenant,
-                "ref_update": update_graph_ref(repository, pack, branch, updated_at_unix_ms.map(u128::from))
+                "ref_update": ref_update
             })
         }
         "rustyred_thg_graph_version_log"
@@ -1359,19 +1376,34 @@ fn call_tool<P: McpGraphProvider>(
         "ensemble_select" | "theorem_harness_ensemble_select" => {
             ensemble_select_payload(&tenant, &backend, &arguments)?
         }
+        "harness_prepare" | "theorem_harness_prepare" => {
+            harness_prepare_payload(&tenant, &mut backend, &arguments)?
+        }
         "code_search"
         | "compute_code"
+        | "code_ingest"
         | "theorem_harness_code_search"
-        | "theorem_harness_compute_code" => {
-            let operation = code_search_operation(&arguments)?;
+        | "theorem_harness_compute_code"
+        | "theorem_harness_code_ingest" => {
+            let operation = if matches!(name, "code_ingest" | "theorem_harness_code_ingest")
+                && arguments
+                    .get("operation")
+                    .or_else(|| arguments.get("mode"))
+                    .or_else(|| arguments.get("verb"))
+                    .is_none()
+            {
+                "ingest".to_string()
+            } else {
+                code_search_operation(&arguments)?
+            };
             if matches!(
                 operation.as_str(),
-                "ingest" | "reindex" | "record_use_receipt"
+                "ingest" | "reindex" | "session_reingest" | "record_use_receipt"
             ) && config.read_only
             {
                 return Ok(tool_result_error(json!({
                     "error": "mcp_read_only",
-                    "message": "Code-search writes are unavailable while read-only mode is active."
+                    "message": "Code ingest writes are unavailable while read-only mode is active."
                 })));
             }
             code_search_payload(&tenant, &mut backend, &arguments, &operation)?
@@ -3471,6 +3503,255 @@ fn ensemble_select_payload(
     }))
 }
 
+fn harness_prepare_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let task = argument_text(arguments, &["task", "query", "intent"])
+        .ok_or_else(|| McpError::invalid_params("harness_prepare requires task"))?;
+    let actor = argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default();
+    let budget_units = arguments
+        .get("budget_units")
+        .or_else(|| arguments.get("budgetUnits"))
+        .and_then(Value::as_u64);
+    let request = EnsembleSelectRequest {
+        task: task.clone(),
+        budget_units,
+        max_selected: arguments
+            .get("max_selected")
+            .or_else(|| arguments.get("maxSelected"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        candidates: Vec::new(),
+        priors: ensemble_priors_from_arguments(arguments)?,
+    };
+    let decision = {
+        let store = McpEnsembleReadStore { backend: &*backend };
+        ensemble_select_from_store(&store, tenant, None, request).map_err(mcp_ensemble_error)?
+    };
+    let signature = decision.content_address();
+    let recall_results = {
+        let mut store = McpMemoryStore { backend };
+        recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: tenant.to_string(),
+                query: task.clone(),
+                surface: argument_text(arguments, &["surface"]).unwrap_or_default(),
+                actor: actor.clone(),
+                limit: argument_u64(arguments, &["memory_limit", "memoryLimit", "limit"])
+                    .unwrap_or(8) as usize,
+                include_low_fitness: false,
+                include_consolidation_sources: false,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .map_err(mcp_memory_error)?
+    };
+    let memory_contract = memory_contract_from_recall(&recall_results);
+    let selected_pack_details = {
+        let store = McpEnsembleReadStore { backend: &*backend };
+        decision
+            .selected
+            .iter()
+            .filter_map(|selected| {
+                ensemble_get_pack(&store, tenant, &selected.pack_content_hash)
+                    .ok()
+                    .flatten()
+                    .map(|pack| (selected.pack_content_hash.clone(), pack))
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let selected_capabilities = decision
+        .selected
+        .iter()
+        .map(|selected| {
+            let pack = selected_pack_details.get(&selected.pack_content_hash);
+            let title = pack
+                .and_then(|pack| {
+                    let title = pack.title.trim();
+                    (!title.is_empty()).then(|| title.to_string())
+                })
+                .unwrap_or_else(|| selected.pack_content_hash.clone());
+            let description = pack
+                .map(|pack| pack.description.trim().to_string())
+                .unwrap_or_default();
+            json!({
+                "id": selected.pack_content_hash,
+                "title": title,
+                "kind": selected.kind,
+                "description": description,
+                "reason": selected.reason,
+                "score": selected.score,
+                "cost_units": selected.cost_units
+            })
+        })
+        .collect::<Vec<_>>();
+    let rendered_markdown = render_harness_prepare_markdown(
+        &task,
+        &signature,
+        &selected_capabilities,
+        &memory_contract,
+    );
+    Ok(json!({
+        "tenant": tenant,
+        "task": task,
+        "actor": actor,
+        "signature": signature,
+        "budget_units": budget_units,
+        "selected_capabilities": selected_capabilities,
+        "memory_contract": memory_contract,
+        "recall_results": recall_results,
+        "decision_content_hash": signature,
+        "decision": decision,
+        "brief": {
+            "task": task,
+            "signature": signature,
+            "selected_capabilities": selected_capabilities,
+            "memory_contract": memory_contract
+        },
+        "rendered_markdown": rendered_markdown
+    }))
+}
+
+fn memory_contract_from_recall(results: &[theorem_harness_runtime::MemoryRecallItem]) -> Value {
+    let read_first = results
+        .iter()
+        .take(5)
+        .filter_map(memory_recall_item_summary)
+        .collect::<Vec<_>>();
+    let risks = results
+        .iter()
+        .filter_map(memory_recall_item_risk)
+        .take(5)
+        .collect::<Vec<_>>();
+    let do_not = results
+        .iter()
+        .filter_map(memory_recall_item_do_not)
+        .take(5)
+        .collect::<Vec<_>>();
+    json!({
+        "read_first": read_first,
+        "risks": risks,
+        "do_not": do_not
+    })
+}
+
+fn memory_recall_item_summary(item: &theorem_harness_runtime::MemoryRecallItem) -> Option<String> {
+    let value = serde_json::to_value(item).ok()?;
+    let title = first_string_at(&value, &["title", "id"])?;
+    let preview = first_string_at(&value, &["summary", "content"]).unwrap_or_default();
+    if preview.is_empty() {
+        Some(title)
+    } else {
+        Some(format!("{title}: {preview}"))
+    }
+}
+
+fn memory_recall_item_risk(item: &theorem_harness_runtime::MemoryRecallItem) -> Option<String> {
+    let value = serde_json::to_value(item).ok()?;
+    let text = first_string_at(&value, &["summary", "content", "title"])?;
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("risk")
+        || lower.contains("do not")
+        || lower.contains("do_not")
+        || lower.contains("avoid")
+        || lower.contains("caution")
+    {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+fn memory_recall_item_do_not(item: &theorem_harness_runtime::MemoryRecallItem) -> Option<String> {
+    let value = serde_json::to_value(item).ok()?;
+    let text = first_string_at(&value, &["summary", "content", "title"])?;
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("do not") || lower.contains("don't") || lower.contains("never") {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+fn first_string_at(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = value.get(*key).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn render_harness_prepare_markdown(
+    task: &str,
+    signature: &str,
+    selected_capabilities: &[Value],
+    memory_contract: &Value,
+) -> String {
+    fn list(values: &[String]) -> String {
+        if values.is_empty() {
+            "(none)".to_string()
+        } else {
+            values
+                .iter()
+                .map(|value| format!("- {value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+    let read_first = string_vec_from_value(&memory_contract["read_first"]);
+    let risks = string_vec_from_value(&memory_contract["risks"]);
+    let do_not = string_vec_from_value(&memory_contract["do_not"]);
+    let selected = if selected_capabilities.is_empty() {
+        "(none)".to_string()
+    } else {
+        selected_capabilities
+            .iter()
+            .map(|capability| {
+                let title = capability
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| capability.get("id").and_then(Value::as_str))
+                    .unwrap_or("(untitled)");
+                let reason = capability
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("selected by Ensemble");
+                format!("- **{title}**: {reason}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "## Theorem Context Brief\n\n**Task:** {task}\n**Signature:** `{signature}`\n\n### Selected capabilities\n{selected}\n\n### Read first\n{read_first}\n\n### Risks\n{risks}\n\n### Do not\n{do_not}",
+        read_first = list(&read_first),
+        risks = list(&risks),
+        do_not = list(&do_not)
+    )
+}
+
+fn string_vec_from_value(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn capability_pack_from_arguments(
     tenant: &str,
     arguments: &Value,
@@ -3612,7 +3893,46 @@ fn code_search_payload(
     arguments: &Value,
     operation: &str,
 ) -> Result<Value, McpError> {
-    backend.invoke_code_search(tenant, arguments, operation)
+    let normalized = normalize_code_arguments(arguments, operation);
+    backend.invoke_code_search(tenant, &normalized, operation)
+}
+
+fn normalize_code_arguments(arguments: &Value, operation: &str) -> Value {
+    let mut normalized = arguments.clone();
+    let Some(object) = normalized.as_object_mut() else {
+        return normalized;
+    };
+    object
+        .entry("operation".to_string())
+        .or_insert_with(|| Value::String(operation.to_string()));
+    if let Some(repo) = object.get("repo").cloned() {
+        if object.get("repo_id").is_none()
+            && object.get("repo_url").is_none()
+            && object.get("repo_path").is_none()
+        {
+            let repo_text = repo.as_str().unwrap_or_default();
+            let target_key = if repo_text.starts_with("http://")
+                || repo_text.starts_with("https://")
+                || repo_text.ends_with(".git")
+            {
+                "repo_url"
+            } else if repo_text.starts_with('/')
+                || repo_text.starts_with("./")
+                || repo_text.starts_with("../")
+            {
+                "repo_path"
+            } else {
+                "repo_id"
+            };
+            object.insert(target_key.to_string(), repo);
+        }
+    }
+    if let Some(limits) = object.get("limits").and_then(Value::as_object).cloned() {
+        for (key, value) in limits {
+            object.entry(key).or_insert(value);
+        }
+    }
+    normalized
 }
 
 fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
@@ -3634,7 +3954,7 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
         "ingest_status" | "status" | "job_status" => Ok("ingest_status".to_string()),
         "record_use" | "use_receipt" | "record_use_receipt" => Ok("record_use_receipt".to_string()),
         "list_repos" | "listrepos" | "repos" => Ok("list_repos".to_string()),
-        "kg_status" | "kgstatus" | "instant_kg_status" | "status" => Ok("kg_status".to_string()),
+        "kg_status" | "kgstatus" | "instant_kg_status" => Ok("kg_status".to_string()),
         "session_reingest" | "sessionreingest" | "reingest_session" => {
             Ok("session_reingest".to_string())
         }
@@ -8182,97 +8502,70 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
-            "code_search",
-            "Native CodeParsing plugin operations over the tenant RustyRed graph. RedCore backends ingest/search locally; non-RedCore backends may fall back to app affordances.",
+            "compute_code",
+            "Native CodeCrawler read path for graph-structural code discovery: search, context, explain, recognize, and explore.",
             json!({
                 "type": "object",
                 "properties": {
-                    "tenant": { "type": "string" },
                     "tenant_slug": { "type": "string" },
                     "operation": {
                         "type": "string",
-                        "enum": ["ingest", "reindex", "ingest_status", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
+                        "enum": ["search", "context", "recognize", "explore", "explain", "list_repos", "kg_status", "context_pack", "ingest_status"],
                         "default": "search"
                     },
-                    "repo_path": { "type": "string" },
-                    "repo_url": { "type": "string" },
-                    "job_id": { "type": "string" },
                     "query": { "type": "string" },
                     "node_id": { "type": "string" },
-                    "repo_id": { "type": "string" },
-                    "file_path": { "type": "string" },
+                    "repo": { "type": "string" },
                     "path_prefix": { "type": "string" },
                     "kinds": { "type": "array", "items": { "type": "string" } },
-                    "include_extensions": { "type": "array", "items": { "type": "string" } },
-                    "exclude_dirs": { "type": "array", "items": { "type": "string" } },
                     "limit": { "type": "integer", "default": 20 },
-                    "cursor": { "type": "integer", "default": 0 },
-                    "next_cursor": { "type": "integer" },
-                    "max_depth": { "type": "integer", "default": 1 },
-                    "max_files": { "type": "integer" },
-                    "max_file_bytes": { "type": "integer" },
-                    "max_total_bytes": { "type": "integer" },
-                    "max_clone_bytes": { "type": "integer" },
-                    "max_repo_bytes": { "type": "integer" },
-                    "before_lines": { "type": "integer" },
-                    "after_lines": { "type": "integer" },
-                    "max_chars": { "type": "integer" },
-                    "text": { "type": "string" },
+                    "limits": { "type": "object" }
+                }
+            }),
+        ),
+        tool_write(
+            "code_ingest",
+            "Native CodeCrawler heavy path for ingesting or reindexing repositories.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant_slug": { "type": "string" },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["ingest", "reindex", "session_reingest", "record_use_receipt"],
+                        "default": "ingest"
+                    },
+                    "repo": { "type": "string" },
+                    "repo_url": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "files": { "type": "array", "items": { "type": "object" } },
+                    "node_id": { "type": "string" },
                     "action": { "type": "string" },
                     "outcome": { "type": "string" },
-                    "use": { "type": "object" },
-                    "actor": { "type": "string" },
-                    "timeout_ms": { "type": "integer" },
-                    "dry_run": { "type": "boolean", "default": false },
-                    "confirmed": { "type": "boolean", "default": false }
+                    "limits": { "type": "object" },
+                    "confirmed": { "type": "boolean", "default": true }
                 }
             }),
         ),
         tool(
-            "compute_code",
-            "Alias for the native CodeParsing plugin-backed code_search; use for graph-structural code discovery and compute-code replacement flows.",
+            "harness_prepare",
+            "Compose a native Theorem Context Brief from Ensemble selection plus tenant memory recall.",
             json!({
                 "type": "object",
                 "properties": {
+                    "task": { "type": "string" },
                     "tenant": { "type": "string" },
                     "tenant_slug": { "type": "string" },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["ingest", "reindex", "ingest_status", "search", "context", "recognize", "explore", "explain", "record_use_receipt"],
-                        "default": "search"
-                    },
-                    "repo_path": { "type": "string" },
-                    "repo_url": { "type": "string" },
-                    "job_id": { "type": "string" },
-                    "query": { "type": "string" },
-                    "node_id": { "type": "string" },
-                    "repo_id": { "type": "string" },
-                    "file_path": { "type": "string" },
-                    "path_prefix": { "type": "string" },
-                    "kinds": { "type": "array", "items": { "type": "string" } },
-                    "include_extensions": { "type": "array", "items": { "type": "string" } },
-                    "exclude_dirs": { "type": "array", "items": { "type": "string" } },
-                    "limit": { "type": "integer", "default": 20 },
-                    "cursor": { "type": "integer", "default": 0 },
-                    "next_cursor": { "type": "integer" },
-                    "max_depth": { "type": "integer", "default": 1 },
-                    "max_files": { "type": "integer" },
-                    "max_file_bytes": { "type": "integer" },
-                    "max_total_bytes": { "type": "integer" },
-                    "max_clone_bytes": { "type": "integer" },
-                    "max_repo_bytes": { "type": "integer" },
-                    "before_lines": { "type": "integer" },
-                    "after_lines": { "type": "integer" },
-                    "max_chars": { "type": "integer" },
-                    "text": { "type": "string" },
-                    "action": { "type": "string" },
-                    "outcome": { "type": "string" },
-                    "use": { "type": "object" },
                     "actor": { "type": "string" },
-                    "timeout_ms": { "type": "integer" },
-                    "dry_run": { "type": "boolean", "default": false },
-                    "confirmed": { "type": "boolean", "default": false }
-                }
+                    "budget_units": { "type": "integer" },
+                    "max_selected": { "type": "integer" },
+                    "maxSelected": { "type": "integer" },
+                    "memory_limit": { "type": "integer", "default": 8 },
+                    "surface": { "type": "string" },
+                    "priors": { "type": "object" }
+                },
+                "required": ["task"]
             }),
         ),
         tool(
@@ -9456,7 +9749,8 @@ fn tool_write(name: &str, description: &str, input_schema: Value) -> Value {
 
 fn output_schema_for_tool(name: &str) -> Value {
     match name {
-        "code_search" | "compute_code" => code_search_output_schema(),
+        "code_search" | "compute_code" | "code_ingest" => code_search_output_schema(),
+        "harness_prepare" => harness_prepare_output_schema(),
         "web_consume" => web_consume_output_schema(),
         "browse_with_me" | "browse_for_me" => browsing_run_output_schema(),
         "fractal_expansion" | "rustyweb_search_acquisition" => async_run_output_schema(),
@@ -9542,6 +9836,32 @@ fn code_search_output_schema() -> Value {
             "receipt": { "type": "object" },
             "error": { "type": "string" },
             "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn harness_prepare_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "task": { "type": "string" },
+            "actor": { "type": "string" },
+            "signature": { "type": "string" },
+            "decision_content_hash": { "type": "string" },
+            "selected_capabilities": { "type": "array", "items": { "type": "object" } },
+            "memory_contract": {
+                "type": "object",
+                "properties": {
+                    "read_first": { "type": "array", "items": { "type": "string" } },
+                    "risks": { "type": "array", "items": { "type": "string" } },
+                    "do_not": { "type": "array", "items": { "type": "string" } }
+                }
+            },
+            "recall_results": { "type": "array", "items": { "type": "object" } },
+            "brief": { "type": "object" },
+            "rendered_markdown": { "type": "string" }
         },
         "additionalProperties": true
     })
@@ -10799,33 +11119,28 @@ mod tests {
         assert!(has_tool(tools, "relate"));
         assert!(has_tool(tools, "self_recall_archive"));
         assert!(has_tool(tools, "observe"));
-        assert!(has_tool(tools, "code_search"));
+        assert!(!has_tool(tools, "code_search"));
         assert!(has_tool(tools, "compute_code"));
+        assert!(has_tool(tools, "code_ingest"));
+        assert!(has_tool(tools, "harness_prepare"));
         assert_eq!(
-            tool_by_name(tools, "code_search")["inputSchema"]["properties"]["confirmed"]["type"],
-            "boolean"
-        );
-        assert_eq!(
-            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["confirmed"]["type"],
-            "boolean"
-        );
-        assert_eq!(
-            tool_by_name(tools, "code_search")["inputSchema"]["properties"]["repo_url"]["type"],
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo"]["type"],
             "string"
         );
-        assert_eq!(
-            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo_url"]["type"],
-            "string"
+        assert!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]
+                .get("confirmed")
+                .is_none()
         );
-        assert_eq!(
-            tool_by_name(tools, "code_search")["inputSchema"]["properties"]["max_total_bytes"]
-                ["type"],
-            "integer"
+        assert!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]
+                .get("repo_url")
+                .is_none()
         );
-        assert_eq!(
-            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["max_clone_bytes"]
-                ["type"],
-            "integer"
+        assert!(
+            tool_by_name(tools, "compute_code")["inputSchema"]["properties"]
+                .get("max_clone_bytes")
+                .is_none()
         );
         assert!(has_tool(tools, "ensemble_select"));
         assert!(tools
@@ -10962,10 +11277,9 @@ mod tests {
         let via_top_level = call_tool_json(
             &provider,
             &config,
-            "compute_code",
+            "code_ingest",
             json!({
                 "tenant": "smoke",
-                "operation": "ingest",
                 "repo_path": "/tmp/theorem-fixture",
                 "confirmed": true,
                 "actor": "codex",
@@ -11089,10 +11403,9 @@ mod tests {
         let gated = call_tool_json(
             &provider,
             &config,
-            "code_search",
+            "code_ingest",
             json!({
                 "tenant": "smoke",
-                "operation": "ingest",
                 "repo_path": "/tmp/theorem-fixture",
                 "actor": "codex",
             }),
@@ -11176,6 +11489,8 @@ mod tests {
         assert!(has_tool(tools, "ensemble_select"));
         assert!(has_tool(tools, "ensemble_register"));
         assert!(has_tool(tools, "compute_code"));
+        assert!(has_tool(tools, "code_ingest"));
+        assert!(has_tool(tools, "harness_prepare"));
         assert!(has_tool(tools, "remember"));
         assert!(has_tool(tools, "recall"));
         assert!(has_tool(tools, "relate"));
@@ -11201,7 +11516,13 @@ mod tests {
         );
 
         let tools = response["result"]["tools"].as_array().unwrap();
-        for name in ["browse_for_me", "browse_with_me", "code_search"] {
+        for name in [
+            "browse_for_me",
+            "browse_with_me",
+            "compute_code",
+            "code_ingest",
+            "harness_prepare",
+        ] {
             let tool = tool_by_name(tools, name);
             assert_eq!(tool["outputSchema"]["type"], "object");
             assert!(
@@ -11218,9 +11539,13 @@ mod tests {
             true
         );
         assert_eq!(
-            tool_by_name(tools, "code_search")["outputSchema"]["properties"]["affordance_id"]
+            tool_by_name(tools, "compute_code")["outputSchema"]["properties"]["affordance_id"]
                 ["type"],
             "string"
+        );
+        assert_eq!(
+            tool_by_name(tools, "code_ingest")["inputSchema"]["properties"]["confirmed"]["type"],
+            "boolean"
         );
     }
 
@@ -11333,6 +11658,78 @@ mod tests {
             selected["decision"]["selected"][0]["pack_content_hash"],
             pack_hash
         );
+    }
+
+    #[test]
+    fn native_harness_prepare_composes_ensemble_and_memory_brief() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        call_tool_json(
+            &provider,
+            &config,
+            "ensemble_register",
+            json!({
+                "tenant": "smoke",
+                "pack": sample_capability_pack(),
+                "source_content_hash": "hash-source",
+                "artifact_hashes": ["hash-artifact"],
+            }),
+        );
+        call_tool_json(
+            &provider,
+            &config,
+            "remember",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "surface": "codex",
+                "kind": "insight",
+                "title": "Rust graph store MCP restructure",
+                "content": "Risk: duplicate schemas return if the local Node MCP route is reintroduced. Do not use the local Node MCP for harness prepare.",
+                "tags": ["rust", "mcp", "prepare"],
+                "created_at": "2026-06-15T00:00:00Z"
+            }),
+        );
+
+        let prepared = call_tool_json(
+            &provider,
+            &config,
+            "harness_prepare",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "surface": "codex",
+                "task": "use rust graph store mcp code search",
+                "max_selected": 1,
+                "memory_limit": 5
+            }),
+        );
+
+        assert!(!prepared["signature"].as_str().unwrap().is_empty());
+        assert_eq!(
+            prepared["selected_capabilities"][0]["title"],
+            "Rust Engineering"
+        );
+        assert!(prepared["memory_contract"]["read_first"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap_or("").contains("Rust graph store")));
+        assert!(prepared["memory_contract"]["risks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap_or("").contains("Risk")));
+        assert!(prepared["memory_contract"]["do_not"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap_or("").contains("Do not")));
+        let markdown = prepared["rendered_markdown"].as_str().unwrap();
+        assert!(markdown.contains("Theorem Context Brief"));
+        assert!(markdown.contains("Rust Engineering"));
+        assert!(markdown.contains("### Read first"));
     }
 
     #[test]

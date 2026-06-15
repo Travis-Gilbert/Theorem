@@ -161,7 +161,7 @@ pub fn register_training_fixture<S: AdapterGraphStore>(
     tenant_id: &str,
     actor: Option<&str>,
 ) -> ThgResult<TrainingFixtureResult> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let object_node_ids = vec![object_node_id(1), object_node_id(2), object_node_id(3)];
     let reasoning_trace_node_ids = vec![
         reasoning_trace_node_id(&tenant_id, "trace-alpha"),
@@ -394,7 +394,7 @@ pub fn register_gnn_export_dir<S: AdapterGraphStore>(
     actor: Option<&str>,
 ) -> ThgResult<GnnExportImportResult> {
     let export_dir = export_dir.as_ref();
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let export_id = export_id.trim().to_string();
     if export_id.is_empty() {
         return Err(ThgError::new("invalid_gnn_export", "export_id is required"));
@@ -754,7 +754,7 @@ pub fn export_training_snapshot(
     tenant_id: &str,
     export_id: &str,
 ) -> ThgResult<TrainingExportManifest> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let selected_nodes = snapshot
         .nodes
         .iter()
@@ -867,7 +867,7 @@ pub fn register_model_artifact<S: AdapterGraphStore>(
     input: ModelArtifactInput,
     actor: Option<&str>,
 ) -> ThgResult<ModelWritebackResult> {
-    let tenant_id = normalize_tenant_id(&input.tenant_id);
+    let tenant_id = input.tenant_id.trim().to_string();
     let model_node_id = model_artifact_node_id(&tenant_id, &input.model_id);
     let evaluation_node_id = evaluation_receipt_node_id(&tenant_id, &input.model_id);
     let model_id = input.model_id.trim().to_string();

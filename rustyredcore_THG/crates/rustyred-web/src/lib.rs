@@ -48,6 +48,8 @@ pub use fetch_cascade::{
     should_promote, FetchCascade, FetchCascadeOptions, FetchTier, FetchTierResult,
 };
 
+pub mod frontier;
+
 pub mod browser_engine;
 pub use browser_engine::{
     action_allowed_by_policy, action_allowed_by_robots, page_state_from_html, web_consume_to_graph,

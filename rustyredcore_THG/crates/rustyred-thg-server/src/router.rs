@@ -1,10 +1,11 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
     },
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -23,9 +24,9 @@ use rustyred_thg_core::errors::ThgError;
 use rustyred_thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
-    merge_graph_snapshots, stable_hash, update_graph_ref, CodeKgManifest, Direction, EdgeRecord,
-    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphMergeStrategy, GraphRebuildReport,
-    GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
+    merge_graph_snapshots, stable_hash, update_graph_ref_cas, CodeKgManifest, Direction,
+    EdgeRecord, EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphMergeStrategy,
+    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
     GraphVersionRepository, GraphWriteResult, HarnessInstantKg, InMemoryGraphStore, NeighborHit,
     NeighborQuery, NodeQuery, NodeRecord, SessionDelta, VerifyReport,
 };
@@ -60,7 +61,7 @@ use theorem_harness_runtime::{
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::auth::require_scope;
+use crate::auth::{authenticate, require_scope, require_scope_for_tenant, AuthContext};
 use crate::graph_cache::{
     GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody, GraphCacheStatsBody,
 };
@@ -339,6 +340,8 @@ pub struct GraphVersionRefBody {
     pub repository: Option<GraphVersionRepository>,
     #[serde(default)]
     pub updated_at_unix_ms: Option<u128>,
+    #[serde(default)]
+    pub expected_commit_hash: Option<String>,
     #[serde(flatten)]
     pub options: GraphCompileOptions,
 }
@@ -581,8 +584,71 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/tenants/:tenant_id/instant-kg/explain-edge",
             post(instant_kg_explain_edge),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_path_tenant_auth,
+        ))
         .layer(cors)
         .with_state(state)
+}
+
+async fn enforce_path_tenant_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let Some(tenant_id) = tenant_id_from_v1_path(request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let auth_context = match authenticate(
+        request.headers(),
+        &state.config.api_tokens,
+        state.config.require_auth,
+    ) {
+        Ok(context) => context,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = auth_context.require_tenant(&tenant_id) {
+        return status.into_response();
+    }
+    next.run(request).await
+}
+
+fn tenant_id_from_v1_path(path: &str) -> Option<String> {
+    let mut parts = path.trim_start_matches('/').split('/');
+    if parts.next()? != "v1" || parts.next()? != "tenants" {
+        return None;
+    }
+    percent_decode_path_segment(parts.next()?)
+        .ok()
+        .filter(|tenant| !tenant.trim().is_empty())
+}
+
+fn percent_decode_path_segment(segment: &str) -> Result<String, ()> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = bytes.get(index + 1).copied().ok_or(())?;
+            let low = bytes.get(index + 2).copied().ok_or(())?;
+            decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ())
+}
+
+fn hex_value(byte: u8) -> Result<u8, ()> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(()),
+    }
 }
 
 async fn health() -> Json<HealthBody> {
@@ -627,6 +693,15 @@ async fn mcp_post(
     };
 
     let config = state.mcp_config();
+    match mcp_payload_tenant(&config, &payload) {
+        Ok(Some(tenant_id)) => {
+            if let Err(status) = auth_context.require_tenant(&tenant_id) {
+                return status.into_response();
+            }
+        }
+        Ok(None) => {}
+        Err(response) => return response,
+    }
     let mcp_context = McpRequestContext::with_scopes(auth_context.scopes);
     if let Some(response) = maybe_handle_browser_use_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
@@ -649,6 +724,43 @@ async fn mcp_post(
         payload,
     ))
     .into_response()
+}
+
+fn mcp_payload_tenant(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Result<Option<String>, axum::response::Response> {
+    match payload.get("method").and_then(Value::as_str) {
+        Some("tools/call") => {
+            let arguments = payload
+                .get("params")
+                .and_then(|params| params.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            resolve_tenant_id(
+                argument_text_any(&arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+                &config.default_tenant,
+            )
+            .map(Some)
+            .map_err(query_surface_error_response)
+        }
+        Some("resources/read") => {
+            let Some(uri) = payload
+                .get("params")
+                .and_then(|params| params.get("uri"))
+                .and_then(Value::as_str)
+            else {
+                return Ok(None);
+            };
+            Ok(tenant_from_mcp_resource_uri(uri).map(str::to_string))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn tenant_from_mcp_resource_uri(uri: &str) -> Option<&str> {
+    let raw = uri.strip_prefix("rustyred_thg://tenant/")?;
+    raw.split('/').next().filter(|tenant| !tenant.is_empty())
 }
 
 async fn maybe_handle_composed_agent_mcp(
@@ -1265,33 +1377,45 @@ fn page_state_payload(page: &PageState) -> Value {
 async fn browser_web_consume(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    browser_route_response(state, tenant_id, "web_consume", body).await
+    browser_route_response(state, tenant_id, headers, "web_consume", body).await
 }
 
 async fn browser_browse_with_me(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    browser_route_response(state, tenant_id, "browse_with_me", body).await
+    browser_route_response(state, tenant_id, headers, "browse_with_me", body).await
 }
 
 async fn browser_browse_for_me(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    browser_route_response(state, tenant_id, "browse_for_me", body).await
+    browser_route_response(state, tenant_id, headers, "browse_for_me", body).await
 }
 
 async fn browser_route_response(
     state: AppState,
     tenant_id: String,
+    headers: HeaderMap,
     tool_name: &str,
     body: Value,
 ) -> axum::response::Response {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
     let config = state.mcp_config();
     let arguments = body_with_tenant(body, tenant_id);
     match browser_use_payload(&state, &config, tool_name, &arguments).await {
@@ -2511,15 +2635,8 @@ fn execute_search(
     headers: &HeaderMap,
     query: &SearchQuery,
 ) -> Result<(String, rustyred_web::SubstrateSearch), axum::response::Response> {
-    if let Err(status) = require_scope(
-        headers,
-        &state.config.api_tokens,
-        "graph:read",
-        state.config.require_auth,
-    ) {
-        return Err(status.into_response());
-    }
-    let tenant_id = resolve_route_tenant(state, query.tenant.as_deref())?;
+    let tenant_id =
+        resolve_authorized_route_tenant(headers, state, "graph:read", query.tenant.as_deref())?;
     let store = search_snapshot_store(state, &tenant_id)?;
     let search = search_substrate(
         &store,
@@ -2534,15 +2651,12 @@ async fn crawl_submit(
     headers: HeaderMap,
     Json(body): Json<CrawlRouteBody>,
 ) -> axum::response::Response {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "graph:write",
-        state.config.require_auth,
+        body.tenant.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id = match resolve_route_tenant(&state, body.tenant.as_deref()) {
         Ok(tenant_id) => tenant_id,
         Err(response) => return response,
     };
@@ -2585,15 +2699,12 @@ async fn federate_submit(
     headers: HeaderMap,
     Json(body): Json<FederateSubmitBody>,
 ) -> axum::response::Response {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "federation:write",
-        state.config.require_auth,
+        body.tenant.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id = match resolve_route_tenant(&state, body.tenant.as_deref()) {
         Ok(tenant_id) => tenant_id,
         Err(response) => return response,
     };
@@ -3310,6 +3421,50 @@ fn resolve_route_tenant(
         .map_err(query_surface_error_response)
 }
 
+fn authorize_scope(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope: &str,
+) -> Result<AuthContext, axum::response::Response> {
+    require_scope(
+        headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+    )
+    .map_err(IntoResponse::into_response)
+}
+
+fn authorize_scope_for_tenant(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope: &str,
+    tenant_id: &str,
+) -> Result<AuthContext, axum::response::Response> {
+    require_scope_for_tenant(
+        headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+        tenant_id,
+    )
+    .map_err(IntoResponse::into_response)
+}
+
+fn resolve_authorized_route_tenant(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope: &str,
+    tenant: Option<&str>,
+) -> Result<String, axum::response::Response> {
+    let auth_context = authorize_scope(headers, state, scope)?;
+    let tenant_id = resolve_route_tenant(state, tenant)?;
+    auth_context
+        .require_tenant(&tenant_id)
+        .map_err(IntoResponse::into_response)?;
+    Ok(tenant_id)
+}
+
 fn search_snapshot_store(
     state: &AppState,
     tenant_id: &str,
@@ -3373,18 +3528,10 @@ async fn root_command(
     Json(body): Json<RootCommandBody>,
 ) -> impl IntoResponse {
     let scope = required_scope_for_command(&body.command);
-    if let Err(status) = require_scope(
-        &headers,
-        &state.config.api_tokens,
-        scope,
-        state.config.require_auth,
-    ) {
-        return status.into_response();
-    }
     let tenant_id =
-        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+        match resolve_authorized_route_tenant(&headers, &state, scope, body.tenant_id.as_deref()) {
             Ok(tenant_id) => tenant_id,
-            Err(error) => return query_surface_error_response(error),
+            Err(response) => return response,
         };
     execute_tenant_command(&state, &tenant_id, &body.command, body.args)
 }
@@ -3421,13 +3568,8 @@ async fn root_batch(
         };
     for item in &body.commands {
         let scope = required_scope_for_command(&item.command);
-        if let Err(status) = require_scope(
-            &headers,
-            &state.config.api_tokens,
-            scope,
-            state.config.require_auth,
-        ) {
-            return status.into_response();
+        if let Err(response) = authorize_scope_for_tenant(&headers, &state, scope, &tenant_id) {
+            return response;
         }
     }
     execute_batch_commands(&state, &tenant_id, body.commands)
@@ -3438,19 +3580,15 @@ async fn root_cache_put(
     headers: HeaderMap,
     Json(body): Json<GraphCachePutBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "graph:write",
-        state.config.require_auth,
+        body.tenant_id.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id =
-        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
-            Ok(tenant_id) => tenant_id,
-            Err(error) => return query_surface_error_response(error),
-        };
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
     match execute_cache_put(&state, &tenant_id, body) {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => graph_store_error_response(error),
@@ -3462,19 +3600,15 @@ async fn root_cache_get(
     headers: HeaderMap,
     Json(body): Json<GraphCacheLookupBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "graph:read",
-        state.config.require_auth,
+        body.tenant_id.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id =
-        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
-            Ok(tenant_id) => tenant_id,
-            Err(error) => return query_surface_error_response(error),
-        };
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
     match execute_cache_get(&state, &tenant_id, body) {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => graph_store_error_response(error),
@@ -3486,19 +3620,15 @@ async fn root_cache_check(
     headers: HeaderMap,
     Json(body): Json<GraphCacheLookupBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "graph:read",
-        state.config.require_auth,
+        body.tenant_id.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id =
-        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
-            Ok(tenant_id) => tenant_id,
-            Err(error) => return query_surface_error_response(error),
-        };
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
     match execute_cache_check(&state, &tenant_id, body) {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => graph_store_error_response(error),
@@ -3510,19 +3640,15 @@ async fn root_cache_explain(
     headers: HeaderMap,
     Json(body): Json<GraphCacheLookupBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "graph:read",
-        state.config.require_auth,
+        body.tenant_id.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id =
-        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
-            Ok(tenant_id) => tenant_id,
-            Err(error) => return query_surface_error_response(error),
-        };
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
     match execute_cache_explain(&state, &tenant_id, body) {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => graph_store_error_response(error),
@@ -3534,19 +3660,15 @@ async fn root_cache_invalidate(
     headers: HeaderMap,
     Json(body): Json<GraphCacheInvalidateBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "graph:write",
-        state.config.require_auth,
+        body.tenant_id.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id =
-        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
-            Ok(tenant_id) => tenant_id,
-            Err(error) => return query_surface_error_response(error),
-        };
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
     match execute_cache_invalidate(&state, &tenant_id, body) {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => graph_store_error_response(error),
@@ -3558,19 +3680,15 @@ async fn root_cache_stats(
     headers: HeaderMap,
     Json(body): Json<GraphCacheStatsBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
+    let tenant_id = match resolve_authorized_route_tenant(
         &headers,
-        &state.config.api_tokens,
+        &state,
         "graph:read",
-        state.config.require_auth,
+        body.tenant_id.as_deref(),
     ) {
-        return status.into_response();
-    }
-    let tenant_id =
-        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
-            Ok(tenant_id) => tenant_id,
-            Err(error) => return query_surface_error_response(error),
-        };
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
     match execute_cache_stats(&state, &tenant_id) {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => graph_store_error_response(error),
@@ -3603,14 +3721,6 @@ async fn public_query(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
-        &headers,
-        &state.config.api_tokens,
-        "graph:read",
-        state.config.require_auth,
-    ) {
-        return status.into_response();
-    }
     if let Err(error) = state.store_ready() {
         return store_unavailable_response(error);
     }
@@ -3621,6 +3731,9 @@ async fn public_query(
         Ok(tenant_id) => tenant_id,
         Err(error) => return query_surface_error_response(error),
     };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:read", &tenant_id) {
+        return response;
+    }
     let store = match state.tenant_graph_store(&tenant_id) {
         Ok(store) => store,
         Err(error) => return store_unavailable_response(error),
@@ -3643,14 +3756,6 @@ async fn public_cypher(
         "graph:read"
     };
 
-    if let Err(status) = require_scope(
-        &headers,
-        &state.config.api_tokens,
-        scope,
-        state.config.require_auth,
-    ) {
-        return status.into_response();
-    }
     if let Err(error) = state.store_ready() {
         return store_unavailable_response(error);
     }
@@ -3659,6 +3764,9 @@ async fn public_cypher(
             Ok(tenant_id) => tenant_id,
             Err(error) => return query_surface_error_response(error),
         };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, scope, &tenant_id) {
+        return response;
+    }
     if let Some(tx_id) = body.tx_id.as_deref() {
         if tx_id.trim().is_empty() {
             return query_surface_error_response(QuerySurfaceError::invalid(
@@ -3716,14 +3824,6 @@ async fn transaction_begin(
     headers: HeaderMap,
     Json(body): Json<TransactionBeginBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
-        &headers,
-        &state.config.api_tokens,
-        "graph:write",
-        state.config.require_auth,
-    ) {
-        return status.into_response();
-    }
     if let Err(error) = state.store_ready() {
         return store_unavailable_response(error);
     }
@@ -3732,6 +3832,9 @@ async fn transaction_begin(
             Ok(tenant_id) => tenant_id,
             Err(error) => return query_surface_error_response(error),
         };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:write", &tenant_id) {
+        return response;
+    }
     let tx_id = match state.begin_graph_transaction(&tenant_id) {
         Ok(tx_id) => tx_id,
         Err(error) => {
@@ -3753,14 +3856,6 @@ async fn transaction_commit(
     headers: HeaderMap,
     Json(body): Json<TransactionMutationBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
-        &headers,
-        &state.config.api_tokens,
-        "graph:write",
-        state.config.require_auth,
-    ) {
-        return status.into_response();
-    }
     if let Err(error) = state.store_ready() {
         return store_unavailable_response(error);
     }
@@ -3776,6 +3871,9 @@ async fn transaction_commit(
             Ok(tenant_id) => tenant_id,
             Err(error) => return query_surface_error_response(error),
         };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:write", &tenant_id) {
+        return response;
+    }
     let transaction = match state.commit_graph_transaction(&tenant_id, tx_id) {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -3797,14 +3895,6 @@ async fn transaction_rollback(
     headers: HeaderMap,
     Json(body): Json<TransactionMutationBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
-        &headers,
-        &state.config.api_tokens,
-        "graph:write",
-        state.config.require_auth,
-    ) {
-        return status.into_response();
-    }
     if let Err(error) = state.store_ready() {
         return store_unavailable_response(error);
     }
@@ -3820,6 +3910,9 @@ async fn transaction_rollback(
             Ok(tenant_id) => tenant_id,
             Err(error) => return query_surface_error_response(error),
         };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:write", &tenant_id) {
+        return response;
+    }
     if let Err(error) = state.rollback_graph_transaction(&tenant_id, tx_id) {
         state.observability.record_error();
         return graph_store_error_response(transaction_state_error(error));
@@ -3839,14 +3932,6 @@ async fn public_cypher_explain(
     headers: HeaderMap,
     Json(body): Json<PublicCypherBody>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_scope(
-        &headers,
-        &state.config.api_tokens,
-        "graph:read",
-        state.config.require_auth,
-    ) {
-        return status.into_response();
-    }
     if let Err(error) = state.store_ready() {
         return store_unavailable_response(error);
     }
@@ -3855,6 +3940,9 @@ async fn public_cypher_explain(
             Ok(tenant_id) => tenant_id,
             Err(error) => return query_surface_error_response(error),
         };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:read", &tenant_id) {
+        return response;
+    }
     match explain_cypher_query(&tenant_id, &body) {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => query_surface_error_response(error),
@@ -4537,12 +4625,27 @@ async fn graph_version_ref(
         Ok(snapshot) => {
             let branch = body.options.branch.clone();
             let pack = compile_graph_pack(&snapshot, body.options);
-            let ref_update = update_graph_ref(
+            let ref_update = match update_graph_ref_cas(
                 body.repository.unwrap_or_default(),
                 pack,
                 branch,
+                body.expected_commit_hash,
                 body.updated_at_unix_ms,
-            );
+            ) {
+                Ok(update) => update,
+                Err(conflict) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "ok": false,
+                            "tenant": tenant_id,
+                            "error": "graph_ref_conflict",
+                            "conflict": conflict,
+                        })),
+                    )
+                        .into_response()
+                }
+            };
             Json(json!({
                 "ok": true,
                 "tenant": tenant_id,
@@ -6773,25 +6876,28 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::Json;
     use serde_json::{json, Value};
+    use tower::ServiceExt;
 
     use super::{
-        browser_use_job, default_ppr_alpha, default_ppr_epsilon, default_ppr_max_pushes,
-        default_pr_damping, default_pr_max_iter, default_pr_tolerance, derive_live_search_seeds,
-        execute_graph_store_command, execute_tenant_cache_command, execute_tenant_command,
-        graph_algorithm_communities, graph_algorithm_components, graph_algorithm_pagerank,
-        graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes, graph_error_status,
-        graph_fulltext_search, graph_vector_hybrid, graph_vector_search, instant_kg_explain_edge,
-        instant_kg_impact, instant_kg_ppr, instant_kg_search, is_adapter_command, is_cache_command,
-        is_graph_command, live_search_budget, live_search_is_sparse, maybe_handle_browser_use_mcp,
-        maybe_handle_composed_agent_mcp, maybe_handle_live_search_acquisition_mcp,
-        mcp_origin_allowed, memory_docs_list, public_cypher, required_scope_for_command,
-        search_live, transaction_begin, transaction_commit, transaction_rollback, BulkQuery,
-        CommunitiesBody, ComponentsBody, FullTextSearchBody, HybridSearchBody,
-        InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody, InstantKgSearchBody,
-        InstantKgViewBody, LiveSearchRequest, MemoryDocsQuery, PageRankBody, PprBody,
-        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        browser_use_job, build_router, default_ppr_alpha, default_ppr_epsilon,
+        default_ppr_max_pushes, default_pr_damping, default_pr_max_iter, default_pr_tolerance,
+        derive_live_search_seeds, execute_graph_store_command, execute_tenant_cache_command,
+        execute_tenant_command, graph_algorithm_communities, graph_algorithm_components,
+        graph_algorithm_pagerank, graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes,
+        graph_error_status, graph_fulltext_search, graph_vector_hybrid, graph_vector_search,
+        instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr, instant_kg_search,
+        is_adapter_command, is_cache_command, is_graph_command, live_search_budget,
+        live_search_is_sparse, maybe_handle_browser_use_mcp, maybe_handle_composed_agent_mcp,
+        maybe_handle_live_search_acquisition_mcp, mcp_origin_allowed, memory_docs_list,
+        public_cypher, required_scope_for_command, search_live, transaction_begin,
+        transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
+        FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
+        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest,
+        MemoryDocsQuery, PageRankBody, PprBody, PublicCypherBody, TransactionBeginBody,
+        TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
+        auth::ApiToken,
         config::{Config, StorageMode, TenantConfigOverride},
         metrics::diagnostics_config,
         state::AppState,
@@ -6893,6 +6999,69 @@ mod tests {
             },
             search_providers,
         )
+    }
+
+    fn memory_product_auth_state() -> AppState {
+        let mut config = Config::default_for_tests();
+        config.require_auth = true;
+        config.api_tokens = vec![ApiToken {
+            token: "secret-a".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            scopes: vec!["graph:read".to_string(), "graph:write".to_string()],
+        }];
+        config.mcp_enabled = true;
+        config.mcp_read_only = false;
+        config.mcp_default_tenant = "tenant-a".to_string();
+        AppState::new(config)
+    }
+
+    #[tokio::test]
+    async fn path_tenant_auth_rejects_mismatched_token_before_write() {
+        let state = memory_product_auth_state();
+        let app = build_router(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/tenant-b/graph/nodes")
+            .header("authorization", "Bearer secret-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "node:blocked",
+                    "labels": ["Doc"],
+                    "properties": { "title": "blocked" }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let store = state.tenant_graph_store("tenant-b").unwrap();
+        assert!(store.get_node("node:blocked").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn root_tenant_auth_rejects_mismatched_body_tenant() {
+        let state = memory_product_auth_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/query")
+            .header("authorization", "Bearer secret-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "tenant_id": "tenant-b",
+                    "query": "MATCH (n) RETURN n"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

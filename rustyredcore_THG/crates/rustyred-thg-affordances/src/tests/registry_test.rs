@@ -136,7 +136,7 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
     let result = register_theseus_app_affordances(&mut store, "theorem", Some("test")).unwrap();
 
     assert_eq!(result.server_id, THEOREM_GRPC_SERVER_ID);
-    assert_eq!(result.affordance_node_ids.len(), 20);
+    assert_eq!(result.affordance_node_ids.len(), 24);
     assert!(store.get_node(&result.connector_node_id).is_some());
 
     let publisher_id = affordance_node_id("theorem", "theorem_grpc.publisher.publish");
@@ -189,7 +189,7 @@ fn theseus_app_affordances_become_theorem_grpc_nodes() {
 
     let offers =
         store.neighbors(NeighborQuery::out(&result.connector_node_id).with_edge_type(OFFERS));
-    assert_eq!(offers.len(), 20);
+    assert_eq!(offers.len(), 24);
 }
 
 #[test]

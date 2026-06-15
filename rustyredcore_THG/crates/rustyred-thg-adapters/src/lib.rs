@@ -118,7 +118,7 @@ pub use training_substrate::{
     TRAINING_EXPORT_LABEL, TRAINING_PACK_LABEL, USED_ARTIFACT,
 };
 pub use types::{
-    adapter_node_id, adapter_vector_designation, normalize_tenant_id, object_node_id,
+    adapter_node_id, adapter_vector_designation, normalize_tenant_id, object_node_id, tenant_node_id,
     AdapterFindRequest, AdapterFitnessRecordRequest, AdapterFitnessRecordResult, AdapterGraphStore,
     AdapterListRequest, AdapterRef, AdapterSupersedeResult, AdapterUpsertResult, LoraAdapter,
     DEFAULT_FITNESS_EPSILON, DEFAULT_MIN_FITNESS, DEFAULT_PPR_DAMPING, DEFAULT_PPR_MAX_PUSHES,

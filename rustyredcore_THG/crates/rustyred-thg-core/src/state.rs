@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use imbl::OrdMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -7,9 +7,9 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ThgState {
     pub seq: u64,
-    pub runs: BTreeMap<String, RunState>,
-    pub contexts: BTreeMap<String, ContextState>,
-    pub patches: BTreeMap<String, PatchState>,
+    pub runs: OrdMap<String, RunState>,
+    pub contexts: OrdMap<String, ContextState>,
+    pub patches: OrdMap<String, PatchState>,
 }
 
 impl ThgState {

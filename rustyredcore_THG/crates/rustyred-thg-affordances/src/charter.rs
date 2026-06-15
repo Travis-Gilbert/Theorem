@@ -31,9 +31,9 @@ pub struct BindingCharterRequest {
 
 impl BindingCharterRequest {
     pub fn normalized(mut self, binding: &AgentBinding) -> Self {
-        self.tenant_id = crate::types::normalize_tenant_id(&self.tenant_id);
+        self.tenant_id = self.tenant_id.trim().to_string();
         if self.tenant_id.is_empty() {
-            self.tenant_id = crate::types::normalize_tenant_id(&binding.identity.agent_id);
+            self.tenant_id = binding.identity.agent_id.trim().to_string();
         }
         self.stance = self.stance.trim().to_string();
         self.task_type = self.task_type.trim().to_string();

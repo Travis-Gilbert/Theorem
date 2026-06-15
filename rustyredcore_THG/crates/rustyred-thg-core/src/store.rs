@@ -1,28 +1,41 @@
+use std::sync::Arc;
+
 use crate::state::ThgState;
 
 pub trait ThgStore {
     fn load(&self) -> ThgState;
+    fn load_snapshot(&self) -> Arc<ThgState> {
+        Arc::new(self.load())
+    }
     fn save(&mut self, state: &ThgState);
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryThgStore {
-    state: ThgState,
+    state: Arc<ThgState>,
 }
 
 impl InMemoryThgStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn snapshot(&self) -> Arc<ThgState> {
+        Arc::clone(&self.state)
+    }
 }
 
 impl ThgStore for InMemoryThgStore {
     fn load(&self) -> ThgState {
-        self.state.clone()
+        self.state.as_ref().clone()
+    }
+
+    fn load_snapshot(&self) -> Arc<ThgState> {
+        self.snapshot()
     }
 
     fn save(&mut self, state: &ThgState) {
-        self.state = state.clone();
+        self.state = Arc::new(state.clone());
     }
 }
 
@@ -81,6 +94,7 @@ impl ThgStore for RedisThgStore {
 mod tests {
     use super::{InMemoryThgStore, ThgStore};
     use crate::state::RunState;
+    use std::sync::Arc;
 
     #[test]
     fn in_memory_store_round_trips_state() {
@@ -102,5 +116,28 @@ mod tests {
 
         let loaded = store.load();
         assert_eq!(loaded.runs["run:redis-contract"].task, "persist THG");
+    }
+
+    #[test]
+    fn in_memory_store_load_snapshot_is_arc_shared() {
+        let mut store = InMemoryThgStore::new();
+        let mut state = store.load();
+        state.runs.insert(
+            "run:shared".to_string(),
+            RunState {
+                run_id: "run:shared".to_string(),
+                task: "shared snapshot".to_string(),
+                actor: "agent".to_string(),
+                scope: serde_json::json!({}),
+                status: "running".to_string(),
+                steps: Vec::new(),
+            },
+        );
+        store.save(&state);
+
+        let first = store.load_snapshot();
+        let second = store.load_snapshot();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.runs["run:shared"].task, "shared snapshot");
     }
 }

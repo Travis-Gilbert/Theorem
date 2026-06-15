@@ -186,7 +186,7 @@ pub struct Affordance {
 
 impl Affordance {
     pub fn normalized(mut self) -> Self {
-        self.tenant_id = sanitize_tenant_segment(&self.tenant_id);
+        self.tenant_id = self.tenant_id.trim().to_string();
         self.affordance_id = self.affordance_id.trim().to_string();
         self.server_id = self.server_id.trim().to_string();
         self.tool_name = self.tool_name.trim().to_string();
@@ -514,7 +514,7 @@ pub struct SelectionRequest {
 
 impl SelectionRequest {
     pub fn normalized(mut self) -> Self {
-        self.tenant_id = sanitize_tenant_segment(&self.tenant_id);
+        self.tenant_id = self.tenant_id.trim().to_string();
         self.task_type = self.task_type.trim().to_string();
         if self.k == 0 {
             self.k = 10;

@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -1979,6 +1980,19 @@ const REDCORE_PREVIOUS_SNAPSHOT_TMP_FILE: &str = "graph.snapshot.previous.tmp";
 const REDCORE_MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
 
 static REDCORE_PROCESS_LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+static REDCORE_DURABILITY_SYNCER: OnceLock<mpsc::Sender<DurabilitySyncRequest>> = OnceLock::new();
+
+#[derive(Debug)]
+struct DurabilitySyncRequest {
+    file_path: PathBuf,
+    directory_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedCoreSyncMode {
+    Inline,
+    Background,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2813,11 +2827,9 @@ impl RedCoreGraphStore {
                     .map(|elapsed| elapsed >= Duration::from_secs(1))
                     .unwrap_or(true);
                 if should_sync {
-                    file.sync_data()
-                        .map_err(|err| GraphStoreError::io("fsync RedCore AOF", err))?;
-                    if created {
-                        sync_directory(data_dir, "fsync RedCore data directory after AOF create")?;
-                    }
+                    file.flush()
+                        .map_err(|err| GraphStoreError::io("flush RedCore AOF", err))?;
+                    queue_durability_sync(&path, created.then(|| data_dir.to_path_buf()))?;
                     self.last_fsync = Some(SystemTime::now());
                 }
             }
@@ -2898,14 +2910,23 @@ impl RedCoreGraphStore {
         };
         let raw = serde_json::to_vec_pretty(&manifest)
             .map_err(|err| GraphStoreError::io("encode RedCore manifest", err))?;
-        write_atomic_file(
+        write_atomic_file_with_sync(
             data_dir,
             REDCORE_MANIFEST_TMP_FILE,
             REDCORE_MANIFEST_FILE,
             &raw,
             "RedCore manifest",
+            self.commit_sync_mode(),
         )?;
         Ok(())
+    }
+
+    fn commit_sync_mode(&self) -> RedCoreSyncMode {
+        if self.options.durability == RedCoreDurability::AofEverysec && !self.options.strict_acid {
+            RedCoreSyncMode::Background
+        } else {
+            RedCoreSyncMode::Inline
+        }
     }
 }
 
@@ -3046,6 +3067,24 @@ fn write_atomic_file(
     raw: &[u8],
     label: &str,
 ) -> GraphStoreResult<()> {
+    write_atomic_file_with_sync(
+        data_dir,
+        tmp_name,
+        final_name,
+        raw,
+        label,
+        RedCoreSyncMode::Inline,
+    )
+}
+
+fn write_atomic_file_with_sync(
+    data_dir: &Path,
+    tmp_name: &str,
+    final_name: &str,
+    raw: &[u8],
+    label: &str,
+    sync_mode: RedCoreSyncMode,
+) -> GraphStoreResult<()> {
     fs::create_dir_all(data_dir)
         .map_err(|err| GraphStoreError::io(format!("create {label} directory"), err))?;
     let tmp_path = data_dir.join(tmp_name);
@@ -3066,15 +3105,29 @@ fn write_atomic_file(
         .map_err(|err| GraphStoreError::io(format!("create {label} temp file"), err))?;
     file.write_all(raw)
         .map_err(|err| GraphStoreError::io(format!("write {label} temp file"), err))?;
-    file.sync_all()
-        .map_err(|err| GraphStoreError::io(format!("fsync {label} temp file"), err))?;
+    match sync_mode {
+        RedCoreSyncMode::Inline => {
+            file.sync_all()
+                .map_err(|err| GraphStoreError::io(format!("fsync {label} temp file"), err))?;
+        }
+        RedCoreSyncMode::Background => {
+            file.flush()
+                .map_err(|err| GraphStoreError::io(format!("flush {label} temp file"), err))?;
+        }
+    }
     drop(file);
-    fs::rename(&tmp_path, data_dir.join(final_name))
+    let final_path = data_dir.join(final_name);
+    fs::rename(&tmp_path, &final_path)
         .map_err(|err| GraphStoreError::io(format!("install {label}"), err))?;
-    sync_directory(
-        data_dir,
-        format!("fsync RedCore directory after {label} install"),
-    )
+    match sync_mode {
+        RedCoreSyncMode::Inline => sync_directory(
+            data_dir,
+            format!("fsync RedCore directory after {label} install"),
+        ),
+        RedCoreSyncMode::Background => {
+            queue_durability_sync(&final_path, Some(data_dir.to_path_buf()))
+        }
+    }
 }
 
 fn sync_file_path(path: &Path, action: &str) -> GraphStoreResult<()> {
@@ -3087,6 +3140,68 @@ fn sync_directory(data_dir: &Path, action: impl AsRef<str>) -> GraphStoreResult<
     File::open(data_dir)
         .and_then(|dir| dir.sync_all())
         .map_err(|err| GraphStoreError::io(action.as_ref(), err))
+}
+
+fn queue_durability_sync(
+    file_path: &Path,
+    directory_path: Option<PathBuf>,
+) -> GraphStoreResult<()> {
+    let fallback_directory_path = directory_path.clone();
+    let request = DurabilitySyncRequest {
+        file_path: file_path.to_path_buf(),
+        directory_path,
+    };
+    let sender = REDCORE_DURABILITY_SYNCER.get_or_init(spawn_durability_syncer);
+    if sender.send(request).is_err() {
+        sync_file_path(
+            file_path,
+            "fsync RedCore file after background sync fallback",
+        )?;
+        if let Some(directory_path) = fallback_directory_path {
+            sync_directory(
+                &directory_path,
+                "fsync RedCore directory after background sync fallback",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn spawn_durability_syncer() -> mpsc::Sender<DurabilitySyncRequest> {
+    let (tx, rx) = mpsc::channel::<DurabilitySyncRequest>();
+    thread::Builder::new()
+        .name("redcore-durability-sync".to_string())
+        .spawn(move || durability_sync_worker(rx))
+        .expect("spawn RedCore durability sync worker");
+    tx
+}
+
+fn durability_sync_worker(rx: mpsc::Receiver<DurabilitySyncRequest>) {
+    while let Ok(first) = rx.recv() {
+        let mut file_paths = BTreeSet::new();
+        let mut directory_paths = BTreeSet::new();
+        collect_sync_request(first, &mut file_paths, &mut directory_paths);
+        while let Ok(request) = rx.recv_timeout(Duration::from_millis(25)) {
+            collect_sync_request(request, &mut file_paths, &mut directory_paths);
+        }
+        for path in file_paths {
+            let _ = File::open(path).and_then(|file| file.sync_data());
+        }
+        for path in directory_paths {
+            let _ = File::open(path).and_then(|dir| dir.sync_all());
+        }
+    }
+}
+
+fn collect_sync_request(
+    request: DurabilitySyncRequest,
+    file_paths: &mut BTreeSet<PathBuf>,
+    directory_paths: &mut BTreeSet<PathBuf>,
+) {
+    file_paths.insert(request.file_path);
+    if let Some(directory_path) = request.directory_path {
+        directory_paths.insert(directory_path);
+    }
 }
 
 pub fn read_manifest(data_dir: &Path) -> GraphStoreResult<Option<RedCoreManifest>> {
@@ -4552,15 +4667,18 @@ fn decode_property_pair(raw: &str) -> Option<(String, String)> {
 }
 
 pub fn sanitize_tenant_segment(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "default".to_string()
-    } else {
-        sanitized
+    let mut encoded = String::with_capacity("pct_".len() + value.len());
+    encoded.push_str("pct_");
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(hex_digit(byte >> 4).to_ascii_uppercase());
+            encoded.push(hex_digit(byte & 0x0f).to_ascii_uppercase());
+        }
     }
+    encoded
 }
 
 #[cfg(feature = "redis-store")]
@@ -4574,7 +4692,6 @@ fn encode_key_segment(value: &str) -> String {
     encoded
 }
 
-#[cfg(feature = "redis-store")]
 fn hex_digit(value: u8) -> char {
     match value {
         0..=9 => (b'0' + value) as char,
@@ -4586,13 +4703,14 @@ fn hex_digit(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
-        Direction, EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, GraphStore,
-        InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord, RedCoreDurability,
-        RedCoreGraphStore, RedCoreOptions, VectorIndex,
+        sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
+        GraphSnapshot, GraphStore, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
+        RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCoreSyncMode, VectorIndex,
     };
 
     #[test]
@@ -4650,6 +4768,54 @@ mod tests {
 
         assert_ne!(updated.content_hash.as_ref().unwrap(), &first_hash);
         assert_eq!(updated.parent_hashes, vec![first_hash]);
+    }
+
+    #[test]
+    fn tenant_segment_encoding_distinguishes_separator_collisions() {
+        assert_ne!(
+            sanitize_tenant_segment("acme/prod"),
+            sanitize_tenant_segment("acme.prod")
+        );
+        assert_eq!(sanitize_tenant_segment("acme/prod"), "pct_acme%2Fprod");
+        assert_eq!(sanitize_tenant_segment("acme.prod"), "pct_acme.prod");
+    }
+
+    #[test]
+    fn tenant_segment_encoding_is_injective_over_pseudo_random_strings() {
+        let mut seen = std::collections::BTreeMap::new();
+        let mut state = 0xC0DEC0DE_u64;
+        for _ in 0..10_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let len = (state % 24) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for offset in 0..len {
+                state = state
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let byte = match (state >> ((offset % 8) * 8)) as u8 {
+                    0 => b'_',
+                    1 => b'-',
+                    2 => b'.',
+                    3 => b'/',
+                    4 => b'%',
+                    5 => b':',
+                    6 => b'{',
+                    7 => b'}',
+                    value => 0x20 + (value % 0x5f),
+                };
+                bytes.push(byte);
+            }
+            let original = String::from_utf8_lossy(&bytes).to_string();
+            let encoded = sanitize_tenant_segment(&original);
+            if let Some(prior) = seen.insert(encoded.clone(), original.clone()) {
+                assert_eq!(
+                    prior, original,
+                    "tenant segment collision for {prior:?} and {original:?}: {encoded}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5706,6 +5872,40 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, "redcore_strict_mode_invalid");
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_aof_everysec_uses_background_group_sync_window() {
+        let data_dir = unique_test_dir("redcore-aof-everysec-group-sync");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofEverysec,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            assert_eq!(store.commit_sync_mode(), RedCoreSyncMode::Background);
+            store
+                .upsert_node(NodeRecord::new("node:first", ["Doc"], json!({})))
+                .unwrap();
+            let first_sync = store.last_fsync.expect("first AOF write queues sync");
+            store
+                .upsert_node(NodeRecord::new("node:second", ["Doc"], json!({})))
+                .unwrap();
+            assert_eq!(
+                store.last_fsync,
+                Some(first_sync),
+                "AofEverysec should not schedule one AOF fsync per commit"
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(75));
+        let reopened = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(reopened.get_node("node:first").unwrap().is_some());
+        assert!(reopened.get_node("node:second").unwrap().is_some());
+        assert!(reopened.verify().unwrap().ok);
+
         std::fs::remove_dir_all(data_dir).ok();
     }
 

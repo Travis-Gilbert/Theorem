@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 
 use crate::commands::{ThgCommand, ThgRequest, ThgResponse};
@@ -18,7 +20,7 @@ pub trait ThgExecutor {
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryThgExecutor {
-    state: ThgState,
+    state: Arc<ThgState>,
     graph_store: InMemoryGraphStore,
 }
 
@@ -28,6 +30,10 @@ impl InMemoryThgExecutor {
     }
 
     pub fn from_state(state: ThgState) -> Self {
+        Self::from_state_snapshot(Arc::new(state))
+    }
+
+    pub fn from_state_snapshot(state: Arc<ThgState>) -> Self {
         Self {
             state,
             graph_store: InMemoryGraphStore::new(),
@@ -36,6 +42,10 @@ impl InMemoryThgExecutor {
 
     pub fn state_hash(&self) -> String {
         self.state.hash()
+    }
+
+    fn state_mut(&mut self) -> &mut ThgState {
+        Arc::make_mut(&mut self.state)
     }
 
     pub fn execute_json(&mut self, request_json: &str) -> String {
@@ -53,9 +63,8 @@ impl InMemoryThgExecutor {
     }
 
     fn run_begin(&mut self, args: Value) -> ThgResponse {
-        self.state.next_seq();
-        let run_id =
-            string_arg(&args, "run_id").unwrap_or_else(|| generated_id("run", self.state.seq));
+        let seq = self.state_mut().next_seq();
+        let run_id = string_arg(&args, "run_id").unwrap_or_else(|| generated_id("run", seq));
         let run = RunState {
             run_id: run_id.clone(),
             task: string_arg(&args, "task").unwrap_or_default(),
@@ -65,7 +74,7 @@ impl InMemoryThgExecutor {
             steps: Vec::new(),
         };
         let node = run.node();
-        self.state.runs.insert(run_id.clone(), run);
+        self.state_mut().runs.insert(run_id.clone(), run);
         let mut response = ThgResponse::ok(
             ThgCommand::RunBegin.name(),
             "ok",
@@ -80,10 +89,9 @@ impl InMemoryThgExecutor {
     }
 
     fn run_step(&mut self, args: Value) -> ThgResponse {
-        self.state.next_seq();
+        let seq = self.state_mut().next_seq();
         let run_id = string_arg(&args, "run_id").unwrap_or_default();
-        let step_id =
-            string_arg(&args, "step_id").unwrap_or_else(|| generated_id("step", self.state.seq));
+        let step_id = string_arg(&args, "step_id").unwrap_or_else(|| generated_id("step", seq));
         let index = int_arg(&args, "index").unwrap_or_else(|| {
             self.state
                 .runs
@@ -98,7 +106,7 @@ impl InMemoryThgExecutor {
             payload: args.get("payload").cloned().unwrap_or_else(|| json!({})),
         };
         let node = step.node(&run_id);
-        if let Some(run) = self.state.runs.get_mut(&run_id) {
+        if let Some(run) = self.state_mut().runs.get_mut(&run_id) {
             run.steps.push(step);
         }
         let edge = ThgEdge {
@@ -169,9 +177,9 @@ impl InMemoryThgExecutor {
     }
 
     fn context_pack(&mut self, args: Value) -> ThgResponse {
-        self.state.next_seq();
-        let artifact_id = string_arg(&args, "artifact_id")
-            .unwrap_or_else(|| generated_id("artifact", self.state.seq));
+        let seq = self.state_mut().next_seq();
+        let artifact_id =
+            string_arg(&args, "artifact_id").unwrap_or_else(|| generated_id("artifact", seq));
         let context = ContextState {
             artifact_id: artifact_id.clone(),
             status: "packed".to_string(),
@@ -182,7 +190,9 @@ impl InMemoryThgExecutor {
                 .unwrap_or_else(|| json!({})),
         };
         let node = context.node();
-        self.state.contexts.insert(artifact_id.clone(), context);
+        self.state_mut()
+            .contexts
+            .insert(artifact_id.clone(), context);
         let mut response = ThgResponse::ok(
             ThgCommand::ContextPack.name(),
             "ok",
@@ -209,9 +219,8 @@ impl InMemoryThgExecutor {
     }
 
     fn patch_propose(&mut self, args: Value) -> ThgResponse {
-        self.state.next_seq();
-        let patch_id =
-            string_arg(&args, "patch_id").unwrap_or_else(|| generated_id("patch", self.state.seq));
+        let seq = self.state_mut().next_seq();
+        let patch_id = string_arg(&args, "patch_id").unwrap_or_else(|| generated_id("patch", seq));
         let run_id = string_arg(&args, "run_id").unwrap_or_default();
         let patch = PatchState {
             patch_id: patch_id.clone(),
@@ -221,7 +230,7 @@ impl InMemoryThgExecutor {
             findings: json!([]),
         };
         let node = patch.node();
-        self.state.patches.insert(patch_id.clone(), patch);
+        self.state_mut().patches.insert(patch_id.clone(), patch);
         let mut response = ThgResponse::ok(
             ThgCommand::PatchPropose.name(),
             "ok",
@@ -246,7 +255,7 @@ impl InMemoryThgExecutor {
             .get("findings")
             .cloned()
             .unwrap_or_else(|| json!([{ "code": "human_review_required" }]));
-        if let Some(patch) = self.state.patches.get_mut(&patch_id) {
+        if let Some(patch) = self.state_mut().patches.get_mut(&patch_id) {
             patch.status = "needs_review".to_string();
             patch.findings = findings.clone();
         }
@@ -260,7 +269,7 @@ impl InMemoryThgExecutor {
 
     fn patch_commit(&mut self, args: Value) -> ThgResponse {
         let patch_id = string_arg(&args, "patch_id").unwrap_or_default();
-        if let Some(patch) = self.state.patches.get_mut(&patch_id) {
+        if let Some(patch) = self.state_mut().patches.get_mut(&patch_id) {
             patch.status = "committed".to_string();
         }
         ThgResponse::ok(
@@ -301,7 +310,7 @@ impl InMemoryThgExecutor {
 
     fn graph_node_upsert(&mut self, args: Value) -> ThgResponse {
         let command = ThgCommand::GraphNodeUpsert.name();
-        self.state.next_seq();
+        self.state_mut().next_seq();
         let node = match node_record_from_args(args) {
             Ok(node) => node,
             Err(error) => return ThgResponse::err(command, error, self.state_hash()),
@@ -324,7 +333,7 @@ impl InMemoryThgExecutor {
 
     fn graph_edge_upsert(&mut self, args: Value) -> ThgResponse {
         let command = ThgCommand::GraphEdgeUpsert.name();
-        self.state.next_seq();
+        self.state_mut().next_seq();
         let edge = match edge_record_from_args(args) {
             Ok(edge) => edge,
             Err(error) => return ThgResponse::err(command, error, self.state_hash()),
@@ -454,10 +463,10 @@ pub struct StoreBackedThgExecutor<S: ThgStore> {
 
 impl<S: ThgStore> StoreBackedThgExecutor<S> {
     pub fn new(store: S) -> Self {
-        let state = store.load();
+        let state = store.load_snapshot();
         Self {
             store,
-            inner: InMemoryThgExecutor::from_state(state),
+            inner: InMemoryThgExecutor::from_state_snapshot(state),
         }
     }
 
@@ -533,7 +542,7 @@ impl ThgExecutor for InMemoryThgExecutor {
     }
 
     fn state(&self) -> &ThgState {
-        &self.state
+        self.state.as_ref()
     }
 }
 

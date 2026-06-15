@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::graph_store::{unix_ms, EdgeRecord, GraphSnapshot, NodeRecord};
+use crate::graph_store::{
+    unix_ms, EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, NodeRecord,
+};
 use crate::state::stable_hash;
 
 pub const VERSIONED_GRAPH_PROTOCOL_VERSION: &str = "rustyred-versioned-graph-v1";
@@ -192,6 +194,12 @@ pub struct GraphVersionRepository {
     pub protocol_version: String,
     #[serde(default)]
     pub refs: Vec<GraphVersionRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<GraphCommit>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub objects: BTreeMap<String, GraphContentObject>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tree_nodes: BTreeMap<String, GraphTreeNode>,
     #[serde(default)]
     pub packs: Vec<CompiledGraphPack>,
 }
@@ -201,6 +209,9 @@ impl Default for GraphVersionRepository {
         Self {
             protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
             refs: Vec::new(),
+            commits: Vec::new(),
+            objects: BTreeMap::new(),
+            tree_nodes: BTreeMap::new(),
             packs: Vec::new(),
         }
     }
@@ -212,6 +223,26 @@ pub struct GraphRefUpdate {
     pub repository: GraphVersionRepository,
     pub reference: GraphVersionRef,
     pub pack: CompiledGraphPack,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct IncrementalGraphPack {
+    pub protocol_version: String,
+    pub pack: CompiledGraphPack,
+    pub changed_object_keys: Vec<String>,
+    pub changed_tree_nodes: usize,
+    pub reused_tree_nodes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphRefConflict {
+    pub protocol_version: String,
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_commit_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_commit_hash: Option<String>,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -414,6 +445,169 @@ pub fn compile_graph_pack(
     }
 }
 
+pub fn apply_graph_mutation_batch(
+    snapshot: &GraphSnapshot,
+    batch: &GraphMutationBatch,
+) -> GraphSnapshot {
+    let mut nodes = snapshot
+        .nodes
+        .iter()
+        .cloned()
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut edges = snapshot
+        .edges
+        .iter()
+        .cloned()
+        .map(|edge| (edge.id.clone(), edge))
+        .collect::<BTreeMap<_, _>>();
+
+    for mutation in &batch.mutations {
+        match mutation {
+            GraphMutation::NodeUpsert(node) => {
+                nodes.insert(node.id.clone(), node.clone());
+            }
+            GraphMutation::EdgeUpsert(edge) => {
+                edges.insert(edge.id.clone(), edge.clone());
+            }
+        }
+    }
+
+    GraphSnapshot {
+        version: snapshot.version.saturating_add(1),
+        nodes: nodes.into_values().collect(),
+        edges: edges.into_values().collect(),
+    }
+}
+
+pub fn compile_graph_pack_incremental(
+    prior_pack: &CompiledGraphPack,
+    batch: &GraphMutationBatch,
+    mut options: GraphCompileOptions,
+) -> IncrementalGraphPack {
+    let name = clean_or_default(options.name.take(), "graph-pack");
+    let branch = clean_or_default(options.branch.take(), DEFAULT_GRAPH_BRANCH);
+    let author = clean_or_default(options.author.take(), "rustyred");
+    let message = clean_or_default(options.message.take(), "incremental graph mutation batch");
+    let timestamp_unix_ms = options.timestamp_unix_ms.unwrap_or_else(unix_ms);
+    let parent_commits = if options.parent_commits.is_empty() {
+        vec![prior_pack.commit.commit_hash.clone()]
+    } else {
+        options.parent_commits
+    };
+
+    let mut objects_by_key = prior_pack
+        .objects
+        .iter()
+        .cloned()
+        .map(|object| (object.key.clone(), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut changed_object_keys = BTreeSet::new();
+
+    for mutation in &batch.mutations {
+        let object = match mutation {
+            GraphMutation::NodeUpsert(node) => node_content_object(node, options.include_payloads),
+            GraphMutation::EdgeUpsert(edge) => edge_content_object(edge, options.include_payloads),
+        };
+        let changed = objects_by_key
+            .get(&object.key)
+            .map(|existing| existing.hash != object.hash)
+            .unwrap_or(true);
+        if changed {
+            changed_object_keys.insert(object.key.clone());
+        }
+        objects_by_key.insert(object.key.clone(), object);
+    }
+
+    let objects = objects_by_key.into_values().collect::<Vec<_>>();
+    let tree = build_prolly_tree(&objects);
+    let graph_version = prior_pack.commit.graph_version.saturating_add(1);
+    let commit = build_commit(
+        &tree,
+        &branch,
+        parent_commits,
+        &author,
+        &message,
+        timestamp_unix_ms,
+        graph_version,
+    );
+    let nodes_total = objects
+        .iter()
+        .filter(|object| object.kind == GraphObjectKind::Node)
+        .count();
+    let edges_total = objects
+        .iter()
+        .filter(|object| object.kind == GraphObjectKind::Edge)
+        .count();
+    let manifest = GraphPackManifest {
+        protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
+        compiler_version: GRAPH_PACK_COMPILER_VERSION.to_string(),
+        name: name.clone(),
+        branch: branch.clone(),
+        commit_hash: commit.commit_hash.clone(),
+        tree_hash: tree.root_hash.clone(),
+        graph_version,
+        nodes_total,
+        edges_total,
+        objects_total: objects.len(),
+    };
+    let manifest_body = serde_json::to_value(&manifest).unwrap_or_else(|_| json!({}));
+    let validator_body = json!({
+        "validator": "rustyred.verify_tree_root",
+        "tree_hash": tree.root_hash,
+        "objects_total": objects.len(),
+        "protocol_version": VERSIONED_GRAPH_PROTOCOL_VERSION,
+    });
+    let prior_hashes = prior_pack
+        .tree
+        .nodes
+        .iter()
+        .map(|node| node.hash.clone())
+        .collect::<BTreeSet<_>>();
+    let next_hashes = tree
+        .nodes
+        .iter()
+        .map(|node| node.hash.clone())
+        .collect::<BTreeSet<_>>();
+    let reused_tree_nodes = next_hashes.intersection(&prior_hashes).count();
+    let changed_tree_nodes = next_hashes.difference(&prior_hashes).count();
+
+    IncrementalGraphPack {
+        protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
+        pack: CompiledGraphPack {
+            protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
+            compiler_version: GRAPH_PACK_COMPILER_VERSION.to_string(),
+            manifest,
+            commit,
+            tree,
+            capabilities: vec![
+                GraphCompilerCapability {
+                    name: format!("{name}.manifest"),
+                    kind: "graph_manifest".to_string(),
+                    mime_type: "application/json".to_string(),
+                    content_hash: stable_hash(&manifest_body),
+                    body: manifest_body,
+                },
+                GraphCompilerCapability {
+                    name: format!("{name}.verify_tree_root"),
+                    kind: "validator".to_string(),
+                    mime_type: "application/json".to_string(),
+                    content_hash: stable_hash(&validator_body),
+                    body: validator_body,
+                },
+            ],
+            objects: if options.include_payloads {
+                objects
+            } else {
+                Vec::new()
+            },
+        },
+        changed_object_keys: changed_object_keys.into_iter().collect(),
+        changed_tree_nodes,
+        reused_tree_nodes,
+    }
+}
+
 pub fn diff_graph_snapshots(base: &GraphSnapshot, target: &GraphSnapshot) -> GraphVersionDiff {
     let base_objects = snapshot_content_objects(base, false);
     let target_objects = snapshot_content_objects(target, false);
@@ -476,16 +670,44 @@ pub fn diff_graph_snapshots(base: &GraphSnapshot, target: &GraphSnapshot) -> Gra
 }
 
 pub fn update_graph_ref(
-    mut repository: GraphVersionRepository,
+    repository: GraphVersionRepository,
     pack: CompiledGraphPack,
     branch: Option<String>,
     updated_at_unix_ms: Option<u128>,
 ) -> GraphRefUpdate {
+    update_graph_ref_cas(repository, pack, branch, None, updated_at_unix_ms)
+        .expect("unconditional graph ref update cannot conflict")
+}
+
+pub fn update_graph_ref_cas(
+    mut repository: GraphVersionRepository,
+    pack: CompiledGraphPack,
+    branch: Option<String>,
+    expected_commit_hash: Option<String>,
+    updated_at_unix_ms: Option<u128>,
+) -> Result<GraphRefUpdate, GraphRefConflict> {
     repository.protocol_version = VERSIONED_GRAPH_PROTOCOL_VERSION.to_string();
     let ref_name = clean_or_default(
         branch.or_else(|| Some(pack.commit.branch.clone())),
         DEFAULT_GRAPH_BRANCH,
     );
+    let actual_commit_hash = repository
+        .refs
+        .iter()
+        .find(|reference| reference.name == ref_name)
+        .map(|reference| reference.commit_hash.clone());
+    if let Some(expected) = expected_commit_hash.as_ref() {
+        if actual_commit_hash.as_deref() != Some(expected.as_str()) {
+            return Err(GraphRefConflict {
+                protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
+                branch: ref_name,
+                expected_commit_hash,
+                actual_commit_hash,
+                message: "graph ref compare-and-swap failed".to_string(),
+            });
+        }
+    }
+
     let updated_at_unix_ms = updated_at_unix_ms.unwrap_or_else(unix_ms);
     let reference = GraphVersionRef {
         name: ref_name.clone(),
@@ -501,20 +723,22 @@ pub fn update_graph_ref(
     repository.refs.push(reference.clone());
     repository.refs.sort_by(|a, b| a.name.cmp(&b.name));
 
+    index_pack_content(&mut repository, &pack);
+    let stored_pack = compact_repository_pack(&pack);
     repository
         .packs
-        .retain(|existing| existing.commit.commit_hash != pack.commit.commit_hash);
-    repository.packs.push(pack.clone());
+        .retain(|existing| existing.commit.commit_hash != stored_pack.commit.commit_hash);
+    repository.packs.push(stored_pack);
     repository
         .packs
         .sort_by(|a, b| a.commit.commit_hash.cmp(&b.commit.commit_hash));
 
-    GraphRefUpdate {
+    Ok(GraphRefUpdate {
         protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
         repository,
         reference,
         pack,
-    }
+    })
 }
 
 pub fn graph_version_log(
@@ -527,9 +751,16 @@ pub fn graph_version_log(
         .unwrap_or(DEFAULT_GRAPH_BRANCH)
         .to_string();
     let commits_by_hash = repository
-        .packs
+        .commits
         .iter()
-        .map(|pack| (pack.commit.commit_hash.clone(), pack.commit.clone()))
+        .cloned()
+        .map(|commit| (commit.commit_hash.clone(), commit))
+        .chain(
+            repository
+                .packs
+                .iter()
+                .map(|pack| (pack.commit.commit_hash.clone(), pack.commit.clone())),
+        )
         .collect::<BTreeMap<_, _>>();
     let mut commits = Vec::new();
     let mut seen = BTreeSet::new();
@@ -558,6 +789,38 @@ pub fn graph_version_log(
     }
 }
 
+fn index_pack_content(repository: &mut GraphVersionRepository, pack: &CompiledGraphPack) {
+    if !repository
+        .commits
+        .iter()
+        .any(|commit| commit.commit_hash == pack.commit.commit_hash)
+    {
+        repository.commits.push(pack.commit.clone());
+        repository
+            .commits
+            .sort_by(|a, b| a.commit_hash.cmp(&b.commit_hash));
+    }
+    for object in &pack.objects {
+        repository
+            .objects
+            .entry(object.hash.clone())
+            .or_insert_with(|| object.clone());
+    }
+    for node in &pack.tree.nodes {
+        repository
+            .tree_nodes
+            .entry(node.hash.clone())
+            .or_insert_with(|| node.clone());
+    }
+}
+
+fn compact_repository_pack(pack: &CompiledGraphPack) -> CompiledGraphPack {
+    let mut compact = pack.clone();
+    compact.objects.clear();
+    compact.tree.nodes.clear();
+    compact
+}
+
 pub fn checkout_graph_version(
     repository: &GraphVersionRepository,
     target: &str,
@@ -571,12 +834,13 @@ pub fn checkout_graph_version(
         .packs
         .iter()
         .find(|pack| pack.commit.commit_hash == commit_hash)?;
-    let snapshot = graph_snapshot_from_pack(pack)?;
+    let tree = repository_tree_for_pack(repository, pack)?;
+    let snapshot = graph_snapshot_from_repository(repository, pack)?;
     Some(GraphCheckoutResult {
         protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
         target: target.to_string(),
         commit: pack.commit.clone(),
-        tree: pack.tree.clone(),
+        tree,
         snapshot,
     })
 }
@@ -973,6 +1237,92 @@ fn resolve_repository_target(repository: &GraphVersionRepository, target: &str) 
                 .find(|pack| pack.commit.commit_hash == target)
                 .map(|pack| pack.commit.commit_hash.clone())
         })
+        .or_else(|| {
+            repository
+                .commits
+                .iter()
+                .find(|commit| commit.commit_hash == target)
+                .map(|commit| commit.commit_hash.clone())
+        })
+}
+
+fn repository_tree_for_pack(
+    repository: &GraphVersionRepository,
+    pack: &CompiledGraphPack,
+) -> Option<GraphProllyTree> {
+    if !pack.tree.nodes.is_empty() {
+        return Some(pack.tree.clone());
+    }
+    let mut nodes = Vec::new();
+    collect_repository_tree_nodes(repository, &pack.tree.root_hash, &mut nodes)?;
+    nodes.sort_by(|a, b| {
+        a.level
+            .cmp(&b.level)
+            .then_with(|| a.first_key.cmp(&b.first_key))
+            .then_with(|| a.last_key.cmp(&b.last_key))
+            .then_with(|| a.hash.cmp(&b.hash))
+    });
+    Some(GraphProllyTree {
+        root_hash: pack.tree.root_hash.clone(),
+        root_level: pack.tree.root_level,
+        entries_total: pack.tree.entries_total,
+        nodes,
+    })
+}
+
+fn collect_repository_tree_nodes(
+    repository: &GraphVersionRepository,
+    hash: &str,
+    out: &mut Vec<GraphTreeNode>,
+) -> Option<()> {
+    let node = repository.tree_nodes.get(hash)?.clone();
+    for child in &node.children {
+        collect_repository_tree_nodes(repository, &child.hash, out)?;
+    }
+    out.push(node);
+    Some(())
+}
+
+fn graph_snapshot_from_repository(
+    repository: &GraphVersionRepository,
+    pack: &CompiledGraphPack,
+) -> Option<GraphSnapshot> {
+    if !pack.objects.is_empty() {
+        return graph_snapshot_from_pack(pack);
+    }
+    let entries = repository_tree_entries(repository, &pack.tree.root_hash)?;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for entry in entries {
+        let object = repository.objects.get(&entry.object_hash)?;
+        let payload = object.payload.clone()?;
+        match object.kind {
+            GraphObjectKind::Node => nodes.push(serde_json::from_value(payload).ok()?),
+            GraphObjectKind::Edge => edges.push(serde_json::from_value(payload).ok()?),
+        }
+    }
+    nodes.sort_by(|a: &NodeRecord, b| a.id.cmp(&b.id));
+    edges.sort_by(|a: &EdgeRecord, b| a.id.cmp(&b.id));
+    Some(GraphSnapshot {
+        version: pack.commit.graph_version,
+        nodes,
+        edges,
+    })
+}
+
+fn repository_tree_entries(
+    repository: &GraphVersionRepository,
+    hash: &str,
+) -> Option<Vec<GraphTreeEntry>> {
+    let node = repository.tree_nodes.get(hash)?;
+    if node.level == 0 {
+        return Some(node.entries.clone());
+    }
+    let mut entries = Vec::new();
+    for child in &node.children {
+        entries.extend(repository_tree_entries(repository, &child.hash)?);
+    }
+    Some(entries)
 }
 
 fn graph_snapshot_from_pack(pack: &CompiledGraphPack) -> Option<GraphSnapshot> {
@@ -1170,7 +1520,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::graph_store::{EdgeRecord, GraphSnapshot, NodeRecord};
+    use crate::graph_store::{
+        EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, NodeRecord,
+    };
 
     #[test]
     fn compiler_builds_stable_tree_independent_of_record_order() {
@@ -1231,6 +1583,68 @@ mod tests {
     }
 
     #[test]
+    fn incremental_pack_matches_full_recompile_and_reuses_tree_nodes() {
+        let base_nodes = (0..96)
+            .map(|idx| {
+                NodeRecord::new(
+                    format!("node:{idx:03}"),
+                    ["Person"],
+                    json!({ "name": format!("person-{idx:03}") }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base = GraphSnapshot {
+            version: 7,
+            nodes: base_nodes,
+            edges: Vec::new(),
+        };
+        let base_pack = compile_graph_pack(
+            &base,
+            GraphCompileOptions {
+                branch: Some("main".to_string()),
+                timestamp_unix_ms: Some(1),
+                ..GraphCompileOptions::default()
+            },
+        );
+        let batch = GraphMutationBatch::new([GraphMutation::NodeUpsert(NodeRecord::new(
+            "node:095",
+            ["Person"],
+            json!({ "name": "person-095", "status": "updated" }),
+        ))]);
+        let final_snapshot = apply_graph_mutation_batch(&base, &batch);
+        let incremental = compile_graph_pack_incremental(
+            &base_pack,
+            &batch,
+            GraphCompileOptions {
+                branch: Some("main".to_string()),
+                parent_commits: vec![base_pack.commit.commit_hash.clone()],
+                timestamp_unix_ms: Some(2),
+                ..GraphCompileOptions::default()
+            },
+        );
+        let full = compile_graph_pack(
+            &final_snapshot,
+            GraphCompileOptions {
+                branch: Some("main".to_string()),
+                parent_commits: vec![base_pack.commit.commit_hash.clone()],
+                timestamp_unix_ms: Some(2),
+                message: Some("incremental graph mutation batch".to_string()),
+                ..GraphCompileOptions::default()
+            },
+        );
+
+        assert_eq!(incremental.changed_object_keys, vec!["node/node:095"]);
+        assert_eq!(incremental.pack.tree.root_hash, full.tree.root_hash);
+        assert_eq!(incremental.pack.commit.commit_hash, full.commit.commit_hash);
+        assert!(
+            incremental.reused_tree_nodes > incremental.changed_tree_nodes,
+            "single-record update should reuse most Prolly nodes: reused={}, changed={}",
+            incremental.reused_tree_nodes,
+            incremental.changed_tree_nodes
+        );
+    }
+
+    #[test]
     fn refs_log_and_checkout_round_trip_snapshot_payloads() {
         let snapshot = GraphSnapshot {
             version: 7,
@@ -1263,6 +1677,112 @@ mod tests {
         let checkout = checkout_graph_version(&update.repository, "main").unwrap();
         assert_eq!(checkout.commit.commit_hash, pack.commit.commit_hash);
         assert_eq!(checkout.snapshot.nodes[0].id, "node:ada");
+    }
+
+    #[test]
+    fn repository_deduplicates_objects_and_tree_nodes_across_commits() {
+        let snapshot = GraphSnapshot {
+            version: 7,
+            nodes: vec![NodeRecord::new(
+                "node:ada",
+                ["Person"],
+                json!({"name": "Ada"}),
+            )],
+            edges: Vec::new(),
+        };
+        let first_pack = compile_graph_pack(
+            &snapshot,
+            GraphCompileOptions {
+                branch: Some("main".to_string()),
+                timestamp_unix_ms: Some(1),
+                ..GraphCompileOptions::default()
+            },
+        );
+        let first = update_graph_ref(
+            GraphVersionRepository::default(),
+            first_pack,
+            Some("main".to_string()),
+            Some(2),
+        );
+        let object_count = first.repository.objects.len();
+        let tree_node_count = first.repository.tree_nodes.len();
+        assert_eq!(object_count, 1);
+        assert!(tree_node_count > 0);
+        assert!(first.repository.packs[0].objects.is_empty());
+        assert!(first.repository.packs[0].tree.nodes.is_empty());
+
+        let second_pack = compile_graph_pack(
+            &snapshot,
+            GraphCompileOptions {
+                branch: Some("main".to_string()),
+                parent_commits: vec![first.reference.commit_hash.clone()],
+                timestamp_unix_ms: Some(3),
+                ..GraphCompileOptions::default()
+            },
+        );
+        let second = update_graph_ref(
+            first.repository,
+            second_pack,
+            Some("main".to_string()),
+            Some(4),
+        );
+
+        assert_eq!(second.repository.objects.len(), object_count);
+        assert_eq!(second.repository.tree_nodes.len(), tree_node_count);
+        let checkout = checkout_graph_version(&second.repository, "main").unwrap();
+        assert_eq!(checkout.snapshot.nodes[0].id, "node:ada");
+    }
+
+    #[test]
+    fn graph_ref_cas_rejects_stale_expected_commit() {
+        let snapshot = GraphSnapshot {
+            version: 1,
+            nodes: vec![NodeRecord::new("node:ada", ["Person"], json!({}))],
+            edges: Vec::new(),
+        };
+        let first_pack = compile_graph_pack(
+            &snapshot,
+            GraphCompileOptions {
+                branch: Some("main".to_string()),
+                timestamp_unix_ms: Some(1),
+                ..GraphCompileOptions::default()
+            },
+        );
+        let first = update_graph_ref(
+            GraphVersionRepository::default(),
+            first_pack,
+            Some("main".to_string()),
+            Some(2),
+        );
+        let mut changed = snapshot.clone();
+        changed.version = 2;
+        changed
+            .nodes
+            .push(NodeRecord::new("node:bob", ["Person"], json!({})));
+        let second_pack = compile_graph_pack(
+            &changed,
+            GraphCompileOptions {
+                branch: Some("main".to_string()),
+                parent_commits: vec![first.reference.commit_hash.clone()],
+                timestamp_unix_ms: Some(3),
+                ..GraphCompileOptions::default()
+            },
+        );
+
+        let conflict = update_graph_ref_cas(
+            first.repository,
+            second_pack,
+            Some("main".to_string()),
+            Some("sha256:stale".to_string()),
+            Some(4),
+        )
+        .unwrap_err();
+
+        assert_eq!(conflict.branch, "main");
+        assert_eq!(
+            conflict.actual_commit_hash.as_deref(),
+            Some(first.reference.commit_hash.as_str())
+        );
     }
 
     #[test]

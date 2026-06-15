@@ -148,7 +148,7 @@ pub struct LoraAdapter {
 
 impl LoraAdapter {
     pub fn normalized(mut self) -> Self {
-        self.tenant_id = sanitize_tenant_segment(&self.tenant_id);
+        self.tenant_id = self.tenant_id.trim().to_string();
         self.target_modules = self
             .target_modules
             .into_iter()
@@ -281,7 +281,7 @@ pub struct AdapterFindRequest {
 
 impl AdapterFindRequest {
     pub fn normalized(mut self) -> Self {
-        self.tenant_id = sanitize_tenant_segment(&self.tenant_id);
+        self.tenant_id = self.tenant_id.trim().to_string();
         self.seed_node_ids = self
             .seed_node_ids
             .into_iter()

@@ -65,7 +65,7 @@ fn routing_excludes_cross_tenant_adapters_until_shared() {
             "edge:share-b-to-a",
             shared.node_id,
             SHARED_WITH,
-            "tenant:tenant-a",
+            crate::types::tenant_node_id("tenant-a"),
             json!({ "weight": 0.5 }),
         ))
         .unwrap();
@@ -77,7 +77,8 @@ fn routing_excludes_cross_tenant_adapters_until_shared() {
 
 fn seeded_store() -> InMemoryGraphStore {
     let mut store = InMemoryGraphStore::new();
-    for node_id in ["object:1", "tenant:tenant-a"] {
+    let tenant_node = crate::types::tenant_node_id("tenant-a");
+    for node_id in ["object:1", tenant_node.as_str()] {
         store
             .upsert_node(NodeRecord::new(node_id, ["Object"], json!({})))
             .unwrap();

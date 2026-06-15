@@ -774,8 +774,7 @@ fn job_record_from_node(node: &NodeRecord) -> Option<(IngestJobRecord, bool)> {
 /// TTL-expire durable terminal jobs beyond the cap so the mirror stays bounded.
 /// Queued/running jobs are never expired. Runs on submit (bounded frequency).
 fn prune_persisted_terminal_jobs(store: &mut RedCoreGraphStore) {
-    let Ok(nodes) =
-        store.query_nodes(NodeQuery::label(CODE_INGEST_JOB_LABEL).with_limit(100_000))
+    let Ok(nodes) = store.query_nodes(NodeQuery::label(CODE_INGEST_JOB_LABEL).with_limit(100_000))
     else {
         return;
     };

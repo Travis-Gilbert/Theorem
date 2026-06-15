@@ -94,7 +94,7 @@ pub fn export_affordance_training_view(
     tenant_id: &str,
     export_id: &str,
 ) -> ThgResult<AffordanceTrainingExport> {
-    let tenant_id = normalize_tenant_id(tenant_id);
+    let tenant_id = tenant_id.trim().to_string();
     let mut ranking_pairs = snapshot
         .nodes
         .iter()
@@ -161,7 +161,7 @@ pub fn register_pairformer_artifact<S: AffordanceGraphStore>(
     input: PairformerArtifactInput,
     actor: Option<&str>,
 ) -> ThgResult<PairformerWritebackResult> {
-    let tenant_id = normalize_tenant_id(&input.tenant_id);
+    let tenant_id = input.tenant_id.trim().to_string();
     let model_id = input.model_id.trim().to_string();
     let model_type = input.model_type.trim().to_string();
     let s3_uri = input.s3_uri.trim().to_string();

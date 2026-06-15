@@ -14,7 +14,8 @@ use crate::{
     featurize_pairformer_input, load_pairformer_file, quarantine_densification_candidates,
     rank_trained_pairformer_densification_candidates, reflexive_match_inference,
     register_model_artifact, register_trained_pairformer_artifact, save_pairformer_file,
-    score_links_with_trained, train_pairformer, BurnPairformerConfig, DensificationRequest,
+    score_links_with_trained, tenant_node_id, train_pairformer, BurnPairformerConfig,
+    DensificationRequest,
     MatchInferenceScorer, ModelArtifactInput, PairformerConfig, PairformerTrainingConfig,
 };
 
@@ -253,7 +254,7 @@ fn trained_model_drives_densification_and_artifact_registration() {
     let mut store = InMemoryGraphStore::new();
     store
         .upsert_node(NodeRecord::new(
-            "tenant:theorem",
+            tenant_node_id("theorem"),
             ["Tenant"],
             json!({ "tenant_id": "theorem" }),
         ))
@@ -374,7 +375,7 @@ fn reflexive_match_inference_defaults_to_promoted_burn_pairformer() {
     let mut store = InMemoryGraphStore::new();
     store
         .upsert_node(NodeRecord::new(
-            "tenant:theorem",
+            tenant_node_id("theorem"),
             ["Tenant"],
             json!({ "tenant_id": "theorem" }),
         ))
@@ -479,7 +480,7 @@ fn reflexive_match_inference_bootstraps_learned_pairformer_without_artifact() {
     let mut store = InMemoryGraphStore::new();
     store
         .upsert_node(NodeRecord::new(
-            "tenant:theorem",
+            tenant_node_id("theorem"),
             ["Tenant"],
             json!({ "tenant_id": "theorem" }),
         ))
@@ -554,7 +555,7 @@ fn reflexive_match_inference_bootstraps_when_promoted_artifact_is_remote_only() 
     let mut store = InMemoryGraphStore::new();
     store
         .upsert_node(NodeRecord::new(
-            "tenant:theorem",
+            tenant_node_id("theorem"),
             ["Tenant"],
             json!({ "tenant_id": "theorem" }),
         ))
