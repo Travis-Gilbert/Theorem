@@ -19,6 +19,9 @@ impersonate-fetch = ["dep:rquest", "dep:wreq-util"]
 # accesskit version pin; the pure-DTO reader is fully testable without it. When
 # the embedder wires it, reconcile this version with Servo's accesskit pin.
 accesskit = ["dep:accesskit"]
+# Optional dense/vector acceleration. Default browser builds keep exact
+# pure-Rust scoring and avoid TurboVec's BLAS-linked dependency graph.
+vector-accelerated = ["dep:turbovec", "rustyred-thg-core/vector-accelerated"]
 
 [dependencies]
 accesskit = { version = "0.24", optional = true }
@@ -35,7 +38,7 @@ serde_json = "1.0"
 spider = { version = "2.52.0", default-features = false, optional = true }
 texting_robots = "0.2.2"
 tokio = { version = "1.47.1", features = ["rt", "sync", "time"] }
-turbovec = "0.8.0"
+turbovec = { version = "0.8.0", optional = true }
 url = "2.5.8"
 wreq-util = { version = "2.2.6", optional = true }
 

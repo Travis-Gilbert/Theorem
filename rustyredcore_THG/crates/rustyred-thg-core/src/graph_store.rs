@@ -9,11 +9,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "vector-accelerated")]
 use turbovec::IdMapIndex;
 
 use crate::state::stable_hash;
 
+#[cfg(feature = "vector-accelerated")]
 const VECTOR_INDEX_BIT_WIDTH: usize = 4;
+#[cfg(feature = "vector-accelerated")]
 const VECTOR_EAGER_REBUILD_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -37,6 +40,7 @@ impl VectorPoint {
 pub struct VectorIndex {
     points: Vec<VectorPoint>,
     node_ids: Vec<String>,
+    #[cfg(feature = "vector-accelerated")]
     turbovec: Option<IdMapIndex>,
     pub dimension: usize,
 }
@@ -46,6 +50,7 @@ impl Clone for VectorIndex {
         Self {
             points: self.points.clone(),
             node_ids: self.node_ids.clone(),
+            #[cfg(feature = "vector-accelerated")]
             turbovec: None,
             dimension: self.dimension,
         }
@@ -66,6 +71,7 @@ impl VectorIndex {
         Self {
             points: Vec::new(),
             node_ids: Vec::new(),
+            #[cfg(feature = "vector-accelerated")]
             turbovec: None,
             dimension,
         }
@@ -78,17 +84,21 @@ impl VectorIndex {
             self.points.push(VectorPoint::new(vector));
             self.node_ids.push(node_id.to_string());
         }
-        // Rebuilding the accelerated index on every insert turns large AOF
-        // replay and bulk designation into repeated whole-index construction.
-        // Keep eager acceleration for tiny indexes; exact search remains
-        // available when the accelerated index is absent.
-        if self.points.len() <= VECTOR_EAGER_REBUILD_LIMIT {
-            self.rebuild();
-        } else {
-            self.turbovec = None;
+        #[cfg(feature = "vector-accelerated")]
+        {
+            // Rebuilding the accelerated index on every insert turns large AOF
+            // replay and bulk designation into repeated whole-index construction.
+            // Keep eager acceleration for tiny indexes; exact search remains
+            // available when the accelerated index is absent.
+            if self.points.len() <= VECTOR_EAGER_REBUILD_LIMIT {
+                self.rebuild();
+            } else {
+                self.turbovec = None;
+            }
         }
     }
 
+    #[cfg(feature = "vector-accelerated")]
     fn rebuild(&mut self) {
         if self.points.is_empty() {
             self.turbovec = None;
@@ -119,31 +129,38 @@ impl VectorIndex {
         if k == 0 || query.iter().any(|value| !value.is_finite()) {
             return Vec::new();
         }
-        let Some(index) = &self.turbovec else {
-            return self.exact_search(query, k);
-        };
-        let query_point = VectorPoint::new(query);
-        let recall_k = k.saturating_mul(4).max(k).min(self.node_ids.len());
-        let (_scores, ids) = index.search(query_point.as_slice(), recall_k);
-        let mut results = ids
-            .into_iter()
-            .filter_map(|id| {
-                let index = id as usize;
-                let node_id = self.node_ids.get(index)?;
-                let point = self.points.get(index)?;
-                Some((
-                    node_id.clone(),
-                    cosine_distance(query_point.as_slice(), point.as_slice()),
-                ))
-            })
-            .collect::<Vec<_>>();
-        results.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        results.truncate(k);
-        results
+        #[cfg(feature = "vector-accelerated")]
+        {
+            let Some(index) = &self.turbovec else {
+                return self.exact_search(query, k);
+            };
+            let query_point = VectorPoint::new(query);
+            let recall_k = k.saturating_mul(4).max(k).min(self.node_ids.len());
+            let (_scores, ids) = index.search(query_point.as_slice(), recall_k);
+            let mut results = ids
+                .into_iter()
+                .filter_map(|id| {
+                    let index = id as usize;
+                    let node_id = self.node_ids.get(index)?;
+                    let point = self.points.get(index)?;
+                    Some((
+                        node_id.clone(),
+                        cosine_distance(query_point.as_slice(), point.as_slice()),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            results.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            results.truncate(k);
+            return results;
+        }
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            self.exact_search(query, k)
+        }
     }
 
     fn exact_search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
@@ -4710,8 +4727,10 @@ mod tests {
     use super::{
         sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
         GraphSnapshot, GraphStore, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
-        RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCoreSyncMode, VectorIndex,
+        RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCoreSyncMode,
     };
+    #[cfg(feature = "vector-accelerated")]
+    use super::VectorIndex;
 
     #[test]
     fn records_have_stable_hashes_and_metadata() {
@@ -6047,6 +6066,7 @@ mod tests {
         assert_eq!(results[1].0, "doc:3");
     }
 
+    #[cfg(feature = "vector-accelerated")]
     #[test]
     fn vector_index_uses_turbovec_for_supported_embedding_dimension() {
         let mut index = VectorIndex::new(128);

@@ -9,6 +9,9 @@ rust-version = "1.85"
 [features]
 default = []
 redis-store = ["dep:redis"]
+# Optional vector-index acceleration. Default builds keep the exact in-memory
+# vector search and avoid TurboVec's BLAS-linked dependency graph.
+vector-accelerated = ["dep:turbovec"]
 # §P5-A pa5.1+pa5.2: tantivy as alternative full-text backend behind
 # RUSTY_RED_FULLTEXT_BACKEND=tantivy. Default builds keep the hand-rolled BM25.
 tantivy = ["dep:tantivy"]
@@ -26,4 +29,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tantivy = { version = "0.22", optional = true }
-turbovec = "0.8.0"
+turbovec = { version = "0.8.0", optional = true }

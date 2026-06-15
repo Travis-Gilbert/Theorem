@@ -285,8 +285,12 @@ pub enum ActuationKind {
     CoordinateSynthesis { point: DevicePoint, pointer: PointerKind },
     /// Focus by coordinate, then commit text (keyboard / IME).
     Keyboard { point: DevicePoint, text: String },
-    /// Mechanism B: respond to a Servo-rendered native control.
-    EmbedderControl { control: EmbedderControlPlan },
+    /// Mechanism B: open a Servo-rendered native control, then respond through
+    /// the embedder delegate object.
+    EmbedderControl {
+        point: DevicePoint,
+        control: EmbedderControlPlan,
+    },
     /// Scroll the element into view, then re-measure.
     Scroll { point: DevicePoint },
     /// The #4344 route: activate the element by AccessKit node id. The engine
@@ -389,11 +393,13 @@ pub fn build_actuation_plan<D: BrowserDriver + ?Sized>(
         },
         LocatorAction::ScrollIntoView => ActuationKind::Scroll { point },
         LocatorAction::SelectOption { value } => ActuationKind::EmbedderControl {
+            point,
             control: EmbedderControlPlan::SelectOption {
                 value: value.clone(),
             },
         },
         LocatorAction::SetInputFiles { paths } => ActuationKind::EmbedderControl {
+            point,
             control: EmbedderControlPlan::SetInputFiles {
                 paths: paths.clone(),
             },
@@ -497,7 +503,7 @@ fn browser_action_for_plan(plan: &ActuationPlan) -> BrowserEngineResult<BrowserA
             text: text.clone(),
         }),
         ActuationKind::Scroll { .. } => Ok(BrowserAction::ScrollToElement { element_id }),
-        ActuationKind::EmbedderControl { control } => match control {
+        ActuationKind::EmbedderControl { control, .. } => match control {
             EmbedderControlPlan::SelectOption { value } => Ok(BrowserAction::SelectOption {
                 element_id,
                 value: value.clone(),
