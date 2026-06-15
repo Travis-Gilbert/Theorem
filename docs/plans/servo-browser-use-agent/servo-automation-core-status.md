@@ -147,8 +147,19 @@ codex (`apps/browser/src/main.rs`):
 - #4344 source scan completed against Servo
   `b891f04d0819272b27e80ac975e2e57d3cb9e66b`; the fork route is captured in
   `servo-4344-semantic-activation-fork-plan.md`.
-- Uncommitted: both heads' work sits in the working tree on `feat/crdt-substrate`.
-  Commit with an explicit pathspec (shared index); do not bare-commit.
+- Committed pathspec'd as `1fd442a4` (core + adapter + CI step + docs) on
+  `feat/crdt-substrate`, pushed. claude-code independently re-ran the warm
+  `/tmp/theorem-browser-target` embedder `--headless-automation-smoke`: `EXIT=0`,
+  same receipt (`interactive_elements=2`, `servo_notify_input_event`,
+  `servo_focus_then_value_commit`) -- the live Servo browser is driven by the
+  automation core, verified independent of the build host.
+- CI (`servo-browser.yml`) first failed at LINK on `-lopenblas`: the Ubuntu runner
+  lacks the OpenBLAS the local brew/macOS build has. `cblas-sys`/`ndarray` is a
+  transitive pull via rustyred-web's ML stack, linked once the adapter references
+  more of rustyred-web. Stopgap fix: install `libopenblas-dev` in CI (`906a0024`),
+  re-triggered as run 27569567121 -> GREEN (17m32s): the embedder built + LINKED
+  on Linux and all four smokes passed, including the headless Playwright-class
+  automation smoke. The browser is proven up on both local (macOS) and CI (Linux).
 
 ## Remaining (the seam targets)
 
@@ -165,3 +176,6 @@ codex (`apps/browser/src/main.rs`):
 5. **Slice 4**: engine-truth upgrades (box-tree visibility, settle-signal
    stability, engine occlusion hit-test) swapping the JS heuristics behind the
    same API.
+6. **Trim the BLAS transitive dep out of apps/browser** so the browser binary does
+   not link OpenBLAS at all (feature-gate rustyred-web's ML/embedding path out of
+   the embedder's reachable graph); the CI `libopenblas-dev` install is the stopgap.
