@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use crate::protocol::{
     initialize_params, parse_tool_call_result, tools_call_params, ToolCallOutcome,
 };
-use crate::transport::{spawn_stdio, ConnectionTarget, McpTransport};
+use crate::transport::{connect_transport, ConnectionTarget, McpTransport};
 use crate::{ConnectorError, ConnectorResult};
 
 /// When a selected tool may actually fire. The default never fires.
@@ -201,7 +201,7 @@ pub fn invoke_affordance<S: AffordanceGraphStore>(
             recorded: None,
         });
     }
-    let mut transport = spawn_stdio(&planned.connection_target)?;
+    let mut transport = connect_transport(&planned.connection_target)?;
     transport.request("initialize", initialize_params())?;
     transport.notify("notifications/initialized", json!({}))?;
     let (outcome, recorded) = fire_over_transport(

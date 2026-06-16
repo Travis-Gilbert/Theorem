@@ -50,6 +50,24 @@ impl RepoFetchCaps {
     }
 }
 
+/// Credential material for one clone. Tokens are intentionally kept out of
+/// durable ingest requests; callers resolve them immediately before cloning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitCredential {
+    BearerToken(String),
+}
+
+/// Resolves a clone credential at the worker edge. The base `resolve` signature
+/// stays repo-url-only per the public seam; installation-aware resolvers can
+/// override `resolve_installation` without changing existing callers.
+pub trait GitCredentialResolver: Send + Sync {
+    fn resolve(&self, repo_url: &str) -> Option<GitCredential>;
+
+    fn resolve_installation(&self, repo_url: &str, _installation_id: u64) -> Option<GitCredential> {
+        self.resolve(repo_url)
+    }
+}
+
 fn configured_default_max_total_bytes() -> u64 {
     MAX_TOTAL_BYTES_ENV
         .iter()
@@ -136,12 +154,22 @@ pub fn is_fetchable_repo_url(url: &str) -> bool {
 /// Shallow-clone `url` into a quarantined tempdir and return a handle that
 /// removes the tree on drop. Caps the on-disk size; never executes the tree.
 pub fn fetch_repo(url: &str, caps: &RepoFetchCaps) -> Result<FetchedRepo, RepoFetchError> {
-    fetch_repo_with_git(url, caps, Path::new("git"))
+    fetch_repo_with_credential(url, caps, None)
+}
+
+/// Shallow-clone `url` with an optional one-shot credential.
+pub fn fetch_repo_with_credential(
+    url: &str,
+    caps: &RepoFetchCaps,
+    credential: Option<&GitCredential>,
+) -> Result<FetchedRepo, RepoFetchError> {
+    fetch_repo_with_git(url, caps, credential, Path::new("git"))
 }
 
 fn fetch_repo_with_git(
     url: &str,
     caps: &RepoFetchCaps,
+    credential: Option<&GitCredential>,
     git_binary: &Path,
 ) -> Result<FetchedRepo, RepoFetchError> {
     let url = url.trim();
@@ -161,7 +189,7 @@ fn fetch_repo_with_git(
     // Always start from a clean slot.
     let _ = std::fs::remove_dir_all(&dir);
 
-    let clone = match run_git_clone(git_binary, url, &dir, caps.clone_timeout_ms) {
+    let clone = match run_git_clone(git_binary, url, &dir, caps.clone_timeout_ms, credential) {
         Ok(clone) => clone,
         Err(err) => {
             let _ = std::fs::remove_dir_all(&dir);
@@ -215,6 +243,7 @@ fn run_git_clone(
     url: &str,
     dir: &Path,
     timeout_ms: u64,
+    credential: Option<&GitCredential>,
 ) -> Result<GitCloneOutput, RepoFetchError> {
     let stderr_path = std::env::temp_dir().join(format!(
         "rustyred-code-clone-stderr-{}",
@@ -237,17 +266,19 @@ fn run_git_clone(
         )
     })?;
 
-    let mut child = Command::new(git_binary)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/bin/true")
-        .env("SSH_ASKPASS", "/bin/true")
-        .env(
-            "GIT_SSH_COMMAND",
-            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
-        )
-        .args([
-            "-c",
-            "credential.helper=",
+    let mut args: Vec<String> = Vec::new();
+    if let Some(GitCredential::BearerToken(token)) = credential {
+        args.push("-c".to_string());
+        args.push(format!("http.extraHeader=Authorization: Bearer {token}"));
+    } else {
+        args.push("-c".to_string());
+        args.push("credential.helper=".to_string());
+    }
+    // Public clones remain credential-free, but both public and authed paths now
+    // use the same low-speed and batch-mode SSH hardening. This is the one
+    // intentional divergence from the handoff's byte-for-byte public path note.
+    args.extend(
+        [
             "-c",
             "http.lowSpeedLimit=1",
             "-c",
@@ -259,15 +290,28 @@ fn run_git_clone(
             "--no-tags",
             "--quiet",
             url,
-        ])
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+
+    let mut command = Command::new(git_binary);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/bin/true")
+        .env("SSH_ASKPASS", "/bin/true")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+        )
+        .args(&args)
         .arg(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .map_err(|err| {
-            RepoFetchError::new("git_spawn_failed", format!("could not run git: {err}"))
-        })?;
+        .stderr(Stdio::from(stderr_file));
+    let mut child = command.spawn().map_err(|err| {
+        RepoFetchError::new("git_spawn_failed", format!("could not run git: {err}"))
+    })?;
 
     let timeout = Duration::from_millis(timeout_ms.max(1));
     let started = Instant::now();
@@ -278,7 +322,7 @@ fn run_git_clone(
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let stderr = read_lossy(&stderr_path);
+                    let stderr = sanitize_git_stderr(read_lossy(&stderr_path), credential);
                     let _ = std::fs::remove_file(&stderr_path);
                     let _ = std::fs::remove_file(&stdout_path);
                     return Err(RepoFetchError::new(
@@ -305,11 +349,20 @@ fn run_git_clone(
         }
     };
 
-    let stderr = read_lossy(&stderr_path);
+    let stderr = sanitize_git_stderr(read_lossy(&stderr_path), credential);
     let _ = std::fs::remove_file(&stderr_path);
     let _ = std::fs::remove_file(&stdout_path);
 
     Ok(GitCloneOutput { status, stderr })
+}
+
+fn sanitize_git_stderr(stderr: String, credential: Option<&GitCredential>) -> String {
+    match credential {
+        Some(GitCredential::BearerToken(token)) if !token.is_empty() => {
+            stderr.replace(token, "<redacted>")
+        }
+        _ => stderr,
+    }
 }
 
 fn read_lossy(path: &Path) -> String {
@@ -415,6 +468,44 @@ printf 'package main\nfunc main() {}\n' > "$last/main.go"
                 clone_timeout_ms: 1_000,
                 ..RepoFetchCaps::default()
             },
+            None,
+            &fake_git,
+        )
+        .unwrap();
+
+        assert!(fetched.path().join("main.go").is_file());
+        drop(fetched);
+        fs::remove_dir_all(script_dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fetch_repo_with_bearer_uses_extra_header_and_omits_helper_reset() {
+        let (script_dir, fake_git) = write_fake_git(
+            "bearer",
+            r#"#!/bin/sh
+if [ "$GIT_TERMINAL_PROMPT" != "0" ]; then echo "missing GIT_TERMINAL_PROMPT" >&2; exit 11; fi
+case " $* " in
+  *" -c http.extraHeader=Authorization: Bearer test-token "*) ;;
+  *) echo "missing bearer header: $*" >&2; exit 12 ;;
+esac
+case " $* " in
+  *" -c credential.helper= "*) echo "unexpected credential helper reset: $*" >&2; exit 13 ;;
+esac
+last=""
+for arg in "$@"; do last="$arg"; done
+mkdir -p "$last"
+printf 'package main\nfunc main() {}\n' > "$last/main.go"
+"#,
+        );
+        let credential = GitCredential::BearerToken("test-token".to_string());
+        let fetched = fetch_repo_with_git(
+            "https://github.com/example/private.git",
+            &RepoFetchCaps {
+                clone_timeout_ms: 1_000,
+                ..RepoFetchCaps::default()
+            },
+            Some(&credential),
             &fake_git,
         )
         .unwrap();
@@ -444,6 +535,7 @@ sleep 5
                 clone_timeout_ms: 50,
                 ..RepoFetchCaps::default()
             },
+            None,
             &fake_git,
         )
         .unwrap_err();

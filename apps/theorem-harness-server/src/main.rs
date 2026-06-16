@@ -29,16 +29,18 @@ use axum::{
     Json, Router,
 };
 use rustyred_thg_affordances::registry::register_connector_with_target;
+use rustyred_thg_code::{CodeIndexRuntime, GitCredentialResolver};
 use rustyred_thg_connectors::{
-    connector_manifest, initialize_params, parse_initialize, parse_tools_list, spawn_stdio,
+    connect_transport, connector_manifest, initialize_params, parse_initialize, parse_tools_list,
     tools_list_params, ConnectionTarget, McpTransport,
 };
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use theorem_harness_server::{
-    connectors_json, intents_json, mentions_json, presence_json, push_router, records_json,
-    room_json, run_json, runs_json, spawn_wake_listener, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
+    connectors_json, github_router, intents_json, mentions_json, presence_json, push_router,
+    records_json, room_json, run_json, runs_json, spawn_wake_listener, GithubApp,
+    GithubWebhookState, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
@@ -122,8 +124,9 @@ async fn main() {
         )
         .route("/connectors", get(list_connectors))
         .route("/connectors/register", post(register_connector_route))
-        .with_state(state)
+        .with_state(state.clone())
         .merge(push);
+    let app = maybe_mount_github_router(app);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "50080".to_string());
     let addr = format!("0.0.0.0:{port}");
@@ -132,6 +135,30 @@ async fn main() {
         .expect("bind listener");
     tracing::info!(%addr, %data_dir, "theorem-harness-server listening");
     axum::serve(listener, app).await.expect("serve");
+}
+
+fn maybe_mount_github_router(app: Router) -> Router {
+    let Ok(github_app) = GithubApp::from_env() else {
+        tracing::info!("GitHub App webhook router disabled: missing GitHub App env config");
+        return app;
+    };
+    let github_app = Arc::new(github_app);
+    let resolver: Arc<dyn GitCredentialResolver> = github_app.clone();
+    let code_index = match CodeIndexRuntime::try_new_with_credential_resolver(resolver) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!(%error, "GitHub App webhook router disabled: code index failed to open");
+            return app;
+        }
+    };
+    let tenant_slug = std::env::var("THEOREM_GITHUB_TENANT_SLUG")
+        .or_else(|_| std::env::var("THEOREM_TENANT_ID"))
+        .unwrap_or_else(|_| "Travis-Gilbert".to_string());
+    app.merge(github_router(GithubWebhookState::new(
+        github_app,
+        code_index,
+        tenant_slug,
+    )))
 }
 
 async fn healthz() -> &'static str {
@@ -276,7 +303,7 @@ async fn register_connector_route(
 
     let outcome = tokio::task::spawn_blocking(move || -> Result<Value, String> {
         // Network OUTSIDE the store lock: spawn the server and run the handshake.
-        let mut transport = spawn_stdio(&target).map_err(|e| e.to_string())?;
+        let mut transport = connect_transport(&target).map_err(|e| e.to_string())?;
         let init = transport
             .request("initialize", initialize_params())
             .map_err(|e| e.to_string())?;

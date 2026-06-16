@@ -30,7 +30,10 @@ pub use protocol::{
     parse_tools_list, tool_manifest_from_descriptor, tools_call_params, tools_list_params,
     InitializeInfo, ToolCallOutcome, ToolDescriptor,
 };
-pub use transport::{spawn_stdio, ConnectionTarget, McpTransport, StdioTransport};
+pub use transport::{
+    connect_http, connect_transport, spawn_stdio, ConnectedTransport, ConnectionTarget,
+    ConnectorAuth, HttpTransport, McpTransport, StdioTransport,
+};
 
 use std::fmt;
 

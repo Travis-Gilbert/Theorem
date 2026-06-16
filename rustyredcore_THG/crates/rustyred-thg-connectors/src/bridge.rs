@@ -15,7 +15,7 @@ use crate::protocol::{
     connector_manifest, initialize_params, parse_initialize, parse_tools_list, tools_list_params,
     InitializeInfo,
 };
-use crate::transport::{spawn_stdio, ConnectionTarget, McpTransport};
+use crate::transport::{connect_transport, ConnectionTarget, McpTransport};
 use crate::{ConnectorError, ConnectorResult};
 
 /// Result of connecting to a server and registering its tools.
@@ -93,7 +93,7 @@ pub fn connect_target<S: AffordanceGraphStore>(
     label: &str,
     actor: Option<&str>,
 ) -> ConnectorResult<ConnectAndRegisterResult> {
-    let mut transport = spawn_stdio(&target)?;
+    let mut transport = connect_transport(&target)?;
     connect_and_register_with_target(
         &mut transport,
         Some(&target),

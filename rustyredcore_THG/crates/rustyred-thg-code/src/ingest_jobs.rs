@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use crate::{
     commit_prepared_ingest, default_parse_budget_ms, load_file_texts, normalize_tenant,
     prepare_codebase_ingest_resolved, resolve_ingest_config, snapshot_for_operation,
-    stage_repo_for_ingest, CodeIndexError, IngestCodebaseInput, IngestCodebaseOutput,
-    IngestPipelineOptions, RepoFetchCaps, SOURCE,
+    stage_repo_for_ingest_with_credential, CodeIndexError, GitCredentialResolver,
+    IngestCodebaseInput, IngestCodebaseOutput, IngestPipelineOptions, RepoFetchCaps, SOURCE,
 };
 
 const MAX_RETAINED_JOBS: usize = 64;
@@ -235,6 +235,7 @@ pub struct IngestJobRequest {
     pub input: IngestCodebaseInput,
     pub operation: String,
     pub repo_url: String,
+    pub installation_id: Option<u64>,
     pub caps: RepoFetchCaps,
     pub parse_budget_ms: Option<u64>,
     #[cfg(test)]
@@ -834,6 +835,7 @@ fn request_to_json(request: &IngestJobRequest) -> Value {
         },
         "operation": request.operation,
         "repo_url": request.repo_url,
+        "installation_id": request.installation_id,
         "caps": {
             "max_total_bytes": request.caps.max_total_bytes,
             "clone_timeout_ms": request.caps.clone_timeout_ms,
@@ -894,6 +896,7 @@ fn request_from_json(value: &Value) -> Option<IngestJobRequest> {
         input,
         operation: str_at(value, "operation"),
         repo_url: str_at(value, "repo_url"),
+        installation_id: value.get("installation_id").and_then(Value::as_u64),
         caps,
         parse_budget_ms: value.get("parse_budget_ms").and_then(Value::as_u64),
         ..Default::default()
@@ -906,6 +909,7 @@ fn request_from_json(value: &Value) -> Option<IngestJobRequest> {
 pub(crate) fn ingest_worker_loop(
     store: Weak<Mutex<RedCoreGraphStore>>,
     registry: Arc<IngestJobRegistry>,
+    credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
 ) {
     loop {
         let Some((job_id, request)) = registry.next_queued(WORKER_IDLE_POLL) else {
@@ -914,7 +918,7 @@ pub(crate) fn ingest_worker_loop(
             }
             continue;
         };
-        run_ingest_job(&store, &registry, &job_id, request);
+        run_ingest_job(&store, &registry, &job_id, request, &credential_resolver);
     }
 }
 
@@ -923,6 +927,7 @@ fn run_ingest_job(
     registry: &Arc<IngestJobRegistry>,
     job_id: &str,
     request: IngestJobRequest,
+    credential_resolver: &Option<Arc<dyn GitCredentialResolver>>,
 ) {
     let started = Instant::now();
     registry.mark_running(job_id);
@@ -936,13 +941,36 @@ fn run_ingest_job(
         );
     };
 
+    let credential = match (request.installation_id, credential_resolver.as_ref()) {
+        (Some(installation_id), Some(resolver)) => {
+            match resolver.resolve_installation(&request.repo_url, installation_id) {
+                Some(credential) => Some(credential),
+                None => {
+                    return fail(CodeIndexError::invalid(format!(
+                        "credential resolver returned no credential for installation {installation_id}"
+                    )));
+                }
+            }
+        }
+        (Some(installation_id), None) => {
+            return fail(CodeIndexError::invalid(format!(
+                "no credential resolver configured for installation {installation_id}"
+            )));
+        }
+        (None, _) => None,
+    };
+
     let url = if request.repo_url.trim().is_empty() {
         None
     } else {
         registry.set_stage(job_id, "clone");
         Some((request.repo_url.as_str(), &request.caps))
     };
-    let (input, clone_ms, _fetched) = match stage_repo_for_ingest(request.input.clone(), url) {
+    let (input, clone_ms, _fetched) = match stage_repo_for_ingest_with_credential(
+        request.input.clone(),
+        url,
+        credential.as_ref(),
+    ) {
         Ok(staged) => staged,
         Err(error) => return fail(error),
     };

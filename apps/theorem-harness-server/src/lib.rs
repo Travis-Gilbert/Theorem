@@ -13,8 +13,12 @@
 //! endpoint, the in-process emit, the SSE stream the app subscribes to, and the
 //! spawn-listener that wakes agents on `delivery = wake` messages.
 
+pub mod github;
+pub mod github_app;
 pub mod push;
 
+pub use github::{github_router, verify_webhook_signature, GithubWebhookState};
+pub use github_app::{GithubApp, GithubAppError, InstallationToken};
 pub use push::{
     push_router, spawn_wake_listener, CommandSpawnDispatcher, Delivery, MessagePost, PushState,
     RoomBus, RoomMessageEvent, SpawnDispatcher, SpawnOutcome, DEFAULT_BUS_CAPACITY,
