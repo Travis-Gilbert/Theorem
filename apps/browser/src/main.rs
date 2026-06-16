@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
-use embedder_traits::WebResourceResponse;
+use embedder_traits::{SelectElementOptionOrOptgroup, WebResourceResponse};
 use euclid::Scale;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
@@ -41,10 +41,10 @@ use scene_os_web::render_scene;
 use serde_json::json;
 use serde_json::Value;
 use servo::{
-    EventLoopWaker, InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, RenderingContext,
-    ServoBuilder, SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId, WebResourceLoad,
-    WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    EmbedderControl, EventLoopWaker, InputEvent, InputEventId, InputEventResult, JSValue,
+    LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences,
+    RenderingContext, ServoBuilder, SoftwareRenderingContext, TouchEvent, TouchEventType, TouchId,
+    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use theorem_browser_substrate::{
     browser_affordances, durable_browser_session, memory_browser_session,
@@ -86,6 +86,13 @@ const AUTOMATION_SMOKE_HTML: &str = r#"<!doctype html>
       <h1>Theorem automation smoke</h1>
       <button data-testid="automation-click" onclick="this.dataset.clicked='yes'">Run action</button>
       <label>Search term <input data-testid="automation-input" aria-label="Search term" type="text"></label>
+      <label>Mode
+        <select data-testid="automation-select" aria-label="Mode">
+          <option value="alpha">Alpha</option>
+          <option value="beta">Beta</option>
+        </select>
+      </label>
+      <label>Upload <input data-testid="automation-file" aria-label="Upload" type="file"></label>
     </main>
   </body>
 </html>"#;
@@ -341,6 +348,7 @@ impl WebViewDelegate for A11ySmokeDelegate {
 #[derive(Default)]
 struct ServoAutomationEvents {
     input_results: RefCell<Vec<(InputEventId, InputEventResult)>>,
+    embedder_controls: RefCell<Vec<EmbedderControl>>,
 }
 
 impl ServoAutomationEvents {
@@ -352,6 +360,19 @@ impl ServoAutomationEvents {
         let mut results = self.input_results.borrow_mut();
         let position = results.iter().position(|(id, _)| *id == event_id)?;
         Some(results.remove(position).1)
+    }
+
+    fn record_embedder_control(&self, control: EmbedderControl) {
+        self.embedder_controls.borrow_mut().push(control);
+    }
+
+    fn take_embedder_control(
+        &self,
+        mut matches: impl FnMut(&EmbedderControl) -> bool,
+    ) -> Option<EmbedderControl> {
+        let mut controls = self.embedder_controls.borrow_mut();
+        let position = controls.iter().position(|control| matches(control))?;
+        Some(controls.remove(position))
     }
 }
 
@@ -391,6 +412,10 @@ impl WebViewDelegate for AutomationSmokeDelegate {
         result: InputEventResult,
     ) {
         self.events.record_input_result(event_id, result);
+    }
+
+    fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
+        self.events.record_embedder_control(embedder_control);
     }
 }
 
@@ -497,10 +522,8 @@ impl ServoWebViewAutomationDriver {
                     detail,
                 })
             }
-            ActuationKind::EmbedderControl { control } => {
-                Err(BrowserEngineError::UnsupportedAction {
-                    reason: format!("Servo EmbedderControl response is not wired in apps/browser yet: {control:?}"),
-                })
+            ActuationKind::EmbedderControl { point, control } => {
+                self.actuate_embedder_control(*point, &plan.target_handle, control)
             }
             ActuationKind::SemanticActivation { .. } => {
                 Err(BrowserEngineError::UnsupportedAction {
@@ -607,6 +630,219 @@ impl ServoWebViewAutomationDriver {
         Ok(result)
     }
 
+    fn wait_for_embedder_control(
+        &self,
+        mut matches: impl FnMut(&EmbedderControl) -> bool,
+        timeout_reason: &str,
+    ) -> BrowserEngineResult<EmbedderControl> {
+        let saved_control = Rc::new(RefCell::new(None));
+        let spin_control = saved_control.clone();
+        let events = self.events.clone();
+        self.spin_until(
+            move || {
+                if let Some(control) = events.take_embedder_control(|control| matches(control)) {
+                    *spin_control.borrow_mut() = Some(control);
+                    true
+                } else {
+                    false
+                }
+            },
+            timeout_reason,
+        )?;
+        let control = saved_control
+            .borrow_mut()
+            .take()
+            .expect("spin_until waited for an embedder control");
+        Ok(control)
+    }
+
+    fn actuate_embedder_control(
+        &self,
+        point: AutomationDevicePoint,
+        target_handle: &str,
+        control: &rustyred_web::EmbedderControlPlan,
+    ) -> BrowserEngineResult<ActuationReceipt> {
+        match control {
+            rustyred_web::EmbedderControlPlan::SelectOption { value } => {
+                let option_index = self.select_option_index_for_handle(target_handle, value)?;
+                let pointer_detail = self.actuate_pointer(point, PointerKind::Click)?;
+                let control = self.wait_for_embedder_control(
+                    |control| matches!(control, EmbedderControl::SelectElement(_)),
+                    "timed out waiting for Servo select element control",
+                )?;
+                let EmbedderControl::SelectElement(mut select) = control else {
+                    unreachable!("wait_for_embedder_control matched select element");
+                };
+                let options = select_options_receipt(select.options());
+                if !options.iter().any(|option| {
+                    option
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .map(|id| id as usize == option_index)
+                        .unwrap_or(false)
+                }) {
+                    return Err(BrowserEngineError::UnsupportedAction {
+                        reason: format!(
+                            "Servo select control did not expose option index {option_index}"
+                        ),
+                    });
+                }
+                select.select(vec![option_index]);
+                let selected_options = select.selected_options();
+                select.submit();
+                Ok(ActuationReceipt {
+                    mechanism: "servo_embedder_select_element".to_string(),
+                    detail: json!({
+                        "pointer": pointer_detail,
+                        "handle": target_handle,
+                        "requested": value,
+                        "selectedOptions": selected_options,
+                        "options": options,
+                    }),
+                })
+            }
+            rustyred_web::EmbedderControlPlan::SetInputFiles { paths } => {
+                if paths.is_empty() {
+                    return Err(BrowserEngineError::UnsupportedAction {
+                        reason: "set_input_files requires at least one path".to_string(),
+                    });
+                }
+                let file_paths = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+                let pointer_detail = self.actuate_pointer(point, PointerKind::Click)?;
+                let control = self.wait_for_embedder_control(
+                    |control| matches!(control, EmbedderControl::FilePicker(_)),
+                    "timed out waiting for Servo file picker control",
+                )?;
+                let EmbedderControl::FilePicker(mut picker) = control else {
+                    unreachable!("wait_for_embedder_control matched file picker");
+                };
+                let allow_select_multiple = picker.allow_select_multiple();
+                if file_paths.len() > 1 && !allow_select_multiple {
+                    return Err(BrowserEngineError::UnsupportedAction {
+                        reason: "Servo file picker does not allow multiple files".to_string(),
+                    });
+                }
+                picker.select(&file_paths);
+                picker.submit();
+                let file_info = self.wait_for_file_input_files(target_handle, file_paths.len())?;
+                Ok(ActuationReceipt {
+                    mechanism: "servo_embedder_file_picker".to_string(),
+                    detail: json!({
+                        "pointer": pointer_detail,
+                        "handle": target_handle,
+                        "paths": paths,
+                        "allowSelectMultiple": allow_select_multiple,
+                        "fileInfo": file_info,
+                    }),
+                })
+            }
+        }
+    }
+
+    fn select_option_index_for_handle(
+        &self,
+        handle: &str,
+        value: &str,
+    ) -> BrowserEngineResult<usize> {
+        let handle_json = json_string(handle)?;
+        let value_json = json_string(value)?;
+        let script = format!(
+            r#"(function () {{
+  var handle = {handle_json};
+  var wanted = {value_json};
+  var nodes = document.querySelectorAll("[data-theorem-id]");
+  var el = null;
+  for (var i = 0; i < nodes.length; i++) {{
+    if (nodes[i].getAttribute("data-theorem-id") === handle) {{
+      el = nodes[i];
+      break;
+    }}
+  }}
+  if (!el) return JSON.stringify({{ ok: false, error: "not_found", handle: handle }});
+  if (el.tagName.toLowerCase() !== "select") return JSON.stringify({{ ok: false, error: "not_select", handle: handle }});
+  for (var index = 0; index < el.options.length; index++) {{
+    var option = el.options[index];
+    if (option.value === wanted || option.text.trim() === wanted || String(index) === wanted) {{
+      if (option.disabled) return JSON.stringify({{ ok: false, error: "option_disabled", index: index, value: option.value, label: option.text }});
+      return JSON.stringify({{ ok: true, index: index, value: option.value, label: option.text }});
+    }}
+  }}
+  return JSON.stringify({{ ok: false, error: "option_not_found", wanted: wanted, count: el.options.length }});
+}})()"#
+        );
+        let response = self.evaluate_javascript_string(script)?;
+        let receipt: Value = serde_json::from_str(&response).map_err(|error| {
+            BrowserEngineError::UnsupportedAction {
+                reason: format!("select option lookup receipt did not parse: {error}"),
+            }
+        })?;
+        if receipt.get("ok").and_then(Value::as_bool) == Some(true) {
+            return receipt
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|index| index as usize)
+                .ok_or_else(|| BrowserEngineError::UnsupportedAction {
+                    reason: format!("select option lookup omitted index: {receipt}"),
+                });
+        }
+        Err(BrowserEngineError::UnsupportedAction {
+            reason: format!("select option lookup failed: {receipt}"),
+        })
+    }
+
+    fn file_input_info_for_handle(&self, handle: &str) -> BrowserEngineResult<Value> {
+        let handle_json = json_string(handle)?;
+        let script = format!(
+            r#"(function () {{
+  var handle = {handle_json};
+  var nodes = document.querySelectorAll("[data-theorem-id]");
+  var el = null;
+  for (var i = 0; i < nodes.length; i++) {{
+    if (nodes[i].getAttribute("data-theorem-id") === handle) {{
+      el = nodes[i];
+      break;
+    }}
+  }}
+  if (!el) return JSON.stringify({{ ok: false, error: "not_found", handle: handle }});
+  if (el.tagName.toLowerCase() !== "input" || (el.getAttribute("type") || "").toLowerCase() !== "file") {{
+    return JSON.stringify({{ ok: false, error: "not_file_input", handle: handle }});
+  }}
+  return JSON.stringify({{
+    ok: true,
+    count: el.files ? el.files.length : 0,
+    names: Array.prototype.map.call(el.files || [], function (file) {{ return file.name; }})
+  }});
+}})()"#
+        );
+        let response = self.evaluate_javascript_string(script)?;
+        serde_json::from_str(&response).map_err(|error| BrowserEngineError::UnsupportedAction {
+            reason: format!("file input receipt did not parse: {error}"),
+        })
+    }
+
+    fn wait_for_file_input_files(
+        &self,
+        handle: &str,
+        expected_count: usize,
+    ) -> BrowserEngineResult<Value> {
+        let deadline = Instant::now() + Duration::from_millis(AUTOMATION_SPIN_TIMEOUT_MS);
+        loop {
+            let info = self.file_input_info_for_handle(handle)?;
+            if info.get("ok").and_then(Value::as_bool) == Some(true)
+                && info.get("count").and_then(Value::as_u64) == Some(expected_count as u64)
+            {
+                return Ok(info);
+            }
+            self.servo.spin_event_loop();
+            std::thread::sleep(Duration::from_millis(1));
+            if Instant::now() > deadline {
+                return Err(BrowserEngineError::UnsupportedAction {
+                    reason: format!("timed out waiting for Servo file input update: {info}"),
+                });
+            }
+        }
+    }
+
     fn set_value_for_handle(&self, handle: &str, value: &str) -> BrowserEngineResult<Value> {
         let handle_json = json_string(handle)?;
         let value_json = json_string(value)?;
@@ -700,6 +936,32 @@ fn input_event_receipt(event_id: InputEventId, result: InputEventResult) -> Valu
         "consumed": result.contains(InputEventResult::Consumed),
         "dispatchFailed": result.contains(InputEventResult::DispatchFailed),
     })
+}
+
+fn select_options_receipt(options: &[SelectElementOptionOrOptgroup]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for option_or_group in options {
+        match option_or_group {
+            SelectElementOptionOrOptgroup::Option(option) => {
+                out.push(json!({
+                    "id": option.id,
+                    "label": option.label,
+                    "disabled": option.is_disabled,
+                }));
+            }
+            SelectElementOptionOrOptgroup::Optgroup { label, options } => {
+                for option in options {
+                    out.push(json!({
+                        "id": option.id,
+                        "label": option.label,
+                        "disabled": option.is_disabled,
+                        "group": label,
+                    }));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn json_string(value: &str) -> BrowserEngineResult<String> {
@@ -1196,12 +1458,88 @@ fn run_headless_automation_smoke() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
+    let select_locator = Locator::get_by_test_id("automation-select");
+    let select = select_locator
+        .resolve(&driver.snapshot().map_err(browser_error_box)?)
+        .into_iter()
+        .next()
+        .ok_or("automation smoke select did not resolve by test id")?;
+    let select_plan = build_actuation_plan(
+        &driver,
+        &select,
+        &LocatorAction::SelectOption {
+            value: "beta".to_string(),
+        },
+    )
+    .map_err(browser_error_box)?;
+    let select_receipt = driver
+        .actuate_sync(select_plan, &BrowserActionPolicy::default())
+        .map_err(browser_error_box)?;
+    let selected_value = driver
+        .evaluate_javascript_string(
+            "document.querySelector('[data-testid=\"automation-select\"]').value",
+        )
+        .map_err(browser_error_box)?;
+    if selected_value != "beta" {
+        return Err(format!(
+            "automation smoke select did not round-trip through DOM value: {selected_value:?}"
+        )
+        .into());
+    }
+
+    let upload_path = std::env::temp_dir().join("theorem-browser-automation-upload.txt");
+    std::fs::write(&upload_path, b"servo upload smoke")?;
+    let upload_name = upload_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("automation upload path did not have a UTF-8 file name")?
+        .to_string();
+    let file_locator = Locator::get_by_test_id("automation-file");
+    let file_input = file_locator
+        .resolve(&driver.snapshot().map_err(browser_error_box)?)
+        .into_iter()
+        .next()
+        .ok_or("automation smoke file input did not resolve by test id")?;
+    let file_plan = build_actuation_plan(
+        &driver,
+        &file_input,
+        &LocatorAction::SetInputFiles {
+            paths: vec![upload_path.to_string_lossy().to_string()],
+        },
+    )
+    .map_err(browser_error_box)?;
+    let file_receipt = driver
+        .actuate_sync(file_plan, &BrowserActionPolicy::default())
+        .map_err(browser_error_box)?;
+    let file_info_json = driver
+        .evaluate_javascript_string(
+            r#"JSON.stringify((function () {
+  var input = document.querySelector('[data-testid="automation-file"]');
+  return {
+    count: input.files ? input.files.length : 0,
+    name: input.files && input.files[0] ? input.files[0].name : null
+  };
+})())"#,
+        )
+        .map_err(browser_error_box)?;
+    let file_info: Value = serde_json::from_str(&file_info_json)?;
+    let file_count = file_info.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let file_name = file_info.get("name").and_then(Value::as_str);
+    if file_count != 1 || file_name != Some(upload_name.as_str()) {
+        return Err(format!(
+            "automation smoke file picker did not round-trip through DOM files: {file_info}"
+        )
+        .into());
+    }
+
     println!(
-        "theorem-browser: headless automation smoke OK; url={}, interactive_elements={}, click_mechanism={}, fill_mechanism={}",
+        "theorem-browser: headless automation smoke OK; url={}, interactive_elements={}, click_mechanism={}, fill_mechanism={}, select_mechanism={}, file_mechanism={}",
         page.url,
         page.interactive_elements.len(),
         click_receipt.mechanism,
-        fill_receipt.mechanism
+        fill_receipt.mechanism,
+        select_receipt.mechanism,
+        file_receipt.mechanism
     );
     Ok(())
 }

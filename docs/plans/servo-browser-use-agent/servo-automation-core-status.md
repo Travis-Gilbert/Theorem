@@ -97,13 +97,18 @@ codex (`apps/browser/src/main.rs`):
 - Live coordinate synthesis: sends `MouseMove`, `MouseButton(Down/Up)`, double
   click, hover, and tap through `WebView::notify_input_event`; the delegate
   captures `notify_input_event_handled` into structured receipts.
+- Live native controls: `ActuationKind::EmbedderControl` now carries the target
+  point; the apps/browser delegate captures Servo `EmbedderControl` callbacks and
+  the driver responds with `SelectElement::select(...).submit()` and
+  `FilePicker::select(...).submit()`.
 - Live smoke flag: `cargo run --manifest-path apps/browser/Cargo.toml --
-  --headless-automation-smoke` loads an intercepted page, snapshots button/input
-  handles, clicks a real button handler via `notify_input_event`, fills an input,
-  and re-snapshots to verify the value round-tripped.
-- Still intentionally unsupported in this adapter: Servo EmbedderControl
-  responses and `SemanticActivation`. EmbedderControl needs the native-control
-  response path; semantic activation needs the #4344 fork route documented in
+  --headless-automation-smoke` loads an intercepted page, snapshots
+  button/input/select/file handles, clicks a real button handler via
+  `notify_input_event`, fills an input, selects a `<select>` option through
+  Servo's native control, sets an upload through Servo's file picker, and
+  verifies the DOM state after each action.
+- Still intentionally unsupported in this adapter: `SemanticActivation`.
+  Semantic activation needs the #4344 fork route documented in
   `servo-4344-semantic-activation-fork-plan.md`.
 
 ## Acceptance map (Slices 1-2)
@@ -115,7 +120,7 @@ codex (`apps/browser/src/main.rs`):
 | Slice 2: briefly-disabled field fills without a sleep | COVERED | `auto_wait_passes_once_a_briefly_disabled_field_enables`. |
 | Slice 2: click fails closed on receives-events (no blind click) | COVERED | `auto_wait_fails_closed_when_receives_events_never_passes`. |
 | Slice 2: coordinate transform (E5/E6) | COVERED (math + live event path) | Unit-tested math plus live `notify_input_event` smoke against a real page handler; deeper Paint hit-test occlusion remains Slice 4. |
-| Slice 2: select_option / set_input_files via EmbedderControl | PARTIAL | Plan + mechanism present; the live EmbedderControl response is the apps/browser GAP. |
+| Slice 2: select_option / set_input_files via EmbedderControl | COVERED (live adapter) | Delegate-captured Servo `SelectElement` / `FilePicker` responses, with DOM re-read in `--headless-automation-smoke`. |
 | Fence: rustyred-web stays Servo-free | COVERED | No libservo; the Servo surface is the `BrowserDriver` trait. |
 
 ## Validation receipts
@@ -160,22 +165,41 @@ codex (`apps/browser/src/main.rs`):
   re-triggered as run 27569567121 -> GREEN (17m32s): the embedder built + LINKED
   on Linux and all four smokes passed, including the headless Playwright-class
   automation smoke. The browser is proven up on both local (macOS) and CI (Linux).
+- Codex follow-up trimmed the default BLAS edge out of `apps/browser`: TurboVec is
+  now opt-in behind `vector-accelerated` in `rustyred-thg-core` and `rustyred-web`.
+  Default `theorem-browser` dependency checks now report no `cblas-sys` and no
+  `turbovec` package in the graph; `cargo check -p rustyred-thg-core` and
+  `cargo check -p rustyred-web` pass with default features. The
+  `servo-browser.yml` OpenBLAS install step was removed. Next CI should prove the
+  embedder links on Linux without the syslib stopgap.
+- BLAS-trim validation receipts: `cargo tree --manifest-path
+  apps/browser/Cargo.toml -i cblas-sys` and `-i turbovec` both fail with "package
+  ID specification ... did not match any packages"; feature-tree grep over
+  `theorem-browser` has no `turbovec|cblas|ndarray|openblas|vector-accelerated`
+  hits; `cargo test -p rustyred-thg-core vector_` passes 6 tests; `cargo test -p
+  rustyred-web ring_`, `relevant_match_outranks_the_central_hub`, and
+  `super_hub_does_not_flood_the_neighbourhood` pass; `cargo check -p
+  rustyred-thg-core --features vector-accelerated` and `cargo check -p
+  rustyred-web --features vector-accelerated` pass; `CARGO_TARGET_DIR=/tmp/theorem-browser-target
+  cargo check --manifest-path apps/browser/Cargo.toml --bin theorem-browser` from
+  `/tmp/theorem-repo` passes.
+- EmbedderControl validation receipt: `CARGO_TARGET_DIR=/tmp/theorem-browser-target
+  cargo run --manifest-path apps/browser/Cargo.toml --bin theorem-browser --
+  --headless-automation-smoke` from `/tmp/theorem-repo` passes with
+  `interactive_elements=4`, `click_mechanism=servo_notify_input_event`,
+  `fill_mechanism=servo_focus_then_value_commit`,
+  `select_mechanism=servo_embedder_select_element`, and
+  `file_mechanism=servo_embedder_file_picker`.
 
 ## Remaining (the seam targets)
 
-1. **apps/browser EmbedderControl responses** (codex lane, CI-only): wire
-   `select_option` / `set_input_files` through Servo's native-control response
-   path and return receipts alongside the coordinate-synthesis receipts.
-2. **#4344 Servo fork** (codex lane, CI-only): the `perform_action` route across
+1. **#4344 Servo fork** (codex lane, CI-only): the `perform_action` route across
    servoshell/constellation/script/layout, filling `SemanticActivation`.
    Grounded fork plan:
    `docs/plans/servo-browser-use-agent/servo-4344-semantic-activation-fork-plan.md`.
-3. **Full Playwright selector bundle** vendoring (replace the thin bridge).
-4. **Slice 3 remainder**: wire `Context` to a real storage partition and `route`
+2. **Full Playwright selector bundle** vendoring (replace the thin bridge).
+3. **Slice 3 remainder**: wire `Context` to a real storage partition and `route`
    to the live interception seam (`load_web_resource().intercept()`).
-5. **Slice 4**: engine-truth upgrades (box-tree visibility, settle-signal
+4. **Slice 4**: engine-truth upgrades (box-tree visibility, settle-signal
    stability, engine occlusion hit-test) swapping the JS heuristics behind the
    same API.
-6. **Trim the BLAS transitive dep out of apps/browser** so the browser binary does
-   not link OpenBLAS at all (feature-gate rustyred-web's ML/embedding path out of
-   the embedder's reachable graph); the CI `libopenblas-dev` install is the stopgap.

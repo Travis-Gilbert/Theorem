@@ -35,6 +35,7 @@ use futures_util::future::join_all;
 use rustyred_thg_core::graph_store::{GraphStore, NeighborQuery, NodeQuery, NodeRecord};
 use rustyred_thg_core::personalized_pagerank;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "vector-accelerated")]
 use turbovec::IdMapIndex;
 use url::Url;
 
@@ -64,6 +65,7 @@ const DEFAULT_ACQUISITION_LIMIT: usize = 16;
 /// Hash embedding dimensionality for the standalone dense layer.
 const DENSE_DIM: usize = 128;
 /// TurboVec quantization bit width for ephemeral local search indexes.
+#[cfg(feature = "vector-accelerated")]
 const DENSE_BIT_WIDTH: usize = 4;
 /// Avoid arbitrary dense-only matches when the hash vector has no meaningful overlap.
 const MIN_DENSE_SCORE: f32 = 0.08;
@@ -683,6 +685,7 @@ fn compare_ranked_hits(a: &(String, usize, f64), b: &(String, usize, f64)) -> Or
         .then_with(|| a.0.cmp(&b.0))
 }
 
+#[cfg(feature = "vector-accelerated")]
 fn stable_dense_id(page_id: &str, used: &mut BTreeSet<u64>) -> u64 {
     let digest = blake3::hash(page_id.as_bytes());
     let bytes = digest.as_bytes();
@@ -693,6 +696,15 @@ fn stable_dense_id(page_id: &str, used: &mut BTreeSet<u64>) -> u64 {
         id = id.wrapping_add(1);
     }
     id
+}
+
+#[cfg(not(feature = "vector-accelerated"))]
+fn dense_similarity(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(a, b)| a * b)
+        .sum::<f32>()
+        .clamp(-1.0, 1.0)
 }
 
 fn normalized_features(text: &str) -> Vec<String> {
@@ -747,9 +759,8 @@ fn dense_candidate_scores(
         return BTreeMap::new();
     }
 
-    let mut vectors = Vec::with_capacity(pages.len() * DENSE_DIM);
-    let mut ids = Vec::with_capacity(pages.len());
-    let mut id_to_page: HashMap<u64, String> = HashMap::with_capacity(pages.len());
+    let mut page_vectors = Vec::with_capacity(pages.len());
+    #[cfg(feature = "vector-accelerated")]
     let mut used_ids = BTreeSet::new();
     for page in pages {
         let Some((url, title, text)) = meta.get(&page.id) else {
@@ -760,35 +771,62 @@ fn dense_candidate_scores(
         if vector.iter().all(|value| value.abs() < 1e-6) {
             continue;
         }
-        let dense_id = stable_dense_id(&page.id, &mut used_ids);
-        id_to_page.insert(dense_id, page.id.clone());
-        ids.push(dense_id);
-        vectors.extend(vector);
+        page_vectors.push((page.id.clone(), vector));
     }
-    if ids.is_empty() {
+    if page_vectors.is_empty() {
         return BTreeMap::new();
     }
 
-    let mut index = match IdMapIndex::new(DENSE_DIM, DENSE_BIT_WIDTH) {
-        Ok(index) => index,
-        Err(_) => return BTreeMap::new(),
-    };
-    if index.add_with_ids(&vectors, &ids).is_err() {
-        return BTreeMap::new();
+    #[cfg(feature = "vector-accelerated")]
+    {
+        let mut vectors = Vec::with_capacity(page_vectors.len() * DENSE_DIM);
+        let mut ids = Vec::with_capacity(page_vectors.len());
+        let mut id_to_page: HashMap<u64, String> = HashMap::with_capacity(page_vectors.len());
+        for (page_id, vector) in page_vectors {
+            let dense_id = stable_dense_id(&page_id, &mut used_ids);
+            id_to_page.insert(dense_id, page_id);
+            ids.push(dense_id);
+            vectors.extend(vector);
+        }
+
+        let mut index = match IdMapIndex::new(DENSE_DIM, DENSE_BIT_WIDTH) {
+            Ok(index) => index,
+            Err(_) => return BTreeMap::new(),
+        };
+        if index.add_with_ids(&vectors, &ids).is_err() {
+            return BTreeMap::new();
+        }
+        let (scores, result_ids) = index.search(&query_vector, k.min(ids.len()));
+        scores
+            .into_iter()
+            .zip(result_ids)
+            .filter_map(|(score, dense_id)| {
+                if score < MIN_DENSE_SCORE {
+                    return None;
+                }
+                id_to_page
+                    .get(&dense_id)
+                    .map(|page_id| (page_id.clone(), score as f64))
+            })
+            .collect()
     }
-    let (scores, result_ids) = index.search(&query_vector, k.min(ids.len()));
-    scores
-        .into_iter()
-        .zip(result_ids)
-        .filter_map(|(score, dense_id)| {
-            if score < MIN_DENSE_SCORE {
-                return None;
-            }
-            id_to_page
-                .get(&dense_id)
-                .map(|page_id| (page_id.clone(), score as f64))
-        })
-        .collect()
+    #[cfg(not(feature = "vector-accelerated"))]
+    {
+        let mut results = page_vectors
+            .into_iter()
+            .filter_map(|(page_id, vector)| {
+                let score = dense_similarity(&query_vector, &vector);
+                (score >= MIN_DENSE_SCORE).then_some((page_id, score as f64))
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        results.truncate(k.min(results.len()));
+        results.into_iter().collect()
+    }
 }
 
 fn add_rrf_scores(
