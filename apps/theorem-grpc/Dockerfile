@@ -7,12 +7,12 @@
 #
 # Transitive internal-crate set (verified via `cargo tree -p theorem-grpc`):
 # rustyred-web, rustyred-thg-core, rustyred-thg-code, rustyred-thg-affordances,
-# theorem-harness-core.
+# theorem-harness-core, pilot-core.
 # rustyred-thg-core and theorem-harness-core are leaf crates (no internal
-# path-deps); rustyred-web and rustyred-thg-code path-dep rustyred-thg-core;
-# rustyred-thg-affordances path-deps rustyred-thg-core + theorem-harness-core.
-# So the COPY list below is complete. This list MUST be kept in sync with
-# apps/theorem-grpc/Cargo.toml.
+# path-deps); rustyred-web path-deps rustyred-thg-core + pilot-core;
+# rustyred-thg-code path-deps rustyred-thg-core; rustyred-thg-affordances
+# path-deps rustyred-thg-core + theorem-harness-core. So the COPY list below is
+# complete. This list MUST be kept in sync with apps/theorem-grpc/Cargo.toml.
 #
 # Toolchain: rust 1.89-bookworm. Above rustyred-thg-server's 1.88, matching the
 # civic backend's >=1.89 requirement, and deliberately NOT the Servo 1.95
@@ -36,6 +36,7 @@ RUN apt-get update \
 # Context = Theorem repo root. Copy the crate + its path-dep sources.
 COPY apps/theorem-grpc ./apps/theorem-grpc
 COPY rustyredcore_THG/crates/rustyred-web ./rustyredcore_THG/crates/rustyred-web
+COPY rustyredcore_THG/crates/pilot-core ./rustyredcore_THG/crates/pilot-core
 COPY rustyredcore_THG/crates/rustyred-thg-core ./rustyredcore_THG/crates/rustyred-thg-core
 COPY rustyredcore_THG/crates/rustyred-thg-code ./rustyredcore_THG/crates/rustyred-thg-code
 COPY rustyredcore_THG/crates/rustyred-thg-affordances ./rustyredcore_THG/crates/rustyred-thg-affordances
