@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::graph_store::{GraphStoreError, GraphStoreResult, RedCoreGraphStore};
+use crate::hooks::HookRegistration;
 
 pub type PluginOperationHandler = fn(PluginOperationContext<'_>, Value) -> GraphStoreResult<Value>;
 
@@ -63,6 +64,13 @@ pub trait RustyRedPlugin: Send + Sync + std::fmt::Debug {
     fn operations(&self) -> Vec<PluginOperationRegistration> {
         Vec::new()
     }
+
+    /// Graph-level hooks this plugin registers. Default empty so existing
+    /// plugins compile unchanged. The registry collects these at init; an
+    /// embedder feeds them to a `crate::hooks::HookDispatcher`.
+    fn hooks(&self) -> Vec<HookRegistration> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -95,6 +103,16 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|plugin| plugin.capabilities())
+            .collect()
+    }
+
+    /// All graph-level hooks registered by loaded plugins, collected at the
+    /// point of call. An embedder feeds these to a `crate::hooks::HookDispatcher`
+    /// (typically once at init) so plugin hooks fire on store mutations.
+    pub fn hooks(&self) -> Vec<HookRegistration> {
+        self.plugins
+            .iter()
+            .flat_map(|plugin| plugin.hooks())
             .collect()
     }
 

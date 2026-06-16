@@ -12,6 +12,7 @@ use serde_json::Value;
 #[cfg(feature = "vector-accelerated")]
 use turbovec::IdMapIndex;
 
+use crate::hooks::{changed_property_keys, HookEmitter, MutationEvent, MutationKind};
 use crate::state::stable_hash;
 
 #[cfg(feature = "vector-accelerated")]
@@ -2161,6 +2162,19 @@ pub struct RedCoreGraphStore {
     recovered_frames: u64,
     last_recovery_ok: bool,
     last_fsync: Option<SystemTime>,
+    // ---- Graph-level hooks (additive; see crate::hooks) ----------------
+    // Optional post-commit mutation-event sink. `None` (the default for every
+    // existing caller) makes every emit a no-op, so the hook subsystem is
+    // strictly opt-in and changes nothing for stores without a dispatcher.
+    hook_emitter: Option<HookEmitter>,
+    // Loop-guard generation stamped onto events this store emits. The hook
+    // worker sets this to `g + 1` around a handler running at generation `g`,
+    // so a handler's writes are tagged one deeper and converge under max_depth.
+    // Foreground writes leave it at 0.
+    hook_emit_depth: u32,
+    // Tenant label stamped onto emitted events. Per-tenant embedders set this
+    // when they open the store so events carry the right scope; empty by default.
+    hook_tenant: String,
 }
 
 #[derive(Debug)]
@@ -2185,6 +2199,9 @@ impl RedCoreGraphStore {
             recovered_frames: 0,
             last_recovery_ok: true,
             last_fsync: None,
+            hook_emitter: None,
+            hook_emit_depth: 0,
+            hook_tenant: String::new(),
         }
     }
 
@@ -2204,6 +2221,9 @@ impl RedCoreGraphStore {
             recovered_frames: 0,
             last_recovery_ok: false,
             last_fsync: None,
+            hook_emitter: None,
+            hook_emit_depth: 0,
+            hook_tenant: String::new(),
         };
         engine.recover()?;
         engine.last_recovery_ok = true;
@@ -2266,6 +2286,73 @@ impl RedCoreGraphStore {
 
     pub fn graph_snapshot(&self) -> GraphSnapshot {
         self.store.snapshot()
+    }
+
+    // ---- Graph-level hooks (additive emit seam; see crate::hooks) -------
+    //
+    // The emit points live at the post-commit, post-publish boundary in
+    // `commit_batch` and `purge_expired_nodes`. They are strictly additive:
+    // when no emitter is attached (the default), they are skipped entirely.
+
+    /// Install a post-commit hook emitter (handed out by a `HookDispatcher`).
+    /// Until set, every mutation emit is a no-op, so hooks are strictly opt-in
+    /// and existing callers are unaffected.
+    pub fn attach_hook_emitter(&mut self, emitter: HookEmitter) {
+        self.hook_emitter = Some(emitter);
+    }
+
+    /// Drop the hook emitter, returning the store to a no-emit state.
+    pub fn detach_hook_emitter(&mut self) {
+        self.hook_emitter = None;
+    }
+
+    pub fn has_hook_emitter(&self) -> bool {
+        self.hook_emitter.is_some()
+    }
+
+    /// Set the tenant label stamped onto emitted mutation events. Per-tenant
+    /// embedders set this when they open the store.
+    pub fn set_hook_tenant(&mut self, tenant: impl Into<String>) {
+        self.hook_tenant = tenant.into();
+    }
+
+    pub fn hook_tenant(&self) -> &str {
+        &self.hook_tenant
+    }
+
+    /// Set the loop-guard generation stamped onto subsequently emitted events.
+    /// The hook worker sets this around handler execution so a handler's writes
+    /// are tagged one generation deeper; foreground callers leave it at 0.
+    pub fn set_hook_emit_depth(&mut self, depth: u32) {
+        self.hook_emit_depth = depth;
+    }
+
+    pub fn hook_emit_depth(&self) -> u32 {
+        self.hook_emit_depth
+    }
+
+    /// Non-blocking post-commit emit. No-op without an attached emitter. Called
+    /// only after a commit is durably published, never inside the commit
+    /// critical section.
+    fn emit_hook_event(
+        &self,
+        kind: MutationKind,
+        id: String,
+        labels: Vec<String>,
+        changed_props: Vec<String>,
+        committed_at_ms: u64,
+    ) {
+        if let Some(emitter) = &self.hook_emitter {
+            emitter.try_emit(MutationEvent::new(
+                kind,
+                self.hook_tenant.clone(),
+                id,
+                labels,
+                changed_props,
+                committed_at_ms,
+                self.hook_emit_depth,
+            ));
+        }
     }
 
     pub fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
@@ -2361,6 +2448,11 @@ impl RedCoreGraphStore {
         let mut staged = self.store.clone();
         let mut writes = Vec::with_capacity(batch.mutations.len());
         let mut durable_mutations = Vec::with_capacity(batch.mutations.len());
+        // Only diff/collect hook events when an emitter is attached: zero
+        // overhead on the common no-hook path. The diff compares the live
+        // pre-publish record (`self.store`) against the staged record.
+        let emit_hooks = self.hook_emitter.is_some();
+        let mut pending_events: Vec<(MutationKind, String, Vec<String>, Vec<String>)> = Vec::new();
 
         for mutation in batch.mutations {
             match mutation {
@@ -2369,6 +2461,16 @@ impl RedCoreGraphStore {
                     let record = staged.nodes.get(&write.id).cloned().ok_or_else(|| {
                         GraphStoreError::new("redcore_missing_write", "node write vanished")
                     })?;
+                    if emit_hooks {
+                        let prior = self.store.nodes.get(&write.id).map(|n| &n.properties);
+                        let changed = changed_property_keys(prior, &record.properties);
+                        pending_events.push((
+                            MutationKind::NodeUpserted,
+                            write.id.clone(),
+                            record.labels.clone(),
+                            changed,
+                        ));
+                    }
                     durable_mutations.push(RedCoreMutation::NodeUpsert(record));
                     writes.push(write);
                 }
@@ -2377,6 +2479,16 @@ impl RedCoreGraphStore {
                     let record = staged.edges.get(&write.id).cloned().ok_or_else(|| {
                         GraphStoreError::new("redcore_missing_write", "edge write vanished")
                     })?;
+                    if emit_hooks {
+                        let prior = self.store.edges.get(&write.id).map(|e| &e.properties);
+                        let changed = changed_property_keys(prior, &record.properties);
+                        pending_events.push((
+                            MutationKind::EdgeUpserted,
+                            write.id.clone(),
+                            vec![record.edge_type.clone()],
+                            changed,
+                        ));
+                    }
                     durable_mutations.push(RedCoreMutation::EdgeUpsert(record));
                     writes.push(write);
                 }
@@ -2399,6 +2511,15 @@ impl RedCoreGraphStore {
         self.last_txn_id = txn_id;
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
+        }
+
+        // Post-commit, post-publish: the batch is durable and visible. Emit is
+        // non-blocking and outside the commit critical section.
+        if emit_hooks && !pending_events.is_empty() {
+            let committed_at_ms = now_ms().max(0) as u64;
+            for (kind, id, labels, changed_props) in pending_events {
+                self.emit_hook_event(kind, id, labels, changed_props, committed_at_ms);
+            }
         }
 
         Ok(GraphTransaction {
@@ -2493,6 +2614,27 @@ impl RedCoreGraphStore {
         }
         let count = purged_ids.len();
 
+        // Capture delete events before `purged_ids` is consumed below. Labels
+        // come from the still-live pre-publish store; a purge clears the whole
+        // node, so `changed_props` is empty.
+        let emit_hooks = self.hook_emitter.is_some();
+        let pending_deletes: Vec<(String, Vec<String>)> = if emit_hooks {
+            purged_ids
+                .iter()
+                .map(|id| {
+                    let labels = self
+                        .store
+                        .nodes
+                        .get(id)
+                        .map(|node| node.labels.clone())
+                        .unwrap_or_default();
+                    (id.clone(), labels)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Wrap as a single NodeDelete when only one node expired, or a
         // Batch otherwise. Single-mutation framing keeps the AOF cheap
         // for the common "one mention atom expires per tick" case.
@@ -2522,6 +2664,20 @@ impl RedCoreGraphStore {
         self.last_txn_id = txn_id;
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
+        }
+
+        // Post-commit, post-publish NodeDeleted emit (off the critical path).
+        if emit_hooks {
+            let committed_at_ms = now_ms().max(0) as u64;
+            for (id, labels) in pending_deletes {
+                self.emit_hook_event(
+                    MutationKind::NodeDeleted,
+                    id,
+                    labels,
+                    Vec::new(),
+                    committed_at_ms,
+                );
+            }
         }
 
         Ok(count)

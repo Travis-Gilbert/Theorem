@@ -164,6 +164,29 @@ export interface RoomParticipant {
   lastSeen?: string;
 }
 
+export interface RoomIntent {
+  actor: string;
+  status: string;
+  summary: string;
+  footprint: string[];
+  updatedAt?: string;
+  expectedCompletion?: string;
+  repo?: string;
+  branch?: string;
+  task?: string;
+}
+
+export interface RoomRecord {
+  id: string;
+  kind: string;
+  actor?: string;
+  title?: string;
+  summary: string;
+  body?: string;
+  refs: string[];
+  createdAt?: string;
+}
+
 export interface QueueJob {
   jobId: string;
   title: string;
@@ -219,6 +242,8 @@ export interface AppState {
   recallByDomain: Record<string, RecallHit[]>;
   roomFeedBySpace: Record<SpaceId, RoomFeedItem[]>;
   participantsBySpace: Record<SpaceId, RoomParticipant[]>;
+  roomIntentsBySpace: Record<SpaceId, RoomIntent[]>;
+  roomRecordsBySpace: Record<SpaceId, RoomRecord[]>;
   queueJobs: QueueJob[];
   syncReceipts: SyncReceipt[];
   agentIngestionReceipts: AgentIngestionReceipt[];

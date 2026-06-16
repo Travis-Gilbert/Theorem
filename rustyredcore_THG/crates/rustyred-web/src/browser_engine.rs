@@ -10,77 +10,34 @@ use url::Url;
 
 use crate::browser_perception::{
     extract_structured, keyboard_fallback_for, resolve_upload_path, DomainPolicy,
-    NavigationDecision, SensitiveData, TabSet, UploadDecision,
+    NavigationDecision, TabSet, UploadDecision,
 };
+#[cfg(test)]
+use crate::browser_perception::SensitiveData;
 use crate::{
     apply_batch_to_store, build_v2_fixture_crawl, canonicalize_url, extract_links_for_url,
     global_robots_cache, CrawlBudget, CrawlRequest, CrawlScope, FetchCascade, FetchTierResult,
     FixturePage, RobotsDecision, RustyWebError, RustyWebResult,
 };
 
-pub type BrowserEngineResult<T> = Result<T, BrowserEngineError>;
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BrowserEngineError {
-    NoCurrentPage,
-    ElementNotFound { element_id: String },
-    UnsupportedAction { reason: String },
-    ActionBlocked { reason: String },
-    RustyWeb { message: String },
-}
 
 impl From<RustyWebError> for BrowserEngineError {
     fn from(error: RustyWebError) -> Self {
-        Self::RustyWeb {
+        Self::Backend {
             message: error.to_string(),
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ElementBox {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
+// The pure page-snapshot + action-vocabulary data types now live in `pilot-core`
+// (the Servo-free, substrate-free automation core, migrated in place toward an
+// open-source "WebDriver BiDi for Servo"). Re-exported here so every current
+// rustyred-web consumer is unchanged.
+pub use pilot_core::{
+    BrowserAction, BrowserActionPolicy, BrowserEngineError, BrowserEngineResult, ElementBox,
+    InteractiveElement, PageState, WaitCondition,
+};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InteractiveElement {
-    pub element_id: String,
-    pub role: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub test_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bbox: Option<ElementBox>,
-    pub visible: bool,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub editable: bool,
-    /// job-007 D5: the engine has not yet rolled a proper interactive role or
-    /// bounds for this node, so it is surfaced degraded. A degraded element is
-    /// still operable (keyboard fallback), but the driving model should prefer
-    /// keyboard or vision over a precise click. Additive; serde-defaults false
-    /// so older receipts and the HTML reader path round-trip unchanged.
-    #[serde(default)]
-    pub degraded: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PageState {
-    pub url: String,
-    pub title: String,
-    pub distilled_text: String,
-    pub interactive_elements: Vec<InteractiveElement>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_tab_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fetch: Option<FetchTierResult>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PageExtract {
@@ -93,100 +50,6 @@ pub struct PageExtract {
     pub valid: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WaitCondition {
-    LoadComplete,
-    ElementVisible(String),
-    Millis(u64),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-pub enum BrowserAction {
-    Click {
-        element_id: String,
-    },
-    Type {
-        element_id: String,
-        text: String,
-    },
-    Select {
-        element_id: String,
-        value: String,
-    },
-    SendKeys {
-        sequence: String,
-    },
-    SelectOption {
-        element_id: String,
-        value: String,
-    },
-    Hover {
-        element_id: String,
-    },
-    Scroll {
-        delta: i32,
-    },
-    ScrollToElement {
-        element_id: String,
-    },
-    UploadFile {
-        element_id: String,
-        path: String,
-    },
-    Back,
-    Forward,
-    WaitFor {
-        condition: WaitCondition,
-    },
-    Submit,
-    OpenTab {
-        url: String,
-    },
-    SwitchTab {
-        tab_id: String,
-    },
-    CloseTab {
-        tab_id: String,
-    },
-    ListTabs,
-    Extract {
-        schema: Value,
-        candidate: Value,
-    },
-    Done {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        summary: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BrowserActionPolicy {
-    pub allow_state_changing: bool,
-    pub confirmed: bool,
-    pub require_robots: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub permitted_domains: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub upload_roots: Vec<String>,
-    #[serde(default)]
-    pub sensitive_data: SensitiveData,
-}
-
-impl Default for BrowserActionPolicy {
-    fn default() -> Self {
-        Self {
-            allow_state_changing: false,
-            confirmed: false,
-            require_robots: true,
-            permitted_domains: Vec::new(),
-            upload_roots: Vec::new(),
-            sensitive_data: SensitiveData::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -242,7 +105,7 @@ impl FetchCascadeBrowserEngine {
             .await?;
         let html = String::from_utf8_lossy(&fetch.html_bytes).to_string();
         let mut page = page_state_from_html(&fetch.final_url, &html)?;
-        page.fetch = Some(fetch);
+        page.fetch = Some(fetch_summary(&fetch));
         self.stamp_active_tab(&mut page);
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
@@ -662,7 +525,7 @@ pub async fn web_consume_to_graph<S: GraphStore>(
         .await?;
     let html = String::from_utf8_lossy(&fetch.html_bytes).to_string();
     let mut page = page_state_from_html(&fetch.final_url, &html)?;
-    page.fetch = Some(fetch.clone());
+    page.fetch = Some(fetch_summary(&fetch));
     let extract = PageExtract {
         url: page.url.clone(),
         title: page.title.clone(),
@@ -701,7 +564,7 @@ pub async fn web_consume_to_graph<S: GraphStore>(
             }],
         )?;
         let writes = apply_batch_to_store(store, &output.graph.batch).map_err(|error| {
-            BrowserEngineError::RustyWeb {
+            BrowserEngineError::Backend {
                 message: format!("{}: {}", error.code, error.message),
             }
         })?;
@@ -991,16 +854,18 @@ fn input_type_is_editable(input_type: &str) -> bool {
     )
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
+/// The transport summary rustyred-web stores in `PageState.fetch` (which the
+/// core treats as an opaque `Value`). Mirrors the shape the product server emits.
+fn fetch_summary(fetch: &FetchTierResult) -> Value {
+    json!({
+        "tier_used": fetch.tier_used,
+        "http_status": fetch.http_status,
+        "content_type": fetch.content_type,
+        "final_url": fetch.final_url,
+        "truncated": fetch.truncated,
+        "body_bytes": fetch.html_bytes.len(),
+        "error": fetch.error,
+    })
 }
 
 fn extract_title(html: &str) -> String {

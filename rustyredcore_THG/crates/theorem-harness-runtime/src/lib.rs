@@ -61,9 +61,14 @@ pub use coordination::{
     PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
 };
 pub use coordination_push::{
-    global_coordination_room_bus, publish_coordination_room_event_from_state, stream_event_matches,
-    subscribe_coordination_room_events, wake_targets, RoomEventBus, RoomMessageDelivery,
-    RoomMessageEvent, DEFAULT_ROOM_BUS_CAPACITY,
+    agent_space_event_kind, agent_space_event_matches, agent_space_high_water_seq,
+    global_agent_space_bus, global_coordination_room_bus, publish_agent_space_event,
+    publish_agent_space_room_message, publish_coordination_room_event_from_state,
+    publish_crdt_delta, publish_footprint_event, publish_presence_event, publish_record_event,
+    publish_work_graph_transition, stream_event_matches, subscribe_agent_space_events,
+    subscribe_coordination_room_events, wake_targets, AddOrRemove, AgentSpaceEnvelope,
+    AgentSpaceEvent, AgentSpaceEventBus, CausalMeta, CrdtDelta, DeltaOp, RoomEventBus,
+    RoomMessageDelivery, RoomMessageEvent, DEFAULT_ROOM_BUS_CAPACITY,
 };
 pub use event_log::{
     append_transition, append_transition_from_store, event_node_id, load_events, load_run,

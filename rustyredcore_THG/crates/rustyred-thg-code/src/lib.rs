@@ -14,16 +14,21 @@ use std::time::Instant;
 use rayon::prelude::*;
 use rustyred_thg_core::{
     now_ms, stable_hash, CodeKgManifest, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
-    GraphSnapshot, GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord,
-    PluginCapability, PluginCapabilityKind, PluginExecutionOutput, PluginOperationContext,
-    PluginOperationRegistration, PluginRegistry, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
-    RustyRedPlugin,
+    GraphSnapshot, GraphStoreError, GraphStoreResult, HookDispatcher, HookDispatcherConfig,
+    HookRegistration, NeighborQuery, NodeQuery, NodeRecord, PluginCapability, PluginCapabilityKind,
+    PluginExecutionOutput, PluginOperationContext, PluginOperationRegistration, PluginRegistry,
+    RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RustyRedPlugin,
 };
 use serde_json::{json, Value};
 use syn::visit::Visit;
 
+mod code_embed_hook;
+mod code_hooks;
 mod ingest_jobs;
 mod repo_fetch;
+
+pub use code_embed_hook::{incremental_embed_hook, EMBEDDING_DIM, EMBEDDING_PROPERTY};
+pub use code_hooks::{code_kg_hooks, incremental_centrality_hook, CENTRALITY_PROPERTY};
 pub use ingest_jobs::{
     IngestJobEvent, IngestJobEventKind, IngestJobRegistry, IngestJobRequest, IngestJobState,
     IngestJobStatus, CODE_INGEST_JOB_LABEL,
@@ -71,6 +76,36 @@ pub struct CodeIndexRuntime {
     store: Arc<Mutex<RedCoreGraphStore>>,
     jobs: Arc<IngestJobRegistry>,
     worker_started: Arc<std::sync::Once>,
+    // Kept alive for the runtime's lifetime so the hook worker keeps draining;
+    // `None` unless graph-level code-KG hooks are enabled (see THEOREM_CODE_HOOKS).
+    #[allow(dead_code)]
+    hook_dispatcher: Option<Arc<HookDispatcher>>,
+}
+
+/// Build and start a graph-level hook dispatcher for the code KG over `store`,
+/// attaching the emitter so every commit warms centrality + embeddings off the
+/// writer's path. The returned dispatcher must outlive the store (its worker
+/// stops on drop). This is the one-call embedder wiring an owner of an
+/// `Arc<Mutex<RedCoreGraphStore>>` uses to register the code plugin's hooks.
+pub fn start_code_kg_dispatcher(store: Arc<Mutex<RedCoreGraphStore>>) -> HookDispatcher {
+    let dispatcher = HookDispatcher::start(
+        Arc::clone(&store),
+        code_kg_hooks(),
+        HookDispatcherConfig::default(),
+    );
+    if let Ok(mut guard) = store.lock() {
+        guard.attach_hook_emitter(dispatcher.emitter());
+    }
+    dispatcher
+}
+
+/// Whether `CodeIndexRuntime` auto-starts the code-KG hooks. Default off so a
+/// deploy is a deliberate flag flip, not a silent behavior change. Truthy:
+/// `1`/`true`/`on`/`yes`.
+fn code_hooks_enabled() -> bool {
+    std::env::var("THEOREM_CODE_HOOKS")
+        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +229,13 @@ impl RustyRedPlugin for CodeParsingPlugin {
                 name: "code.graph.tenant_store_commit".to_string(),
             },
         ]
+    }
+
+    /// Graph-level hooks: warm centrality + fresh embeddings on code-graph
+    /// mutations. Realizes the previously-inert `code.graph.tenant_store_commit`
+    /// Hook capability.
+    fn hooks(&self) -> Vec<HookRegistration> {
+        code_kg_hooks()
     }
 
     fn operations(&self) -> Vec<PluginOperationRegistration> {
@@ -329,12 +371,31 @@ impl CodeIndexRuntime {
     }
 
     pub fn try_new_with_store(store: RedCoreGraphStore) -> Result<Self, CodeIndexError> {
+        Self::build(store, code_hooks_enabled())
+    }
+
+    /// Like [`Self::try_new_with_store`], but always starts the graph-level
+    /// code-KG hooks regardless of the `THEOREM_CODE_HOOKS` env flag. For
+    /// embedders/tests that opt in explicitly.
+    pub fn try_new_with_store_hooked(store: RedCoreGraphStore) -> Result<Self, CodeIndexError> {
+        Self::build(store, true)
+    }
+
+    fn build(store: RedCoreGraphStore, with_hooks: bool) -> Result<Self, CodeIndexError> {
         let store = Arc::new(Mutex::new(store));
         let jobs = Arc::new(IngestJobRegistry::with_persistence(Arc::downgrade(&store)));
+        // Start the hook dispatcher before recovery so any re-enqueued ingest's
+        // commits are observed. No-op for stores without hooks enabled.
+        let hook_dispatcher = if with_hooks {
+            Some(Arc::new(start_code_kg_dispatcher(Arc::clone(&store))))
+        } else {
+            None
+        };
         let runtime = Self {
             store,
             jobs,
             worker_started: Arc::new(std::sync::Once::new()),
+            hook_dispatcher,
         };
         // D-jobs: recover durably-mirrored ingest jobs. Terminal jobs become
         // queryable again; jobs interrupted mid-flight (queued/running at the

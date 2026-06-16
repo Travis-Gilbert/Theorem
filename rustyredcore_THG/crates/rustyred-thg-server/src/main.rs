@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod agent_space;
 mod auth;
 mod bulk;
 mod config;

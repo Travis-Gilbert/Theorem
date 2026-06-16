@@ -14,6 +14,7 @@ pub mod fulltext_tantivy;
 pub mod graph;
 pub mod graph_csr;
 pub mod graph_store;
+pub mod hooks;
 pub mod instant_kg;
 pub mod plugin;
 pub mod spatial;
@@ -54,6 +55,11 @@ pub use graph_store::{
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
+pub use hooks::{
+    coalesce_per_id, CoalesceKeyFn, HookContext, HookDispatcher, HookDispatcherConfig,
+    HookDispatcherStats, HookEmitter, HookError, HookHandler, HookOutcome, HookRegistration,
+    HookStoreAccess, MutationEvent, MutationKind, MutationMatcher,
+};
 pub use instant_kg::{
     instant_kg_payload_delta, instant_kg_payload_manifest, instant_kg_status_payload,
     CodeKgEncodedFile, CodeKgManifest, EdgeExplanation, HarnessInstantKg, ImpactResult,

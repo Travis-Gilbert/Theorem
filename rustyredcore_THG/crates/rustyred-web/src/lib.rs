@@ -50,6 +50,12 @@ pub use fetch_cascade::{
 
 pub mod frontier;
 
+pub mod crawl_hooks;
+pub use crawl_hooks::{
+    crawl_hooks, fetch_completion_hook, link_discovery_hook, RustyWebHooksPlugin, EDGE_MENTIONS,
+    WEB_ENTITY_LABEL,
+};
+
 pub mod browser_engine;
 pub use browser_engine::{
     action_allowed_by_policy, action_allowed_by_robots, page_state_from_html, web_consume_to_graph,

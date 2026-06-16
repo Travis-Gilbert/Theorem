@@ -1,14 +1,68 @@
 # Harness Memory Tenancy (V2 / Theorems-Harness)
 
 Date: 2026-06-02
-Status: Convention in force. Operational runbook for how Travis's harness memory
-is partitioned on the deployed V2 server (`rustyredcore-theorem-production`,
-self-id `rusty-red-graph-database`).
+Status: Historical convention plus live-drift warning. This records the intended
+partitioning model for Travis's harness memory on the deployed V2 server
+(`rustyredcore-theorem-production`, self-id `rusty-red-graph-database`), but the
+2026-06-16 production check below supersedes the old lowercase assumption.
 
 NOTE: the memory itself is LIVE DATA in the RustyRed graph store, not in git.
 This file is the durable record of the convention + the operations performed; it
-is not the data. The data lives under the `travis-gilbert` tenant partition on
-the deployed server.
+is not the data. As of the 2026-06-16 check, the reachable production memory
+surface is the `Travis-Gilbert` tenant partition, while `travis-gilbert` is a
+near-empty split partition.
+
+## Live drift check (2026-06-16)
+
+- `rustyred_thg_graph_schema tenant=Travis-Gilbert` returned 54 nodes, including
+  `MemoryDocument`, `HarnessMemory`, and coordination labels.
+- `rustyred_thg_graph_schema tenant=travis-gilbert` returned 2 coordination
+  nodes and no `MemoryDocument` nodes.
+- `rustyred_thg_graph_schema tenant=default` returned 4253 coordination-heavy
+  nodes and no `MemoryDocument` nodes.
+- `rustyred_thg_graph_query tenant=Travis-Gilbert label=MemoryDocument`
+  returned 4 memory documents. This is lower than the 47 documents recorded in
+  the 2026-06-02 verified end state, so the missing memory corpus still needs a
+  recovery or migration pass from the older store/backups.
+- Local Codex plugin hooks now resolve `THEOREM_TENANT_ID=Travis-Gilbert` by
+  default in the installed cache and source plugin copy, so new hook traffic
+  stops falling into `default` when no tenant env var is set.
+
+## Consolidation pass (2026-06-16)
+
+The missing corpus was found on the older RedCore service
+`https://thg-product-production.up.railway.app`, not in `default` on the current
+`rustyredcore-theorem-production` service. The older service held V1-style
+`MemoryAtom` / `TheoremsHarness` data under lowercase `travis-gilbert` and
+`default`; the current service held only the small V2 `MemoryDocument` set under
+capitalized `Travis-Gilbert`.
+
+Codex migrated the deduped old corpus into current canonical tenant
+`Travis-Gilbert` on `rustyredcore-theorem-production` using deterministic
+`legacy-thg-<hash>` `doc_id`s and `upsert_note`, so reruns update the same
+documents instead of creating duplicates.
+
+Migration result:
+
+- Old unique sources inspected: 1042.
+- Migrated V2 `MemoryDocument`s: 372.
+- Source split: 264 from old `travis-gilbert`, 108 from old `default`.
+- Status split: 228 active knowledge-bearing documents, 144 archived
+  coordination-telemetry documents.
+- Deduped or empty sources skipped: 670. Three non-empty source nodes were
+  skipped because an equivalent content/title/kind source was migrated:
+  `custom-graphql-scalars...-2`, `harness:encode:7f373135...`, and
+  `harness:encode:bd7331...`.
+- Verification after migration: current `Travis-Gilbert` held 376
+  `MemoryDocument`s total, with 232 active and 144 archived. The migrated batch
+  is tagged `migration_batch=2026-06-16-legacy-thg-consolidation`,
+  `legacy_source_service=thg-product-production`, `legacy_source_tenant`, and
+  `legacy_source_node_id`.
+
+Status policy for this pass: semantic memory kinds (`orchestrate`, `solution`,
+`feedback`, `postmortem`, `encode`, `self_note`) were kept active; old
+coordination/presence/subscribe/room telemetry was preserved but archived so it
+is recoverable without dominating normal recall.
 
 ## The tenant model (grounded in `rustyredcore_THG`)
 

@@ -4,4 +4,5 @@
 # Currently bundled: Archivo Black (display) + IBM Plex Sans (body), both OFL.
 
 .build/
+build/
 DerivedData/

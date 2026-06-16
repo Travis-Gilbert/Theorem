@@ -72,6 +72,8 @@ const initialState: AppState = {
   recallByDomain: {},
   roomFeedBySpace: {},
   participantsBySpace: {},
+  roomIntentsBySpace: {},
+  roomRecordsBySpace: {},
   queueJobs: [],
   syncReceipts: [],
   agentIngestionReceipts: [],
@@ -114,6 +116,16 @@ type Action =
       type: "SET_PARTICIPANTS";
       spaceId: SpaceId;
       participants: AppState["participantsBySpace"][string];
+    }
+  | {
+      type: "SET_ROOM_INTENTS";
+      spaceId: SpaceId;
+      intents: AppState["roomIntentsBySpace"][string];
+    }
+  | {
+      type: "SET_ROOM_RECORDS";
+      spaceId: SpaceId;
+      records: AppState["roomRecordsBySpace"][string];
     }
   | { type: "SET_QUEUE_JOBS"; jobs: AppState["queueJobs"] }
   | { type: "ADD_SYNC_RECEIPT"; receipt: SyncReceipt }
@@ -335,6 +347,24 @@ function reducer(state: AppState, action: Action): AppState {
         participantsBySpace: {
           ...state.participantsBySpace,
           [action.spaceId]: action.participants,
+        },
+      };
+
+    case "SET_ROOM_INTENTS":
+      return {
+        ...state,
+        roomIntentsBySpace: {
+          ...state.roomIntentsBySpace,
+          [action.spaceId]: action.intents,
+        },
+      };
+
+    case "SET_ROOM_RECORDS":
+      return {
+        ...state,
+        roomRecordsBySpace: {
+          ...state.roomRecordsBySpace,
+          [action.spaceId]: action.records,
         },
       };
 
@@ -664,6 +694,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const context = await cmd.roomContext(space.roomId);
       dispatch({ type: "SET_ROOM_FEED", spaceId, feed: context.feed });
       dispatch({ type: "SET_PARTICIPANTS", spaceId, participants: context.participants });
+      dispatch({ type: "SET_ROOM_INTENTS", spaceId, intents: context.intents });
+      dispatch({ type: "SET_ROOM_RECORDS", spaceId, records: context.records });
     };
 
     return {

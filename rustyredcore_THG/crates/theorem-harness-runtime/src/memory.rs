@@ -1,10 +1,10 @@
 use rustyred_thg_core::{
-    Direction, EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord,
+    Direction, EdgeRecord, EpistemicType, GraphStore, GraphStoreError, GraphStoreResult,
+    NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,13 +19,41 @@ const NODE_MEMORY_KINDS: &[&str] = &["claim", "finding"];
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
 const MAX_GRAPH_QUERY_LIMIT: usize = 10_000;
+const DEFAULT_SEED_LIMIT: usize = 16;
+const DEFAULT_PPR_ALPHA: f64 = 0.15;
+const DEFAULT_PPR_EPSILON: f64 = 1e-6;
+const DEFAULT_PPR_MAX_PUSHES: usize = 100_000;
+const DEFAULT_RECENCY_HALF_LIFE_SECONDS: f64 = 0.0;
+const COMMUNITY_SUMMARY_KIND: &str = "community_summary";
+const COMMUNITY_SUMMARY_EDGE: &str = "MEMORY_SUMMARIZES";
 
 pub trait MemoryGraphStore {
     fn memory_upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()>;
     fn memory_upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()>;
     fn memory_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>>;
+    fn memory_get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>>;
     fn memory_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>>;
     fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>>;
+    fn memory_fulltext_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        let _ = (label, property, query, k);
+        Ok(Vec::new())
+    }
+    fn memory_vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        let _ = (label, property, query, k);
+        Ok(Vec::new())
+    }
 }
 
 impl<T: GraphStore> MemoryGraphStore for T {
@@ -39,6 +67,10 @@ impl<T: GraphStore> MemoryGraphStore for T {
 
     fn memory_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
         Ok(self.get_node(id).cloned())
+    }
+
+    fn memory_get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        Ok(self.get_edge(id).cloned())
     }
 
     fn memory_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
@@ -147,6 +179,24 @@ pub struct RecallMemoryInput {
     pub include_consolidation_sources: bool,
     #[serde(default)]
     pub consume_handoffs: bool,
+    #[serde(default)]
+    pub query_time: String,
+    #[serde(default)]
+    pub overall_state: bool,
+    #[serde(default)]
+    pub seed_limit: usize,
+    #[serde(default)]
+    pub query_embedding: Vec<f32>,
+    #[serde(default)]
+    pub embedding_property: String,
+    #[serde(default)]
+    pub ppr_alpha: f64,
+    #[serde(default)]
+    pub ppr_epsilon: f64,
+    #[serde(default)]
+    pub ppr_max_pushes: usize,
+    #[serde(default)]
+    pub recency_half_life_seconds: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -187,6 +237,8 @@ pub struct ReviseMemoryInput {
     pub cites_doc_ids: Vec<String>,
     #[serde(default)]
     pub derived_from_doc_ids: Vec<String>,
+    #[serde(default)]
+    pub contradicts_doc_ids: Vec<String>,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -431,10 +483,27 @@ pub struct MemoryRecallItem {
     pub updated_at: String,
     pub score: f64,
     pub provenance: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<MemoryRecallFlag>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub rank_signals: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<MemoryDocumentState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<MemoryNodeState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRecallFlag {
+    pub kind: String,
+    #[serde(default)]
+    pub edge_id: String,
+    #[serde(default)]
+    pub edge_type: String,
+    #[serde(default)]
+    pub related_id: String,
+    #[serde(default)]
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -596,50 +665,88 @@ pub fn recall_memory<S: MemoryGraphStore>(
     let actor_filter = input.actor.trim().to_string();
     let since = input.since.trim().to_string();
     let limit = bounded_limit(input.limit);
-    let mut results = Vec::new();
+    let query_time = timestamp_or_now(&input.query_time);
+    let mut atoms = load_recall_atoms(
+        store,
+        &tenant_slug,
+        &kind_filter,
+        &surface_filter,
+        &actor_filter,
+        &since,
+        input.include_low_fitness,
+    )?;
+    let mut atom_by_graph_id = atoms
+        .iter()
+        .map(|atom| (atom.graph_id.clone(), atom.clone()))
+        .collect::<HashMap<_, _>>();
 
-    for document in load_memory_documents(store, &tenant_slug, true)? {
-        if !document_matches_recall(
-            &document,
-            &query,
-            &kind_filter,
+    let mut broad_query =
+        kind_filter.is_empty() && (input.overall_state || is_broad_recall_query(&query));
+    if broad_query {
+        ensure_community_summaries(store, &tenant_slug, &query_time)?;
+        atoms = load_recall_atoms(
+            store,
+            &tenant_slug,
+            COMMUNITY_SUMMARY_KIND,
             &surface_filter,
             &actor_filter,
             &since,
             input.include_low_fitness,
-        ) {
-            continue;
-        }
-        results.push(recall_item_for_document(document));
+        )?;
+        atom_by_graph_id = atoms
+            .iter()
+            .map(|atom| (atom.graph_id.clone(), atom.clone()))
+            .collect::<HashMap<_, _>>();
     }
-    for node in load_memory_nodes(store, &tenant_slug, true)? {
-        if !node_matches_recall(
-            &node,
-            &query,
-            &kind_filter,
+
+    let seed_limit = bounded_seed_limit(input.seed_limit);
+    let mut seeds = if broad_query {
+        seed_community_summaries(&atoms, &query, seed_limit)
+    } else {
+        resolve_recall_seeds(store, &atoms, &query, &input, seed_limit)?
+    };
+    if kind_filter.is_empty()
+        && !broad_query
+        && seeds.is_empty()
+        && !query_has_specific_anchor(&query)
+    {
+        broad_query = true;
+        ensure_community_summaries(store, &tenant_slug, &query_time)?;
+        atoms = load_recall_atoms(
+            store,
+            &tenant_slug,
+            COMMUNITY_SUMMARY_KIND,
             &surface_filter,
             &actor_filter,
             &since,
             input.include_low_fitness,
-        ) {
-            continue;
-        }
-        results.push(recall_item_for_node(node));
+        )?;
+        atom_by_graph_id = atoms
+            .iter()
+            .map(|atom| (atom.graph_id.clone(), atom.clone()))
+            .collect::<HashMap<_, _>>();
+        seeds = seed_community_summaries(&atoms, &query, seed_limit);
     }
 
-    for item in &mut results {
-        item.score = score_match(&query, &item.title, &item.content, &item.summary);
-    }
-    results.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| right.updated_at.cmp(&left.updated_at))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    let mut results = if broad_query || seeds.is_empty() {
+        lexical_recall_results(&atoms, &query)
+    } else {
+        ranked_ppr_recall_results(
+            store,
+            &atom_by_graph_id,
+            &seeds,
+            &query,
+            &query_time,
+            &input,
+        )?
+    };
+
+    annotate_recall_results(store, &mut results, &tenant_slug, &query_time)?;
+    results.retain(|item| item.score > 0.0 || query.is_empty() || broad_query);
+    results.sort_by(compare_recall_items);
     results.truncate(limit);
     bump_recalled_compound_fitness(store, &tenant_slug, &results)?;
+    bump_recall_salience(store, &tenant_slug, &results, &query_time)?;
 
     if input.consume_handoffs && kind_filter == "handoff" {
         for item in &results {
@@ -816,6 +923,19 @@ pub fn revise_memory_document<S: MemoryGraphStore>(
         &revised.doc_id,
         "MEMORY_DERIVED_FROM",
         &input.derived_from_doc_ids,
+    )?;
+    link_doc_id_list(
+        store,
+        &tenant_slug,
+        &revised.doc_id,
+        "MEMORY_CONTRADICTS",
+        &input.contradicts_doc_ids,
+    )?;
+    invalidate_positive_edges_for_targets(
+        store,
+        &tenant_slug,
+        &input.contradicts_doc_ids,
+        &revised.updated_at,
     )?;
 
     Ok(ReviseMemoryReceipt {
@@ -1473,7 +1593,7 @@ fn memory_document_node(document: &MemoryDocumentState) -> MemoryResult<NodeReco
     );
     Ok(NodeRecord::new(
         memory_document_node_id(&document.tenant_slug, &document.doc_id),
-        ["HarnessMemory", "MemoryDocument"],
+        ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
         properties,
     ))
 }
@@ -1484,7 +1604,7 @@ fn memory_node_node(node: &MemoryNodeState) -> MemoryResult<NodeRecord> {
     insert_search_text(&mut properties, &node.title, &node.content, "", &node.tags);
     Ok(NodeRecord::new(
         memory_node_node_id(&node.tenant_slug, &node.node_id),
-        ["HarnessMemory", "MemoryNode"],
+        ["HarnessMemory", "MemoryAtom", "MemoryNode"],
         properties,
     ))
 }
@@ -1648,6 +1768,8 @@ fn recall_item_for_document(document: MemoryDocumentState) -> MemoryRecallItem {
         updated_at: document.updated_at.clone(),
         score: 0.0,
         provenance,
+        flags: Vec::new(),
+        rank_signals: Map::new(),
         document: Some(document),
         node: None,
     }
@@ -1678,9 +1800,1177 @@ fn recall_item_for_node(node: MemoryNodeState) -> MemoryRecallItem {
         updated_at: node.updated_at.clone(),
         score: 0.0,
         provenance,
+        flags: Vec::new(),
+        rank_signals: Map::new(),
         document: None,
         node: Some(node),
     }
+}
+
+#[derive(Clone)]
+struct RecallAtom {
+    graph_id: String,
+    item: MemoryRecallItem,
+    text: String,
+}
+
+#[derive(Clone, Default)]
+struct SeedProfile {
+    fulltext_score: f64,
+    vector_score: f64,
+    mass: f64,
+}
+
+fn load_recall_atoms<S: MemoryGraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    kind_filter: &str,
+    surface_filter: &str,
+    actor_filter: &str,
+    since: &str,
+    include_low_fitness: bool,
+) -> MemoryResult<Vec<RecallAtom>> {
+    let mut atoms = Vec::new();
+    for document in load_memory_documents(store, tenant_slug, true)? {
+        if !document_matches_recall(
+            &document,
+            "",
+            kind_filter,
+            surface_filter,
+            actor_filter,
+            since,
+            include_low_fitness,
+        ) {
+            continue;
+        }
+        let graph_id = memory_document_node_id(&document.tenant_slug, &document.doc_id);
+        let text = memory_document_text(&document);
+        atoms.push(RecallAtom {
+            graph_id,
+            item: recall_item_for_document(document),
+            text,
+        });
+    }
+    for node in load_memory_nodes(store, tenant_slug, true)? {
+        if !node_matches_recall(
+            &node,
+            "",
+            kind_filter,
+            surface_filter,
+            actor_filter,
+            since,
+            include_low_fitness,
+        ) {
+            continue;
+        }
+        let graph_id = memory_node_node_id(&node.tenant_slug, &node.node_id);
+        let text = memory_node_text(&node);
+        atoms.push(RecallAtom {
+            graph_id,
+            item: recall_item_for_node(node),
+            text,
+        });
+    }
+    Ok(atoms)
+}
+
+fn memory_document_text(document: &MemoryDocumentState) -> String {
+    let tags = document.tags.join(" ");
+    [
+        document.title.as_str(),
+        document.summary.as_str(),
+        document.content.as_str(),
+        tags.as_str(),
+    ]
+    .into_iter()
+    .filter(|part| !part.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn memory_node_text(node: &MemoryNodeState) -> String {
+    let tags = node.tags.join(" ");
+    [node.title.as_str(), node.content.as_str(), tags.as_str()]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn resolve_recall_seeds<S: MemoryGraphStore>(
+    store: &S,
+    atoms: &[RecallAtom],
+    query: &str,
+    input: &RecallMemoryInput,
+    seed_limit: usize,
+) -> MemoryResult<BTreeMap<String, SeedProfile>> {
+    if query.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let atom_ids = atoms
+        .iter()
+        .map(|atom| atom.graph_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut fulltext = atoms
+        .iter()
+        .map(|atom| {
+            (
+                atom.graph_id.clone(),
+                score_match(
+                    query,
+                    &atom.item.title,
+                    &atom.item.content,
+                    &atom.item.summary,
+                ),
+            )
+        })
+        .filter(|(_, score)| *score > 0.0)
+        .collect::<Vec<_>>();
+    for (graph_id, score) in indexed_fulltext_seed_scores(store, query, seed_limit)? {
+        if atom_ids.contains(graph_id.as_str()) {
+            fulltext.push((graph_id, score));
+        }
+    }
+    fulltext.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    fulltext.truncate(seed_limit);
+
+    let identifier_query = query_has_specific_anchor(query);
+    let mut vector = indexed_vector_seed_scores(store, input, seed_limit)?
+        .into_iter()
+        .filter(|(graph_id, _)| atom_ids.contains(graph_id.as_str()))
+        .collect::<Vec<_>>();
+    if vector.is_empty() {
+        vector = atoms
+            .iter()
+            .filter_map(|atom| {
+                let score = if input.query_embedding.is_empty() {
+                    if identifier_query {
+                        0.0
+                    } else {
+                        token_cosine_score(query, &atom.text)
+                    }
+                } else {
+                    atom_embedding_score(atom, &input.query_embedding, &input.embedding_property)
+                };
+                (score > 0.0).then(|| (atom.graph_id.clone(), score))
+            })
+            .collect::<Vec<_>>();
+    }
+    vector.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    vector.truncate(seed_limit);
+
+    let max_fulltext = fulltext
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
+    let max_vector = vector
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
+    let mut seeds: BTreeMap<String, SeedProfile> = BTreeMap::new();
+    for (graph_id, score) in fulltext {
+        seeds.entry(graph_id).or_default().fulltext_score = score / max_fulltext;
+    }
+    for (graph_id, score) in vector {
+        seeds.entry(graph_id).or_default().vector_score = score / max_vector;
+    }
+    let total = seeds
+        .values()
+        .map(|seed| seed.fulltext_score + seed.vector_score)
+        .sum::<f64>();
+    if total > 0.0 {
+        for seed in seeds.values_mut() {
+            seed.mass = (seed.fulltext_score + seed.vector_score) / total;
+        }
+    }
+    Ok(seeds)
+}
+
+fn seed_community_summaries(
+    atoms: &[RecallAtom],
+    query: &str,
+    seed_limit: usize,
+) -> BTreeMap<String, SeedProfile> {
+    let mut seeds = resolve_summary_seeds(atoms, query, seed_limit);
+    if seeds.is_empty() && !atoms.is_empty() {
+        let take = atoms.len().min(seed_limit.max(1));
+        let mass = 1.0 / take as f64;
+        for atom in atoms.iter().take(take) {
+            seeds.insert(
+                atom.graph_id.clone(),
+                SeedProfile {
+                    fulltext_score: 1.0,
+                    vector_score: 0.0,
+                    mass,
+                },
+            );
+        }
+    }
+    seeds
+}
+
+fn resolve_summary_seeds(
+    atoms: &[RecallAtom],
+    query: &str,
+    seed_limit: usize,
+) -> BTreeMap<String, SeedProfile> {
+    let mut fulltext = atoms
+        .iter()
+        .map(|atom| {
+            (
+                atom.graph_id.clone(),
+                score_match(
+                    query,
+                    &atom.item.title,
+                    &atom.item.content,
+                    &atom.item.summary,
+                ),
+            )
+        })
+        .filter(|(_, score)| *score > 0.0)
+        .collect::<Vec<_>>();
+    fulltext.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    fulltext.truncate(seed_limit);
+    let total = fulltext.iter().map(|(_, score)| *score).sum::<f64>();
+    let mut seeds = BTreeMap::new();
+    if total > 0.0 {
+        for (graph_id, score) in fulltext {
+            seeds.insert(
+                graph_id,
+                SeedProfile {
+                    fulltext_score: score / total,
+                    vector_score: 0.0,
+                    mass: score / total,
+                },
+            );
+        }
+    }
+    seeds
+}
+
+fn indexed_fulltext_seed_scores<S: MemoryGraphStore>(
+    store: &S,
+    query: &str,
+    seed_limit: usize,
+) -> MemoryResult<Vec<(String, f64)>> {
+    let mut results = Vec::new();
+    for label in [
+        Some("MemoryAtom"),
+        Some("MemoryDocument"),
+        Some("MemoryNode"),
+    ] {
+        match store.memory_fulltext_search(label, "search_text", query, seed_limit) {
+            Ok(hits) => results.extend(
+                hits.into_iter()
+                    .filter(|(_, score)| *score > 0.0)
+                    .map(|(id, score)| (id, score as f64)),
+            ),
+            Err(error) if error.code == "unsupported_operation" => {}
+            Err(error) => return Err(MemoryError::Store(error)),
+        }
+    }
+    dedupe_rank_scores(results, true, seed_limit)
+}
+
+fn indexed_vector_seed_scores<S: MemoryGraphStore>(
+    store: &S,
+    input: &RecallMemoryInput,
+    seed_limit: usize,
+) -> MemoryResult<Vec<(String, f64)>> {
+    if input.query_embedding.is_empty() {
+        return Ok(Vec::new());
+    }
+    let property = if input.embedding_property.trim().is_empty() {
+        "embedding"
+    } else {
+        input.embedding_property.trim()
+    };
+    let mut results = Vec::new();
+    for label in [
+        Some("MemoryAtom"),
+        Some("MemoryDocument"),
+        Some("MemoryNode"),
+    ] {
+        match store.memory_vector_search(label, property, &input.query_embedding, seed_limit) {
+            Ok(hits) => results.extend(hits.into_iter().map(|(id, distance)| {
+                let score = (1.0 - distance as f64).clamp(0.0, 1.0);
+                (id, score)
+            })),
+            Err(error) if error.code == "unsupported_operation" => {}
+            Err(error) if error.code == "dimension_mismatch" => {}
+            Err(error) if error.code == "no_vector_designation" => {}
+            Err(error) => return Err(MemoryError::Store(error)),
+        }
+    }
+    dedupe_rank_scores(results, true, seed_limit)
+}
+
+fn dedupe_rank_scores(
+    results: Vec<(String, f64)>,
+    higher_is_better: bool,
+    limit: usize,
+) -> MemoryResult<Vec<(String, f64)>> {
+    let mut by_id = BTreeMap::<String, f64>::new();
+    for (id, score) in results {
+        if !score.is_finite() {
+            continue;
+        }
+        by_id
+            .entry(id)
+            .and_modify(|current| {
+                if (higher_is_better && score > *current) || (!higher_is_better && score < *current)
+                {
+                    *current = score;
+                }
+            })
+            .or_insert(score);
+    }
+    let mut results = by_id.into_iter().collect::<Vec<_>>();
+    if higher_is_better {
+        results.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+    } else {
+        results.sort_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+    }
+    results.truncate(limit);
+    Ok(results)
+}
+
+fn lexical_recall_results(atoms: &[RecallAtom], query: &str) -> Vec<MemoryRecallItem> {
+    let identifier_query = query_has_specific_anchor(query);
+    atoms
+        .iter()
+        .map(|atom| {
+            let mut item = atom.item.clone();
+            let lexical = score_match(query, &item.title, &item.content, &item.summary);
+            let vector = if identifier_query {
+                0.0
+            } else {
+                token_cosine_score(query, &atom.text)
+            };
+            item.score = if query.trim().is_empty() {
+                1.0
+            } else {
+                lexical + vector
+            };
+            item.rank_signals
+                .insert("lexical_score".to_string(), json!(lexical));
+            item.rank_signals
+                .insert("vector_score".to_string(), json!(vector));
+            item.rank_signals
+                .insert("pipeline".to_string(), json!("stage0_or_stage3"));
+            item
+        })
+        .collect()
+}
+
+fn ranked_ppr_recall_results<S: MemoryGraphStore>(
+    store: &S,
+    atoms: &HashMap<String, RecallAtom>,
+    seeds: &BTreeMap<String, SeedProfile>,
+    query: &str,
+    query_time: &str,
+    input: &RecallMemoryInput,
+) -> MemoryResult<Vec<MemoryRecallItem>> {
+    let adjacency = memory_recall_adjacency(
+        store,
+        atoms,
+        query_time,
+        effective_recency_half_life(input.recency_half_life_seconds),
+    )?;
+    let seed_mass = seeds
+        .iter()
+        .map(|(graph_id, profile)| (graph_id.clone(), profile.mass))
+        .collect::<HashMap<_, _>>();
+    let ppr = rustyred_thg_core::personalized_pagerank(
+        &adjacency,
+        &seed_mass,
+        effective_ppr_alpha(input.ppr_alpha),
+        effective_ppr_epsilon(input.ppr_epsilon),
+        effective_ppr_max_pushes(input.ppr_max_pushes),
+    );
+    let mut results = Vec::new();
+    for (graph_id, atom) in atoms {
+        let ppr_score = ppr.get(graph_id).copied().unwrap_or(0.0);
+        let seed = seeds.get(graph_id).cloned().unwrap_or_default();
+        let lexical = score_match(
+            query,
+            &atom.item.title,
+            &atom.item.content,
+            &atom.item.summary,
+        );
+        let vector = if input.query_embedding.is_empty() {
+            if query_has_specific_anchor(query) {
+                0.0
+            } else {
+                token_cosine_score(query, &atom.text)
+            }
+        } else {
+            atom_embedding_score(atom, &input.query_embedding, &input.embedding_property)
+        };
+        let fitness_boost = fitness_rank_boost(&atom.item);
+        let base = ppr_score + (0.15 * seed.fulltext_score) + (0.15 * seed.vector_score);
+        let mut item = atom.item.clone();
+        item.score = (base * (1.0 + fitness_boost)).max(lexical * 0.01 + vector * 0.01);
+        item.rank_signals
+            .insert("ppr_score".to_string(), json!(ppr_score));
+        item.rank_signals
+            .insert("seed_mass".to_string(), json!(seed.mass));
+        item.rank_signals.insert(
+            "fulltext_seed_score".to_string(),
+            json!(seed.fulltext_score),
+        );
+        item.rank_signals
+            .insert("vector_seed_score".to_string(), json!(seed.vector_score));
+        item.rank_signals
+            .insert("lexical_score".to_string(), json!(lexical));
+        item.rank_signals
+            .insert("vector_score".to_string(), json!(vector));
+        item.rank_signals
+            .insert("fitness_boost".to_string(), json!(fitness_boost));
+        item.rank_signals
+            .insert("pipeline".to_string(), json!("stage0_stage1_stage2"));
+        results.push(item);
+    }
+    Ok(results)
+}
+
+fn memory_recall_adjacency<S: MemoryGraphStore>(
+    store: &S,
+    atoms: &HashMap<String, RecallAtom>,
+    query_time: &str,
+    recency_half_life_seconds: f64,
+) -> MemoryResult<HashMap<String, Vec<(String, f64)>>> {
+    let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    for graph_id in atoms.keys() {
+        adjacency.entry(graph_id.clone()).or_default();
+        for hit in store.memory_neighbors(NeighborQuery::out(graph_id))? {
+            if !atoms.contains_key(&hit.node_id) {
+                continue;
+            }
+            let Some(edge) = store.memory_get_edge(&hit.edge_id)? else {
+                continue;
+            };
+            if !edge_valid_at(&edge, query_time) || !edge_propagates(&edge) {
+                continue;
+            }
+            let weight = edge_propagation_weight(&edge)
+                * edge.effective_confidence()
+                * recency_decay(&edge, query_time, recency_half_life_seconds);
+            if weight > 0.0 {
+                adjacency
+                    .entry(edge.from_id.clone())
+                    .or_default()
+                    .push((edge.to_id.clone(), weight));
+            }
+        }
+    }
+    Ok(adjacency)
+}
+
+fn annotate_recall_results<S: MemoryGraphStore>(
+    store: &S,
+    results: &mut [MemoryRecallItem],
+    tenant_slug: &str,
+    query_time: &str,
+) -> MemoryResult<()> {
+    for item in results {
+        let graph_id = recall_item_graph_id(tenant_slug, item);
+        let mut support_clusters = BTreeSet::new();
+        for direction in [Direction::Out, Direction::In] {
+            for hit in store.memory_neighbors(NeighborQuery {
+                node_id: graph_id.clone(),
+                direction,
+                edge_type: None,
+                include_expired: false,
+            })? {
+                let Some(edge) = store.memory_get_edge(&hit.edge_id)? else {
+                    continue;
+                };
+                if !edge_valid_at(&edge, query_time) {
+                    continue;
+                }
+                if edge_is_contradiction_or_tension(&edge) {
+                    item.flags.push(MemoryRecallFlag {
+                        kind: edge_flag_kind(&edge).to_string(),
+                        edge_id: edge.id.clone(),
+                        edge_type: edge.edge_type.clone(),
+                        related_id: memory_external_id(&hit.node_id),
+                        message: format!(
+                            "{} edge connected to recalled memory",
+                            edge.edge_type.to_lowercase()
+                        ),
+                    });
+                } else if edge_propagates(&edge) {
+                    support_clusters.insert(edge_source_cluster(&edge, &hit.node_id));
+                }
+            }
+        }
+        if support_clusters.len() == 1 {
+            item.flags.push(MemoryRecallFlag {
+                kind: "narrow_source_support".to_string(),
+                edge_id: String::new(),
+                edge_type: String::new(),
+                related_id: support_clusters.into_iter().next().unwrap_or_default(),
+                message: "support derives from one source cluster".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn compare_recall_items(left: &MemoryRecallItem, right: &MemoryRecallItem) -> std::cmp::Ordering {
+    right
+        .score
+        .partial_cmp(&left.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn recall_item_graph_id(tenant_slug: &str, item: &MemoryRecallItem) -> String {
+    if item.item_type == "node" {
+        memory_node_node_id(tenant_slug, &item.id)
+    } else {
+        memory_document_node_id(tenant_slug, &item.id)
+    }
+}
+
+fn memory_external_id(graph_id: &str) -> String {
+    graph_id.rsplit(':').next().unwrap_or(graph_id).to_string()
+}
+
+fn is_broad_recall_query(query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let broad_markers = [
+        "overall",
+        "whole state",
+        "current state",
+        "big picture",
+        "summarize",
+        "summary",
+        "what do we know",
+        "how are things",
+        "what is going on",
+    ];
+    broad_markers.iter().any(|marker| query.contains(marker))
+}
+
+fn query_has_specific_anchor(query: &str) -> bool {
+    let query = query.trim();
+    if query.contains('"') || query.contains(':') || query.contains('-') || query.contains('/') {
+        return true;
+    }
+    let generic = BTreeSet::from([
+        "about", "all", "are", "current", "going", "how", "know", "memory", "overall", "state",
+        "status", "stuff", "summary", "things", "what", "where",
+    ]);
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(str::to_lowercase)
+        .any(|token| token.len() >= 3 && !generic.contains(token.as_str()))
+}
+
+fn token_cosine_score(query: &str, text: &str) -> f64 {
+    let q = token_counts(query);
+    let t = token_counts(text);
+    if q.is_empty() || t.is_empty() {
+        return 0.0;
+    }
+    let dot = q
+        .iter()
+        .filter_map(|(token, left)| t.get(token).map(|right| left * right))
+        .sum::<f64>();
+    let q_norm = q.values().map(|v| v * v).sum::<f64>().sqrt();
+    let t_norm = t.values().map(|v| v * v).sum::<f64>().sqrt();
+    if q_norm <= 0.0 || t_norm <= 0.0 {
+        0.0
+    } else {
+        dot / (q_norm * t_norm)
+    }
+}
+
+fn token_counts(text: &str) -> BTreeMap<String, f64> {
+    let mut counts = BTreeMap::new();
+    for token in text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|token| token.len() > 1)
+    {
+        *counts.entry(token).or_insert(0.0) += 1.0;
+    }
+    counts
+}
+
+fn atom_embedding_score(atom: &RecallAtom, query_embedding: &[f32], property: &str) -> f64 {
+    let property = if property.trim().is_empty() {
+        "embedding"
+    } else {
+        property.trim()
+    };
+    let embedding = atom
+        .item
+        .document
+        .as_ref()
+        .and_then(|document| embedding_from_metadata(&document.metadata, property))
+        .or_else(|| {
+            atom.item
+                .node
+                .as_ref()
+                .and_then(|node| embedding_from_metadata(&node.metadata, property))
+        });
+    let Some(embedding) = embedding else {
+        return 0.0;
+    };
+    cosine_similarity_f32(query_embedding, &embedding).max(0.0)
+}
+
+fn embedding_from_metadata(metadata: &Map<String, Value>, property: &str) -> Option<Vec<f32>> {
+    metadata
+        .get(property)
+        .or_else(|| metadata.get("embedding"))
+        .or_else(|| metadata.get("vector"))
+        .and_then(float_array)
+}
+
+fn float_array(value: &Value) -> Option<Vec<f32>> {
+    let values = value.as_array()?;
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        result.push(value.as_f64()? as f32);
+    }
+    Some(result)
+}
+
+fn cosine_similarity_f32(left: &[f32], right: &[f32]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(l, r)| (*l as f64) * (*r as f64))
+        .sum::<f64>();
+    let left_norm = left
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt();
+    let right_norm = right
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt();
+    if left_norm <= 0.0 || right_norm <= 0.0 {
+        0.0
+    } else {
+        dot / (left_norm * right_norm)
+    }
+}
+
+fn edge_propagates(edge: &EdgeRecord) -> bool {
+    !edge_is_contradiction_or_tension(edge)
+        && matches!(
+            normalized_edge_type(edge).as_str(),
+            "memory_relates"
+                | "memory_supports"
+                | "supports"
+                | "memory_derived_from"
+                | "derives"
+                | "derived_from"
+                | "memory_cites"
+                | "cites"
+                | "memory_supercedes"
+                | "memory_supersedes"
+                | "memory_summarizes"
+        )
+}
+
+fn edge_propagation_weight(edge: &EdgeRecord) -> f64 {
+    match normalized_edge_type(edge).as_str() {
+        "memory_supports" | "supports" => 1.0,
+        "memory_derived_from" | "derives" | "derived_from" => 0.9,
+        "memory_cites" | "cites" => 0.75,
+        "memory_summarizes" => 0.7,
+        "memory_relates" => 0.65,
+        "memory_supercedes" | "memory_supersedes" => 0.4,
+        _ => 0.0,
+    }
+}
+
+fn edge_is_contradiction_or_tension(edge: &EdgeRecord) -> bool {
+    matches!(
+        edge.epistemic_type,
+        Some(EpistemicType::Contradicts) | Some(EpistemicType::Tension)
+    ) || matches!(
+        normalized_edge_type(edge).as_str(),
+        "memory_contradicts" | "contradicts" | "memory_tension" | "tension"
+    )
+}
+
+fn edge_flag_kind(edge: &EdgeRecord) -> &'static str {
+    if matches!(edge.epistemic_type, Some(EpistemicType::Tension))
+        || normalized_edge_type(edge).contains("tension")
+    {
+        "tension"
+    } else {
+        "contradiction"
+    }
+}
+
+fn normalized_edge_type(edge: &EdgeRecord) -> String {
+    edge.edge_type.trim().to_lowercase()
+}
+
+fn edge_valid_at(edge: &EdgeRecord, query_time: &str) -> bool {
+    let valid_at = edge_property_text(edge, &["valid_at", "validAt"]);
+    let invalid_at = edge_property_text(edge, &["invalid_at", "invalidAt"]);
+    if let Some(valid_at) = valid_at.as_deref() {
+        if !valid_at.is_empty() && valid_at > query_time {
+            return false;
+        }
+    }
+    if let Some(invalid_at) = invalid_at.as_deref() {
+        if !invalid_at.is_empty() && invalid_at <= query_time {
+            return false;
+        }
+    }
+    true
+}
+
+fn edge_property_text(edge: &EdgeRecord, names: &[&str]) -> Option<String> {
+    let object = edge.properties.as_object()?;
+    for name in names {
+        if let Some(value) = object.get(*name).and_then(Value::as_str) {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+fn edge_property_f64(edge: &EdgeRecord, name: &str) -> Option<f64> {
+    edge.properties.as_object()?.get(name)?.as_f64()
+}
+
+fn recency_decay(edge: &EdgeRecord, query_time: &str, half_life_seconds: f64) -> f64 {
+    if half_life_seconds <= 0.0 {
+        return 1.0;
+    }
+    let Some(valid_at) = edge_property_text(edge, &["valid_at", "validAt"]) else {
+        return 1.0;
+    };
+    let Some(age_seconds) = iso8601_age_seconds(&valid_at, query_time) else {
+        return 1.0;
+    };
+    0.5_f64.powf((age_seconds.max(0.0)) / half_life_seconds)
+}
+
+fn iso8601_age_seconds(start: &str, end: &str) -> Option<f64> {
+    let start = parse_simple_rfc3339_seconds(start)?;
+    let end = parse_simple_rfc3339_seconds(end)?;
+    Some((end - start) as f64)
+}
+
+fn parse_simple_rfc3339_seconds(value: &str) -> Option<i64> {
+    let value = value.strip_suffix('Z').unwrap_or(value);
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-').map(|part| part.parse::<i64>().ok());
+    let year = date_parts.next()??;
+    let month = date_parts.next()??;
+    let day = date_parts.next()??;
+    let mut time_parts = time.split(':').map(|part| part.parse::<i64>().ok());
+    let hour = time_parts.next()??;
+    let minute = time_parts.next()??;
+    let second = time_parts.next().and_then(|part| part).unwrap_or(0);
+    Some(days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month_adjusted = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_adjusted + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn fitness_rank_boost(item: &MemoryRecallItem) -> f64 {
+    let fitness = item
+        .document
+        .as_ref()
+        .and_then(|document| document.fitness.as_ref())
+        .or_else(|| item.node.as_ref().and_then(|node| node.fitness.as_ref()));
+    let Some(fitness) = fitness else {
+        return 0.0;
+    };
+    let mut boost = 0.0;
+    if fitness
+        .get("outcome")
+        .and_then(Value::as_str)
+        .is_some_and(|outcome| outcome == "positive" || outcome == "accepted")
+    {
+        boost += 0.15;
+    }
+    if let Some(positive_count) = fitness
+        .get("compound")
+        .and_then(|compound| compound.get("positive_count"))
+        .and_then(Value::as_f64)
+    {
+        boost += (positive_count * 0.02).min(0.2);
+    }
+    boost
+}
+
+fn edge_source_cluster(edge: &EdgeRecord, fallback: &str) -> String {
+    edge.provenance
+        .as_ref()
+        .and_then(|provenance| provenance.source_id.clone())
+        .or_else(|| {
+            edge.properties
+                .get("source_cluster")
+                .or_else(|| edge.properties.get("source"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn bounded_seed_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEFAULT_SEED_LIMIT
+    } else {
+        limit.clamp(1, MAX_LIMIT)
+    }
+}
+
+fn effective_ppr_alpha(alpha: f64) -> f64 {
+    if alpha > 0.0 {
+        alpha.clamp(0.01, 0.99)
+    } else {
+        DEFAULT_PPR_ALPHA
+    }
+}
+
+fn effective_ppr_epsilon(epsilon: f64) -> f64 {
+    if epsilon > 0.0 {
+        epsilon
+    } else {
+        DEFAULT_PPR_EPSILON
+    }
+}
+
+fn effective_ppr_max_pushes(max_pushes: usize) -> usize {
+    if max_pushes == 0 {
+        DEFAULT_PPR_MAX_PUSHES
+    } else {
+        max_pushes
+    }
+}
+
+fn effective_recency_half_life(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        DEFAULT_RECENCY_HALF_LIFE_SECONDS
+    }
+}
+
+fn ensure_community_summaries<S: MemoryGraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    query_time: &str,
+) -> MemoryResult<()> {
+    let existing = load_memory_documents(store, tenant_slug, true)?
+        .into_iter()
+        .any(|document| {
+            document.kind == COMMUNITY_SUMMARY_KIND && document.status == DEFAULT_STATUS
+        });
+    if existing {
+        return Ok(());
+    }
+    recompute_memory_community_summaries(store, tenant_slug, query_time).map(|_| ())
+}
+
+pub fn recompute_memory_community_summaries<S: MemoryGraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    query_time: &str,
+) -> MemoryResult<Vec<MemoryDocumentState>> {
+    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let atoms = load_recall_atoms(store, &tenant_slug, "", "", "", "", true)?
+        .into_iter()
+        .filter(|atom| atom.item.kind != COMMUNITY_SUMMARY_KIND)
+        .collect::<Vec<_>>();
+    if atoms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let atom_map = atoms
+        .iter()
+        .map(|atom| (atom.graph_id.clone(), atom.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut edge_map = BTreeMap::new();
+    for graph_id in atom_map.keys() {
+        for hit in store.memory_neighbors(NeighborQuery::out(graph_id))? {
+            if !atom_map.contains_key(&hit.node_id) {
+                continue;
+            }
+            let Some(edge) = store.memory_get_edge(&hit.edge_id)? else {
+                continue;
+            };
+            if edge_valid_at(&edge, query_time) && edge_propagates(&edge) {
+                edge_map.insert(edge.id.clone(), edge);
+            }
+        }
+    }
+    let (labels, _) = if edge_map.is_empty() {
+        (HashMap::new(), 0.0)
+    } else {
+        let edges = edge_map.values().cloned().collect::<Vec<_>>();
+        rustyred_thg_core::label_propagation_communities(&edges)
+    };
+    let mut groups: BTreeMap<u64, Vec<RecallAtom>> = BTreeMap::new();
+    let mut next_group = labels.values().copied().max().unwrap_or(0) + 1;
+    for atom in atoms {
+        let group = labels.get(&atom.graph_id).copied().unwrap_or_else(|| {
+            let group = next_group;
+            next_group += 1;
+            group
+        });
+        groups.entry(group).or_default().push(atom);
+    }
+
+    let mut summaries = Vec::new();
+    for (community_id, members) in &groups {
+        let doc_id = format!("community_l1_{community_id}");
+        let document = community_summary_document(
+            &tenant_slug,
+            &doc_id,
+            1,
+            &format!("Community {community_id}"),
+            members,
+            query_time,
+        );
+        persist_memory_document(store, &document)?;
+        let summary_graph_id = memory_document_node_id(&tenant_slug, &document.doc_id);
+        for member in members {
+            upsert_memory_edge(
+                store,
+                &tenant_slug,
+                COMMUNITY_SUMMARY_EDGE,
+                &summary_graph_id,
+                &member.graph_id,
+                json!({
+                    "source": "community_summary",
+                    "valid_at": query_time,
+                    "community_id": community_id
+                }),
+            )?;
+        }
+        summaries.push(document);
+    }
+
+    let level_one_atoms = summaries
+        .iter()
+        .map(|document| RecallAtom {
+            graph_id: memory_document_node_id(&tenant_slug, &document.doc_id),
+            item: recall_item_for_document(document.clone()),
+            text: memory_document_text(document),
+        })
+        .collect::<Vec<_>>();
+    let top = community_summary_document(
+        &tenant_slug,
+        "community_l2_overall",
+        2,
+        "Overall memory state",
+        &level_one_atoms,
+        query_time,
+    );
+    persist_memory_document(store, &top)?;
+    let top_graph_id = memory_document_node_id(&tenant_slug, &top.doc_id);
+    for summary in &summaries {
+        upsert_memory_edge(
+            store,
+            &tenant_slug,
+            COMMUNITY_SUMMARY_EDGE,
+            &top_graph_id,
+            &memory_document_node_id(&tenant_slug, &summary.doc_id),
+            json!({
+                "source": "community_summary",
+                "valid_at": query_time,
+                "level": 2
+            }),
+        )?;
+    }
+    summaries.push(top);
+    Ok(summaries)
+}
+
+fn community_summary_document(
+    tenant_slug: &str,
+    doc_id: &str,
+    level: u64,
+    title: &str,
+    members: &[RecallAtom],
+    updated_at: &str,
+) -> MemoryDocumentState {
+    let member_titles = members
+        .iter()
+        .take(8)
+        .map(|member| {
+            if member.item.summary.trim().is_empty() {
+                member.item.title.clone()
+            } else {
+                format!("{}: {}", member.item.title, member.item.summary)
+            }
+        })
+        .collect::<Vec<_>>();
+    let content = member_titles.join("\n");
+    let mut metadata = Map::new();
+    metadata.insert("summary_level".to_string(), json!(level));
+    metadata.insert(
+        "member_ids".to_string(),
+        Value::Array(
+            members
+                .iter()
+                .map(|member| Value::String(member.graph_id.clone()))
+                .collect(),
+        ),
+    );
+    MemoryDocumentState {
+        tenant_slug: tenant_slug.to_string(),
+        doc_id: doc_id.to_string(),
+        kind: COMMUNITY_SUMMARY_KIND.to_string(),
+        title: title.to_string(),
+        content,
+        summary: format!("{} memory atoms", members.len()),
+        tags: vec!["community-summary".to_string()],
+        links: Vec::new(),
+        actor_id: "theorem-harness".to_string(),
+        session_id: String::new(),
+        origin_surface: "memory_recall_pipeline".to_string(),
+        project_slug: String::new(),
+        status: DEFAULT_STATUS.to_string(),
+        memory_node_type: "summary".to_string(),
+        target_actor_id: String::new(),
+        expires_at: String::new(),
+        metadata,
+        fitness: None,
+        created_at: updated_at.to_string(),
+        updated_at: updated_at.to_string(),
+        deleted_reason: String::new(),
+        deleted_at: String::new(),
+    }
+}
+
+fn bump_recall_salience<S: MemoryGraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    results: &[MemoryRecallItem],
+    recalled_at: &str,
+) -> MemoryResult<()> {
+    for item in results {
+        if item.item_type == "node" {
+            if let Some(mut node) = load_memory_node(store, tenant_slug, &item.id)? {
+                increment_salience(&mut node.metadata, recalled_at);
+                persist_memory_node(store, &node)?;
+            }
+        } else if let Some(mut document) = load_memory_document(store, tenant_slug, &item.id)? {
+            increment_salience(&mut document.metadata, recalled_at);
+            persist_memory_document(store, &document)?;
+        }
+    }
+    Ok(())
+}
+
+fn increment_salience(metadata: &mut Map<String, Value>, recalled_at: &str) {
+    let count = metadata
+        .get("salience")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + 1;
+    metadata.insert("salience".to_string(), json!(count));
+    metadata.insert("last_recalled_at".to_string(), json!(recalled_at));
+}
+
+fn invalidate_positive_edges_for_targets<S: MemoryGraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    target_doc_ids: &[String],
+    invalid_at: &str,
+) -> MemoryResult<()> {
+    for target_doc_id in normalize_strings(target_doc_ids) {
+        let Some(target_graph_id) = resolve_memory_graph_id(store, tenant_slug, &target_doc_id)?
+        else {
+            continue;
+        };
+        for direction in [Direction::Out, Direction::In] {
+            for hit in store.memory_neighbors(NeighborQuery {
+                node_id: target_graph_id.clone(),
+                direction,
+                edge_type: None,
+                include_expired: false,
+            })? {
+                let Some(mut edge) = store.memory_get_edge(&hit.edge_id)? else {
+                    continue;
+                };
+                if !edge_propagates(&edge) {
+                    continue;
+                }
+                set_edge_invalid_at(&mut edge, invalid_at);
+                store.memory_upsert_edge(edge)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_edge_invalid_at(edge: &mut EdgeRecord, invalid_at: &str) {
+    let mut properties = edge.properties.as_object().cloned().unwrap_or_default();
+    properties
+        .entry("valid_at".to_string())
+        .or_insert_with(|| Value::String(invalid_at.to_string()));
+    properties.insert(
+        "invalid_at".to_string(),
+        Value::String(invalid_at.to_string()),
+    );
+    edge.properties = Value::Object(properties);
 }
 
 fn relation_item_from_graph_node<S: MemoryGraphStore>(
@@ -1784,15 +3074,57 @@ fn upsert_memory_edge<S: MemoryGraphStore>(
     if store.memory_get_node(from_id)?.is_none() || store.memory_get_node(to_id)?.is_none() {
         return Ok(());
     }
-    let edge = EdgeRecord::new(
+    let properties = memory_edge_properties(edge_type, properties);
+    let mut edge = EdgeRecord::new(
         memory_edge_id(tenant_slug, edge_type, from_id, to_id),
         from_id,
         edge_type,
         to_id,
         properties,
     );
+    if let Some(confidence) = edge_property_f64(&edge, "confidence") {
+        edge = edge.with_confidence(confidence);
+    }
+    if let Some(epistemic_type) = epistemic_type_for_edge(edge_type) {
+        edge = edge.with_epistemic_type(epistemic_type);
+    }
     upsert_edge_if_changed(store, edge)?;
     Ok(())
+}
+
+fn memory_edge_properties(edge_type: &str, properties: Value) -> Value {
+    let mut map = properties.as_object().cloned().unwrap_or_default();
+    let valid_at = map
+        .get("valid_at")
+        .or_else(|| map.get("validAt"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            map.get("updated_at")
+                .or_else(|| map.get("updatedAt"))
+                .or_else(|| map.get("created_at"))
+                .or_else(|| map.get("createdAt"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| timestamp_or_now(""));
+    map.insert("valid_at".to_string(), Value::String(valid_at));
+    map.insert(
+        "edge_semantics".to_string(),
+        Value::String(edge_type.to_string()),
+    );
+    Value::Object(map)
+}
+
+fn epistemic_type_for_edge(edge_type: &str) -> Option<EpistemicType> {
+    match edge_type.trim().to_lowercase().as_str() {
+        "memory_supports" | "supports" => Some(EpistemicType::Supports),
+        "memory_contradicts" | "contradicts" => Some(EpistemicType::Contradicts),
+        "memory_tension" | "tension" => Some(EpistemicType::Tension),
+        "memory_derived_from" | "derives" | "derived_from" => Some(EpistemicType::Derives),
+        "memory_cites" | "cites" => Some(EpistemicType::Cites),
+        _ => None,
+    }
 }
 
 fn upsert_node_if_changed<S: MemoryGraphStore>(
@@ -2132,6 +3464,403 @@ mod tests {
     const TENANT: &str = "travis-gilbert";
     const T1: &str = "2026-06-01T00:00:00Z";
     const T2: &str = "2026-06-01T00:01:00Z";
+    const T3: &str = "2026-06-01T00:02:00Z";
+
+    #[test]
+    fn recall_stage0_seeds_named_entities_from_union() {
+        let mut store = InMemoryGraphStore::new();
+        let alpha = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "insight".to_string(),
+                title: "Alpha project".to_string(),
+                content: "First anchor.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let beta = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "insight".to_string(),
+                title: "Beta project".to_string(),
+                content: "Second anchor.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "Alpha Beta".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        let alpha_seed = results.iter().find(|item| item.id == alpha.doc_id).unwrap();
+        let beta_seed = results.iter().find(|item| item.id == beta.doc_id).unwrap();
+        assert!(alpha_seed.rank_signals["seed_mass"].as_f64().unwrap() > 0.0);
+        assert!(beta_seed.rank_signals["seed_mass"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn recall_stage1_masks_edges_by_half_open_valid_time() {
+        let mut store = InMemoryGraphStore::new();
+        let seed = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "insight".to_string(),
+                title: "Alpha seed".to_string(),
+                content: "Anchor only.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let fact = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "insight".to_string(),
+                title: "Temporal fact".to_string(),
+                content: "Only reachable through valid support.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        upsert_memory_edge(
+            &mut store,
+            TENANT,
+            "MEMORY_SUPPORTS",
+            &memory_document_node_id(TENANT, &seed.doc_id),
+            &memory_document_node_id(TENANT, &fact.doc_id),
+            json!({ "valid_at": T1, "invalid_at": T3, "source": "fixture" }),
+        )
+        .unwrap();
+
+        let before = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "Alpha".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        assert!(before.iter().any(|item| item.id == fact.doc_id));
+
+        let after = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "Alpha".to_string(),
+                query_time: T3.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        assert!(!after.iter().any(|item| item.id == fact.doc_id));
+    }
+
+    #[test]
+    fn recall_stage2_flags_contradictions_without_propagating_them() {
+        let mut store = InMemoryGraphStore::new();
+        let seed = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "claim".to_string(),
+                title: "Alpha claim".to_string(),
+                content: "Anchor claim.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let contradicted = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "claim".to_string(),
+                title: "Remote claim".to_string(),
+                content: "This should not receive corroborating mass.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        upsert_memory_edge(
+            &mut store,
+            TENANT,
+            "MEMORY_CONTRADICTS",
+            &memory_document_node_id(TENANT, &seed.doc_id),
+            &memory_document_node_id(TENANT, &contradicted.doc_id),
+            json!({ "valid_at": T1, "source": "fixture" }),
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "Alpha".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        let seed_result = results.iter().find(|item| item.id == seed.doc_id).unwrap();
+        assert!(seed_result
+            .flags
+            .iter()
+            .any(|flag| flag.kind == "contradiction"));
+        assert!(!results.iter().any(|item| item.id == contradicted.doc_id));
+    }
+
+    #[test]
+    fn recall_stage2_adds_trust_flag_for_single_source_cluster_support() {
+        let mut store = InMemoryGraphStore::new();
+        let seed = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "claim".to_string(),
+                title: "Alpha source".to_string(),
+                content: "Anchor source.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let supported = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "claim".to_string(),
+                title: "Supported claim".to_string(),
+                content: "Reached through one source cluster.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        upsert_memory_edge(
+            &mut store,
+            TENANT,
+            "MEMORY_SUPPORTS",
+            &memory_document_node_id(TENANT, &seed.doc_id),
+            &memory_document_node_id(TENANT, &supported.doc_id),
+            json!({ "valid_at": T1, "source_cluster": "cluster-a", "confidence": 0.9 }),
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "Alpha".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        let supported_result = results
+            .iter()
+            .find(|item| item.id == supported.doc_id)
+            .unwrap();
+        assert!(supported_result
+            .flags
+            .iter()
+            .any(|flag| flag.kind == "narrow_source_support"));
+    }
+
+    #[test]
+    fn recall_stage3_routes_broad_queries_to_two_level_summaries() {
+        let mut store = InMemoryGraphStore::new();
+        let first = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "insight".to_string(),
+                title: "Budget thread".to_string(),
+                content: "Finance lane details.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let second = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "insight".to_string(),
+                title: "Deploy thread".to_string(),
+                content: "Infrastructure lane details.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        upsert_memory_edge(
+            &mut store,
+            TENANT,
+            "MEMORY_RELATES",
+            &memory_document_node_id(TENANT, &first.doc_id),
+            &memory_document_node_id(TENANT, &second.doc_id),
+            json!({ "valid_at": T1, "source": "fixture" }),
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "overall state".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|item| item.kind == COMMUNITY_SUMMARY_KIND));
+        let levels = results
+            .iter()
+            .filter_map(|item| {
+                item.document
+                    .as_ref()
+                    .and_then(|document| document.metadata["summary_level"].as_u64())
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(levels.contains(&1));
+        assert!(levels.contains(&2));
+    }
+
+    #[test]
+    fn recall_bumps_salience_as_rehearsal() {
+        let mut store = InMemoryGraphStore::new();
+        let document = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "insight".to_string(),
+                title: "Alpha rehearsal".to_string(),
+                content: "Recall should bump salience.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "Alpha".to_string(),
+                query_time: T2.to_string(),
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        let loaded = load_memory_document(&store, TENANT, &document.doc_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.metadata["salience"], json!(1));
+        assert_eq!(loaded.metadata["last_recalled_at"], json!(T2));
+    }
+
+    #[test]
+    fn contradiction_revision_invalidates_positive_edges_additively() {
+        let mut store = InMemoryGraphStore::new();
+        let original = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "claim".to_string(),
+                title: "Original".to_string(),
+                content: "Old framing.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let target = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "claim".to_string(),
+                title: "Target".to_string(),
+                content: "Superseded target.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let dependent = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "claim".to_string(),
+                title: "Dependent".to_string(),
+                content: "Depends on target.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let target_graph_id = memory_document_node_id(TENANT, &target.doc_id);
+        let dependent_graph_id = memory_document_node_id(TENANT, &dependent.doc_id);
+        upsert_memory_edge(
+            &mut store,
+            TENANT,
+            "MEMORY_SUPPORTS",
+            &target_graph_id,
+            &dependent_graph_id,
+            json!({ "valid_at": T1, "source": "fixture" }),
+        )
+        .unwrap();
+        let support_edge_id = memory_edge_id(
+            TENANT,
+            "MEMORY_SUPPORTS",
+            &target_graph_id,
+            &dependent_graph_id,
+        );
+
+        revise_memory_document(
+            &mut store,
+            ReviseMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                doc_id: original.doc_id,
+                content: "New framing contradicts target.".to_string(),
+                contradicts_doc_ids: vec![target.doc_id],
+                updated_at: T2.to_string(),
+                ..ReviseMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        let edge = store.get_edge(&support_edge_id).unwrap();
+        assert_eq!(edge.properties["valid_at"], json!(T1));
+        assert_eq!(edge.properties["invalid_at"], json!(T2));
+        assert!(!edge.tombstone);
+    }
 
     #[test]
     fn remember_recall_documents_and_nodes_with_provenance() {

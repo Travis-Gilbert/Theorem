@@ -1,58 +1,50 @@
 {
   "schema_version": 1,
-  "source": "SPEC-harness-plugin-restructure.md",
-  "created_at": "2026-06-15T00:00:00Z",
-  "task": "Implement the harness plugin restructure: collapse the plugin MCP layer, move prepare/run/code surfaces to native Theorem MCP, add dark skills, and rewrite coordination around announce-over-room plus semantic overlap.",
-  "source_hash": "local:/Users/travisgilbert/Downloads/SPEC-harness-plugin-restructure.md",
+  "source": "memory-recall-pipeline-spec.md",
+  "created_at": "2026-06-15T20:18:32Z",
+  "task": "Implement the memory recall pipeline: hybrid seeding, bi-temporal masked PPR, epistemic weighting, community-summary fallback, and add-only valid-time invalidation.",
+  "source_hash": "local:/Users/travisgilbert/Downloads/memory-recall-pipeline-spec.md",
   "repo": "Theorem",
   "branch": "feat/crdt-substrate",
   "items": [
     {
-      "id": "HPR-001",
-      "deliverable": "Single remote MCP registration",
-      "acceptance_criterion": "Plugin manifests register one HTTP MCP server named `theorems-harness`; the local Node MCP and RustyRed proxy are gone.",
+      "id": "MRP-001",
+      "deliverable": "Stage 0 hybrid seeding",
+      "acceptance_criterion": "Recall extracts anchors from the query and seeds from a deduplicated union of lexical/fulltext-style and vector-style candidates over memory atoms. Queries naming two entities seed both with nonzero mass; unanchored broad queries route to summaries.",
       "status": "completed",
-      "verification": "`python3 scripts/sync-plugin-manifests.py theorems-harness --check` passed; `.mcp.json`, `.claude-plugin/plugin.json`, and `.codex-plugin/plugin.json` point at the single remote HTTP server; `mcp/` is absent; stale-route grep found no `mcp/server`, `rustyred-theorem-proxy`, or `mcp__rustyred-thg__` references in live plugin docs/scripts/manifests.",
+      "verification": "`cargo test -p theorem-harness-runtime` passed; `recall_stage0_seeds_named_entities_from_union` proves a query naming Alpha and Beta gives both memory atoms nonzero seed mass. MCP adapters now expose native fulltext/vector search hooks, with deterministic runtime fallbacks.",
       "deferral_reason": ""
     },
     {
-      "id": "HPR-002",
-      "deliverable": "Native `harness_prepare`",
-      "acceptance_criterion": "`harness_prepare` composes Ensemble selection plus native memory recall and returns a structured brief with rendered markdown.",
+      "id": "MRP-002",
+      "deliverable": "Stage 1 bi-temporal-masked PPR",
+      "acceptance_criterion": "Recall runs PPR over memory edges filtered by valid_at <= query_time and (invalid_at is absent or invalid_at > query_time), with the interval treated as half-open.",
       "status": "completed",
-      "verification": "`cargo test -p rustyred-thg-mcp native_harness_prepare_composes_ensemble_and_memory_brief` passed; full `cargo test -p rustyred-thg-mcp` passed.",
+      "verification": "`cargo test -p theorem-harness-runtime` passed; `recall_stage1_masks_edges_by_half_open_valid_time` proves a fact is reachable before invalid_at and excluded at invalid_at.",
       "deferral_reason": ""
     },
     {
-      "id": "HPR-003",
-      "deliverable": "Native run lifecycle hooks",
-      "acceptance_criterion": "Hook scripts use `harness_append_transition` / `harness_run` style native calls and no longer define or call Django helpers.",
+      "id": "MRP-003",
+      "deliverable": "Stage 2 epistemic-weighted rank",
+      "acceptance_criterion": "Supports, derives, and cites propagate rank; contradicts and tension are returned as result flags instead of corroborating mass; confidence and positive fitness affect ranking.",
       "status": "completed",
-      "verification": "`bash -n scripts/*.sh` passed; stale-route grep found no `theorem_post`, `theorem_get`, `THEOREM_CONTEXT_BASE_URL`, or `/api/v2/theseus` references in live plugin scripts/docs/manifests; `cargo test -p rustyred-thg-mcp native_harness_run_transitions_round_trip_through_mcp` passed.",
+      "verification": "`cargo test -p theorem-harness-runtime` passed; `recall_stage2_flags_contradictions_without_propagating_them` and `recall_stage2_adds_trust_flag_for_single_source_cluster_support` prove contradiction flagging, non-propagation, confidence-weighted support, and narrow-source trust flags.",
       "deferral_reason": ""
     },
     {
-      "id": "HPR-004",
-      "deliverable": "`compute_code` / `code_ingest` split",
-      "acceptance_criterion": "The native MCP advertises `compute_code` once for reads, advertises `code_ingest` for ingest/reindex/session writes, and keeps old `code_search` dispatch compatibility without advertising it.",
+      "id": "MRP-004",
+      "deliverable": "Stage 3 community-summary fallback",
+      "acceptance_criterion": "Broad or unanchored recall returns community-summary nodes rather than raw atoms, and generated summaries are two-level graph nodes with provenance links to members.",
       "status": "completed",
-      "verification": "`cargo test -p rustyred-thg-mcp tools_list_exposes_read_only_graph_tools`, `chatgpt_flagged_tools_advertise_receipt_output_schemas`, `code_search_routes_named_harness_verb_to_app_affordance`, `compute_code_alias_routes_to_code_search_app_affordance`, `code_search_forwards_confirmation_from_tool_control_shapes`, and `code_search_write_operations_are_read_only_gated` passed; full MCP crate suite passed.",
+      "verification": "`cargo test -p theorem-harness-runtime` passed; `recall_stage3_routes_broad_queries_to_two_level_summaries` proves broad recall returns only `community_summary` documents and includes summary levels 1 and 2.",
       "deferral_reason": ""
     },
     {
-      "id": "HPR-005",
-      "deliverable": "Skills and docs updated",
-      "acceptance_criterion": "The plugin includes the four dark skills and docs teach the native MCP/code split rather than the removed local server.",
+      "id": "MRP-005",
+      "deliverable": "Bi-temporal validity and maintenance hooks",
+      "acceptance_criterion": "Memory edges carry valid_at and invalid_at valid-time fields; invalidation writes invalid_at and retains the edge; retrieval bumps salience; contradiction-based belief revision can invalidate superseded support.",
       "status": "completed",
-      "verification": "`skills/graph-version/`, `skills/symbolic/`, `skills/dispatch/`, and `skills/browser-web/` are present; README, command docs, graph/code/research skills, and manifests were updated; stale-route grep passed.",
-      "deferral_reason": ""
-    },
-    {
-      "id": "HPR-006",
-      "deliverable": "Coordination rewrite",
-      "acceptance_criterion": "Coordination prompts and skills lead with announce-over-room and semantic overlap; patch/lease mechanics are documented as reconciliation, not ownership.",
-      "status": "completed",
-      "verification": "`AGENTS.md`, `skills/harness-coordinate/SKILL.md`, `skills/theorems-harness/SKILL.md`, `commands/coordinate.md`, `commands/harness.md`, and `scripts/inject-harness-directives.sh` were updated; `bash -n scripts/*.sh` passed; `references/SHARED_CODE_CRDT_DECISION.md` documents the no-shared-code-CRDT boundary.",
+      "verification": "`cargo test -p theorem-harness-runtime` passed; `recall_bumps_salience_as_rehearsal` proves retrieval salience writes, and `contradiction_revision_invalidates_positive_edges_additively` proves invalid_at is written while the support edge remains live. `cargo test -p rustyred-thg-mcp` passed for the transport surface.",
       "deferral_reason": ""
     }
   ]

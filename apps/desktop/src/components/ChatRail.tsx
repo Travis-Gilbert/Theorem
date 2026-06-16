@@ -4,6 +4,7 @@ import { domainOf } from "../lib/routing";
 import type { MentionRef, Tab } from "../state/types";
 import { KnownContextStrip } from "./KnownContextStrip";
 import { MentionPopover } from "./MentionPopover";
+import { AgentSpaceViewport } from "./AgentSpaceViewport";
 import { ChatIcon, CloseIcon } from "./icons";
 
 export function ChatRail() {
@@ -14,6 +15,16 @@ export function ChatRail() {
     : undefined;
   const boundRoom = activeSpace?.roomId;
   const turns = active ? state.conversations[active.id]?.turns ?? [] : [];
+  const roomParticipants = activeSpace?.id
+    ? state.participantsBySpace[activeSpace.id] ?? []
+    : [];
+  const roomFeed = activeSpace?.id ? state.roomFeedBySpace[activeSpace.id] ?? [] : [];
+  const roomIntents = activeSpace?.id
+    ? state.roomIntentsBySpace[activeSpace.id] ?? []
+    : [];
+  const roomRecords = activeSpace?.id
+    ? state.roomRecordsBySpace[activeSpace.id] ?? []
+    : [];
 
   const domain =
     active?.kind === "web" && active.url ? domainOf(active.url) : null;
@@ -170,56 +181,63 @@ export function ChatRail() {
       <div className="rail__turns" ref={turnsRef}>
         {state.railView === "room" && activeSpace?.id && boundRoom ? (
           <>
-            <div className="participants">
-              {(state.participantsBySpace[activeSpace.id] ?? []).map((participant) => (
-                <span className="chip" key={participant.actor}>
-                  {participant.actor}: {participant.status}
-                </span>
-              ))}
+            <AgentSpaceViewport
+              roomId={boundRoom}
+              participants={roomParticipants}
+              feed={roomFeed}
+              intents={roomIntents}
+              records={roomRecords}
+            />
+            <div className="room-feed">
+              <div className="room-feed__title">Room feed</div>
+              {roomFeed.length > 0 ? (
+                roomFeed.map((item) => (
+                  <div key={item.id} className="turn turn--system">
+                    <div className="turn__role">{item.actor}</div>
+                    <div className="turn__body">{item.text}</div>
+                  </div>
+                ))
+              ) : (
+                <div className="rail__empty rail__empty--compact">No room messages.</div>
+              )}
             </div>
-            {(state.roomFeedBySpace[activeSpace.id] ?? []).map((item) => (
-              <div key={item.id} className="turn turn--system">
-                <div className="turn__role">{item.actor}</div>
-                <div className="turn__body">{item.text}</div>
-              </div>
-            ))}
           </>
         ) : (
-        <>
-        {turns.length === 0 ? (
-          <div className="rail__empty">
-            Ask about this page, or @mention another tab to bring it in.
-          </div>
-        ) : (
-          turns.map((turn) => (
-            <div key={turn.id} className={"turn turn--" + turn.role}>
-              <div className="turn__role">{turn.role}</div>
-              {turn.mentions && turn.mentions.length > 0 && (
-                <div className="turn__mentions">
-                  {turn.mentions.map((m) => (
-                    <span className="chip" key={m.tabId}>
-                      @{m.title}
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="turn__body">
-                {turn.pending ? (
-                  <span className="shimmer">thinking...</span>
-                ) : (
-                  turn.text
-                )}
+          <>
+            {turns.length === 0 ? (
+              <div className="rail__empty">
+                Ask about this page, or @mention another tab to bring it in.
               </div>
-              {turn.usage && (
-                <div className="turn__cost">
-                  {turn.usage.model} · {turn.usage.tokensIn}/{turn.usage.tokensOut} tokens · $
-                  {turn.usage.estimatedUsd.toFixed(4)}
+            ) : (
+              turns.map((turn) => (
+                <div key={turn.id} className={"turn turn--" + turn.role}>
+                  <div className="turn__role">{turn.role}</div>
+                  {turn.mentions && turn.mentions.length > 0 && (
+                    <div className="turn__mentions">
+                      {turn.mentions.map((m) => (
+                        <span className="chip" key={m.tabId}>
+                          @{m.title}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="turn__body">
+                    {turn.pending ? (
+                      <span className="shimmer">thinking...</span>
+                    ) : (
+                      turn.text
+                    )}
+                  </div>
+                  {turn.usage && (
+                    <div className="turn__cost">
+                      {turn.usage.model} · {turn.usage.tokensIn}/{turn.usage.tokensOut} tokens · $
+                      {turn.usage.estimatedUsd.toFixed(4)}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-          ))
-        )}
-        </>
+              ))
+            )}
+          </>
         )}
       </div>
 
