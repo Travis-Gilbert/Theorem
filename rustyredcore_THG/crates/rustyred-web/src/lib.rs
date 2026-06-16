@@ -97,7 +97,7 @@ pub use browser_run::{BrowsingRunRecord, BrowsingRunRecorder, BrowsingRunReplay,
 pub mod providers;
 pub use providers::{
     configured_search_providers_from_env, BraveSearchProvider, ExaSearchProvider,
-    MojeekSearchProvider, OfflineSearchProvider, SerpApiSearchProvider,
+    MojeekSearchProvider, OfflineSearchProvider, SearXngSearchProvider, SerpApiSearchProvider,
 };
 
 pub mod robots;
@@ -130,6 +130,12 @@ pub use search::{
     RankedSearchCandidate, SearchAcquisition, SearchCandidate, SearchHit, SearchLink,
     SearchOptions, SearchOpts, SearchProvider, SearchProviderError, SearchProviderReceipt,
     StaticSearchProvider, SubstrateSearch,
+};
+
+pub mod search_graph;
+pub use search_graph::{
+    gate_search_graph, warm_pages_task, web_search_graph, write_fetched_pages, WebSearchGraph,
+    WebSearchGraphOptions,
 };
 
 // The browser's SERP: render a search as a node-and-edge graph page. See serp.rs.

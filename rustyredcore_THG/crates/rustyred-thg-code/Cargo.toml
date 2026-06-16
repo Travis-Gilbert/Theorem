@@ -9,6 +9,8 @@ rust-version = "1.85"
 [dependencies]
 ignore = "0.4"
 rayon = "1.10"
+rustyred-membrane = { path = "../rustyred-membrane", features = ["graph-store"] }
+rustyred-rerank = { path = "../rustyred-rerank" }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 serde_json = "1.0"
 syn = { version = "2", features = ["full", "visit"] }

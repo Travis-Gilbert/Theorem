@@ -24,11 +24,22 @@ use syn::visit::Visit;
 
 mod code_embed_hook;
 mod code_hooks;
+mod context_pack;
+mod ensure;
 mod ingest_jobs;
 mod repo_fetch;
 
 pub use code_embed_hook::{incremental_embed_hook, EMBEDDING_DIM, EMBEDDING_PROPERTY};
 pub use code_hooks::{code_kg_hooks, incremental_centrality_hook, CENTRALITY_PROPERTY};
+pub use context_pack::{
+    code_context_pack_in_store, context_pack, context_pack_fetch, AdmittedSymbol,
+    CodeContextPackInput, CodeContextPackOutput, ContextPackOutput,
+    DEFAULT_CONTEXT_PACK_BUDGET_TOKENS,
+};
+pub use ensure::{
+    code_ingest_ensure, ensure_repo_kg, ensure_repo_kg_in_store, RepoKgStatus, HEAD_SHA_PROPERTY,
+    REPO_URL_PROPERTY,
+};
 pub use ingest_jobs::{
     IngestJobEvent, IngestJobEventKind, IngestJobRegistry, IngestJobRequest, IngestJobState,
     IngestJobStatus, CODE_INGEST_JOB_LABEL,
@@ -267,6 +278,32 @@ impl RustyRedPlugin for CodeParsingPlugin {
                 summary: "Search latest-generation CodeSymbol records in the tenant graph.",
                 writes_graph: false,
                 handler: handle_search_code_operation,
+            },
+            PluginOperationRegistration {
+                operation: "context_pack",
+                command: "RUSTYRED_THG.CODE.CONTEXT_PACK",
+                aliases: &[
+                    "code.context_pack",
+                    "rustyred.thg.code.context_pack",
+                    "RUSTYRED.CODE.CONTEXT_PACK",
+                ],
+                summary: "Generate CodeSymbol candidates, rerank them with the membrane scorer, and return a budgeted Admission.",
+                writes_graph: true,
+                handler: handle_context_pack_code_operation,
+            },
+            PluginOperationRegistration {
+                operation: "code_ingest_ensure",
+                command: "RUSTYRED_THG.CODE.ENSURE",
+                aliases: &[
+                    "code.ensure",
+                    "code_ingest_ensure",
+                    "ensure_repo_kg",
+                    "rustyred.thg.code.ensure",
+                    "RUSTYRED.CODE.ENSURE",
+                ],
+                summary: "SHA-keyed idempotent entry into a repo code graph: load the snapshot at the current sha, incrementally reindex a changed sha, or full-ingest an unknown repo.",
+                writes_graph: true,
+                handler: handle_ensure_code_operation,
             },
             PluginOperationRegistration {
                 operation: "context",
@@ -529,6 +566,14 @@ impl CodeIndexRuntime {
     pub fn search_code(&self, input: SearchCodeInput) -> Result<SearchCodeOutput, CodeIndexError> {
         let mut store = self.lock_store()?;
         search_code_with_store(&mut store, input)
+    }
+
+    pub fn context_pack(
+        &self,
+        input: CodeContextPackInput,
+    ) -> Result<CodeContextPackOutput, CodeIndexError> {
+        let mut store = self.lock_store()?;
+        code_context_pack_in_store(&mut store, input)
     }
 
     pub fn list_repos(&self, input: ListReposInput) -> Result<ListReposOutput, CodeIndexError> {
@@ -1064,6 +1109,90 @@ fn handle_search_code_operation(
         },
     )?;
     Ok(output.to_json())
+}
+
+fn handle_context_pack_code_operation(
+    context: PluginOperationContext<'_>,
+    arguments: Value,
+) -> GraphStoreResult<Value> {
+    // Spec composition (Code arm + the /compute_code reflex): a context_pack that
+    // carries a fetchable repo_url ensures the code graph is resident at `sha`
+    // FIRST (SHA-keyed: snapshot load / incremental reindex / full ingest), then
+    // gates. Without this, a one-call pack on a not-yet-ingested repo would
+    // return an empty pack instead of ingesting it.
+    let repo_url = code_plugin_arg_string(&arguments, &["repo_url", "repoUrl", "url"]);
+    let mut repo_id = code_plugin_arg_string(&arguments, &["repo_id", "repoId"]);
+    let mut ingest_status: Option<Value> = None;
+    if is_fetchable_repo_url(repo_url.trim()) {
+        let sha = code_plugin_arg_string(&arguments, &["sha", "head_sha", "headSha", "ref"]);
+        let sha = if sha.trim().is_empty() {
+            None
+        } else {
+            Some(sha.trim())
+        };
+        let supplied_repo_id = if repo_id.trim().is_empty() {
+            None
+        } else {
+            Some(repo_id.trim())
+        };
+        let status = ensure_repo_kg_in_store(
+            context.store,
+            context.tenant_id,
+            repo_url.trim(),
+            sha,
+            supplied_repo_id,
+            &RepoFetchCaps::default(),
+        )?;
+        if repo_id.trim().is_empty() {
+            repo_id = crate::ensure::repo_id_from_url(repo_url.trim());
+        }
+        ingest_status = Some(status.to_json());
+    }
+    let output = code_context_pack_in_store(
+        context.store,
+        CodeContextPackInput {
+            tenant_id: context.tenant_id.to_string(),
+            query: code_plugin_arg_string(&arguments, &["query", "task"]),
+            repo_id,
+            path_prefix: code_plugin_arg_string(&arguments, &["path_prefix", "pathPrefix"]),
+            kinds: code_plugin_arg_string_vec(&arguments, &["kinds"]),
+            limit: code_plugin_arg_u64(&arguments, &["limit"]),
+            budget_tokens: code_plugin_arg_u64(&arguments, &["budget_tokens", "budgetTokens"]),
+        },
+    )?;
+    let mut json = output.to_json();
+    if let (Some(status), Some(object)) = (ingest_status, json.as_object_mut()) {
+        object.insert("ingest_status".to_string(), status);
+    }
+    Ok(json)
+}
+
+fn handle_ensure_code_operation(
+    context: PluginOperationContext<'_>,
+    arguments: Value,
+) -> GraphStoreResult<Value> {
+    let repo_url = code_plugin_arg_string(&arguments, &["repo_url", "repoUrl", "url"]);
+    let sha = code_plugin_arg_string(&arguments, &["sha", "head_sha", "headSha", "ref"]);
+    let sha = if sha.trim().is_empty() {
+        None
+    } else {
+        Some(sha.trim())
+    };
+    let repo_id = code_plugin_arg_string(&arguments, &["repo_id", "repoId"]);
+    let repo_id = if repo_id.trim().is_empty() {
+        None
+    } else {
+        Some(repo_id.trim())
+    };
+    let status = ensure_repo_kg_in_store(
+        context.store,
+        context.tenant_id,
+        &repo_url,
+        sha,
+        repo_id,
+        &RepoFetchCaps::default(),
+    )?;
+    Ok(status.to_json())
 }
 
 fn handle_context_code_operation(
@@ -3392,20 +3521,6 @@ pub fn resolve_ingest_config(input: IngestCodebaseInput) -> Result<IngestConfig,
         repo_url: String::new(),
         head_sha: String::new(),
     })
-}
-
-/// Best-effort `git rev-parse HEAD` in `path`. Empty string when the directory
-/// is not a git checkout or git is unavailable. Used to stamp AM6 provenance.
-fn git_head_sha(path: &Path) -> String {
-    std::process::Command::new("git")
-        .args(["-C"])
-        .arg(path)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_default()
 }
 
 fn extract_symbols(
@@ -5916,6 +6031,10 @@ mod tests {
             .operations
             .iter()
             .any(|operation| operation.operation == "search" && !operation.writes_graph));
+        assert!(manifest
+            .operations
+            .iter()
+            .any(|operation| operation.operation == "context_pack" && operation.writes_graph));
         assert!(CodeParsingPlugin.manifest_json()["operations"]
             .as_array()
             .unwrap()

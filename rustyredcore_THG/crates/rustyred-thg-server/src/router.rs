@@ -39,12 +39,17 @@ use rustyred_thg_mcp::{
 };
 use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
-    fanout_search_providers, render_serp_html, run_live_crawl, search_substrate,
-    web_consume_to_graph, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope, PageRecord,
-    PageState, RustyWebError, SearchOptions, SearchOpts, WebCommonsFragment,
+    fanout_search_providers, gate_search_graph, render_serp_html, run_live_crawl, search_substrate,
+    warm_pages_task, web_consume_to_graph, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope,
+    PageRecord, PageState, RustyWebError, SearchOptions, SearchOpts, WebCommonsFragment,
     WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt, WebConsumeReceipt,
-    WebConsumeRequest, EDGE_LINKS_TO, LABEL_PAGE, LABEL_WEB_COMMONS_ATTESTATION,
-    LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION, SEMANTIC_VECTOR_PROPERTY,
+    WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
+    LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION,
+    SEMANTIC_VECTOR_PROPERTY,
+};
+use rustyred_rerank::{
+    CrossEncoder, GTE_RERANKER_MODERNBERT_BASE, HttpCrossEncoder, HttpListwiseReranker,
+    JINA_RERANKER_V3, LexicalCrossEncoder, ListwiseReranker, RerankScorer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -176,6 +181,18 @@ struct LiveSearchAcquisitionJob {
     seed_limit: usize,
     actor_id: String,
     wait: bool,
+}
+
+/// The WEB arm of SPEC-CONTEXT-MEMBRANE-1.0: one `web_search_graph` invocation.
+/// Carries everything the synchronous gate needs plus the fire-and-forget
+/// warming knobs.
+#[derive(Clone, Debug)]
+struct WebSearchGraphJob {
+    run_id: String,
+    tenant: String,
+    query: String,
+    provider_allowlist: Vec<String>,
+    options: WebSearchGraphOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -719,19 +736,22 @@ async fn mcp_post(
     {
         return Json(response).into_response();
     }
+    if let Some(response) = maybe_handle_web_search_graph_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
     if let Some(response) = maybe_handle_live_fractal_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
     }
     if let Some(response) = maybe_handle_composed_agent_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
     }
-    Json(handle_mcp_request_with_context(
-        &state,
-        &config,
-        &mcp_context,
-        payload,
-    ))
-    .into_response()
+    let inject_web_search_graph_tool =
+        payload.get("method").and_then(Value::as_str) == Some("tools/list");
+    let mut response = handle_mcp_request_with_context(&state, &config, &mcp_context, payload);
+    if inject_web_search_graph_tool {
+        inject_web_search_graph_tool_definition(&mut response);
+    }
+    Json(response).into_response()
 }
 
 fn mcp_payload_tenant(
@@ -1624,6 +1644,377 @@ async fn enqueue_live_search_acquisition(
     Ok(handoff)
 }
 
+/// The WEB arm of SPEC-CONTEXT-MEMBRANE-1.0. Intercepts the MCP `web_search_graph`
+/// tool call before it reaches the synchronous MCP backend, runs the membrane gate
+/// over the tenant graph store, and returns the spec's
+/// `{ admitted_context, deferred_handles, subgraph_ref }` shape. Page extraction is
+/// warmed fire-and-forget (acceptance #4): the response never blocks on a fetch.
+async fn maybe_handle_web_search_graph_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "web_search_graph" | "theorem_web_search_graph") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match web_search_graph_payload(state, config, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn web_search_graph_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    if config.read_only {
+        return Err(json!({
+            "error": "mcp_read_only",
+            "message": "web_search_graph persists membrane receipts and warm pages; it is unavailable while read-only mode is active."
+        }));
+    }
+    let job = web_search_graph_job(config, arguments)?;
+    execute_web_search_graph(state, job).await
+}
+
+fn web_search_graph_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<WebSearchGraphJob, Value> {
+    let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_web_search_graph",
+            "message": "web_search_graph requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let provider_allowlist = string_array_argument(arguments, "providers");
+
+    let mut options = WebSearchGraphOptions::default();
+    options.acquisition = SearchOpts {
+        provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
+            .map(|value| value.clamp(1, 50) as usize)
+            .unwrap_or(options.acquisition.provider_limit),
+        limit: argument_u64_any(arguments, &["limit", "top_k", "topK"])
+            .map(|value| value.clamp(1, 100) as usize)
+            .unwrap_or(options.acquisition.limit),
+        rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
+            .map(|value| value.clamp(1, 1_000) as usize)
+            .unwrap_or(options.acquisition.rrf_k),
+    };
+    if let Some(budget_tokens) = argument_u64_any(arguments, &["budget_tokens", "budgetTokens"]) {
+        options.budget_tokens = budget_tokens.clamp(1, 1_000_000) as usize;
+    }
+    if let Some(redundancy_penalty) =
+        argument_f64_any(arguments, &["redundancy_penalty", "redundancyPenalty"])
+    {
+        options.redundancy_penalty = redundancy_penalty.clamp(0.0, 1.0) as f32;
+    }
+    if let Some(fetch_top_k) = argument_u64_any(arguments, &["fetch_top_k", "fetchTopK"]) {
+        options.fetch_top_k = fetch_top_k.clamp(0, 100) as usize;
+    }
+
+    Ok(WebSearchGraphJob {
+        run_id: argument_text_any(arguments, &["run_id", "runId"])
+            .unwrap_or_else(|| default_live_web_run_id("web-search-graph")),
+        tenant,
+        query,
+        provider_allowlist,
+        options,
+    })
+}
+
+fn web_cross_encoder_from_env() -> Box<dyn CrossEncoder> {
+    let model_id = env_nonempty(&["THEOREM_RERANKER_MODEL", "RUSTYRED_RERANKER_MODEL"])
+        .unwrap_or_else(|| GTE_RERANKER_MODERNBERT_BASE.to_string());
+    match env_nonempty(&[
+        "THEOREM_RERANKER_URL",
+        "RUSTYRED_RERANKER_URL",
+        "RUSTYWEB_RERANKER_URL",
+    ]) {
+        Some(url) => Box::new(HttpCrossEncoder::new(reranker_endpoint(&url, "score"), model_id)),
+        None => Box::new(LexicalCrossEncoder::new("lexical-cross-encoder")),
+    }
+}
+
+fn web_listwise_reranker_from_env() -> Option<Box<dyn ListwiseReranker>> {
+    let url = env_nonempty(&[
+        "THEOREM_LISTWISE_RERANKER_URL",
+        "THEOREM_WEB_LISTWISE_URL",
+        "RUSTYWEB_LISTWISE_RERANKER_URL",
+    ])?;
+    let model_id = env_nonempty(&[
+        "THEOREM_LISTWISE_RERANKER_MODEL",
+        "THEOREM_WEB_LISTWISE_MODEL",
+        "RUSTYWEB_LISTWISE_RERANKER_MODEL",
+    ])
+    .unwrap_or_else(|| JINA_RERANKER_V3.to_string());
+    Some(Box::new(HttpListwiseReranker::new(
+        reranker_endpoint(&url, "rerank"),
+        model_id,
+    )))
+}
+
+fn reranker_endpoint(base_or_endpoint: &str, path: &str) -> String {
+    let trimmed = base_or_endpoint.trim().trim_end_matches('/');
+    if trimmed.ends_with("/score") || trimmed.ends_with("/rerank") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/{path}")
+    }
+}
+
+fn env_nonempty(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn execute_web_search_graph(state: &AppState, job: WebSearchGraphJob) -> Result<Value, Value> {
+    let WebSearchGraphJob {
+        run_id,
+        tenant,
+        query,
+        provider_allowlist,
+        options,
+    } = job;
+
+    // (1) FRESH pool fan-out: async, NO tenant store lock held. The store guard is
+    // a non-Send std::sync::Mutex guard, so the fan-out await must complete before
+    // any guard is acquired (otherwise this future stops being Send).
+    let providers = state.search_providers(&provider_allowlist);
+    let acquisition = fanout_search_providers(&providers, &query, options.acquisition.clone()).await;
+
+    // (2) Synchronous gate: acquire the tenant store, run the membrane gate, drop
+    // the guard. No `.await` lives inside this scope, so the guard never crosses an
+    // await boundary. gate_search_graph reads the warm substrate, unifies the fresh
+    // + warm pools, admits to the token budget (persisting deferred handles byte-
+    // exact), and emits the membrane receipt.
+    let scorer = RerankScorer::web(web_cross_encoder_from_env());
+    let reranker_version = scorer.version();
+    let listwise = web_listwise_reranker_from_env();
+    let result = {
+        let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
+            json!({
+                "error": "store_unavailable",
+                "code": error.code,
+                "message": error.message
+            })
+        })?;
+        let mut gate_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+            json!({
+                "error": "web_search_graph_store_unavailable",
+                "code": error.code,
+                "message": error.message
+            })
+        })?;
+        gate_search_graph(
+            &mut gate_store,
+            acquisition,
+            &options,
+            &scorer,
+            listwise.as_deref(),
+            reranker_version,
+        )
+        .map_err(|error| {
+            json!({
+                "error": "web_search_graph_failed",
+                "message": format!("{error:?}")
+            })
+        })?
+    };
+
+    // (3) Fire-and-forget warming (acceptance #4): fetch the top result urls and
+    // write them back as `state="fetched"` Page nodes so the FetchCompletionHook
+    // extraction runs reactively. The response below is assembled and returned
+    // WITHOUT awaiting this. The TenantMirrorGraphStore guard borrows the store, so
+    // it is not 'static; the spawned task therefore fetches first (store-free), then
+    // re-acquires its own tenant store synchronously to write the fetched pages.
+    let seed_urls = result.fetch_seed_urls.clone();
+    if !seed_urls.is_empty() {
+        spawn_web_search_graph_warming(state.clone(), tenant.clone(), run_id.clone(), seed_urls);
+    }
+
+    Ok(json!({
+        "tenant": tenant,
+        "run_id": run_id,
+        "query": result.query,
+        "admitted_context": result.admitted_context,
+        "deferred_handles": result.deferred_handles,
+        "subgraph_ref": result.subgraph_ref,
+        "providers": result.providers,
+        "tokens_admitted": result.tokens_admitted,
+        "tokens_deferred": result.tokens_deferred,
+        "reranker_version": result.reranker_version,
+        "receipt": result.receipt,
+        "fetch_seed_urls": result.fetch_seed_urls,
+        "stats": {
+            "admitted_context": result.admitted_context.len(),
+            "deferred_handles": result.deferred_handles.len(),
+            "providers": providers.len(),
+            "provider_receipts": result.providers.len(),
+            "fetch_seed_urls": result.fetch_seed_urls.len(),
+        },
+        "mode": "sync"
+    }))
+}
+
+/// Fire-and-forget warming spawn for [`execute_web_search_graph`]. Fetches the seed
+/// urls through the membrane warming pass and writes them back as `state="fetched"`
+/// Page nodes. Owns its own tenant store handle (re-acquired inside the task) so the
+/// response's store guard is never held across the spawn. Per-url fetch failures are
+/// swallowed inside `warm_pages_task`; a missing store is logged and dropped.
+fn spawn_web_search_graph_warming(
+    state: AppState,
+    tenant: String,
+    run_id: String,
+    seed_urls: Vec<String>,
+) {
+    tokio::spawn(async move {
+        let mut store = match state.tenant_graph_store(&tenant) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    target: "web_search_graph",
+                    tenant = %tenant,
+                    run_id = %run_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "web_search_graph warming skipped: tenant store unavailable"
+                );
+                return;
+            }
+        };
+        let mut warm_store = match TenantMirrorGraphStore::new(&mut store) {
+            Ok(warm_store) => warm_store,
+            Err(error) => {
+                tracing::warn!(
+                    target: "web_search_graph",
+                    tenant = %tenant,
+                    run_id = %run_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "web_search_graph warming skipped: mirror store unavailable"
+                );
+                return;
+            }
+        };
+        let written = warm_pages_task(&mut warm_store, &seed_urls, run_id.clone()).await;
+        tracing::debug!(
+            target: "web_search_graph",
+            tenant = %tenant,
+            run_id = %run_id,
+            written,
+            requested = seed_urls.len(),
+            "web_search_graph warming pass complete"
+        );
+    });
+}
+
+/// Append the `web_search_graph` tool definition to a `tools/list` response. The
+/// tool's call execution is intercepted in the async router (it persists membrane
+/// receipts + warm pages), so the synchronous MCP backend does not own its
+/// definition; the router injects it so the tool is discoverable in `tools/list`.
+fn inject_web_search_graph_tool_definition(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if tools.iter().any(|tool| {
+        tool.get("name").and_then(Value::as_str) == Some("web_search_graph")
+    }) {
+        return;
+    }
+    tools.push(web_search_graph_tool_definition());
+}
+
+fn web_search_graph_tool_definition() -> Value {
+    json!({
+        "name": "web_search_graph",
+        "description": "WEB arm of the context membrane (SPEC-CONTEXT-MEMBRANE-1.0): fan a query across search providers, gate the fresh + warm-substrate pools through the token budget, persist deferred handles byte-exact (recoverable), emit a membrane receipt, and warm the top result pages fire-and-forget. Returns the admitted context, deferred handles, and a stable subgraph reference.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to gate into graph context."
+                },
+                "tenant": {
+                    "type": "string",
+                    "description": "Tenant slug whose graph store the gate reads and writes. Defaults to the server's default tenant."
+                },
+                "budget_tokens": {
+                    "type": "integer",
+                    "description": "Token budget the membrane gate fills; overflow defers (recoverable). Default 2000.",
+                    "minimum": 1
+                },
+                "providers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional provider allowlist for the fresh-pool fan-out. Empty uses all configured providers."
+                },
+                "provider_limit": {
+                    "type": "integer",
+                    "description": "Max results requested per provider during fan-out. Default 10.",
+                    "minimum": 1,
+                    "maximum": 50
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max RRF-merged candidates carried into the gate. Default 16.",
+                    "minimum": 1,
+                    "maximum": 100
+                },
+                "rrf_k": {
+                    "type": "integer",
+                    "description": "Reciprocal-rank-fusion k constant for cross-provider merge. Default 60.",
+                    "minimum": 1,
+                    "maximum": 1000
+                },
+                "redundancy_penalty": {
+                    "type": "number",
+                    "description": "Cross-pool redundancy penalty handed to the scorer. Default 0.15.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "fetch_top_k": {
+                    "type": "integer",
+                    "description": "How many top result urls the fire-and-forget warming pass fetches + writes back as fetched Page nodes. Default 5.",
+                    "minimum": 0,
+                    "maximum": 100
+                }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
 async fn live_fractal_expansion_payload(
     state: &AppState,
     config: &rustyred_thg_mcp::McpServerConfig,
@@ -2185,6 +2576,11 @@ fn argument_text_any(arguments: &Value, keys: &[&str]) -> Option<String> {
 fn argument_u64_any(arguments: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| arguments.get(*key).and_then(Value::as_u64))
+}
+
+fn argument_f64_any(arguments: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_f64))
 }
 
 fn argument_bool_any(arguments: &Value, keys: &[&str]) -> Option<bool> {
@@ -6888,7 +7284,8 @@ mod tests {
         instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr, instant_kg_search,
         is_adapter_command, is_cache_command, is_graph_command, live_search_budget,
         live_search_is_sparse, maybe_handle_browser_use_mcp, maybe_handle_composed_agent_mcp,
-        maybe_handle_live_search_acquisition_mcp, mcp_origin_allowed, memory_docs_list,
+        maybe_handle_live_search_acquisition_mcp, maybe_handle_web_search_graph_mcp,
+        mcp_origin_allowed, memory_docs_list,
         public_cypher, required_scope_for_command, search_live, transaction_begin,
         transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
         FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
@@ -7442,6 +7839,128 @@ mod tests {
             run_payload["detail"]["run"]["outcome"]["receipt"]["stats"]["candidates"],
             1
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_web_search_graph_intercept_returns_membrane_shape() {
+        let state =
+            memory_product_write_state_with_search_providers(vec![Arc::new(
+                StaticSearchProvider::new(
+                    "static",
+                    vec![
+                        SearchCandidate {
+                            url: "https://example.com/membrane-candidate".to_string(),
+                            title: Some("Membrane candidate".to_string()),
+                            snippet: Some(
+                                "candidate carried into the membrane gate".to_string(),
+                            ),
+                            source: "static".to_string(),
+                            rank: 1,
+                        },
+                        SearchCandidate {
+                            url: "https://example.com/membrane-other".to_string(),
+                            title: Some("Other".to_string()),
+                            snippet: Some("a second candidate for the gate".to_string()),
+                            source: "static".to_string(),
+                            rank: 2,
+                        },
+                    ],
+                ),
+            )]);
+        let config = state.mcp_config();
+        let response = maybe_handle_web_search_graph_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "web-search-graph",
+                "method": "tools/call",
+                "params": {
+                    "name": "web_search_graph",
+                    "arguments": {
+                        "query": "membrane candidate",
+                        "providers": ["static"],
+                        "budget_tokens": 2000,
+                        "fetch_top_k": 0,
+                        "run_id": "web-search-graph-test"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("web_search_graph MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["mode"], "sync");
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["run_id"], "web-search-graph-test");
+        assert_eq!(payload["query"], "membrane candidate");
+        // The spec's { admitted_context, deferred_handles, subgraph_ref } triple.
+        assert!(payload["admitted_context"].is_array());
+        assert!(payload["deferred_handles"].is_array());
+        assert!(payload["subgraph_ref"].as_str().is_some_and(|r| !r.is_empty()));
+        assert_eq!(payload["stats"]["providers"], 1);
+        assert_eq!(payload["providers"][0]["provider"], "static");
+        assert_eq!(payload["providers"][0]["status"], "ok");
+        assert!(payload["reranker_version"]
+            .as_str()
+            .is_some_and(|version| version.contains("lexical-cross-encoder")));
+    }
+
+    #[tokio::test]
+    async fn mcp_web_search_graph_intercept_rejects_read_only() {
+        let state = memory_product_state_with_search_providers(Vec::new());
+        let config = state.mcp_config();
+        let response = maybe_handle_web_search_graph_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "web-search-graph-read-only",
+                "method": "tools/call",
+                "params": {
+                    "name": "web_search_graph",
+                    "arguments": { "query": "membrane candidate" }
+                }
+            }),
+        )
+        .await
+        .expect("web_search_graph MCP route should be intercepted by the async server");
+
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_includes_web_search_graph() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+        let mut response = handle_mcp_request_with_context(
+            &state,
+            &config,
+            &McpRequestContext::default(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "tools-list",
+                "method": "tools/list",
+                "params": {}
+            }),
+        );
+        super::inject_web_search_graph_tool_definition(&mut response);
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let web_search_graph = tools
+            .iter()
+            .find(|tool| tool["name"] == "web_search_graph")
+            .expect("tools/list should advertise web_search_graph");
+        assert_eq!(
+            web_search_graph["inputSchema"]["required"][0],
+            "query"
+        );
+        assert!(web_search_graph["inputSchema"]["properties"]["budget_tokens"].is_object());
     }
 
     #[tokio::test]

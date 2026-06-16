@@ -15,6 +15,7 @@ const MOJEEK_SEARCH_ENDPOINT: &str = "https://api.mojeek.com/search";
 const EXA_SEARCH_ENDPOINT: &str = "https://api.exa.ai/search";
 const SERPAPI_SEARCH_ENDPOINT: &str = "https://serpapi.com/search.json";
 const PERPLEXITY_SEARCH_ENDPOINT: &str = "https://api.perplexity.ai/search";
+const SEARXNG_SEARCH_PATH: &str = "search";
 
 pub fn configured_search_providers_from_env() -> Vec<Arc<dyn SearchProvider>> {
     let enabled =
@@ -63,6 +64,13 @@ fn provider_from_env(provider: &str) -> Option<Arc<dyn SearchProvider>> {
             "PERPLEXITY_API_KEY",
         ])
         .map(PerplexitySearchProvider::new)
+        .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
+        "searxng" | "searx" | "searxng_search" => env_first(&[
+            "RUSTYWEB_SEARXNG_URL",
+            "RUSTY_RED_SEARXNG_URL",
+            "SEARXNG_URL",
+        ])
+        .map(SearXngSearchProvider::new)
         .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
         "offline" | "offline_jsonl" | "seed_manifest" => env_first(&[
             "RUSTYWEB_OFFLINE_SEARCH_MANIFEST",
@@ -315,6 +323,53 @@ impl SearchProvider for PerplexitySearchProvider {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SearXngSearchProvider {
+    client: Client,
+    endpoint: String,
+}
+
+impl SearXngSearchProvider {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            endpoint: searxng_search_endpoint(&base_url.into()),
+        }
+    }
+}
+
+impl SearchProvider for SearXngSearchProvider {
+    fn name(&self) -> &str {
+        "searxng"
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        opts: &'a SearchOpts,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(&self.endpoint)
+                .query(&[
+                    ("q", query),
+                    ("format", "json"),
+                    ("categories", "general"),
+                    ("safesearch", "1"),
+                ])
+                .send()
+                .await
+                .map_err(|error| provider_error(self.name(), error.to_string()))?;
+            let payload = response_json(self.name(), response).await?;
+            let mut candidates = searxng_candidates(&payload, self.name());
+            candidates.truncate(opts.provider_limit);
+            Ok(candidates)
+        })
+    }
+}
+
 /// File-backed provider for offline OWI/Common Crawl seed manifests. This is
 /// the light adapter path: upstream corpus jobs can emit JSON/JSONL candidates,
 /// and RustyWeb feeds them through the same provider fan-out and RRF layer.
@@ -527,6 +582,42 @@ fn perplexity_candidates(payload: &Value, source: &str) -> Vec<SearchCandidate> 
         .collect()
 }
 
+fn searxng_search_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with(SEARXNG_SEARCH_PATH) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/{SEARXNG_SEARCH_PATH}")
+    }
+}
+
+fn searxng_candidates(payload: &Value, source: &str) -> Vec<SearchCandidate> {
+    payload
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, result)| {
+            let url = string_field(result, "url")?;
+            Some(SearchCandidate {
+                url,
+                title: string_field(result, "title"),
+                snippet: string_field(result, "content")
+                    .or_else(|| string_field(result, "snippet")),
+                source: source.to_string(),
+                rank: result
+                    .get("positions")
+                    .and_then(Value::as_array)
+                    .and_then(|positions| positions.first())
+                    .and_then(Value::as_u64)
+                    .map(|rank| rank as usize)
+                    .unwrap_or(index + 1),
+            })
+        })
+        .collect()
+}
+
 fn string_field(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -707,6 +798,22 @@ mod tests {
         assert_eq!(perplexity[0].snippet.as_deref(), Some("Perplexity snippet"));
         assert_eq!(perplexity[0].rank, 1);
         assert_eq!(perplexity[0].source, "perplexity");
+
+        let searxng = searxng_candidates(
+            &json!({
+                "results": [{
+                    "url": "https://example.com/searxng",
+                    "title": "SearXNG title",
+                    "content": "SearXNG content",
+                    "positions": [4]
+                }]
+            }),
+            "searxng",
+        );
+        assert_eq!(searxng[0].url, "https://example.com/searxng");
+        assert_eq!(searxng[0].snippet.as_deref(), Some("SearXNG content"));
+        assert_eq!(searxng[0].rank, 4);
+        assert_eq!(searxng[0].source, "searxng");
     }
 
     #[tokio::test]

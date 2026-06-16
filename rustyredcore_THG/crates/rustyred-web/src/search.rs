@@ -415,7 +415,7 @@ pub async fn fanout_search_providers(
     }
 }
 
-fn normalize_candidate_url(url: &str) -> Option<String> {
+pub(crate) fn normalize_candidate_url(url: &str) -> Option<String> {
     let mut parsed = Url::parse(url.trim()).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;

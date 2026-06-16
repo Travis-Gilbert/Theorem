@@ -6496,6 +6496,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "rustyred-membrane"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustyred-rerank"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "rustyred-membrane",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-adapters"
 version = "0.5.0"
 dependencies = [
@@ -6522,6 +6542,8 @@ version = "0.7.0"
 dependencies = [
  "ignore",
  "rayon",
+ "rustyred-membrane",
+ "rustyred-rerank",
  "rustyred-thg-core",
  "serde_json",
  "syn",
@@ -6629,6 +6651,8 @@ dependencies = [
  "prost",
  "redis",
  "reqwest 0.12.28",
+ "rustyred-membrane",
+ "rustyred-rerank",
  "rustyred-thg-adapters",
  "rustyred-thg-affordances",
  "rustyred-thg-core",
@@ -6662,6 +6686,8 @@ dependencies = [
  "pilot-core",
  "redis",
  "reqwest 0.12.28",
+ "rustyred-membrane",
+ "rustyred-rerank",
  "rustyred-thg-core",
  "serde",
  "serde_json",
