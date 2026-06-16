@@ -187,3 +187,71 @@ fn discovered_link_sets_initial_priority() {
         "discovered link seeded an initial frontier priority"
     );
 }
+
+/// End-to-end wiring over the real (tokio-async) frontier store: `attach_crawl_hooks`
+/// bridges the async-mutex store to the sync hook worker via `blocking_lock`, and
+/// a fetched page reprioritizes the frontier. Proves the CrawlRunner-facing path.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_crawl_hooks_bridges_async_store() {
+    use rustyred_web::attach_crawl_hooks;
+    use std::sync::Arc as StdArc;
+
+    let store: rustyred_web::frontier::SharedFrontierStore =
+        StdArc::new(tokio::sync::Mutex::new(RedCoreGraphStore::memory()));
+
+    let a = fingerprint("GET", "https://example.com/a", b"").to_hex();
+    let b = fingerprint("GET", "https://example.com/b", b"").to_hex();
+    let c = fingerprint("GET", "https://example.com/c", b"").to_hex();
+    {
+        let mut g = store.lock().await;
+        g.upsert_node(NodeRecord::new(
+            "content_snapshot:hA",
+            ["ContentSnapshot"],
+            json!({ "text": "Theorem Theorem Theseus Memgraph Rust" }),
+        ))
+        .unwrap();
+        g.upsert_node(url_node(&a, "https://example.com/a", STATE_FRONTIER, "hA"))
+            .unwrap();
+        g.upsert_node(url_node(&b, "https://example.com/b", STATE_FRONTIER, ""))
+            .unwrap();
+        g.upsert_node(url_node(&c, "https://example.com/c", STATE_FRONTIER, ""))
+            .unwrap();
+        g.upsert_edge(EdgeRecord::new("l:a-b", &a, EDGE_LINKS_TO, &b, json!({})))
+            .unwrap();
+        g.upsert_edge(EdgeRecord::new("l:c-b", &c, EDGE_LINKS_TO, &b, json!({})))
+            .unwrap();
+    }
+
+    let dispatcher = StdArc::new(attach_crawl_hooks(StdArc::clone(&store), "Travis-Gilbert").await);
+
+    // Fetch A.
+    {
+        let mut g = store.lock().await;
+        let mut node = g.get_node(&a).unwrap().unwrap();
+        node.properties
+            .as_object_mut()
+            .unwrap()
+            .insert("state".to_string(), json!(STATE_FETCHED));
+        g.upsert_node(node).unwrap();
+    }
+
+    // quiesce blocks, so run it off the runtime.
+    {
+        let d = StdArc::clone(&dispatcher);
+        tokio::task::spawn_blocking(move || d.quiesce(Duration::from_secs(10)))
+            .await
+            .unwrap();
+    }
+
+    let b_priority = store
+        .lock()
+        .await
+        .get_node(&b)
+        .unwrap()
+        .unwrap()
+        .properties
+        .get("priority")
+        .and_then(|v| v.as_f64())
+        .unwrap();
+    assert!(b_priority > 0.0, "async-store fetch reprioritized the frontier");
+}

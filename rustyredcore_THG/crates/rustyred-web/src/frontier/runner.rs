@@ -1,17 +1,23 @@
 use std::sync::Arc;
 
 use futures_util::future::join_all;
+use rustyred_thg_core::HookDispatcher;
 use serde::{Deserialize, Serialize};
 
 use super::fetcher::Fetcher;
 use super::model::FetchOutcome;
 use super::{Frontier, FrontierResult};
+use crate::crawl_hooks::attach_crawl_hooks;
 
 #[derive(Clone)]
 pub struct CrawlRunner {
     frontier: Frontier,
     fetcher: Arc<dyn Fetcher>,
     concurrency: usize,
+    // Owns the self-organizing crawl hook dispatcher when enabled; kept alive
+    // for the runner's lifetime (its worker stops on drop). `None` = the legacy
+    // periodic-prioritizer behavior, unchanged.
+    hook_dispatcher: Option<Arc<HookDispatcher>>,
 }
 
 impl CrawlRunner {
@@ -20,6 +26,7 @@ impl CrawlRunner {
             frontier,
             fetcher: Arc::new(fetcher),
             concurrency: concurrency.max(1),
+            hook_dispatcher: None,
         }
     }
 
@@ -28,7 +35,22 @@ impl CrawlRunner {
             frontier,
             fetcher,
             concurrency: concurrency.max(1),
+            hook_dispatcher: None,
         }
+    }
+
+    /// Opt into the event-driven self-organizing frontier: attach the crawl
+    /// hooks so each fetched page and discovered link reprioritizes the frontier
+    /// inside the store, instead of relying on the periodic prioritizer. The
+    /// dispatcher is owned by the runner and torn down with it.
+    pub async fn enable_crawl_hooks(&mut self) {
+        let dispatcher = attach_crawl_hooks(self.frontier.store(), self.frontier.tenant()).await;
+        self.hook_dispatcher = Some(Arc::new(dispatcher));
+    }
+
+    /// The crawl hook dispatcher, when enabled (for tests / quiesce).
+    pub fn hook_dispatcher(&self) -> Option<&HookDispatcher> {
+        self.hook_dispatcher.as_deref()
     }
 
     pub async fn run(&self) -> FrontierResult<CrawlReport> {

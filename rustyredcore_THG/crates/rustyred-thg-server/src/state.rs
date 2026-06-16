@@ -12,9 +12,10 @@ use rustyred_thg_core::{
     make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
     EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
     GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
-    SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
+    GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
+    HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
+    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
+    SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
@@ -692,6 +693,11 @@ impl AppState {
             RedCoreGraphStore::open(data_dir, options)?,
             tenant_config.tenant_memory_quota_bytes,
         )?);
+        if graph_hooks_enabled() {
+            if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
+                eprintln!("[theorem] enable graph hooks failed for {tenant_id}: {}", err.message);
+            }
+        }
         stores.insert(safe_tenant, store.clone());
         Ok(store)
     }
@@ -713,6 +719,11 @@ impl AppState {
             RedCoreGraphStore::memory(),
             tenant_config.tenant_memory_quota_bytes,
         )?);
+        if graph_hooks_enabled() {
+            if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
+                eprintln!("[theorem] enable graph hooks failed for {tenant_id}: {}", err.message);
+            }
+        }
         stores.insert(safe_tenant, store.clone());
         Ok(store)
     }
@@ -803,6 +814,15 @@ impl From<GraphStoreError> for StoreAccessError {
     }
 }
 
+/// Whether per-tenant stores auto-attach graph-level hooks. Default off so a
+/// deploy is a deliberate flag flip, not a silent behavior change. Truthy:
+/// `1`/`true`/`on`/`yes`.
+fn graph_hooks_enabled() -> bool {
+    std::env::var("THEOREM_GRAPH_HOOKS")
+        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
 #[derive(Debug)]
 pub struct RedCoreTenantExecutor {
     writer: Mutex<RedCoreGraphStore>,
@@ -812,6 +832,23 @@ pub struct RedCoreTenantExecutor {
     /// share the underlying allocation across concurrent calls; any mutation
     /// that bumps `graph_version` triggers a rebuild on the next read.
     cached_edges: RwLock<Option<(u64, Arc<Vec<EdgeRecord>>)>>,
+    /// Graph-level hook dispatcher, owned here so its worker lives as long as the
+    /// tenant store. `None` unless hooks are enabled (see `enable_graph_hooks`).
+    hook_dispatcher: Mutex<Option<HookDispatcher>>,
+}
+
+/// Bridges the executor's private writer mutex to the hook dispatcher worker.
+/// Holds a `Weak` so the executor->dispatcher->executor reference does not form
+/// a strong cycle (the dispatcher is owned by the executor it points back to).
+struct ExecutorHookStore(std::sync::Weak<RedCoreTenantExecutor>);
+
+impl HookStoreAccess for ExecutorHookStore {
+    fn with_store_mut(&self, f: &mut dyn FnMut(&mut RedCoreGraphStore)) -> bool {
+        match self.0.upgrade() {
+            Some(executor) => executor.run_hook_batch(f),
+            None => false, // executor gone: fail open
+        }
+    }
 }
 
 impl RedCoreTenantExecutor {
@@ -822,7 +859,65 @@ impl RedCoreTenantExecutor {
             committed_snapshot: RwLock::new(committed_snapshot),
             tenant_memory_quota_bytes,
             cached_edges: RwLock::new(None),
+            hook_dispatcher: Mutex::new(None),
         })
+    }
+
+    /// Run a coalesced hook batch under the writer lock, then refresh the read
+    /// mirror. Hook handlers write through the writer (bypassing `commit_batch`'s
+    /// own snapshot refresh), so the committed snapshot must be rebuilt here for
+    /// the derived structure to be visible to reads. Off the commit critical
+    /// path; never unwraps a lock (fails open on poison).
+    fn run_hook_batch(&self, f: &mut dyn FnMut(&mut RedCoreGraphStore)) -> bool {
+        let mut writer = match self.writer.lock() {
+            Ok(writer) => writer,
+            Err(_) => return false,
+        };
+        f(&mut writer);
+        if let Ok(snapshot) = InMemoryGraphStore::from_snapshot(writer.graph_snapshot()) {
+            if let Ok(mut guard) = self.committed_snapshot.write() {
+                *guard = snapshot;
+            }
+        }
+        true
+    }
+
+    /// Attach a hook dispatcher to this tenant store: start the worker over the
+    /// writer, install the emitter, and own the dispatcher for the store's
+    /// lifetime. No-op when `registrations` is empty. Idempotent-ish: a second
+    /// call replaces the dispatcher (the prior one's worker stops on drop).
+    pub fn enable_graph_hooks(
+        self: &Arc<Self>,
+        registrations: Vec<HookRegistration>,
+        tenant: &str,
+    ) -> GraphStoreResult<()> {
+        if registrations.is_empty() {
+            return Ok(());
+        }
+        let dispatcher = HookDispatcher::start(
+            ExecutorHookStore(Arc::downgrade(self)),
+            registrations,
+            HookDispatcherConfig::default(),
+        );
+        {
+            let mut writer = self.lock_writer()?;
+            writer.attach_hook_emitter(dispatcher.emitter());
+            writer.set_hook_tenant(tenant);
+        }
+        if let Ok(mut guard) = self.hook_dispatcher.lock() {
+            *guard = Some(dispatcher);
+        }
+        Ok(())
+    }
+
+    /// Block until the hook dispatcher has drained (or the timeout elapses).
+    /// Returns true when drained or when no dispatcher is attached. Useful for
+    /// deterministic shutdown and tests.
+    pub fn quiesce_hooks(&self, timeout: std::time::Duration) -> bool {
+        match self.hook_dispatcher.lock() {
+            Ok(guard) => guard.as_ref().map(|d| d.quiesce(timeout)).unwrap_or(true),
+            Err(_) => true,
+        }
     }
 
     /// §P6-A pa6.1: cheap `Arc<Vec<EdgeRecord>>` clone for algorithm endpoints.
@@ -2353,6 +2448,48 @@ mod tests {
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn graph_hooks_refresh_executor_read_snapshot() {
+        use rustyred_thg_core::{
+            HookContext, HookHandler, HookOutcome, HookRegistration, MutationEvent, MutationKind,
+            MutationMatcher,
+        };
+
+        fn coalesce(_event: &MutationEvent) -> Option<String> {
+            Some("derive".to_string())
+        }
+        // On a `Trigger` upsert, write a derived node through the writer.
+        let handler: HookHandler = Arc::new(|ctx: &mut HookContext, _events: &[MutationEvent]| {
+            ctx.store
+                .upsert_node(NodeRecord::new("derived:1", ["Derived"], json!({ "by": "hook" })))?;
+            Ok(HookOutcome::Done)
+        });
+        let reg = HookRegistration::new(
+            "test.derive",
+            MutationMatcher::any()
+                .with_kinds([MutationKind::NodeUpserted])
+                .with_labels(["Trigger"]),
+            coalesce,
+            handler,
+        );
+
+        let executor =
+            Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap());
+        executor.enable_graph_hooks(vec![reg], "tenant-x").unwrap();
+
+        executor
+            .upsert_node(NodeRecord::new("t1", ["Trigger"], json!({})))
+            .unwrap();
+        assert!(executor.quiesce_hooks(Duration::from_secs(10)));
+
+        // Visible through the executor's READ snapshot, proving run_hook_batch
+        // refreshed the committed mirror after the hook wrote via the writer.
+        assert!(
+            executor.get_node("derived:1").unwrap().is_some(),
+            "hook-derived node visible via the executor read snapshot"
+        );
+    }
 
     #[test]
     fn app_affordance_endpoint_normalization_adds_scheme() {

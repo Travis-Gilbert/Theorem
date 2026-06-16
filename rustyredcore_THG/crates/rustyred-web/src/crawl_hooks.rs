@@ -22,9 +22,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rustyred_thg_core::{
-    EdgeRecord, HookContext, HookError, HookHandler, HookOutcome, HookRegistration, MutationEvent,
-    MutationKind, MutationMatcher, NodeRecord, PluginCapability, PluginCapabilityKind,
-    RedCoreGraphStore, RustyRedPlugin,
+    EdgeRecord, HookContext, HookDispatcher, HookDispatcherConfig, HookError, HookHandler,
+    HookOutcome, HookRegistration, HookStoreAccess, MutationEvent, MutationKind, MutationMatcher,
+    NodeRecord, PluginCapability, PluginCapabilityKind, RedCoreGraphStore, RustyRedPlugin,
 };
 use serde_json::{json, Value};
 use url::Url;
@@ -32,7 +32,7 @@ use url::Url;
 use crate::frontier::model::{
     EDGE_LINKS_TO, LABEL_URL, STATE_FETCHED, STATE_FRONTIER, UrlFingerprint,
 };
-use crate::frontier::{FrontierCtx, PprPrioritizer, Prioritizer};
+use crate::frontier::{FrontierCtx, PprPrioritizer, Prioritizer, SharedFrontierStore};
 use crate::source_class::classify_url;
 
 /// Entity nodes/edges the fetch-completion hook materializes from page text.
@@ -68,6 +68,42 @@ impl RustyRedPlugin for RustyWebHooksPlugin {
     fn hooks(&self) -> Vec<HookRegistration> {
         crawl_hooks()
     }
+}
+
+/// Bridges the (tokio-async) frontier store to the (sync, tokio-free) hook
+/// dispatcher. The dispatcher worker runs on a dedicated `std::thread`, never a
+/// tokio runtime worker, so `blocking_lock` here is safe and never stalls the
+/// async runtime. tokio's `Mutex` is designed for exactly this mixed sync/async
+/// use and cannot be poisoned, so there is no `unwrap` on a lock result.
+struct FrontierHookStore(SharedFrontierStore);
+
+impl HookStoreAccess for FrontierHookStore {
+    fn with_store_mut(&self, f: &mut dyn FnMut(&mut RedCoreGraphStore)) -> bool {
+        let mut guard = self.0.blocking_lock();
+        f(&mut guard);
+        true
+    }
+}
+
+/// Start the self-organizing crawl hooks over a shared frontier store and attach
+/// the emitter so crawl commits fire them event-driven. The returned dispatcher
+/// must be kept alive for the crawl's lifetime (its worker stops on drop). Async
+/// because attaching the emitter takes the frontier store's async lock.
+pub async fn attach_crawl_hooks(
+    store: SharedFrontierStore,
+    tenant: impl Into<String>,
+) -> HookDispatcher {
+    let dispatcher = HookDispatcher::start(
+        FrontierHookStore(Arc::clone(&store)),
+        crawl_hooks(),
+        HookDispatcherConfig::default(),
+    );
+    {
+        let mut guard = store.lock().await;
+        guard.attach_hook_emitter(dispatcher.emitter());
+        guard.set_hook_tenant(tenant);
+    }
+    dispatcher
 }
 
 // ---- FetchCompletionHook ------------------------------------------------

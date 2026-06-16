@@ -52,8 +52,8 @@ pub mod frontier;
 
 pub mod crawl_hooks;
 pub use crawl_hooks::{
-    crawl_hooks, fetch_completion_hook, link_discovery_hook, RustyWebHooksPlugin, EDGE_MENTIONS,
-    WEB_ENTITY_LABEL,
+    attach_crawl_hooks, crawl_hooks, fetch_completion_hook, link_discovery_hook,
+    RustyWebHooksPlugin, EDGE_MENTIONS, WEB_ENTITY_LABEL,
 };
 
 pub mod browser_engine;

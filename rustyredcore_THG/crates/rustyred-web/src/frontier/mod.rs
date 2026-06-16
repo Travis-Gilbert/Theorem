@@ -118,6 +118,10 @@ impl Frontier {
         Arc::clone(&self.store)
     }
 
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
     pub async fn resume_pending(&self) -> FrontierResult<usize> {
         let pending = {
             let store = self.store.lock().await;
