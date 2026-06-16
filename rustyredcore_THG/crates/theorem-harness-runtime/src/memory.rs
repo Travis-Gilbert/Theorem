@@ -2086,10 +2086,17 @@ fn indexed_fulltext_seed_scores<S: MemoryGraphStore>(
                     .map(|(id, score)| (id, score as f64)),
             ),
             Err(error) if error.code == "unsupported_operation" => {}
+            Err(error) if missing_fulltext_designation(&error) => {}
             Err(error) => return Err(MemoryError::Store(error)),
         }
     }
     dedupe_rank_scores(results, true, seed_limit)
+}
+
+fn missing_fulltext_designation(error: &GraphStoreError) -> bool {
+    error.code == "store_mode_unsupported"
+        && (error.message.contains("no fulltext designations")
+            || error.message.contains("no matching fulltext designation"))
 }
 
 fn indexed_vector_seed_scores<S: MemoryGraphStore>(
@@ -3458,13 +3465,66 @@ impl IfEmpty for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyred_thg_core::{InMemoryGraphStore, RedCoreGraphStore, RedCoreOptions};
+    use rustyred_thg_core::{
+        GraphStoreError, InMemoryGraphStore, RedCoreGraphStore, RedCoreOptions,
+    };
     use std::fs;
 
     const TENANT: &str = "travis-gilbert";
     const T1: &str = "2026-06-01T00:00:00Z";
     const T2: &str = "2026-06-01T00:01:00Z";
     const T3: &str = "2026-06-01T00:02:00Z";
+
+    struct MissingFulltextStore {
+        inner: InMemoryGraphStore,
+    }
+
+    impl MissingFulltextStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryGraphStore::new(),
+            }
+        }
+    }
+
+    impl MemoryGraphStore for MissingFulltextStore {
+        fn memory_upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+            self.inner.upsert_node(node).map(|_| ())
+        }
+
+        fn memory_upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+            self.inner.upsert_edge(edge).map(|_| ())
+        }
+
+        fn memory_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+            Ok(self.inner.get_node(id).cloned())
+        }
+
+        fn memory_get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+            Ok(self.inner.get_edge(id).cloned())
+        }
+
+        fn memory_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+            Ok(self.inner.query_nodes(query))
+        }
+
+        fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+            Ok(self.inner.neighbors(query))
+        }
+
+        fn memory_fulltext_search(
+            &self,
+            _label: Option<&str>,
+            _property: &str,
+            _query: &str,
+            _k: usize,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            Err(GraphStoreError::new(
+                "store_mode_unsupported",
+                "no fulltext designations for this tenant",
+            ))
+        }
+    }
 
     #[test]
     fn recall_stage0_seeds_named_entities_from_union() {
@@ -3911,6 +3971,41 @@ mod tests {
         assert!(results.iter().any(|item| item.item_type == "document"));
         assert!(results.iter().any(|item| item.item_type == "node"));
         assert_eq!(results[0].provenance["actor"], "codex");
+    }
+
+    #[test]
+    fn recall_falls_back_when_fulltext_designations_are_missing() {
+        let mut store = MissingFulltextStore::new();
+        let document = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Jobintel tenant".to_string(),
+                content: "Keep Role and Company nodes in the dedicated jobintel tenant."
+                    .to_string(),
+                tags: vec!["jobintel".to_string(), "tenant-hygiene".to_string()],
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "jobintel tenant".to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            results.iter().any(|item| item.id == document.doc_id),
+            "lexical fallback should preserve recall when fulltext designations are missing"
+        );
     }
 
     #[test]

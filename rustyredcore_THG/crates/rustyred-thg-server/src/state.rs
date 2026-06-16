@@ -202,6 +202,7 @@ impl AppState {
         // If label given, search just that (label, property). Otherwise union
         // over every label that has this property indexed.
         let mut combined: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut matched_designation = false;
         for ((idx_label, idx_property), index) in tenant_map.iter() {
             if idx_property != property {
                 continue;
@@ -211,6 +212,7 @@ impl AppState {
                     continue;
                 }
             }
+            matched_designation = true;
             for (id, score) in index.search(query, k) {
                 let slot = combined.entry(id).or_insert(0.0);
                 if score > *slot {
@@ -218,7 +220,7 @@ impl AppState {
                 }
             }
         }
-        if combined.is_empty() {
+        if !matched_designation {
             return Err(StoreAccessError::unsupported(
                 "no matching fulltext designation; call /fulltext/designate first",
             ));
@@ -3022,6 +3024,40 @@ mod tests {
         assert_eq!(
             spatial_search["result"]["structuredContent"]["node_ids"][0],
             "place:a"
+        );
+    }
+
+    #[test]
+    fn fulltext_search_returns_empty_for_designated_label_with_no_hits() {
+        let state = AppState::new(memory_config());
+        state
+            .designate_fulltext_property("tenant-empty-ft", "MemoryAtom", "search_text")
+            .expect("designation succeeds before nodes exist");
+
+        let hits = state
+            .fulltext_search(
+                "tenant-empty-ft",
+                Some("MemoryAtom"),
+                "search_text",
+                "jobintel",
+                5,
+            )
+            .expect("empty designated index is a valid search");
+        assert!(hits.is_empty());
+
+        let error = state
+            .fulltext_search(
+                "tenant-empty-ft",
+                Some("MemoryNode"),
+                "search_text",
+                "jobintel",
+                5,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "store_mode_unsupported");
+        assert_eq!(
+            error.message,
+            "no matching fulltext designation; call /fulltext/designate first"
         );
     }
 
