@@ -1,0 +1,59 @@
+# jobintel 0.1 - Job-Intelligence Pipeline on RustyRed.
+#
+# A light, standalone CLI that consumes a *running* RustyRed instance over its
+# public tenant HTTP routes. It never embeds the database: RustyRed is the heavy
+# substrate, jobintel is the light client. This mirrors the same split that
+# apps/theorem-grpc and apps/theorem-harness-server use (standalone Cargo root,
+# bare [workspace] table at the bottom so no ancestor workspace adopts it).
+#
+# Unlike apps/theorem-grpc, jobintel has ZERO path-deps into rustyredcore_THG.
+# It talks to RustyRed only over HTTP/JSON, so it builds and tests in seconds
+# without compiling the substrate. The graph contract lives in src/client.rs
+# and is pinned to the real route + body shapes in
+# rustyredcore_THG/crates/rustyred-thg-server/src/router.rs.
+
+[package]
+name = "jobintel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Job-intelligence pipeline: ingest open job sources into RustyRed, rank roles against a profile with vector + graph + flag signals, draft an outreach queue."
+license = "MIT"
+
+[dependencies]
+# Blocking reqwest + rustls-tls is the established CLI convention in this repo
+# (theorem-receiver, theorem-agentd, theorem-grpc all use this exact line). A
+# sequential CLI has no need for an async runtime, so we avoid tokio entirely.
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+toml = "0.8"
+thiserror = "1"
+anyhow = "1"
+
+# Optional local-embedding path. The default build uses the offline HashEmbedder
+# (no model download), so the demo runs from one command. `--features bge`
+# pulls candle + tokenizers + hf-hub for a real bge-small-en-v1.5 encoder.
+# candle-core and tokenizers already resolve in the repo lock, so the version
+# universe is known-good.
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.20", optional = true }
+hf-hub = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Real local sentence-transformers encoder (bge-small-en-v1.5, D=384) via candle.
+bge = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+
+[[bin]]
+name = "jobintel"
+path = "src/main.rs"
+
+# Standalone workspace root: keeps jobintel OUT of any ancestor workspace and
+# gives it its own Cargo.lock. Same isolation trick theorem-grpc and
+# reconstruction-engine use.
+[workspace]

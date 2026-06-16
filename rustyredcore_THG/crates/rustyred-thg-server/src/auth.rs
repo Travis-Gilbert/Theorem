@@ -1,10 +1,11 @@
 use axum::http::{HeaderMap, StatusCode};
 
-const ALL_SCOPES: [&str; 16] = [
+const ALL_SCOPES: [&str; 17] = [
     "run:write",
     "run:read",
     "context:write",
     "context:read",
+    "coordination:read",
     "graph:read",
     "graph:write",
     "federation:write",

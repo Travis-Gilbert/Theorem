@@ -405,6 +405,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/.well-known/agent.json", get(agent_well_known))
         .route("/mcp", post(mcp_post))
         .route("/v1/coordination/events", get(coordination_events))
+        .route(
+            "/v1/agent-space/stream",
+            get(crate::agent_space::agent_space_stream),
+        )
+        .route(
+            "/v1/agent-space/snapshot",
+            get(crate::agent_space::agent_space_snapshot),
+        )
         .route("/metrics", get(crate::metrics::metrics))
         .route(
             "/v1/diagnostics/slow_queries",
@@ -1362,15 +1370,7 @@ fn page_state_payload(page: &PageState) -> Value {
         "distilled_text": page.distilled_text,
         "active_tab_id": page.active_tab_id,
         "interactive_elements": page.interactive_elements,
-        "fetch": page.fetch.as_ref().map(|fetch| json!({
-            "tier_used": fetch.tier_used,
-            "http_status": fetch.http_status,
-            "content_type": fetch.content_type,
-            "final_url": fetch.final_url,
-            "truncated": fetch.truncated,
-            "body_bytes": fetch.html_bytes.len(),
-            "error": fetch.error
-        }))
+        "fetch": page.fetch.clone()
     })
 }
 
@@ -5581,7 +5581,7 @@ fn cors_layer(state: &AppState) -> CorsLayer {
     layer
 }
 
-fn mcp_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
+pub(crate) fn mcp_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
     let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
         return true;
     };
@@ -7062,6 +7062,74 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn agent_space_snapshot_seeds_room_and_returns_cursor() {
+        let state = memory_product_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agent-space/snapshot?tenant=default&room=room:agent-space")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["room_id"], "room:agent-space");
+        // The cursor is the monotonic high-water seq the stream de-dupes against.
+        assert!(
+            payload["cursor"].is_u64(),
+            "snapshot cursor must be a numeric seq, got {}",
+            payload["cursor"]
+        );
+        assert!(payload.get("room").is_some());
+        assert!(payload.get("presence").is_some());
+        assert!(payload.get("work_graph").is_some());
+    }
+
+    #[tokio::test]
+    async fn agent_space_snapshot_requires_tenant() {
+        let state = memory_product_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agent-space/snapshot")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["error"], "missing_tenant");
+    }
+
+    #[tokio::test]
+    async fn agent_space_stream_opens_as_event_stream() {
+        let state = memory_product_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agent-space/stream?tenant=default&room=room:agent-space")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "agent-space stream must be an SSE response, got {content_type}"
+        );
     }
 
     #[test]

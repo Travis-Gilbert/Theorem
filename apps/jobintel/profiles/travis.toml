@@ -1,0 +1,23 @@
+# A jobintel profile. `jobintel rank --profile travis` loads this file, upserts
+# a Profile node (with embedding + Skill edges derived from `text`), then ranks
+# every Role against it. Add more profiles as profiles/<id>.toml.
+
+id = "travis"
+
+text = """
+Rust systems engineer building a Rust-native graph database substrate (RustyRed/THG):
+an in-process GraphStore with durable AOF persistence, vector/HNSW search, personalized
+PageRank, and symbolic engines. I build RAG and retrieval pipelines, knowledge-graph
+infrastructure, and MCP servers/tools in pure Rust, plus the PyO3 bridge to Python.
+Strong on graph algorithms, embeddings, vector indexes, agent orchestration, and
+LLM-backed systems. Comfortable across Rust, Python, async services, and metal-to-model
+infrastructure. Looking for contract or remote work on graph, vector, RAG, agent, or
+LLM infrastructure with teams that ship in Rust.
+"""
+
+# Optional proof points injected into every drafted context pack. Override per
+# your own portfolio; these are the spec's fixed set.
+[proof_points]
+repo = "https://github.com/Travis-Gilbert/Theseus"
+metal_to_model = "Rust-native substrate: one in-process graph engine from metal to model, no API boundary."
+benchmarks = "Durable GraphStore with AOF + HNSW vector search and personalized PageRank, exercised end-to-end."

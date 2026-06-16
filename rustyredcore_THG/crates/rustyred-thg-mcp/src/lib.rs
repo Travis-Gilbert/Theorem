@@ -40,10 +40,11 @@ use theorem_harness_runtime::{
     default_theorem_binding, encode_memory, forget_memory, get_skill_pack, handoff_memory,
     infer_coordination_room_id, list_skill_packs, load_events, load_run,
     normalize_coordination_urgency, parse_coordination_mentions,
-    publish_coordination_room_event_from_state, publish_skill_pack, recall_archived_memory,
+    publish_coordination_room_event_from_state, publish_footprint_event, publish_presence_event,
+    publish_record_event, publish_skill_pack, publish_work_graph_transition, recall_archived_memory,
     recall_memory, relate_memory, remember_memory, revise_memory_document,
     scratchpad_revision_node_id, self_note_memory, stable_coordination_message_id,
-    stable_coordination_record_id, task_node_graph_id, upsert_note, ArchiveMemoryInput,
+    stable_coordination_record_id, task_node_graph_id, upsert_note, AddOrRemove, ArchiveMemoryInput,
     CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
     CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
     ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult, JobNoteInput,
@@ -77,6 +78,145 @@ pub struct HandoffDispatch {
 
 fn publish_coordination_room_event(state: &CoordinationMessageState) {
     publish_coordination_room_event_from_state(state);
+}
+
+// --- Agent Space Viewport emit hooks -------------------------------------
+// After a coordination write is persisted, mirror it onto the agent-space
+// observatory bus so the live viewport sees presence, footprints, work-graph
+// transitions, and records. These read the persisted tool `arguments` (the
+// public tool contract) defensively; a missing field degrades to an empty
+// string rather than dropping the event, because the viewport is an
+// eventually-consistent observatory, not a source of truth.
+
+fn agent_space_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn agent_space_arg_str<'a>(arguments: &'a Value, keys: &[&str]) -> &'a str {
+    for key in keys {
+        if let Some(value) = arguments.get(*key).and_then(Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    ""
+}
+
+fn agent_space_arg_room(arguments: &Value) -> Option<String> {
+    arguments
+        .get("room_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|room| !room.is_empty())
+        .map(str::to_string)
+}
+
+fn agent_space_arg_list(arguments: &Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        if let Some(items) = arguments.get(*key).and_then(Value::as_array) {
+            return items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn emit_agent_space_presence(tenant: &str, arguments: &Value) {
+    let actor = agent_space_arg_str(arguments, &["actor_id", "actor"]);
+    if actor.is_empty() {
+        return;
+    }
+    let status = match agent_space_arg_str(arguments, &["status"]) {
+        "" => "active",
+        other => other,
+    };
+    publish_presence_event(
+        tenant.to_string(),
+        agent_space_arg_room(arguments),
+        actor.to_string(),
+        status.to_string(),
+        agent_space_now_ms(),
+    );
+}
+
+fn emit_agent_space_footprint(tenant: &str, arguments: &Value) {
+    let actor = agent_space_arg_str(arguments, &["actor_id", "actor"]);
+    if actor.is_empty() {
+        return;
+    }
+    let room = agent_space_arg_room(arguments);
+    let ts = agent_space_now_ms();
+    let files = agent_space_arg_list(
+        arguments,
+        &["footprint", "claimed_files", "claimedFiles", "touched_files"],
+    );
+    if files.is_empty() {
+        let target = agent_space_arg_str(arguments, &["task", "binding_id", "summary"]);
+        if !target.is_empty() {
+            publish_footprint_event(
+                tenant.to_string(),
+                room,
+                actor.to_string(),
+                target.to_string(),
+                AddOrRemove::Add,
+                ts,
+            );
+        }
+        return;
+    }
+    for file in files {
+        publish_footprint_event(
+            tenant.to_string(),
+            room.clone(),
+            actor.to_string(),
+            file,
+            AddOrRemove::Add,
+            ts,
+        );
+    }
+}
+
+fn emit_agent_space_record(tenant: &str, arguments: &Value) {
+    let kind = match agent_space_arg_str(arguments, &["record_type", "kind", "type"]) {
+        "" => "event",
+        other => other,
+    };
+    let summary = agent_space_arg_str(arguments, &["summary", "title"]);
+    let refs = agent_space_arg_list(arguments, &["refs", "references"]);
+    publish_record_event(
+        tenant.to_string(),
+        agent_space_arg_room(arguments),
+        kind.to_string(),
+        summary.to_string(),
+        refs,
+        agent_space_now_ms(),
+    );
+}
+
+fn emit_agent_space_transition(tenant: &str, arguments: &Value) {
+    let node_id = agent_space_arg_str(arguments, &["run_id", "node_id", "binding_id", "id"]);
+    let from = agent_space_arg_str(arguments, &["from", "from_state", "previous_state"]);
+    let to = agent_space_arg_str(arguments, &["to", "to_state", "state", "event_type", "kind"]);
+    let actor = agent_space_arg_str(arguments, &["actor_id", "actor", "author"]);
+    publish_work_graph_transition(
+        tenant.to_string(),
+        agent_space_arg_room(arguments),
+        node_id.to_string(),
+        from.to_string(),
+        to.to_string(),
+        actor.to_string(),
+        agent_space_now_ms(),
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -1072,7 +1212,9 @@ fn call_tool<P: McpGraphProvider>(
                     "message": "Native presence writes are unavailable while read-only mode is active."
                 })));
             }
-            presence_payload(&tenant, &mut backend, &arguments)?
+            let payload = presence_payload(&tenant, &mut backend, &arguments)?;
+            emit_agent_space_presence(&tenant, &arguments);
+            payload
         }
         "coordination_intent" | "write_intent" | "theorem_harness_write_intent" => {
             if config.read_only {
@@ -1081,7 +1223,9 @@ fn call_tool<P: McpGraphProvider>(
                     "message": "Native coordination intent writes are unavailable while read-only mode is active."
                 })));
             }
-            write_intent_payload(&tenant, &mut backend, &arguments)?
+            let payload = write_intent_payload(&tenant, &mut backend, &arguments)?;
+            emit_agent_space_footprint(&tenant, &arguments);
+            payload
         }
         "read_intents_for_room" | "theorem_harness_read_intents_for_room" => {
             read_intents_payload(&tenant, &backend, &arguments)?
@@ -1170,7 +1314,10 @@ fn call_tool<P: McpGraphProvider>(
             if let Some(error) = coordination_policy_error(&policy_receipt) {
                 return Ok(tool_result_error(error));
             }
-            write_record_payload(&tenant, &mut backend, &arguments, Some(policy_receipt))?
+            let payload =
+                write_record_payload(&tenant, &mut backend, &arguments, Some(policy_receipt))?;
+            emit_agent_space_record(&tenant, &arguments);
+            payload
         }
         "coordination_contribution" | "theorem_harness_coordination_contribution" => {
             if config.read_only {
@@ -1211,7 +1358,9 @@ fn call_tool<P: McpGraphProvider>(
                     "message": "Native harness transition appends are unavailable while read-only mode is active."
                 })));
             }
-            append_harness_transition_payload(&tenant, &mut backend, &arguments)?
+            let payload = append_harness_transition_payload(&tenant, &mut backend, &arguments)?;
+            emit_agent_space_transition(&tenant, &arguments);
+            payload
         }
         "harness_run" | "theorem_harness_run" => {
             harness_run_payload(&tenant, &backend, &arguments)?
@@ -4061,6 +4210,25 @@ fn recall_memory_payload(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         consume_handoffs,
+        query_time: argument_text(arguments, &["query_time", "queryTime"]).unwrap_or_default(),
+        overall_state: arguments
+            .get("overall_state")
+            .or_else(|| arguments.get("overallState"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        seed_limit: argument_u64(arguments, &["seed_limit", "seedLimit"]).unwrap_or(0) as usize,
+        query_embedding: f32_array_any(arguments, &["query_embedding", "queryEmbedding"]),
+        embedding_property: argument_text(arguments, &["embedding_property", "embeddingProperty"])
+            .unwrap_or_default(),
+        ppr_alpha: argument_f64_any(arguments, &["ppr_alpha", "pprAlpha"]).unwrap_or(0.0),
+        ppr_epsilon: argument_f64_any(arguments, &["ppr_epsilon", "pprEpsilon"]).unwrap_or(0.0),
+        ppr_max_pushes: argument_u64(arguments, &["ppr_max_pushes", "pprMaxPushes"]).unwrap_or(0)
+            as usize,
+        recency_half_life_seconds: argument_f64_any(
+            arguments,
+            &["recency_half_life_seconds", "recencyHalfLifeSeconds"],
+        )
+        .unwrap_or(0.0),
     };
     let results = recall_memory(&mut store, input).map_err(mcp_memory_error)?;
     Ok(json!({
@@ -4130,6 +4298,10 @@ fn revise_memory_payload(
         derived_from_doc_ids: string_array_any(
             arguments,
             &["derived_from_doc_ids", "derivedFromDocIds"],
+        ),
+        contradicts_doc_ids: string_array_any(
+            arguments,
+            &["contradicts_doc_ids", "contradictsDocIds"],
         ),
         updated_at: argument_text(arguments, &["updated_at", "updatedAt"]).unwrap_or_default(),
     };
@@ -6060,6 +6232,21 @@ fn string_array_any(arguments: &Value, keys: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn f32_array_any(arguments: &Value, keys: &[&str]) -> Vec<f32> {
+    keys.iter()
+        .find_map(|key| {
+            arguments.get(*key).map(|value| match value {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(value_as_f64)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn required_text_any(
     arguments: &Value,
     keys: &[&str],
@@ -7641,12 +7828,36 @@ impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryStore<'_, B> {
         self.backend.get_node(id)
     }
 
+    fn memory_get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.backend.get_edge(id)
+    }
+
     fn memory_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
         self.backend.query_nodes(query)
     }
 
     fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
         self.backend.neighbors(query)
+    }
+
+    fn memory_fulltext_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.backend.fulltext_search(label, property, query, k)
+    }
+
+    fn memory_vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.backend.vector_search(label, property, query, k)
     }
 }
 
@@ -7669,12 +7880,36 @@ impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryReadStore<'_, B> {
         self.backend.get_node(id)
     }
 
+    fn memory_get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.backend.get_edge(id)
+    }
+
     fn memory_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
         self.backend.query_nodes(query)
     }
 
     fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
         self.backend.neighbors(query)
+    }
+
+    fn memory_fulltext_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.backend.fulltext_search(label, property, query, k)
+    }
+
+    fn memory_vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.backend.vector_search(label, property, query, k)
     }
 }
 
@@ -8629,7 +8864,25 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "limit": { "type": "integer", "default": 10 },
                     "include_low_fitness": { "type": "boolean", "default": false },
                     "include_consolidation_sources": { "type": "boolean", "default": false },
-                    "consume_handoffs": { "type": "boolean", "default": false }
+                    "consume_handoffs": { "type": "boolean", "default": false },
+                    "query_time": { "type": "string", "description": "RFC3339 valid-time cutoff. Defaults to now." },
+                    "queryTime": { "type": "string" },
+                    "overall_state": { "type": "boolean", "default": false },
+                    "overallState": { "type": "boolean", "default": false },
+                    "seed_limit": { "type": "integer", "default": 16 },
+                    "seedLimit": { "type": "integer" },
+                    "query_embedding": { "type": "array", "items": { "type": "number" } },
+                    "queryEmbedding": { "type": "array", "items": { "type": "number" } },
+                    "embedding_property": { "type": "string", "default": "embedding" },
+                    "embeddingProperty": { "type": "string" },
+                    "ppr_alpha": { "type": "number", "default": 0.15 },
+                    "pprAlpha": { "type": "number" },
+                    "ppr_epsilon": { "type": "number", "default": 0.000001 },
+                    "pprEpsilon": { "type": "number" },
+                    "ppr_max_pushes": { "type": "integer", "default": 100000 },
+                    "pprMaxPushes": { "type": "integer" },
+                    "recency_half_life_seconds": { "type": "number", "default": 0 },
+                    "recencyHalfLifeSeconds": { "type": "number" }
                 }
             }),
         ),
@@ -9483,7 +9736,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "reason": { "type": "string" },
                     "memory_node_type": { "type": "string" },
                     "cites_doc_ids": { "type": "array", "items": { "type": "string" } },
-                    "derived_from_doc_ids": { "type": "array", "items": { "type": "string" } }
+                    "derived_from_doc_ids": { "type": "array", "items": { "type": "string" } },
+                    "contradicts_doc_ids": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["doc_id", "content"]
             }),
@@ -10904,6 +11158,102 @@ mod tests {
             panic!("tool call failed for {name}: {error}");
         }
         response["result"]["structuredContent"].clone()
+    }
+
+    #[test]
+    fn coordination_writes_emit_onto_agent_space_bus() {
+        use theorem_harness_runtime::{subscribe_agent_space_events, AgentSpaceEvent};
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        // A unique tenant keeps this test's events distinguishable from any
+        // other test sharing the process-global agent-space bus.
+        let tenant = "agent-space-emit";
+        let room = "agent-space-room";
+
+        // Subscribe before driving writes so every emitted event is buffered.
+        let mut events = subscribe_agent_space_events();
+
+        call_tool_json(
+            &provider,
+            &config,
+            "coordinate",
+            json!({
+                "tenant": tenant,
+                "actor": "codex",
+                "room_id": room,
+                "delivery": "passive",
+                "message": "agent-space emit smoke",
+                "created_at": "2026-06-01T00:00:00Z"
+            }),
+        );
+        call_tool_json(
+            &provider,
+            &config,
+            "presence",
+            json!({
+                "tenant": tenant,
+                "mode": "heartbeat",
+                "actor": "codex",
+                "room_id": room,
+                "status": "working",
+                "ttl_seconds": 120
+            }),
+        );
+        call_tool_json(
+            &provider,
+            &config,
+            "coordination_intent",
+            json!({
+                "tenant": tenant,
+                "actor": "codex",
+                "room_id": room,
+                "summary": "wire agent-space transport",
+                "claimed_files": ["crates/rustyred-thg-server/src/agent_space.rs"],
+                "updated_at": "2026-06-01T00:02:00Z"
+            }),
+        );
+
+        // Drain the shared bus, tolerating broadcast lag and ignoring events
+        // emitted by other tests (filtered by our unique tenant).
+        let mut saw_message = false;
+        let mut saw_presence = false;
+        let mut saw_footprint = false;
+        loop {
+            match events.try_recv() {
+                Ok(envelope) => {
+                    if envelope.tenant_slug != tenant {
+                        continue;
+                    }
+                    match envelope.event {
+                        AgentSpaceEvent::RoomMessage(message) if message.room_id == room => {
+                            saw_message = true;
+                        }
+                        AgentSpaceEvent::Presence { actor, status, .. }
+                            if actor == "codex" && status == "working" =>
+                        {
+                            saw_presence = true;
+                        }
+                        AgentSpaceEvent::Footprint { actor, target, .. }
+                            if actor == "codex" && target.contains("agent_space.rs") =>
+                        {
+                            saw_footprint = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_message, "coordinate write must reach the agent-space bus");
+        assert!(saw_presence, "presence write must reach the agent-space bus");
+        assert!(
+            saw_footprint,
+            "intent footprint must reach the agent-space bus"
+        );
     }
 
     fn append_harness_event(

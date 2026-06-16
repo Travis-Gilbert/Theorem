@@ -175,6 +175,8 @@ struct RoomPostInput {
 struct RoomContext {
     feed: Vec<RoomFeedItem>,
     participants: Vec<RoomParticipant>,
+    intents: Vec<RoomIntentItem>,
+    records: Vec<RoomRecordItem>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -193,6 +195,33 @@ struct RoomParticipant {
     actor: String,
     status: String,
     last_seen: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoomIntentItem {
+    actor: String,
+    status: String,
+    summary: String,
+    footprint: Vec<String>,
+    updated_at: Option<String>,
+    expected_completion: Option<String>,
+    repo: Option<String>,
+    branch: Option<String>,
+    task: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoomRecordItem {
+    id: String,
+    kind: String,
+    actor: Option<String>,
+    title: Option<String>,
+    summary: String,
+    body: Option<String>,
+    refs: Vec<String>,
+    created_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1449,7 +1478,47 @@ fn room_context_from_payload(payload: &Value) -> RoomContext {
             last_seen: string_at(item, &["refreshed_at", "updated_at", "created_at"]),
         })
         .collect();
-    RoomContext { feed, participants }
+    let intents = payload
+        .get("intents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| RoomIntentItem {
+            actor: string_at(item, &["actor_id", "actor"]).unwrap_or_else(|| "unknown".to_string()),
+            status: string_at(item, &["status"]).unwrap_or_else(|| "working".to_string()),
+            summary: string_at(item, &["summary"]).unwrap_or_default(),
+            footprint: string_array_at(item, &["footprint", "claimed_files", "claimedFiles"]),
+            updated_at: string_at(item, &["updated_at", "updatedAt", "created_at"]),
+            expected_completion: string_at(item, &["expected_completion", "expectedCompletion"]),
+            repo: string_at(item, &["repo"]),
+            branch: string_at(item, &["branch"]),
+            task: string_at(item, &["task"]),
+        })
+        .collect();
+    let records = payload
+        .get("records")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| RoomRecordItem {
+            id: string_at(item, &["record_id", "recordId", "id"])
+                .unwrap_or_else(|| format!("record-{}", now_millis())),
+            kind: string_at(item, &["record_type", "recordType", "kind"])
+                .unwrap_or_else(|| "event".to_string()),
+            actor: string_at(item, &["actor_id", "actor"]),
+            title: string_at(item, &["title"]),
+            summary: string_at(item, &["summary", "title", "body"]).unwrap_or_default(),
+            body: string_at(item, &["body"]),
+            refs: string_array_at(item, &["refs", "source_refs", "sourceRefs"]),
+            created_at: string_at(item, &["created_at", "createdAt"]),
+        })
+        .collect();
+    RoomContext {
+        feed,
+        participants,
+        intents,
+        records,
+    }
 }
 
 fn queue_jobs_from_payload(payload: &Value) -> Vec<QueueJob> {
@@ -1525,6 +1594,17 @@ fn strip_html(input: &str) -> String {
 fn string_at(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
+}
+
+fn string_array_at(value: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|entry| !entry.trim().is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn domain_tag(url: &str) -> String {

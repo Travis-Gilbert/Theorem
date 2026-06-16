@@ -5423,6 +5423,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pilot-core"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6650,6 +6659,7 @@ dependencies = [
  "blake3",
  "futures-util",
  "lol_html",
+ "pilot-core",
  "redis",
  "reqwest 0.12.28",
  "rustyred-thg-core",

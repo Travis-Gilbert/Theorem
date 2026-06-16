@@ -1,0 +1,15 @@
+[package]
+name = "pilot-core"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Servo-free, Playwright-class browser automation core: locator, actionability + auto-wait, geometry snapshot, coordinate synthesis, and web-first assertions behind a BrowserDriver trait. In-place precursor to an open-source 'WebDriver BiDi for Servo'."
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "macros", "rt", "rt-multi-thread"] }

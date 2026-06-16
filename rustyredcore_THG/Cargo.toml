@@ -33,6 +33,7 @@ members = [
     "crates/rustyred-thg-connectors",
     "crates/ensemble",
     "crates/prose-check",
+    "crates/pilot-core",
 ]
 resolver = "2"
 

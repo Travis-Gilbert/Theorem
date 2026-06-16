@@ -17,7 +17,9 @@ import type {
   AgentIngestionReceipt,
   QueueJob,
   RoomFeedItem,
+  RoomIntent,
   RoomParticipant,
+  RoomRecord,
   HarnessSettings,
   PageContext,
   ProviderId,
@@ -319,12 +321,14 @@ export async function spaceBindRoom(input: SpaceBindInput): Promise<void> {
 export interface RoomContext {
   feed: RoomFeedItem[];
   participants: RoomParticipant[];
+  intents: RoomIntent[];
+  records: RoomRecord[];
 }
 
 /** Rust: `room_context(room_id) -> RoomContext`. */
 export async function roomContext(roomId: string): Promise<RoomContext> {
   if (isTauri()) return invoke<RoomContext>("room_context", { roomId });
-  return { feed: [], participants: [] };
+  return { feed: [], participants: [], intents: [], records: [] };
 }
 
 export interface RoomPostInput {
