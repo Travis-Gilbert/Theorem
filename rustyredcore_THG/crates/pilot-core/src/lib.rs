@@ -39,3 +39,9 @@ pub use types::{
 
 pub mod masking;
 pub use masking::{MaskedText, SensitiveData};
+
+pub mod automation;
+pub use automation::*;
+
+pub mod driver;
+pub use driver::*;
