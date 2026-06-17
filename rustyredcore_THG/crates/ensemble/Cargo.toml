@@ -8,6 +8,7 @@ rust-version = "1.85"
 
 [dependencies]
 rustyred-thg-core = { path = "../rustyred-thg-core" }
+rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
 theorem-harness-core = { path = "../theorem-harness-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

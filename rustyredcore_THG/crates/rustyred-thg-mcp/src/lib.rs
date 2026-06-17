@@ -4206,6 +4206,13 @@ fn recall_memory_payload(
         actor: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
         since: argument_text(arguments, &["since"]).unwrap_or_default(),
         kind: argument_text(arguments, &["kind"]).unwrap_or_default(),
+        project_slug: argument_text(arguments, &["project_slug", "projectSlug"])
+            .unwrap_or_default(),
+        project_permeability: argument_f64_any(
+            arguments,
+            &["project_permeability", "projectPermeability"],
+        )
+        .unwrap_or(0.75),
         limit: argument_u64(arguments, &["limit"]).unwrap_or(10) as usize,
         include_low_fitness: arguments
             .get("include_low_fitness")

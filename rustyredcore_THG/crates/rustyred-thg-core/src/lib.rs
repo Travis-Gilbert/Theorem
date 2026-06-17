@@ -18,6 +18,7 @@ pub mod hooks;
 pub mod instant_kg;
 pub mod ordered;
 pub mod plugin;
+pub mod ppr_cache;
 pub mod spatial;
 #[cfg(feature = "s2")]
 pub mod spatial_s2;
@@ -75,6 +76,10 @@ pub use plugin::{
     normalize_plugin_command, PluginCapability, PluginCapabilityKind, PluginExecutionOutput,
     PluginOperationContext, PluginOperationHandler, PluginOperationRegistration, PluginRegistry,
     RustyRedPlugin,
+};
+pub use ppr_cache::{
+    cached_personalized_pagerank, cached_single_seed_personalized_pagerank, clear_scoped_ppr_cache,
+    merge_ppr_scores, scoped_ppr_cache_len,
 };
 pub use spatial::{
     make_spatial_backend, make_spatial_backend_from_value, SpatialBackend, SpatialDesignation,

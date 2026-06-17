@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use rustyred_thg_core::{personalized_pagerank, EdgeRecord, ThgResult};
+use rustyred_thg_core::{cached_single_seed_personalized_pagerank, EdgeRecord, ThgResult};
 
 use crate::outcomes::{affordance_nodes, effective_affordance_fitness_from_node};
 use crate::types::{
@@ -40,10 +40,17 @@ pub fn select_affordances<S: AffordanceGraphStore>(
     let adjacency = affordance_adjacency(&snapshot.edges);
 
     let seed_node = task_type_node_id(&req.tenant_id, &req.task_type);
-    let mut seeds = HashMap::new();
-    seeds.insert(seed_node, 1.0_f64);
     let alpha = (1.0 - req.ppr_damping as f64).clamp(0.01, 0.99);
-    let ppr = personalized_pagerank(&adjacency, &seeds, alpha, 1e-4, req.ppr_max_iter as usize);
+    let ppr = cached_single_seed_personalized_pagerank(
+        "affordance-selection-task",
+        snapshot.version,
+        &adjacency,
+        &seed_node,
+        1.0,
+        alpha,
+        1e-4,
+        req.ppr_max_iter as usize,
+    );
 
     let min_fitness = req.min_fitness.unwrap_or(DEFAULT_MIN_FITNESS);
     let mut refs = Vec::new();

@@ -16,16 +16,28 @@
 //! via [`crate::registry::list_packs`] and then calls the pure [`select`].
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::decision::{EnsembleDecision, RejectedCandidate, SelectedCapability};
+use crate::outcomes::{
+    effective_pack_fitness_from_node, PACK_SEQUENCED_WITH, PACK_SERVED_TASK, TASK_IN_DOMAIN,
+};
 use crate::registry::{
-    list_packs, CapabilityPack, EnsembleGraphStore, EnsembleResult, PackKind, TrustTier,
+    domain_node_id, list_packs, pack_node_id, CapabilityPack, EnsembleGraphStore, EnsembleResult,
+    PackKind, TrustTier, PACK_EXPOSES_AFFORDANCE, PACK_IN_DOMAIN,
 };
 use crate::trust::{meets_floor, parse_trust_floor, trust_rank, trust_score};
+use rustyred_thg_affordances::{
+    affordance_nodes, task_type_node_id, Affordance, AffordanceGraphStore, CapabilityScope,
+    DEFAULT_COLD_START_SCORE, DEFAULT_MIN_FITNESS, PRODUCED_OUTCOME, SEQUENCED_WITH, SERVED_TASK,
+};
+use rustyred_thg_core::{
+    cached_single_seed_personalized_pagerank, merge_ppr_scores, personalized_pagerank, EdgeRecord,
+    GraphSnapshot, GraphStore,
+};
 
 /// Cost charged to a pack when neither the priors nor the pack spec name one.
 const DEFAULT_COST_UNITS: u64 = 1;
@@ -55,6 +67,50 @@ pub struct EnsembleSelectRequest {
     pub candidates: Vec<CapabilityPack>,
     #[serde(default)]
     pub priors: Value,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UnifiedSelectionRequest {
+    pub task: String,
+    #[serde(default)]
+    pub budget_units: Option<u64>,
+    #[serde(default)]
+    pub max_selected: Option<usize>,
+    #[serde(default)]
+    pub pack_kind: Option<PackKind>,
+    #[serde(default)]
+    pub priors: Value,
+    #[serde(default)]
+    pub scope: CapabilityScope,
+    #[serde(default)]
+    pub min_fitness: Option<f32>,
+    #[serde(default)]
+    pub k: Option<usize>,
+    #[serde(default)]
+    pub domain_refs: Vec<String>,
+    #[serde(default)]
+    pub domain_weight: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedSelectionEntry {
+    pub entry_type: String,
+    pub id: String,
+    pub label: String,
+    pub score: f64,
+    pub reason: String,
+    #[serde(default)]
+    pub pack_content_hash: Option<String>,
+    #[serde(default)]
+    pub affordance_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedSelectionResult {
+    pub task: String,
+    pub live_graph_version: u64,
+    pub entries: Vec<UnifiedSelectionEntry>,
+    pub ensemble_decision: EnsembleDecision,
 }
 
 /// Internal scored candidate. Carries the cloned pack plus the deterministic score breakdown.
@@ -203,7 +259,117 @@ pub fn select_from_store<S: EnsembleGraphStore>(
     mut request: EnsembleSelectRequest,
 ) -> EnsembleResult<EnsembleDecision> {
     request.candidates = list_packs(store, tenant, kind)?;
+    if let Some(snapshot) = store.pack_graph_snapshot()? {
+        let prior = live_selection_prior_from_snapshot(&snapshot, tenant, &request.task, &[]);
+        request.priors = merge_live_pack_scores(
+            request.priors,
+            &request.candidates,
+            &prior.pack_scores,
+            prior.graph_version,
+        );
+    }
     Ok(select(&request))
+}
+
+pub fn select_unified_from_store<S>(
+    store: &S,
+    tenant: &str,
+    request: UnifiedSelectionRequest,
+) -> EnsembleResult<UnifiedSelectionResult>
+where
+    S: EnsembleGraphStore + AffordanceGraphStore + GraphStore,
+{
+    let task = request.task.trim().to_string();
+    let prior = live_selection_prior(store, tenant, &task, &request.domain_refs)?;
+    let candidates = list_packs(store, tenant, request.pack_kind)?;
+    let pack_priors = merge_live_pack_scores(
+        request.priors.clone(),
+        &candidates,
+        &prior.pack_scores,
+        prior.graph_version,
+    );
+    let ensemble_decision = select(&EnsembleSelectRequest {
+        task: task.clone(),
+        budget_units: request.budget_units,
+        max_selected: request.max_selected,
+        candidates: candidates.clone(),
+        priors: pack_priors,
+    });
+    let pack_by_hash = candidates
+        .into_iter()
+        .map(|pack| (pack.pack_content_hash.clone(), pack))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut entries = Vec::new();
+    for selected in &ensemble_decision.selected {
+        let Some(pack) = pack_by_hash.get(&selected.pack_content_hash) else {
+            continue;
+        };
+        entries.push(UnifiedSelectionEntry {
+            entry_type: "pack".to_string(),
+            id: pack_node_id(&pack.tenant_slug, &pack.pack_content_hash),
+            label: pack.title.clone(),
+            score: selected.score,
+            reason: selected.reason.clone(),
+            pack_content_hash: Some(pack.pack_content_hash.clone()),
+            affordance_id: None,
+        });
+    }
+
+    let min_fitness = request.min_fitness.unwrap_or(DEFAULT_MIN_FITNESS);
+    for node in affordance_nodes(store)
+        .map_err(|error| crate::registry::EnsembleError::InvalidPack(format!("{error:?}")))?
+    {
+        let affordance = match Affordance::from_node_record(&node) {
+            Ok(affordance) => affordance,
+            Err(_) => continue,
+        };
+        if affordance.tenant_id != tenant {
+            continue;
+        }
+        if !request.scope.admits(&affordance) {
+            continue;
+        }
+        let fitness = rustyred_thg_affordances::effective_affordance_fitness_from_node(&node);
+        if fitness < min_fitness {
+            continue;
+        }
+        let structural = prior.ppr.get(&node.id).copied().unwrap_or(0.0) + DEFAULT_COLD_START_SCORE;
+        let score = round6(structural * fitness as f64);
+        entries.push(UnifiedSelectionEntry {
+            entry_type: "affordance".to_string(),
+            id: node.id.clone(),
+            label: if affordance.label.trim().is_empty() {
+                affordance.affordance_id.clone()
+            } else {
+                affordance.label.clone()
+            },
+            score,
+            reason: format!(
+                "live structural prior {:.4} * fitness {:.4}",
+                structural, fitness
+            ),
+            pack_content_hash: None,
+            affordance_id: Some(affordance.affordance_id),
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.entry_type.cmp(&right.entry_type))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    entries.truncate(request.k.unwrap_or(20).max(1));
+
+    Ok(UnifiedSelectionResult {
+        task,
+        live_graph_version: prior.graph_version,
+        entries,
+        ensemble_decision,
+    })
 }
 
 fn reject(kind: String, hash: String, reason: String) -> RejectedCandidate {
@@ -309,10 +475,198 @@ fn canonical_kind_label(value: &str) -> String {
         .unwrap_or_else(|| value.trim().to_ascii_lowercase())
 }
 
+struct LiveSelectionPrior {
+    ppr: HashMap<String, f64>,
+    pack_scores: BTreeMap<String, f64>,
+    graph_version: u64,
+}
+
+fn live_selection_prior<S: GraphStore>(
+    store: &S,
+    tenant: &str,
+    task: &str,
+    domain_refs: &[String],
+) -> EnsembleResult<LiveSelectionPrior> {
+    let snapshot = store.graph_snapshot()?;
+    Ok(live_selection_prior_from_snapshot(
+        &snapshot,
+        tenant,
+        task,
+        domain_refs,
+    ))
+}
+
+fn live_selection_prior_from_snapshot(
+    snapshot: &GraphSnapshot,
+    tenant: &str,
+    task: &str,
+    domain_refs: &[String],
+) -> LiveSelectionPrior {
+    let adjacency = selection_adjacency(snapshot);
+    let mut ppr = HashMap::new();
+    let task_node = task_type_node_id(tenant, task);
+    if !task.trim().is_empty() {
+        ppr = cached_single_seed_personalized_pagerank(
+            "ensemble-selection-task",
+            snapshot.version,
+            &adjacency,
+            &task_node,
+            1.0,
+            0.15,
+            1e-5,
+            20_000,
+        );
+    }
+    let mut domain_seeds = HashMap::new();
+    for domain_ref in domain_refs {
+        let domain_ref = domain_ref.trim();
+        if domain_ref.is_empty() {
+            continue;
+        }
+        domain_seeds.insert(domain_node_id(tenant, domain_ref), 1.0);
+    }
+    if !domain_seeds.is_empty() {
+        merge_ppr_scores(
+            &mut ppr,
+            personalized_pagerank(&adjacency, &domain_seeds, 0.15, 1e-5, 20_000),
+        );
+    }
+    let mut pack_scores = BTreeMap::new();
+    for node in snapshot.nodes.iter().filter(|node| {
+        node.labels
+            .iter()
+            .any(|label| label == crate::registry::PACK_LABEL)
+    }) {
+        let Ok(pack) = serde_json::from_value::<CapabilityPack>(node.properties.clone()) else {
+            continue;
+        };
+        if pack.tenant_slug != tenant && pack.tenant_slug != "default" {
+            continue;
+        }
+        let structural = ppr.get(&node.id).copied().unwrap_or(0.0) + DEFAULT_COLD_START_SCORE;
+        let fitness = effective_pack_fitness_from_node(node);
+        pack_scores.insert(pack.pack_content_hash, round6(structural * fitness as f64));
+    }
+    LiveSelectionPrior {
+        ppr,
+        pack_scores,
+        graph_version: snapshot.version,
+    }
+}
+
+fn merge_live_pack_scores(
+    priors: Value,
+    candidates: &[CapabilityPack],
+    live_scores: &BTreeMap<String, f64>,
+    graph_version: u64,
+) -> Value {
+    let mut object = priors.as_object().cloned().unwrap_or_default();
+    let prior_weight = prior_f64(
+        &Value::Object(object.clone()),
+        "prior_weight",
+        DEFAULT_PRIOR_WEIGHT,
+    );
+    let lexical_weight = prior_f64(
+        &Value::Object(object.clone()),
+        "lexical_weight",
+        DEFAULT_LEXICAL_WEIGHT,
+    );
+    let mut pack_scores = object
+        .get("pack_scores")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for candidate in candidates {
+        let Some(live_score) = live_scores.get(&candidate.pack_content_hash).copied() else {
+            continue;
+        };
+        let blended = pack_scores
+            .get(&candidate.pack_content_hash)
+            .and_then(Value::as_f64)
+            .map(|offline| prior_weight * offline + lexical_weight * live_score)
+            .unwrap_or(live_score);
+        pack_scores.insert(candidate.pack_content_hash.clone(), json!(round6(blended)));
+    }
+    object.insert("pack_scores".to_string(), Value::Object(pack_scores));
+    object.insert("live_prior_source".to_string(), json!("graph_ppr"));
+    object.insert("graph_version".to_string(), json!(graph_version));
+    Value::Object(object)
+}
+
+fn selection_adjacency(snapshot: &GraphSnapshot) -> HashMap<String, Vec<(String, f64)>> {
+    let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    for edge in &snapshot.edges {
+        if edge.tombstone {
+            continue;
+        }
+        match edge.edge_type.as_str() {
+            SERVED_TASK | PACK_SERVED_TASK => {
+                let weight = edge.effective_confidence().clamp(0.0, 1.0);
+                adjacency
+                    .entry(edge.to_id.clone())
+                    .or_default()
+                    .push((edge.from_id.clone(), weight));
+            }
+            PRODUCED_OUTCOME => {
+                let weight = edge_outcome_weight(edge);
+                adjacency
+                    .entry(edge.from_id.clone())
+                    .or_default()
+                    .push((edge.to_id.clone(), weight));
+                adjacency
+                    .entry(edge.to_id.clone())
+                    .or_default()
+                    .push((edge.from_id.clone(), weight));
+            }
+            SEQUENCED_WITH | PACK_SEQUENCED_WITH => {
+                adjacency
+                    .entry(edge.from_id.clone())
+                    .or_default()
+                    .push((edge.to_id.clone(), 0.5));
+                adjacency
+                    .entry(edge.to_id.clone())
+                    .or_default()
+                    .push((edge.from_id.clone(), 0.5));
+            }
+            PACK_EXPOSES_AFFORDANCE => {
+                adjacency
+                    .entry(edge.from_id.clone())
+                    .or_default()
+                    .push((edge.to_id.clone(), 0.8));
+                adjacency
+                    .entry(edge.to_id.clone())
+                    .or_default()
+                    .push((edge.from_id.clone(), 0.8));
+            }
+            PACK_IN_DOMAIN | TASK_IN_DOMAIN => {
+                adjacency
+                    .entry(edge.from_id.clone())
+                    .or_default()
+                    .push((edge.to_id.clone(), 0.7));
+                adjacency
+                    .entry(edge.to_id.clone())
+                    .or_default()
+                    .push((edge.from_id.clone(), 0.9));
+            }
+            _ => {}
+        }
+    }
+    adjacency
+}
+
+fn edge_outcome_weight(edge: &EdgeRecord) -> f64 {
+    edge.properties
+        .get("outcome_value")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.5)
+        .max(0.05)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::{register_pack, PackExposure};
+    use rustyred_thg_affordances::{register_connector, ConnectorManifest, ToolManifest};
     use rustyred_thg_core::InMemoryGraphStore;
     use serde_json::json;
 
@@ -342,6 +696,25 @@ mod tests {
     fn first_party() -> TrustTier {
         TrustTier::FirstParty {
             passport_id: "fp-1".to_string(),
+        }
+    }
+
+    fn connector_manifest() -> ConnectorManifest {
+        ConnectorManifest {
+            tenant_id: "default".to_string(),
+            server_id: "github".to_string(),
+            label: "GitHub".to_string(),
+            tools: vec![ToolManifest {
+                name: "search_code".to_string(),
+                label: "Search code".to_string(),
+                description: "search code".to_string(),
+                input_schema: json!({}),
+                permissions: vec![],
+                cost: json!({}),
+                writeback_policy: "read-only".to_string(),
+                tags: vec!["code".to_string()],
+                description_embedding: None,
+            }],
         }
     }
 
@@ -598,5 +971,69 @@ mod tests {
         let decision = select_from_store(&store, "default", None, req).expect("select");
         assert_eq!(decision.selected.len(), 1);
         assert_eq!(decision.selected[0].kind, "skill");
+    }
+
+    #[test]
+    fn unified_selection_returns_packs_and_affordances_with_domain_bias() {
+        let mut store = InMemoryGraphStore::new();
+        register_connector(&mut store, connector_manifest(), Some("test")).unwrap();
+
+        let mut code = pack(
+            "code-pack",
+            "skill",
+            "Code pack",
+            "code graph work",
+            &["code"],
+            TrustTier::Unverified,
+        );
+        code.spec = json!({
+            "kind": "skill",
+            "title": "Code pack",
+            "description": "code graph work",
+            "capabilities": ["code"],
+            "affordance_ids": ["github.search_code"],
+            "domain_refs": ["code"]
+        });
+        register_pack(&mut store, code).unwrap();
+        register_pack(
+            &mut store,
+            pack(
+                "math-pack",
+                "skill",
+                "Math pack",
+                "symbolic algebra",
+                &["math"],
+                TrustTier::Unverified,
+            ),
+        )
+        .unwrap();
+
+        let result = select_unified_from_store(
+            &store,
+            "default",
+            UnifiedSelectionRequest {
+                task: "neutral task".to_string(),
+                max_selected: Some(1),
+                k: Some(10),
+                domain_refs: vec!["code".to_string()],
+                scope: CapabilityScope::unrestricted("agent"),
+                ..UnifiedSelectionRequest::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.ensemble_decision.selected[0].pack_content_hash,
+            "code-pack"
+        );
+        assert!(result
+            .entries
+            .iter()
+            .any(|entry| entry.entry_type == "pack"));
+        assert!(result
+            .entries
+            .iter()
+            .any(|entry| entry.entry_type == "affordance"
+                && entry.affordance_id.as_deref() == Some("github.search_code")));
     }
 }

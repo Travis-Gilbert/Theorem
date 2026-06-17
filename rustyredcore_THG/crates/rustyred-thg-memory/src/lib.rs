@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustyred_thg_core::{
-    edge_time_interval, now_ms, personalized_pagerank, stable_hash, ActorId, EdgeRecord,
-    EpistemicType, GraphStore, GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery,
-    NodeRecord, PluginCapability, PluginCapabilityKind, PluginOperationContext,
-    PluginOperationRegistration, PluginRegistry, RustyRedPlugin, TimeInterval,
+    cached_single_seed_personalized_pagerank, edge_time_interval, merge_ppr_scores, now_ms,
+    personalized_pagerank, stable_hash, ActorId, EdgeRecord, EpistemicType, GraphStore,
+    GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
+    PluginCapabilityKind, PluginOperationContext, PluginOperationRegistration, PluginRegistry,
+    RustyRedPlugin, TimeInterval,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -12,9 +13,11 @@ use serde_json::{json, Map, Value};
 pub const MEMORY_DOCUMENT_LABEL: &str = "MemoryDocument";
 pub const MEMORY_NODE_LABEL: &str = "MemoryNode";
 pub const MEMORY_SUMMARY_LABEL: &str = "MemorySummary";
+pub const MEMORY_PROJECT_LABEL: &str = "MemoryProject";
 pub const HARNESS_MEMORY_LABEL: &str = "HarnessMemory";
 pub const DERIVED_FROM: &str = "DERIVED_FROM";
 pub const SUPPORTS: &str = "supports";
+pub const MEMORY_IN_PROJECT: &str = "MEMORY_IN_PROJECT";
 pub const MEMORY_PLUGIN_SOURCE: &str = "rustyred_thg_memory";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -27,6 +30,10 @@ pub struct MemoryRecallInput {
     pub query: String,
     #[serde(default)]
     pub seeds: Vec<String>,
+    #[serde(default)]
+    pub project_slug: String,
+    #[serde(default = "default_project_permeability")]
+    pub project_permeability: f64,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     #[serde(default)]
@@ -46,6 +53,8 @@ impl Default for MemoryRecallInput {
             tenant_slug: String::new(),
             query: String::new(),
             seeds: Vec::new(),
+            project_slug: String::new(),
+            project_permeability: default_project_permeability(),
             top_k: default_top_k(),
             edge_type_weights: BTreeMap::new(),
             as_of_ms: None,
@@ -278,17 +287,23 @@ pub fn recall<S: GraphStore>(
         .into_iter()
         .filter(|node| node_visible_for_recall(node, as_of_ms))
         .collect::<Vec<_>>();
-    let id_set = nodes
+    let mut id_set = nodes
         .iter()
         .map(|node| node.id.clone())
         .collect::<BTreeSet<_>>();
+    let project_anchor = project_seed_node(&tenant_id, &input);
+    if let Some(anchor) = project_anchor.as_ref() {
+        id_set.insert(anchor.clone());
+    }
     let seeds = recall_seeds(&nodes, &id_set, &input);
     let adjacency = memory_adjacency(store, &id_set, as_of_ms, &input.edge_type_weights)?;
-    let ppr = if seeds.is_empty() {
-        HashMap::new()
-    } else {
-        personalized_pagerank(&adjacency, &seeds, 0.15, 1e-5, 20_000)
-    };
+    let ppr = recall_ppr(
+        &adjacency,
+        seeds,
+        project_anchor.as_deref(),
+        &tenant_id,
+        store.stats().version,
+    );
 
     let mut ranked = nodes
         .iter()
@@ -297,6 +312,7 @@ pub fn recall<S: GraphStore>(
                 node,
                 &input.query,
                 ppr.get(&node.id).copied().unwrap_or(0.0),
+                project_rank_bonus(node, &input),
             )
         })
         .collect::<Vec<_>>();
@@ -663,7 +679,7 @@ fn memory_adjacency<S: GraphStore>(
     as_of_ms: i64,
     weights: &BTreeMap<String, f64>,
 ) -> GraphStoreResult<HashMap<String, Vec<(String, f64)>>> {
-    let mut adjacency = HashMap::new();
+    let mut adjacency: HashMap<String, Vec<(String, f64)>> = HashMap::new();
     for id in ids {
         let mut neighbors = Vec::new();
         for hit in store.neighbors(NeighborQuery::out(id).with_include_expired(true)) {
@@ -675,13 +691,26 @@ fn memory_adjacency<S: GraphStore>(
                     continue;
                 }
             }
-            let weight = weights.get(&hit.edge_type).copied().unwrap_or(1.0)
-                * hit.confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+            let weight = weights.get(&hit.edge_type).copied().unwrap_or_else(|| {
+                if hit.edge_type == MEMORY_IN_PROJECT {
+                    0.85
+                } else {
+                    1.0
+                }
+            }) * hit.confidence.unwrap_or(1.0).clamp(0.0, 1.0);
             if weight > 0.0 {
-                neighbors.push((hit.node_id, weight));
+                if hit.edge_type == MEMORY_IN_PROJECT {
+                    adjacency
+                        .entry(hit.node_id.clone())
+                        .or_default()
+                        .push((id.clone(), weight));
+                    neighbors.push((hit.node_id, weight * 0.5));
+                } else {
+                    neighbors.push((hit.node_id, weight));
+                }
             }
         }
-        adjacency.insert(id.clone(), neighbors);
+        adjacency.entry(id.clone()).or_default().extend(neighbors);
     }
     Ok(adjacency)
 }
@@ -697,13 +726,12 @@ fn recall_seeds(
             seeds.insert(seed.clone(), 1.0);
         }
     }
-    if !seeds.is_empty() {
-        return seeds;
-    }
-    for node in nodes {
-        let score = lexical_score(&input.query, node);
-        if score > 0.0 {
-            seeds.insert(node.id.clone(), score);
+    if seeds.is_empty() {
+        for node in nodes {
+            let score = lexical_score(&input.query, node);
+            if score > 0.0 {
+                seeds.insert(node.id.clone(), score);
+            }
         }
     }
     if seeds.is_empty() {
@@ -711,10 +739,52 @@ fn recall_seeds(
             seeds.insert(node.id.clone(), 1.0);
         }
     }
+    add_project_seed(&mut seeds, id_set, input);
     seeds
 }
 
-fn ranked_memory(node: &NodeRecord, query: &str, ppr_score: f64) -> RankedMemory {
+fn recall_ppr(
+    adjacency: &HashMap<String, Vec<(String, f64)>>,
+    seeds: HashMap<String, f64>,
+    project_anchor: Option<&str>,
+    tenant_id: &str,
+    graph_version: u64,
+) -> HashMap<String, f64> {
+    if seeds.is_empty() {
+        return HashMap::new();
+    }
+    let mut live_seeds = seeds;
+    let mut ppr = HashMap::new();
+    if let Some(anchor) = project_anchor {
+        if let Some(weight) = live_seeds.remove(anchor) {
+            let scope = format!("memory-project-anchor:{tenant_id}");
+            ppr = cached_single_seed_personalized_pagerank(
+                &scope,
+                graph_version,
+                adjacency,
+                anchor,
+                weight,
+                0.15,
+                1e-5,
+                20_000,
+            );
+        }
+    }
+    if !live_seeds.is_empty() {
+        merge_ppr_scores(
+            &mut ppr,
+            personalized_pagerank(adjacency, &live_seeds, 0.15, 1e-5, 20_000),
+        );
+    }
+    ppr
+}
+
+fn ranked_memory(
+    node: &NodeRecord,
+    query: &str,
+    ppr_score: f64,
+    project_bonus: f64,
+) -> RankedMemory {
     let activation = prop_f64(&node.properties, "activation").unwrap_or(0.0);
     let fitness = fitness_score(&node.properties);
     let recency = prop_i64(&node.properties, "updated_at_ms")
@@ -722,7 +792,8 @@ fn ranked_memory(node: &NodeRecord, query: &str, ppr_score: f64) -> RankedMemory
         .map(|value| (value.max(0) as f64 + 1.0).log10() / 16.0)
         .unwrap_or(0.0);
     let lexical = lexical_score(query, node);
-    let score = ppr_score * 2.0 + lexical + activation * 0.05 + fitness * 0.2 + recency;
+    let score =
+        ppr_score * 2.0 + lexical + activation * 0.05 + fitness * 0.2 + recency + project_bonus;
     let title = prop_str(&node.properties, "title").unwrap_or_else(|| node.id.clone());
     let summary = prop_str(&node.properties, "summary").unwrap_or_default();
     let content = prop_str(&node.properties, "content").unwrap_or_default();
@@ -736,6 +807,11 @@ fn ranked_memory(node: &NodeRecord, query: &str, ppr_score: f64) -> RankedMemory
     );
     if let Some(source_ref) = prop_str(&node.properties, "source_ref") {
         provenance.insert("source_ref".to_string(), Value::String(source_ref));
+    }
+    if let Some(project_slug) =
+        prop_str(&node.properties, "project_slug").filter(|value| !value.trim().is_empty())
+    {
+        provenance.insert("project_slug".to_string(), Value::String(project_slug));
     }
     RankedMemory {
         id: prop_str(&node.properties, "doc_id")
@@ -808,15 +884,121 @@ fn intervals_overlap(left: &EdgeRecord, right: &EdgeRecord) -> bool {
 }
 
 fn consolidation_key(node: &NodeRecord) -> String {
+    let project = prop_str(&node.properties, "project_slug")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "tenant".to_string());
     prop_str(&node.properties, "source_ref")
         .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("source:{value}"))
+        .map(|value| format!("project:{project}:source:{value}"))
         .unwrap_or_else(|| {
             let content = prop_str(&node.properties, "content")
                 .or_else(|| prop_str(&node.properties, "summary"))
                 .unwrap_or_else(|| node.id.clone());
-            format!("content:{}", stable_hash(content))
+            format!("project:{project}:content:{}", stable_hash(content))
         })
+}
+
+/// Stable id for a project's anchor hub node.
+///
+/// This MUST resolve to the same id the write path (`theorem-harness-runtime::memory`)
+/// produces, because the membership edge `member --MEMORY_IN_PROJECT--> anchor` is
+/// written there and read here: recall only sees the edge when this id matches the
+/// edge's `to_id`. The write path slugifies the project segment and lowercases the
+/// tenant, so a trim-only id here would silently miss the membership for any slug with
+/// caps/spaces/punctuation (the bias would vanish with no error). We therefore mirror
+/// the write path's normalization exactly. A cross-crate parity test
+/// (`theorem-harness-runtime/tests/project_anchor_parity.rs`) fails if the two ever drift.
+pub fn project_anchor_node_id(tenant_id: &str, project_slug: &str) -> String {
+    let tenant = {
+        let normalized = tenant_id.trim().to_lowercase();
+        if normalized.is_empty() {
+            "default".to_string()
+        } else {
+            normalized
+        }
+    };
+    let slug = {
+        let slugged = project_anchor_slugify(project_slug);
+        if slugged.is_empty() {
+            "unknown".to_string()
+        } else {
+            slugged
+        }
+    };
+    format!("mem:project:{tenant}:{slug}")
+}
+
+/// Mirror of `theorem-harness-runtime::memory::slugify`, kept byte-identical so the
+/// recall-side anchor id matches the write-side anchor id. Guarded by the cross-crate
+/// parity test.
+fn project_anchor_slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for character in value.trim().to_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+        if slug.len() >= 96 {
+            break;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+pub fn project_membership_edge_id(tenant_id: &str, memory_id: &str, project_slug: &str) -> String {
+    memory_edge_id(
+        tenant_id,
+        MEMORY_IN_PROJECT,
+        memory_id,
+        &project_anchor_node_id(tenant_id, project_slug),
+    )
+}
+
+fn project_seed_node(tenant_id: &str, input: &MemoryRecallInput) -> Option<String> {
+    let project_slug = input.project_slug.trim();
+    if project_slug.is_empty() || project_permeability(input) <= 0.0 {
+        None
+    } else {
+        Some(project_anchor_node_id(tenant_id, project_slug))
+    }
+}
+
+fn add_project_seed(
+    seeds: &mut HashMap<String, f64>,
+    id_set: &BTreeSet<String>,
+    input: &MemoryRecallInput,
+) {
+    let Some(anchor) = project_seed_node(&normalized_tenant(input), input) else {
+        return;
+    };
+    if !id_set.contains(&anchor) {
+        return;
+    }
+    let weight = project_permeability(input);
+    seeds
+        .entry(anchor)
+        .and_modify(|existing| *existing = existing.max(weight))
+        .or_insert(weight);
+}
+
+fn project_permeability(input: &MemoryRecallInput) -> f64 {
+    input.project_permeability.clamp(0.0, 1.0) * 4.0
+}
+
+fn project_rank_bonus(node: &NodeRecord, input: &MemoryRecallInput) -> f64 {
+    let project_slug = input.project_slug.trim();
+    if project_slug.is_empty() {
+        return 0.0;
+    }
+    if prop_str(&node.properties, "project_slug").as_deref() == Some(project_slug) {
+        project_permeability(input) * 10.0
+    } else {
+        0.0
+    }
 }
 
 fn summary_node_id(tenant_id: &str, group: &[NodeRecord]) -> String {
@@ -964,6 +1146,10 @@ fn default_budget_tokens() -> i64 {
     2_000
 }
 
+fn default_project_permeability() -> f64 {
+    0.75
+}
+
 fn default_max_groups() -> usize {
     32
 }
@@ -1001,6 +1187,37 @@ mod tests {
                 "updated_at_ms": 1000,
             }),
         )
+    }
+
+    fn memory_doc_in_project(id: &str, title: &str, content: &str, project: &str) -> NodeRecord {
+        let mut node = memory_doc(id, title, content);
+        set_prop_str(&mut node.properties, "project_slug", project);
+        node
+    }
+
+    fn project_anchor(tenant: &str, project: &str) -> NodeRecord {
+        NodeRecord::new(
+            project_anchor_node_id(tenant, project),
+            [HARNESS_MEMORY_LABEL, MEMORY_PROJECT_LABEL],
+            json!({
+                "tenant_id": tenant,
+                "tenant_slug": tenant,
+                "project_slug": project,
+                "source": MEMORY_PLUGIN_SOURCE,
+            }),
+        )
+    }
+
+    fn link_project(store: &mut InMemoryGraphStore, tenant: &str, memory: &str, project: &str) {
+        store
+            .upsert_edge(EdgeRecord::new(
+                project_membership_edge_id(tenant, memory, project),
+                memory,
+                MEMORY_IN_PROJECT,
+                project_anchor_node_id(tenant, project),
+                json!({ "tenant_id": tenant, "project_slug": project }),
+            ))
+            .unwrap();
     }
 
     #[test]
@@ -1046,6 +1263,120 @@ mod tests {
             .properties
             .get("last_accessed_ms")
             .is_some());
+    }
+
+    #[test]
+    fn project_scope_biases_recall_without_filtering_sibling_context() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(project_anchor("theorem", "alpha"))
+            .unwrap();
+        store
+            .upsert_node(project_anchor("theorem", "beta"))
+            .unwrap();
+        store
+            .upsert_node(memory_doc_in_project(
+                "mem:alpha",
+                "Shared planning",
+                "shared graph recall",
+                "alpha",
+            ))
+            .unwrap();
+        store
+            .upsert_node(memory_doc_in_project(
+                "mem:alpha-2",
+                "Shared build",
+                "shared graph implementation",
+                "alpha",
+            ))
+            .unwrap();
+        store
+            .upsert_node(memory_doc_in_project(
+                "mem:beta",
+                "Shared sibling",
+                "shared graph context from another project",
+                "beta",
+            ))
+            .unwrap();
+        link_project(&mut store, "theorem", "mem:alpha", "alpha");
+        link_project(&mut store, "theorem", "mem:alpha-2", "alpha");
+        link_project(&mut store, "theorem", "mem:beta", "beta");
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:alpha-beta",
+                "mem:alpha",
+                SUPPORTS,
+                "mem:beta",
+                json!({ "tenant_id": "theorem" }),
+            ))
+            .unwrap();
+
+        let result = recall(
+            &mut store,
+            MemoryRecallInput {
+                tenant_id: "theorem".to_string(),
+                query: "shared graph".to_string(),
+                project_slug: "alpha".to_string(),
+                project_permeability: 1.0,
+                top_k: 3,
+                budget_tokens: 200,
+                bump_activation: false,
+                ..MemoryRecallInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.memories[0].provenance["project_slug"], "alpha");
+        assert!(
+            result
+                .memories
+                .iter()
+                .any(|item| item.graph_id == "mem:beta"),
+            "sibling project memory connected through the tenant graph still surfaces"
+        );
+    }
+
+    #[test]
+    fn project_scope_does_not_cross_the_tenant_wall() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(project_anchor("theorem", "alpha"))
+            .unwrap();
+        store.upsert_node(project_anchor("other", "alpha")).unwrap();
+        store
+            .upsert_node(memory_doc_in_project(
+                "mem:alpha",
+                "Tenant memory",
+                "tenant wall",
+                "alpha",
+            ))
+            .unwrap();
+        let mut other = memory_doc_in_project("mem:other", "Other tenant", "tenant wall", "alpha");
+        set_prop_str(&mut other.properties, "tenant_id", "other");
+        set_prop_str(&mut other.properties, "tenant_slug", "other");
+        store.upsert_node(other).unwrap();
+        link_project(&mut store, "theorem", "mem:alpha", "alpha");
+        link_project(&mut store, "other", "mem:other", "alpha");
+
+        let result = recall(
+            &mut store,
+            MemoryRecallInput {
+                tenant_id: "theorem".to_string(),
+                query: "tenant wall".to_string(),
+                project_slug: "alpha".to_string(),
+                project_permeability: 1.0,
+                top_k: 10,
+                budget_tokens: 200,
+                bump_activation: false,
+                ..MemoryRecallInput::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result
+            .memories
+            .iter()
+            .all(|item| item.graph_id != "mem:other"));
     }
 
     #[test]

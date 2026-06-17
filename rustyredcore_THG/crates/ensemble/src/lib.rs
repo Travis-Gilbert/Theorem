@@ -15,15 +15,24 @@
 //! follow-up. Tracked in `docs/plans/ensemble/ensemble-rs-implementation-plan.md`.
 
 pub mod decision;
+pub mod outcomes;
 pub mod registry;
 pub mod selector;
 pub mod trust;
 
 pub use decision::{EnsembleDecision, RejectedCandidate, SelectedCapability};
+pub use outcomes::{
+    effective_pack_fitness_from_node, record_pack_invocation, PackInvocationRecordRequest,
+    PackInvocationRecordResult, PACK_INVOCATION_RECEIPT_LABEL, PACK_SEQUENCED_WITH,
+    PACK_SERVED_TASK, TASK_IN_DOMAIN,
+};
 pub use registry::{
     get_pack, list_packs, pack_node_id, register_pack, CapabilityPack, EnsembleError,
     EnsembleGraphStore, EnsembleResult, PackExposure, PackKind, TrustTier, PACK_ARTIFACT_EDGE,
-    PACK_LABEL, PACK_SOURCE_EDGE,
+    PACK_EXPOSES_AFFORDANCE, PACK_IN_DOMAIN, PACK_LABEL, PACK_SOURCE_EDGE,
 };
-pub use selector::{select, select_from_store, EnsembleSelectRequest};
+pub use selector::{
+    select, select_from_store, select_unified_from_store, EnsembleSelectRequest,
+    UnifiedSelectionEntry, UnifiedSelectionRequest, UnifiedSelectionResult,
+};
 pub use trust::{meets_floor, parse_trust_floor, passport_id, trust_rank, trust_score};

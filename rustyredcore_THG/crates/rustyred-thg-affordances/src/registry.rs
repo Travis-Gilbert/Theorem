@@ -11,10 +11,10 @@ use rustyred_thg_core::{GraphMutation, GraphMutationBatch, NodeRecord, ThgResult
 use theorem_harness_core::default_affordance_registry;
 
 use crate::types::{
-    connector_node_id, edge_with_affordance_provenance, tenant_node_id,
-    thg_error_from_store, Affordance, AffordanceGraphStore, AffordanceUpsertResult,
-    ConnectorManifest, ConnectorRegisterResult, ToolManifest, CONNECTOR_LABEL,
-    DEFAULT_HALF_LIFE_DAYS, OFFERS, TENANT_LABEL, THG_AFFORDANCE_SOURCE,
+    connector_node_id, edge_with_affordance_provenance, tenant_node_id, thg_error_from_store,
+    Affordance, AffordanceGraphStore, AffordanceUpsertResult, ConnectorManifest,
+    ConnectorRegisterResult, ToolManifest, CONNECTOR_LABEL, DEFAULT_HALF_LIFE_DAYS, OFFERS,
+    TENANT_LABEL, THG_AFFORDANCE_SOURCE,
 };
 
 pub const THEOREM_GRPC_SERVER_ID: &str = "theorem_grpc";

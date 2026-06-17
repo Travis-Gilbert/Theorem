@@ -17,12 +17,11 @@ use rustyred_thg_core::{
 use theorem_harness_core::AffordanceReceipt;
 
 use crate::types::{
-    affordance_node_id, edge_with_affordance_provenance, invocation_receipt_node_id,
-    property_f32, property_i64, task_type_node_id, thg_error_from_store,
-    Affordance, AffordanceGraphStore, InvocationRecordRequest, InvocationRecordResult,
-    AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS, DEFAULT_FITNESS_EPSILON, DEFAULT_HALF_LIFE_DAYS,
-    INVOCATION_RECEIPT_LABEL, PRODUCED_OUTCOME, SEQUENCED_WITH, SERVED_TASK, TASK_TYPE_LABEL,
-    THG_AFFORDANCE_SOURCE,
+    affordance_node_id, edge_with_affordance_provenance, invocation_receipt_node_id, property_f32,
+    property_i64, task_type_node_id, thg_error_from_store, Affordance, AffordanceGraphStore,
+    InvocationRecordRequest, InvocationRecordResult, AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS,
+    DEFAULT_FITNESS_EPSILON, DEFAULT_HALF_LIFE_DAYS, INVOCATION_RECEIPT_LABEL, PRODUCED_OUTCOME,
+    SEQUENCED_WITH, SERVED_TASK, TASK_TYPE_LABEL, THG_AFFORDANCE_SOURCE,
 };
 
 /// Record one affordance invocation: receipt node + edges + fitness update.

@@ -2,14 +2,20 @@
 //! kinds, generalizing the `theorem-harness-runtime::skill_pack` storage pattern beyond the
 //! single `skill_pack` kind.
 
-use rustyred_thg_core::{EdgeRecord, GraphStore, GraphStoreError, NodeQuery, NodeRecord};
+use rustyred_thg_affordances::affordance_node_id;
+use rustyred_thg_core::{
+    EdgeRecord, GraphSnapshot, GraphStore, GraphStoreError, NodeQuery, NodeRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use theorem_harness_core::stable_value_hash;
+use theorem_harness_core::{stable_map_id, stable_value_hash};
 
 pub const PACK_LABEL: &str = "CapabilityPack";
 pub const PACK_SOURCE_EDGE: &str = "PACK_SOURCE";
 pub const PACK_ARTIFACT_EDGE: &str = "PACK_ARTIFACT";
+pub const PACK_EXPOSES_AFFORDANCE: &str = "PACK_EXPOSES_AFFORDANCE";
+pub const PACK_IN_DOMAIN: &str = "PACK_IN_DOMAIN";
+pub const DOMAIN_MAP_LABEL: &str = "DomainMap";
 const DEFAULT_TENANT: &str = "default";
 const PACK_QUERY_LIMIT: usize = 10_000;
 
@@ -156,6 +162,9 @@ pub trait EnsembleGraphStore {
     fn pack_upsert_edge(&mut self, edge: EdgeRecord) -> EnsembleResult<()>;
     fn pack_get_node(&self, id: &str) -> EnsembleResult<Option<NodeRecord>>;
     fn pack_query_nodes(&self, query: NodeQuery) -> EnsembleResult<Vec<NodeRecord>>;
+    fn pack_graph_snapshot(&self) -> EnsembleResult<Option<GraphSnapshot>> {
+        Ok(None)
+    }
 }
 
 impl<T: GraphStore> EnsembleGraphStore for T {
@@ -177,6 +186,10 @@ impl<T: GraphStore> EnsembleGraphStore for T {
 
     fn pack_query_nodes(&self, query: NodeQuery) -> EnsembleResult<Vec<NodeRecord>> {
         Ok(self.query_nodes(query))
+    }
+
+    fn pack_graph_snapshot(&self) -> EnsembleResult<Option<GraphSnapshot>> {
+        Ok(Some(self.graph_snapshot()?))
     }
 }
 
@@ -300,6 +313,51 @@ pub fn register_pack<S: EnsembleGraphStore>(
         ))?;
     }
 
+    for affordance_id in pack_affordance_refs(&pack) {
+        let affordance_node = affordance_node_id(&tenant, &affordance_id);
+        if store.pack_get_node(&affordance_node)?.is_some() {
+            store.pack_upsert_edge(EdgeRecord::new(
+                format!("{node_id}|{PACK_EXPOSES_AFFORDANCE}|{affordance_node}"),
+                node_id.clone(),
+                PACK_EXPOSES_AFFORDANCE,
+                affordance_node,
+                json!({
+                    "tenant_slug": tenant,
+                    "affordance_id": affordance_id,
+                    "source": "ensemble_registry",
+                }),
+            ))?;
+        }
+    }
+
+    for domain_ref in pack_domain_refs(&pack) {
+        let domain_node = domain_node_id(&tenant, &domain_ref);
+        if store.pack_get_node(&domain_node)?.is_none() {
+            store.pack_upsert_node(NodeRecord::new(
+                domain_node.clone(),
+                [DOMAIN_MAP_LABEL],
+                json!({
+                    "tenant_slug": tenant,
+                    "scope_kind": "domain",
+                    "scope_ref": domain_ref,
+                    "map_kind": "DomainMap",
+                    "source": "ensemble_registry",
+                }),
+            ))?;
+        }
+        store.pack_upsert_edge(EdgeRecord::new(
+            format!("{node_id}|{PACK_IN_DOMAIN}|{domain_node}"),
+            node_id.clone(),
+            PACK_IN_DOMAIN,
+            domain_node,
+            json!({
+                "tenant_slug": tenant,
+                "domain_ref": domain_ref,
+                "source": "ensemble_registry",
+            }),
+        ))?;
+    }
+
     Ok(pack)
 }
 
@@ -370,9 +428,89 @@ fn text_at(spec: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
+pub fn domain_node_id(tenant: &str, domain_ref: &str) -> String {
+    let trimmed = domain_ref.trim();
+    if trimmed.starts_with("capability_pack:") || trimmed.starts_with("map:") {
+        trimmed.to_string()
+    } else {
+        stable_map_id(
+            "DomainMap",
+            "domain",
+            &format!("{}:{trimmed}", normalize_tenant(tenant)),
+        )
+    }
+}
+
+fn pack_affordance_refs(pack: &CapabilityPack) -> Vec<String> {
+    string_refs_at_any(
+        &pack.spec,
+        &[
+            &["affordance_ids"][..],
+            &["exposes_affordances"][..],
+            &["tool_affordance_ids"][..],
+            &["exposes", "affordance_ids"][..],
+            &["exposes", "tools"][..],
+        ],
+    )
+}
+
+fn pack_domain_refs(pack: &CapabilityPack) -> Vec<String> {
+    if PackKind::parse(&pack.kind) == Some(PackKind::Domain) {
+        return Vec::new();
+    }
+    string_refs_at_any(
+        &pack.spec,
+        &[
+            &["domain"][..],
+            &["domain_ref"][..],
+            &["domain_refs"][..],
+            &["domains"][..],
+            &["scope", "domain"][..],
+            &["scope", "domain_ref"][..],
+            &["scope", "domain_refs"][..],
+        ],
+    )
+}
+
+fn string_refs_at_any(spec: &Value, paths: &[&[&str]]) -> Vec<String> {
+    let mut refs = std::collections::BTreeSet::new();
+    for path in paths {
+        if let Some(value) = value_at_path(spec, path) {
+            collect_string_refs(value, &mut refs);
+        }
+    }
+    refs.into_iter().collect()
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    Some(cursor)
+}
+
+fn collect_string_refs(value: &Value, refs: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                refs.insert(trimmed.to_string());
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_string_refs(value, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyred_thg_affordances::{register_connector, ConnectorManifest, ToolManifest};
     use rustyred_thg_core::InMemoryGraphStore;
 
     fn skill_spec() -> Value {
@@ -397,6 +535,25 @@ mod tests {
             exposure: PackExposure::default(),
             source_content_hash: String::new(),
             artifact_hashes: vec![],
+        }
+    }
+
+    fn connector_with_search_tool() -> ConnectorManifest {
+        ConnectorManifest {
+            tenant_id: "default".to_string(),
+            server_id: "github".to_string(),
+            label: "GitHub".to_string(),
+            tools: vec![ToolManifest {
+                name: "search_code".to_string(),
+                label: String::new(),
+                description: "search code".to_string(),
+                input_schema: json!({}),
+                permissions: vec![],
+                cost: json!({}),
+                writeback_policy: "read-only".to_string(),
+                tags: vec![],
+                description_embedding: None,
+            }],
         }
     }
 
@@ -502,5 +659,32 @@ mod tests {
             .expect("present");
         assert_eq!(fetched.tenant_slug, "default");
         assert_eq!(fetched.origin_tenant_slug, "default");
+    }
+
+    #[test]
+    fn register_pack_links_existing_affordances_and_domains() {
+        let mut store = InMemoryGraphStore::new();
+        register_connector(&mut store, connector_with_search_tool(), Some("test")).unwrap();
+
+        let registered = register_pack(
+            &mut store,
+            pack_from(json!({
+                "kind": "skill",
+                "title": "Code search pack",
+                "affordance_ids": ["github.search_code"],
+                "domain_refs": ["code"]
+            })),
+        )
+        .expect("register");
+
+        let pack_node = pack_node_id("default", &registered.pack_content_hash);
+        let affordance_node = affordance_node_id("default", "github.search_code");
+        let expose_edge = format!("{pack_node}|{PACK_EXPOSES_AFFORDANCE}|{affordance_node}");
+        assert!(store.get_edge(&expose_edge).is_some());
+
+        let domain_node = domain_node_id("default", "code");
+        let domain_edge = format!("{pack_node}|{PACK_IN_DOMAIN}|{domain_node}");
+        assert!(store.get_node(&domain_node).is_some());
+        assert!(store.get_edge(&domain_edge).is_some());
     }
 }

@@ -2696,6 +2696,7 @@ dependencies = [
 name = "ensemble"
 version = "0.1.0"
 dependencies = [
+ "rustyred-thg-affordances",
  "rustyred-thg-core",
  "serde",
  "serde_json",
@@ -8181,6 +8182,7 @@ dependencies = [
  "prose-check",
  "reqwest 0.12.28",
  "rustyred-thg-core",
+ "rustyred-thg-memory",
  "serde",
  "serde_json",
  "theorem-harness-core",
