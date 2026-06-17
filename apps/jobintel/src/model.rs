@@ -169,6 +169,10 @@ pub mod labels {
     pub const SOURCE: &str = "Source";
     pub const SKILL: &str = "Skill";
     pub const PROFILE: &str = "Profile";
+
+    // 0.2 outreach nodes (append-only trail + terminal learning signal).
+    pub const OUTREACH_EVENT: &str = "OutreachEvent";
+    pub const OUTCOME_RECORD: &str = "OutcomeRecord";
 }
 
 pub mod edges {
@@ -184,6 +188,11 @@ pub mod edges {
     // sinks would propagate nothing. See rank::profile_seeds.
     pub const REQUIRED_BY: &str = "required_by"; // Skill -> Role
     pub const POSTED_BY: &str = "posted_by"; // Role -> Company
+
+    // 0.2: Role -has_outreach-> OutreachEvent (spec Module 1).
+    pub const HAS_OUTREACH: &str = "has_outreach";
+    // Role -has_outcome-> OutcomeRecord (terminal learning signal, Module 5).
+    pub const HAS_OUTCOME: &str = "has_outcome";
 }
 
 pub mod props {
@@ -204,6 +213,37 @@ pub mod props {
     pub const POSTED_AT: &str = "posted_at";
     pub const NAME: &str = "name";
     pub const DOMAIN: &str = "domain";
+
+    // 0.2 outreach state, carried on the Role node (spec Module 1). Prefixed
+    // `outreach_` so they never collide with the ingest props above when the
+    // Role is read-modify-written.
+    pub const OUTREACH_STATUS: &str = "outreach_status";
+    pub const LAST_TOUCH_AT: &str = "last_touch_at";
+    pub const NEXT_FOLLOWUP_AT: &str = "next_followup_at";
+    pub const TOUCH_COUNT: &str = "touch_count";
+    pub const GMAIL_DRAFT_ID: &str = "gmail_draft_id";
+    pub const GMAIL_THREAD_ID: &str = "gmail_thread_id";
+    /// The send date of the initial outreach; the day-4/day-9 cadence is anchored
+    /// to this, not to the most recent touch.
+    pub const OUTREACH_SENT_AT: &str = "outreach_sent_at";
+    /// Template key used for the initial draft (Module 5 groups outcomes by it).
+    pub const OUTREACH_TEMPLATE: &str = "outreach_template";
+    /// Recipient address of the initial draft. Persisted so follow-ups reach the
+    /// same contact without re-running Hunter resolution.
+    pub const OUTREACH_TO: &str = "outreach_to";
+
+    // OutreachEvent node props (append-only, never mutated).
+    pub const EVENT_ID: &str = "event_id";
+    pub const ROLE_ID: &str = "role_id";
+    pub const KIND: &str = "kind";
+    pub const AT: &str = "at";
+    pub const NOTE: &str = "note";
+
+    // OutcomeRecord node props (terminal learning signal).
+    pub const TEMPLATE: &str = "template";
+    pub const STATUS: &str = "status";
+    pub const TOUCHES: &str = "touches";
+    pub const LEAD_TYPE: &str = "lead_type";
 }
 
 #[cfg(test)]

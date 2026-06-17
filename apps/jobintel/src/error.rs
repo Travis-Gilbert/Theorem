@@ -33,6 +33,20 @@ pub enum JobIntelError {
     #[error("embedding error: {0}")]
     Embed(String),
 
+    /// A Gmail API route returned a non-2xx status. Same shape as `Rustyred` so a
+    /// failing draft/thread call is debuggable from the CLI.
+    #[error("gmail {route} returned HTTP {status}: {body}")]
+    Gmail {
+        route: String,
+        status: u16,
+        body: String,
+    },
+
+    /// Outreach precondition / logic failure (e.g. GMAIL_TOKEN unset, a lead in
+    /// an unexpected state).
+    #[error("outreach error: {0}")]
+    Outreach(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

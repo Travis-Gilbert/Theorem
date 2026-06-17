@@ -134,6 +134,10 @@ fn config_for(base: &str) -> Config {
         hunter_api_key: None,
         embed_url: None,
         embed_dim: 384,
+        gmail_token: None,
+        gmail_api_base: "https://gmail.googleapis.com".to_string(),
+        daily_draft_cap: 8,
+        followup_days: vec![4, 9],
     }
 }
 

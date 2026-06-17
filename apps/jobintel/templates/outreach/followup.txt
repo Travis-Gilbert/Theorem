@@ -1,0 +1,7 @@
+Subject: Re: {{title}} - {{company}}
+
+Hi - circling back on my note about the {{title}} role at {{company}}. Still keen, and happy to work around your timing.
+
+If now isn't the moment, a pointer to the right person would help. Recap and code: {{proof_repo}}
+
+- {{sender}}

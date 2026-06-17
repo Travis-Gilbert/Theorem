@@ -1,4 +1,4 @@
-# jobintel 0.1 - Job-Intelligence Pipeline on RustyRed.
+# jobintel 0.2 - Job-Intelligence + Outreach Engine on RustyRed.
 #
 # A light, standalone CLI that consumes a *running* RustyRed instance over its
 # public tenant HTTP routes. It never embeds the database: RustyRed is the heavy
@@ -11,13 +11,19 @@
 # without compiling the substrate. The graph contract lives in src/client.rs
 # and is pinned to the real route + body shapes in
 # rustyredcore_THG/crates/rustyred-thg-server/src/router.rs.
+#
+# 0.2 adds the outreach engine (src/outreach/): an outreach state machine on the
+# Role graph, a Gmail create-draft bridge (never sends), a follow-up cadence,
+# reply detection, and a per-template learning signal. Gmail is a second HTTP
+# seam (gmail.googleapis.com) with the same base-URL-swappable, mock-testable
+# shape as the RustyRed client.
 
 [package]
 name = "jobintel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
-description = "Job-intelligence pipeline: ingest open job sources into RustyRed, rank roles against a profile with vector + graph + flag signals, draft an outreach queue."
+description = "Job-intelligence + outreach pipeline: ingest open job sources into RustyRed, rank roles against a profile, then triage a daily outreach queue, draft into Gmail, follow up on a cadence, and learn from replies."
 license = "MIT"
 
 [dependencies]
@@ -32,6 +38,14 @@ regex = "1"
 toml = "0.8"
 thiserror = "1"
 anyhow = "1"
+
+# Date math for the outreach cadence (follow-up day-4/day-9 scheduling, "today"
+# vs next_followup_at comparisons, RFC3339 event timestamps). default-features
+# off keeps it lean: `clock` gives Utc::now, `std` for NaiveDate parse/format.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Gmail's create-draft route carries the RFC822 message as a base64url `raw`
+# field; base64 is a zero-dep leaf crate for that URL-safe encoding.
+base64 = "0.22"
 
 # Optional local-embedding path. The default build uses the offline HashEmbedder
 # (no model download), so the demo runs from one command. `--features bge`

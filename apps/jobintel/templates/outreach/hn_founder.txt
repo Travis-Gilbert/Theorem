@@ -1,0 +1,13 @@
+Subject: {{title}} at {{company}} - Rust graph substrate
+
+Hi,
+
+I saw your "Who is Hiring" post for {{title}}. {{role_language}}
+
+I build exactly this: a Rust-native graph substrate, end to end. {{proof_metal_to_model}} {{proof_benchmarks}} Code is open: {{proof_repo}}
+
+Direct overlap with what you described: {{matched_skills}}.
+
+Worth a short call?
+
+- {{sender}}

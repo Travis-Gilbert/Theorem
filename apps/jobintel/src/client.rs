@@ -86,6 +86,12 @@ struct NodesEnvelope {
 }
 
 #[derive(Deserialize)]
+struct NodeEnvelope {
+    #[serde(default)]
+    node: Option<Value>,
+}
+
+#[derive(Deserialize)]
 struct BulkEnvelope {
     #[serde(default)]
     pub inserted: usize,
@@ -250,6 +256,25 @@ impl RustyRedClient {
         Ok(env.nodes)
     }
 
+    /// Fetch a single node by id (`GET /graph/nodes/{id}` -> `{ok, node}`).
+    /// Returns `None` on 404. This is the read half of the outreach state
+    /// machine's read-modify-write: RustyRed's upsert REPLACES a node wholesale
+    /// (it does not merge properties), so a status change must re-send the node's
+    /// full property map, not just the changed keys.
+    pub fn get_node(&self, id: &str) -> Result<Option<Value>> {
+        let suffix = format!("graph/nodes/{}", urlencode_path(id));
+        let resp = self
+            .http
+            .get(self.url(&suffix))
+            .bearer_auth(&self.token)
+            .send()?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let env: NodeEnvelope = self.read("graph/nodes/{id}", resp)?;
+        Ok(env.node)
+    }
+
     /// Store a context pack. Returns the server echo `{artifact_id, sections, ...}`.
     pub fn context_pack(
         &self,
@@ -286,6 +311,23 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max])
     }
+}
+
+/// Percent-encode a node id for use as a single URL path segment. Node ids look
+/// like `role:hn:123` (the `:` is path-legal) but ATS source ids can carry
+/// arbitrary characters, so anything outside the RFC 3986 unreserved set plus
+/// `:` is encoded. `/` is always encoded so an id never splits the segment.
+fn urlencode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b':');
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[allow(dead_code)]
@@ -342,5 +384,12 @@ mod tests {
         assert_eq!(truncate("short", 400), "short");
         let long = "x".repeat(500);
         assert_eq!(truncate(&long, 400).len(), 403); // 400 + "..."
+    }
+
+    #[test]
+    fn urlencode_path_keeps_node_id_colons_but_escapes_slashes() {
+        assert_eq!(urlencode_path("role:hn:123"), "role:hn:123");
+        assert_eq!(urlencode_path("role:greenhouse:a/b"), "role:greenhouse:a%2Fb");
+        assert_eq!(urlencode_path("a b"), "a%20b");
     }
 }

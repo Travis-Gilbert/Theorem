@@ -1,0 +1,13 @@
+Subject: {{title}} - Rust + graph background
+
+Hello,
+
+I'm reaching out about the {{title}} role at {{company}}. {{role_language}}
+
+My background lines up closely: {{proof_metal_to_model}} {{proof_benchmarks}} Code is open: {{proof_repo}}
+
+Overlap with the role: {{matched_skills}}.
+
+Happy to share more or talk through how I'd contribute.
+
+- {{sender}}
