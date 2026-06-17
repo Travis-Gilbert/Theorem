@@ -25,6 +25,10 @@ COPY rustyredcore_THG/crates/rustyred-thg-connectors ./rustyredcore_THG/crates/r
 COPY rustyredcore_THG/crates/rustyred-membrane ./rustyredcore_THG/crates/rustyred-membrane
 COPY rustyredcore_THG/crates/rustyred-rerank ./rustyredcore_THG/crates/rustyred-rerank
 COPY rustyredcore_THG/crates/rustyred-thg-code ./rustyredcore_THG/crates/rustyred-thg-code
+# Dispatch v2 job board: the harness-server Cargo.toml path-depends on
+# theorem-dispatch (Postgres execution queue); its source must be in the build
+# context too (theorem-dispatch -> theorem-harness-core, already copied above).
+COPY rustyredcore_THG/crates/theorem-dispatch ./rustyredcore_THG/crates/theorem-dispatch
 
 WORKDIR /app/apps/theorem-harness-server
 # rustyred-thg-affordances pulls in BLAS-backed crates (statrs/nalgebra/faer),
