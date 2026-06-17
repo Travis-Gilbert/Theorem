@@ -5,14 +5,13 @@
 # ../../rustyredcore_THG/crates. On Railway, set the service Root Directory so
 # the Docker build context is the Theorem repo root.
 #
-# Transitive internal-crate set (verified via `cargo tree -p theorem-grpc`):
-# rustyred-web, rustyred-thg-core, rustyred-thg-code, rustyred-thg-affordances,
-# theorem-harness-core, pilot-core.
-# rustyred-thg-core and theorem-harness-core are leaf crates (no internal
-# path-deps); rustyred-web path-deps rustyred-thg-core + pilot-core;
-# rustyred-thg-code path-deps rustyred-thg-core; rustyred-thg-affordances
-# path-deps rustyred-thg-core + theorem-harness-core. So the COPY list below is
-# complete. This list MUST be kept in sync with apps/theorem-grpc/Cargo.toml.
+# The whole crates directory is copied wholesale (COPY rustyredcore_THG/crates)
+# rather than a hand-listed subset. cargo only compiles what theorem-grpc's
+# dependency tree needs, so the extra sources cost no build time, and the build
+# can never again break when a transitive path-dep is added to a copied crate
+# without updating this file. (Previously the per-crate COPY list drifted when
+# rustyred-web gained rustyred-membrane + rustyred-rerank, breaking the build
+# with cargo exit 101: failed to load source for a missing crate directory.)
 #
 # Toolchain: rust 1.89-bookworm. Above rustyred-thg-server's 1.88, matching the
 # civic backend's >=1.89 requirement, and deliberately NOT the Servo 1.95
@@ -33,14 +32,10 @@ RUN apt-get update \
         gfortran \
     && rm -rf /var/lib/apt/lists/*
 
-# Context = Theorem repo root. Copy the crate + its path-dep sources.
+# Context = Theorem repo root. Copy the app crate + the whole crates dir, so the
+# build is immune to path-dep drift.
 COPY apps/theorem-grpc ./apps/theorem-grpc
-COPY rustyredcore_THG/crates/rustyred-web ./rustyredcore_THG/crates/rustyred-web
-COPY rustyredcore_THG/crates/pilot-core ./rustyredcore_THG/crates/pilot-core
-COPY rustyredcore_THG/crates/rustyred-thg-core ./rustyredcore_THG/crates/rustyred-thg-core
-COPY rustyredcore_THG/crates/rustyred-thg-code ./rustyredcore_THG/crates/rustyred-thg-code
-COPY rustyredcore_THG/crates/rustyred-thg-affordances ./rustyredcore_THG/crates/rustyred-thg-affordances
-COPY rustyredcore_THG/crates/theorem-harness-core ./rustyredcore_THG/crates/theorem-harness-core
+COPY rustyredcore_THG/crates ./rustyredcore_THG/crates
 
 WORKDIR /app/apps/theorem-grpc
 RUN cargo build -p theorem-grpc --release
