@@ -7,28 +7,15 @@ FROM rust:1.89-bookworm AS builder
 WORKDIR /app
 
 COPY apps/theorem-harness-server ./apps/theorem-harness-server
-COPY rustyredcore_THG/crates/theorem-harness-core ./rustyredcore_THG/crates/theorem-harness-core
-COPY rustyredcore_THG/crates/theorem-harness-runtime ./rustyredcore_THG/crates/theorem-harness-runtime
-COPY rustyredcore_THG/crates/rustyred-thg-core ./rustyredcore_THG/crates/rustyred-thg-core
-# theorem-harness-runtime path-depends on prose-check (deterministic style checker
-# for receipts); its source must be in the build context or cargo resolution fails.
-COPY rustyredcore_THG/crates/prose-check ./rustyredcore_THG/crates/prose-check
-# Connector driving surface (slice 3) path-deps: the harness-server Cargo.toml
-# pulls in rustyred-thg-connectors + rustyred-thg-affordances, so their sources
-# must be in the build context too (connectors -> affordances -> core/harness-core,
-# the latter two already copied above).
-COPY rustyredcore_THG/crates/rustyred-thg-affordances ./rustyredcore_THG/crates/rustyred-thg-affordances
-COPY rustyredcore_THG/crates/rustyred-thg-connectors ./rustyredcore_THG/crates/rustyred-thg-connectors
-# GitHub App ingestion path-depends on the code graph runtime; include its
-# direct local path dependencies too so Railway's cargo build resolves offline
-# from the repo-root Docker context.
-COPY rustyredcore_THG/crates/rustyred-membrane ./rustyredcore_THG/crates/rustyred-membrane
-COPY rustyredcore_THG/crates/rustyred-rerank ./rustyredcore_THG/crates/rustyred-rerank
-COPY rustyredcore_THG/crates/rustyred-thg-code ./rustyredcore_THG/crates/rustyred-thg-code
-# Dispatch v2 job board: the harness-server Cargo.toml path-depends on
-# theorem-dispatch (Postgres execution queue); its source must be in the build
-# context too (theorem-dispatch -> theorem-harness-core, already copied above).
-COPY rustyredcore_THG/crates/theorem-dispatch ./rustyredcore_THG/crates/theorem-dispatch
+# Copy the whole crates directory wholesale instead of enumerating each crate.
+# theorem-harness-server path-depends on a growing set under
+# rustyredcore_THG/crates (harness-core/runtime, thg-core, prose-check,
+# affordances, connectors, membrane, rerank, thg-code, theorem-dispatch, ...).
+# A per-crate COPY list silently drifts: the moment a new path-dep lands without
+# a matching COPY line, the Railway build dies with exit 101 ("failed to load
+# manifest for dependency ..."). A whole-dir COPY cannot drift. Matches the
+# theorem-grpc Dockerfile (commit 622d202e), which fixed the identical failure.
+COPY rustyredcore_THG/crates ./rustyredcore_THG/crates
 
 WORKDIR /app/apps/theorem-harness-server
 # rustyred-thg-affordances pulls in BLAS-backed crates (statrs/nalgebra/faer),
