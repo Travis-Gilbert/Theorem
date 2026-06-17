@@ -8,18 +8,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use url::Url;
 
+#[cfg(test)]
+use crate::browser_perception::SensitiveData;
 use crate::browser_perception::{
     extract_structured, keyboard_fallback_for, resolve_upload_path, DomainPolicy,
     NavigationDecision, TabSet, UploadDecision,
 };
-#[cfg(test)]
-use crate::browser_perception::SensitiveData;
 use crate::{
     apply_batch_to_store, build_v2_fixture_crawl, canonicalize_url, extract_links_for_url,
     global_robots_cache, CrawlBudget, CrawlRequest, CrawlScope, FetchCascade, FetchTierResult,
     FixturePage, RobotsDecision, RustyWebError, RustyWebResult,
 };
-
 
 impl From<RustyWebError> for BrowserEngineError {
     fn from(error: RustyWebError) -> Self {
@@ -37,7 +36,6 @@ pub use pilot_core::{
     BrowserAction, BrowserActionPolicy, BrowserEngineError, BrowserEngineResult, ElementBox,
     InteractiveElement, PageState, WaitCondition,
 };
-
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PageExtract {

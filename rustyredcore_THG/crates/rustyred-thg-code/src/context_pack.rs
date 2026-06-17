@@ -316,8 +316,7 @@ fn build_code_context_pack(
     let max_search_score = hits.iter().map(|hit| hit.score).fold(0.0_f64, f64::max);
     let mut candidates = Vec::with_capacity(hits.len());
     for hit in &hits {
-        if let Some(candidate) =
-            candidate_from_code_hit(store, hit, max_search_score, &ppr_scores)?
+        if let Some(candidate) = candidate_from_code_hit(store, hit, max_search_score, &ppr_scores)?
         {
             candidates.push(candidate);
         }
@@ -347,7 +346,8 @@ fn build_code_context_pack(
             baseline_tokens as i64 - admission.tokens_admitted as i64,
         ),
     };
-    let membrane_receipt_hash = emit_receipt(store, &receipt).map_err(CodeIndexError::from_store)?;
+    let membrane_receipt_hash =
+        emit_receipt(store, &receipt).map_err(CodeIndexError::from_store)?;
     let mut receipt_payload = json!({
         "tenant_id": tenant_id,
         "operation": "code_context_pack",
@@ -590,8 +590,7 @@ fn candidate_from_code_hit(
         .get(&hit.node_id)
         .map(|value| value.clamp(0.0, 1.0) as f32)
         .unwrap_or(0.0);
-    candidate.ppr_proximity =
-        combine_proximity(centrality, seeded, normalized_search);
+    candidate.ppr_proximity = combine_proximity(centrality, seeded, normalized_search);
     candidate.metadata = BTreeMap::from([
         ("repo_id".to_string(), hit.repo_id.clone()),
         ("file_id".to_string(), hit.file_id.clone()),
@@ -855,9 +854,11 @@ mod tests {
             let recovered = context_pack_fetch(&store, handle)
                 .expect("deferred handle must recover from the store");
             assert_eq!(
-                rustyred_membrane::Handle::from_candidate(
-                    &Candidate::new(handle.node_id.clone(), recovered.clone(), handle.token_count)
-                )
+                rustyred_membrane::Handle::from_candidate(&Candidate::new(
+                    handle.node_id.clone(),
+                    recovered.clone(),
+                    handle.token_count
+                ))
                 .digest,
                 handle.digest,
                 "recovered text must re-hash to the handle digest"

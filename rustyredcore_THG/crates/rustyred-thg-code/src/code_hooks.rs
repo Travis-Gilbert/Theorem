@@ -82,10 +82,7 @@ fn coalesce_code_kg(_event: &MutationEvent) -> Option<String> {
 /// True when an event's only changed property is the derived centrality value,
 /// i.e. it is a self-induced re-trigger we must not treat as fresh structure.
 fn is_self_induced(changed_props: &[String]) -> bool {
-    !changed_props.is_empty()
-        && changed_props
-            .iter()
-            .all(|key| key == CENTRALITY_PROPERTY)
+    !changed_props.is_empty() && changed_props.iter().all(|key| key == CENTRALITY_PROPERTY)
 }
 
 fn centrality_handler(

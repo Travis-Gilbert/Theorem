@@ -36,7 +36,9 @@ async fn ac2_concurrent_workers_claim_each_url_exactly_once() {
     );
     // Distinct hosts so per-domain in-flight politeness (cap 1) does not
     // serialize the workers - we want them genuinely racing the claim path.
-    let seeds: Vec<String> = (0..200).map(|i| format!("https://h{i}.example.com/")).collect();
+    let seeds: Vec<String> = (0..200)
+        .map(|i| format!("https://h{i}.example.com/"))
+        .collect();
     frontier.seed(seeds).await.unwrap();
 
     let mut handles = Vec::new();
@@ -70,7 +72,11 @@ async fn ac2_concurrent_workers_claim_each_url_exactly_once() {
         assert!(seen.insert(*fp), "fingerprint claimed by two workers: {fp}");
     }
     // ...and every seeded URL was claimed exactly once across all workers.
-    assert_eq!(seen.len(), 200, "expected all 200 URLs claimed exactly once");
+    assert_eq!(
+        seen.len(),
+        200,
+        "expected all 200 URLs claimed exactly once"
+    );
     assert_eq!(all.len(), 200, "no double-claims and none dropped");
 }
 
@@ -146,8 +152,7 @@ fn ac4_ppr_reorders_versus_depth() {
         seeds: vec![root],
         ..Default::default()
     };
-    let scores: HashMap<UrlFingerprint, f64> =
-        ppr.recompute(&ctx).unwrap().into_iter().collect();
+    let scores: HashMap<UrlFingerprint, f64> = ppr.recompute(&ctx).unwrap().into_iter().collect();
     let ppr_hub = *scores.get(&hub).unwrap_or(&0.0);
     let ppr_x1 = *scores.get(&x1).unwrap_or(&0.0);
     assert!(
@@ -193,7 +198,9 @@ impl Fetcher for OrderedFetcher {
     }
 }
 
-async fn crawl_graph_with(fetcher: OrderedFetcher) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
+async fn crawl_graph_with(
+    fetcher: OrderedFetcher,
+) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
     let frontier = Frontier::new(
         RedCoreGraphStore::memory(),
         MemoryFrontierQueue::new(),
@@ -235,10 +242,14 @@ async fn crawl_graph_with(fetcher: OrderedFetcher) -> (BTreeSet<String>, BTreeSe
 
 #[tokio::test]
 async fn ac5_fetcher_swap_yields_identical_graph() {
-    let (visited_a, edges_a) =
-        crawl_graph_with(OrderedFetcher { links: vec!["/a", "/b", "/c"] }).await;
-    let (visited_b, edges_b) =
-        crawl_graph_with(OrderedFetcher { links: vec!["/c", "/b", "/a"] }).await;
+    let (visited_a, edges_a) = crawl_graph_with(OrderedFetcher {
+        links: vec!["/a", "/b", "/c"],
+    })
+    .await;
+    let (visited_b, edges_b) = crawl_graph_with(OrderedFetcher {
+        links: vec!["/c", "/b", "/a"],
+    })
+    .await;
 
     assert_eq!(visited_a, visited_b, "fetcher swap changed the visited set");
     assert_eq!(edges_a, edges_b, "fetcher swap changed the crawl graph");
@@ -295,7 +306,11 @@ async fn ac6_in_progress_crawl_is_queryable_as_graph() {
         &*store,
         NeighborQuery::out(root_task.fp.to_hex()).with_edge_type(EDGE_LINKS_TO),
     );
-    assert_eq!(out.len(), 2, "root should link to its two discovered children");
+    assert_eq!(
+        out.len(),
+        2,
+        "root should link to its two discovered children"
+    );
 
     // PPR over the in-progress graph returns positive mass.
     let ppr = PprPrioritizer {
@@ -325,5 +340,8 @@ async fn ac6_in_progress_crawl_is_queryable_as_graph() {
         })
         .collect();
     assert!(states.contains("in_flight"), "root should be in_flight");
-    assert!(states.contains("frontier"), "children should be in frontier");
+    assert!(
+        states.contains("frontier"),
+        "children should be in frontier"
+    );
 }

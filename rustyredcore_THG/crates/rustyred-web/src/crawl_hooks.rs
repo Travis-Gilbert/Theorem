@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::frontier::model::{
-    EDGE_LINKS_TO, LABEL_URL, STATE_FETCHED, STATE_FRONTIER, UrlFingerprint,
+    UrlFingerprint, EDGE_LINKS_TO, LABEL_URL, STATE_FETCHED, STATE_FRONTIER,
 };
 use crate::frontier::{FrontierCtx, PprPrioritizer, Prioritizer, SharedFrontierStore};
 use crate::source_class::classify_url;
@@ -170,10 +170,7 @@ fn fetch_completion_handler(
 /// Classify the fetched page's source and materialize entities from its content
 /// snapshot (`content_snapshot:<content_hash>` -> `text`) into the graph as
 /// `WebEntity` nodes with `MENTIONS` edges from the page.
-fn classify_and_extract(
-    store: &mut RedCoreGraphStore,
-    url_id: &str,
-) -> Result<usize, HookError> {
+fn classify_and_extract(store: &mut RedCoreGraphStore, url_id: &str) -> Result<usize, HookError> {
     let Some(mut node) = store.get_node(url_id).map_err(HookError::from)? else {
         return Ok(0);
     };
@@ -225,7 +222,11 @@ fn classify_and_extract(
         let slug = entity_slug(&entity);
         let entity_id = format!("web:entity:{slug}");
         // Idempotent upsert of the entity node.
-        if store.get_node(&entity_id).map_err(HookError::from)?.is_none() {
+        if store
+            .get_node(&entity_id)
+            .map_err(HookError::from)?
+            .is_none()
+        {
             store
                 .upsert_node(NodeRecord::new(
                     &entity_id,
@@ -351,7 +352,11 @@ fn link_discovery_handler(
         }
         // PPR score when available, else a small depth-discounted default so a
         // freshly-linked node still enters the frontier with a sane priority.
-        let depth = node.properties.get("depth").and_then(Value::as_u64).unwrap_or(0);
+        let depth = node
+            .properties
+            .get("depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let score = scores
             .get(&target_id)
             .copied()

@@ -30,6 +30,7 @@ use crate::code_index::{
 };
 use crate::code_kg::{self, ContextPackInput, SessionReingestInput};
 use crate::pb;
+use crate::valkey_cache::ValkeyCache;
 
 #[derive(Clone)]
 pub struct TheoremAppAffordanceService {
@@ -42,8 +43,15 @@ impl TheoremAppAffordanceService {
     }
 
     pub fn try_new_with_code_index(code_index: CodeIndexRuntime) -> Result<Self, String> {
+        Self::try_new_with_code_index_and_cache(code_index, ValkeyCache::disabled())
+    }
+
+    pub fn try_new_with_code_index_and_cache(
+        code_index: CodeIndexRuntime,
+        cache: ValkeyCache,
+    ) -> Result<Self, String> {
         Ok(Self {
-            runtime: AppAffordanceRuntime::try_new(code_index)?,
+            runtime: AppAffordanceRuntime::try_new(code_index, cache)?,
         })
     }
 
@@ -80,15 +88,17 @@ struct AppAffordanceRuntime {
     adapter: TheseusAppAdapter,
     code_index: CodeIndexRuntime,
     session_kg: code_kg::SessionKgCache,
+    cache: ValkeyCache,
 }
 
 impl AppAffordanceRuntime {
-    fn try_new(code_index: CodeIndexRuntime) -> Result<Self, String> {
+    fn try_new(code_index: CodeIndexRuntime, cache: ValkeyCache) -> Result<Self, String> {
         Self::try_new_at(
             redcore_data_dir(),
             redcore_options(),
             TheseusAppAdapter::from_env(),
             code_index,
+            cache,
         )
     }
 
@@ -97,6 +107,7 @@ impl AppAffordanceRuntime {
         options: RedCoreOptions,
         adapter: TheseusAppAdapter,
         code_index: CodeIndexRuntime,
+        cache: ValkeyCache,
     ) -> Result<Self, String> {
         let mut store = RedCoreGraphStore::open(data_dir.as_ref(), options)
             .map_err(|err| format!("open theorem_grpc RedCore store failed: {err:?}"))?;
@@ -107,6 +118,7 @@ impl AppAffordanceRuntime {
             adapter,
             code_index,
             session_kg: code_kg::SessionKgCache::new(),
+            cache,
         })
     }
 
@@ -124,6 +136,7 @@ impl AppAffordanceRuntime {
             &self.adapter,
             &self.code_index,
             &self.session_kg,
+            &self.cache,
             req,
             started,
         ))
@@ -135,6 +148,7 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
     adapter: &TheseusAppAdapter,
     code_index: &CodeIndexRuntime,
     session_kg: &code_kg::SessionKgCache,
+    cache: &ValkeyCache,
     req: pb::InvokeAffordanceRequest,
     started: Instant,
 ) -> pb::InvokeAffordanceResponse {
@@ -311,6 +325,7 @@ fn invoke_registered_affordance<S: AffordanceGraphStore>(
         adapter,
         code_index,
         session_kg,
+        cache,
         &tenant_id,
         actor.as_str(),
     );
@@ -362,6 +377,7 @@ fn handle_affordance(
     adapter: &TheseusAppAdapter,
     code_index: &CodeIndexRuntime,
     session_kg: &code_kg::SessionKgCache,
+    cache: &ValkeyCache,
     tenant_id: &str,
     actor: &str,
 ) -> HandlerOutcome {
@@ -428,7 +444,9 @@ fn handle_affordance(
             return code_session_reingest_handler(base, code_index, session_kg, request, tenant_id);
         }
         "code_search.context_pack" => {
-            return code_context_pack_handler(base, code_index, session_kg, request, tenant_id);
+            return code_context_pack_handler(
+                base, code_index, session_kg, cache, request, tenant_id,
+            );
         }
         "anti_misinfo_algo.inspect_claim" => merge_json(
             base,
@@ -1102,6 +1120,7 @@ fn code_context_pack_handler(
     base: Value,
     code_index: &CodeIndexRuntime,
     session_kg: &code_kg::SessionKgCache,
+    cache: &ValkeyCache,
     request: &Value,
     tenant_id: &str,
 ) -> HandlerOutcome {
@@ -1118,16 +1137,43 @@ fn code_context_pack_handler(
             .or_else(|| request_u64(request, "budgetTokens"))
             .unwrap_or(0) as usize,
     };
-    match code_kg::context_pack(code_index, session_kg, input) {
-        Ok(output) => HandlerOutcome {
+    let cache_key = cache.cache_key(
+        "context_pack",
+        json!({
+            "tenant_id": input.tenant_id.as_str(),
+            "repo_id": input.repo_id.as_str(),
+            "session_id": input.session_id.as_str(),
+            "dirty_files": &input.dirty_files,
+            "footprint_files": &input.footprint_files,
+            "prompt_text": input.prompt_text.as_str(),
+            "top_k": input.top_k,
+            "budget_tokens": input.budget_tokens,
+        }),
+    );
+    if let Some(output) = cache.get_json(&cache_key) {
+        return HandlerOutcome {
             status: "ok".to_string(),
             executed: true,
             output: merge_json(base, output),
             error_code: String::new(),
-            message: "context pack composed from the merged code KG".to_string(),
+            message: "context pack served from Valkey cache".to_string(),
             outcome_value: 1.0,
-            outcome_label: "code_context_pack_ok".to_string(),
-        },
+            outcome_label: "code_context_pack_cache_hit".to_string(),
+        };
+    }
+    match code_kg::context_pack(code_index, session_kg, input) {
+        Ok(output) => {
+            cache.put_json(&cache_key, &output);
+            HandlerOutcome {
+                status: "ok".to_string(),
+                executed: true,
+                output: merge_json(base, output),
+                error_code: String::new(),
+                message: "context pack composed from the merged code KG".to_string(),
+                outcome_value: 1.0,
+                outcome_label: "code_context_pack_ok".to_string(),
+            }
+        }
         Err(err) => HandlerOutcome {
             status: "failed".to_string(),
             executed: false,
@@ -1733,9 +1779,14 @@ mod tests {
         let data_dir = unique_test_dir("redcore");
         let code_dir = data_dir.join("code-index");
         let code_index = CodeIndexRuntime::try_new_at(&code_dir, test_options()).unwrap();
-        let runtime =
-            AppAffordanceRuntime::try_new_at(&data_dir, test_options(), adapter, code_index)
-                .unwrap();
+        let runtime = AppAffordanceRuntime::try_new_at(
+            &data_dir,
+            test_options(),
+            adapter,
+            code_index,
+            ValkeyCache::disabled(),
+        )
+        .unwrap();
         (runtime, data_dir)
     }
 
@@ -2565,6 +2616,7 @@ mod tests {
                 test_options(),
                 TheseusAppAdapter::new(None, None),
                 code_index,
+                ValkeyCache::disabled(),
             )
             .unwrap();
             let response = runtime

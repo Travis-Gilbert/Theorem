@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustyred_rerank::{
+    CrossEncoder, HttpCrossEncoder, HttpListwiseReranker, LexicalCrossEncoder, ListwiseReranker,
+    RerankScorer, GTE_RERANKER_MODERNBERT_BASE, JINA_RERANKER_V3,
+};
 use rustyred_thg_adapters::execute_adapter_command;
 use rustyred_thg_core::commands::{ThgCommand, ThgRequest, ThgResponse};
 use rustyred_thg_core::errors::ThgError;
@@ -46,10 +50,6 @@ use rustyred_web::{
     WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
     LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION,
     SEMANTIC_VECTOR_PROPERTY,
-};
-use rustyred_rerank::{
-    CrossEncoder, GTE_RERANKER_MODERNBERT_BASE, HttpCrossEncoder, HttpListwiseReranker,
-    JINA_RERANKER_V3, LexicalCrossEncoder, ListwiseReranker, RerankScorer,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1754,7 +1754,10 @@ fn web_cross_encoder_from_env() -> Box<dyn CrossEncoder> {
         "RUSTYRED_RERANKER_URL",
         "RUSTYWEB_RERANKER_URL",
     ]) {
-        Some(url) => Box::new(HttpCrossEncoder::new(reranker_endpoint(&url, "score"), model_id)),
+        Some(url) => Box::new(HttpCrossEncoder::new(
+            reranker_endpoint(&url, "score"),
+            model_id,
+        )),
         None => Box::new(LexicalCrossEncoder::new("lexical-cross-encoder")),
     }
 }
@@ -1793,7 +1796,10 @@ fn env_nonempty(keys: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn execute_web_search_graph(state: &AppState, job: WebSearchGraphJob) -> Result<Value, Value> {
+async fn execute_web_search_graph(
+    state: &AppState,
+    job: WebSearchGraphJob,
+) -> Result<Value, Value> {
     let WebSearchGraphJob {
         run_id,
         tenant,
@@ -1806,7 +1812,8 @@ async fn execute_web_search_graph(state: &AppState, job: WebSearchGraphJob) -> R
     // a non-Send std::sync::Mutex guard, so the fan-out await must complete before
     // any guard is acquired (otherwise this future stops being Send).
     let providers = state.search_providers(&provider_allowlist);
-    let acquisition = fanout_search_providers(&providers, &query, options.acquisition.clone()).await;
+    let acquisition =
+        fanout_search_providers(&providers, &query, options.acquisition.clone()).await;
 
     // (2) Synchronous gate: acquire the tenant store, run the membrane gate, drop
     // the guard. No `.await` lives inside this scope, so the guard never crosses an
@@ -1946,9 +1953,10 @@ fn inject_web_search_graph_tool_definition(response: &mut Value) {
     else {
         return;
     };
-    if tools.iter().any(|tool| {
-        tool.get("name").and_then(Value::as_str) == Some("web_search_graph")
-    }) {
+    if tools
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("web_search_graph"))
+    {
         return;
     }
     tools.push(web_search_graph_tool_definition());
@@ -7285,13 +7293,12 @@ mod tests {
         is_adapter_command, is_cache_command, is_graph_command, live_search_budget,
         live_search_is_sparse, maybe_handle_browser_use_mcp, maybe_handle_composed_agent_mcp,
         maybe_handle_live_search_acquisition_mcp, maybe_handle_web_search_graph_mcp,
-        mcp_origin_allowed, memory_docs_list,
-        public_cypher, required_scope_for_command, search_live, transaction_begin,
-        transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody,
-        FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody,
-        InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest,
-        MemoryDocsQuery, PageRankBody, PprBody, PublicCypherBody, TransactionBeginBody,
-        TransactionMutationBody, VectorSearchBody,
+        mcp_origin_allowed, memory_docs_list, public_cypher, required_scope_for_command,
+        search_live, transaction_begin, transaction_commit, transaction_rollback, BulkQuery,
+        CommunitiesBody, ComponentsBody, FullTextSearchBody, HybridSearchBody,
+        InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody, InstantKgSearchBody,
+        InstantKgViewBody, LiveSearchRequest, MemoryDocsQuery, PageRankBody, PprBody,
+        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         auth::ApiToken,
@@ -7843,30 +7850,27 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_web_search_graph_intercept_returns_membrane_shape() {
-        let state =
-            memory_product_write_state_with_search_providers(vec![Arc::new(
-                StaticSearchProvider::new(
-                    "static",
-                    vec![
-                        SearchCandidate {
-                            url: "https://example.com/membrane-candidate".to_string(),
-                            title: Some("Membrane candidate".to_string()),
-                            snippet: Some(
-                                "candidate carried into the membrane gate".to_string(),
-                            ),
-                            source: "static".to_string(),
-                            rank: 1,
-                        },
-                        SearchCandidate {
-                            url: "https://example.com/membrane-other".to_string(),
-                            title: Some("Other".to_string()),
-                            snippet: Some("a second candidate for the gate".to_string()),
-                            source: "static".to_string(),
-                            rank: 2,
-                        },
-                    ],
-                ),
-            )]);
+        let state = memory_product_write_state_with_search_providers(vec![Arc::new(
+            StaticSearchProvider::new(
+                "static",
+                vec![
+                    SearchCandidate {
+                        url: "https://example.com/membrane-candidate".to_string(),
+                        title: Some("Membrane candidate".to_string()),
+                        snippet: Some("candidate carried into the membrane gate".to_string()),
+                        source: "static".to_string(),
+                        rank: 1,
+                    },
+                    SearchCandidate {
+                        url: "https://example.com/membrane-other".to_string(),
+                        title: Some("Other".to_string()),
+                        snippet: Some("a second candidate for the gate".to_string()),
+                        source: "static".to_string(),
+                        rank: 2,
+                    },
+                ],
+            ),
+        )]);
         let config = state.mcp_config();
         let response = maybe_handle_web_search_graph_mcp(
             &state,
@@ -7898,7 +7902,9 @@ mod tests {
         // The spec's { admitted_context, deferred_handles, subgraph_ref } triple.
         assert!(payload["admitted_context"].is_array());
         assert!(payload["deferred_handles"].is_array());
-        assert!(payload["subgraph_ref"].as_str().is_some_and(|r| !r.is_empty()));
+        assert!(payload["subgraph_ref"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()));
         assert_eq!(payload["stats"]["providers"], 1);
         assert_eq!(payload["providers"][0]["provider"], "static");
         assert_eq!(payload["providers"][0]["status"], "ok");
@@ -7956,10 +7962,7 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "web_search_graph")
             .expect("tools/list should advertise web_search_graph");
-        assert_eq!(
-            web_search_graph["inputSchema"]["required"][0],
-            "query"
-        );
+        assert_eq!(web_search_graph["inputSchema"]["required"][0], "query");
         assert!(web_search_graph["inputSchema"]["properties"]["budget_tokens"].is_object());
     }
 

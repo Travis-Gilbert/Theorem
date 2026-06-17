@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rustyred_thg_core::{
-    HookContext, HookError, HookHandler, HookOutcome, HookRegistration, MutationEvent, MutationKind,
-    MutationMatcher, NodeRecord, RedCoreGraphStore,
+    HookContext, HookError, HookHandler, HookOutcome, HookRegistration, MutationEvent,
+    MutationKind, MutationMatcher, NodeRecord, RedCoreGraphStore,
 };
 use serde_json::{json, Value};
 
@@ -26,8 +26,7 @@ pub const EMBEDDING_DIM: usize = 64;
 /// `{signature, doc, body_hash}`; the current code schema carries `signature`,
 /// `snippet`, and `search_text`, so we trigger on the union (the spec names are
 /// kept for forward-compat when symbol docs/body hashes land).
-const EMBED_TRIGGER_PROPS: [&str; 5] =
-    ["signature", "snippet", "search_text", "doc", "body_hash"];
+const EMBED_TRIGGER_PROPS: [&str; 5] = ["signature", "snippet", "search_text", "doc", "body_hash"];
 
 /// Idempotency threshold for the per-component embedding diff.
 const EMBED_EPSILON: f32 = 1e-6;

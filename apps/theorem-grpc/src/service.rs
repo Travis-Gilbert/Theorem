@@ -15,10 +15,12 @@ use std::time::Instant;
 
 use rustyred_thg_core::personalized_pagerank;
 use rustyred_web::{search_substrate, SearchOptions, SubstrateSearch};
+use serde::Serialize;
 use tonic::{Request, Response, Status};
 
 use crate::engine::Engine;
 use crate::pb;
+use crate::valkey_cache::ValkeyCache;
 
 // PPR tuning for the GapWalk single-round expansion. Mirrors the defaults the
 // substrate search itself uses internally (ACL local-push PPR). Held as local
@@ -31,12 +33,36 @@ const GAPWALK_PPR_MAX_PUSHES: usize = 10_000;
 /// outlives every (borrowing) handler call.
 pub struct TheoremSearchService {
     engine: Arc<Engine>,
+    cache: ValkeyCache,
 }
 
 impl TheoremSearchService {
-    pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine }
+    pub fn new(engine: Arc<Engine>, cache: ValkeyCache) -> Self {
+        Self { engine, cache }
     }
+}
+
+#[derive(Serialize)]
+struct SearchCacheKey {
+    query: String,
+    mode: i32,
+    user_id: String,
+    session_id: String,
+    bbox: Vec<String>,
+    time_range: Vec<i64>,
+    min_confidence: String,
+    source_pair: bool,
+    top_k: u32,
+}
+
+#[derive(Serialize)]
+struct GapWalkCacheKey {
+    query: String,
+    user_id: String,
+    mode: i32,
+    max_rounds: u32,
+    ppr_alpha: String,
+    ppr_top_k: u32,
 }
 
 #[tonic::async_trait]
@@ -50,6 +76,23 @@ impl pb::SearchService for TheoremSearchService {
         request: Request<pb::SearchRequest>,
     ) -> Result<Response<pb::SearchResponse>, Status> {
         let req = request.into_inner();
+        let cache_key = self.cache.cache_key(
+            "search",
+            SearchCacheKey {
+                query: req.query.clone(),
+                mode: req.mode,
+                user_id: req.user_id.clone(),
+                session_id: req.session_id.clone(),
+                bbox: req.bbox.iter().map(|value| value.to_string()).collect(),
+                time_range: req.time_range.clone(),
+                min_confidence: req.min_confidence.to_string(),
+                source_pair: req.source_pair,
+                top_k: req.top_k,
+            },
+        );
+        if let Some(response) = self.cache.get_proto::<pb::SearchResponse>(&cache_key) {
+            return Ok(Response::new(response));
+        }
 
         // Named binding: the store must outlive the &borrow `search_substrate`
         // takes. The engine owns it, so `store()` hands back a borrow valid for
@@ -70,6 +113,7 @@ impl pb::SearchService for TheoremSearchService {
         let latency_ms = started.elapsed().as_millis() as u64;
 
         let response = map::to_search_response(req.query, result, latency_ms);
+        self.cache.put_proto(&cache_key, &response);
         Ok(Response::new(response))
     }
 
@@ -85,6 +129,20 @@ impl pb::SearchService for TheoremSearchService {
         request: Request<pb::GapWalkRequest>,
     ) -> Result<Response<pb::GapWalkResponse>, Status> {
         let req = request.into_inner();
+        let cache_key = self.cache.cache_key(
+            "gap_walk",
+            GapWalkCacheKey {
+                query: req.query.clone(),
+                user_id: req.user_id.clone(),
+                mode: req.mode,
+                max_rounds: req.max_rounds,
+                ppr_alpha: req.ppr_alpha.to_string(),
+                ppr_top_k: req.ppr_top_k,
+            },
+        );
+        if let Some(response) = self.cache.get_proto::<pb::GapWalkResponse>(&cache_key) {
+            return Ok(Response::new(response));
+        }
         let store = self.engine.store();
 
         let started = Instant::now();
@@ -121,6 +179,7 @@ impl pb::SearchService for TheoremSearchService {
             hit_round_cap: false,
             latency_ms,
         };
+        self.cache.put_proto(&cache_key, &response);
         Ok(Response::new(response))
     }
 

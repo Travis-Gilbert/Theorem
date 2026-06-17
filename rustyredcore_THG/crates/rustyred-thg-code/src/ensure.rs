@@ -195,7 +195,10 @@ fn stamp_head_sha(
     }
     let tenant = normalize_tenant(tenant_id);
     let repo_id = repo_id.trim();
-    let Some(mut node) = store.get_node(repo_id).map_err(CodeIndexError::from_store)? else {
+    let Some(mut node) = store
+        .get_node(repo_id)
+        .map_err(CodeIndexError::from_store)?
+    else {
         return Ok(());
     };
     if !node.labels.iter().any(|label| label == CODE_REPO_LABEL) {
@@ -220,7 +223,9 @@ fn stamp_head_sha(
             node.properties = json!({ HEAD_SHA_PROPERTY: sha, REPO_URL_PROPERTY: repo_url });
         }
     }
-    store.upsert_node(node).map_err(CodeIndexError::from_store)?;
+    store
+        .upsert_node(node)
+        .map_err(CodeIndexError::from_store)?;
     Ok(())
 }
 
@@ -239,7 +244,9 @@ pub fn ensure_repo_kg_in_store(
     let tenant = normalize_tenant(tenant_id);
     let repo_url = repo_url.trim();
     if repo_url.is_empty() {
-        return Err(CodeIndexError::invalid("ensure_repo_kg requires a repo_url"));
+        return Err(CodeIndexError::invalid(
+            "ensure_repo_kg requires a repo_url",
+        ));
     }
     let repo_id = repo_id
         .map(|id| id.trim().to_string())

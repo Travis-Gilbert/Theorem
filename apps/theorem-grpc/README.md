@@ -61,6 +61,11 @@ Durability and live adapter knobs:
   The RustyRed product Docker image defaults this to
   `http://theorem-grpc.railway.internal:8080`; bare `host:port` values are
   normalized to `http://host:port`.
+- `VALKEY_URL`: optional private-network Valkey URL for cache-aside reads. When
+  unset, the service computes directly from RustyRed and stores nothing outside
+  RedCore.
+- `VALKEY_CACHE_TTL_SECONDS`: TTL for Valkey cached responses (default: `60`).
+- `VALKEY_KEY_PREFIX`: cache key prefix (default: `theorem-grpc`).
 
 Build: `cargo build -p theorem-grpc` (run from this dir; standalone Cargo root,
 not a member of `rustyredcore_THG`).
@@ -75,3 +80,36 @@ substrate). `GapWalk` is a real single-round PPR over the existing substrate.
 ingested yet). `Provenance` returns the real node or honest-empty. None
 fabricate: graph-grounded-or-empty, never invented. An empty substrate yields
 zero hits, which is truthful, not a bug.
+
+## Valkey cache/offload
+
+Valkey is an accelerator only. It holds recomputable `Search`, `GapWalk`, and
+`code_search.context_pack` cache values with TTL. It never holds dispatch
+state, coordination state, provenance, execution receipts, or any
+must-not-lose graph data.
+
+Railway service shape:
+
+- Image: `valkey/valkey:8` or a later pinned `valkey/valkey` tag.
+- Network: private Railway networking only; do not attach a public domain.
+- Persistence: disabled. Run with `--save "" --appendonly no`.
+- Memory policy: set `--maxmemory <instance-size>` and
+  `--maxmemory-policy allkeys-lru`.
+- Consumers: set `VALKEY_URL` on `theorem-grpc`, the harness service, and any
+  future API service that uses cache-aside reads.
+
+Example Valkey start command:
+
+```bash
+valkey-server --bind :: --protected-mode yes --save "" --appendonly no \
+  --maxmemory 256mb --maxmemory-policy allkeys-lru
+```
+
+Private-network validation:
+
+```bash
+redis-cli -u "$VALKEY_URL" PING
+```
+
+Expected result: `PONG` from services inside the Railway private network, and no
+publicly reachable Valkey endpoint.

@@ -177,7 +177,10 @@ impl MutationMatcher {
             }
         }
         if let Some(labels) = &self.labels {
-            if !labels.iter().any(|wanted| event.labels.iter().any(|l| l == wanted)) {
+            if !labels
+                .iter()
+                .any(|wanted| event.labels.iter().any(|l| l == wanted))
+            {
                 return false;
             }
         }
@@ -823,7 +826,13 @@ pub(crate) fn changed_property_keys(prior: Option<&Value>, next: &Value) -> Vec<
 mod tests {
     use super::*;
 
-    fn ev(kind: MutationKind, id: &str, labels: &[&str], props: &[&str], depth: u32) -> MutationEvent {
+    fn ev(
+        kind: MutationKind,
+        id: &str,
+        labels: &[&str],
+        props: &[&str],
+        depth: u32,
+    ) -> MutationEvent {
         MutationEvent::new(
             kind,
             "tenant-a",
@@ -841,13 +850,37 @@ mod tests {
             .with_kinds([MutationKind::NodeUpserted])
             .with_labels(["CodeSymbol"])
             .with_changed_props_any(["signature"]);
-        assert!(m.matches(&ev(MutationKind::NodeUpserted, "n1", &["CodeSymbol"], &["signature"], 0)));
+        assert!(m.matches(&ev(
+            MutationKind::NodeUpserted,
+            "n1",
+            &["CodeSymbol"],
+            &["signature"],
+            0
+        )));
         // wrong kind
-        assert!(!m.matches(&ev(MutationKind::NodeDeleted, "n1", &["CodeSymbol"], &["signature"], 0)));
+        assert!(!m.matches(&ev(
+            MutationKind::NodeDeleted,
+            "n1",
+            &["CodeSymbol"],
+            &["signature"],
+            0
+        )));
         // wrong label
-        assert!(!m.matches(&ev(MutationKind::NodeUpserted, "n1", &["CodeFile"], &["signature"], 0)));
+        assert!(!m.matches(&ev(
+            MutationKind::NodeUpserted,
+            "n1",
+            &["CodeFile"],
+            &["signature"],
+            0
+        )));
         // prop not in changed set
-        assert!(!m.matches(&ev(MutationKind::NodeUpserted, "n1", &["CodeSymbol"], &["doc"], 0)));
+        assert!(!m.matches(&ev(
+            MutationKind::NodeUpserted,
+            "n1",
+            &["CodeSymbol"],
+            &["doc"],
+            0
+        )));
     }
 
     #[test]
@@ -856,7 +889,13 @@ mod tests {
             .with_kinds([MutationKind::EdgeUpserted])
             .with_labels(["links_to"]);
         assert!(m.matches(&ev(MutationKind::EdgeUpserted, "e1", &["links_to"], &[], 0)));
-        assert!(!m.matches(&ev(MutationKind::EdgeUpserted, "e1", &["CALLS_SYMBOL"], &[], 0)));
+        assert!(!m.matches(&ev(
+            MutationKind::EdgeUpserted,
+            "e1",
+            &["CALLS_SYMBOL"],
+            &[],
+            0
+        )));
     }
 
     #[test]
@@ -865,7 +904,10 @@ mod tests {
         let next = serde_json::json!({"a": 1, "b": 99, "d": 4});
         let keys = changed_property_keys(Some(&prior), &next);
         // b changed, d added, c removed; a unchanged.
-        assert_eq!(keys, vec!["b".to_string(), "c".to_string(), "d".to_string()]);
+        assert_eq!(
+            keys,
+            vec!["b".to_string(), "c".to_string(), "d".to_string()]
+        );
     }
 
     #[test]
@@ -877,12 +919,27 @@ mod tests {
 
     #[test]
     fn merge_event_unions_props_and_takes_max_depth() {
-        let mut a = ev(MutationKind::NodeUpserted, "n1", &["CodeSymbol"], &["signature"], 0);
+        let mut a = ev(
+            MutationKind::NodeUpserted,
+            "n1",
+            &["CodeSymbol"],
+            &["signature"],
+            0,
+        );
         a.committed_at_ms = 10;
-        let mut b = ev(MutationKind::NodeUpserted, "n1", &["CodeSymbol"], &["doc"], 1);
+        let mut b = ev(
+            MutationKind::NodeUpserted,
+            "n1",
+            &["CodeSymbol"],
+            &["doc"],
+            1,
+        );
         b.committed_at_ms = 20;
         merge_event(&mut a, b);
-        assert_eq!(a.changed_props, vec!["doc".to_string(), "signature".to_string()]);
+        assert_eq!(
+            a.changed_props,
+            vec!["doc".to_string(), "signature".to_string()]
+        );
         assert_eq!(a.depth, 1);
         assert_eq!(a.committed_at_ms, 20);
     }

@@ -592,9 +592,21 @@ mod agent_space_tests {
         assert!(agent_space_event_matches(&scoped, "tenant-a", None));
         assert!(agent_space_event_matches(&global, "tenant-a", None));
         // Room requested: that room plus room-less (global) events match.
-        assert!(agent_space_event_matches(&scoped, "tenant-a", Some("room:a")));
-        assert!(agent_space_event_matches(&global, "tenant-a", Some("room:a")));
-        assert!(!agent_space_event_matches(&other_room, "tenant-a", Some("room:a")));
+        assert!(agent_space_event_matches(
+            &scoped,
+            "tenant-a",
+            Some("room:a")
+        ));
+        assert!(agent_space_event_matches(
+            &global,
+            "tenant-a",
+            Some("room:a")
+        ));
+        assert!(!agent_space_event_matches(
+            &other_room,
+            "tenant-a",
+            Some("room:a")
+        ));
         // Tenant always gates.
         assert!(!agent_space_event_matches(&other_tenant, "tenant-a", None));
     }

@@ -51,7 +51,9 @@ fn build_call_graph(store: &mut RedCoreGraphStore) {
             )));
         }
     }
-    store.commit_batch(GraphMutationBatch::new(mutations)).unwrap();
+    store
+        .commit_batch(GraphMutationBatch::new(mutations))
+        .unwrap();
 }
 
 fn repo_adjacency(store: &RedCoreGraphStore) -> HashMap<String, Vec<(String, f64)>> {
@@ -136,7 +138,11 @@ fn warm_centrality_prior_beats_cold_ppr() {
     );
 
     assert!(!cold_scores.is_empty(), "cold PPR produced a ranking");
-    assert_eq!(warm_scores.len(), seeds.len(), "warm prior present for all seeds");
+    assert_eq!(
+        warm_scores.len(),
+        seeds.len(),
+        "warm prior present for all seeds"
+    );
     assert!(
         warm_elapsed < cold_elapsed,
         "warm prior read ({warm_elapsed:?}) should beat cold global PPR ({cold_elapsed:?})"

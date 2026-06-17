@@ -167,7 +167,14 @@ pub async fn web_search_graph<S: GraphStore>(
     // (the product server) run the fan-out OUTSIDE the tenant store lock, then
     // drive the gate inside a brief synchronous lock scope, so no store guard is
     // ever held across the fan-out `.await`.
-    gate_search_graph(store, acquisition, options, scorer, listwise, reranker_version)
+    gate_search_graph(
+        store,
+        acquisition,
+        options,
+        scorer,
+        listwise,
+        reranker_version,
+    )
 }
 
 /// Synchronous store-side half of the web arm: the warm-substrate read, candidate
@@ -219,13 +226,7 @@ pub fn gate_search_graph<S: GraphStore>(
     // (d)-(e) Gate the unified pool. A listwise reranker feeds this gate by way
     // of the `ListwiseRankScorer` wrapper above, so diversity can change the
     // admitted set instead of merely reordering already-admitted context.
-    let admission = admit_to_budget(
-        store,
-        candidates,
-        gate_scorer,
-        &ctx,
-        options.budget_tokens,
-    )
+    let admission = admit_to_budget(store, candidates, gate_scorer, &ctx, options.budget_tokens)
         .map_err(|error| crate::RustyWebError::Fetch {
             url: acquisition.query.clone(),
             reason: format!("membrane admit failed: {error:?}"),
@@ -431,21 +432,28 @@ fn fresh_candidate(ranked: &RankedSearchCandidate, max_score: f64) -> Candidate 
     let snippet = ranked.candidate.snippet.clone().unwrap_or_default();
     let text = join_nonempty(&[&title, &snippet]);
     let token_count = approximate_tokens(&text);
-    let mut candidate = Candidate::new(web_result_node_id(&ranked.normalized_url), text, token_count)
-        .with_source_arm(SourceArm::Web);
+    let mut candidate = Candidate::new(
+        web_result_node_id(&ranked.normalized_url),
+        text,
+        token_count,
+    )
+    .with_source_arm(SourceArm::Web);
     candidate.ppr_proximity = 0.0;
     candidate.epistemic.source_reliability =
         Some((ranked.sources.len() as f32 / 3.0).clamp(0.0, 1.0));
     candidate.epistemic.support_ratio = Some((ranked.sources.len() as f32 / 2.0).clamp(0.0, 1.0));
     if max_score > 0.0 {
-        candidate
-            .metadata
-            .insert("provider_score_norm".to_string(), format!("{:.6}", ranked.score / max_score));
+        candidate.metadata.insert(
+            "provider_score_norm".to_string(),
+            format!("{:.6}", ranked.score / max_score),
+        );
     }
     if let Some(host) = host_key(&ranked.normalized_url) {
         candidate = candidate.with_redundancy_key(host);
     }
-    candidate.metadata.insert("pool".to_string(), "fresh".to_string());
+    candidate
+        .metadata
+        .insert("pool".to_string(), "fresh".to_string());
     candidate
         .metadata
         .insert("url".to_string(), ranked.candidate.url.clone());
@@ -472,17 +480,18 @@ fn warm_candidate(hit: &SearchHit, max_match: f64) -> Candidate {
     };
     // A corpus page (already fetched + extracted) is more reliable than a fresh
     // snippet; a frontier page (discovered, unfetched) less so.
-    candidate.epistemic.source_reliability = Some(if hit.provenance == "corpus" {
-        0.9
-    } else {
-        0.4
-    });
+    candidate.epistemic.source_reliability =
+        Some(if hit.provenance == "corpus" { 0.9 } else { 0.4 });
     candidate.epistemic.support_ratio = Some(1.0);
     if let Some(host) = host_key(&hit.url) {
         candidate = candidate.with_redundancy_key(host);
     }
-    candidate.metadata.insert("pool".to_string(), "warm".to_string());
-    candidate.metadata.insert("url".to_string(), hit.url.clone());
+    candidate
+        .metadata
+        .insert("pool".to_string(), "warm".to_string());
+    candidate
+        .metadata
+        .insert("url".to_string(), hit.url.clone());
     candidate
         .metadata
         .insert("ring".to_string(), hit.ring.to_string());
@@ -587,8 +596,8 @@ mod tests {
     use rustyred_rerank::{LexicalCrossEncoder, NoopListwiseReranker, RerankScorer};
     use rustyred_thg_core::InMemoryGraphStore;
 
-    use crate::{build_fixture_crawl_graph, CrawlConfig, FixturePage, SearchCandidate};
     use crate::search::{SearchProviderError, StaticSearchProvider};
+    use crate::{build_fixture_crawl_graph, CrawlConfig, FixturePage, SearchCandidate};
 
     use super::*;
 
@@ -614,13 +623,17 @@ mod tests {
             _opts: &'a SearchOpts,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<Vec<SearchCandidate>, SearchProviderError>,
-                    > + Send
+                dyn std::future::Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>>
+                    + Send
                     + 'a,
             >,
         > {
-            Box::pin(async move { Err(SearchProviderError::new(self.name.clone(), "quota exceeded")) })
+            Box::pin(async move {
+                Err(SearchProviderError::new(
+                    self.name.clone(),
+                    "quota exceeded",
+                ))
+            })
         }
     }
 
@@ -888,6 +901,9 @@ mod tests {
 
         // The page is in the substrate and search_substrate can read it back.
         let found = search_substrate(&store, "membrane", SearchOptions::default());
-        assert!(found.hits.iter().any(|hit| hit.url.contains("fetched-page")));
+        assert!(found
+            .hits
+            .iter()
+            .any(|hit| hit.url.contains("fetched-page")));
     }
 }

@@ -15,6 +15,7 @@ mod engine;
 mod pb;
 mod service;
 mod session_delta;
+mod valkey_cache;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use code_service::TheoremCodeCrawlerService;
 use engine::Engine;
 use pb::{AppAffordanceServiceServer, CodeCrawlerServiceServer, SearchServiceServer};
 use service::TheoremSearchService;
+use valkey_cache::ValkeyCache;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,6 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the engine (empty substrate is the honest slice-1 default) and wrap
     // it in an Arc so the owned store outlives every borrowing handler call.
     let engine = Arc::new(Engine::new());
+    let valkey_cache = ValkeyCache::from_env();
+    match valkey_cache.ping() {
+        Ok(Some(pong)) => tracing::info!("THEOREM_GRPC_VALKEY_READY {}", pong),
+        Ok(None) => tracing::info!("THEOREM_GRPC_VALKEY_DISABLED"),
+        Err(error) => tracing::warn!("THEOREM_GRPC_VALKEY_UNREACHABLE {}", error),
+    }
     // ONE code store for the whole service: this CodeIndexRuntime (RedCore at
     // code_index_data_dir()) is shared by BOTH CodeCrawlerService and
     // AppAffordanceService below. The harness MCP `compute_code` reaches it
@@ -53,11 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // own tenant store directly; both routes keep ingest and search on one
     // store.)
     let code_index = CodeIndexRuntime::try_new().map_err(std::io::Error::other)?;
-    let search_svc = SearchServiceServer::new(TheoremSearchService::new(engine));
+    let search_svc =
+        SearchServiceServer::new(TheoremSearchService::new(engine, valkey_cache.clone()));
     let code_svc =
         CodeCrawlerServiceServer::new(TheoremCodeCrawlerService::new(code_index.clone()));
     let app_affordance_svc = AppAffordanceServiceServer::new(
-        TheoremAppAffordanceService::try_new_with_code_index(code_index)
+        TheoremAppAffordanceService::try_new_with_code_index_and_cache(code_index, valkey_cache)
             .map_err(std::io::Error::other)?,
     );
 

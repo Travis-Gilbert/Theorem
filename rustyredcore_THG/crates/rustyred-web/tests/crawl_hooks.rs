@@ -66,8 +66,13 @@ fn seed_link_graph(store: &Arc<Mutex<RedCoreGraphStore>>) -> (String, String, St
         json!({ "text": "Theorem Theorem Theorem powers Theseus and Memgraph across Rust." }),
     ))
     .unwrap();
-    g.upsert_node(url_node(&a, "https://example.com/a", STATE_FRONTIER, "hashA"))
-        .unwrap();
+    g.upsert_node(url_node(
+        &a,
+        "https://example.com/a",
+        STATE_FRONTIER,
+        "hashA",
+    ))
+    .unwrap();
     g.upsert_node(url_node(&b, "https://example.com/b", STATE_FRONTIER, ""))
         .unwrap();
     g.upsert_node(url_node(&c, "https://example.com/c", STATE_FRONTIER, ""))
@@ -138,7 +143,10 @@ fn without_hook_frontier_priority_is_unchanged() {
     let b_after = priority(&store, &b);
 
     assert_eq!(b_before, 0.0);
-    assert_eq!(b_after, 0.0, "no hook -> static priority, unchanged crawl order");
+    assert_eq!(
+        b_after, 0.0,
+        "no hook -> static priority, unchanged crawl order"
+    );
 }
 
 #[test]
@@ -148,10 +156,20 @@ fn discovered_link_sets_initial_priority() {
     let child = fingerprint("GET", "https://example.com/child", b"").to_hex();
     {
         let mut g = store.lock().unwrap();
-        g.upsert_node(url_node(&parent, "https://example.com/parent", STATE_FRONTIER, ""))
-            .unwrap();
-        g.upsert_node(url_node(&child, "https://example.com/child", STATE_FRONTIER, ""))
-            .unwrap();
+        g.upsert_node(url_node(
+            &parent,
+            "https://example.com/parent",
+            STATE_FRONTIER,
+            "",
+        ))
+        .unwrap();
+        g.upsert_node(url_node(
+            &child,
+            "https://example.com/child",
+            STATE_FRONTIER,
+            "",
+        ))
+        .unwrap();
     }
 
     let config = HookDispatcherConfig {
@@ -253,5 +271,8 @@ async fn attach_crawl_hooks_bridges_async_store() {
         .get("priority")
         .and_then(|v| v.as_f64())
         .unwrap();
-    assert!(b_priority > 0.0, "async-store fetch reprioritized the frontier");
+    assert!(
+        b_priority > 0.0,
+        "async-store fetch reprioritized the frontier"
+    );
 }

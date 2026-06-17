@@ -86,7 +86,11 @@ fn coalesces_ingest_storm_into_one_call_and_writes_back() {
     }
 
     assert!(dispatcher.quiesce(Duration::from_secs(5)), "queue drained");
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "one coalesced handler call");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one coalesced handler call"
+    );
     assert_eq!(seen.load(Ordering::SeqCst), 50, "handler saw all 50 events");
 
     let summary = store.lock().unwrap().get_node("repo-summary").unwrap();
@@ -131,7 +135,8 @@ fn handler_error_is_isolated_and_queue_keeps_draining() {
     );
 
     let store = shared_store();
-    let dispatcher = HookDispatcher::start(Arc::clone(&store), vec![boom_reg, good_reg], fast_config());
+    let dispatcher =
+        HookDispatcher::start(Arc::clone(&store), vec![boom_reg, good_reg], fast_config());
     store
         .lock()
         .unwrap()
@@ -162,7 +167,12 @@ fn handler_error_is_isolated_and_queue_keeps_draining() {
         .unwrap();
     assert!(dispatcher.quiesce(Duration::from_secs(5)));
     assert_eq!(good_calls.load(Ordering::SeqCst), 1);
-    assert!(store.lock().unwrap().get_node("good-marker").unwrap().is_some());
+    assert!(store
+        .lock()
+        .unwrap()
+        .get_node("good-marker")
+        .unwrap()
+        .is_some());
 }
 
 /// Extends acceptance 3: a panicking handler must not poison the store mutex.
@@ -193,8 +203,11 @@ fn handler_panic_does_not_poison_the_store() {
     );
 
     let store = shared_store();
-    let dispatcher =
-        HookDispatcher::start(Arc::clone(&store), vec![panic_reg, after_reg], fast_config());
+    let dispatcher = HookDispatcher::start(
+        Arc::clone(&store),
+        vec![panic_reg, after_reg],
+        fast_config(),
+    );
     store
         .lock()
         .unwrap()
@@ -343,11 +356,17 @@ fn write_does_not_block_on_a_slow_handler() {
             elapsed < Duration::from_millis(100),
             "write blocked on hook? took {elapsed:?}"
         );
-        assert!(!done.load(Ordering::SeqCst), "handler ran on the writer path");
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "handler ran on the writer path"
+        );
     }
 
     assert!(dispatcher.quiesce(Duration::from_secs(2)));
-    assert!(done.load(Ordering::SeqCst), "handler eventually ran off-path");
+    assert!(
+        done.load(Ordering::SeqCst),
+        "handler eventually ran off-path"
+    );
 }
 
 /// A store with no emitter attached behaves exactly as before: writes succeed,

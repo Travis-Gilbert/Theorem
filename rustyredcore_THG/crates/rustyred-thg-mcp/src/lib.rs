@@ -41,18 +41,18 @@ use theorem_harness_runtime::{
     infer_coordination_room_id, list_skill_packs, load_events, load_run,
     normalize_coordination_urgency, parse_coordination_mentions,
     publish_coordination_room_event_from_state, publish_footprint_event, publish_presence_event,
-    publish_record_event, publish_skill_pack, publish_work_graph_transition, recall_archived_memory,
-    recall_memory, relate_memory, remember_memory, revise_memory_document,
+    publish_record_event, publish_skill_pack, publish_work_graph_transition,
+    recall_archived_memory, recall_memory, relate_memory, remember_memory, revise_memory_document,
     scratchpad_revision_node_id, self_note_memory, stable_coordination_message_id,
-    stable_coordination_record_id, task_node_graph_id, upsert_note, AddOrRemove, ArchiveMemoryInput,
-    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
-    CoordinationRecordState, CoordinationRoomMember, CoordinationRoomState, EncodeMemoryInput,
-    ForgetMemoryInput, HandoffMemoryInput, HarnessRuntimeError, JobActionResult, JobNoteInput,
-    JoinRoomInput, MemoryError, MemoryGraphStore, MemoryWriteInput, PresenceInput,
-    RecallMemoryInput, RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput, SkillPackError,
-    SkillPackGetInput, SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput,
-    UpsertNoteInput, WriteIntentInput, WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF,
-    EDGE_REFINED_INTO, TASK_NODE_LABEL,
+    stable_coordination_record_id, task_node_graph_id, upsert_note, AddOrRemove,
+    ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
+    CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
+    CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
+    HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
+    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
+    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
+    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
+    WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -158,7 +158,12 @@ fn emit_agent_space_footprint(tenant: &str, arguments: &Value) {
     let ts = agent_space_now_ms();
     let files = agent_space_arg_list(
         arguments,
-        &["footprint", "claimed_files", "claimedFiles", "touched_files"],
+        &[
+            "footprint",
+            "claimed_files",
+            "claimedFiles",
+            "touched_files",
+        ],
     );
     if files.is_empty() {
         let target = agent_space_arg_str(arguments, &["task", "binding_id", "summary"]);
@@ -206,7 +211,10 @@ fn emit_agent_space_record(tenant: &str, arguments: &Value) {
 fn emit_agent_space_transition(tenant: &str, arguments: &Value) {
     let node_id = agent_space_arg_str(arguments, &["run_id", "node_id", "binding_id", "id"]);
     let from = agent_space_arg_str(arguments, &["from", "from_state", "previous_state"]);
-    let to = agent_space_arg_str(arguments, &["to", "to_state", "state", "event_type", "kind"]);
+    let to = agent_space_arg_str(
+        arguments,
+        &["to", "to_state", "state", "event_type", "kind"],
+    );
     let actor = agent_space_arg_str(arguments, &["actor_id", "actor", "author"]);
     publish_work_graph_transition(
         tenant.to_string(),
@@ -11250,8 +11258,14 @@ mod tests {
             }
         }
 
-        assert!(saw_message, "coordinate write must reach the agent-space bus");
-        assert!(saw_presence, "presence write must reach the agent-space bus");
+        assert!(
+            saw_message,
+            "coordinate write must reach the agent-space bus"
+        );
+        assert!(
+            saw_presence,
+            "presence write must reach the agent-space bus"
+        );
         assert!(
             saw_footprint,
             "intent footprint must reach the agent-space bus"

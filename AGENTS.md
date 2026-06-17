@@ -36,3 +36,9 @@ Do not look for problems by reading. Stand up the oracles and fix what they flag
 ## Scope discipline
 
 Implement what the spec says, fully. Do not insert conservative defaults that contradict the spec, do not downgrade to an MVP that was not asked for, and do not frame in-scope work as deferred. A named choice in the spec is a requirement, not a suggestion. If something genuinely cannot be done, say so plainly and name the blocker, rather than quietly shrinking the work.
+
+## Doc-update protocol (end of every session)
+
+Code outruns docs. If your session added, renamed, or removed a crate or app, before you end the session: update the crate or app table in `CLAUDE.md` and the matching row in `docs/site/reference/`, fix any `CLAUDE.md` section the change makes wrong, bump the README `Last sync` line if you re-synced with Theseus, then run `scripts/check-doc-drift.sh --refresh`. Encode the decision to the harness if it is load-bearing.
+
+Detection backs the rule. `scripts/check-doc-drift.sh` compares crates and apps on disk against the `CLAUDE.md` map and a baseline. A `SessionStart` hook injects the current doc-map status into every session. A `Stop` hook flags new undocumented directories; export `THEOREM_DOC_DRIFT_BLOCK=1` to make it block until they are documented. Full guide: `docs/site/guides/doc-update-protocol.md`.
