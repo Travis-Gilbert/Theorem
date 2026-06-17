@@ -13,6 +13,7 @@ use serde_json::Value;
 use turbovec::IdMapIndex;
 
 use crate::hooks::{changed_property_keys, HookEmitter, MutationEvent, MutationKind};
+use crate::ordered::{OrderedDesignation, OrderedIndex};
 use crate::state::stable_hash;
 
 #[cfg(feature = "vector-accelerated")]
@@ -914,6 +915,7 @@ pub struct InMemoryGraphStore {
     property_index: BTreeMap<(String, String), BTreeSet<String>>,
     vector_designations: HashMap<(String, String), usize>,
     vector_indexes: HashMap<(String, String), VectorIndex>,
+    ordered_indexes: BTreeMap<(String, String), OrderedIndex>,
     /// TTL expiration index: maps `_ttl_expires_at_ms` -> set of node ids
     /// that expire at that timestamp. Updated on every node upsert that
     /// has (or had) a TTL property. Sweep iterates `range(..=now_ms)` to
@@ -935,6 +937,7 @@ impl Default for InMemoryGraphStore {
             property_index: BTreeMap::new(),
             vector_designations: HashMap::new(),
             vector_indexes: HashMap::new(),
+            ordered_indexes: BTreeMap::new(),
             ttl_index: BTreeMap::new(),
         }
     }
@@ -1423,6 +1426,81 @@ impl InMemoryGraphStore {
             .collect()
     }
 
+    pub fn designate_ordered_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+    ) -> GraphStoreResult<()> {
+        if label.trim().is_empty() || property_name.trim().is_empty() {
+            return Err(GraphStoreError::new(
+                "invalid_ordered_designation",
+                "label and property_name must be non-empty".to_string(),
+            ));
+        }
+        let key = (label.to_string(), property_name.to_string());
+        self.ordered_indexes
+            .entry(key.clone())
+            .or_insert_with(OrderedIndex::persistent);
+        let entries = self
+            .nodes
+            .values()
+            .filter(|node| {
+                !node.tombstone && node.labels.iter().any(|candidate| candidate == label)
+            })
+            .filter_map(|node| {
+                numeric_property(&node.properties, property_name)
+                    .map(|score| (node.id.as_bytes().to_vec(), score))
+            })
+            .collect::<Vec<_>>();
+        if let Some(index) = self.ordered_indexes.get_mut(&key) {
+            for (member, score) in entries {
+                index.zadd(member, score)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ordered_designations(&self) -> Vec<OrderedDesignation> {
+        self.ordered_indexes
+            .keys()
+            .map(|(label, property)| OrderedDesignation {
+                label: label.clone(),
+                property: property.clone(),
+            })
+            .collect()
+    }
+
+    pub fn ordered_range_by_score(
+        &self,
+        label: &str,
+        property_name: &str,
+        min: f64,
+        max: f64,
+        limit: Option<usize>,
+    ) -> GraphStoreResult<Vec<(String, f64)>> {
+        let Some(index) = self
+            .ordered_indexes
+            .get(&(label.to_string(), property_name.to_string()))
+        else {
+            return Ok(Vec::new());
+        };
+        index
+            .zrange_by_score(min, max, limit)?
+            .into_iter()
+            .map(|(member, score)| {
+                String::from_utf8(member)
+                    .map(|member| (member, score))
+                    .map_err(|err| GraphStoreError::new("invalid_ordered_member", err.to_string()))
+            })
+            .collect()
+    }
+
+    pub fn ordered_score(&self, label: &str, property_name: &str, node_id: &str) -> Option<f64> {
+        self.ordered_indexes
+            .get(&(label.to_string(), property_name.to_string()))
+            .and_then(|index| index.zscore(node_id.as_bytes()))
+    }
+
     pub fn index_vector(
         &mut self,
         node_id: &str,
@@ -1633,6 +1711,26 @@ impl InMemoryGraphStore {
         }
     }
 
+    fn auto_index_ordered(&mut self, node: &NodeRecord) -> GraphStoreResult<()> {
+        let designations = self
+            .ordered_indexes
+            .keys()
+            .cloned()
+            .collect::<Vec<(String, String)>>();
+        for (label, property) in designations {
+            if !node.labels.iter().any(|candidate| candidate == &label) {
+                continue;
+            }
+            let Some(score) = numeric_property(&node.properties, &property) else {
+                continue;
+            };
+            if let Some(index) = self.ordered_indexes.get_mut(&(label, property)) {
+                index.zadd(node.id.as_bytes().to_vec(), score)?;
+            }
+        }
+        Ok(())
+    }
+
     fn estimated_memory_bytes(&self) -> usize {
         let snapshot_bytes = serde_json::to_vec(&self.snapshot())
             .map(|raw| raw.len())
@@ -1643,6 +1741,7 @@ impl InMemoryGraphStore {
             + tuple_index_bytes(&self.out_adjacency)
             + tuple_index_bytes(&self.in_adjacency)
             + tuple_index_bytes(&self.property_index)
+            + ordered_index_bytes(&self.ordered_indexes)
     }
 
     pub fn verify(&self) -> VerifyReport {
@@ -1758,6 +1857,14 @@ impl InMemoryGraphStore {
         self.label_index.clear();
         self.edge_type_index.clear();
         self.property_index.clear();
+        let ordered_designations = self.ordered_designations();
+        self.ordered_indexes.clear();
+        for designation in ordered_designations {
+            self.ordered_indexes.insert(
+                (designation.label, designation.property),
+                OrderedIndex::persistent(),
+            );
+        }
         // TTL index is symmetric with the other secondary indexes:
         // cleared here and repopulated via add_node_indexes below.
         // This gives us startup-scan TTL index rebuild for free
@@ -1926,6 +2033,7 @@ impl InMemoryGraphStore {
                 .or_default()
                 .insert(node.id.clone());
         }
+        self.auto_index_ordered(node).ok();
     }
 
     fn remove_node_indexes(&mut self, node: &NodeRecord) {
@@ -1953,6 +2061,9 @@ impl InMemoryGraphStore {
                     self.ttl_index.remove(&expires_at_ms);
                 }
             }
+        }
+        for index in self.ordered_indexes.values_mut() {
+            index.zrem(node.id.as_bytes());
         }
     }
 
@@ -2131,6 +2242,7 @@ enum RedCoreMutation {
     EdgeUpsert(EdgeRecord),
     Batch(Vec<RedCoreMutation>),
     VectorDesignation(VectorDesignation),
+    OrderedDesignation(OrderedDesignation),
     /// Durable node deletion (TTL-04). Recovery handler removes the node
     /// from storage and from every index. Idempotent on recovery: an
     /// AOF replay that deletes a node already absent in the snapshot is
@@ -2162,6 +2274,7 @@ pub struct RedCoreGraphStore {
     recovered_frames: u64,
     last_recovery_ok: bool,
     last_fsync: Option<SystemTime>,
+    transient_ordered_indexes: HashMap<String, OrderedIndex>,
     // ---- Graph-level hooks (additive; see crate::hooks) ----------------
     // Optional post-commit mutation-event sink. `None` (the default for every
     // existing caller) makes every emit a no-op, so the hook subsystem is
@@ -2183,6 +2296,17 @@ struct RedCoreDirectoryLock {
     process_key: PathBuf,
 }
 
+type PendingHookEvent = (MutationKind, String, Vec<String>, Vec<String>);
+
+#[derive(Debug)]
+struct RedCoreCommitPlan {
+    graph_version: u64,
+    durable_mutation: RedCoreMutation,
+    publish_mutations: Vec<RedCoreMutation>,
+    writes: Vec<GraphWriteResult>,
+    pending_events: Vec<PendingHookEvent>,
+}
+
 impl RedCoreGraphStore {
     pub fn memory() -> Self {
         Self {
@@ -2199,6 +2323,7 @@ impl RedCoreGraphStore {
             recovered_frames: 0,
             last_recovery_ok: true,
             last_fsync: None,
+            transient_ordered_indexes: HashMap::new(),
             hook_emitter: None,
             hook_emit_depth: 0,
             hook_tenant: String::new(),
@@ -2221,6 +2346,7 @@ impl RedCoreGraphStore {
             recovered_frames: 0,
             last_recovery_ok: false,
             last_fsync: None,
+            transient_ordered_indexes: HashMap::new(),
             hook_emitter: None,
             hook_emit_depth: 0,
             hook_tenant: String::new(),
@@ -2445,6 +2571,11 @@ impl RedCoreGraphStore {
             return Err(GraphStoreError::empty_transaction());
         }
 
+        let txn_id = self.last_txn_id + 1;
+        if self.can_commit_incrementally(txn_id) {
+            return self.commit_batch_incremental(txn_id, batch);
+        }
+
         let mut staged = self.store.clone();
         let mut writes = Vec::with_capacity(batch.mutations.len());
         let mut durable_mutations = Vec::with_capacity(batch.mutations.len());
@@ -2495,7 +2626,6 @@ impl RedCoreGraphStore {
             }
         }
 
-        let txn_id = self.last_txn_id + 1;
         let graph_version = staged.stats().version;
         let durable_mutation = if durable_mutations.len() == 1 {
             durable_mutations
@@ -2527,6 +2657,217 @@ impl RedCoreGraphStore {
             graph_version,
             writes,
         })
+    }
+
+    fn can_commit_incrementally(&self, txn_id: u64) -> bool {
+        !matches!(self.options.durability, RedCoreDurability::SnapshotOnly)
+            && !self.should_snapshot_for(txn_id)
+    }
+
+    fn commit_batch_incremental(
+        &mut self,
+        txn_id: u64,
+        batch: GraphMutationBatch,
+    ) -> GraphStoreResult<GraphTransaction> {
+        let emit_hooks = self.hook_emitter.is_some();
+        let plan = self.prepare_commit_plan(batch, emit_hooks)?;
+        self.persist_delta_before_publish(
+            txn_id,
+            plan.graph_version,
+            plan.durable_mutation.clone(),
+        )?;
+
+        for mutation in plan.publish_mutations {
+            match mutation {
+                RedCoreMutation::NodeUpsert(node) => self.store.apply_recovered_node(node)?,
+                RedCoreMutation::EdgeUpsert(edge) => self.store.apply_recovered_edge(edge)?,
+                _ => {}
+            }
+        }
+        self.last_txn_id = txn_id;
+
+        if emit_hooks && !plan.pending_events.is_empty() {
+            let committed_at_ms = now_ms().max(0) as u64;
+            for (kind, id, labels, changed_props) in plan.pending_events {
+                self.emit_hook_event(kind, id, labels, changed_props, committed_at_ms);
+            }
+        }
+
+        Ok(GraphTransaction {
+            txn_id,
+            graph_version: plan.graph_version,
+            writes: plan.writes,
+        })
+    }
+
+    fn prepare_commit_plan(
+        &self,
+        batch: GraphMutationBatch,
+        emit_hooks: bool,
+    ) -> GraphStoreResult<RedCoreCommitPlan> {
+        let mut graph_version = self.store.version;
+        let mut staged_nodes: BTreeMap<String, NodeRecord> = BTreeMap::new();
+        let mut staged_edges: BTreeMap<String, EdgeRecord> = BTreeMap::new();
+        let mut durable_mutations = Vec::with_capacity(batch.mutations.len());
+        let mut publish_mutations = Vec::with_capacity(batch.mutations.len());
+        let mut writes = Vec::with_capacity(batch.mutations.len());
+        let mut pending_events: Vec<PendingHookEvent> = Vec::new();
+
+        for mutation in batch.mutations {
+            match mutation {
+                GraphMutation::NodeUpsert(node) => {
+                    let record =
+                        self.prepare_node_upsert(node, &staged_nodes, graph_version + 1)?;
+                    graph_version = record.version;
+                    let checksum = record.checksum();
+                    let id = record.id.clone();
+                    if emit_hooks {
+                        let prior = self.store.nodes.get(&id).map(|n| &n.properties);
+                        let changed = changed_property_keys(prior, &record.properties);
+                        pending_events.push((
+                            MutationKind::NodeUpserted,
+                            id.clone(),
+                            record.labels.clone(),
+                            changed,
+                        ));
+                    }
+                    let mutation = RedCoreMutation::NodeUpsert(record.clone());
+                    durable_mutations.push(mutation.clone());
+                    publish_mutations.push(mutation);
+                    staged_nodes.insert(id.clone(), record);
+                    writes.push(GraphWriteResult {
+                        id,
+                        version: graph_version,
+                        checksum,
+                    });
+                }
+                GraphMutation::EdgeUpsert(edge) => {
+                    let record = self.prepare_edge_upsert(
+                        edge,
+                        &staged_nodes,
+                        &staged_edges,
+                        graph_version + 1,
+                    )?;
+                    graph_version = record.version;
+                    let checksum = record.checksum();
+                    let id = record.id.clone();
+                    if emit_hooks {
+                        let prior = self.store.edges.get(&id).map(|e| &e.properties);
+                        let changed = changed_property_keys(prior, &record.properties);
+                        pending_events.push((
+                            MutationKind::EdgeUpserted,
+                            id.clone(),
+                            vec![record.edge_type.clone()],
+                            changed,
+                        ));
+                    }
+                    let mutation = RedCoreMutation::EdgeUpsert(record.clone());
+                    durable_mutations.push(mutation.clone());
+                    publish_mutations.push(mutation);
+                    staged_edges.insert(id.clone(), record);
+                    writes.push(GraphWriteResult {
+                        id,
+                        version: graph_version,
+                        checksum,
+                    });
+                }
+            }
+        }
+
+        let durable_mutation = if durable_mutations.len() == 1 {
+            durable_mutations
+                .pop()
+                .expect("single durable mutation exists")
+        } else {
+            RedCoreMutation::Batch(durable_mutations)
+        };
+
+        Ok(RedCoreCommitPlan {
+            graph_version,
+            durable_mutation,
+            publish_mutations,
+            writes,
+            pending_events,
+        })
+    }
+
+    fn prepare_node_upsert(
+        &self,
+        mut node: NodeRecord,
+        staged_nodes: &BTreeMap<String, NodeRecord>,
+        version: u64,
+    ) -> GraphStoreResult<NodeRecord> {
+        if node.id.trim().is_empty() {
+            return Err(GraphStoreError::empty_field("node.id"));
+        }
+        node.labels = normalize_labels(node.labels);
+        let parent_hash = staged_nodes
+            .get(&node.id)
+            .or_else(|| self.store.nodes.get(&node.id))
+            .map(|existing| {
+                existing
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| existing.checksum())
+            });
+        node.version = version;
+        let content_hash = node.checksum();
+        if node.parent_hashes.is_empty() {
+            if let Some(parent_hash) = parent_hash.filter(|parent| parent != &content_hash) {
+                node.parent_hashes.push(parent_hash);
+            }
+        }
+        node.content_hash = Some(content_hash);
+        Ok(node)
+    }
+
+    fn prepare_edge_upsert(
+        &self,
+        mut edge: EdgeRecord,
+        staged_nodes: &BTreeMap<String, NodeRecord>,
+        staged_edges: &BTreeMap<String, EdgeRecord>,
+        version: u64,
+    ) -> GraphStoreResult<EdgeRecord> {
+        validate_edge_shape(&edge)?;
+        self.require_live_endpoint_in_plan(&edge, "from", &edge.from_id, staged_nodes)?;
+        self.require_live_endpoint_in_plan(&edge, "to", &edge.to_id, staged_nodes)?;
+        let parent_hash = staged_edges
+            .get(&edge.id)
+            .or_else(|| self.store.edges.get(&edge.id))
+            .map(|existing| {
+                existing
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| existing.checksum())
+            });
+        edge.version = version;
+        let content_hash = edge.checksum();
+        if edge.parent_hashes.is_empty() {
+            if let Some(parent_hash) = parent_hash.filter(|parent| parent != &content_hash) {
+                edge.parent_hashes.push(parent_hash);
+            }
+        }
+        edge.content_hash = Some(content_hash);
+        Ok(edge)
+    }
+
+    fn require_live_endpoint_in_plan(
+        &self,
+        edge: &EdgeRecord,
+        endpoint: &str,
+        node_id: &str,
+        staged_nodes: &BTreeMap<String, NodeRecord>,
+    ) -> GraphStoreResult<()> {
+        let node = staged_nodes
+            .get(node_id)
+            .or_else(|| self.store.nodes.get(node_id))
+            .ok_or_else(|| GraphStoreError::missing_endpoint(&edge.id, endpoint, node_id))?;
+        if node.tombstone {
+            return Err(GraphStoreError::tombstoned_endpoint(
+                &edge.id, endpoint, node_id,
+            ));
+        }
+        Ok(())
     }
 
     pub fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
@@ -2797,6 +3138,91 @@ impl RedCoreGraphStore {
         self.store.vector_designations()
     }
 
+    pub fn designate_ordered_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+    ) -> GraphStoreResult<()> {
+        let designation = OrderedDesignation {
+            label: label.to_string(),
+            property: property_name.to_string(),
+        };
+        let txn_id = self.last_txn_id + 1;
+        let mut staged = self.store.clone();
+        staged.designate_ordered_property(label, property_name)?;
+        let graph_version = staged.stats().version;
+        let prepublished_snapshot_txn_id = self.persist_before_publish(
+            txn_id,
+            graph_version,
+            &staged,
+            RedCoreMutation::OrderedDesignation(designation),
+        )?;
+        self.store = staged;
+        self.last_txn_id = txn_id;
+        if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
+            self.snapshot_txn_id = snapshot_txn_id;
+        }
+        Ok(())
+    }
+
+    pub fn ordered_designations(&self) -> Vec<OrderedDesignation> {
+        self.store.ordered_designations()
+    }
+
+    pub fn ordered_range_by_score(
+        &self,
+        label: &str,
+        property_name: &str,
+        min: f64,
+        max: f64,
+        limit: Option<usize>,
+    ) -> GraphStoreResult<Vec<(String, f64)>> {
+        self.store
+            .ordered_range_by_score(label, property_name, min, max, limit)
+    }
+
+    pub fn ordered_score(&self, label: &str, property_name: &str, node_id: &str) -> Option<f64> {
+        self.store.ordered_score(label, property_name, node_id)
+    }
+
+    pub fn transient_ordered_zadd(
+        &mut self,
+        index_name: &str,
+        member: impl Into<Vec<u8>>,
+        score: f64,
+    ) -> GraphStoreResult<bool> {
+        self.transient_ordered_indexes
+            .entry(index_name.to_string())
+            .or_insert_with(OrderedIndex::transient)
+            .zadd(member, score)
+    }
+
+    pub fn transient_ordered_zpop_max(&mut self, index_name: &str) -> Option<(Vec<u8>, f64)> {
+        self.transient_ordered_indexes
+            .get_mut(index_name)
+            .and_then(OrderedIndex::zpop_max)
+    }
+
+    pub fn transient_ordered_zpop_min(&mut self, index_name: &str) -> Option<(Vec<u8>, f64)> {
+        self.transient_ordered_indexes
+            .get_mut(index_name)
+            .and_then(OrderedIndex::zpop_min)
+    }
+
+    pub fn transient_ordered_zcard(&self, index_name: &str) -> usize {
+        self.transient_ordered_indexes
+            .get(index_name)
+            .map(OrderedIndex::zcard)
+            .unwrap_or_default()
+    }
+
+    pub fn transient_ordered_zrem(&mut self, index_name: &str, member: &[u8]) -> bool {
+        self.transient_ordered_indexes
+            .get_mut(index_name)
+            .map(|index| index.zrem(member))
+            .unwrap_or(false)
+    }
+
     pub fn epistemic_neighbors(
         &self,
         node_id: &str,
@@ -2917,6 +3343,9 @@ impl RedCoreGraphStore {
                 self.store
                     .designate_vector_property(&d.label, &d.property, d.dimension)
             }
+            RedCoreMutation::OrderedDesignation(d) => {
+                self.store.designate_ordered_property(&d.label, &d.property)
+            }
             RedCoreMutation::NodeDelete(id) => self.store.apply_recovered_delete(&id),
         }
     }
@@ -2949,6 +3378,28 @@ impl RedCoreGraphStore {
             snapshot_txn_id.unwrap_or(self.snapshot_txn_id),
         )?;
         Ok(snapshot_txn_id)
+    }
+
+    fn persist_delta_before_publish(
+        &mut self,
+        txn_id: u64,
+        graph_version: u64,
+        mutation: RedCoreMutation,
+    ) -> GraphStoreResult<()> {
+        match self.options.durability {
+            RedCoreDurability::None => {}
+            RedCoreDurability::AofEverysec | RedCoreDurability::AofAlways => {
+                self.append_aof(txn_id, graph_version, mutation)?;
+            }
+            RedCoreDurability::SnapshotOnly => {
+                return Err(GraphStoreError::new(
+                    "redcore_incremental_snapshot_unsupported",
+                    "snapshot-only durability requires staged snapshot commit".to_string(),
+                ));
+            }
+        }
+        self.write_manifest_for(graph_version, txn_id, self.snapshot_txn_id)?;
+        Ok(())
     }
 
     fn append_aof(
@@ -4460,6 +4911,13 @@ fn extract_float_array(properties: &Value, key: &str) -> Option<Vec<f32>> {
     }
 }
 
+fn numeric_property(properties: &Value, key: &str) -> Option<f64> {
+    properties
+        .get(key)?
+        .as_f64()
+        .filter(|score| !score.is_nan())
+}
+
 fn normalize_labels(labels: impl IntoIterator<Item = impl Into<String>>) -> Vec<String> {
     let mut labels = labels
         .into_iter()
@@ -4507,6 +4965,21 @@ fn tuple_index_bytes(index: &BTreeMap<(String, String), BTreeSet<String>>) -> us
         .iter()
         .map(|((left, right), values)| {
             left.len() + right.len() + values.iter().map(String::len).sum::<usize>()
+        })
+        .sum()
+}
+
+fn ordered_index_bytes(indexes: &BTreeMap<(String, String), OrderedIndex>) -> usize {
+    indexes
+        .iter()
+        .map(|((label, property), index)| {
+            label.len()
+                + property.len()
+                + index
+                    .entries()
+                    .into_iter()
+                    .map(|(member, _)| member.len() + std::mem::size_of::<f64>())
+                    .sum::<usize>()
         })
         .sum()
 }
@@ -4880,13 +5353,13 @@ mod tests {
 
     use serde_json::json;
 
+    #[cfg(feature = "vector-accelerated")]
+    use super::VectorIndex;
     use super::{
         sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
         GraphSnapshot, GraphStore, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
         RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCoreSyncMode,
     };
-    #[cfg(feature = "vector-accelerated")]
-    use super::VectorIndex;
 
     #[test]
     fn records_have_stable_hashes_and_metadata() {
@@ -6438,6 +6911,94 @@ mod tests {
         let labels: Vec<&str> = desigs.iter().map(|d| d.label.as_str()).collect();
         assert!(labels.contains(&"Doc"));
         assert!(labels.contains(&"Claim"));
+    }
+
+    #[test]
+    fn ordered_designation_tracks_numeric_property_updates() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .upsert_node(NodeRecord::new("doc:b", ["Doc"], json!({ "score": 1.0 })))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new("doc:a", ["Doc"], json!({ "score": 1.0 })))
+            .unwrap();
+        store.designate_ordered_property("Doc", "score").unwrap();
+
+        assert_eq!(
+            store.ordered_range_by_score("Doc", "score", 0.0, 10.0, None),
+            Ok(vec![("doc:a".to_string(), 1.0), ("doc:b".to_string(), 1.0)])
+        );
+
+        store
+            .upsert_node(NodeRecord::new("doc:b", ["Doc"], json!({ "score": 9.0 })))
+            .unwrap();
+
+        assert_eq!(store.ordered_score("Doc", "score", "doc:b"), Some(9.0));
+        assert_eq!(
+            store.ordered_range_by_score("Doc", "score", 0.0, 10.0, None),
+            Ok(vec![("doc:a".to_string(), 1.0), ("doc:b".to_string(), 9.0)])
+        );
+    }
+
+    #[test]
+    fn redcore_persists_ordered_designation_through_reopen() {
+        let data_dir = unique_test_dir("ordered-aof");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new("role:1", ["Role"], json!({ "rank": 2.0 })))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new("role:2", ["Role"], json!({ "rank": 1.0 })))
+                .unwrap();
+            store.designate_ordered_property("Role", "rank").unwrap();
+            assert_eq!(
+                store
+                    .ordered_range_by_score("Role", "rank", 0.0, 10.0, None)
+                    .unwrap(),
+                vec![("role:2".to_string(), 1.0), ("role:1".to_string(), 2.0)]
+            );
+        }
+
+        {
+            let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+            assert_eq!(store.ordered_designations().len(), 1);
+            assert_eq!(
+                store
+                    .ordered_range_by_score("Role", "rank", 0.0, 10.0, None)
+                    .unwrap(),
+                vec![("role:2".to_string(), 1.0), ("role:1".to_string(), 2.0)]
+            );
+        }
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn transient_ordered_set_does_not_advance_redcore_commit_log() {
+        let mut store = RedCoreGraphStore::memory();
+        let before = store.status();
+
+        assert!(store
+            .transient_ordered_zadd("frontier:test", b"url:b".to_vec(), 2.0)
+            .unwrap());
+        assert!(store
+            .transient_ordered_zadd("frontier:test", b"url:a".to_vec(), 1.0)
+            .unwrap());
+
+        assert_eq!(store.transient_ordered_zcard("frontier:test"), 2);
+        assert_eq!(
+            store.transient_ordered_zpop_max("frontier:test"),
+            Some((b"url:b".to_vec(), 2.0))
+        );
+        assert_eq!(store.status().last_txn_id, before.last_txn_id);
+        assert_eq!(store.status().graph_version, before.graph_version);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod graph_csr;
 pub mod graph_store;
 pub mod hooks;
 pub mod instant_kg;
+pub mod ordered;
 pub mod plugin;
 pub mod spatial;
 #[cfg(feature = "s2")]
@@ -66,6 +67,10 @@ pub use instant_kg::{
     InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
     INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
 };
+pub use ordered::{
+    OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember, OrderedMode,
+    OrderedScore,
+};
 pub use plugin::{
     normalize_plugin_command, PluginCapability, PluginCapabilityKind, PluginExecutionOutput,
     PluginOperationContext, PluginOperationHandler, PluginOperationRegistration, PluginRegistry,
@@ -85,14 +90,17 @@ pub use symbolic::{
     DATALOG_RULE_IDS,
 };
 pub use versioned_graph::{
-    apply_graph_mutation_batch, build_prolly_tree, checkout_graph_version, compile_graph_pack,
-    compile_graph_pack_incremental, diff_graph_snapshots, graph_version_log, merge_graph_snapshots,
-    resolve_auto_confidence_edge, snapshot_content_objects, update_graph_ref, update_graph_ref_cas,
+    apply_graph_mutation_batch, build_prolly_tree, build_prolly_tree_from_entries,
+    build_prolly_tree_incremental, checkout_graph_version, compile_graph_pack,
+    compile_graph_pack_incremental, diff_graph_snapshots, diff_graph_trees, graph_version_log,
+    merge_graph_snapshots, prolly_validation_enabled, resolve_auto_confidence_edge,
+    snapshot_content_objects, update_graph_ref, update_graph_ref_cas, CommitCost,
     CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
     GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
     GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide, GraphMergeStrategy,
     GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefConflict, GraphRefUpdate,
     GraphTreeChild, GraphTreeEntry, GraphTreeNode, GraphVersionDiff, GraphVersionLog,
-    GraphVersionRef, GraphVersionRepository, IncrementalGraphPack, DEFAULT_GRAPH_BRANCH,
-    GRAPH_PACK_COMPILER_VERSION, VERSIONED_GRAPH_PROTOCOL_VERSION,
+    GraphVersionRef, GraphVersionRepository, IncrementalGraphPack, IncrementalTreeBuild,
+    DEFAULT_GRAPH_BRANCH, GRAPH_CHUNK_FORMAT_VERSION, GRAPH_PACK_COMPILER_VERSION,
+    VERSIONED_GRAPH_PROTOCOL_VERSION,
 };

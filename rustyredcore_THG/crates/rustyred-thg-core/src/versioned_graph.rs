@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -232,6 +232,20 @@ pub struct IncrementalGraphPack {
     pub changed_object_keys: Vec<String>,
     pub changed_tree_nodes: usize,
     pub reused_tree_nodes: usize,
+    /// Per-commit structural-sharing accounting for this incremental commit
+    /// (the genuine O(changed + log n) work + the persisted delta). Defaulted
+    /// for backward compatibility with packs serialized before this field.
+    #[serde(default)]
+    pub commit_cost: CommitCost,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CommitCost {
+    pub changed_objects: usize,
+    pub changed_tree_nodes: usize,
+    pub reused_tree_nodes: usize,
+    pub chunks_written: usize,
+    pub bytes_written: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -496,31 +510,79 @@ pub fn compile_graph_pack_incremental(
         options.parent_commits
     };
 
-    let mut objects_by_key = prior_pack
-        .objects
+    // Prior object-hash by key, sourced from the prior tree leaves so a
+    // COMPACTED prior pack (objects stripped for storage) still drives changed
+    // detection -- and so we never clone the parent commit's whole object set
+    // (the O(graph) materialization the audit flagged). Only the changed objects
+    // ride along as this commit's delta payload.
+    let prior_entry_hash: BTreeMap<String, String> = prior_pack
+        .tree
+        .nodes
         .iter()
-        .cloned()
-        .map(|object| (object.key.clone(), object))
-        .collect::<BTreeMap<_, _>>();
-    let mut changed_object_keys = BTreeSet::new();
+        .filter(|node| node.level == 0)
+        .flat_map(|node| node.entries.iter())
+        .map(|entry| (entry.key.clone(), entry.object_hash.clone()))
+        .collect();
 
+    let mut upserts: BTreeMap<String, GraphTreeEntry> = BTreeMap::new();
+    let mut changed_objects: Vec<GraphContentObject> = Vec::new();
+    let mut changed_object_keys: BTreeSet<String> = BTreeSet::new();
     for mutation in &batch.mutations {
         let object = match mutation {
             GraphMutation::NodeUpsert(node) => node_content_object(node, options.include_payloads),
             GraphMutation::EdgeUpsert(edge) => edge_content_object(edge, options.include_payloads),
         };
-        let changed = objects_by_key
+        let entry = GraphTreeEntry {
+            key: object.key.clone(),
+            kind: object.kind.clone(),
+            object_hash: object.hash.clone(),
+        };
+        let changed = prior_entry_hash
             .get(&object.key)
-            .map(|existing| existing.hash != object.hash)
+            .map(|hash| hash != &object.hash)
             .unwrap_or(true);
         if changed {
             changed_object_keys.insert(object.key.clone());
+            changed_objects.push(object);
         }
-        objects_by_key.insert(object.key.clone(), object);
+        upserts.insert(entry.key.clone(), entry);
     }
 
-    let objects = objects_by_key.into_values().collect::<Vec<_>>();
-    let tree = build_prolly_tree(&objects);
+    // O(changed + log n) build: re-chunk only the touched leaves + spine,
+    // reuse every unchanged chunk by hash. The tree carries the full node set
+    // (so the cost set-diff and all downstream consumers are unchanged) but only
+    // the changed window + spine are re-hashed/re-serialized.
+    let build = build_prolly_tree_incremental(&prior_pack.tree, &upserts);
+
+    // Dual-commit validation (bring-up gate, handoff cautions): build the same
+    // final tree the canonical full path would and assert byte-identity + that
+    // every node the incremental build emitted belongs to it. On by default in
+    // debug/test, off in release, overridable via RUSTYRED_PROLLY_VALIDATE.
+    if prolly_validation_enabled() {
+        let prior_entries = leaf_entries_in_order(&prior_pack.tree);
+        let full = build_prolly_tree_from_entries(merge_entries(&prior_entries, &upserts));
+        assert_eq!(
+            build.tree.root_hash, full.root_hash,
+            "incremental prolly tree root diverged from full rebuild"
+        );
+        assert_eq!(
+            build.tree.entries_total, full.entries_total,
+            "incremental entry total diverged from full rebuild"
+        );
+        let full_hashes: HashSet<&str> = full.nodes.iter().map(|node| node.hash.as_str()).collect();
+        for node in &build.tree.nodes {
+            assert!(
+                full_hashes.contains(node.hash.as_str()),
+                "incremental delta node {} absent from full rebuild",
+                node.hash
+            );
+        }
+    }
+
+    let tree = build.tree;
+    let nodes_total = build.nodes_total;
+    let edges_total = build.edges_total;
+    let objects = changed_objects;
     let graph_version = prior_pack.commit.graph_version.saturating_add(1);
     let commit = build_commit(
         &tree,
@@ -531,14 +593,6 @@ pub fn compile_graph_pack_incremental(
         timestamp_unix_ms,
         graph_version,
     );
-    let nodes_total = objects
-        .iter()
-        .filter(|object| object.kind == GraphObjectKind::Node)
-        .count();
-    let edges_total = objects
-        .iter()
-        .filter(|object| object.kind == GraphObjectKind::Edge)
-        .count();
     let manifest = GraphPackManifest {
         protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
         compiler_version: GRAPH_PACK_COMPILER_VERSION.to_string(),
@@ -549,28 +603,24 @@ pub fn compile_graph_pack_incremental(
         graph_version,
         nodes_total,
         edges_total,
-        objects_total: objects.len(),
+        objects_total: tree.entries_total,
     };
     let manifest_body = serde_json::to_value(&manifest).unwrap_or_else(|_| json!({}));
     let validator_body = json!({
         "validator": "rustyred.verify_tree_root",
         "tree_hash": tree.root_hash,
-        "objects_total": objects.len(),
+        "objects_total": tree.entries_total,
         "protocol_version": VERSIONED_GRAPH_PROTOCOL_VERSION,
     });
-    let prior_hashes = prior_pack
-        .tree
-        .nodes
-        .iter()
-        .map(|node| node.hash.clone())
-        .collect::<BTreeSet<_>>();
-    let next_hashes = tree
-        .nodes
-        .iter()
-        .map(|node| node.hash.clone())
-        .collect::<BTreeSet<_>>();
-    let reused_tree_nodes = next_hashes.intersection(&prior_hashes).count();
-    let changed_tree_nodes = next_hashes.difference(&prior_hashes).count();
+    let changed_tree_nodes = build.cost.chunks_written;
+    let reused_tree_nodes = build.cost.chunks_reused;
+    let commit_cost = CommitCost {
+        changed_objects: changed_object_keys.len(),
+        changed_tree_nodes,
+        reused_tree_nodes,
+        chunks_written: build.cost.chunks_written,
+        bytes_written: build.cost.bytes_written,
+    };
 
     IncrementalGraphPack {
         protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
@@ -605,6 +655,453 @@ pub fn compile_graph_pack_incremental(
         changed_object_keys: changed_object_keys.into_iter().collect(),
         changed_tree_nodes,
         reused_tree_nodes,
+        commit_cost,
+    }
+}
+
+/// Persisted chunk-encoding format version. Bump when the on-disk tree-node or
+/// content-object encoding changes, so an older store is migrated rather than
+/// silently misread. The chunk HASH stays sha256 (`stable_hash`, this crate's
+/// content-address primitive) -- a deliberate, documented divergence from the
+/// handoff's "blake3" naming: switching the hash would change every existing
+/// pack root and break the snapshot/branch/diff/merge byte-parity tests.
+pub const GRAPH_CHUNK_FORMAT_VERSION: u8 = 1;
+
+/// Internal per-commit structural-sharing counters for an incremental build.
+/// `chunks_written` = tree nodes whose hash is new vs the parent (the genuine
+/// O(changed + log n) re-hash/re-serialize work and the persisted delta);
+/// `chunks_reused` = nodes carried over by hash; `bytes_written` = serialized
+/// byte size of the written nodes. Mapped onto the public `CommitCost`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TreeBuildCost {
+    pub(crate) chunks_written: usize,
+    pub(crate) chunks_reused: usize,
+    pub(crate) bytes_written: usize,
+}
+
+/// Result of an O(changed) incremental Prolly-tree build. `tree` carries the
+/// FULL content-addressed node set -- unchanged chunks reused by struct, only
+/// the changed window + spine re-hashed -- so `root_hash` is byte-identical to
+/// a full `build_prolly_tree` rebuild and every downstream consumer (cost set-
+/// diff, checkout, persistence) is unchanged. The expensive work and the
+/// persisted delta are O(changed + log n), reported by `cost`. No whole-graph
+/// snapshot or NodeRecord/payload clone is allocated; the working set is the
+/// tiny key-sorted entry stream.
+pub struct IncrementalTreeBuild {
+    pub tree: GraphProllyTree,
+    pub(crate) cost: TreeBuildCost,
+    pub nodes_total: usize,
+    pub edges_total: usize,
+}
+
+/// Whether to commit both ways (incremental + full rebuild) and assert the
+/// trees match. Defaults ON in debug/test builds (so every test cross-checks
+/// the incremental commit against the canonical full build) and OFF in release,
+/// overridable by `RUSTYRED_PROLLY_VALIDATE=1|true|on|yes`.
+pub fn prolly_validation_enabled() -> bool {
+    match std::env::var("RUSTYRED_PROLLY_VALIDATE") {
+        Ok(value) => matches!(value.trim(), "1" | "true" | "on" | "yes"),
+        Err(_) => cfg!(debug_assertions),
+    }
+}
+
+fn account_tree_node(
+    node: &GraphTreeNode,
+    prior_hashes: &BTreeSet<String>,
+    cost: &mut TreeBuildCost,
+) {
+    if prior_hashes.contains(&node.hash) {
+        cost.chunks_reused += 1;
+    } else {
+        cost.chunks_written += 1;
+        cost.bytes_written += serde_json::to_vec(node)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+    }
+}
+
+fn child_descriptor(node: &GraphTreeNode) -> GraphTreeChild {
+    GraphTreeChild {
+        hash: node.hash.clone(),
+        first_key: node.first_key.clone(),
+        last_key: node.last_key.clone(),
+        entries_total: node.entry_count(),
+    }
+}
+
+fn prior_level_nodes(tree: &GraphProllyTree, level: u32) -> Vec<GraphTreeNode> {
+    let mut nodes: Vec<GraphTreeNode> = tree
+        .nodes
+        .iter()
+        .filter(|node| node.level == level)
+        .cloned()
+        .collect();
+    nodes.sort_by(|a, b| a.first_key.cmp(&b.first_key));
+    nodes
+}
+
+fn leaf_entries_in_order(tree: &GraphProllyTree) -> Vec<GraphTreeEntry> {
+    prior_level_nodes(tree, 0)
+        .into_iter()
+        .flat_map(|leaf| leaf.entries.into_iter())
+        .collect()
+}
+
+/// Merge an upsert set into a key-sorted prior entry stream (a
+/// `GraphMutationBatch` only upserts, so there are no deletions). Two-pointer
+/// merge over two sorted sequences -> O(n + k) cheap iteration, no hashing.
+fn merge_entries(
+    prior_entries: &[GraphTreeEntry],
+    upserts: &BTreeMap<String, GraphTreeEntry>,
+) -> Vec<GraphTreeEntry> {
+    let mut out = Vec::with_capacity(prior_entries.len() + upserts.len());
+    let mut pending = upserts.iter().peekable();
+    for entry in prior_entries {
+        while let Some((key, value)) = pending.peek() {
+            if key.as_str() < entry.key.as_str() {
+                out.push((*value).clone());
+                pending.next();
+            } else {
+                break;
+            }
+        }
+        if let Some((key, value)) = pending.peek() {
+            if key.as_str() == entry.key.as_str() {
+                out.push((*value).clone());
+                pending.next();
+                continue;
+            }
+        }
+        out.push(entry.clone());
+    }
+    for (_, value) in pending {
+        out.push(value.clone());
+    }
+    out
+}
+
+/// Re-chunk one tree level incrementally, reusing the prior level's unchanged
+/// prefix and suffix nodes by hash and re-chunking only the window touched by
+/// the change. Returns the full ordered new level (so the next level up can be
+/// derived). Content-defined boundaries (`should_split_chunk`) re-synchronize
+/// quickly past the last change, so the re-hashed window is O(changed + chunk).
+fn rechunk_level<I: Clone + Serialize>(
+    prior_level: &[GraphTreeNode],
+    new_items: &[I],
+    item_key: impl Fn(&I) -> String,
+    make_node: impl Fn(&[I]) -> GraphTreeNode,
+    changed_keys: &BTreeSet<String>,
+    prior_hashes: &BTreeSet<String>,
+    cost: &mut TreeBuildCost,
+) -> Vec<GraphTreeNode> {
+    if new_items.is_empty() {
+        let node = make_node(&[]);
+        account_tree_node(&node, prior_hashes, cost);
+        return vec![node];
+    }
+    // No prior structure at this level (e.g. growing from empty): full chunk.
+    if prior_level.is_empty() {
+        let nodes = chunk_by_boundary(new_items.to_vec(), |chunk| make_node(chunk));
+        for node in &nodes {
+            account_tree_node(node, prior_hashes, cost);
+        }
+        return nodes;
+    }
+
+    // Window bounds: first and last new-item indices whose key changed.
+    let mut lo: Option<usize> = None;
+    let mut hi = 0usize;
+    for (idx, item) in new_items.iter().enumerate() {
+        if changed_keys.contains(&item_key(item)) {
+            if lo.is_none() {
+                lo = Some(idx);
+            }
+            hi = idx;
+        }
+    }
+    let Some(lo) = lo else {
+        // Nothing changed at this level: reuse every prior node verbatim.
+        cost.chunks_reused += prior_level.len();
+        return prior_level.to_vec();
+    };
+    let max_changed_key = item_key(&new_items[hi]);
+    let lo_key = item_key(&new_items[lo]);
+
+    // The re-chunk window starts at the first item of the prior node containing
+    // (or immediately preceding) the first change. That node's left boundary is
+    // stable -- its predecessors are unchanged -- so the prefix is reusable.
+    let mut start_key = prior_level[0].first_key.clone();
+    for node in prior_level {
+        if node.first_key.as_str() <= lo_key.as_str() {
+            start_key = node.first_key.clone();
+        } else {
+            break;
+        }
+    }
+    let start_idx = new_items.partition_point(|item| item_key(item).as_str() < start_key.as_str());
+
+    let mut result: Vec<GraphTreeNode> = Vec::new();
+    for node in prior_level {
+        if node.first_key.as_str() < start_key.as_str() {
+            cost.chunks_reused += 1;
+            result.push(node.clone());
+        } else {
+            break;
+        }
+    }
+
+    let mut idx = start_idx;
+    let mut chunk: Vec<I> = Vec::new();
+    while idx < new_items.len() {
+        // Re-sync: at a fresh chunk boundary, past the last change, where the
+        // next item starts a prior node -> the unchanged suffix is reusable.
+        if chunk.is_empty() && idx > start_idx {
+            let key = item_key(&new_items[idx]);
+            if key.as_str() > max_changed_key.as_str() {
+                if let Ok(pos) =
+                    prior_level.binary_search_by(|node| node.first_key.as_str().cmp(key.as_str()))
+                {
+                    for node in &prior_level[pos..] {
+                        cost.chunks_reused += 1;
+                        result.push(node.clone());
+                    }
+                    return result;
+                }
+            }
+        }
+        chunk.push(new_items[idx].clone());
+        let hash = stable_hash(chunk.last().expect("chunk has item"));
+        if should_split_chunk(chunk.len(), &hash) {
+            let node = make_node(&chunk);
+            account_tree_node(&node, prior_hashes, cost);
+            result.push(node);
+            chunk.clear();
+        }
+        idx += 1;
+    }
+    if !chunk.is_empty() {
+        let node = make_node(&chunk);
+        account_tree_node(&node, prior_hashes, cost);
+        result.push(node);
+    }
+    result
+}
+
+/// Build the new Prolly tree from the parent commit's tree plus an upsert set,
+/// re-chunking only the affected leaves and the O(log n) spine above them and
+/// reusing every unchanged chunk by hash. The returned tree is FULL (so it is a
+/// drop-in for `build_prolly_tree`) and its `root_hash` is byte-identical to a
+/// full rebuild over the same final entry set; the expensive re-hash work and
+/// the persisted delta are O(changed + log n).
+pub fn build_prolly_tree_incremental(
+    prior_tree: &GraphProllyTree,
+    upserts: &BTreeMap<String, GraphTreeEntry>,
+) -> IncrementalTreeBuild {
+    let prior_hashes: BTreeSet<String> = prior_tree
+        .nodes
+        .iter()
+        .map(|node| node.hash.clone())
+        .collect();
+    let prior_entries = leaf_entries_in_order(prior_tree);
+    let new_entries = merge_entries(&prior_entries, upserts);
+    let entries_total = new_entries.len();
+    let nodes_total = new_entries
+        .iter()
+        .filter(|entry| entry.kind == GraphObjectKind::Node)
+        .count();
+    let edges_total = entries_total - nodes_total;
+
+    let mut cost = TreeBuildCost::default();
+    let mut all_nodes: Vec<GraphTreeNode> = Vec::new();
+
+    if new_entries.is_empty() {
+        let root = empty_leaf_node();
+        account_tree_node(&root, &prior_hashes, &mut cost);
+        let root_hash = root.hash.clone();
+        all_nodes.push(root);
+        return IncrementalTreeBuild {
+            tree: GraphProllyTree {
+                root_hash,
+                root_level: 0,
+                entries_total: 0,
+                nodes: all_nodes,
+            },
+            cost,
+            nodes_total: 0,
+            edges_total: 0,
+        };
+    }
+
+    // Every upsert key bounds the change window. A no-op upsert (identical
+    // entry) re-chunks one leaf to an identical hash -> counted as reused, root
+    // unchanged: correctness holds, the window is just slightly wider.
+    let changed_entry_keys: BTreeSet<String> = upserts.keys().cloned().collect();
+
+    let prior_leaves = prior_level_nodes(prior_tree, 0);
+    let mut level_nodes = rechunk_level(
+        &prior_leaves,
+        &new_entries,
+        |entry: &GraphTreeEntry| entry.key.clone(),
+        |chunk: &[GraphTreeEntry]| make_leaf_node(chunk.to_vec()),
+        &changed_entry_keys,
+        &prior_hashes,
+        &mut cost,
+    );
+    all_nodes.extend(level_nodes.iter().cloned());
+
+    let mut level = 1u32;
+    while level_nodes.len() > 1 {
+        let prior_parents = prior_level_nodes(prior_tree, level);
+        let descriptors: Vec<GraphTreeChild> = level_nodes.iter().map(child_descriptor).collect();
+        // A parent changes iff one of its child node hashes is new.
+        let changed_child_keys: BTreeSet<String> = descriptors
+            .iter()
+            .filter(|child| !prior_hashes.contains(&child.hash))
+            .map(|child| child.first_key.clone())
+            .collect();
+        level_nodes = rechunk_level(
+            &prior_parents,
+            &descriptors,
+            |child: &GraphTreeChild| child.first_key.clone(),
+            |chunk: &[GraphTreeChild]| make_parent_node(level, chunk.to_vec()),
+            &changed_child_keys,
+            &prior_hashes,
+            &mut cost,
+        );
+        all_nodes.extend(level_nodes.iter().cloned());
+        level += 1;
+    }
+
+    let root = level_nodes
+        .into_iter()
+        .next()
+        .unwrap_or_else(empty_leaf_node);
+    IncrementalTreeBuild {
+        tree: GraphProllyTree {
+            root_hash: root.hash.clone(),
+            root_level: root.level,
+            entries_total,
+            nodes: all_nodes,
+        },
+        cost,
+        nodes_total,
+        edges_total,
+    }
+}
+
+/// O(k + log n) adjacent-commit diff over two FULL Prolly trees. Prunes any
+/// subtree whose root hash is shared with the other side (identical content),
+/// so only the changed region plus its O(log n) spine is visited. Returns the
+/// diff plus the tree-node visit count (handoff acceptance #3's chunk-visit
+/// counter): O(differences), never O(graph), for trees that share structure.
+pub fn diff_graph_trees(
+    base: &GraphProllyTree,
+    target: &GraphProllyTree,
+) -> (GraphVersionDiff, usize) {
+    let base_nodes: HashMap<&str, &GraphTreeNode> = base
+        .nodes
+        .iter()
+        .map(|node| (node.hash.as_str(), node))
+        .collect();
+    let target_nodes: HashMap<&str, &GraphTreeNode> = target
+        .nodes
+        .iter()
+        .map(|node| (node.hash.as_str(), node))
+        .collect();
+    let base_hashes: HashSet<&str> = base.nodes.iter().map(|node| node.hash.as_str()).collect();
+    let target_hashes: HashSet<&str> = target.nodes.iter().map(|node| node.hash.as_str()).collect();
+
+    let mut visits = 0usize;
+    let mut base_changed: BTreeMap<String, GraphTreeEntry> = BTreeMap::new();
+    collect_changed_entries(
+        &base.root_hash,
+        &base_nodes,
+        &target_hashes,
+        &mut base_changed,
+        &mut visits,
+    );
+    let mut target_changed: BTreeMap<String, GraphTreeEntry> = BTreeMap::new();
+    collect_changed_entries(
+        &target.root_hash,
+        &target_nodes,
+        &base_hashes,
+        &mut target_changed,
+        &mut visits,
+    );
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut modified = Vec::new();
+    for (key, target_entry) in &target_changed {
+        match base_changed.get(key) {
+            None => added.push(GraphDiffEntry {
+                key: key.clone(),
+                kind: target_entry.kind.clone(),
+                old_hash: None,
+                new_hash: Some(target_entry.object_hash.clone()),
+            }),
+            Some(base_entry) if base_entry.object_hash != target_entry.object_hash => {
+                modified.push(GraphDiffEntry {
+                    key: key.clone(),
+                    kind: target_entry.kind.clone(),
+                    old_hash: Some(base_entry.object_hash.clone()),
+                    new_hash: Some(target_entry.object_hash.clone()),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for (key, base_entry) in &base_changed {
+        if !target_changed.contains_key(key) {
+            removed.push(GraphDiffEntry {
+                key: key.clone(),
+                kind: base_entry.kind.clone(),
+                old_hash: Some(base_entry.object_hash.clone()),
+                new_hash: None,
+            });
+        }
+    }
+    let unchanged = target
+        .entries_total
+        .saturating_sub(added.len() + modified.len());
+
+    (
+        GraphVersionDiff {
+            protocol_version: VERSIONED_GRAPH_PROTOCOL_VERSION.to_string(),
+            base_tree_hash: base.root_hash.clone(),
+            target_tree_hash: target.root_hash.clone(),
+            added,
+            removed,
+            modified,
+            unchanged,
+        },
+        visits,
+    )
+}
+
+fn collect_changed_entries(
+    hash: &str,
+    nodes: &HashMap<&str, &GraphTreeNode>,
+    other_hashes: &HashSet<&str>,
+    out: &mut BTreeMap<String, GraphTreeEntry>,
+    visits: &mut usize,
+) {
+    *visits += 1;
+    // Identical subtree present on the other side -> nothing in it changed.
+    if other_hashes.contains(hash) {
+        return;
+    }
+    let Some(node) = nodes.get(hash) else {
+        return;
+    };
+    if node.level == 0 {
+        for entry in &node.entries {
+            out.insert(entry.key.clone(), entry.clone());
+        }
+    } else {
+        for child in &node.children {
+            collect_changed_entries(&child.hash, nodes, other_hashes, out, visits);
+        }
     }
 }
 
@@ -986,7 +1483,16 @@ pub fn build_prolly_tree(objects: &[GraphContentObject]) -> GraphProllyTree {
             object_hash: object.hash.clone(),
         })
         .collect::<Vec<_>>();
+    build_prolly_tree_from_entries(entries)
+}
 
+/// Full Prolly-tree build from an already-prepared, key-sorted entry list. The
+/// reference (oracle) build: `build_prolly_tree` and the dual-commit validation
+/// path both route through it so the incremental commit is checked against one
+/// canonical chunking. Content-defined boundaries (`should_split_chunk`) give
+/// structural sharing across commits via stable per-node hashes.
+pub fn build_prolly_tree_from_entries(entries: Vec<GraphTreeEntry>) -> GraphProllyTree {
+    let entries_total = entries.len();
     let mut all_nodes = Vec::new();
     let mut current_level = leaf_nodes(entries);
     all_nodes.extend(current_level.iter().cloned());
@@ -1006,7 +1512,7 @@ pub fn build_prolly_tree(objects: &[GraphContentObject]) -> GraphProllyTree {
     GraphProllyTree {
         root_hash: root.hash.clone(),
         root_level: root.level,
-        entries_total: objects.len(),
+        entries_total,
         nodes: all_nodes,
     }
 }

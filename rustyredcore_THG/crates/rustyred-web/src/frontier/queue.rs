@@ -2,9 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use rustyred_thg_core::OrderedIndex;
 
 use super::model::UrlFingerprint;
 use super::FrontierResult;
+
+const DEFAULT_FRONTIER_SCAN_LIMIT: usize = 256;
 
 #[async_trait]
 pub trait FrontierQueue: Send + Sync {
@@ -25,26 +28,46 @@ pub trait FrontierQueue: Send + Sync {
     async fn len(&self) -> FrontierResult<u64>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryFrontierQueue {
     state: Mutex<MemoryQueueState>,
+    scan_limit: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MemoryQueueState {
-    entries: BTreeMap<String, MemoryQueueEntry>,
+    ordered: OrderedIndex,
+    fingerprints: BTreeMap<String, UrlFingerprint>,
     domains: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug)]
-struct MemoryQueueEntry {
-    fp: UrlFingerprint,
-    priority: f64,
+impl Default for MemoryQueueState {
+    fn default() -> Self {
+        Self {
+            ordered: OrderedIndex::transient(),
+            fingerprints: BTreeMap::new(),
+            domains: BTreeMap::new(),
+        }
+    }
 }
 
 impl MemoryFrontierQueue {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_scan_limit(mut self, scan_limit: usize) -> Self {
+        self.scan_limit = scan_limit.max(1);
+        self
+    }
+}
+
+impl Default for MemoryFrontierQueue {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(MemoryQueueState::default()),
+            scan_limit: DEFAULT_FRONTIER_SCAN_LIMIT,
+        }
     }
 }
 
@@ -58,9 +81,9 @@ impl FrontierQueue for MemoryFrontierQueue {
 
     async fn push(&self, fp: &UrlFingerprint, priority: f64) -> FrontierResult<()> {
         let mut state = self.state.lock().expect("memory frontier queue poisoned");
-        state
-            .entries
-            .insert(fp.to_hex(), MemoryQueueEntry { fp: *fp, priority });
+        let fp_hex = fp.to_hex();
+        state.ordered.zadd(fp_hex.as_bytes().to_vec(), priority)?;
+        state.fingerprints.insert(fp_hex, *fp);
         Ok(())
     }
 
@@ -70,24 +93,25 @@ impl FrontierQueue for MemoryFrontierQueue {
     ) -> FrontierResult<Option<UrlFingerprint>> {
         let mut state = self.state.lock().expect("memory frontier queue poisoned");
         let mut best_key = None;
-        let mut best_priority = f64::NEG_INFINITY;
-        for (fp_hex, entry) in &state.entries {
-            let domain = state.domains.get(fp_hex).cloned();
+        for (member, _) in state.ordered.entries_desc(self.scan_limit) {
+            let Ok(fp_hex) = String::from_utf8(member) else {
+                continue;
+            };
+            let domain = state.domains.get(&fp_hex).cloned();
             let ready = domain
                 .as_deref()
                 .is_some_and(|domain| is_domain_ready(domain));
-            if ready
-                && (entry.priority > best_priority
-                    || (entry.priority == best_priority
-                        && best_key.as_ref().is_none_or(|key| fp_hex < key)))
-            {
-                best_key = Some(fp_hex.clone());
-                best_priority = entry.priority;
+            if ready {
+                best_key = Some(fp_hex);
+                break;
             }
         }
-        Ok(best_key
-            .and_then(|fp_hex| state.entries.remove(&fp_hex))
-            .map(|entry| entry.fp))
+        let Some(fp_hex) = best_key else {
+            return Ok(None);
+        };
+        state.ordered.zrem(fp_hex.as_bytes());
+        state.domains.remove(&fp_hex);
+        Ok(state.fingerprints.remove(&fp_hex))
     }
 
     async fn requeue(&self, fp: &UrlFingerprint, priority: f64) -> FrontierResult<()> {
@@ -96,7 +120,7 @@ impl FrontierQueue for MemoryFrontierQueue {
 
     async fn len(&self) -> FrontierResult<u64> {
         let state = self.state.lock().expect("memory frontier queue poisoned");
-        Ok(state.entries.len() as u64)
+        Ok(state.ordered.zcard() as u64)
     }
 }
 
@@ -117,7 +141,7 @@ impl RedisFrontierQueue {
             client,
             key: format!("frontier:{tenant}:{queue}"),
             domain_key: format!("frontier:{tenant}:{queue}:domains"),
-            scan_limit: 256,
+            scan_limit: DEFAULT_FRONTIER_SCAN_LIMIT,
         })
     }
 
@@ -151,7 +175,7 @@ impl FrontierQueue for RedisFrontierQueue {
         use redis::AsyncCommands;
 
         let mut connection = self.connection().await?;
-        let _: () = connection.zadd(&self.key, fp.to_hex(), -priority).await?;
+        let _: () = connection.zadd(&self.key, fp.to_hex(), priority).await?;
         Ok(())
     }
 
@@ -163,7 +187,7 @@ impl FrontierQueue for RedisFrontierQueue {
 
         let mut connection = self.connection().await?;
         let candidates: Vec<String> = connection
-            .zrange(&self.key, 0, (self.scan_limit as isize) - 1)
+            .zrevrange(&self.key, 0, (self.scan_limit as isize) - 1)
             .await?;
         let mut ready_domains = Vec::new();
         for fp_hex in candidates {
@@ -180,12 +204,13 @@ impl FrontierQueue for RedisFrontierQueue {
 
         let script = redis::Script::new(
             r#"
-local members = redis.call('ZRANGE', KEYS[1], 0, tonumber(ARGV[1]) - 1)
+local members = redis.call('ZREVRANGE', KEYS[1], 0, tonumber(ARGV[1]) - 1)
 for _, member in ipairs(members) do
   local domain = redis.call('HGET', KEYS[2], member) or ''
   for i = 2, #ARGV do
     if domain == ARGV[i] then
       if redis.call('ZREM', KEYS[1], member) == 1 then
+        redis.call('HDEL', KEYS[2], member)
         return member
       end
     end
@@ -222,7 +247,11 @@ return nil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontier::model::fingerprint;
+    use crate::frontier::model::{fingerprint, UrlFingerprint};
+
+    fn fixed_fp(byte: u8) -> UrlFingerprint {
+        UrlFingerprint([byte; 32])
+    }
 
     #[tokio::test]
     async fn memory_queue_pops_highest_ready_priority() {
@@ -240,5 +269,65 @@ mod tests {
             .unwrap();
         assert_eq!(popped, Some(low));
         assert_eq!(queue.len().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_queue_equal_priority_uses_descending_member_tie_break() {
+        let queue = MemoryFrontierQueue::new();
+        let lower = fixed_fp(0x11);
+        let higher = fixed_fp(0x22);
+        queue
+            .remember_domain(&lower, "lower.example")
+            .await
+            .unwrap();
+        queue
+            .remember_domain(&higher, "higher.example")
+            .await
+            .unwrap();
+        queue.push(&lower, 1.0).await.unwrap();
+        queue.push(&higher, 1.0).await.unwrap();
+
+        let popped = queue.pop_eligible(&|_| true).await.unwrap();
+        assert_eq!(popped, Some(higher));
+    }
+
+    #[tokio::test]
+    async fn memory_queue_scan_limit_bounds_candidate_window() {
+        let blocked_high = fixed_fp(0x33);
+        let blocked_mid = fixed_fp(0x22);
+        let ready_low = fixed_fp(0x11);
+
+        let queue = MemoryFrontierQueue::new().with_scan_limit(2);
+        for (fp, domain) in [
+            (blocked_high, "blocked-high.example"),
+            (blocked_mid, "blocked-mid.example"),
+            (ready_low, "ready.example"),
+        ] {
+            queue.remember_domain(&fp, domain).await.unwrap();
+            queue.push(&fp, 1.0).await.unwrap();
+        }
+
+        let popped = queue
+            .pop_eligible(&|domain| domain == "ready.example")
+            .await
+            .unwrap();
+        assert_eq!(popped, None);
+        assert_eq!(queue.len().await.unwrap(), 3);
+
+        let queue = MemoryFrontierQueue::new().with_scan_limit(3);
+        for (fp, domain) in [
+            (blocked_high, "blocked-high.example"),
+            (blocked_mid, "blocked-mid.example"),
+            (ready_low, "ready.example"),
+        ] {
+            queue.remember_domain(&fp, domain).await.unwrap();
+            queue.push(&fp, 1.0).await.unwrap();
+        }
+
+        let popped = queue
+            .pop_eligible(&|domain| domain == "ready.example")
+            .await
+            .unwrap();
+        assert_eq!(popped, Some(ready_low));
     }
 }

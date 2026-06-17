@@ -9,6 +9,10 @@ rust-version = "1.85"
 [features]
 default = []
 redis-frontier = ["dep:redis"]
+# Live Valkey/Redis cache-aside backend (Spec 3). The in-memory backend, key
+# schemes, stats, and cache-aside logic compile without it; this only adds the
+# networked backend. Shares the `redis` dep with redis-frontier.
+valkey-cache = ["dep:redis"]
 servo = []
 spider_fetch = ["dep:spider"]
 # Browser-fingerprint fetch tier. Pulls wreq (the `rquest` alias) for the client and

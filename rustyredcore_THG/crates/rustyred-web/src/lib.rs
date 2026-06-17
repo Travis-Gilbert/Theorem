@@ -48,6 +48,9 @@ pub use fetch_cascade::{
     should_promote, FetchCascade, FetchCascadeOptions, FetchTier, FetchTierResult,
 };
 
+pub mod cache;
+pub use cache::{Cache, CacheBackend, CacheError, CacheStatsSnapshot, InMemoryBackend};
+
 pub mod frontier;
 
 pub mod crawl_hooks;
