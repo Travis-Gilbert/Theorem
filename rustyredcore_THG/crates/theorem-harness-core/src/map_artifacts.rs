@@ -107,6 +107,14 @@ pub struct MapArtifactCompileInput {
     pub current: Option<MapArtifactState>,
     #[serde(default)]
     pub workstream_id: String,
+    /// KG-projected baseline entries (module/entry_point/dependency/key_symbol)
+    /// injected alongside the task-context entries for a CodebaseMap. Empty for
+    /// every existing task-context caller, so those callers keep the same entry
+    /// baseline; grouped CodebaseMap markdown is the intentional render change.
+    /// The code-graph projection (uniform-seed PageRank over the code KG) is the
+    /// only producer.
+    #[serde(default)]
+    pub precomputed_entries: Vec<MapEntry>,
 }
 
 pub fn stable_map_id(map_kind: &str, scope_kind: &str, scope_ref: &str) -> String {
@@ -164,7 +172,11 @@ pub fn compile_map_artifact(input: MapArtifactCompileInput) -> MapArtifactState 
         input.pending_delta_count,
         applied_ids.len() as i64,
     );
-    let markdown_body = render_markdown(&map_kind, &title, &summary, &resolved_entries);
+    let markdown_body = if map_kind == "CodebaseMap" {
+        render_codebase_markdown(&title, &summary, &resolved_entries)
+    } else {
+        render_markdown(&map_kind, &title, &summary, &resolved_entries)
+    };
     let mut json_export = Map::new();
     json_export.insert("map_id".to_string(), json!(map_id));
     json_export.insert("map_kind".to_string(), json!(map_kind));
@@ -260,7 +272,13 @@ pub fn describe_map_artifact(artifact: &MapArtifactState) -> Map<String, Value> 
 fn baseline_entries(input: &MapArtifactCompileInput, map_kind: &str) -> Vec<MapEntry> {
     match map_kind {
         "ToolMap" => tool_entries(&input.selected_tools),
-        "CodebaseMap" | "SpecMap" => codebase_entries(input),
+        "CodebaseMap" | "SpecMap" => {
+            // Task-context orientation first, then any KG-projected entries. With
+            // no projection (the default) this keeps the prior entry baseline.
+            let mut entries = codebase_entries(input);
+            entries.extend(input.precomputed_entries.iter().cloned());
+            entries
+        }
         "RuleMap" => rule_entries(input),
         "UserMemoryMap" => user_memory_entries(&input.memory_recall_preview),
         "PostmortemMap" => postmortem_entries(&input.memory_recall_preview),
@@ -626,6 +644,89 @@ fn render_markdown(map_kind: &str, title: &str, summary: &str, entries: &[MapEnt
         ));
     }
     lines.join("\n").trim().to_string()
+}
+
+/// Render a CodebaseMap as sectioned markdown: entries are grouped by `kind`
+/// (KG-projected structure first, task-context orientation after) so `codebase.md`
+/// reads as labelled sections instead of one flat list. A kind with no preset
+/// label renders under a title-cased version of its own name, so a future
+/// projection kind needs no change here.
+fn render_codebase_markdown(title: &str, summary: &str, entries: &[MapEntry]) -> String {
+    let mut lines = vec![
+        format!("# {title}"),
+        String::new(),
+        non_empty(summary.trim(), "CodebaseMap artifact."),
+    ];
+    let mut groups: BTreeMap<String, Vec<&MapEntry>> = BTreeMap::new();
+    let mut first_seen: Vec<String> = Vec::new();
+    for entry in entries {
+        let kind = string_or(entry, "kind", "note");
+        if !groups.contains_key(&kind) {
+            first_seen.push(kind.clone());
+        }
+        groups.entry(kind).or_default().push(entry);
+    }
+    // Preferred sections first (when present), then any remaining kinds in the
+    // order they first appeared.
+    let mut ordered: Vec<String> = CODEBASE_SECTION_ORDER
+        .iter()
+        .map(|kind| kind.to_string())
+        .filter(|kind| groups.contains_key(kind))
+        .collect();
+    for kind in &first_seen {
+        if !ordered.contains(kind) {
+            ordered.push(kind.clone());
+        }
+    }
+    for kind in ordered {
+        let Some(group) = groups.get(&kind) else {
+            continue;
+        };
+        lines.push(String::new());
+        lines.push(format!("## {}", codebase_section_label(&kind)));
+        for entry in group {
+            lines.push(format!(
+                "- {}: {}",
+                string_or(entry, "title", ""),
+                string_or(entry, "summary", "")
+            ));
+        }
+    }
+    lines.join("\n").trim().to_string()
+}
+
+/// Section order for grouped CodebaseMap rendering: KG-projected structure first,
+/// then task-context orientation.
+const CODEBASE_SECTION_ORDER: [&str; 8] = [
+    "module",
+    "entry_point",
+    "dependency",
+    "key_symbol",
+    "repo",
+    "target",
+    "read_first",
+    "validators",
+];
+
+fn codebase_section_label(kind: &str) -> String {
+    match kind {
+        "module" => "Modules".to_string(),
+        "entry_point" => "Entry points".to_string(),
+        "dependency" => "Dependencies".to_string(),
+        "key_symbol" => "Key symbols".to_string(),
+        "repo" => "Repo boundary".to_string(),
+        "target" => "Task target".to_string(),
+        "read_first" => "Read first".to_string(),
+        "validators" => "Validators".to_string(),
+        other => {
+            let spaced = other.replace('_', " ");
+            let mut chars = spaced.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Other".to_string(),
+            }
+        }
+    }
 }
 
 fn stable_map_hash(value: &Value) -> String {

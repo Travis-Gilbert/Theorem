@@ -175,3 +175,119 @@ fn delta_defaults(delta_id: &str) -> MapDeltaState {
         applied_at: "applied".to_string(),
     }
 }
+
+fn projected_entry(entry_id: &str, kind: &str, title: &str, summary: &str) -> Map<String, Value> {
+    Map::from_iter([
+        ("entry_id".to_string(), json!(entry_id)),
+        ("kind".to_string(), json!(kind)),
+        ("title".to_string(), json!(title)),
+        ("summary".to_string(), json!(summary)),
+        ("metadata".to_string(), json!({})),
+    ])
+}
+
+#[test]
+fn empty_precomputed_entries_leave_codebase_baseline_unchanged() {
+    // The default (no projection) path: a CodebaseMap with only a repo scope must
+    // produce exactly the task-context entry it always did, with no phantom KG
+    // entries injected.
+    let artifact = compile_map_artifact(MapArtifactCompileInput {
+        map_kind: "CodebaseMap".to_string(),
+        scope_kind: "repo".to_string(),
+        scope_ref: "Theorem".to_string(),
+        repo: "Theorem".to_string(),
+        ..MapArtifactCompileInput::default()
+    });
+    let ids = artifact
+        .entries
+        .iter()
+        .map(|entry| entry["entry_id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["repo-boundary"]);
+    assert!(artifact.markdown_body.contains("# CodebaseMap for Theorem"));
+}
+
+#[test]
+fn precomputed_entries_inject_into_codebase_and_group_in_markdown() {
+    let artifact = compile_map_artifact(MapArtifactCompileInput {
+        map_kind: "CodebaseMap".to_string(),
+        scope_kind: "repo".to_string(),
+        scope_ref: "Theorem".to_string(),
+        repo: "Theorem".to_string(),
+        precomputed_entries: vec![
+            projected_entry(
+                "module:src/lib.rs",
+                "module",
+                "src/lib.rs",
+                "Top-ranked module by PageRank.",
+            ),
+            projected_entry(
+                "symbol:main",
+                "key_symbol",
+                "main",
+                "Highest-centrality symbol.",
+            ),
+        ],
+        ..MapArtifactCompileInput::default()
+    });
+
+    let ids = artifact
+        .entries
+        .iter()
+        .map(|entry| entry["entry_id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(artifact.entries.len(), 3);
+    assert!(ids.contains(&"repo-boundary".to_string()));
+    assert!(ids.contains(&"module:src/lib.rs".to_string()));
+    assert!(ids.contains(&"symbol:main".to_string()));
+
+    // Grouped renderer emits one section per kind, KG structure before context.
+    let md = &artifact.markdown_body;
+    assert!(md.contains("# CodebaseMap for Theorem"));
+    assert!(md.contains("## Modules"));
+    assert!(md.contains("## Key symbols"));
+    assert!(md.contains("## Repo boundary"));
+    let modules_at = md.find("## Modules").unwrap();
+    let repo_at = md.find("## Repo boundary").unwrap();
+    assert!(
+        modules_at < repo_at,
+        "KG sections must precede task-context"
+    );
+}
+
+#[test]
+fn precomputed_entries_are_part_of_the_delta_baseline() {
+    // A KG-projected entry can be superseded by an applied delta, proving the
+    // projection feeds the same baseline the delta model already rides.
+    let remove = MapDeltaState {
+        delta_id: "d1".to_string(),
+        map_kind: "CodebaseMap".to_string(),
+        scope_kind: "repo".to_string(),
+        scope_ref: "Theorem".to_string(),
+        status: "applied".to_string(),
+        action: "remove".to_string(),
+        entry_id: "module:stale".to_string(),
+        ..delta_defaults("d1")
+    };
+    let artifact = compile_map_artifact(MapArtifactCompileInput {
+        map_kind: "CodebaseMap".to_string(),
+        scope_kind: "repo".to_string(),
+        scope_ref: "Theorem".to_string(),
+        repo: "Theorem".to_string(),
+        precomputed_entries: vec![
+            projected_entry("module:stale", "module", "stale.rs", "Removed by delta."),
+            projected_entry("module:keep", "module", "keep.rs", "Survives."),
+        ],
+        applied_deltas: vec![remove],
+        ..MapArtifactCompileInput::default()
+    });
+    let ids = artifact
+        .entries
+        .iter()
+        .map(|entry| entry["entry_id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"module:keep".to_string()));
+    assert!(ids.contains(&"repo-boundary".to_string()));
+    assert!(!ids.contains(&"module:stale".to_string()));
+    assert_eq!(artifact.source_delta_ids, vec!["d1"]);
+}

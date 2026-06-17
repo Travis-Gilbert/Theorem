@@ -25,8 +25,14 @@ pub use push::{
 };
 
 use rustyred_thg_affordances::{affordance_nodes, AffordanceGraphStore};
-use rustyred_thg_core::{GraphStore, NodeQuery};
+use rustyred_thg_code::{CodebaseMapEntry, CodebaseMapProjectionEvent, CodebaseMapProjectionSink};
+use rustyred_thg_core::{GraphStore, NodeQuery, NodeRecord, RedCoreGraphStore};
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use theorem_harness_core::{
+    compile_map_artifact, describe_map_artifact, stable_map_id, MapArtifactCompileInput,
+    MapArtifactState,
+};
 use theorem_harness_runtime::{
     list_presence, load_events, load_run, read_intents_for_room, read_mentions_for_actor,
     read_records_for_room, room_status, CoordinationError, HarnessRuntimeError,
@@ -34,6 +40,9 @@ use theorem_harness_runtime::{
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
 pub const RUN_LABEL: &str = "HarnessRun";
+
+/// Node label for persisted compiled map artifacts.
+pub const MAP_ARTIFACT_LABEL: &str = "MapArtifact";
 
 /// List runs as the client list contract. Each run node's properties are the
 /// `RunState` serde shape plus `state_hash`.
@@ -141,6 +150,151 @@ pub fn records_json<S: GraphStore>(
     }))
 }
 
+/// Server-side bridge from code-KG projections to persisted `MapArtifact` nodes.
+#[derive(Clone)]
+pub struct GraphStoreMapArtifactSink {
+    store: Arc<Mutex<RedCoreGraphStore>>,
+}
+
+impl GraphStoreMapArtifactSink {
+    pub fn new(store: Arc<Mutex<RedCoreGraphStore>>) -> Self {
+        Self { store }
+    }
+}
+
+impl CodebaseMapProjectionSink for GraphStoreMapArtifactSink {
+    fn publish_codebase_map(&self, event: &CodebaseMapProjectionEvent) -> Result<(), String> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "harness store lock poisoned".to_string())?;
+        persist_codebase_map_projection(&mut *store, event).map(|_| ())
+    }
+}
+
+/// Persist a code-KG projection through the existing MapArtifact compiler.
+pub fn persist_codebase_map_projection<S: GraphStore>(
+    store: &mut S,
+    event: &CodebaseMapProjectionEvent,
+) -> Result<MapArtifactState, String> {
+    let map_kind = "CodebaseMap";
+    let scope_kind = "repo";
+    let map_id = stable_map_id(map_kind, scope_kind, &event.repo_id);
+    let current = store
+        .get_node(&map_id)
+        .and_then(|node| serde_json::from_value::<MapArtifactState>(node.properties.clone()).ok());
+    let artifact = compile_map_artifact(MapArtifactCompileInput {
+        map_kind: map_kind.to_string(),
+        scope_kind: scope_kind.to_string(),
+        scope_ref: event.repo_id.clone(),
+        repo: event.repo_id.clone(),
+        target: event.repo_id.clone(),
+        current,
+        precomputed_entries: event.projection.entries.clone(),
+        ..MapArtifactCompileInput::default()
+    });
+    let node = map_artifact_node(
+        &artifact,
+        &event.tenant_id,
+        &event.repo_id,
+        &event.operation,
+        &event.projection.entries,
+    )?;
+    GraphStore::upsert_node(store, node)
+        .map_err(|error| format!("persist MapArtifact: {}", error.message))?;
+    Ok(artifact)
+}
+
+fn map_artifact_node(
+    artifact: &MapArtifactState,
+    tenant_id: &str,
+    repo_id: &str,
+    operation: &str,
+    projection_entries: &[CodebaseMapEntry],
+) -> Result<NodeRecord, String> {
+    let mut properties = serde_json::to_value(artifact)
+        .map_err(|error| error.to_string())?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "MapArtifactState did not serialize to an object".to_string())?;
+    properties.insert("tenant_id".to_string(), json!(tenant_id));
+    properties.insert("repo_id".to_string(), json!(repo_id));
+    properties.insert("source".to_string(), json!("code_kg_projection"));
+    properties.insert("operation".to_string(), json!(operation));
+    properties.insert(
+        "projection_entry_count".to_string(),
+        json!(projection_entries.len()),
+    );
+    Ok(NodeRecord::new(
+        artifact.map_id.clone(),
+        [MAP_ARTIFACT_LABEL],
+        Value::Object(properties),
+    ))
+}
+
+/// List persisted map artifacts for the tenant.
+pub fn maps_json<S: GraphStore>(store: &S, tenant_slug: &str) -> Value {
+    let query = NodeQuery {
+        label: Some(MAP_ARTIFACT_LABEL.to_string()),
+        properties: Default::default(),
+        limit: None,
+        include_expired: false,
+    };
+    let mut maps: Vec<Value> = GraphStore::query_nodes(store, query)
+        .into_iter()
+        .filter(|node| {
+            node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_slug)
+        })
+        .map(|node| map_artifact_summary(&node.properties))
+        .collect();
+    maps.sort_by(|a, b| {
+        let a_key = (
+            a.get("scope_ref").and_then(Value::as_str).unwrap_or(""),
+            a.get("map_kind").and_then(Value::as_str).unwrap_or(""),
+            a.get("map_id").and_then(Value::as_str).unwrap_or(""),
+        );
+        let b_key = (
+            b.get("scope_ref").and_then(Value::as_str).unwrap_or(""),
+            b.get("map_kind").and_then(Value::as_str).unwrap_or(""),
+            b.get("map_id").and_then(Value::as_str).unwrap_or(""),
+        );
+        a_key.cmp(&b_key)
+    });
+    json!({
+        "tenant": tenant_slug,
+        "maps": maps,
+        "count": maps.len()
+    })
+}
+
+/// Fetch one persisted map artifact for the tenant.
+pub fn map_json<S: GraphStore>(store: &S, tenant_slug: &str, map_id: &str) -> Option<Value> {
+    let node = GraphStore::get_node(store, map_id)?;
+    if !node.labels.iter().any(|label| label == MAP_ARTIFACT_LABEL) {
+        return None;
+    }
+    if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_slug) {
+        return None;
+    }
+    Some(json!({
+        "tenant": tenant_slug,
+        "map": node.properties.clone()
+    }))
+}
+
+fn map_artifact_summary(properties: &Value) -> Value {
+    if let Ok(artifact) = serde_json::from_value::<MapArtifactState>(properties.clone()) {
+        let mut summary = describe_map_artifact(&artifact);
+        for key in ["tenant_id", "repo_id", "source", "operation"] {
+            if let Some(value) = properties.get(key) {
+                summary.insert(key.to_string(), value.clone());
+            }
+        }
+        return Value::Object(summary);
+    }
+    properties.clone()
+}
+
 /// Registered connectors and their tool affordances for the Connectors surface.
 /// Read-only and fast (no subprocess, no network): lists the tenant's `Affordance`
 /// nodes (one per registered tool) plus the distinct owning servers. Safe to serve
@@ -187,8 +341,10 @@ pub fn connectors_json<S: AffordanceGraphStore>(store: &S, tenant_slug: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyred_thg_code::{CodebaseMapProjection, CodebaseMapProjectionEvent};
     use rustyred_thg_core::InMemoryGraphStore;
     use serde_json::Map;
+    use std::path::PathBuf;
     use theorem_harness_core::TransitionInput;
     use theorem_harness_runtime::{
         append_transition_from_store, heartbeat_presence, join_room, write_intent, write_message,
@@ -202,6 +358,37 @@ mod tests {
             map.insert((*key).to_string(), value.clone());
         }
         map
+    }
+
+    fn map_entry(kind: &str, id: &str, title: &str) -> CodebaseMapEntry {
+        payload(&[
+            ("entry_id", json!(id)),
+            ("kind", json!(kind)),
+            ("title", json!(title)),
+            ("summary", json!(format!("{title} summary"))),
+            ("pagerank", json!(0.42)),
+            ("in_degree", json!(2)),
+            ("out_degree", json!(3)),
+        ])
+    }
+
+    fn projection_event() -> CodebaseMapProjectionEvent {
+        let entries = vec![
+            map_entry("module", "module:src/lib.rs", "src/lib.rs"),
+            map_entry("key_symbol", "symbol:handle", "handle_ingest"),
+        ];
+        CodebaseMapProjectionEvent {
+            tenant_id: "smoke".to_string(),
+            repo_id: "theorem/example".to_string(),
+            operation: "ingest".to_string(),
+            repo_path: Some(PathBuf::from("/workspace/theorem")),
+            projection: CodebaseMapProjection {
+                tenant_id: "smoke".to_string(),
+                repo_id: "theorem/example".to_string(),
+                markdown_body: "# CodebaseMap for theorem/example".to_string(),
+                entries,
+            },
+        }
     }
 
     fn seed_run(store: &mut InMemoryGraphStore) {
@@ -397,5 +584,63 @@ mod tests {
 
         // A different tenant sees nothing (tenant scoping).
         assert_eq!(connectors_json(&store, "other")["count"], json!(0));
+    }
+
+    #[test]
+    fn persists_and_serves_codebase_map_projection() {
+        let mut store = InMemoryGraphStore::default();
+        let event = projection_event();
+
+        let artifact =
+            persist_codebase_map_projection(&mut store, &event).expect("persist projection");
+
+        assert_eq!(artifact.map_kind, "CodebaseMap");
+        assert_eq!(artifact.scope_kind, "repo");
+        assert_eq!(artifact.scope_ref, "theorem/example");
+        assert!(artifact
+            .entries
+            .iter()
+            .any(|entry| entry.get("kind") == Some(&json!("module"))));
+        assert!(artifact
+            .entries
+            .iter()
+            .any(|entry| entry.get("kind") == Some(&json!("key_symbol"))));
+        assert!(artifact.markdown_body.contains("## Modules"));
+        assert!(artifact.markdown_body.contains("## Key symbols"));
+
+        let listing = maps_json(&store, "smoke");
+        assert_eq!(listing["count"], json!(1));
+        assert_eq!(listing["maps"][0]["map_id"], json!(artifact.map_id));
+        assert_eq!(
+            listing["maps"][0]["entry_count"],
+            json!(artifact.entries.len())
+        );
+        assert_eq!(listing["maps"][0]["source"], json!("code_kg_projection"));
+
+        let detail = map_json(&store, "smoke", &artifact.map_id).expect("map detail");
+        assert_eq!(detail["map"]["tenant_id"], json!("smoke"));
+        assert_eq!(detail["map"]["repo_id"], json!("theorem/example"));
+        assert_eq!(detail["map"]["projection_entry_count"], json!(2));
+        assert!(detail["map"]["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .any(|entry| entry.get("kind") == Some(&json!("module"))));
+
+        assert!(map_json(&store, "other", &artifact.map_id).is_none());
+    }
+
+    #[test]
+    fn codebase_map_projection_updates_preserve_map_identity() {
+        let mut store = InMemoryGraphStore::default();
+        let event = projection_event();
+
+        let first = persist_codebase_map_projection(&mut store, &event).expect("first projection");
+        let second =
+            persist_codebase_map_projection(&mut store, &event).expect("second projection");
+
+        assert_eq!(first.map_id, second.map_id);
+        assert_eq!(first.created_at, second.created_at);
+        assert_eq!(maps_json(&store, "smoke")["count"], json!(1));
     }
 }

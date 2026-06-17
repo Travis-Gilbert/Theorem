@@ -28,6 +28,7 @@ mod code_hooks;
 mod context_pack;
 mod ensure;
 mod ingest_jobs;
+mod map_projection;
 mod repo_fetch;
 
 pub use code_embed_hook::{incremental_embed_hook, EMBEDDING_DIM, EMBEDDING_PROPERTY};
@@ -44,6 +45,11 @@ pub use ensure::{
 pub use ingest_jobs::{
     IngestJobEvent, IngestJobEventKind, IngestJobRegistry, IngestJobRequest, IngestJobState,
     IngestJobStatus, CODE_INGEST_JOB_LABEL,
+};
+pub use map_projection::{
+    project_codebase_map_entries, project_codebase_map_in_store, render_codebase_map_markdown,
+    CodebaseMapEntry, CodebaseMapProjection, CodebaseMapProjectionEvent, CodebaseMapProjectionSink,
+    CodebaseMarkdownFileSink, CODEBASE_MAP_DEFAULT_TOP_K,
 };
 pub use repo_fetch::{
     fetch_repo, fetch_repo_with_credential, is_fetchable_repo_url, FetchedRepo, GitCredential,
@@ -90,6 +96,7 @@ pub struct CodeIndexRuntime {
     jobs: Arc<IngestJobRegistry>,
     worker_started: Arc<std::sync::Once>,
     credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
+    map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
     // Kept alive for the runtime's lifetime so the hook worker keeps draining;
     // `None` unless graph-level code-KG hooks are enabled (see THEOREM_CODE_HOOKS).
     #[allow(dead_code)]
@@ -435,28 +442,58 @@ impl CodeIndexRuntime {
         Self::try_new_with_store_and_credential_resolver(store, credential_resolver)
     }
 
+    pub fn try_new_with_integrations(
+        credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
+        map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
+    ) -> Result<Self, CodeIndexError> {
+        let store = RedCoreGraphStore::open(code_index_data_dir(), code_index_options())
+            .map_err(CodeIndexError::from_store)?;
+        Self::try_new_with_store_integrations(store, credential_resolver, map_projection_sink)
+    }
+
     pub fn try_new_with_store(store: RedCoreGraphStore) -> Result<Self, CodeIndexError> {
-        Self::build(store, code_hooks_enabled(), None)
+        Self::build(store, code_hooks_enabled(), None, None)
     }
 
     pub fn try_new_with_store_and_credential_resolver(
         store: RedCoreGraphStore,
         credential_resolver: Arc<dyn GitCredentialResolver>,
     ) -> Result<Self, CodeIndexError> {
-        Self::build(store, code_hooks_enabled(), Some(credential_resolver))
+        Self::build(store, code_hooks_enabled(), Some(credential_resolver), None)
+    }
+
+    pub fn try_new_with_store_and_map_projection_sink(
+        store: RedCoreGraphStore,
+        map_projection_sink: Arc<dyn CodebaseMapProjectionSink>,
+    ) -> Result<Self, CodeIndexError> {
+        Self::build(store, code_hooks_enabled(), None, Some(map_projection_sink))
+    }
+
+    pub fn try_new_with_store_integrations(
+        store: RedCoreGraphStore,
+        credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
+        map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
+    ) -> Result<Self, CodeIndexError> {
+        Self::build(
+            store,
+            code_hooks_enabled(),
+            credential_resolver,
+            map_projection_sink,
+        )
     }
 
     /// Like [`Self::try_new_with_store`], but always starts the graph-level
     /// code-KG hooks regardless of the `THEOREM_CODE_HOOKS` env flag. For
     /// embedders/tests that opt in explicitly.
     pub fn try_new_with_store_hooked(store: RedCoreGraphStore) -> Result<Self, CodeIndexError> {
-        Self::build(store, true, None)
+        Self::build(store, true, None, None)
     }
 
     fn build(
         store: RedCoreGraphStore,
         with_hooks: bool,
         credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
+        map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
     ) -> Result<Self, CodeIndexError> {
         let store = Arc::new(Mutex::new(store));
         let jobs = Arc::new(IngestJobRegistry::with_persistence(Arc::downgrade(&store)));
@@ -472,6 +509,7 @@ impl CodeIndexRuntime {
             jobs,
             worker_started: Arc::new(std::sync::Once::new()),
             credential_resolver,
+            map_projection_sink,
             hook_dispatcher,
         };
         // D-jobs: recover durably-mirrored ingest jobs. Terminal jobs become
@@ -531,10 +569,14 @@ impl CodeIndexRuntime {
         url: Option<(&str, &RepoFetchCaps)>,
     ) -> Result<IngestCodebaseOutput, CodeIndexError> {
         let started = Instant::now();
+        let is_local_worktree = url.is_none();
         let (input, clone_ms, _fetched) = stage_repo_for_ingest(input, url)?;
         let resolve_started = Instant::now();
         let config = resolve_ingest_config(input)?;
         let resolve_ms = elapsed_ms(resolve_started);
+        let projection_tenant_id = config.tenant_id.clone();
+        let projection_repo_id = config.repo_id.clone();
+        let projection_repo_path = is_local_worktree.then(|| config.repo_root.clone());
         let prior = {
             let store = self.lock_store()?;
             snapshot_for_operation(&store, operation, &config)?
@@ -556,7 +598,16 @@ impl CodeIndexRuntime {
             },
         )?;
         let mut store = self.lock_store()?;
-        commit_prepared_ingest(&mut store, prepared, operation)
+        let output = commit_prepared_ingest(&mut store, prepared, operation)?;
+        map_projection::publish_codebase_map_projection(
+            &store,
+            self.map_projection_sink.as_deref(),
+            &projection_tenant_id,
+            &projection_repo_id,
+            operation,
+            projection_repo_path.as_deref(),
+        );
+        Ok(output)
     }
 
     /// D1: submit an ingest/reindex as a background job and return its status
@@ -592,11 +643,17 @@ impl CodeIndexRuntime {
         let store = Arc::downgrade(&self.store);
         let registry = Arc::clone(&self.jobs);
         let credential_resolver = self.credential_resolver.clone();
+        let map_projection_sink = self.map_projection_sink.clone();
         self.worker_started.call_once(move || {
             if let Err(error) = std::thread::Builder::new()
                 .name("code-ingest-worker".to_string())
                 .spawn(move || {
-                    ingest_jobs::ingest_worker_loop(store, registry, credential_resolver)
+                    ingest_jobs::ingest_worker_loop(
+                        store,
+                        registry,
+                        credential_resolver,
+                        map_projection_sink,
+                    )
                 })
             {
                 // The registry stays usable; submitted jobs will sit queued.
@@ -6459,6 +6516,170 @@ mod tests {
             .symbols
             .iter()
             .any(|symbol| symbol.name == "search_code"));
+
+        drop(runtime);
+        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(store_dir).ok();
+    }
+
+    #[test]
+    fn codebase_map_projection_emits_ranked_entry_kinds() {
+        let store_dir = unique_dir("map-projection-store");
+        let mut store = RedCoreGraphStore::open(&store_dir, test_options()).unwrap();
+        let tenant = "Travis-Gilbert";
+        let repo_id = "repo:projection-demo";
+        store
+            .commit_batch(GraphMutationBatch::new([
+                GraphMutation::NodeUpsert(NodeRecord::new(
+                    repo_id,
+                    [CODE_REPO_LABEL],
+                    json!({
+                        "tenant_id": tenant,
+                        "repo_id": repo_id,
+                        "latest_generation": 1,
+                        "source": SOURCE,
+                    }),
+                )),
+                GraphMutation::NodeUpsert(NodeRecord::new(
+                    "code:file:projection",
+                    [CODE_FILE_LABEL],
+                    json!({
+                        "tenant_id": tenant,
+                        "repo_id": repo_id,
+                        "path": "src/lib.rs",
+                        "generation": 1,
+                        "source": SOURCE,
+                    }),
+                )),
+                GraphMutation::NodeUpsert(NodeRecord::new(
+                    "code:symbol:main",
+                    [CODE_SYMBOL_LABEL],
+                    json!({
+                        "tenant_id": tenant,
+                        "repo_id": repo_id,
+                        "name": "main",
+                        "kind": "function",
+                        "file_path": "src/lib.rs",
+                        "line": 3,
+                        "generation": 1,
+                        "source": SOURCE,
+                    }),
+                )),
+                GraphMutation::NodeUpsert(NodeRecord::new(
+                    "code:symbol:adapter",
+                    [CODE_SYMBOL_LABEL],
+                    json!({
+                        "tenant_id": tenant,
+                        "repo_id": repo_id,
+                        "name": "Adapter",
+                        "kind": "struct",
+                        "file_path": "src/lib.rs",
+                        "line": 9,
+                        "generation": 1,
+                        "source": SOURCE,
+                    }),
+                )),
+                GraphMutation::NodeUpsert(NodeRecord::new(
+                    "code:symbol:config",
+                    [CODE_SYMBOL_LABEL],
+                    json!({
+                        "tenant_id": tenant,
+                        "repo_id": repo_id,
+                        "name": "Config",
+                        "kind": "struct",
+                        "file_path": "src/lib.rs",
+                        "line": 16,
+                        "generation": 1,
+                        "source": SOURCE,
+                    }),
+                )),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:repo:file",
+                    repo_id,
+                    CONTAINS_FILE,
+                    "code:file:projection",
+                    json!({ "tenant_id": tenant, "repo_id": repo_id }),
+                )),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:file:main",
+                    "code:file:projection",
+                    DECLARES_SYMBOL,
+                    "code:symbol:main",
+                    json!({ "tenant_id": tenant, "repo_id": repo_id }),
+                )),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:file:adapter",
+                    "code:file:projection",
+                    DECLARES_SYMBOL,
+                    "code:symbol:adapter",
+                    json!({ "tenant_id": tenant, "repo_id": repo_id }),
+                )),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:file:config",
+                    "code:file:projection",
+                    DECLARES_SYMBOL,
+                    "code:symbol:config",
+                    json!({ "tenant_id": tenant, "repo_id": repo_id }),
+                )),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:main:adapter",
+                    "code:symbol:main",
+                    CALLS_SYMBOL,
+                    "code:symbol:adapter",
+                    json!({ "tenant_id": tenant, "repo_id": repo_id }),
+                )),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:main:config",
+                    "code:symbol:main",
+                    DEPENDS_ON_SYMBOL,
+                    "code:symbol:config",
+                    json!({ "tenant_id": tenant, "repo_id": repo_id }),
+                )),
+            ]))
+            .unwrap();
+
+        let projection = project_codebase_map_in_store(&store, tenant, repo_id, 12);
+        let kinds = projection
+            .entries
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        assert!(kinds.contains("module"));
+        assert!(kinds.contains("entry_point"));
+        assert!(kinds.contains("dependency"));
+        assert!(kinds.contains("key_symbol"));
+        assert!(projection.markdown_body.contains("## Modules"));
+        assert!(projection.markdown_body.contains("## Entry points"));
+        assert!(projection
+            .entries
+            .iter()
+            .all(|entry| { entry["metadata"]["pagerank_score"].as_f64().unwrap_or(0.0) > 0.0 }));
+
+        fs::remove_dir_all(store_dir).ok();
+    }
+
+    #[test]
+    fn local_ingest_with_map_sink_writes_codebase_markdown() {
+        let (repo_dir, store_dir) = write_fixture_repo();
+        let store = RedCoreGraphStore::open(&store_dir, test_options()).unwrap();
+        let runtime = CodeIndexRuntime::try_new_with_store_and_map_projection_sink(
+            store,
+            Arc::new(CodebaseMarkdownFileSink),
+        )
+        .unwrap();
+        let output = runtime
+            .ingest_codebase(IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                actor: "codex-test".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(output.status, "ok");
+        let codebase_md = fs::read_to_string(repo_dir.join("codebase.md")).unwrap();
+        assert!(codebase_md.contains("# CodebaseMap for "));
+        assert!(codebase_md.contains("## Modules"));
+        assert!(codebase_md.contains("## Key symbols") || codebase_md.contains("## Entry points"));
 
         drop(runtime);
         fs::remove_dir_all(repo_dir).ok();

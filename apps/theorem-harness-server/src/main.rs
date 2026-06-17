@@ -4,6 +4,8 @@
 //! contract the Theorem clients consume:
 //!   GET /harness/runs            -> { "runs": [...] }
 //!   GET /harness/runs/{run_id}   -> { "run": {...}, "events": [...] }  (404 if unknown)
+//!   GET /harness/maps            -> { "maps": [...] }
+//!   GET /harness/maps/{map_id}   -> { "map": {...} }  (404 if unknown)
 //!   GET /harness/rooms/{room_id}          -> { "room": {...} }
 //!   GET /harness/rooms/{room_id}/presence -> { "presence": [...] }
 //!   GET /harness/rooms/{room_id}/intents  -> { "intents": [...] }
@@ -29,7 +31,7 @@ use axum::{
     Json, Router,
 };
 use rustyred_thg_affordances::registry::register_connector_with_target;
-use rustyred_thg_code::{CodeIndexRuntime, GitCredentialResolver};
+use rustyred_thg_code::{CodeIndexRuntime, CodebaseMapProjectionSink, GitCredentialResolver};
 use rustyred_thg_connectors::{
     connect_transport, connector_manifest, initialize_params, parse_initialize, parse_tools_list,
     tools_list_params, ConnectionTarget, McpTransport,
@@ -38,9 +40,10 @@ use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use theorem_harness_server::{
-    connectors_json, github_router, intents_json, mentions_json, presence_json, push_router,
-    records_json, room_json, run_json, runs_json, spawn_wake_listener, GithubApp,
-    GithubWebhookState, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
+    connectors_json, github_router, intents_json, map_json, maps_json, mentions_json,
+    presence_json, push_router, records_json, room_json, run_json, runs_json, spawn_wake_listener,
+    GithubApp, GithubWebhookState, GraphStoreMapArtifactSink, PushState, RoomBus,
+    DEFAULT_BUS_CAPACITY,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
@@ -114,6 +117,8 @@ async fn main() {
         .route("/healthz", get(healthz))
         .route("/harness/runs", get(list_runs))
         .route("/harness/runs/:run_id", get(get_run))
+        .route("/harness/maps", get(list_maps))
+        .route("/harness/maps/:map_id", get(get_map))
         .route("/harness/rooms/:room_id", get(get_room))
         .route("/harness/rooms/:room_id/presence", get(get_room_presence))
         .route("/harness/rooms/:room_id/intents", get(get_room_intents))
@@ -126,7 +131,7 @@ async fn main() {
         .route("/connectors/register", post(register_connector_route))
         .with_state(state.clone())
         .merge(push);
-    let app = maybe_mount_github_router(app);
+    let app = maybe_mount_github_router(app, state.clone());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "50080".to_string());
     let addr = format!("0.0.0.0:{port}");
@@ -137,14 +142,19 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-fn maybe_mount_github_router(app: Router) -> Router {
+fn maybe_mount_github_router(app: Router, store: SharedStore) -> Router {
     let Ok(github_app) = GithubApp::from_env() else {
         tracing::info!("GitHub App webhook router disabled: missing GitHub App env config");
         return app;
     };
     let github_app = Arc::new(github_app);
     let resolver: Arc<dyn GitCredentialResolver> = github_app.clone();
-    let code_index = match CodeIndexRuntime::try_new_with_credential_resolver(resolver) {
+    let map_sink: Arc<dyn CodebaseMapProjectionSink> =
+        Arc::new(GraphStoreMapArtifactSink::new(store));
+    let code_index = match CodeIndexRuntime::try_new_with_integrations(
+        Some(resolver),
+        Some(map_sink),
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             tracing::warn!(%error, "GitHub App webhook router disabled: code index failed to open");
@@ -163,6 +173,25 @@ fn maybe_mount_github_router(app: Router) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn list_maps(
+    State(store): State<SharedStore>,
+    Query(query): Query<CoordinationQuery>,
+) -> Json<Value> {
+    let store = store.lock().expect("store lock");
+    Json(maps_json(&*store, &query.tenant_slug()))
+}
+
+async fn get_map(
+    State(store): State<SharedStore>,
+    Path(map_id): Path<String>,
+    Query(query): Query<CoordinationQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let store = store.lock().expect("store lock");
+    map_json(&*store, &query.tenant_slug(), &map_id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn list_runs(State(store): State<SharedStore>) -> Json<Value> {

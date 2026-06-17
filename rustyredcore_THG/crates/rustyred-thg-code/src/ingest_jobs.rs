@@ -25,8 +25,9 @@ use serde_json::{json, Value};
 use crate::{
     commit_prepared_ingest, default_parse_budget_ms, load_file_texts, normalize_tenant,
     prepare_codebase_ingest_resolved, resolve_ingest_config, snapshot_for_operation,
-    stage_repo_for_ingest_with_credential, CodeIndexError, GitCredentialResolver,
-    IngestCodebaseInput, IngestCodebaseOutput, IngestPipelineOptions, RepoFetchCaps, SOURCE,
+    stage_repo_for_ingest_with_credential, CodeIndexError, CodebaseMapProjectionSink,
+    GitCredentialResolver, IngestCodebaseInput, IngestCodebaseOutput, IngestPipelineOptions,
+    RepoFetchCaps, SOURCE,
 };
 
 const MAX_RETAINED_JOBS: usize = 64;
@@ -910,6 +911,7 @@ pub(crate) fn ingest_worker_loop(
     store: Weak<Mutex<RedCoreGraphStore>>,
     registry: Arc<IngestJobRegistry>,
     credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
+    map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
 ) {
     loop {
         let Some((job_id, request)) = registry.next_queued(WORKER_IDLE_POLL) else {
@@ -918,7 +920,14 @@ pub(crate) fn ingest_worker_loop(
             }
             continue;
         };
-        run_ingest_job(&store, &registry, &job_id, request, &credential_resolver);
+        run_ingest_job(
+            &store,
+            &registry,
+            &job_id,
+            request,
+            &credential_resolver,
+            &map_projection_sink,
+        );
     }
 }
 
@@ -928,6 +937,7 @@ fn run_ingest_job(
     job_id: &str,
     request: IngestJobRequest,
     credential_resolver: &Option<Arc<dyn GitCredentialResolver>>,
+    map_projection_sink: &Option<Arc<dyn CodebaseMapProjectionSink>>,
 ) {
     let started = Instant::now();
     registry.mark_running(job_id);
@@ -983,6 +993,13 @@ fn run_ingest_job(
         Ok(config) => config,
         Err(error) => return fail(error),
     };
+    let projection_tenant_id = config.tenant_id.clone();
+    let projection_repo_id = config.repo_id.clone();
+    let projection_repo_path = request
+        .repo_url
+        .trim()
+        .is_empty()
+        .then(|| config.repo_root.clone());
     let resolve_ms = crate::elapsed_ms(resolve_started);
 
     // Brief lock: snapshot the prior generation for an incremental reindex.
@@ -1050,7 +1067,18 @@ fn run_ingest_job(
             Ok(guard) => guard,
             Err(_) => return fail(store_poisoned_error()),
         };
-        commit_prepared_ingest(&mut guard, prepared, &request.operation)
+        let output = commit_prepared_ingest(&mut guard, prepared, &request.operation);
+        if output.is_ok() {
+            crate::map_projection::publish_codebase_map_projection(
+                &guard,
+                map_projection_sink.as_deref(),
+                &projection_tenant_id,
+                &projection_repo_id,
+                &request.operation,
+                projection_repo_path.as_deref(),
+            );
+        }
+        output
     };
     match output {
         Ok(output) => {
