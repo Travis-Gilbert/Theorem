@@ -77,7 +77,7 @@ First slice landed in the Rust library layer:
 - `rustyred-web/src/search.rs` now owns the borrowed-breadth acquisition contract: `SearchProvider`, `SearchOpts`, `SearchCandidate`, provider receipts, `fanout_search_providers`, normalized URL dedupe, and RRF merge.
 - `rustyred-web/src/epistemic_filter.rs` is exported as the pure ranking/filter port. `SearchAcquisition::fused_candidates_for_epistemic_filter` now calibrates provider RRF scores into the filter input shape so default `min_score` does not drop every borrowed-breadth candidate. Full graph hydration and learned scorer wiring are still open.
 - `StaticSearchProvider` gives tests and future config smoke checks a deterministic provider.
-- `rustyred-web/src/providers.rs` now has live provider adapters for Brave, Mojeek, Exa, and SerpAPI, plus a file-backed offline JSON/JSONL seed-manifest provider for OWI/Common Crawl corpus jobs. Providers are enabled only by `RUSTYWEB_SEARCH_PROVIDERS` / `RUSTY_RED_SEARCH_PROVIDERS` plus provider-specific config; stray keys alone do not trigger outbound API calls.
+- `rustyred-web/src/providers.rs` now has live provider adapters for Brave, Mojeek, Exa, SerpAPI, Perplexity, Firecrawl, and SearXNG, plus a file-backed offline JSON/JSONL seed-manifest provider for OWI/Common Crawl corpus jobs. Providers are enabled only by `RUSTYWEB_SEARCH_PROVIDERS` / `RUSTY_RED_SEARCH_PROVIDERS` plus provider-specific config; stray keys alone do not trigger outbound API calls.
 - `rustyred-thg-fractal` now exposes `run_fractal_expansion_with_search_providers` and `run_fixture_fractal_expansion_with_search_providers`; provider candidates are merged into `web_seed_urls`, and receipts report provider candidates plus provider receipts.
 - `rustyweb_search_acquisition` is advertised by `rustyred-thg-mcp` and intercepted by `rustyred-thg-server`; tests cover both the stable empty-provider shape and configured-provider seed URLs.
 - `fractal_expansion` now calls the provider-backed wrapper when the server has configured providers; otherwise it preserves the existing explicit-seed/frontier behavior.
@@ -96,13 +96,16 @@ Still open for the next slice:
 
 Provider env:
 
-- `RUSTYWEB_SEARCH_PROVIDERS=brave,mojeek,exa,serpapi,offline` (or `RUSTY_RED_SEARCH_PROVIDERS`).
+- `RUSTYWEB_SEARCH_PROVIDERS=brave,mojeek,exa,serpapi,perplexity,firecrawl,searxng,offline` (or `RUSTY_RED_SEARCH_PROVIDERS`).
 - Brave key: `RUSTYWEB_BRAVE_SEARCH_API_KEY`, `RUSTY_RED_BRAVE_SEARCH_API_KEY`, or `BRAVE_SEARCH_API_KEY`.
 - Mojeek key: `RUSTYWEB_MOJEEK_SEARCH_API_KEY`, `RUSTY_RED_MOJEEK_SEARCH_API_KEY`, or `MOJEEK_SEARCH_API_KEY`.
 - Exa key: `RUSTYWEB_EXA_API_KEY`, `RUSTY_RED_EXA_API_KEY`, or `EXA_API_KEY`.
 - SerpAPI key: `RUSTYWEB_SERPAPI_API_KEY`, `RUSTY_RED_SERPAPI_API_KEY`, or `SERPAPI_API_KEY`.
+- Perplexity key: `RUSTYWEB_PERPLEXITY_API_KEY`, `RUSTY_RED_PERPLEXITY_API_KEY`, or `PERPLEXITY_API_KEY`.
+- Firecrawl key: `RUSTYWEB_FIRECRAWL_API_KEY`, `RUSTY_RED_FIRECRAWL_API_KEY`, or `FIRECRAWL_API_KEY`.
+- SearXNG URL: `RUSTYWEB_SEARXNG_URL`, `RUSTY_RED_SEARXNG_URL`, or `SEARXNG_URL`.
 - Offline seed manifest: `RUSTYWEB_OFFLINE_SEARCH_MANIFEST` or `RUSTY_RED_OFFLINE_SEARCH_MANIFEST`. The file can be a JSON array or JSONL rows with `url`, optional `title`, `snippet`, `source`, `rank`, `query`, and `terms`.
 - Qwen4B embed endpoint: `RUSTYWEB_QWEN4B_EMBED_URL`, `RUSTYWEB_QWEN3_EMBEDDING_4B_URL`, `RUSTY_RED_QWEN4B_EMBED_URL`, `RUNPOD_QWEN3_EMBED_URL`, or `QWEN3_EMBEDDING_4B_URL`.
 - Optional Qwen4B overrides: `RUSTYWEB_QWEN4B_MODEL_ID`, `RUSTYWEB_QWEN4B_DIMENSION`, `RUSTYWEB_QWEN4B_BATCH_SIZE`, `RUSTYWEB_QWEN4B_TIMEOUT_SECONDS`, and `RUSTYWEB_QWEN4B_REQUEST_FORMAT` (`auto`, `openai`, or `tei`).
 
-Docs checked before implementation: Brave Web Search uses `https://api.search.brave.com/res/v1/web/search` with `X-Subscription-Token` and returns `web.results`; Exa uses `POST https://api.exa.ai/search` with `x-api-key` and `results`; SerpAPI Google Search uses `https://serpapi.com/search.json?engine=google` and `organic_results`; Mojeek uses `https://api.mojeek.com/search` with `api_key`, `q`, `fmt=json`, and `response.results`.
+Docs checked before implementation: Brave Web Search uses `POST https://api.search.brave.com/res/v1/web/search` with `X-Subscription-Token`, JSON `q`/`count`, and `web.results`; Exa uses `POST https://api.exa.ai/search` with `x-api-key` and `results`; SerpAPI Google Search uses `https://serpapi.com/search.json?engine=google` and `organic_results`; Mojeek uses `https://api.mojeek.com/search` with `api_key`, `q`, `fmt=json`, and `response.results`; Firecrawl uses `POST https://api.firecrawl.dev/v2/search` with `Authorization: Bearer`, `query`, `limit`, and `data.web`.

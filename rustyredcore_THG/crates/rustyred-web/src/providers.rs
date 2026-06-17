@@ -15,6 +15,7 @@ const MOJEEK_SEARCH_ENDPOINT: &str = "https://api.mojeek.com/search";
 const EXA_SEARCH_ENDPOINT: &str = "https://api.exa.ai/search";
 const SERPAPI_SEARCH_ENDPOINT: &str = "https://serpapi.com/search.json";
 const PERPLEXITY_SEARCH_ENDPOINT: &str = "https://api.perplexity.ai/search";
+const FIRECRAWL_SEARCH_ENDPOINT: &str = "https://api.firecrawl.dev/v2/search";
 const SEARXNG_SEARCH_PATH: &str = "search";
 
 pub fn configured_search_providers_from_env() -> Vec<Arc<dyn SearchProvider>> {
@@ -64,6 +65,13 @@ fn provider_from_env(provider: &str) -> Option<Arc<dyn SearchProvider>> {
             "PERPLEXITY_API_KEY",
         ])
         .map(PerplexitySearchProvider::new)
+        .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
+        "firecrawl" | "firecrawl_search" => env_first(&[
+            "RUSTYWEB_FIRECRAWL_API_KEY",
+            "RUSTY_RED_FIRECRAWL_API_KEY",
+            "FIRECRAWL_API_KEY",
+        ])
+        .map(FirecrawlSearchProvider::new)
         .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
         "searxng" | "searx" | "searxng_search" => env_first(&[
             "RUSTYWEB_SEARXNG_URL",
@@ -118,12 +126,16 @@ impl SearchProvider for BraveSearchProvider {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let count = opts.provider_limit.min(20).to_string();
             let response = self
                 .client
-                .get(&self.endpoint)
+                .post(&self.endpoint)
+                .header("accept", "application/json")
                 .header("X-Subscription-Token", &self.api_key)
-                .query(&[("q", query), ("count", count.as_str())])
+                .json(&json!({
+                    "q": query,
+                    "count": opts.provider_limit.min(20),
+                    "result_filter": ["web"],
+                }))
                 .send()
                 .await
                 .map_err(|error| provider_error(self.name(), error.to_string()))?;
@@ -319,6 +331,52 @@ impl SearchProvider for PerplexitySearchProvider {
                 .map_err(|error| provider_error(self.name(), error.to_string()))?;
             let payload = response_json(self.name(), response).await?;
             Ok(perplexity_candidates(&payload, self.name()))
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FirecrawlSearchProvider {
+    api_key: String,
+    client: Client,
+    endpoint: String,
+}
+
+impl FirecrawlSearchProvider {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            client: Client::new(),
+            endpoint: FIRECRAWL_SEARCH_ENDPOINT.to_string(),
+        }
+    }
+}
+
+impl SearchProvider for FirecrawlSearchProvider {
+    fn name(&self) -> &str {
+        "firecrawl"
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        opts: &'a SearchOpts,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let response = self
+                .client
+                .post(&self.endpoint)
+                .bearer_auth(&self.api_key)
+                .json(&json!({
+                    "query": query,
+                    "limit": opts.provider_limit.min(100),
+                }))
+                .send()
+                .await
+                .map_err(|error| provider_error(self.name(), error.to_string()))?;
+            let payload = response_json(self.name(), response).await?;
+            Ok(firecrawl_candidates(&payload, self.name()))
         })
     }
 }
@@ -582,6 +640,28 @@ fn perplexity_candidates(payload: &Value, source: &str) -> Vec<SearchCandidate> 
         .collect()
 }
 
+fn firecrawl_candidates(payload: &Value, source: &str) -> Vec<SearchCandidate> {
+    payload
+        .pointer("/data/web")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, result)| {
+            let url = string_field(result, "url")?;
+            Some(SearchCandidate {
+                url,
+                title: string_field(result, "title"),
+                snippet: string_field(result, "description")
+                    .or_else(|| string_field(result, "snippet"))
+                    .or_else(|| string_field(result, "markdown")),
+                source: source.to_string(),
+                rank: index + 1,
+            })
+        })
+        .collect()
+}
+
 fn searxng_search_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with(SEARXNG_SEARCH_PATH) {
@@ -798,6 +878,29 @@ mod tests {
         assert_eq!(perplexity[0].snippet.as_deref(), Some("Perplexity snippet"));
         assert_eq!(perplexity[0].rank, 1);
         assert_eq!(perplexity[0].source, "perplexity");
+
+        let firecrawl = firecrawl_candidates(
+            &json!({
+                "success": true,
+                "data": {
+                    "web": [{
+                        "url": "https://example.com/firecrawl",
+                        "title": "Firecrawl title",
+                        "description": "Firecrawl description",
+                        "category": "research"
+                    }]
+                }
+            }),
+            "firecrawl",
+        );
+        assert_eq!(firecrawl[0].url, "https://example.com/firecrawl");
+        assert_eq!(firecrawl[0].title.as_deref(), Some("Firecrawl title"));
+        assert_eq!(
+            firecrawl[0].snippet.as_deref(),
+            Some("Firecrawl description")
+        );
+        assert_eq!(firecrawl[0].rank, 1);
+        assert_eq!(firecrawl[0].source, "firecrawl");
 
         let searxng = searxng_candidates(
             &json!({

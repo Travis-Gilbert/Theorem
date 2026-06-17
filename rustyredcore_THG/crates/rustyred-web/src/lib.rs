@@ -100,7 +100,8 @@ pub use browser_run::{BrowsingRunRecord, BrowsingRunRecorder, BrowsingRunReplay,
 pub mod providers;
 pub use providers::{
     configured_search_providers_from_env, BraveSearchProvider, ExaSearchProvider,
-    MojeekSearchProvider, OfflineSearchProvider, SearXngSearchProvider, SerpApiSearchProvider,
+    FirecrawlSearchProvider, MojeekSearchProvider, OfflineSearchProvider, SearXngSearchProvider,
+    SerpApiSearchProvider,
 };
 
 pub mod robots;
