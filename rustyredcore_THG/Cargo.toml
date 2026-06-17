@@ -20,6 +20,7 @@ members = [
     "crates/rustyred-thg-resp-server",
     "crates/rustyred-membrane",
     "crates/rustyred-rerank",
+    "crates/rustyred-hipporag",
     "crates/rustyred-web",
     "crates/rustyred-thg-code",
     "crates/rustyred-thg-memory",

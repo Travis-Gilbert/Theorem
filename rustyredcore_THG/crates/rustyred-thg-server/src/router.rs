@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rustyred_hipporag::HippoQuery;
 use rustyred_rerank::{
     CrossEncoder, HttpCrossEncoder, HttpListwiseReranker, LexicalCrossEncoder, ListwiseReranker,
     RerankScorer, GTE_RERANKER_MODERNBERT_BASE, JINA_RERANKER_V3,
@@ -43,11 +44,12 @@ use rustyred_thg_mcp::{
 };
 use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
-    fanout_search_providers, gate_search_graph, render_serp_html, run_live_crawl, search_substrate,
+    configured_qwen3_embedding_4b_client_from_env, fanout_search_providers, gate_search_graph,
+    gate_search_graph_with_hippo_query_vector, render_serp_html, run_live_crawl, search_substrate,
     warm_pages_task, web_consume_to_graph, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope,
-    PageRecord, PageState, RustyWebError, SearchOptions, SearchOpts, WebCommonsFragment,
-    WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt, WebConsumeReceipt,
-    WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
+    PageRecord, PageState, RustyWebError, SearchOptions, SearchOpts, TextEmbedder,
+    WebCommonsFragment, WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt,
+    WebConsumeReceipt, WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
     LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION,
     SEMANTIC_VECTOR_PROPERTY,
 };
@@ -736,6 +738,9 @@ async fn mcp_post(
     {
         return Json(response).into_response();
     }
+    if let Some(response) = maybe_handle_hippo_retrieve_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
     if let Some(response) = maybe_handle_web_search_graph_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
     }
@@ -745,10 +750,10 @@ async fn mcp_post(
     if let Some(response) = maybe_handle_composed_agent_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
     }
-    let inject_web_search_graph_tool =
-        payload.get("method").and_then(Value::as_str) == Some("tools/list");
+    let inject_search_tools = payload.get("method").and_then(Value::as_str) == Some("tools/list");
     let mut response = handle_mcp_request_with_context(&state, &config, &mcp_context, payload);
-    if inject_web_search_graph_tool {
+    if inject_search_tools {
+        inject_hippo_retrieve_tool_definition(&mut response);
         inject_web_search_graph_tool_definition(&mut response);
     }
     Json(response).into_response()
@@ -1529,6 +1534,136 @@ async fn maybe_handle_live_search_acquisition_mcp(
     }))
 }
 
+async fn maybe_handle_hippo_retrieve_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "hippo_retrieve" | "hipporag_retrieve") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match hippo_retrieve_payload(state, config, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn hippo_retrieve_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let query = argument_text_any(arguments, &["query", "q", "text"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_hippo_retrieve",
+            "message": "hippo_retrieve requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let top_k = argument_u64_any(arguments, &["top_k", "topK", "limit"])
+        .unwrap_or(8)
+        .clamp(1, 100) as usize;
+    let include_hubs = arguments
+        .get("include_hubs")
+        .or_else(|| arguments.get("includeHubs"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let hippo_query_vector = hippo_query_vector_from_env(&query).await?;
+
+    let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let gate_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "hippo_retrieve_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let hippo_query = HippoQuery {
+        text: &query,
+        top_k,
+        include_hubs,
+    };
+    let (candidates, trace) = match hippo_query_vector.as_deref() {
+        Some(query_vector) => {
+            rustyred_hipporag::retrieve_with_query_vector(&gate_store, hippo_query, query_vector)
+        }
+        None => rustyred_hipporag::retrieve::retrieve_with_trace(&gate_store, hippo_query),
+    };
+    let stats = json!({
+        "candidates": candidates.len(),
+        "seeds": trace.seeds.len(),
+        "warm_centrality_reads": trace.warm_centrality_reads,
+        "ran_query_ppr": trace.ran_query_ppr,
+        "ran_global_ppr": trace.ran_global_ppr
+    });
+
+    Ok(json!({
+        "tenant": tenant,
+        "query": query,
+        "candidates": candidates,
+        "trace": trace,
+        "stats": stats
+    }))
+}
+
+async fn hippo_query_vector_from_env(query: &str) -> Result<Option<Vec<f32>>, Value> {
+    let Some(embedder) = configured_qwen3_embedding_4b_client_from_env().map_err(|error| {
+        json!({
+            "error": "hippo_embedding_config_invalid",
+            "message": error.to_string()
+        })
+    })?
+    else {
+        return Ok(None);
+    };
+    let inputs = [query.to_string()];
+    let mut vectors = TextEmbedder::embed(&embedder, &inputs)
+        .await
+        .map_err(|error| {
+            json!({
+                "error": "hippo_embedding_failed",
+                "message": error.to_string()
+            })
+        })?;
+    if vectors.len() != 1 {
+        return Err(json!({
+            "error": "hippo_embedding_response_invalid",
+            "message": format!(
+                "embedding endpoint returned {} query vectors for HippoRAG retrieval",
+                vectors.len()
+            )
+        }));
+    }
+    Ok(vectors.pop())
+}
+
 async fn live_search_acquisition_payload(
     state: &AppState,
     config: &rustyred_thg_mcp::McpServerConfig,
@@ -1731,6 +1866,11 @@ fn web_search_graph_job(
         argument_f64_any(arguments, &["redundancy_penalty", "redundancyPenalty"])
     {
         options.redundancy_penalty = redundancy_penalty.clamp(0.0, 1.0) as f32;
+        options.mmr_lambda = 1.0 - options.redundancy_penalty;
+    }
+    if let Some(mmr_lambda) = argument_f64_any(arguments, &["mmr_lambda", "mmrLambda"]) {
+        options.mmr_lambda = mmr_lambda.clamp(0.0, 1.0) as f32;
+        options.redundancy_penalty = 1.0 - options.mmr_lambda;
     }
     if let Some(fetch_top_k) = argument_u64_any(arguments, &["fetch_top_k", "fetchTopK"]) {
         options.fetch_top_k = fetch_top_k.clamp(0, 100) as usize;
@@ -1814,6 +1954,7 @@ async fn execute_web_search_graph(
     let providers = state.search_providers(&provider_allowlist);
     let acquisition =
         fanout_search_providers(&providers, &query, options.acquisition.clone()).await;
+    let hippo_query_vector = hippo_query_vector_from_env(&query).await?;
 
     // (2) Synchronous gate: acquire the tenant store, run the membrane gate, drop
     // the guard. No `.await` lives inside this scope, so the guard never crosses an
@@ -1838,14 +1979,25 @@ async fn execute_web_search_graph(
                 "message": error.message
             })
         })?;
-        gate_search_graph(
-            &mut gate_store,
-            acquisition,
-            &options,
-            &scorer,
-            listwise.as_deref(),
-            reranker_version,
-        )
+        match hippo_query_vector.as_deref() {
+            Some(query_vector) => gate_search_graph_with_hippo_query_vector(
+                &mut gate_store,
+                acquisition,
+                &options,
+                &scorer,
+                listwise.as_deref(),
+                reranker_version,
+                query_vector,
+            ),
+            None => gate_search_graph(
+                &mut gate_store,
+                acquisition,
+                &options,
+                &scorer,
+                listwise.as_deref(),
+                reranker_version,
+            ),
+        }
         .map_err(|error| {
             json!({
                 "error": "web_search_graph_failed",
@@ -1945,6 +2097,54 @@ fn spawn_web_search_graph_warming(
 /// tool's call execution is intercepted in the async router (it persists membrane
 /// receipts + warm pages), so the synchronous MCP backend does not own its
 /// definition; the router injects it so the tool is discoverable in `tools/list`.
+fn inject_hippo_retrieve_tool_definition(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if tools
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("hippo_retrieve"))
+    {
+        return;
+    }
+    tools.push(hippo_retrieve_tool_definition());
+}
+
+fn hippo_retrieve_tool_definition() -> Value {
+    json!({
+        "name": "hippo_retrieve",
+        "description": "HippoRAG 2 graph-resident candidate generation: run query-specific PPR over Page, Phrase, and Hub nodes and return membrane Candidate values. This tool does not rerank or admit to budget.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The retrieval query."
+                },
+                "tenant": {
+                    "type": "string",
+                    "description": "Tenant slug whose graph store is searched. Defaults to the server's default tenant."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Max candidates returned. Default 8.",
+                    "minimum": 1,
+                    "maximum": 100
+                },
+                "include_hubs": {
+                    "type": "boolean",
+                    "description": "Whether Hub nodes can appear as candidates. Default true."
+                }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
 fn inject_web_search_graph_tool_definition(response: &mut Value) {
     let Some(tools) = response
         .get_mut("result")
@@ -2007,7 +2207,13 @@ fn web_search_graph_tool_definition() -> Value {
                 },
                 "redundancy_penalty": {
                     "type": "number",
-                    "description": "Cross-pool redundancy penalty handed to the scorer. Default 0.15.",
+                    "description": "Backward-compatible alias for 1 - mmr_lambda. Default 0.3.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "mmr_lambda": {
+                    "type": "number",
+                    "description": "MMR lambda used by the shared membrane fill. 1.0 is pure score-ordered greedy; default 0.7.",
                     "minimum": 0.0,
                     "maximum": 1.0
                 },
@@ -2061,6 +2267,11 @@ fn live_fractal_expansion_job(
             .unwrap_or(8) as usize,
         web_seed_limit: argument_u64_any(arguments, &["web_seed_limit", "webSeedLimit"])
             .unwrap_or(8) as usize,
+        budget_tokens: argument_u64_any(arguments, &["budget_tokens", "budgetTokens"])
+            .unwrap_or(2_000) as usize,
+        mmr_lambda: argument_f64_any(arguments, &["mmr_lambda", "mmrLambda"])
+            .unwrap_or(0.7)
+            .clamp(0.0, 1.0) as f32,
         embedder_model: argument_text_any(arguments, &["embedder_model", "embedderModel"]),
         actor_id: argument_text_any(arguments, &["actor", "actor_id", "actorId"]),
     };
@@ -7292,13 +7503,13 @@ mod tests {
         instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr, instant_kg_search,
         is_adapter_command, is_cache_command, is_graph_command, live_search_budget,
         live_search_is_sparse, maybe_handle_browser_use_mcp, maybe_handle_composed_agent_mcp,
-        maybe_handle_live_search_acquisition_mcp, maybe_handle_web_search_graph_mcp,
-        mcp_origin_allowed, memory_docs_list, public_cypher, required_scope_for_command,
-        search_live, transaction_begin, transaction_commit, transaction_rollback, BulkQuery,
-        CommunitiesBody, ComponentsBody, FullTextSearchBody, HybridSearchBody,
-        InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody, InstantKgSearchBody,
-        InstantKgViewBody, LiveSearchRequest, MemoryDocsQuery, PageRankBody, PprBody,
-        PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        maybe_handle_hippo_retrieve_mcp, maybe_handle_live_search_acquisition_mcp,
+        maybe_handle_web_search_graph_mcp, mcp_origin_allowed, memory_docs_list, public_cypher,
+        required_scope_for_command, search_live, transaction_begin, transaction_commit,
+        transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody,
+        HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
+        InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, MemoryDocsQuery, PageRankBody,
+        PprBody, PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         auth::ApiToken,
@@ -7849,6 +8060,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_hippo_retrieve_intercept_returns_candidates_and_trace() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("default").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:hippo",
+                    [rustyred_hipporag::schema::LABEL_PAGE],
+                    json!({
+                        "url": "https://example.com/hipporag",
+                        "title": "HippoRAG hubs",
+                        "text": "HippoRAG hub summaries connect phrase evidence, graph retrieval, and page passages for associative search."
+                    }),
+                ))
+                .unwrap();
+            let mut gate_store = super::TenantMirrorGraphStore::new(&mut store).unwrap();
+            rustyred_hipporag::indexing::index_passage(&mut gate_store, "page:hippo").unwrap();
+            rustyred_hipporag::raptor::build_summary_tree_for_region(
+                &mut gate_store,
+                rustyred_hipporag::RaptorPolicy {
+                    region_node_threshold: 1,
+                    min_members: 2,
+                    max_level: 1,
+                },
+                &["page:hippo".to_string()],
+            )
+            .unwrap();
+        }
+        let config = state.mcp_config();
+        let response = maybe_handle_hippo_retrieve_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "hippo-retrieve",
+                "method": "tools/call",
+                "params": {
+                    "name": "hippo_retrieve",
+                    "arguments": {
+                        "query": "graph hub phrase retrieval",
+                        "top_k": 4
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("hippo_retrieve MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["query"], "graph hub phrase retrieval");
+        assert!(payload["candidates"].as_array().unwrap().len() >= 1);
+        assert_eq!(payload["trace"]["ran_query_ppr"], true);
+        assert_eq!(payload["trace"]["ran_global_ppr"], false);
+        assert!(payload["stats"]["warm_centrality_reads"].as_u64().is_some());
+    }
+
+    #[tokio::test]
     async fn mcp_web_search_graph_intercept_returns_membrane_shape() {
         let state = memory_product_write_state_with_search_providers(vec![Arc::new(
             StaticSearchProvider::new(
@@ -7941,7 +8210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_tools_list_includes_web_search_graph() {
+    async fn mcp_tools_list_includes_search_tools() {
         let state = memory_product_state();
         let config = state.mcp_config();
         let mut response = handle_mcp_request_with_context(
@@ -7955,9 +8224,16 @@ mod tests {
                 "params": {}
             }),
         );
+        super::inject_hippo_retrieve_tool_definition(&mut response);
         super::inject_web_search_graph_tool_definition(&mut response);
 
         let tools = response["result"]["tools"].as_array().unwrap();
+        let hippo_retrieve = tools
+            .iter()
+            .find(|tool| tool["name"] == "hippo_retrieve")
+            .expect("tools/list should advertise hippo_retrieve");
+        assert_eq!(hippo_retrieve["inputSchema"]["required"][0], "query");
+        assert!(hippo_retrieve["inputSchema"]["properties"]["include_hubs"].is_object());
         let web_search_graph = tools
             .iter()
             .find(|tool| tool["name"] == "web_search_graph")

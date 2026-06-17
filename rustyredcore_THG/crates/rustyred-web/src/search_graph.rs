@@ -33,6 +33,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use rustyred_hipporag::{
+    retrieve as hippo_retrieve, retrieve_with_query_vector as hippo_retrieve_with_query_vector,
+    HippoQuery,
+};
 use rustyred_membrane::recover::{admit_to_budget, emit_receipt};
 use rustyred_membrane::{
     Candidate, Handle, MembraneReceipt, ScoreContext, Scorer, Source, SourceArm,
@@ -69,7 +73,11 @@ pub struct WebSearchGraphOptions {
     pub substrate: SearchOptions,
     /// Token budget the membrane gate fills. Overflow defers (recoverable).
     pub budget_tokens: usize,
+    /// MMR lambda for shared membrane fill. `1.0` is pure score-ordered greedy;
+    /// `0.7` is the v1 diversity-aware default from SPEC-SEARCH-RERANK-GATE-1.0.
+    pub mmr_lambda: f32,
     /// Cross-pool redundancy penalty handed to the [`ScoreContext`].
+    /// Backward-compatible alias for older callers; `mmr_lambda` is authoritative.
     pub redundancy_penalty: f32,
     /// How many top result URLs the fire-and-forget pass fetches + writes back
     /// as `state="fetched"` Page nodes (firing the extraction hook).
@@ -82,7 +90,8 @@ impl Default for WebSearchGraphOptions {
             acquisition: SearchOpts::default(),
             substrate: SearchOptions::default(),
             budget_tokens: 2_000,
-            redundancy_penalty: 0.15,
+            mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
+            redundancy_penalty: rustyred_membrane::scorer::DEFAULT_REDUNDANCY_PENALTY,
             fetch_top_k: 5,
         }
     }
@@ -191,11 +200,65 @@ pub fn gate_search_graph<S: GraphStore>(
     listwise: Option<&dyn ListwiseReranker>,
     reranker_version: impl Into<String>,
 ) -> RustyWebResult<WebSearchGraph> {
+    gate_search_graph_inner(
+        store,
+        acquisition,
+        options,
+        scorer,
+        listwise,
+        reranker_version,
+        None,
+    )
+}
+
+pub fn gate_search_graph_with_hippo_query_vector<S: GraphStore>(
+    store: &mut S,
+    acquisition: SearchAcquisition,
+    options: &WebSearchGraphOptions,
+    scorer: &dyn Scorer,
+    listwise: Option<&dyn ListwiseReranker>,
+    reranker_version: impl Into<String>,
+    hippo_query_vector: &[f32],
+) -> RustyWebResult<WebSearchGraph> {
+    gate_search_graph_inner(
+        store,
+        acquisition,
+        options,
+        scorer,
+        listwise,
+        reranker_version,
+        Some(hippo_query_vector),
+    )
+}
+
+fn gate_search_graph_inner<S: GraphStore>(
+    store: &mut S,
+    acquisition: SearchAcquisition,
+    options: &WebSearchGraphOptions,
+    scorer: &dyn Scorer,
+    listwise: Option<&dyn ListwiseReranker>,
+    reranker_version: impl Into<String>,
+    hippo_query_vector: Option<&[f32]>,
+) -> RustyWebResult<WebSearchGraph> {
     // (b) WARM pool: the substrate subgraph for the query, read over the store.
     let substrate = search_substrate(store, &acquisition.query, options.substrate.clone());
+    let hippo_query = HippoQuery {
+        text: &acquisition.query,
+        top_k: options.acquisition.limit,
+        include_hubs: true,
+    };
+    let hippo_candidates = match hippo_query_vector {
+        Some(query_vector) => hippo_retrieve_with_query_vector(store, hippo_query, query_vector).0,
+        None => hippo_retrieve(store, hippo_query),
+    };
 
     // (c) Build candidates for both pools, deduped across them.
-    let pools = unify_pools(&acquisition, &substrate, options.redundancy_penalty);
+    let pools = unify_pools(
+        &acquisition,
+        &substrate,
+        hippo_candidates,
+        options.redundancy_penalty,
+    );
     let UnifiedPools {
         candidates,
         fresh_urls,
@@ -205,8 +268,7 @@ pub fn gate_search_graph<S: GraphStore>(
     let candidates_scored = candidates.len();
 
     let active: Vec<String> = Vec::new();
-    let ctx = ScoreContext::new(&acquisition.query, &active)
-        .with_redundancy_penalty(options.redundancy_penalty);
+    let ctx = ScoreContext::new(&acquisition.query, &active).with_mmr_lambda(options.mmr_lambda);
 
     let base_reranker_version = reranker_version.into();
     let listwise_model_id = listwise.map(|reranker| reranker.model_id().to_string());
@@ -379,6 +441,7 @@ struct UnifiedPools {
 fn unify_pools(
     acquisition: &SearchAcquisition,
     substrate: &SubstrateSearch,
+    hippo_candidates: Vec<Candidate>,
     redundancy_penalty: f32,
 ) -> UnifiedPools {
     let mut by_url: BTreeMap<String, Candidate> = BTreeMap::new();
@@ -398,6 +461,23 @@ fn unify_pools(
         warm_urls.insert(url_key.clone());
         let candidate = warm_candidate(hit, max_match);
         by_url.insert(url_key, candidate);
+    }
+
+    for mut candidate in hippo_candidates {
+        let key = hippo_candidate_key(&candidate);
+        if by_url.contains_key(&key) {
+            continue;
+        }
+        candidate
+            .metadata
+            .entry("pool".to_string())
+            .or_insert_with(|| "hipporag".to_string());
+        if let Some(url) = candidate.metadata.get("url") {
+            warm_urls
+                .insert(crate::search::normalize_candidate_url(url).unwrap_or_else(|| url.clone()));
+        }
+        warm_ids.push(candidate.node_id.clone());
+        by_url.insert(key, candidate);
     }
 
     // FRESH next; skip a url the warm pool already covers.
@@ -423,6 +503,14 @@ fn unify_pools(
         warm_ids,
         warm_urls,
     }
+}
+
+fn hippo_candidate_key(candidate: &Candidate) -> String {
+    candidate
+        .metadata
+        .get("url")
+        .and_then(|url| crate::search::normalize_candidate_url(url))
+        .unwrap_or_else(|| candidate.node_id.clone())
 }
 
 /// A FRESH-pool candidate: provider snippet, no graph proximity, redundancy key
@@ -594,7 +682,8 @@ fn approximate_tokens(text: &str) -> usize {
 mod tests {
     use rustyred_membrane::context_fetch;
     use rustyred_rerank::{LexicalCrossEncoder, NoopListwiseReranker, RerankScorer};
-    use rustyred_thg_core::InMemoryGraphStore;
+    use rustyred_thg_core::{InMemoryGraphStore, NodeRecord};
+    use serde_json::json;
 
     use crate::search::{SearchProviderError, StaticSearchProvider};
     use crate::{build_fixture_crawl_graph, CrawlConfig, FixturePage, SearchCandidate};
@@ -882,6 +971,76 @@ mod tests {
             .unwrap_or(false));
         // The warm candidate carries real graph proximity (PPR-aware), not 0.
         assert!(warm_admitted.ppr_proximity > 0.0);
+    }
+
+    #[tokio::test]
+    async fn web_search_graph_unions_hipporag_hub_candidates() {
+        let mut store = InMemoryGraphStore::new();
+        for (id, text) in [
+            (
+                "page:overview",
+                "overall shape modernbert reranker retrieval systems",
+            ),
+            (
+                "page:specific",
+                "sequence classification reranker latency benchmark",
+            ),
+        ] {
+            store
+                .upsert_node(NodeRecord::new(
+                    id,
+                    [crate::LABEL_PAGE],
+                    json!({
+                        "url": format!("https://warm.example.com/{id}"),
+                        "title": id,
+                        "text": text,
+                    }),
+                ))
+                .unwrap();
+            rustyred_hipporag::index_passage(&mut store, id).unwrap();
+        }
+        rustyred_hipporag::build_summary_tree_for_region(
+            &mut store,
+            rustyred_hipporag::RaptorPolicy {
+                region_node_threshold: 2,
+                min_members: 2,
+                max_level: 1,
+            },
+            &[],
+        )
+        .unwrap();
+
+        let providers: Vec<Arc<dyn SearchProvider>> = vec![Arc::new(StaticSearchProvider::new(
+            "searxng",
+            vec![SearchCandidate {
+                url: "https://fresh.example.org/unrelated".to_string(),
+                title: Some("Unrelated".to_string()),
+                snippet: Some("other topic".to_string()),
+                source: "searxng".to_string(),
+                rank: 1,
+            }],
+        ))];
+        let scorer = web_scorer();
+        let result = web_search_graph(
+            &mut store,
+            &providers,
+            "overall shape modernbert retrieval",
+            &WebSearchGraphOptions {
+                budget_tokens: 4_000,
+                fetch_top_k: 0,
+                ..WebSearchGraphOptions::default()
+            },
+            &scorer,
+            None,
+            scorer.version(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.admitted_context.iter().any(|candidate| {
+            candidate.metadata.get("pool").map(String::as_str) == Some("hipporag")
+                && candidate.metadata.get("hippo_label").map(String::as_str) == Some("hub")
+        }));
     }
 
     #[test]

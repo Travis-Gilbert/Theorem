@@ -4,6 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use rustyred_hipporag::{HippoError, HippoResult, HippoTextEmbedder};
 use rustyred_thg_core::{GraphMutation, VectorDesignation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -258,6 +259,32 @@ impl TextEmbedder for QwenEmbeddingClient {
     }
 }
 
+impl HippoTextEmbedder for QwenEmbeddingClient {
+    fn model_id(&self) -> &str {
+        TextEmbedder::model_id(self)
+    }
+
+    fn dimension(&self) -> usize {
+        TextEmbedder::dimension(self)
+    }
+
+    fn property(&self) -> &str {
+        TextEmbedder::property(self)
+    }
+
+    fn metric(&self) -> &str {
+        TextEmbedder::metric(self)
+    }
+
+    fn embed<'a>(&'a self, inputs: &'a [String]) -> BoxFuture<'a, HippoResult<Vec<Vec<f32>>>> {
+        Box::pin(async move {
+            TextEmbedder::embed(self, inputs)
+                .await
+                .map_err(|error| HippoError::new("embedding", error.to_string()))
+        })
+    }
+}
+
 pub trait TextEmbedder: Send + Sync {
     fn model_id(&self) -> &str;
     fn dimension(&self) -> usize;
@@ -328,6 +355,32 @@ impl TextEmbedder for StaticTextEmbedder {
                 validate_embedding_dimension(vector, self.dimension)?;
             }
             Ok(embeddings)
+        })
+    }
+}
+
+impl HippoTextEmbedder for StaticTextEmbedder {
+    fn model_id(&self) -> &str {
+        TextEmbedder::model_id(self)
+    }
+
+    fn dimension(&self) -> usize {
+        TextEmbedder::dimension(self)
+    }
+
+    fn property(&self) -> &str {
+        TextEmbedder::property(self)
+    }
+
+    fn metric(&self) -> &str {
+        TextEmbedder::metric(self)
+    }
+
+    fn embed<'a>(&'a self, inputs: &'a [String]) -> BoxFuture<'a, HippoResult<Vec<Vec<f32>>>> {
+        Box::pin(async move {
+            TextEmbedder::embed(self, inputs)
+                .await
+                .map_err(|error| HippoError::new("embedding", error.to_string()))
         })
     }
 }

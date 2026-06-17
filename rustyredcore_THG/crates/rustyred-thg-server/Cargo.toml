@@ -27,6 +27,7 @@ rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
 rustyred-thg-mcp = { path = "../rustyred-thg-mcp", features = ["redis-store"] }
 rustyred-thg-fractal = { path = "../rustyred-thg-fractal" }
 rustyred-web = { path = "../rustyred-web" }
+rustyred-hipporag = { path = "../rustyred-hipporag" }
 rustyred-membrane = { path = "../rustyred-membrane", features = ["graph-store"] }
 rustyred-rerank = { path = "../rustyred-rerank" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

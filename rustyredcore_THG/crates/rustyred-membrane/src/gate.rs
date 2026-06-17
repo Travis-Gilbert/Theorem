@@ -71,9 +71,9 @@ pub fn fill_to_budget(
             if scored.candidate.token_count > remaining_budget {
                 continue;
             }
-            let redundancy = max_redundancy(&scored.candidate, &admitted);
-            let effective =
-                scored.base_score - ctx.redundancy_penalty.max(0.0) * redundancy.clamp(0.0, 1.0);
+            let redundancy = max_redundancy(&scored.candidate, &admitted).clamp(0.0, 1.0);
+            let lambda = ctx.mmr_lambda.clamp(0.0, 1.0);
+            let effective = lambda * scored.base_score - (1.0 - lambda) * redundancy;
             match best_index {
                 None => {
                     best_index = Some(index);
@@ -261,5 +261,25 @@ mod tests {
             vec!["first", "diverse"]
         );
         assert_eq!(admission.deferred[0].node_id, "dup");
+    }
+
+    #[test]
+    fn mmr_lambda_one_reproduces_score_ordered_greedy_fill() {
+        let first = candidate("first", 0.9, 5).with_redundancy_key("same");
+        let duplicate = candidate("dup", 0.89, 5).with_redundancy_key("same");
+        let diverse = candidate("diverse", 0.82, 5).with_redundancy_key("other");
+        let active = Vec::new();
+        let ctx = ScoreContext::new("query", &active).with_mmr_lambda(1.0);
+
+        let admission = fill_to_budget(vec![first, duplicate, diverse], &PprScorer, &ctx, 10);
+
+        assert_eq!(
+            admission
+                .admitted
+                .iter()
+                .map(|candidate| candidate.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "dup"]
+        );
     }
 }

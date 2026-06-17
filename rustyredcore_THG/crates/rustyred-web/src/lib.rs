@@ -121,7 +121,7 @@ pub mod embedding;
 pub use embedding::{
     configured_qwen3_embedding_4b_client_from_env, embed_crawl_graph_pages,
     qwen3_embedding_4b_contract, qwen3_embedding_4b_vector_designation, CrawlEmbeddingReceipt,
-    EmbeddingError, EmbeddingModelContract, QwenEmbeddingClient, QwenEmbeddingConfig,
+    EmbeddingError, EmbeddingModelContract, QwenEmbeddingClient, QwenEmbeddingConfig, TextEmbedder,
     QWEN3_EMBEDDING_4B_DIMENSION, QWEN3_EMBEDDING_4B_MODEL_ID, SEMANTIC_VECTOR_METRIC,
     SEMANTIC_VECTOR_PROPERTY,
 };
@@ -137,8 +137,8 @@ pub use search::{
 
 pub mod search_graph;
 pub use search_graph::{
-    gate_search_graph, warm_pages_task, web_search_graph, write_fetched_pages, WebSearchGraph,
-    WebSearchGraphOptions,
+    gate_search_graph, gate_search_graph_with_hippo_query_vector, warm_pages_task,
+    web_search_graph, write_fetched_pages, WebSearchGraph, WebSearchGraphOptions,
 };
 
 // The browser's SERP: render a search as a node-and-edge graph page. See serp.rs.

@@ -87,15 +87,24 @@ impl Candidate {
     }
 }
 
-pub const DEFAULT_REDUNDANCY_PENALTY: f32 = 0.15;
+/// MMR lambda for budget fill. `1.0` is pure score-ordered greedy fill; lower
+/// values put more pressure on redundancy. SPEC-SEARCH-RERANK-GATE-1.0 names
+/// `0.7` as the v1 default.
+pub const DEFAULT_MMR_LAMBDA: f32 = 0.7;
+pub const DEFAULT_REDUNDANCY_PENALTY: f32 = 1.0 - DEFAULT_MMR_LAMBDA;
 
 /// Query-local scoring context.
 #[derive(Clone, Copy, Debug)]
 pub struct ScoreContext<'a> {
     pub query: &'a str,
     pub active_node_ids: &'a [String],
+    /// MMR score mass retained for candidate value.
+    pub mmr_lambda: f32,
     /// Maximum score mass removed when a candidate duplicates already admitted
     /// context. Set to 0.0 for strict score-only fill.
+    ///
+    /// Kept for callers that still express the old contract as a penalty. It is
+    /// always synchronized with `mmr_lambda` as `1.0 - mmr_lambda`.
     pub redundancy_penalty: f32,
 }
 
@@ -104,17 +113,26 @@ impl<'a> ScoreContext<'a> {
         Self {
             query,
             active_node_ids,
+            mmr_lambda: DEFAULT_MMR_LAMBDA,
             redundancy_penalty: DEFAULT_REDUNDANCY_PENALTY,
         }
     }
 
     pub fn without_redundancy(mut self) -> Self {
+        self.mmr_lambda = 1.0;
         self.redundancy_penalty = 0.0;
         self
     }
 
+    pub fn with_mmr_lambda(mut self, mmr_lambda: f32) -> Self {
+        self.mmr_lambda = mmr_lambda.clamp(0.0, 1.0);
+        self.redundancy_penalty = 1.0 - self.mmr_lambda;
+        self
+    }
+
     pub fn with_redundancy_penalty(mut self, redundancy_penalty: f32) -> Self {
-        self.redundancy_penalty = redundancy_penalty.max(0.0);
+        self.redundancy_penalty = redundancy_penalty.clamp(0.0, 1.0);
+        self.mmr_lambda = 1.0 - self.redundancy_penalty;
         self
     }
 }

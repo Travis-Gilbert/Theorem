@@ -7,11 +7,16 @@ license = "MIT"
 rust-version = "1.85"
 
 [dependencies]
+blake3 = "1.8.5"
+rustyred-hipporag = { path = "../rustyred-hipporag" }
+rustyred-membrane = { path = "../rustyred-membrane", features = ["graph-store"] }
+rustyred-rerank = { path = "../rustyred-rerank" }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 rustyred-web = { path = "../rustyred-web" }
 futures-util = "0.3.31"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+url = "2.5.8"
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

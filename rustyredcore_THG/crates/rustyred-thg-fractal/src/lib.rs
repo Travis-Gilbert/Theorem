@@ -4,9 +4,14 @@
 //! public runner in this crate always builds a web crawl request and ingests
 //! admitted web graph state as a lower-trust, quarantined tier.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use rustyred_membrane::recover::{admit_to_budget, emit_receipt};
+use rustyred_membrane::{
+    Candidate, Handle, MembraneReceipt, ScoreContext, Scorer, Source, SourceArm,
+};
+use rustyred_rerank::{LexicalCrossEncoder, RerankScorer, GTE_RERANKER_MODERNBERT_BASE};
 use rustyred_thg_core::{GraphMutation, GraphStore, NodeQuery, ThgError, ThgResult};
 use rustyred_web::{
     build_v2_fixture_crawl, configured_qwen3_embedding_4b_client_from_env, embed_crawl_graph_pages,
@@ -26,6 +31,7 @@ pub const FRACTAL_EXCERPT_MAX_PASSAGES: usize = 3;
 /// provider snippet budget so the excerpt is a drop-in upgrade over the snippet,
 /// not a heavier payload.
 pub const FRACTAL_EXCERPT_MAX_CHARS: usize = 600;
+pub const DEFAULT_FRACTAL_BUDGET_TOKENS: usize = 2_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FractalExpansionRequest {
@@ -36,6 +42,10 @@ pub struct FractalExpansionRequest {
     pub top_k: usize,
     pub frontier_limit: usize,
     pub web_seed_limit: usize,
+    #[serde(default = "default_fractal_budget_tokens")]
+    pub budget_tokens: usize,
+    #[serde(default = "default_fractal_mmr_lambda")]
+    pub mmr_lambda: f32,
     pub embedder_model: Option<String>,
     pub actor_id: Option<String>,
 }
@@ -54,6 +64,8 @@ impl FractalExpansionRequest {
         self.top_k = self.top_k.max(1);
         self.frontier_limit = self.frontier_limit.max(1);
         self.web_seed_limit = self.web_seed_limit.max(1);
+        self.budget_tokens = self.budget_tokens.max(1);
+        self.mmr_lambda = self.mmr_lambda.clamp(0.0, 1.0);
         self.embedder_model = self
             .embedder_model
             .map(|model| model.trim().to_string())
@@ -65,6 +77,14 @@ impl FractalExpansionRequest {
             .filter(|actor| !actor.is_empty());
         self
     }
+}
+
+const fn default_fractal_budget_tokens() -> usize {
+    DEFAULT_FRACTAL_BUDGET_TOKENS
+}
+
+const fn default_fractal_mmr_lambda() -> f32 {
+    rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -105,6 +125,18 @@ pub struct FractalExpansionReceipt {
     /// matched -- the consumer falls back to the provider snippet.
     #[serde(default)]
     pub admitted_page_excerpts: Vec<FractalPageExcerpt>,
+    #[serde(default)]
+    pub admitted_context: Vec<Candidate>,
+    #[serde(default)]
+    pub deferred_handles: Vec<Handle>,
+    #[serde(default)]
+    pub tokens_admitted: usize,
+    #[serde(default)]
+    pub tokens_deferred: usize,
+    #[serde(default)]
+    pub reranker_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membrane_receipt: Option<MembraneReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -141,10 +173,27 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
     request: FractalExpansionRequest,
     fetched_pages: &[FetchedPage],
 ) -> ThgResult<FractalExpansionReceipt> {
+    let scorer = default_fractal_scorer();
+    run_fixture_fractal_expansion_with_scorer(
+        store,
+        request,
+        fetched_pages,
+        &scorer,
+        scorer.version(),
+    )
+}
+
+pub fn run_fixture_fractal_expansion_with_scorer<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    fetched_pages: &[FetchedPage],
+    scorer: &dyn Scorer,
+    reranker_version: impl Into<String>,
+) -> ThgResult<FractalExpansionReceipt> {
     let request = request.normalized();
     validate_request(&request)?;
 
-    let frontier = graph_frontier(store, &request);
+    let frontier = rerank_frontier(graph_frontier(store, &request), &request.query, scorer);
     let web_seed_urls = web_seeds_from_frontier(&request, &frontier);
     if web_seed_urls.is_empty() {
         return Err(ThgError::new(
@@ -153,8 +202,19 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
         ));
     }
 
-    let (mut output, admitted_page_excerpts) =
-        build_admitted_pages_output(&request, &web_seed_urls, fetched_pages)?;
+    let PageAdmissionResult {
+        admitted_pages,
+        admitted_page_excerpts,
+        admission,
+        membrane_receipt,
+    } = admit_pages_to_budget(
+        store,
+        &request,
+        fetched_pages,
+        scorer,
+        reranker_version.into(),
+    )?;
+    let mut output = build_admitted_pages_output(&request, &web_seed_urls, &admitted_pages)?;
     let web_reached = !fetched_pages.is_empty();
     apply_admitted_pages(
         store,
@@ -166,6 +226,8 @@ pub fn run_fixture_fractal_expansion<S: GraphStore>(
         web_reached,
         Vec::new(),
         admitted_page_excerpts,
+        admission,
+        Some(membrane_receipt),
     )
 }
 
@@ -175,10 +237,30 @@ pub async fn run_fractal_expansion<S: GraphStore>(
     cascade: &FetchCascade,
     max_bytes: usize,
 ) -> ThgResult<FractalExpansionReceipt> {
+    let scorer = default_fractal_scorer();
+    run_fractal_expansion_with_scorer(
+        store,
+        request,
+        cascade,
+        max_bytes,
+        &scorer,
+        scorer.version(),
+    )
+    .await
+}
+
+pub async fn run_fractal_expansion_with_scorer<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    cascade: &FetchCascade,
+    max_bytes: usize,
+    scorer: &dyn Scorer,
+    reranker_version: impl Into<String>,
+) -> ThgResult<FractalExpansionReceipt> {
     let request = request.normalized();
     validate_request(&request)?;
 
-    let frontier = graph_frontier(store, &request);
+    let frontier = rerank_frontier(graph_frontier(store, &request), &request.query, scorer);
     let web_seed_urls = web_seeds_from_frontier(&request, &frontier);
     if web_seed_urls.is_empty() {
         return Err(ThgError::new(
@@ -223,8 +305,13 @@ pub async fn run_fractal_expansion<S: GraphStore>(
     }
     let web_reached = !fetched.is_empty();
 
-    let (mut output, admitted_page_excerpts) =
-        build_admitted_pages_output(&request, &web_seed_urls, &fetched)?;
+    let PageAdmissionResult {
+        admitted_pages,
+        admitted_page_excerpts,
+        admission,
+        membrane_receipt,
+    } = admit_pages_to_budget(store, &request, &fetched, scorer, reranker_version.into())?;
+    let mut output = build_admitted_pages_output(&request, &web_seed_urls, &admitted_pages)?;
     let embedding_receipt = maybe_embed_live_crawl_output(&mut output).await?;
     apply_admitted_pages(
         store,
@@ -236,6 +323,8 @@ pub async fn run_fractal_expansion<S: GraphStore>(
         web_reached,
         web_seed_failures,
         admitted_page_excerpts,
+        admission,
+        Some(membrane_receipt),
     )
 }
 
@@ -247,9 +336,42 @@ pub async fn run_fractal_expansion_with_search_providers<S: GraphStore>(
     providers: &[Arc<dyn SearchProvider>],
     search_opts: SearchOpts,
 ) -> ThgResult<FractalExpansionReceipt> {
+    let scorer = default_fractal_scorer();
+    run_fractal_expansion_with_search_providers_and_scorer(
+        store,
+        request,
+        cascade,
+        max_bytes,
+        providers,
+        search_opts,
+        &scorer,
+        scorer.version(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_fractal_expansion_with_search_providers_and_scorer<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    cascade: &FetchCascade,
+    max_bytes: usize,
+    providers: &[Arc<dyn SearchProvider>],
+    search_opts: SearchOpts,
+    scorer: &dyn Scorer,
+    reranker_version: impl Into<String>,
+) -> ThgResult<FractalExpansionReceipt> {
     let (request, acquisition) =
-        request_with_provider_seeds(request.normalized(), providers, search_opts).await;
-    let mut receipt = run_fractal_expansion(store, request, cascade, max_bytes).await?;
+        request_with_provider_seeds(request.normalized(), providers, search_opts, scorer).await;
+    let mut receipt = run_fractal_expansion_with_scorer(
+        store,
+        request,
+        cascade,
+        max_bytes,
+        scorer,
+        reranker_version,
+    )
+    .await?;
     attach_acquisition(&mut receipt, acquisition);
     Ok(receipt)
 }
@@ -261,9 +383,37 @@ pub async fn run_fixture_fractal_expansion_with_search_providers<S: GraphStore>(
     providers: &[Arc<dyn SearchProvider>],
     search_opts: SearchOpts,
 ) -> ThgResult<FractalExpansionReceipt> {
+    let scorer = default_fractal_scorer();
+    run_fixture_fractal_expansion_with_search_providers_and_scorer(
+        store,
+        request,
+        fetched_pages,
+        providers,
+        search_opts,
+        &scorer,
+        scorer.version(),
+    )
+    .await
+}
+
+pub async fn run_fixture_fractal_expansion_with_search_providers_and_scorer<S: GraphStore>(
+    store: &mut S,
+    request: FractalExpansionRequest,
+    fetched_pages: &[FetchedPage],
+    providers: &[Arc<dyn SearchProvider>],
+    search_opts: SearchOpts,
+    scorer: &dyn Scorer,
+    reranker_version: impl Into<String>,
+) -> ThgResult<FractalExpansionReceipt> {
     let (request, acquisition) =
-        request_with_provider_seeds(request.normalized(), providers, search_opts).await;
-    let mut receipt = run_fixture_fractal_expansion(store, request, fetched_pages)?;
+        request_with_provider_seeds(request.normalized(), providers, search_opts, scorer).await;
+    let mut receipt = run_fixture_fractal_expansion_with_scorer(
+        store,
+        request,
+        fetched_pages,
+        scorer,
+        reranker_version,
+    )?;
     attach_acquisition(&mut receipt, acquisition);
     Ok(receipt)
 }
@@ -285,12 +435,58 @@ async fn request_with_provider_seeds(
     mut request: FractalExpansionRequest,
     providers: &[Arc<dyn SearchProvider>],
     search_opts: SearchOpts,
+    scorer: &dyn Scorer,
 ) -> (FractalExpansionRequest, SearchAcquisition) {
     let mut opts = search_opts.normalized();
     opts.limit = opts.limit.max(request.web_seed_limit.max(1));
-    let acquisition = fanout_search_providers(providers, &request.query, opts).await;
+    let mut acquisition = fanout_search_providers(providers, &request.query, opts).await;
+    rerank_provider_candidates(&mut acquisition, scorer);
     merge_provider_seeds(&mut request, &acquisition);
     (request, acquisition)
+}
+
+fn default_fractal_scorer() -> RerankScorer {
+    RerankScorer::web(Box::new(LexicalCrossEncoder::new(
+        GTE_RERANKER_MODERNBERT_BASE,
+    )))
+}
+
+fn rerank_provider_candidates(acquisition: &mut SearchAcquisition, scorer: &dyn Scorer) {
+    let active = Vec::new();
+    let ctx = ScoreContext::new(&acquisition.query, &active).without_redundancy();
+    acquisition.candidates.sort_by(|left, right| {
+        let left_score = scorer.score(&provider_candidate_for_rerank(left), &ctx);
+        let right_score = scorer.score(&provider_candidate_for_rerank(right), &ctx);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.normalized_url.cmp(&right.normalized_url))
+    });
+}
+
+fn provider_candidate_for_rerank(candidate: &rustyred_web::RankedSearchCandidate) -> Candidate {
+    let title = candidate.candidate.title.clone().unwrap_or_default();
+    let snippet = candidate.candidate.snippet.clone().unwrap_or_default();
+    let text = join_nonempty(&[&title, &snippet, &candidate.candidate.url]);
+    let mut out = Candidate::new(
+        format!(
+            "fractal:provider:{}",
+            stable_digest(&candidate.normalized_url)
+        ),
+        text,
+        1,
+    )
+    .with_source_arm(SourceArm::Web);
+    out.ppr_proximity = candidate.score as f32;
+    out.metadata
+        .insert("url".to_string(), candidate.candidate.url.clone());
+    out
 }
 
 fn merge_provider_seeds(request: &mut FractalExpansionRequest, acquisition: &SearchAcquisition) {
@@ -378,17 +574,55 @@ fn graph_frontier<S: GraphStore>(
         .collect()
 }
 
+fn rerank_frontier(
+    mut frontier: Vec<FractalFrontierHit>,
+    query: &str,
+    scorer: &dyn Scorer,
+) -> Vec<FractalFrontierHit> {
+    let active = Vec::new();
+    let ctx = ScoreContext::new(query, &active).without_redundancy();
+    frontier.sort_by(|left, right| {
+        let left_score = scorer.score(&frontier_candidate(left), &ctx);
+        let right_score = scorer.score(&frontier_candidate(right), &ctx);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    frontier
+}
+
+fn frontier_candidate(hit: &FractalFrontierHit) -> Candidate {
+    let text = join_nonempty(&[&hit.title, &hit.url]);
+    let mut candidate =
+        Candidate::new(hit.node_id.clone(), text, 1).with_source_arm(SourceArm::Web);
+    candidate.ppr_proximity = hit.score.clamp(0.0, 1.0) as f32;
+    candidate
+        .metadata
+        .insert("pool".to_string(), "fractal_frontier".to_string());
+    candidate
+}
+
 fn web_seeds_from_frontier(
     request: &FractalExpansionRequest,
     frontier: &[FractalFrontierHit],
 ) -> Vec<String> {
-    let mut seeds = BTreeSet::new();
+    let mut seeds = Vec::new();
+    let mut seen = BTreeSet::new();
     for seed in &request.web_seed_urls {
-        seeds.insert(seed.clone());
+        if seen.insert(seed.clone()) {
+            seeds.push(seed.clone());
+        }
     }
     for hit in frontier {
-        if !hit.url.trim().is_empty() {
-            seeds.insert(hit.url.clone());
+        if !hit.url.trim().is_empty() && seen.insert(hit.url.clone()) {
+            seeds.push(hit.url.clone());
         }
     }
     seeds.into_iter().take(request.web_seed_limit).collect()
@@ -421,44 +655,78 @@ fn rank_and_sanitize_pages(query: &str, pages: &[FetchedPage], top_k: usize) -> 
         .collect()
 }
 
+struct PageAdmissionResult {
+    admitted_pages: Vec<FetchedPage>,
+    admitted_page_excerpts: Vec<FractalPageExcerpt>,
+    admission: rustyred_membrane::Admission,
+    membrane_receipt: MembraneReceipt,
+}
+
+fn admit_pages_to_budget<S: GraphStore>(
+    store: &mut S,
+    request: &FractalExpansionRequest,
+    fetched_pages: &[FetchedPage],
+    scorer: &dyn Scorer,
+    reranker_version: String,
+) -> ThgResult<PageAdmissionResult> {
+    let mut candidates = rustyred_hipporag::retrieve(
+        store,
+        rustyred_hipporag::HippoQuery {
+            text: &request.query,
+            top_k: request.web_seed_limit.max(request.top_k),
+            include_hubs: true,
+        },
+    );
+    candidates.extend(
+        fetched_pages
+            .iter()
+            .map(|page| fractal_page_candidate(&request.query, page))
+            .collect::<Vec<_>>(),
+    );
+    let candidates_scored = candidates.len();
+    let active = Vec::new();
+    let ctx = ScoreContext::new(&request.query, &active).with_mmr_lambda(request.mmr_lambda);
+    let admission = admit_to_budget(store, candidates, scorer, &ctx, request.budget_tokens)
+        .map_err(graph_error_to_thg)?;
+
+    let admitted_urls = admission
+        .admitted
+        .iter()
+        .filter_map(|candidate| candidate.metadata.get("url").cloned())
+        .collect::<BTreeSet<_>>();
+    let admitted_pages =
+        rank_and_sanitize_pages(&request.query, fetched_pages, fetched_pages.len())
+            .into_iter()
+            .filter(|page| admitted_urls.contains(&page.url))
+            .collect::<Vec<_>>();
+    let admitted_page_excerpts = admitted_pages
+        .iter()
+        .map(|page| page_excerpt(&request.query, page, fetched_pages))
+        .collect::<Vec<_>>();
+
+    let membrane_receipt = MembraneReceipt {
+        source: Source::Web,
+        candidates_scored,
+        tokens_admitted: admission.tokens_admitted,
+        tokens_deferred: admission.tokens_deferred,
+        reranker_version,
+        task_token_delta_vs_baseline: Some(admission.tokens_deferred as i64),
+    };
+    emit_receipt(store, &membrane_receipt).map_err(graph_error_to_thg)?;
+
+    Ok(PageAdmissionResult {
+        admitted_pages,
+        admitted_page_excerpts,
+        admission,
+        membrane_receipt,
+    })
+}
+
 fn build_admitted_pages_output(
     request: &FractalExpansionRequest,
     web_seed_urls: &[String],
-    fetched_pages: &[FetchedPage],
-) -> ThgResult<(CrawlRunOutput, Vec<FractalPageExcerpt>)> {
-    let admitted_pages = rank_and_sanitize_pages(&request.query, fetched_pages, request.top_k);
-
-    // Query-ranked excerpt per admitted page, computed from the RAW body:
-    // relevance runs its own readability, and the sanitized body only escapes
-    // <script> (leaving its text to leak). Match admitted pages back to their raw
-    // bodies by URL.
-    let raw_body_by_url: BTreeMap<&str, &str> = fetched_pages
-        .iter()
-        .map(|page| (page.url.as_str(), page.body.as_str()))
-        .collect();
-    let admitted_page_excerpts = admitted_pages
-        .iter()
-        .map(|page| {
-            let raw = raw_body_by_url
-                .get(page.url.as_str())
-                .copied()
-                .unwrap_or(page.body.as_str());
-            let passages = relevant_excerpt_lexical(
-                &request.query,
-                raw,
-                FRACTAL_EXCERPT_MAX_PASSAGES,
-                FRACTAL_EXCERPT_MAX_CHARS,
-            )
-            .into_iter()
-            .map(|passage| passage.text)
-            .collect::<Vec<_>>();
-            FractalPageExcerpt {
-                url: page.url.clone(),
-                passages,
-            }
-        })
-        .collect::<Vec<_>>();
-
+    admitted_pages: &[FetchedPage],
+) -> ThgResult<CrawlRunOutput> {
     let mut crawl_request = CrawlRequest::new(request.run_id.clone(), web_seed_urls.to_vec());
     crawl_request.scope.namespace = format!("fractal:{}", request.tenant_id);
     crawl_request.scope.source_graph = "rustyred_fractal_expansion".to_string();
@@ -468,7 +736,7 @@ fn build_admitted_pages_output(
     let mut output = build_v2_fixture_crawl(crawl_request, &admitted_pages)
         .map_err(|error| ThgError::new("fractal_web_crawl_failed", error.to_string()))?;
     annotate_open_web_batch(&mut output.graph.batch.mutations, request);
-    Ok((output, admitted_page_excerpts))
+    Ok(output)
 }
 
 async fn maybe_embed_live_crawl_output(
@@ -498,6 +766,8 @@ fn apply_admitted_pages<S: GraphStore>(
     web_reached: bool,
     web_seed_failures: Vec<String>,
     admitted_page_excerpts: Vec<FractalPageExcerpt>,
+    admission: rustyred_membrane::Admission,
+    membrane_receipt: Option<MembraneReceipt>,
 ) -> ThgResult<FractalExpansionReceipt> {
     let writes = output
         .graph
@@ -528,6 +798,15 @@ fn apply_admitted_pages<S: GraphStore>(
         provider_receipts: Vec::new(),
         web_seed_failures,
         admitted_page_excerpts,
+        admitted_context: admission.admitted,
+        deferred_handles: admission.deferred,
+        tokens_admitted: admission.tokens_admitted,
+        tokens_deferred: admission.tokens_deferred,
+        reranker_version: membrane_receipt
+            .as_ref()
+            .map(|receipt| receipt.reranker_version.clone())
+            .unwrap_or_default(),
+        membrane_receipt,
     })
 }
 
@@ -544,9 +823,105 @@ fn fetched_page_from_tier_result(seed_url: &str, result: FetchTierResult) -> Fet
     )
 }
 
+fn fractal_page_candidate(query: &str, page: &FetchedPage) -> Candidate {
+    let text = fractal_candidate_text(query, page);
+    let mut candidate = Candidate::new(
+        format!("fractal:page:{}", stable_digest(&page.url)),
+        text.clone(),
+        approximate_tokens(&text),
+    )
+    .with_source_arm(SourceArm::Web);
+    candidate.ppr_proximity = if page.status == 200 { 1.0 } else { 0.25 };
+    candidate.epistemic.source_reliability = Some(if page.status == 200 { 0.6 } else { 0.2 });
+    candidate.epistemic.support_ratio = Some(1.0);
+    candidate
+        .metadata
+        .insert("url".to_string(), page.url.clone());
+    candidate
+        .metadata
+        .insert("pool".to_string(), "fractal_fetched".to_string());
+    if let Some(host) = host_key(&page.url) {
+        candidate = candidate.with_redundancy_key(host);
+    }
+    candidate
+}
+
+fn fractal_candidate_text(query: &str, page: &FetchedPage) -> String {
+    let passages = relevant_excerpt_lexical(
+        query,
+        &page.body,
+        FRACTAL_EXCERPT_MAX_PASSAGES,
+        FRACTAL_EXCERPT_MAX_CHARS,
+    )
+    .into_iter()
+    .map(|passage| passage.text)
+    .collect::<Vec<_>>();
+    let body = if passages.is_empty() {
+        sanitize_web_body(&page.body)
+            .chars()
+            .take(FRACTAL_EXCERPT_MAX_CHARS)
+            .collect::<String>()
+    } else {
+        passages.join("\n")
+    };
+    join_nonempty(&[&page.url, &body])
+}
+
+fn page_excerpt(
+    query: &str,
+    admitted_page: &FetchedPage,
+    raw_pages: &[FetchedPage],
+) -> FractalPageExcerpt {
+    let raw = raw_pages
+        .iter()
+        .find(|page| page.url == admitted_page.url)
+        .map(|page| page.body.as_str())
+        .unwrap_or(admitted_page.body.as_str());
+    let passages = relevant_excerpt_lexical(
+        query,
+        raw,
+        FRACTAL_EXCERPT_MAX_PASSAGES,
+        FRACTAL_EXCERPT_MAX_CHARS,
+    )
+    .into_iter()
+    .map(|passage| passage.text)
+    .collect::<Vec<_>>();
+    FractalPageExcerpt {
+        url: admitted_page.url.clone(),
+        passages,
+    }
+}
+
 fn sanitize_web_body(body: &str) -> String {
     body.replace("<script", "&lt;script")
         .replace("</script>", "&lt;/script&gt;")
+}
+
+fn approximate_tokens(text: &str) -> usize {
+    (text.chars().count() / 4).max(1)
+}
+
+fn join_nonempty(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn stable_digest(input: &str) -> String {
+    blake3::hash(input.as_bytes()).to_hex().to_string()
+}
+
+fn host_key(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+}
+
+fn graph_error_to_thg(error: rustyred_thg_core::GraphStoreError) -> ThgError {
+    ThgError::new(error.code, error.message)
 }
 
 fn annotate_open_web_batch(mutations: &mut [GraphMutation], request: &FractalExpansionRequest) {
@@ -633,6 +1008,8 @@ mod tests {
             top_k: 2,
             frontier_limit: 4,
             web_seed_limit: 4,
+            budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+            mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
             embedder_model: None,
             actor_id: None,
         }
@@ -650,6 +1027,8 @@ mod tests {
                 top_k: 2,
                 frontier_limit: 4,
                 web_seed_limit: 4,
+                budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+                mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
                 embedder_model: None,
                 actor_id: Some("test".to_string()),
             },
@@ -696,6 +1075,8 @@ mod tests {
             top_k: 2,
             frontier_limit: 4,
             web_seed_limit: 4,
+            budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+            mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
             embedder_model: None,
             actor_id: None,
         }
@@ -713,6 +1094,8 @@ mod tests {
                 top_k: 2,
                 frontier_limit: 4,
                 web_seed_limit: 4,
+                budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+                mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
                 embedder_model: None,
                 actor_id: Some("test".to_string()),
             },
@@ -772,6 +1155,8 @@ mod tests {
             top_k: 2,
             frontier_limit: 4,
             web_seed_limit: 4,
+            budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+            mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
             embedder_model: None,
             actor_id: None,
         }
@@ -789,6 +1174,8 @@ mod tests {
                 top_k: 2,
                 frontier_limit: 4,
                 web_seed_limit: 4,
+                budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+                mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
                 embedder_model: None,
                 actor_id: Some("test".to_string()),
             },
@@ -823,6 +1210,8 @@ mod tests {
                 top_k: 2,
                 frontier_limit: 4,
                 web_seed_limit: 4,
+                budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+                mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
                 embedder_model: None,
                 actor_id: None,
             },
@@ -855,6 +1244,8 @@ mod tests {
             top_k: 2,
             frontier_limit: 4,
             web_seed_limit: 4,
+            budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+            mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
             embedder_model: None,
             actor_id: None,
         }
@@ -872,6 +1263,8 @@ mod tests {
                 top_k: 2,
                 frontier_limit: 4,
                 web_seed_limit: 4,
+                budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+                mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
                 embedder_model: None,
                 actor_id: None,
             },
@@ -906,6 +1299,8 @@ mod tests {
                 top_k: 2,
                 frontier_limit: 4,
                 web_seed_limit: 4,
+                budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+                mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
                 embedder_model: None,
                 actor_id: Some("test".to_string()),
             },
@@ -931,5 +1326,117 @@ mod tests {
 
         let open_web_pages = open_web_pages_for_tenant(&store, "theorem");
         assert!(open_web_pages.contains(&"https://example.com/provider-grounding".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_frontier_uses_reranker_before_seed_merge() {
+        let mut store = InMemoryGraphStore::new();
+        let providers: Vec<Arc<dyn SearchProvider>> = vec![Arc::new(StaticSearchProvider::new(
+            "brave",
+            vec![
+                SearchCandidate {
+                    url: "https://example.com/generic".to_string(),
+                    title: Some("Generic result".to_string()),
+                    snippet: Some("popular but off topic".to_string()),
+                    source: "brave".to_string(),
+                    rank: 1,
+                },
+                SearchCandidate {
+                    url: "https://example.com/modernbert".to_string(),
+                    title: Some("ModernBERT reranker".to_string()),
+                    snippet: Some("fast sequence classification reranker".to_string()),
+                    source: "brave".to_string(),
+                    rank: 2,
+                },
+            ],
+        ))];
+
+        let receipt = run_fixture_fractal_expansion_with_search_providers(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "provider-rerank-fractal".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "modernbert reranker".to_string(),
+                web_seed_urls: Vec::new(),
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 1,
+                budget_tokens: DEFAULT_FRACTAL_BUDGET_TOKENS,
+                mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
+                embedder_model: None,
+                actor_id: Some("test".to_string()),
+            },
+            &[FetchedPage::html(
+                "https://example.com/modernbert",
+                "<html><body>ModernBERT reranker guide</body></html>",
+            )],
+            &providers,
+            SearchOpts {
+                provider_limit: 2,
+                limit: 2,
+                rrf_k: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            receipt.web_seed_urls,
+            vec!["https://example.com/modernbert".to_string()]
+        );
+        assert_eq!(
+            receipt.provider_candidates[0].url,
+            "https://example.com/modernbert"
+        );
+    }
+
+    #[test]
+    fn fixture_fractal_expansion_gates_and_recovers_deferred_context() {
+        let mut store = InMemoryGraphStore::new();
+        let receipt = run_fixture_fractal_expansion(
+            &mut store,
+            FractalExpansionRequest {
+                run_id: "fractal-gate".to_string(),
+                tenant_id: "theorem".to_string(),
+                query: "modernbert reranker".to_string(),
+                web_seed_urls: vec![
+                    "https://example.com/modernbert".to_string(),
+                    "https://example.com/qwen".to_string(),
+                ],
+                top_k: 2,
+                frontier_limit: 4,
+                web_seed_limit: 4,
+                budget_tokens: 16,
+                mmr_lambda: 0.7,
+                embedder_model: None,
+                actor_id: Some("test".to_string()),
+            },
+            &[
+                FetchedPage::html(
+                    "https://example.com/modernbert",
+                    "<html><body>ModernBERT reranker uses sequence classification for fast retrieval ranking.</body></html>",
+                ),
+                FetchedPage::html(
+                    "https://example.com/qwen",
+                    "<html><body>Qwen causal language model reranker is slower on the hot path.</body></html>",
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            receipt.membrane_receipt.as_ref().unwrap().source,
+            Source::Web
+        );
+        assert_eq!(
+            receipt.membrane_receipt.as_ref().unwrap().candidates_scored,
+            2
+        );
+        assert!(receipt.tokens_admitted <= 16);
+        assert!(!receipt.deferred_handles.is_empty());
+        let recovered =
+            rustyred_membrane::context_fetch(&store, &receipt.deferred_handles[0]).unwrap();
+        assert!(!recovered.is_empty());
+        assert!(receipt.reranker_version.contains("membrane-v1"));
     }
 }

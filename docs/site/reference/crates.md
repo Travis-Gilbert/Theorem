@@ -8,6 +8,7 @@ Every crate in the `rustyredcore_THG` Cargo workspace. One line each, taken from
 | `pilot-core` | Servo-free, Playwright-class browser automation core: locator, actionability + auto-wait, geometry snapshot, coordinate synthesis, and web-first assertions behind a BrowserDriver trait. |
 | `prose-check` | Deterministic writing-engineering style checker for Theorem harness receipts. |
 | `reconstruction-engine` | Procedural reconstruction engine, ported whole into Theorem for the substrate-native browser. |
+| `rustyred-hipporag` | HippoRAG 2 candidate generation with RAPTOR-style graph hubs for RustyRed THG. |
 | `rustyred-membrane` | Shared context admission and eviction membrane for RustyRed graph-backed context. |
 | `rustyred-rerank` | Reranker scorer implementations for RustyRed membrane admission. |
 | `rustyred-thg-adapters` | LoRA adapter catalog and routing over RustyRedCore-THG graph records. |
