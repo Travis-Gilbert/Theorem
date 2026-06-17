@@ -20,6 +20,7 @@ serde_json = "1.0"
 rustyred-thg-core = { path = "../rustyred-thg-core", features = ["redis-store"] }
 theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }
+theorem-dispatch = { path = "../theorem-dispatch" }
 theorem-browser-agent = { path = "../theorem-browser-agent" }
 rustyred-thg-adapters = { path = "../rustyred-thg-adapters", features = ["pairformer-burn-cubecl"] }
 rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }

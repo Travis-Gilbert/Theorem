@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
-use theorem_harness_core::Job;
+use theorem_harness_core::{Job, JobSubmission};
 
 use crate::wake::WakeMessage;
 use crate::{ReceiverError, ReceiverResult};
@@ -101,6 +101,20 @@ impl HarnessClient {
         parse_list(&payload)
     }
 
+    /// Create or upsert a board thread. Dispatch-backed receivers use this as a
+    /// best-effort backfill when a row was inserted directly into Postgres.
+    pub fn job_submit(
+        &self,
+        submission: JobSubmission,
+        submitted_by: &str,
+    ) -> ReceiverResult<Value> {
+        let mut arguments = serde_json::to_value(submission)?;
+        if let Value::Object(map) = &mut arguments {
+            map.insert("submitted_by".to_string(), json!(submitted_by));
+        }
+        self.call_tool("job_submit", arguments)
+    }
+
     /// Append a receipt. Receiver start and retry-clear writes use this verb too.
     pub fn job_note(
         &self,
@@ -120,6 +134,18 @@ impl HarnessClient {
                 "refs": refs,
                 "start_session_ref": start_session_ref,
                 "clear_started": clear_started,
+            }),
+        )
+    }
+
+    /// Archive a completed board thread.
+    pub fn job_archive(&self, job_id: &str, reason: &str, actor: &str) -> ReceiverResult<Value> {
+        self.call_tool(
+            "job_archive",
+            json!({
+                "job_id": job_id,
+                "reason": reason,
+                "actor": actor,
             }),
         )
     }

@@ -13,6 +13,8 @@
 //!   POST /harness/rooms/{room_id}/messages -> write a message + emit push (tap/hold)
 //!   GET  /harness/rooms/{room_id}/stream    -> SSE of this room's messages (live)
 //!   GET /harness/actors/{actor}/mentions  -> { "mentions": [...] }
+//!   POST /harness/jobs             -> create THG job, mirror to Postgres, emit wake
+//!   GET /harness/jobs/counts       -> inspect Postgres dispatch state counts
 //!   GET /connectors              -> { "connectors": [...], "affordances": [...] }
 //!   POST /connectors/register    -> connect an MCP server, register its tools as affordances
 //!   GET /healthz                 -> "ok"
@@ -38,15 +40,21 @@ use rustyred_thg_connectors::{
 };
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use theorem_dispatch::{priority_from_harness, DispatchError, DispatchQueue, Job as DispatchJob};
+use theorem_harness_core::{JobSubmission, Priority, TargetHead};
+use theorem_harness_runtime::{job_submit, CoordinationError, HarnessRuntimeError};
+use theorem_harness_server::push::write_room_message;
 use theorem_harness_server::{
     connectors_json, github_router, intents_json, map_json, maps_json, mentions_json,
     presence_json, push_router, records_json, room_json, run_json, runs_json, spawn_wake_listener,
-    GithubApp, GithubWebhookState, GraphStoreMapArtifactSink, PushState, RoomBus,
-    DEFAULT_BUS_CAPACITY,
+    Delivery, GithubApp, GithubWebhookState, GraphStoreMapArtifactSink, MessagePost, PushState,
+    RoomBus, DEFAULT_BUS_CAPACITY,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
+const DISPATCH_DATABASE_URL_ENV: &str = "THEOREM_DISPATCH_DATABASE_URL";
+const DEFAULT_JOB_ROOM_ID: &str = "repo:theorem:branch:main";
 
 #[derive(Debug, Default, Deserialize)]
 struct CoordinationQuery {
@@ -58,6 +66,57 @@ struct CoordinationQuery {
     record_types: Option<String>,
     consume: Option<bool>,
     limit: Option<usize>,
+}
+
+#[derive(Clone)]
+struct JobHttpState {
+    store: SharedStore,
+    bus: RoomBus,
+    dispatch: Option<DispatchQueue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobSubmitHttpBody {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    tenant_slug: Option<String>,
+    #[serde(default)]
+    submitted_by: Option<String>,
+    #[serde(default)]
+    room_id: Option<String>,
+    #[serde(flatten)]
+    submission: JobSubmission,
+}
+
+impl JobSubmitHttpBody {
+    fn tenant_slug(&self) -> String {
+        self.tenant_slug
+            .as_deref()
+            .or(self.tenant.as_deref())
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty())
+            .unwrap_or("default")
+            .to_string()
+    }
+
+    fn submitted_by(&self) -> String {
+        self.submitted_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|actor| !actor.is_empty())
+            .unwrap_or("theorem-harness-server")
+            .to_string()
+    }
+
+    fn room_id(&self) -> String {
+        self.room_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|room| !room.is_empty())
+            .unwrap_or(DEFAULT_JOB_ROOM_ID)
+            .to_string()
+    }
 }
 
 impl CoordinationQuery {
@@ -112,6 +171,12 @@ async fn main() {
         store: state.clone(),
         bus: bus.clone(),
     });
+    let dispatch = dispatch_queue_from_env().await;
+    let jobs = jobs_router(JobHttpState {
+        store: state.clone(),
+        bus: bus.clone(),
+        dispatch,
+    });
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -130,7 +195,8 @@ async fn main() {
         .route("/connectors", get(list_connectors))
         .route("/connectors/register", post(register_connector_route))
         .with_state(state.clone())
-        .merge(push);
+        .merge(push)
+        .merge(jobs);
     let app = maybe_mount_github_router(app, state.clone());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "50080".to_string());
@@ -140,6 +206,25 @@ async fn main() {
         .expect("bind listener");
     tracing::info!(%addr, %data_dir, "theorem-harness-server listening");
     axum::serve(listener, app).await.expect("serve");
+}
+
+async fn dispatch_queue_from_env() -> Option<DispatchQueue> {
+    let database_url = std::env::var(DISPATCH_DATABASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    Some(
+        DispatchQueue::connect(&database_url)
+            .await
+            .expect("connect Postgres dispatch queue"),
+    )
+}
+
+fn jobs_router(state: JobHttpState) -> Router {
+    Router::new()
+        .route("/harness/jobs", post(submit_job))
+        .route("/harness/jobs/counts", get(dispatch_job_counts))
+        .with_state(state)
 }
 
 fn maybe_mount_github_router(app: Router, store: SharedStore) -> Router {
@@ -173,6 +258,89 @@ fn maybe_mount_github_router(app: Router, store: SharedStore) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn submit_job(
+    State(state): State<JobHttpState>,
+    Json(body): Json<JobSubmitHttpBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant_slug = body.tenant_slug();
+    let submitted_by = body.submitted_by();
+    let room_id = body.room_id();
+    let submission = body.submission;
+
+    let outcome = {
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "store lock".to_string()))?;
+        job_submit(&mut *store, submission, submitted_by.clone()).map_err(runtime_status)?
+    };
+
+    let dispatch_mirrored = if let Some(queue) = &state.dispatch {
+        let dispatch_job = DispatchJob::from_harness(&outcome.job);
+        let priority = priority_from_harness(outcome.job.priority);
+        queue
+            .submit(dispatch_job, priority)
+            .await
+            .map_err(dispatch_status)?;
+        true
+    } else {
+        false
+    };
+
+    let wake_event = {
+        let mut metadata = Map::new();
+        metadata.insert("source".to_string(), json!("job_submit"));
+        metadata.insert("job_id".to_string(), json!(outcome.job.job_id));
+        metadata.insert("dispatch_mirrored".to_string(), json!(dispatch_mirrored));
+        let post = MessagePost {
+            tenant_slug: tenant_slug.clone(),
+            actor_id: submitted_by.clone(),
+            message: format!(
+                "dispatch job submitted: {} ({})",
+                outcome.job.job_id, outcome.job.title
+            ),
+            urgency: priority_urgency(outcome.job.priority),
+            delivery: Delivery::Wake,
+            mentions: wake_mentions(outcome.job.target_head),
+            metadata,
+        };
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "store lock".to_string()))?;
+        let (_message, event) =
+            write_room_message(&mut *store, &room_id, post).map_err(coordination_status)?;
+        event
+    };
+    state.bus.publish(wake_event.clone());
+
+    Ok(Json(json!({
+        "tenant": tenant_slug,
+        "room_id": room_id,
+        "job_id": outcome.job.job_id,
+        "created": outcome.created,
+        "dispatch_mirrored": dispatch_mirrored,
+        "job": outcome.job,
+        "wake_event": wake_event
+    })))
+}
+
+async fn dispatch_job_counts(
+    State(state): State<JobHttpState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let Some(queue) = &state.dispatch else {
+        return Ok(Json(json!({
+            "dispatch_configured": false,
+            "counts": []
+        })));
+    };
+    let counts = queue.state_counts().await.map_err(dispatch_status)?;
+    Ok(Json(json!({
+        "dispatch_configured": true,
+        "counts": counts
+    })))
 }
 
 async fn list_maps(
@@ -390,4 +558,65 @@ fn split_csv(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn priority_urgency(priority: Priority) -> String {
+    match priority {
+        Priority::P0 => "block",
+        Priority::P1 => "ask",
+        Priority::P2 => "info",
+    }
+    .to_string()
+}
+
+fn wake_mentions(target_head: TargetHead) -> Vec<String> {
+    match target_head {
+        TargetHead::Claude => vec!["claude-code".to_string()],
+        TargetHead::Codex => vec!["codex".to_string()],
+        TargetHead::Either => vec!["codex".to_string(), "claude-code".to_string()],
+    }
+}
+
+fn runtime_status(error: HarnessRuntimeError) -> (StatusCode, String) {
+    match error {
+        HarnessRuntimeError::Deserialization(_) => (StatusCode::BAD_REQUEST, error.to_string()),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+fn coordination_status(error: CoordinationError) -> (StatusCode, String) {
+    match error {
+        CoordinationError::InvalidInput { .. } => (StatusCode::BAD_REQUEST, error.to_string()),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+fn dispatch_status(error: DispatchError) -> (StatusCode, String) {
+    match error {
+        DispatchError::Invalid(_) => (StatusCode::BAD_REQUEST, error.to_string()),
+        DispatchError::NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
+        DispatchError::Sqlx(_) => (StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_priority_maps_to_coordination_urgency_vocabulary() {
+        assert_eq!(priority_urgency(Priority::P0), "block");
+        assert_eq!(priority_urgency(Priority::P1), "ask");
+        assert_eq!(priority_urgency(Priority::P2), "info");
+    }
+
+    #[test]
+    fn target_head_maps_to_wake_mentions() {
+        assert_eq!(wake_mentions(TargetHead::Claude), vec!["claude-code"]);
+        assert_eq!(wake_mentions(TargetHead::Codex), vec!["codex"]);
+        assert_eq!(
+            wake_mentions(TargetHead::Either),
+            vec!["codex", "claude-code"]
+        );
+    }
 }

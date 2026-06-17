@@ -69,29 +69,16 @@ pub fn job_submit<S: GraphStore>(
     let candidate = Job::from_submission(submission, submitted_by.clone())
         .map_err(HarnessRuntimeError::Deserialization)?;
 
+    if let Some(mut existing) = load_job(store, &candidate.job_id)? {
+        upsert_allowed_fields(store, &mut existing, candidate)?;
+        return Ok(JobSubmitOutcome {
+            job: existing,
+            created: false,
+        });
+    }
+
     if let Some(mut existing) = find_by_idempotency_key(store, &candidate.idempotency_key)? {
-        let mut changed = false;
-        if existing.priority != candidate.priority {
-            existing.priority = candidate.priority;
-            changed = true;
-        }
-        if candidate.spec_ref.is_some() && existing.spec_ref != candidate.spec_ref {
-            existing.spec_ref = candidate.spec_ref;
-            existing.spec_inline = None;
-            changed = true;
-        } else if candidate.spec_inline.is_some() && existing.spec_inline != candidate.spec_inline {
-            existing.spec_inline = candidate.spec_inline;
-            existing.spec_ref = None;
-            changed = true;
-        }
-        if existing.not_before != candidate.not_before {
-            existing.not_before = candidate.not_before;
-            changed = true;
-        }
-        if changed {
-            persist_job(store, &existing)?;
-            maybe_link_spec(store, &existing)?;
-        }
+        upsert_allowed_fields(store, &mut existing, candidate)?;
         return Ok(JobSubmitOutcome {
             job: existing,
             created: false,
@@ -104,6 +91,36 @@ pub fn job_submit<S: GraphStore>(
         job: candidate,
         created: true,
     })
+}
+
+fn upsert_allowed_fields<S: GraphStore>(
+    store: &mut S,
+    existing: &mut Job,
+    candidate: Job,
+) -> RuntimeResult<()> {
+    let mut changed = false;
+    if existing.priority != candidate.priority {
+        existing.priority = candidate.priority;
+        changed = true;
+    }
+    if candidate.spec_ref.is_some() && existing.spec_ref != candidate.spec_ref {
+        existing.spec_ref = candidate.spec_ref;
+        existing.spec_inline = None;
+        changed = true;
+    } else if candidate.spec_inline.is_some() && existing.spec_inline != candidate.spec_inline {
+        existing.spec_inline = candidate.spec_inline;
+        existing.spec_ref = None;
+        changed = true;
+    }
+    if existing.not_before != candidate.not_before {
+        existing.not_before = candidate.not_before;
+        changed = true;
+    }
+    if changed {
+        persist_job(store, existing)?;
+        maybe_link_spec(store, existing)?;
+    }
+    Ok(())
 }
 
 /// `job_list`: the board, ordered by priority then submitted_at.
@@ -456,6 +473,7 @@ mod tests {
 
     fn submission(title: &str) -> JobSubmission {
         JobSubmission {
+            job_id: None,
             title: title.to_string(),
             spec_ref: Some(format!("docs/plans/{title}/HANDOFF.md")),
             spec_inline: None,
@@ -523,6 +541,24 @@ mod tests {
             second.job.not_before.as_deref(),
             Some("2099-01-01T00:00:00Z")
         );
+        assert_eq!(job_list(&store, None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn explicit_job_id_backfills_the_same_thread() {
+        let mut store = InMemoryGraphStore::new();
+        let mut first_submission = submission_priority("dispatch-row", Priority::P2);
+        first_submission.job_id = Some("job-dispatch-row".to_string());
+        let first = job_submit(&mut store, first_submission, "postgres-dispatch").unwrap();
+        assert!(first.created);
+        assert_eq!(first.job.job_id, "job-dispatch-row");
+
+        let mut second_submission = submission_priority("dispatch-row", Priority::P0);
+        second_submission.job_id = Some("job-dispatch-row".to_string());
+        let second = job_submit(&mut store, second_submission, "receiver-a").unwrap();
+        assert!(!second.created);
+        assert_eq!(second.job.job_id, "job-dispatch-row");
+        assert_eq!(second.job.priority, Priority::P0);
         assert_eq!(job_list(&store, None, None).unwrap().len(), 1);
     }
 

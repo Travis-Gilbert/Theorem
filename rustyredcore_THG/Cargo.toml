@@ -28,6 +28,7 @@ members = [
     "crates/theorem-harness-core",
     "crates/theorem-harness-runtime",
     "crates/theorem-harness",
+    "crates/theorem-dispatch",
     "crates/theorem-browser-agent",
     "crates/theorem-agentd",
     "crates/theorem-receiver",

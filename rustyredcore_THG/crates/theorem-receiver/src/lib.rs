@@ -93,4 +93,10 @@ impl From<reqwest::Error> for ReceiverError {
     }
 }
 
+impl From<theorem_dispatch::DispatchError> for ReceiverError {
+    fn from(error: theorem_dispatch::DispatchError) -> Self {
+        Self::Protocol(format!("dispatch queue error: {error}"))
+    }
+}
+
 pub type ReceiverResult<T> = Result<T, ReceiverError>;

@@ -27,8 +27,10 @@ use rustyred_web::{
     SearchProvider,
 };
 use serde_json::{json, Value};
+use theorem_dispatch::{priority_from_harness, DispatchQueue, Job as DispatchJob};
 use theorem_harness_core::{
-    GroundedClaim, HeadInvocationError, JobSubmission, Priority, TransitionInput, TransitionResult,
+    GroundedClaim, HeadInvocationError, Job as HarnessJob, JobSubmission, TransitionInput,
+    TransitionResult,
 };
 use theorem_harness_runtime::{
     append_transition_from_store, load_events, load_run, run_composed_agent,
@@ -42,6 +44,7 @@ use crate::observability::Observability;
 use crate::ttl_sweep::TtlSweepState;
 
 const GRAPH_TRANSACTION_TTL_MS: u64 = 5 * 60 * 1000;
+const DISPATCH_DATABASE_URL_ENV: &str = "THEOREM_DISPATCH_DATABASE_URL";
 
 #[derive(Clone, Debug)]
 struct GraphTransactionContext {
@@ -695,7 +698,10 @@ impl AppState {
         )?);
         if graph_hooks_enabled() {
             if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
-                eprintln!("[theorem] enable graph hooks failed for {tenant_id}: {}", err.message);
+                eprintln!(
+                    "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                    err.message
+                );
             }
         }
         stores.insert(safe_tenant, store.clone());
@@ -721,7 +727,10 @@ impl AppState {
         )?);
         if graph_hooks_enabled() {
             if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
-                eprintln!("[theorem] enable graph hooks failed for {tenant_id}: {}", err.message);
+                eprintln!(
+                    "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                    err.message
+                );
             }
         }
         stores.insert(safe_tenant, store.clone());
@@ -819,7 +828,12 @@ impl From<GraphStoreError> for StoreAccessError {
 /// `1`/`true`/`on`/`yes`.
 fn graph_hooks_enabled() -> bool {
     std::env::var("THEOREM_GRAPH_HOOKS")
-        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -1850,6 +1864,43 @@ fn transition_result_payload(result: TransitionResult) -> Value {
     })
 }
 
+fn mirror_job_to_dispatch_if_configured(job: &HarnessJob) -> Result<bool, McpError> {
+    let Some(database_url) = std::env::var(DISPATCH_DATABASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    let dispatch_job = DispatchJob::from_harness(job);
+    let priority = priority_from_harness(job.priority);
+    let job_id = job.job_id.clone();
+    let handle = std::thread::Builder::new()
+        .name(format!("dispatch-mirror-{job_id}"))
+        .spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async move {
+                let queue = DispatchQueue::connect(&database_url)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                queue
+                    .submit(dispatch_job, priority)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+        })
+        .map_err(|error| McpError::internal(format!("dispatch mirror thread failed: {error}")))?;
+    handle
+        .join()
+        .map_err(|_| McpError::internal("dispatch mirror thread panicked"))?
+        .map_err(|error| McpError::internal(format!("dispatch mirror failed: {error}")))?;
+    Ok(true)
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 struct InvokeAppAffordanceGrpcRequest {
     #[prost(string, tag = "1")]
@@ -2005,7 +2056,21 @@ impl McpGraphBackend for ProductMcpBackend {
         submitted_by: String,
     ) -> Result<Value, McpError> {
         let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
-        job_submit_to_store(&mut runtime_store, submission, submitted_by)
+        let mut result = job_submit_to_store(&mut runtime_store, submission, submitted_by)?;
+        let job_value = result
+            .get("job")
+            .cloned()
+            .ok_or_else(|| McpError::internal("job_submit payload missing job"))?;
+        let job = serde_json::from_value::<HarnessJob>(job_value).map_err(|error| {
+            McpError::internal(format!(
+                "job_submit payload could not mirror to dispatch: {error}"
+            ))
+        })?;
+        let mirrored = mirror_job_to_dispatch_if_configured(&job)?;
+        if let Value::Object(map) = &mut result {
+            map.insert("dispatch_mirrored".to_string(), json!(mirrored));
+        }
+        Ok(result)
     }
 
     fn job_list(&self, repo: Option<String>, state: Option<String>) -> Result<Value, McpError> {
@@ -2461,8 +2526,11 @@ mod tests {
         }
         // On a `Trigger` upsert, write a derived node through the writer.
         let handler: HookHandler = Arc::new(|ctx: &mut HookContext, _events: &[MutationEvent]| {
-            ctx.store
-                .upsert_node(NodeRecord::new("derived:1", ["Derived"], json!({ "by": "hook" })))?;
+            ctx.store.upsert_node(NodeRecord::new(
+                "derived:1",
+                ["Derived"],
+                json!({ "by": "hook" }),
+            ))?;
             Ok(HookOutcome::Done)
         });
         let reg = HookRegistration::new(

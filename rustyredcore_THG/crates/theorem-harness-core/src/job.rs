@@ -61,6 +61,11 @@ impl TargetHead {
 /// The flat input accepted by `job_submit`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobSubmission {
+    /// Optional externally assigned id. Normal callers omit this and the board
+    /// mints `"job-" + ulid`; durable dispatch mirrors pass the Postgres id
+    /// through so the board thread and hot execution row stay joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     pub title: String,
     #[serde(default)]
     pub spec_ref: Option<String>,
@@ -176,7 +181,11 @@ impl Job {
         let spec_identity = submission
             .spec_identity()
             .ok_or_else(|| "job_submit requires spec_ref or spec_inline".to_string())?;
-        let job_id = new_job_id();
+        let job_id = submission
+            .job_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(new_job_id);
         let idempotency_key = submission
             .idempotency_key
             .clone()
@@ -260,6 +269,7 @@ mod tests {
 
     fn submission() -> JobSubmission {
         JobSubmission {
+            job_id: None,
             title: "Desktop app, Dia rebuild".to_string(),
             spec_ref: Some("docs/plans/theorem-desktop/HANDOFF.md".to_string()),
             spec_inline: None,
@@ -285,6 +295,19 @@ mod tests {
             idempotency_key_for(job.spec_ref.as_deref().unwrap(), &job.title)
         );
         assert_eq!(job.submitted_by, "claude.ai");
+    }
+
+    #[test]
+    fn from_submission_accepts_external_job_id() {
+        let mut external = submission();
+        external.job_id = Some("job-postgres-123".to_string());
+        let job = Job::from_submission(external, "dispatch").unwrap();
+        assert_eq!(job.job_id, "job-postgres-123");
+
+        let mut blank = submission();
+        blank.job_id = Some(" ".to_string());
+        let job = Job::from_submission(blank, "dispatch").unwrap();
+        assert!(job.job_id.starts_with("job-"));
     }
 
     #[test]

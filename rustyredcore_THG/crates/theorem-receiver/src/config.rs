@@ -12,9 +12,17 @@ use crate::{ReceiverError, ReceiverResult};
 /// Default claim poll interval. SSE wake on the jobs channel is a named
 /// follow-up (gated on the tenant-scoped push fix); until it lands, polling is
 /// the mechanism.
-pub const DEFAULT_CLAIM_INTERVAL_SECS: u64 = 20;
+pub const DEFAULT_CLAIM_INTERVAL_SECS: u64 = 5;
 /// Default per-repo capacity (concurrent jobs).
 pub const DEFAULT_CAPACITY: u32 = 1;
+/// Default environment variable containing the Postgres dispatch database URL.
+pub const DEFAULT_DISPATCH_DATABASE_URL_ENV: &str = "THEOREM_DISPATCH_DATABASE_URL";
+/// Default Postgres claim lease.
+pub const DEFAULT_DISPATCH_LEASE_SECS: u64 = 600;
+/// Default lease heartbeat cadence.
+pub const DEFAULT_DISPATCH_HEARTBEAT_SECS: u64 = 60;
+/// Default expired-lease reaper cadence.
+pub const DEFAULT_DISPATCH_REAP_INTERVAL_SECS: u64 = 30;
 
 fn default_tenant() -> String {
     "default".to_string()
@@ -26,6 +34,22 @@ fn default_interval() -> u64 {
 
 fn default_capacity() -> u32 {
     DEFAULT_CAPACITY
+}
+
+fn default_dispatch_database_url_env() -> String {
+    DEFAULT_DISPATCH_DATABASE_URL_ENV.to_string()
+}
+
+fn default_dispatch_lease_secs() -> u64 {
+    DEFAULT_DISPATCH_LEASE_SECS
+}
+
+fn default_dispatch_heartbeat_secs() -> u64 {
+    DEFAULT_DISPATCH_HEARTBEAT_SECS
+}
+
+fn default_dispatch_reap_interval_secs() -> u64 {
+    DEFAULT_DISPATCH_REAP_INTERVAL_SECS
 }
 
 /// The receiver's static configuration.
@@ -46,6 +70,16 @@ pub struct ReceiverConfig {
     /// sequentially (parallel dispatch is a named follow-up).
     #[serde(default = "default_capacity")]
     pub capacity: u32,
+    /// Environment variable holding the Postgres queue URL. Leave empty to keep
+    /// the legacy THG-board polling loop.
+    #[serde(default = "default_dispatch_database_url_env")]
+    pub dispatch_database_url_env: String,
+    #[serde(default = "default_dispatch_lease_secs")]
+    pub dispatch_lease_secs: u64,
+    #[serde(default = "default_dispatch_heartbeat_secs")]
+    pub dispatch_heartbeat_secs: u64,
+    #[serde(default = "default_dispatch_reap_interval_secs")]
+    pub dispatch_reap_interval_secs: u64,
     /// Map of repo (`Travis-Gilbert/theorem`) to local worktree path. A job for
     /// an unmapped repo is never claimed (security fence).
     pub worktrees: BTreeMap<String, PathBuf>,
@@ -76,6 +110,26 @@ impl ReceiverConfig {
         if self.worktrees.is_empty() {
             return Err(ReceiverError::Config(
                 "at least one repo -> worktree mapping is required".to_string(),
+            ));
+        }
+        if self.dispatch_lease_secs == 0 {
+            return Err(ReceiverError::Config(
+                "dispatch_lease_secs must be positive".to_string(),
+            ));
+        }
+        if self.dispatch_heartbeat_secs == 0 {
+            return Err(ReceiverError::Config(
+                "dispatch_heartbeat_secs must be positive".to_string(),
+            ));
+        }
+        if self.dispatch_reap_interval_secs == 0 {
+            return Err(ReceiverError::Config(
+                "dispatch_reap_interval_secs must be positive".to_string(),
+            ));
+        }
+        if self.dispatch_heartbeat_secs >= self.dispatch_lease_secs {
+            return Err(ReceiverError::Config(
+                "dispatch_heartbeat_secs must be shorter than dispatch_lease_secs".to_string(),
             ));
         }
         Ok(())
@@ -109,6 +163,30 @@ impl ReceiverConfig {
     pub fn claim_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.claim_interval_secs)
     }
+
+    /// Configured dispatch database URL, resolved from the named environment variable.
+    pub fn dispatch_database_url(&self) -> Option<String> {
+        let env_name = self.dispatch_database_url_env.trim();
+        if env_name.is_empty() {
+            return None;
+        }
+        std::env::var(env_name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn dispatch_lease(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dispatch_lease_secs)
+    }
+
+    pub fn dispatch_heartbeat_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dispatch_heartbeat_secs)
+    }
+
+    pub fn dispatch_reap_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dispatch_reap_interval_secs)
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +205,19 @@ harness_url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
         assert_eq!(config.tenant_slug, "default");
         assert_eq!(config.claim_interval_secs, DEFAULT_CLAIM_INTERVAL_SECS);
         assert_eq!(config.capacity, DEFAULT_CAPACITY);
+        assert_eq!(
+            config.dispatch_database_url_env,
+            DEFAULT_DISPATCH_DATABASE_URL_ENV
+        );
+        assert_eq!(config.dispatch_lease_secs, DEFAULT_DISPATCH_LEASE_SECS);
+        assert_eq!(
+            config.dispatch_heartbeat_secs,
+            DEFAULT_DISPATCH_HEARTBEAT_SECS
+        );
+        assert_eq!(
+            config.dispatch_reap_interval_secs,
+            DEFAULT_DISPATCH_REAP_INTERVAL_SECS
+        );
         assert_eq!(config.repos(), vec!["Travis-Gilbert/theorem".to_string()]);
         assert_eq!(
             config.worktree_for("Travis-Gilbert/theorem"),
@@ -149,6 +240,10 @@ tenant_slug = "acme"
 receiver_id = "laptop-a"
 claim_interval_secs = 5
 capacity = 2
+dispatch_database_url_env = "CUSTOM_DISPATCH_DATABASE_URL"
+dispatch_lease_secs = 120
+dispatch_heartbeat_secs = 20
+dispatch_reap_interval_secs = 10
 
 [worktrees]
 "acme/app" = "/repos/app"
@@ -158,5 +253,26 @@ capacity = 2
         assert_eq!(config.resolved_receiver_id(), "laptop-a");
         assert_eq!(config.claim_interval_secs, 5);
         assert_eq!(config.capacity, 2);
+        assert_eq!(
+            config.dispatch_database_url_env,
+            "CUSTOM_DISPATCH_DATABASE_URL"
+        );
+        assert_eq!(config.dispatch_lease_secs, 120);
+        assert_eq!(config.dispatch_heartbeat_secs, 20);
+        assert_eq!(config.dispatch_reap_interval_secs, 10);
+    }
+
+    #[test]
+    fn rejects_heartbeat_that_cannot_renew_before_expiry() {
+        let raw = r#"
+harness_url = "https://example/mcp"
+dispatch_lease_secs = 10
+dispatch_heartbeat_secs = 10
+
+[worktrees]
+"acme/app" = "/repos/app"
+"#;
+        let error = ReceiverConfig::from_toml(raw).unwrap_err().to_string();
+        assert!(error.contains("heartbeat"));
     }
 }

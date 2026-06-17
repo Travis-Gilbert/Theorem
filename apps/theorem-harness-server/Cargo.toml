@@ -38,6 +38,7 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 
 theorem-harness-runtime = { path = "../../rustyredcore_THG/crates/theorem-harness-runtime" }
 theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
+theorem-dispatch = { path = "../../rustyredcore_THG/crates/theorem-dispatch" }
 rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
 rustyred-thg-code = { path = "../../rustyredcore_THG/crates/rustyred-thg-code" }
 rustyred-thg-affordances = { path = "../../rustyredcore_THG/crates/rustyred-thg-affordances" }

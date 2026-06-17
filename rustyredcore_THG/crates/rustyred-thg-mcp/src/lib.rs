@@ -8675,6 +8675,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "properties": {
                     "tenant": { "type": "string" },
                     "tenant_slug": { "type": "string" },
+                    "job_id": { "type": "string", "description": "optional externally assigned id for Postgres dispatch mirrors/backfills" },
                     "title": { "type": "string" },
                     "spec_ref": { "type": "string", "description": "repo path (docs/plans/x/HANDOFF.md) or harness doc_id" },
                     "spec_inline": { "type": "string", "description": "inline spec text when no spec_ref is available" },
@@ -10758,6 +10759,7 @@ mod tests {
 
     fn job_submission_fixture(title: &str) -> theorem_harness_core::JobSubmission {
         theorem_harness_core::JobSubmission {
+            job_id: None,
             title: title.to_string(),
             spec_ref: Some(format!("docs/plans/{title}/HANDOFF.md")),
             spec_inline: None,

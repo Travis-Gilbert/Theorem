@@ -7,16 +7,20 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use theorem_harness_core::types::now_string;
-use theorem_harness_core::Job;
+use theorem_harness_core::{Job, LANE_CLAUDE, LANE_CODEX};
 
 use crate::config::ReceiverConfig;
 use crate::head::adapter_for;
 use crate::lanes::detect_lanes;
 use crate::spawn::command_from_plan;
 use crate::{client::HarnessClient, ReceiverError, ReceiverResult};
+use theorem_dispatch::{ClaimedJob, DispatchQueue, FailureClass, Head as DispatchHead, JobState};
 
 /// How many stdout lines to retain in the exit receipt.
 const STDOUT_TAIL_LINES: usize = 40;
@@ -54,6 +58,17 @@ pub fn run_loop_until(
         config.claim_interval_secs
     ));
 
+    if let Some(database_url) = config.dispatch_database_url() {
+        return run_postgres_loop_until(
+            config,
+            client,
+            &receiver_id,
+            &lanes,
+            &database_url,
+            &should_stop,
+        );
+    }
+
     while !should_stop() {
         match next_launchable_job(client, config, &lanes) {
             Ok(Some(job)) => match start_and_run_job(config, client, &receiver_id, &lanes, job) {
@@ -73,6 +88,90 @@ pub fn run_loop_until(
     }
     log(&format!("receiver {receiver_id} stopping"));
     Ok(())
+}
+
+fn run_postgres_loop_until(
+    config: &ReceiverConfig,
+    client: &HarnessClient,
+    receiver_id: &str,
+    lanes: &[String],
+    database_url: &str,
+    should_stop: &impl Fn() -> bool,
+) -> ReceiverResult<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let queue = runtime.block_on(DispatchQueue::connect(database_url))?;
+    let heads = dispatch_heads_for_lanes(lanes);
+    if heads.is_empty() {
+        return Err(ReceiverError::Config(
+            "no dispatch heads mapped from detected lanes".to_string(),
+        ));
+    }
+
+    log(&format!(
+        "receiver {receiver_id} using Postgres dispatch queue: heads={heads:?} lease={}s heartbeat={}s reap={}s",
+        config.dispatch_lease_secs,
+        config.dispatch_heartbeat_secs,
+        config.dispatch_reap_interval_secs
+    ));
+
+    let mut next_reap = Instant::now();
+    while !should_stop() {
+        if Instant::now() >= next_reap {
+            match runtime.block_on(queue.reap()) {
+                Ok(report) if report.requeued > 0 || report.dead > 0 => log(&format!(
+                    "reaped expired dispatch leases: requeued={} dead={}",
+                    report.requeued, report.dead
+                )),
+                Ok(_) => {}
+                Err(error) => log(&format!("dispatch reap error: {error}")),
+            }
+            next_reap = Instant::now() + config.dispatch_reap_interval();
+        }
+
+        match runtime.block_on(queue.claim_next_for_heads(
+            receiver_id,
+            &heads,
+            config.dispatch_lease(),
+        )) {
+            Ok(Some(claimed)) => match start_and_run_dispatch_job(
+                &runtime,
+                &queue,
+                config,
+                client,
+                receiver_id,
+                lanes,
+                claimed,
+            ) {
+                Ok(Some(report)) => log(&format!(
+                    "dispatch job {} exited: lane={} exit={:?} receipt={}",
+                    report.job_id, report.lane, report.exit_code, report.exit_receipt_written
+                )),
+                Ok(None) => {}
+                Err(error) => log(&format!("dispatch job run error: {error}")),
+            },
+            Ok(None) => sleep_until_stop(config.claim_interval(), should_stop),
+            Err(error) => {
+                log(&format!("dispatch claim error: {error}; backing off"));
+                sleep_until_stop(config.claim_interval(), should_stop);
+            }
+        }
+    }
+
+    log(&format!("receiver {receiver_id} stopping"));
+    Ok(())
+}
+
+fn dispatch_heads_for_lanes(lanes: &[String]) -> Vec<DispatchHead> {
+    let mut heads = Vec::new();
+    if lanes.iter().any(|lane| lane == LANE_CLAUDE) {
+        heads.push(DispatchHead::Claude);
+    }
+    if lanes.iter().any(|lane| lane == LANE_CODEX) {
+        heads.push(DispatchHead::Codex);
+    }
+    heads
 }
 
 fn next_launchable_job(
@@ -134,6 +233,194 @@ fn start_and_run_job(
             );
             Err(error)
         }
+    }
+}
+
+fn start_and_run_dispatch_job(
+    runtime: &tokio::runtime::Runtime,
+    queue: &DispatchQueue,
+    config: &ReceiverConfig,
+    client: &HarnessClient,
+    receiver_id: &str,
+    lanes: &[String],
+    claimed: ClaimedJob,
+) -> ReceiverResult<Option<JobRunReport>> {
+    let job_payload = claimed.job_payload();
+    let job = claimed.clone().into_harness_job();
+    if let Err(error) = client.job_submit(job_payload.into_harness_submission(), receiver_id) {
+        runtime.block_on(queue.fail(
+            &job.job_id,
+            FailureClass::Retryable,
+            json!({
+                "stage": "board_submit",
+                "error": error.to_string(),
+            }),
+        ))?;
+        return Err(error);
+    }
+
+    let session_ref = format!("receiver:{receiver_id}:{}", job.job_id);
+    let start = client.job_note(
+        &job.job_id,
+        receiver_id,
+        &format!("starting local session {session_ref}"),
+        Vec::new(),
+        Some(session_ref.clone()),
+        false,
+    )?;
+    if !start
+        .get("applied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        runtime.block_on(queue.fail(
+            &job.job_id,
+            FailureClass::Fatal,
+            json!({
+                "stage": "board_start",
+                "error": "start note was not applied",
+                "response": start,
+            }),
+        ))?;
+        log(&format!("dispatch start skipped for {}", job.job_id));
+        return Ok(None);
+    }
+
+    runtime.block_on(queue.renew_lease(&job.job_id, config.dispatch_lease()))?;
+    let heartbeat = match DispatchHeartbeat::start(
+        queue.clone(),
+        job.job_id.clone(),
+        config.dispatch_lease(),
+        config.dispatch_heartbeat_interval(),
+    ) {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => {
+            let _ = client.job_note(
+                &job.job_id,
+                receiver_id,
+                &format!("receiver abort before launch: {error}"),
+                Vec::new(),
+                None,
+                true,
+            );
+            runtime.block_on(queue.fail(
+                &job.job_id,
+                FailureClass::Retryable,
+                json!({
+                    "stage": "dispatch_heartbeat",
+                    "error": error.to_string(),
+                }),
+            ))?;
+            return Err(error);
+        }
+    };
+
+    let run_result = run_job(config, client, receiver_id, lanes, &job, &session_ref);
+    heartbeat.stop();
+
+    match run_result {
+        Ok(report) => {
+            if report.exit_code == Some(0) {
+                runtime.block_on(queue.complete(
+                    &job.job_id,
+                    json!({
+                        "exit_code": report.exit_code,
+                        "lane": report.lane,
+                        "exit_receipt_written": report.exit_receipt_written,
+                    }),
+                ))?;
+                let _ = client.job_archive(&job.job_id, "done", receiver_id);
+            } else {
+                let state = runtime.block_on(queue.fail(
+                    &job.job_id,
+                    FailureClass::Retryable,
+                    json!({
+                        "exit_code": report.exit_code,
+                        "lane": report.lane,
+                        "exit_receipt_written": report.exit_receipt_written,
+                    }),
+                ))?;
+                if state == JobState::Dead {
+                    let _ = client.job_archive(&job.job_id, "dead-lettered", receiver_id);
+                } else {
+                    let _ = client.job_note(
+                        &job.job_id,
+                        receiver_id,
+                        "dispatch retry scheduled after child exit",
+                        Vec::new(),
+                        None,
+                        true,
+                    );
+                }
+            }
+            Ok(Some(report))
+        }
+        Err(error) => {
+            let _ = client.job_note(
+                &job.job_id,
+                receiver_id,
+                &format!("receiver abort before launch: {error}"),
+                Vec::new(),
+                None,
+                true,
+            );
+            runtime.block_on(queue.fail(
+                &job.job_id,
+                FailureClass::Retryable,
+                json!({
+                    "stage": "receiver_run",
+                    "error": error.to_string(),
+                }),
+            ))?;
+            Err(error)
+        }
+    }
+}
+
+struct DispatchHeartbeat {
+    stop: mpsc::Sender<()>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl DispatchHeartbeat {
+    fn start(
+        queue: DispatchQueue,
+        job_id: String,
+        lease: Duration,
+        interval: Duration,
+    ) -> ReceiverResult<Self> {
+        let (stop, stop_rx) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name(format!("dispatch-heartbeat-{job_id}"))
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        log(&format!("dispatch heartbeat runtime error: {error}"));
+                        return;
+                    }
+                };
+                loop {
+                    match stop_rx.recv_timeout(interval) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Err(error) = runtime.block_on(queue.renew_lease(&job_id, lease))
+                            {
+                                log(&format!("dispatch heartbeat failed for {job_id}: {error}"));
+                            }
+                        }
+                    }
+                }
+            })?;
+        Ok(Self { stop, handle })
+    }
+
+    fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.handle.join();
     }
 }
 
