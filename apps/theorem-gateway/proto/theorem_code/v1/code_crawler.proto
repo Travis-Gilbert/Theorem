@@ -1,0 +1,319 @@
+// Copyright 2026 Travis Gilbert. MIT licensed.
+//
+// Native Theorem code-index and code-search surface. The service is internal
+// app infrastructure: it indexes code into RedCore, searches indexed symbols,
+// and expands hits into file context.
+
+syntax = "proto3";
+
+package theorem_code.v1;
+
+service CodeCrawlerService {
+  // Job submission: returns immediately with `job_id` and status "submitted".
+  // The heavy work (clone, walk, parse, commit) runs on a server-side worker
+  // with no client deadline. Watch progress with WatchIngest or poll
+  // GetIngestStatus.
+  rpc IngestCodebase(IngestCodebaseRequest) returns (IngestCodebaseResponse);
+  rpc ReindexCodebase(ReindexCodebaseRequest) returns (IngestCodebaseResponse);
+  // Server-streaming progress for a submitted ingest/reindex job. Replays the
+  // job's full event log from the start, then streams live events; the stream
+  // ends after a terminal `finished` or `failed` event.
+  rpc WatchIngest(WatchIngestRequest) returns (stream IngestEvent);
+  // Poll variant for clients that do not stream.
+  rpc GetIngestStatus(GetIngestStatusRequest) returns (IngestStatus);
+  rpc SearchCode(SearchCodeRequest) returns (SearchCodeResponse);
+  rpc CodeContext(CodeContextRequest) returns (CodeContextResponse);
+  rpc RecognizeCode(RecognizeCodeRequest) returns (RecognizeCodeResponse);
+  rpc ExploreCode(ExploreCodeRequest) returns (ExploreCodeResponse);
+  rpc ExplainCode(ExplainCodeRequest) returns (ExplainCodeResponse);
+  rpc RecordUseReceipt(RecordUseReceiptRequest) returns (RecordUseReceiptResponse);
+}
+
+message IngestCodebaseRequest {
+  string tenant_id = 1;
+  string repo_path = 2;
+  string repo_id = 3;
+  repeated string include_extensions = 4;
+  repeated string exclude_dirs = 5;
+  uint64 max_files = 6;
+  uint64 max_file_bytes = 7;
+  string actor = 8;
+  // CA-1: clone a remote repository instead of reading repo_path.
+  string repo_url = 9;
+  uint64 max_total_bytes = 10;
+}
+
+message ReindexCodebaseRequest {
+  string tenant_id = 1;
+  string repo_path = 2;
+  string repo_id = 3;
+  repeated string include_extensions = 4;
+  repeated string exclude_dirs = 5;
+  uint64 max_files = 6;
+  uint64 max_file_bytes = 7;
+  string actor = 8;
+  string repo_url = 9;
+  uint64 max_total_bytes = 10;
+}
+
+message IngestCodebaseResponse {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string repo_root = 3;
+  uint64 generation = 4;
+  uint64 files_indexed = 5;
+  uint64 symbols_indexed = 6;
+  uint64 files_skipped = 7;
+  uint64 graph_version = 8;
+  string receipt_hash = 9;
+  string receipt_json = 10;
+  // "submitted" on the submission ack; "ok" or "budget_exceeded" on the
+  // completed output carried by IngestStatus / the finished IngestEvent.
+  string status = 11;
+  string message = 12;
+  string job_id = 13;
+  // Files whose symbols were extracted in this pass vs files carried forward
+  // unchanged from the prior generation (incremental reindex).
+  uint64 files_parsed = 14;
+  uint64 files_carried = 15;
+  // JSON-encoded EpistemicRAG instant structural readout. Empty on submission
+  // acknowledgements; populated on completed ingest/reindex responses.
+  string epistemic_readout_json = 16;
+}
+
+message WatchIngestRequest {
+  string tenant_id = 1;
+  string job_id = 2;
+}
+
+message GetIngestStatusRequest {
+  string tenant_id = 1;
+  string job_id = 2;
+}
+
+message IngestStageTimings {
+  uint64 clone_ms = 1;
+  uint64 resolve_ms = 2;
+  uint64 walk_ms = 3;
+  uint64 parse_ms = 4;
+  uint64 mutation_ms = 5;
+  uint64 write_ms = 6;
+  uint64 total_ms = 7;
+}
+
+message IngestEvent {
+  string job_id = 1;
+  uint64 sequence = 2;
+  uint64 recorded_at_ms = 3;
+  oneof event {
+    IngestCloneDone clone_done = 4;
+    IngestWalkDone walk_done = 5;
+    IngestParseProgress parse_progress = 6;
+    IngestCommitDone commit_done = 7;
+    IngestFinished finished = 8;
+    IngestFailed failed = 9;
+  }
+}
+
+message IngestCloneDone {
+  uint64 ms = 1;
+}
+
+message IngestWalkDone {
+  uint64 files_found = 1;
+}
+
+message IngestParseProgress {
+  uint64 done = 1;
+  uint64 total = 2;
+}
+
+message IngestCommitDone {
+  uint64 graph_version = 1;
+}
+
+message IngestFinished {
+  IngestCodebaseResponse output = 1;
+  IngestStageTimings stage_timings = 2;
+}
+
+message IngestFailed {
+  string code = 1;
+  string message = 2;
+}
+
+message IngestStatus {
+  string job_id = 1;
+  // queued | running | finished | failed | budget_exceeded
+  string state = 2;
+  // queued | start | clone | walk | parse | commit | done | failed
+  string stage = 3;
+  uint64 files_total = 4;
+  uint64 files_done = 5;
+  uint64 submitted_at_ms = 6;
+  uint64 updated_at_ms = 7;
+  IngestCodebaseResponse output = 8;
+  string error_code = 9;
+  string error_message = 10;
+}
+
+message SearchCodeRequest {
+  string tenant_id = 1;
+  string query = 2;
+  string repo_id = 3;
+  string path_prefix = 4;
+  repeated string kinds = 5;
+  uint64 limit = 6;
+}
+
+message SearchCodeResponse {
+  string tenant_id = 1;
+  string query = 2;
+  repeated CodeHit hits = 3;
+  uint64 total_admitted = 4;
+  uint64 total_returned = 5;
+  uint64 latency_ms = 6;
+  string receipt_hash = 7;
+  string receipt_json = 8;
+}
+
+message CodeContextRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string repo_id = 3;
+  string file_path = 4;
+  uint64 before_lines = 5;
+  uint64 after_lines = 6;
+  uint64 max_chars = 7;
+}
+
+message CodeContextResponse {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string file_id = 3;
+  string symbol_id = 4;
+  string file_path = 5;
+  uint64 start_line = 6;
+  uint64 end_line = 7;
+  string context = 8;
+  repeated CodeSymbol symbols = 9;
+  string receipt_hash = 10;
+  string receipt_json = 11;
+}
+
+message RecognizeCodeRequest {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string file_path = 3;
+  string text = 4;
+  uint64 limit = 5;
+}
+
+message RecognizeCodeResponse {
+  string tenant_id = 1;
+  string repo_id = 2;
+  string file_path = 3;
+  repeated CodeSymbol symbols = 4;
+  string receipt_hash = 5;
+  string receipt_json = 6;
+}
+
+message ExploreCodeRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string query = 3;
+  string repo_id = 4;
+  uint64 max_depth = 5;
+  uint64 limit = 6;
+}
+
+message ExploreCodeResponse {
+  string tenant_id = 1;
+  CodeSymbol focus = 2;
+  repeated CodeSymbol related_symbols = 3;
+  repeated CodeGraphEdge edges = 4;
+  string receipt_hash = 5;
+  string receipt_json = 6;
+}
+
+message ExplainCodeRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string query = 3;
+  string repo_id = 4;
+  uint64 max_chars = 5;
+}
+
+message ExplainCodeResponse {
+  string tenant_id = 1;
+  CodeSymbol symbol = 2;
+  string summary = 3;
+  string context = 4;
+  repeated CodeGraphEdge edges = 5;
+  string receipt_hash = 6;
+  string receipt_json = 7;
+}
+
+message RecordUseReceiptRequest {
+  string tenant_id = 1;
+  string node_id = 2;
+  string repo_id = 3;
+  string query = 4;
+  string action = 5;
+  string outcome = 6;
+  string actor = 7;
+  string use_json = 8;
+}
+
+message RecordUseReceiptResponse {
+  string tenant_id = 1;
+  string node_id = 2;
+  string repo_id = 3;
+  string receipt_hash = 4;
+  string receipt_json = 5;
+  string status = 6;
+  string message = 7;
+}
+
+message CodeHit {
+  string node_id = 1;
+  string repo_id = 2;
+  string file_id = 3;
+  string file_path = 4;
+  string kind = 5;
+  string name = 6;
+  string language = 7;
+  uint64 line = 8;
+  string snippet = 9;
+  double score = 10;
+  string trust_tier = 11;
+  string community_id = 12;
+}
+
+message CodeSymbol {
+  string node_id = 1;
+  string repo_id = 2;
+  string file_id = 3;
+  string file_path = 4;
+  string kind = 5;
+  string name = 6;
+  string language = 7;
+  uint64 line = 8;
+  string signature = 9;
+  string snippet = 10;
+  string trust_tier = 11;
+  string community_id = 12;
+  repeated string callers = 13;
+  repeated string callees = 14;
+  repeated string dependencies = 15;
+  repeated string dependents = 16;
+}
+
+message CodeGraphEdge {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  string edge_type = 3;
+  string from_name = 4;
+  string to_name = 5;
+  string evidence = 6;
+}
