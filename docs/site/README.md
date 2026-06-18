@@ -12,9 +12,13 @@ This site documents Theorem for people building on it or evaluating it. For the 
 
 ## Where to start
 
-If you want the concept, read [What is Theorem](concepts/what-is-theorem.md), then [The Harness](concepts/the-harness.md).
+If you want the idea in plain terms with no vocabulary to learn first, read [The mental model](concepts/mental-model.md).
 
-If you want to build, read [Getting started](getting-started.md).
+For the concept in depth, read [What is Theorem](concepts/what-is-theorem.md), then [The Harness](concepts/the-harness.md).
+
+If you want to build, read [Getting started](getting-started.md), then the [HTTP API](reference/api-http.md), the [MCP tool catalog](reference/mcp-tools.md), or the [SDKs](reference/sdks.md).
+
+If a term is unfamiliar — "head," "room," "affordance," "substrate" — the [Glossary](reference/glossary.md) defines every in-house word and gives the plain-language equivalent.
 
 If you want the full surface, the [Crate reference](reference/crates.md) and [App reference](reference/apps.md) list every component.
 
