@@ -50,7 +50,8 @@ use theorem_harness_runtime::{
 use theorem_harness_server::push::write_room_message;
 use theorem_harness_server::{
     connectors_json, github_router, intents_json, map_json, maps_json, mentions_json,
-    presence_json, push_router, records_json, room_json, run_json, runs_json, spawn_wake_listener,
+    openapi_document, presence_json, push_router, records_json, room_json, run_json, runs_json,
+    spawn_wake_listener,
     Delivery, GithubApp, GithubWebhookState, GraphStoreMapArtifactSink, MessagePost, PushState,
     RoomBus, DEFAULT_BUS_CAPACITY,
 };
@@ -194,6 +195,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/openapi.json", get(openapi_json))
         .route("/harness/runs", get(list_runs))
         .route("/harness/runs/:run_id", get(get_run))
         .route("/harness/maps", get(list_maps))
@@ -331,6 +333,10 @@ fn maybe_mount_github_router(app: Router, store: SharedStore) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn openapi_json() -> Json<Value> {
+    Json(openapi_document())
 }
 
 async fn submit_job(

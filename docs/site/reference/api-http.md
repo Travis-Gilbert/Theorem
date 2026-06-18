@@ -4,7 +4,7 @@ Theorem exposes two HTTP services. Know which one you are calling.
 
 | Service | Crate | What it serves | OpenAPI |
 |---|---|---|---|
-| **Harness server** | `apps/theorem-harness-server` | Runs, codebase maps, coordination rooms, jobs, connectors | [openapi-harness.yaml](openapi-harness.yaml) (in this repo) |
+| **Harness server** | `apps/theorem-harness-server` | Runs, codebase maps, coordination rooms, jobs, connectors | Generated, served at `GET /openapi.json`; committed snapshot [openapi-harness.json](openapi-harness.json) |
 | **Graph engine** | `rustyredcore_THG/crates/rustyred-thg-server` | Graph nodes/edges, Cypher, vector/spatial/full-text search, transactions, algorithms, live web search | Self-published at `GET /openapi.json` |
 
 The **Harness server** is the product transport: it is what most integrations talk to. The **graph engine** is the lower-level database service; you usually reach its capabilities through the Harness or through MCP rather than calling it directly.
@@ -39,16 +39,17 @@ Default bind: `0.0.0.0:50080` (set `PORT`). Data directory: `THEOREM_HARNESS_DAT
 | POST | `/connectors/register` | Register an MCP server's tools. |
 | POST | `/github/webhook` | GitHub App webhook (only if configured). |
 
-Full request/response schemas are in [openapi-harness.yaml](openapi-harness.yaml). See [Run the Harness and submit a job](../guides/first-job.md) for a worked example.
+Full request/response schemas are in the [committed OpenAPI snapshot](openapi-harness.json), or fetch the live document from a running server at `GET /openapi.json`. See [Run the Harness and submit a job](../guides/first-job.md) for a worked example.
 
 ## Viewing and importing the spec
 
-The `openapi-harness.yaml` file is a standard OpenAPI 3.1 document. You can:
+`openapi-harness.json` is a standard OpenAPI 3.1 document; a running server serves the identical document at `GET /openapi.json`. You can:
 
-- Paste it into [editor.swagger.io](https://editor.swagger.io) or render it with Redocly / Scalar.
+- Fetch it live: `curl localhost:50080/openapi.json`.
+- Paste the committed file into [editor.swagger.io](https://editor.swagger.io) or render it with Redocly / Scalar.
 - Import it into Postman or Insomnia as an API definition.
 - Render it inline in this GitBook with an OpenAPI block once the file is wired into `.gitbook.yaml`.
 
-## A note on keeping this accurate
+## How this stays accurate
 
-This static YAML is committed for immediate use, but it can drift from the code the same way prose docs do. The graph engine avoids that by *generating* its spec from a single source served at `/openapi.json`. The recommended hardening for the Harness server is to do the same — add a generated `/openapi.json` route mirroring `rustyred-thg-server/src/openapi.rs` — so the document cannot lag the routes. Until then, treat `main.rs` route registrations as the source of truth and update this file alongside route changes.
+The spec is generated from code, not hand-maintained. `openapi_document()` in `apps/theorem-harness-server/src/openapi.rs` is the single source of truth; the server serves it at `GET /openapi.json`, and the committed `openapi-harness.json` is regenerated from it. The test `committed_openapi_snapshot_matches_code` compares the committed snapshot against the code on every `cargo test`, so the document cannot silently drift from the routes. To change the API: edit the routes, update `openapi_document()`, then regenerate with `UPDATE_OPENAPI=1 cargo test`.

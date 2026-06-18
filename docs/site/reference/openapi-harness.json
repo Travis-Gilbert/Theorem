@@ -1,0 +1,1252 @@
+{
+  "components": {
+    "parameters": {
+      "MapId": {
+        "in": "path",
+        "name": "map_id",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "RoomId": {
+        "description": "e.g. repo:theorem:branch:main.",
+        "in": "path",
+        "name": "room_id",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "RunId": {
+        "in": "path",
+        "name": "run_id",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "Tenant": {
+        "description": "Tenant slug. Alias `tenant_slug` is also accepted. Defaults to `default`.",
+        "in": "query",
+        "name": "tenant",
+        "required": false,
+        "schema": {
+          "default": "default",
+          "type": "string"
+        }
+      }
+    },
+    "schemas": {
+      "ConnectionTarget": {
+        "additionalProperties": true,
+        "description": "How to reach an MCP server. The stdio transport is shown.",
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "command": {
+            "type": "string"
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "stdio"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
+      "Event": {
+        "additionalProperties": true,
+        "description": "One transition in a run's append-ordered event log.",
+        "properties": {
+          "state_hash_after": {
+            "type": "string"
+          },
+          "type": {
+            "description": "e.g. RUN.CREATED, HOST.OBSERVED",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "Job": {
+        "additionalProperties": true,
+        "description": "The persisted job thread.",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "priority": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2"
+            ],
+            "type": "string"
+          },
+          "repo": {
+            "type": "string"
+          },
+          "target_head": {
+            "enum": [
+              "claude",
+              "codex",
+              "either"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "JobSubmission": {
+        "additionalProperties": true,
+        "description": "Core dispatch job fields (flattened into JobSubmitBody).",
+        "properties": {
+          "idempotency_key": {
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Omit to auto-mint a job- ULID.",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "priority": {
+            "default": "P2",
+            "enum": [
+              "P0",
+              "P1",
+              "P2"
+            ],
+            "type": "string"
+          },
+          "repo": {
+            "type": "string"
+          },
+          "source_project_id": {
+            "type": "string"
+          },
+          "source_task_id": {
+            "type": "string"
+          },
+          "spec_inline": {
+            "type": "string"
+          },
+          "spec_ref": {
+            "type": "string"
+          },
+          "target_head": {
+            "default": "either",
+            "enum": [
+              "claude",
+              "codex",
+              "either"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "repo"
+        ],
+        "type": "object"
+      },
+      "JobSubmitBody": {
+        "allOf": [
+          {
+            "properties": {
+              "room_id": {
+                "type": "string"
+              },
+              "submitted_by": {
+                "type": "string"
+              },
+              "tenant": {
+                "type": "string"
+              },
+              "tenant_slug": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          {
+            "$ref": "#/components/schemas/JobSubmission"
+          }
+        ]
+      },
+      "MapArtifact": {
+        "additionalProperties": true,
+        "description": "A codebase map projected into the graph.",
+        "properties": {
+          "entries": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "entry_count": {
+            "type": "integer"
+          },
+          "map_id": {
+            "type": "string"
+          },
+          "map_kind": {
+            "example": "CodebaseMap",
+            "type": "string"
+          },
+          "markdown_body": {
+            "type": "string"
+          },
+          "repo_id": {
+            "type": "string"
+          },
+          "scope_kind": {
+            "example": "repo",
+            "type": "string"
+          },
+          "scope_ref": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "MessagePost": {
+        "properties": {
+          "actor_id": {
+            "type": "string"
+          },
+          "delivery": {
+            "default": "passive",
+            "enum": [
+              "passive",
+              "wake"
+            ],
+            "type": "string"
+          },
+          "mentions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "tenant_slug": {
+            "default": "default",
+            "type": "string"
+          },
+          "urgency": {
+            "description": "Coordination urgency.",
+            "enum": [
+              "info",
+              "ask",
+              "block"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "actor_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "RegisterConnectorBody": {
+        "properties": {
+          "label": {
+            "description": "Defaults to server_id if empty.",
+            "type": "string"
+          },
+          "server_id": {
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/ConnectionTarget"
+          },
+          "tenant": {
+            "default": "default",
+            "type": "string"
+          }
+        },
+        "required": [
+          "server_id",
+          "target"
+        ],
+        "type": "object"
+      },
+      "RoomMessageEvent": {
+        "additionalProperties": true,
+        "description": "A coordination room message event (also the SSE payload).",
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "delivery": {
+            "enum": [
+              "Passive",
+              "Wake"
+            ],
+            "type": "string"
+          },
+          "mentions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "message_id": {
+            "type": "string"
+          },
+          "room_id": {
+            "type": "string"
+          },
+          "tenant_slug": {
+            "type": "string"
+          },
+          "urgency": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "Run": {
+        "additionalProperties": true,
+        "description": "Serialized harness run state. Core fields shown; additional fields may be present.",
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "state_hash": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "The HTTP surface of `theorem-harness-server`: a thin Axum server over a durable file-backed graph store. It serves the read contract Theorem clients consume (runs, codebase maps, coordination rooms, presence, intents, records, mentions) plus write endpoints for room messages, dispatch jobs, and MCP connector registration.\n\nScope: this is the Harness product transport only. The graph engine (`rustyred-thg-server`) is a separate service with its own, larger API published at its own `GET /openapi.json`.\n\nAuthentication: this server performs NO authentication today. The tenant is a plain `tenant` (or `tenant_slug`) string per request, defaulting to `default`. Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, `POST /harness/rooms/{room_id}/messages`) are therefore unauthenticated. Run it on a trusted network or behind an authenticating proxy before exposing it publicly.\n\nResponse shapes: envelope keys are stable and documented here. Inner objects (a run, an event, a room, an intent) are serialized graph-node state; their fields are described where pinned and otherwise left open rather than guessed.",
+    "summary": "HTTP/JSON transport for Theorem's Harness — runs, rooms, jobs, and connectors.",
+    "title": "Theorem Harness HTTP API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/connectors": {
+      "get": {
+        "description": "Read-only and fast; contacts no external server.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "affordances": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "connectors": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Registered connectors and the affordances learned from them."
+          }
+        },
+        "summary": "List registered MCP connectors and their tool affordances",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/connectors/register": {
+      "post": {
+        "description": "Spawns the target MCP server, performs the initialize -> notifications/initialized -> tools/list handshake, and registers each tool as a learnable affordance node under (tenant, server_id). The connection target is persisted so a selected tool can be invoked later.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterConnectorBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "affordance_ids": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "server": {
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "protocol": {
+                          "type": "string"
+                        },
+                        "version": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "server_id": {
+                      "type": "string"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The server info and the registered affordance ids."
+          },
+          "400": {
+            "description": "Missing server_id."
+          },
+          "502": {
+            "description": "MCP server handshake failed."
+          }
+        },
+        "summary": "Connect to an MCP server and register its tools as affordances",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/github/webhook": {
+      "post": {
+        "description": "Only mounted when GitHub App env config is present. Verifies the X-Hub-Signature-256 HMAC, deduplicates by X-GitHub-Delivery, and ingests push/PR/issue/review events into the code graph. Also available at /github/webhooks. Omitted entirely when GitHub App config is unset.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted (possibly a duplicate delivery)."
+          },
+          "400": {
+            "description": "Missing signature, event, or delivery header."
+          },
+          "401": {
+            "description": "Invalid signature."
+          }
+        },
+        "summary": "GitHub App webhook (conditionally mounted)",
+        "tags": [
+          "operations"
+        ]
+      }
+    },
+    "/harness/actors/{actor_id}/mentions": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "actor_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "description": "Single urgency filter (info, ask, block). Alias of `urgencies`.",
+            "in": "query",
+            "name": "urgency",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated urgency filter.",
+            "in": "query",
+            "name": "urgencies",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "If true, mark the returned mentions as read.",
+            "in": "query",
+            "name": "consume",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "actor_id": {
+                      "type": "string"
+                    },
+                    "consumed": {
+                      "type": "boolean"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "mentions": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    },
+                    "urgencies": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Pending mentions for the actor."
+          }
+        },
+        "summary": "Read (and optionally consume) an actor's mention inbox",
+        "tags": [
+          "actors"
+        ]
+      }
+    },
+    "/harness/jobs": {
+      "post": {
+        "description": "Creates or upserts a pending Job. Defaults: tenant -> default, room -> repo:theorem:branch:main, submitted_by -> theorem-harness-server. If THEOREM_DISPATCH_DATABASE_URL is set, the job is mirrored into the Postgres dispatch queue and a wake event is emitted to the target head.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobSubmitBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "created": {
+                      "type": "boolean"
+                    },
+                    "dispatch_mirrored": {
+                      "type": "boolean"
+                    },
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    },
+                    "job_id": {
+                      "type": "string"
+                    },
+                    "room_id": {
+                      "type": "string"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    },
+                    "wake_event": {
+                      "$ref": "#/components/schemas/RoomMessageEvent"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The created/updated job and the emitted wake event."
+          },
+          "400": {
+            "description": "Invalid submission."
+          },
+          "502": {
+            "description": "Dispatch queue (Postgres) unavailable."
+          }
+        },
+        "summary": "Submit a dispatch job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/harness/jobs/counts": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "counts": {
+                      "items": {
+                        "properties": {
+                          "count": {
+                            "type": "integer"
+                          },
+                          "state": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "dispatch_configured": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Dispatch state counts. If no dispatch database is configured, dispatch_configured is false and counts is empty."
+          }
+        },
+        "summary": "Inspect Postgres dispatch state counts",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/harness/maps": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "maps": {
+                      "items": {
+                        "$ref": "#/components/schemas/MapArtifact"
+                      },
+                      "type": "array"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Map artifacts for the tenant."
+          }
+        },
+        "summary": "List codebase map artifacts for a tenant",
+        "tags": [
+          "maps"
+        ]
+      }
+    },
+    "/harness/maps/{map_id}": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MapId"
+          },
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "map": {
+                      "$ref": "#/components/schemas/MapArtifact"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The map artifact, including its rendered markdown body."
+          },
+          "404": {
+            "description": "Unknown map_id, or map belongs to another tenant."
+          }
+        },
+        "summary": "Get one codebase map artifact",
+        "tags": [
+          "maps"
+        ]
+      }
+    },
+    "/harness/rooms/{room_id}": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RoomId"
+          },
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "room": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "room_id": {
+                      "type": "string"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Room membership and task state."
+          }
+        },
+        "summary": "Get coordination room state",
+        "tags": [
+          "rooms"
+        ]
+      }
+    },
+    "/harness/rooms/{room_id}/intents": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RoomId"
+          },
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "description": "Single status filter (e.g. working, paused, done). Alias of `statuses`.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated status filter.",
+            "in": "query",
+            "name": "statuses",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "intents": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "room_id": {
+                      "type": "string"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Intent records, optionally filtered by status."
+          }
+        },
+        "summary": "List live intents (announced footprints) for a room",
+        "tags": [
+          "rooms"
+        ]
+      }
+    },
+    "/harness/rooms/{room_id}/messages": {
+      "post": {
+        "description": "Writes a coordination message and publishes it on the in-process bus. `delivery: passive` is a tap (recorded, no spawn); `delivery: wake` is a hold the wake-listener can act on. Defaults to passive.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RoomId"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessagePost"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "event": {
+                      "$ref": "#/components/schemas/RoomMessageEvent"
+                    },
+                    "message": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The written message plus the emitted room event."
+          },
+          "400": {
+            "description": "Missing or empty actor_id or message."
+          }
+        },
+        "summary": "Write a message to a room (and emit a push event)",
+        "tags": [
+          "rooms"
+        ]
+      }
+    },
+    "/harness/rooms/{room_id}/presence": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RoomId"
+          },
+          {
+            "$ref": "#/components/parameters/Tenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "presence": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Presence entries."
+          }
+        },
+        "summary": "List member presence for a room's tenant",
+        "tags": [
+          "rooms"
+        ]
+      }
+    },
+    "/harness/rooms/{room_id}/records": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RoomId"
+          },
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "description": "Single record-type filter. Alias of `record_types`.",
+            "in": "query",
+            "name": "record_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated record-type filter (event, decision, tension, reflection).",
+            "in": "query",
+            "name": "record_types",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "records": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "room_id": {
+                      "type": "string"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Durable records, newest-bounded by limit."
+          }
+        },
+        "summary": "List durable room records (decisions, tensions, reflections, events)",
+        "tags": [
+          "rooms"
+        ]
+      }
+    },
+    "/harness/rooms/{room_id}/stream": {
+      "get": {
+        "description": "A long-lived SSE stream; each event is a JSON RoomMessageEvent. The `tenant` query parameter is required and scopes the subscription.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RoomId"
+          },
+          {
+            "in": "query",
+            "name": "tenant",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "An event stream of room messages."
+          },
+          "400": {
+            "description": "Missing tenant query parameter."
+          }
+        },
+        "summary": "Subscribe to a room's messages over Server-Sent Events",
+        "tags": [
+          "rooms"
+        ]
+      }
+    },
+    "/harness/runs": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "runs": {
+                      "items": {
+                        "$ref": "#/components/schemas/Run"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "runs"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "All runs in the store (empty array if none yet)."
+          }
+        },
+        "summary": "List harness runs",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/harness/runs/{run_id}": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "events": {
+                      "items": {
+                        "$ref": "#/components/schemas/Event"
+                      },
+                      "type": "array"
+                    },
+                    "run": {
+                      "$ref": "#/components/schemas/Run"
+                    }
+                  },
+                  "required": [
+                    "run",
+                    "events"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The run plus its append-ordered transition events."
+          },
+          "404": {
+            "description": "Unknown run_id."
+          }
+        },
+        "summary": "Get one run with its ordered event log",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "example": "ok",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server is up."
+          }
+        },
+        "summary": "Liveness probe",
+        "tags": [
+          "operations"
+        ]
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document for this server."
+          }
+        },
+        "summary": "This OpenAPI 3.1 document",
+        "tags": [
+          "operations"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "description": "Local default (PORT defaults to 50080)",
+      "url": "http://localhost:50080"
+    },
+    {
+      "description": "Deployed instance",
+      "url": "https://{host}",
+      "variables": {
+        "host": {
+          "default": "harness.example.com"
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "description": "Liveness and the OpenAPI document.",
+      "name": "operations"
+    },
+    {
+      "description": "Harness run read contract (typed event log per run).",
+      "name": "runs"
+    },
+    {
+      "description": "Codebase map artifacts projected into the graph.",
+      "name": "maps"
+    },
+    {
+      "description": "Coordination rooms: presence, intents, records, messages, live stream.",
+      "name": "rooms"
+    },
+    {
+      "description": "Per-actor mention inbox.",
+      "name": "actors"
+    },
+    {
+      "description": "Dispatch v2 job board and Postgres dispatch counts.",
+      "name": "jobs"
+    },
+    {
+      "description": "MCP connector registration and learnable tool affordances.",
+      "name": "connectors"
+    }
+  ]
+}

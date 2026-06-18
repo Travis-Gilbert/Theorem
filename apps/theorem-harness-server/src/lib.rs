@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 //! JSON/HTTP transport handlers over `theorem-harness-runtime`.
 //!
 //! The two read shapes the Theorem clients consume (see
@@ -15,10 +16,12 @@
 
 pub mod github;
 pub mod github_app;
+pub mod openapi;
 pub mod push;
 
 pub use github::{github_router, verify_webhook_signature, GithubWebhookState};
 pub use github_app::{GithubApp, GithubAppError, InstallationToken};
+pub use openapi::openapi_document;
 pub use push::{
     push_router, spawn_wake_listener, CommandSpawnDispatcher, Delivery, MessagePost, PushState,
     RoomBus, RoomMessageEvent, SpawnDispatcher, SpawnOutcome, WakeDispatchContext,
