@@ -57,9 +57,114 @@ pub struct CompoundHookReceipt {
     pub captured_doc_id: String,
     pub used_pack_hashes: Vec<String>,
     pub used_memory_doc_ids: Vec<String>,
+    #[serde(default)]
+    pub retrieval_attributions: Vec<RetrievalAttribution>,
     pub promotion_proposals: Vec<Value>,
     pub demotions: Vec<Value>,
     pub decayed_items: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalAttribution {
+    pub artifact_id: String,
+    pub query: String,
+    pub query_signature: String,
+    pub seed_signature: String,
+    #[serde(default)]
+    pub memory_doc_ids: Vec<String>,
+    #[serde(default)]
+    pub expansion_depth: Option<u64>,
+    #[serde(default)]
+    pub gap_frontier_choices: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OutcomeSignal {
+    pub run_id: String,
+    pub outcome: String,
+    pub signal: String,
+    pub config_hash: String,
+    pub cluster_key: String,
+    pub run_counter: u64,
+    #[serde(default)]
+    pub gate_axes: Value,
+}
+
+impl OutcomeSignal {
+    fn from_outcome(
+        run_id: &str,
+        outcome: &OutcomeClass,
+        gate_axes: Value,
+        config_hash: &str,
+        cluster_key: &str,
+        run_counter: u64,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            outcome: outcome.as_str().to_string(),
+            signal: outcome.signal().to_string(),
+            config_hash: config_hash.to_string(),
+            cluster_key: cluster_key.to_string(),
+            run_counter,
+            gate_axes,
+        }
+    }
+
+    pub fn is_positive(&self) -> bool {
+        self.outcome == "positive"
+    }
+
+    pub fn hard_axis_regression(&self) -> bool {
+        self.gate_axes
+            .get("writing_engineering")
+            .and_then(|value| value.get("last_hard_axis_failed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompoundStandingReceipt {
+    pub artifact_type: String,
+    pub artifact_id: String,
+    pub run_count: u64,
+    pub positive_count: u64,
+    pub hard_axis_regressions: u64,
+    pub last_outcome: String,
+}
+
+pub trait CompoundingArtifact {
+    fn compound_artifact_type(&self) -> &'static str;
+    fn compound_artifact_id(&self) -> String;
+    fn compound_metadata_mut(&mut self) -> &mut Map<String, Value>;
+}
+
+impl CompoundingArtifact for SkillPackState {
+    fn compound_artifact_type(&self) -> &'static str {
+        "skill_pack"
+    }
+
+    fn compound_artifact_id(&self) -> String {
+        self.pack_content_hash.clone()
+    }
+
+    fn compound_metadata_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.metadata
+    }
+}
+
+pub fn apply_compound_standing<A: CompoundingArtifact>(
+    artifact: &mut A,
+    signal: &OutcomeSignal,
+) -> CompoundStandingReceipt {
+    let artifact_type = artifact.compound_artifact_type().to_string();
+    let artifact_id = artifact.compound_artifact_id();
+    let receipt = apply_compound_standing_to_metadata(artifact.compound_metadata_mut(), signal);
+    CompoundStandingReceipt {
+        artifact_type,
+        artifact_id,
+        ..receipt
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -67,6 +172,7 @@ struct UsedItems {
     packs: BTreeMap<String, UsedPack>,
     memory_doc_ids: BTreeSet<String>,
     tools: BTreeSet<String>,
+    retrieval_attributions: BTreeMap<String, RetrievalAttribution>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -338,6 +444,11 @@ pub fn apply_run_close_hook<S: GraphStore>(
                 .filter(|pack_id| !pack_id.is_empty())
                 .collect::<Vec<_>>(),
             "used_memory_doc_ids": used.memory_doc_ids.iter().cloned().collect::<Vec<_>>(),
+            "retrieval_attributions": used
+                .retrieval_attributions
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
             "used_tools": used.tools.iter().cloned().collect::<Vec<_>>(),
             "positive_reinforcement_applied": outcome == OutcomeClass::Positive,
         }),
@@ -380,6 +491,7 @@ pub fn apply_run_close_hook<S: GraphStore>(
             .map(|pack| pack.pack_content_hash.clone())
             .collect(),
         used_memory_doc_ids: used.memory_doc_ids.into_iter().collect(),
+        retrieval_attributions: used.retrieval_attributions.into_values().collect(),
         promotion_proposals,
         demotions,
         decayed_items,
@@ -487,6 +599,16 @@ fn capture_run_if_qualifies<S: GraphStore>(
                             .collect(),
                     ),
                 ),
+                (
+                    "retrieval_attributions".to_string(),
+                    serde_json::to_value(
+                        used.retrieval_attributions
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_else(|_| Value::Array(Vec::new())),
+                ),
             ]),
             created_at: trigger.created_at.clone(),
             ..MemoryWriteInput::default()
@@ -559,20 +681,16 @@ fn apply_usage_fitness<S: GraphStore>(
             continue;
         };
         let gate_axes = gate_axes_for_pack(&pack.pack_content_hash, events);
-        update_pack_compound_metadata(
-            &mut state,
+        let signal = OutcomeSignal::from_outcome(
             run_id,
             outcome,
-            &gate_axes,
+            gate_axes.clone(),
             config_hash,
             cluster_key,
             run_counter,
         );
-        let hard_axis_regression = gate_axes
-            .get("writing_engineering")
-            .and_then(|value| value.get("last_hard_axis_failed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        update_pack_compound_metadata(&mut state, &signal);
+        let hard_axis_regression = signal.hard_axis_regression();
         if state.status == "shadow" && benchmark_gate_passed(&state, &gate_axes, config) {
             let proposal = json!({
                 "pack_id": state.pack_id,
@@ -627,16 +745,14 @@ fn apply_usage_fitness<S: GraphStore>(
     Ok((proposals, demotions))
 }
 
-fn update_pack_compound_metadata(
-    state: &mut SkillPackState,
-    run_id: &str,
-    outcome: &OutcomeClass,
-    gate_axes: &Value,
-    config_hash: &str,
-    cluster_key: &str,
-    run_counter: u64,
-) {
-    let mut metadata = state.metadata.clone();
+fn update_pack_compound_metadata(state: &mut SkillPackState, signal: &OutcomeSignal) {
+    apply_compound_standing(state, signal);
+}
+
+fn apply_compound_standing_to_metadata(
+    metadata: &mut Map<String, Value>,
+    signal: &OutcomeSignal,
+) -> CompoundStandingReceipt {
     let mut compound = metadata
         .get("compound")
         .and_then(Value::as_object)
@@ -649,20 +765,21 @@ fn update_pack_compound_metadata(
         .unwrap_or_default();
     if !ledger
         .iter()
-        .any(|entry| entry.get("run_id").and_then(Value::as_str) == Some(run_id))
+        .any(|entry| entry.get("run_id").and_then(Value::as_str) == Some(signal.run_id.as_str()))
     {
         ledger.push(json!({
-            "run_id": run_id,
-            "outcome": outcome.as_str(),
-            "cluster_key": cluster_key,
-            "config_hash": config_hash,
-            "gate_axes": gate_axes,
+            "run_id": signal.run_id,
+            "outcome": signal.outcome,
+            "signal": signal.signal,
+            "cluster_key": signal.cluster_key,
+            "config_hash": signal.config_hash,
+            "gate_axes": signal.gate_axes,
         }));
     }
     compound.insert("ledger".to_string(), Value::Array(ledger));
     compound.insert(
         "last_used_run_counter".to_string(),
-        Value::Number(run_counter.into()),
+        Value::Number(signal.run_counter.into()),
     );
 
     let mut fitness = metadata
@@ -676,34 +793,52 @@ fn update_pack_compound_metadata(
         .cloned()
         .unwrap_or_default();
     increment_u64(&mut compound_fitness, "run_count");
-    if *outcome == OutcomeClass::Positive {
+    if signal.is_positive() {
         increment_u64(&mut compound_fitness, "positive_count");
     }
-    if gate_axes
-        .get("writing_engineering")
-        .and_then(|value| value.get("last_hard_axis_failed"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if signal.hard_axis_regression() {
         increment_u64(&mut compound_fitness, "hard_axis_regressions");
     }
     compound_fitness.insert(
         "last_outcome".to_string(),
-        Value::String(outcome.as_str().to_string()),
+        Value::String(signal.outcome.clone()),
     );
-    compound_fitness.insert("last_run_id".to_string(), Value::String(run_id.to_string()));
+    compound_fitness.insert(
+        "last_run_id".to_string(),
+        Value::String(signal.run_id.clone()),
+    );
     compound_fitness.insert("low_fitness".to_string(), Value::Bool(false));
     compound_fitness.insert(
         "last_used_run_counter".to_string(),
-        Value::Number(run_counter.into()),
+        Value::Number(signal.run_counter.into()),
     );
+    let run_count = compound_fitness
+        .get("run_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let positive_count = compound_fitness
+        .get("positive_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let hard_axis_regressions = compound_fitness
+        .get("hard_axis_regressions")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     fitness.insert("compound".to_string(), Value::Object(compound_fitness));
-    if let Some(style_axes) = gate_axes.get("writing_engineering") {
-        fitness.insert("writing_engineering".to_string(), style_axes.clone());
+    if let Some(axis_map) = signal.gate_axes.as_object() {
+        for (axis, value) in axis_map {
+            fitness.insert(axis.clone(), value.clone());
+        }
     }
     metadata.insert("fitness".to_string(), Value::Object(fitness));
     metadata.insert("compound".to_string(), Value::Object(compound));
-    state.metadata = metadata;
+    CompoundStandingReceipt {
+        run_count,
+        positive_count,
+        hard_axis_regressions,
+        last_outcome: signal.outcome.clone(),
+        ..CompoundStandingReceipt::default()
+    }
 }
 
 fn gate_axes_for_pack(pack_content_hash: &str, events: &[EventState]) -> Value {
@@ -745,6 +880,7 @@ fn collect_used_items<S: GraphStore>(
     for event in events {
         collect_pack_from_payload(&mut used, &event.payload);
         collect_memory_from_payload(&mut used, &event.payload);
+        collect_retrieval_from_payload(&mut used, &event.payload);
         collect_tools_from_payload(&mut used, &event.payload);
     }
     for node in store
@@ -831,6 +967,98 @@ fn collect_memory_from_payload(used: &mut UsedItems, payload: &Map<String, Value
         collect_strings_by_key(context, "memory_doc_ids", &mut used.memory_doc_ids);
         collect_strings_by_key(context, "cited_memory_doc_ids", &mut used.memory_doc_ids);
     }
+}
+
+fn collect_retrieval_from_payload(used: &mut UsedItems, payload: &Map<String, Value>) {
+    let payload_value = Value::Object(payload.clone());
+    let mut memory_doc_ids = BTreeSet::new();
+    for key in [
+        "memory_doc_id",
+        "memory_doc_ids",
+        "cited_memory_doc_id",
+        "cited_memory_doc_ids",
+        "memory_citations",
+    ] {
+        collect_strings_by_key(&payload_value, key, &mut memory_doc_ids);
+    }
+    if memory_doc_ids.is_empty() {
+        return;
+    }
+
+    let query = first_text_by_keys(
+        &payload_value,
+        &[
+            "retrieval_query",
+            "memory_query",
+            "query",
+            "task_query",
+            "prompt_query",
+        ],
+    )
+    .unwrap_or_default();
+    let query_signature = first_text_by_keys(&payload_value, &["query_signature"])
+        .unwrap_or_else(|| signature_for_value(&json!({ "query": query })));
+    let seed_signature =
+        first_text_by_keys(&payload_value, &["seed_signature"]).unwrap_or_else(|| {
+            first_value_by_keys(
+                &payload_value,
+                &["seed_report", "seed_ids", "seeds", "retrieval_seeds"],
+            )
+            .map(|value| signature_for_value(&value))
+            .unwrap_or_else(|| {
+                signature_for_value(&Value::Array(
+                    memory_doc_ids.iter().cloned().map(Value::String).collect(),
+                ))
+            })
+        });
+    let expansion_depth = first_u64_by_keys(
+        &payload_value,
+        &["expansion_depth", "retrieval_depth", "ppr_depth", "depth"],
+    );
+    let mut gap_frontier_choices = BTreeSet::new();
+    for key in [
+        "gap_frontier_choices",
+        "frontier_choices",
+        "gap_frontier",
+        "retrieval_frontier",
+    ] {
+        collect_strings_by_key(&payload_value, key, &mut gap_frontier_choices);
+    }
+
+    let memory_doc_ids = memory_doc_ids.into_iter().collect::<Vec<_>>();
+    let gap_frontier_choices = gap_frontier_choices.into_iter().collect::<Vec<_>>();
+    let artifact_id = first_text_by_keys(
+        &payload_value,
+        &[
+            "retrieval_path_id",
+            "retrieval_artifact_id",
+            "context_artifact_id",
+            "artifact_id",
+        ],
+    )
+    .unwrap_or_else(|| {
+        format!(
+            "retrieval:path:{}",
+            stable_value_hash(&json!({
+                "query_signature": query_signature,
+                "seed_signature": seed_signature,
+                "memory_doc_ids": memory_doc_ids,
+                "expansion_depth": expansion_depth,
+                "gap_frontier_choices": gap_frontier_choices,
+            }))
+        )
+    });
+    used.retrieval_attributions
+        .entry(artifact_id.clone())
+        .or_insert(RetrievalAttribution {
+            artifact_id,
+            query,
+            query_signature,
+            seed_signature,
+            memory_doc_ids,
+            expansion_depth,
+            gap_frontier_choices,
+        });
 }
 
 fn collect_tools_from_payload(used: &mut UsedItems, payload: &Map<String, Value>) {
@@ -1390,6 +1618,58 @@ fn collect_strings_by_key(value: &Value, key: &str, output: &mut BTreeSet<String
         }
         _ => {}
     }
+}
+
+fn first_text_by_keys(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(text) = text_value(map.get(*key)) {
+                    return Some(text);
+                }
+            }
+            map.values().find_map(|item| first_text_by_keys(item, keys))
+        }
+        Value::Array(items) => items.iter().find_map(|item| first_text_by_keys(item, keys)),
+        _ => None,
+    }
+}
+
+fn first_u64_by_keys(value: &Value, keys: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(number) = map.get(*key).and_then(Value::as_u64) {
+                    return Some(number);
+                }
+            }
+            map.values().find_map(|item| first_u64_by_keys(item, keys))
+        }
+        Value::Array(items) => items.iter().find_map(|item| first_u64_by_keys(item, keys)),
+        _ => None,
+    }
+}
+
+fn first_value_by_keys(value: &Value, keys: &[&str]) -> Option<Value> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key) {
+                    return Some(value.clone());
+                }
+            }
+            map.values()
+                .find_map(|item| first_value_by_keys(item, keys))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| first_value_by_keys(item, keys)),
+        _ => None,
+    }
+}
+
+fn signature_for_value(value: &Value) -> String {
+    format!("sha256:{}", stable_value_hash(value))
 }
 
 fn text_value(value: Option<&Value>) -> Option<String> {
@@ -2016,6 +2296,152 @@ mod tests {
         assert_eq!(after.fitness, before_fitness);
         assert_eq!(after.updated_at, before_updated_at);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn generic_standing_update_core_records_outcome_signal() {
+        #[derive(Default)]
+        struct TestArtifact {
+            metadata: Map<String, Value>,
+        }
+
+        impl CompoundingArtifact for TestArtifact {
+            fn compound_artifact_type(&self) -> &'static str {
+                "calibration_model"
+            }
+
+            fn compound_artifact_id(&self) -> String {
+                "calibration:v1".to_string()
+            }
+
+            fn compound_metadata_mut(&mut self) -> &mut Map<String, Value> {
+                &mut self.metadata
+            }
+        }
+
+        let mut artifact = TestArtifact::default();
+        let signal = OutcomeSignal {
+            run_id: "run-signal".to_string(),
+            outcome: "positive".to_string(),
+            signal: "pinned".to_string(),
+            config_hash: "cfg:1".to_string(),
+            cluster_key: "cluster:a".to_string(),
+            run_counter: 7,
+            gate_axes: json!({
+                "calibration": { "brier": 0.12 },
+                "writing_engineering": { "last_hard_axis_failed": true }
+            }),
+        };
+
+        let receipt = apply_compound_standing(&mut artifact, &signal);
+
+        assert_eq!(receipt.artifact_type, "calibration_model");
+        assert_eq!(receipt.artifact_id, "calibration:v1");
+        assert_eq!(receipt.run_count, 1);
+        assert_eq!(receipt.positive_count, 1);
+        assert_eq!(receipt.hard_axis_regressions, 1);
+        assert_eq!(
+            artifact.metadata["fitness"]["compound"]["last_used_run_counter"],
+            json!(7)
+        );
+        assert_eq!(
+            artifact.metadata["fitness"]["calibration"]["brier"],
+            json!(0.12)
+        );
+        assert_eq!(
+            artifact.metadata["compound"]["ledger"][0]["signal"],
+            json!("pinned")
+        );
+    }
+
+    #[test]
+    fn run_close_receipt_records_retrieval_path_attribution() {
+        let mut store = InMemoryGraphStore::new();
+        publish_writing_pack(&mut store, "shadow", true);
+
+        drive_run_preamble(
+            &mut store,
+            "run-retrieval-attribution",
+            "Use similar prior memory for a fix",
+        );
+        append_transition_from_store(
+            &mut store,
+            transition(
+                "run-retrieval-attribution",
+                "SESSION.EVENT_RECORDED",
+                json!({
+                    "event_subtype": "memory_retrieval",
+                    "retrieval_path_id": "retrieval:similar-fix",
+                    "retrieval_query": "similar prior memory for failing wake route",
+                    "seed_signature": "seed:repo-main",
+                    "expansion_depth": 2,
+                    "gap_frontier_choices": ["coordination_push", "receiver_wake"],
+                    "memory_doc_ids": ["doc-a", "doc-b"]
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            &mut store,
+            transition(
+                "run-retrieval-attribution",
+                "OUTCOME.RECORDED",
+                json!({
+                    "accepted": true,
+                    "tests_passed": true,
+                    "manual_override": true,
+                    "validator_results": [],
+                    "files_changed": [],
+                    "summary": "accepted"
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            &mut store,
+            transition(
+                "run-retrieval-attribution",
+                "RUN.CLOSED",
+                json!({
+                    "summary": "closed",
+                    "closed_by": "codex",
+                    "source_identifiers": []
+                }),
+            ),
+        )
+        .unwrap();
+
+        let fitness = compound_event(
+            &store,
+            "run-retrieval-attribution",
+            "COMPOUND.FITNESS_APPLIED",
+        );
+        let attributions = fitness.payload["retrieval_attributions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(attributions.len(), 1);
+        assert_eq!(
+            attributions[0]["artifact_id"],
+            json!("retrieval:similar-fix")
+        );
+        assert_eq!(
+            attributions[0]["query"],
+            json!("similar prior memory for failing wake route")
+        );
+        assert_eq!(attributions[0]["seed_signature"], json!("seed:repo-main"));
+        assert_eq!(attributions[0]["memory_doc_ids"], json!(["doc-a", "doc-b"]));
+
+        let capture = load_memory_document(
+            &store,
+            "default",
+            "compound:capture:run-retrieval-attribution",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            capture.metadata["retrieval_attributions"][0]["expansion_depth"],
+            json!(2)
+        );
     }
 
     #[test]

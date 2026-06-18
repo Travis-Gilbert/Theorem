@@ -21,7 +21,8 @@ pub use github::{github_router, verify_webhook_signature, GithubWebhookState};
 pub use github_app::{GithubApp, GithubAppError, InstallationToken};
 pub use push::{
     push_router, spawn_wake_listener, CommandSpawnDispatcher, Delivery, MessagePost, PushState,
-    RoomBus, RoomMessageEvent, SpawnDispatcher, SpawnOutcome, DEFAULT_BUS_CAPACITY,
+    RoomBus, RoomMessageEvent, SpawnDispatcher, SpawnOutcome, WakeDispatchContext,
+    DEFAULT_BUS_CAPACITY,
 };
 
 use rustyred_thg_affordances::{affordance_nodes, AffordanceGraphStore};
@@ -35,7 +36,8 @@ use theorem_harness_core::{
 };
 use theorem_harness_runtime::{
     list_presence, load_events, load_run, read_intents_for_room, read_mentions_for_actor,
-    read_records_for_room, room_status, CoordinationError, HarnessRuntimeError,
+    read_mentions_for_actor_with_urgencies, read_records_for_room, room_status, CoordinationError,
+    HarnessRuntimeError,
 };
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
@@ -120,13 +122,26 @@ pub fn mentions_json<S: GraphStore>(
     store: &mut S,
     tenant_slug: &str,
     actor_id: &str,
+    urgencies: &[String],
     consume: bool,
     limit: usize,
 ) -> Result<Value, CoordinationError> {
-    let mentions = read_mentions_for_actor(store, tenant_slug, actor_id, consume, limit)?;
+    let mentions = if urgencies.is_empty() {
+        read_mentions_for_actor(store, tenant_slug, actor_id, consume, limit)?
+    } else {
+        read_mentions_for_actor_with_urgencies(
+            store,
+            tenant_slug,
+            actor_id,
+            urgencies,
+            consume,
+            limit,
+        )?
+    };
     Ok(json!({
         "tenant": tenant_slug,
         "actor_id": actor_id,
+        "urgencies": urgencies,
         "mentions": mentions,
         "count": mentions.len(),
         "consumed": consume
@@ -529,17 +544,17 @@ mod tests {
             json!("Expose coordination HTTP endpoints")
         );
 
-        let mentions =
-            mentions_json(&mut store, "smoke", "claude-code", false, 20).expect("mentions json");
+        let mentions = mentions_json(&mut store, "smoke", "claude-code", &[], false, 20)
+            .expect("mentions json");
         assert_eq!(mentions["count"], json!(1));
         assert_eq!(mentions["mentions"][0]["actor_id"], json!("codex"));
 
-        let consumed =
-            mentions_json(&mut store, "smoke", "claude-code", true, 20).expect("consume mentions");
+        let consumed = mentions_json(&mut store, "smoke", "claude-code", &[], true, 20)
+            .expect("consume mentions");
         assert_eq!(consumed["count"], json!(1));
 
-        let empty_after_consume =
-            mentions_json(&mut store, "smoke", "claude-code", false, 20).expect("mentions empty");
+        let empty_after_consume = mentions_json(&mut store, "smoke", "claude-code", &[], false, 20)
+            .expect("mentions empty");
         assert_eq!(empty_after_consume["count"], json!(0));
 
         let records =

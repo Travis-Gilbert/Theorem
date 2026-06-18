@@ -47,10 +47,11 @@ pub use work_graph_store::{
 };
 
 pub use compound_engineering::{
-    apply_run_close_hook, compound_config_hash, compound_config_node_id, compound_state_node_id,
-    list_compound_captures, load_compound_config, persist_compound_config, CompoundConfig,
-    CompoundHookReceipt, COMPOUND_CAPTURE_TAG, COMPOUND_CONFIG_NODE_LABEL, COMPOUND_ROOM_ID,
-    COMPOUND_STATE_NODE_LABEL,
+    apply_compound_standing, apply_run_close_hook, compound_config_hash, compound_config_node_id,
+    compound_state_node_id, list_compound_captures, load_compound_config, persist_compound_config,
+    CompoundConfig, CompoundHookReceipt, CompoundStandingReceipt, CompoundingArtifact,
+    OutcomeSignal, RetrievalAttribution, COMPOUND_CAPTURE_TAG, COMPOUND_CONFIG_NODE_LABEL,
+    COMPOUND_ROOM_ID, COMPOUND_STATE_NODE_LABEL,
 };
 pub use coordination::{
     coordination_binding_id, coordination_intent_edge_id, coordination_intent_node_id,
@@ -61,6 +62,7 @@ pub use coordination::{
     end_presence, heartbeat_presence, infer_coordination_room_id, join_room, list_presence,
     load_presence, normalize_coordination_urgency, parse_coordination_mentions,
     read_intents_for_room, read_mentions_for_actor, read_mentions_for_actor_in_room,
+    read_mentions_for_actor_in_room_with_urgencies, read_mentions_for_actor_with_urgencies,
     read_messages_for_room, read_records_for_room, room_status, stable_coordination_message_id,
     stable_coordination_record_id, write_intent, write_message, write_record, CoordinationError,
     CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,

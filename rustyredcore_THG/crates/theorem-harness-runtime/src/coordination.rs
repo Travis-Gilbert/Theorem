@@ -779,7 +779,7 @@ pub fn read_mentions_for_actor<S: GraphStore>(
     consume: bool,
     limit: usize,
 ) -> CoordinationResult<Vec<CoordinationMessageState>> {
-    read_mentions_for_actor_filtered(store, tenant_slug, None, actor_id, consume, limit)
+    read_mentions_for_actor_filtered(store, tenant_slug, None, actor_id, &[], consume, limit)
 }
 
 pub fn read_mentions_for_actor_in_room<S: GraphStore>(
@@ -795,6 +795,46 @@ pub fn read_mentions_for_actor_in_room<S: GraphStore>(
         tenant_slug,
         Some(normalize_room_id(room_id)),
         actor_id,
+        &[],
+        consume,
+        limit,
+    )
+}
+
+pub fn read_mentions_for_actor_with_urgencies<S: GraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    actor_id: &str,
+    urgencies: &[String],
+    consume: bool,
+    limit: usize,
+) -> CoordinationResult<Vec<CoordinationMessageState>> {
+    read_mentions_for_actor_filtered(
+        store,
+        tenant_slug,
+        None,
+        actor_id,
+        urgencies,
+        consume,
+        limit,
+    )
+}
+
+pub fn read_mentions_for_actor_in_room_with_urgencies<S: GraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    room_id: &str,
+    actor_id: &str,
+    urgencies: &[String],
+    consume: bool,
+    limit: usize,
+) -> CoordinationResult<Vec<CoordinationMessageState>> {
+    read_mentions_for_actor_filtered(
+        store,
+        tenant_slug,
+        Some(normalize_room_id(room_id)),
+        actor_id,
+        urgencies,
         consume,
         limit,
     )
@@ -805,11 +845,17 @@ fn read_mentions_for_actor_filtered<S: GraphStore>(
     tenant_slug: &str,
     room_id: Option<String>,
     actor_id: &str,
+    urgencies: &[String],
     consume: bool,
     limit: usize,
 ) -> CoordinationResult<Vec<CoordinationMessageState>> {
     let tenant_slug = normalize_tenant_slug(tenant_slug);
     let actor_id = require_text("actor_id", actor_id)?;
+    let urgency_filter = urgencies
+        .iter()
+        .map(|urgency| urgency.trim().to_ascii_lowercase())
+        .filter(|urgency| !urgency.is_empty())
+        .collect::<BTreeSet<_>>();
     let mut messages = store
         .query_nodes(
             NodeQuery::label("CoordinationMessage")
@@ -827,6 +873,7 @@ fn read_mentions_for_actor_filtered<S: GraphStore>(
                         .as_ref()
                         .map(|room_id| message.room_id == room_id.as_str())
                         .unwrap_or(true)
+                    && (urgency_filter.is_empty() || urgency_filter.contains(&message.urgency))
                     && !message
                         .consumed_by
                         .iter()
@@ -2321,6 +2368,53 @@ mod tests {
         let codex = read_mentions_for_actor(&mut store, TENANT, "codex", false, 10).unwrap();
         assert_eq!(codex.len(), 1);
         assert_eq!(codex[0].message_id, "m2");
+    }
+
+    #[test]
+    fn read_mentions_can_consume_only_selected_urgencies() {
+        let mut store = InMemoryGraphStore::new();
+        for (message_id, urgency, message) in [
+            ("m-info", "info", "@claude-code FYI"),
+            ("m-ask", "ask", "@claude-code question"),
+            ("m-block", "block", "@claude-code blocked"),
+        ] {
+            write_message(
+                &mut store,
+                WriteMessageInput {
+                    tenant_slug: TENANT.to_string(),
+                    room_id: ROOM.to_string(),
+                    actor_id: "codex".to_string(),
+                    message_id: message_id.to_string(),
+                    urgency: urgency.to_string(),
+                    message: message.to_string(),
+                    created_at: T1.to_string(),
+                    ..WriteMessageInput::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let urgent = read_mentions_for_actor_with_urgencies(
+            &mut store,
+            TENANT,
+            "claude-code",
+            &["ask".to_string(), "block".to_string()],
+            true,
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            urgent
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m-ask", "m-block"]
+        );
+
+        let remaining =
+            read_mentions_for_actor(&mut store, TENANT, "claude-code", false, 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].message_id, "m-info");
     }
 
     #[test]

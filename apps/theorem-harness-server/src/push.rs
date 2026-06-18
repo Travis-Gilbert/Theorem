@@ -35,8 +35,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use theorem_harness_runtime::{
-    room_status, stream_event_matches, wake_targets, write_message, CoordinationError,
-    CoordinationMessageState, RoomEventBus, WriteMessageInput, DEFAULT_ROOM_BUS_CAPACITY,
+    load_presence, read_mentions_for_actor_in_room, room_status, stream_event_matches,
+    wake_targets, write_message, CoordinationError, CoordinationMessageState,
+    CoordinationPresenceState, RoomEventBus, WriteMessageInput, DEFAULT_ROOM_BUS_CAPACITY,
 };
 
 pub const DEFAULT_BUS_CAPACITY: usize = DEFAULT_ROOM_BUS_CAPACITY;
@@ -99,12 +100,29 @@ pub struct SpawnOutcome {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct WakeDispatchContext {
+    #[serde(default)]
+    pub pending_mentions: Vec<CoordinationMessageState>,
+    #[serde(default)]
+    pub target_presence: Option<CoordinationPresenceState>,
+}
+
 /// Strategy for waking an agent on a wake-flagged message. The default impl runs
 /// a configured command; tests inject a recorder. The boundary the handoff keeps
 /// is coordinate-versus-execute: a message launches a run, it does not try to
 /// finish inside a chat bubble.
 pub trait SpawnDispatcher: Send + Sync {
     fn dispatch(&self, actor_id: &str, event: &RoomMessageEvent) -> SpawnOutcome;
+
+    fn dispatch_with_context(
+        &self,
+        actor_id: &str,
+        event: &RoomMessageEvent,
+        _context: &WakeDispatchContext,
+    ) -> SpawnOutcome {
+        self.dispatch(actor_id, event)
+    }
 }
 
 /// Spawns the per-actor command configured via the environment, passing the wake
@@ -145,8 +163,48 @@ fn env_actor_key(actor_id: &str) -> String {
         .collect()
 }
 
+fn wake_seed_prompt(
+    actor_id: &str,
+    event: &RoomMessageEvent,
+    context: &WakeDispatchContext,
+) -> String {
+    let pending = context
+        .pending_mentions
+        .iter()
+        .map(|mention| {
+            format!(
+                "- {} from {} [{}]: {}",
+                mention.message_id, mention.actor_id, mention.urgency, mention.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Wake event for `{actor}` in `{room}`.\nMessage `{message_id}` from `{author}`: {message}\n\nUnconsumed mentions:\n{pending}",
+        actor = actor_id.trim(),
+        room = event.room_id,
+        message_id = event.message_id,
+        author = event.author,
+        message = event.message,
+        pending = if pending.trim().is_empty() {
+            "- none".to_string()
+        } else {
+            pending
+        }
+    )
+}
+
 impl SpawnDispatcher for CommandSpawnDispatcher {
     fn dispatch(&self, actor_id: &str, event: &RoomMessageEvent) -> SpawnOutcome {
+        self.dispatch_with_context(actor_id, event, &WakeDispatchContext::default())
+    }
+
+    fn dispatch_with_context(
+        &self,
+        actor_id: &str,
+        event: &RoomMessageEvent,
+        context: &WakeDispatchContext,
+    ) -> SpawnOutcome {
         let Some(command) = Self::command_for(actor_id) else {
             return SpawnOutcome {
                 actor_id: actor_id.to_string(),
@@ -163,6 +221,19 @@ impl SpawnDispatcher for CommandSpawnDispatcher {
             .env("THEOREM_WAKE_MESSAGE_ID", &event.message_id)
             .env("THEOREM_WAKE_MESSAGE", &event.message)
             .env("THEOREM_WAKE_AUTHOR", &event.author)
+            .env(
+                "THEOREM_WAKE_PENDING_MENTION_COUNT",
+                context.pending_mentions.len().to_string(),
+            )
+            .env(
+                "THEOREM_WAKE_SEED_PROMPT",
+                wake_seed_prompt(actor_id, event, context),
+            )
+            .env(
+                "THEOREM_WAKE_PENDING_MENTIONS",
+                serde_json::to_string(&context.pending_mentions)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            )
             .spawn();
         match spawned {
             Ok(_child) => SpawnOutcome {
@@ -321,9 +392,9 @@ fn coordination_status(error: CoordinationError) -> (StatusCode, String) {
 }
 
 /// The agent-wake side: a single task subscribed to the same bus. On a
-/// wake-flagged message it resolves the targets (mentions, else room members)
-/// and asks the dispatcher to spawn each. Because it is a task inside an
-/// already-running server, the marginal always-on cost is one subscription.
+/// wake-flagged message it resolves targets and applies the lifecycle split:
+/// warm actors (active presence) drain through their Stop hook, while cold actors
+/// get a spawned session seeded with their unconsumed mentions.
 pub fn spawn_wake_listener<S: GraphStore + Send + 'static>(
     bus: RoomBus,
     store: Arc<Mutex<S>>,
@@ -339,7 +410,16 @@ pub fn spawn_wake_listener<S: GraphStore + Send + 'static>(
                     }
                     let agents = room_agent_ids(&store, &event.tenant_slug, &event.room_id);
                     for actor in wake_targets(&event, &agents) {
-                        let outcome = spawn.dispatch(&actor, &event);
+                        let route = wake_dispatch_route(&store, &event, &actor);
+                        if route.warm {
+                            tracing::info!(
+                                actor = %actor,
+                                room = %event.room_id,
+                                "coordination wake routed to warm stop-hook drain"
+                            );
+                            continue;
+                        }
+                        let outcome = spawn.dispatch_with_context(&actor, &event, &route.context);
                         tracing::info!(
                             actor = %actor,
                             dispatched = outcome.dispatched,
@@ -356,6 +436,54 @@ pub fn spawn_wake_listener<S: GraphStore + Send + 'static>(
             }
         }
     })
+}
+
+struct WakeDispatchRoute {
+    warm: bool,
+    context: WakeDispatchContext,
+}
+
+fn wake_dispatch_route<S: GraphStore>(
+    store: &Arc<Mutex<S>>,
+    event: &RoomMessageEvent,
+    actor_id: &str,
+) -> WakeDispatchRoute {
+    let mut store = match store.lock() {
+        Ok(store) => store,
+        Err(_) => {
+            return WakeDispatchRoute {
+                warm: false,
+                context: WakeDispatchContext::default(),
+            }
+        }
+    };
+    let target_presence = load_presence(&*store, &event.tenant_slug, actor_id)
+        .ok()
+        .flatten();
+    let pending_mentions = read_mentions_for_actor_in_room(
+        &mut *store,
+        &event.tenant_slug,
+        &event.room_id,
+        actor_id,
+        false,
+        20,
+    )
+    .unwrap_or_default();
+    let warm = target_presence
+        .as_ref()
+        .map(presence_is_warm)
+        .unwrap_or(false);
+    WakeDispatchRoute {
+        warm,
+        context: WakeDispatchContext {
+            pending_mentions,
+            target_presence,
+        },
+    }
+}
+
+fn presence_is_warm(presence: &CoordinationPresenceState) -> bool {
+    presence.status.trim().eq_ignore_ascii_case("active")
 }
 
 /// The room's member actor ids (the wake fallback when no one is mentioned).
@@ -382,7 +510,7 @@ mod tests {
     use rustyred_thg_core::InMemoryGraphStore;
     use std::collections::BTreeSet;
     use std::sync::Mutex as StdMutex;
-    use theorem_harness_runtime::{join_room, JoinRoomInput};
+    use theorem_harness_runtime::{heartbeat_presence, join_room, JoinRoomInput, PresenceInput};
 
     const TENANT: &str = "travis-gilbert";
     const ROOM: &str = "repo:theorem:branch:main";
@@ -520,21 +648,40 @@ mod tests {
     /// spawning a process.
     #[derive(Default)]
     struct RecordingDispatcher {
-        calls: StdMutex<Vec<(String, RoomMessageEvent)>>,
+        calls: StdMutex<Vec<(String, RoomMessageEvent, WakeDispatchContext)>>,
     }
 
     impl RecordingDispatcher {
-        fn calls(&self) -> Vec<(String, RoomMessageEvent)> {
+        fn calls(&self) -> Vec<(String, RoomMessageEvent, WakeDispatchContext)> {
             self.calls.lock().expect("calls lock").clone()
         }
     }
 
     impl SpawnDispatcher for RecordingDispatcher {
         fn dispatch(&self, actor_id: &str, event: &RoomMessageEvent) -> SpawnOutcome {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push((actor_id.to_string(), event.clone()));
+            self.calls.lock().expect("calls lock").push((
+                actor_id.to_string(),
+                event.clone(),
+                WakeDispatchContext::default(),
+            ));
+            SpawnOutcome {
+                actor_id: actor_id.to_string(),
+                dispatched: true,
+                detail: "recorded".to_string(),
+            }
+        }
+
+        fn dispatch_with_context(
+            &self,
+            actor_id: &str,
+            event: &RoomMessageEvent,
+            context: &WakeDispatchContext,
+        ) -> SpawnOutcome {
+            self.calls.lock().expect("calls lock").push((
+                actor_id.to_string(),
+                event.clone(),
+                context.clone(),
+            ));
             SpawnOutcome {
                 actor_id: actor_id.to_string(),
                 dispatched: true,
@@ -593,6 +740,11 @@ mod tests {
         assert_eq!(calls.len(), 1, "only the wake message dispatches");
         assert_eq!(calls[0].0, "codex");
         assert_eq!(calls[0].1.delivery, Delivery::Wake);
+        assert!(calls[0]
+            .2
+            .pending_mentions
+            .iter()
+            .any(|mention| mention.delivery == "wake"));
 
         handle.abort();
     }
@@ -644,11 +796,98 @@ mod tests {
         let woken: BTreeSet<String> = recorder
             .calls()
             .into_iter()
-            .map(|(actor, _)| actor)
+            .map(|(actor, _, _)| actor)
             .collect();
         assert_eq!(
             woken,
             BTreeSet::from(["codex".to_string(), "claude-code".to_string()])
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn listener_routes_warm_present_actor_to_stop_hook_without_spawn() {
+        let recorder = Arc::new(RecordingDispatcher::default());
+        let bus = RoomBus::new(64, recorder.clone());
+        let store = Arc::new(Mutex::new(InMemoryGraphStore::new()));
+
+        {
+            let mut guard = store.lock().unwrap();
+            heartbeat_presence(
+                &mut *guard,
+                PresenceInput {
+                    tenant_slug: TENANT.to_string(),
+                    actor_id: "codex".to_string(),
+                    session_id: "warm-session".to_string(),
+                    status: "active".to_string(),
+                    refreshed_at: "2026-06-04T00:00:00Z".to_string(),
+                    ..PresenceInput::default()
+                },
+            )
+            .expect("presence");
+        }
+
+        let handle = spawn_wake_listener(bus.clone(), store.clone());
+        let (_state, wake_event) = {
+            let mut guard = store.lock().unwrap();
+            write_room_message(
+                &mut *guard,
+                ROOM,
+                post("travis", "@codex please react", Delivery::Wake, &["codex"]),
+            )
+            .expect("wake write")
+        };
+        bus.publish(wake_event);
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            recorder.calls().is_empty(),
+            "active presence means the Stop hook drains the mention instead of spawning"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn listener_seeds_cold_spawn_with_unconsumed_mentions() {
+        let recorder = Arc::new(RecordingDispatcher::default());
+        let bus = RoomBus::new(64, recorder.clone());
+        let store = Arc::new(Mutex::new(InMemoryGraphStore::new()));
+
+        let handle = spawn_wake_listener(bus.clone(), store.clone());
+        let (_state, wake_event) = {
+            let mut guard = store.lock().unwrap();
+            write_room_message(
+                &mut *guard,
+                ROOM,
+                post(
+                    "travis",
+                    "@codex cold start with this context",
+                    Delivery::Wake,
+                    &["codex"],
+                ),
+            )
+            .expect("wake write")
+        };
+        bus.publish(wake_event);
+
+        for _ in 0..100 {
+            if !recorder.calls().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "codex");
+        assert_eq!(calls[0].2.pending_mentions.len(), 1);
+        assert_eq!(
+            calls[0].2.pending_mentions[0].message,
+            "@codex cold start with this context"
         );
 
         handle.abort();

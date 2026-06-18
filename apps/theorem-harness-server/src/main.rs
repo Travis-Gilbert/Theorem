@@ -65,6 +65,8 @@ struct CoordinationQuery {
     tenant_slug: Option<String>,
     status: Option<String>,
     statuses: Option<String>,
+    urgency: Option<String>,
+    urgencies: Option<String>,
     record_type: Option<String>,
     record_types: Option<String>,
     consume: Option<bool>,
@@ -137,6 +139,14 @@ impl CoordinationQuery {
         self.statuses
             .as_deref()
             .or(self.status.as_deref())
+            .map(split_csv)
+            .unwrap_or_default()
+    }
+
+    fn urgencies(&self) -> Vec<String> {
+        self.urgencies
+            .as_deref()
+            .or(self.urgency.as_deref())
             .map(split_csv)
             .unwrap_or_default()
     }
@@ -485,6 +495,7 @@ async fn get_actor_mentions(
         &mut *store,
         &query.tenant_slug(),
         &actor_id,
+        &query.urgencies(),
         query.consume.unwrap_or(false),
         query.limit.unwrap_or(20),
     )
