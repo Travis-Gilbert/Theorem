@@ -1,6 +1,6 @@
-# The substrate and the GraphStore
+# The graph store
 
-The substrate is one graph. The interface to it is the `GraphStore` trait, defined in `rustyred-thg-core`. Everything in Theorem reads and writes through that trait, which is why a page the browser ingests and a memory a harness session records land in the same place and can be traversed together.
+The graph store is one graph — what the code and internal documents call "the substrate" (see the [Glossary](../reference/glossary.md)). The interface to it is the `GraphStore` trait, defined in `rustyred-thg-core`. Everything in Theorem reads and writes through that trait, which is why a page the browser ingests and a memory a harness session records land in the same place and can be traversed together.
 
 ## Three stores, one trait
 
@@ -8,7 +8,7 @@ The trait has three implementations, chosen by durability need.
 
 `InMemoryGraphStore` is ephemeral and in-process. It is for tests and scratch work.
 
-`RedCoreGraphStore` is durable, file-backed, and in-process, using an append-only file plus snapshots. This is the in-process substrate with no API boundary that the browser persists to. Writes delegate to AOF-backed durable upserts; reads serve from an in-memory mirror that is rebuilt from the AOF on open. `RedCoreOptions::default()` is `AofEverysec`; use `AofAlways` when you need fsync-per-commit determinism.
+`RedCoreGraphStore` is durable, file-backed, and in-process, using an append-only file plus snapshots. This is the in-process graph store with no API boundary that the browser persists to. Writes delegate to AOF-backed durable upserts; reads serve from an in-memory mirror that is rebuilt from the AOF on open. `RedCoreOptions::default()` is `AofEverysec`; use `AofAlways` when you need fsync-per-commit determinism.
 
 `RedisGraphStore` connects to a Redis-protocol RustyRed server. This is the out-of-process option, an API boundary.
 

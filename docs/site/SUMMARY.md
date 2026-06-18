@@ -13,6 +13,9 @@
 ## Guides
 
 * [Run the Harness and submit a job](guides/first-job.md)
+* [Persist agent memory](guides/persist-memory.md)
+* [Coordinate two agents](guides/coordinate-agents.md)
+* [Connect a client over MCP](guides/connect-mcp.md)
 * [Doc-update protocol for agents](guides/doc-update-protocol.md)
 
 ## Reference

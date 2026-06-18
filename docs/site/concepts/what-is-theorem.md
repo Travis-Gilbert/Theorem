@@ -1,12 +1,12 @@
 # What is Theorem
 
-Theorem is the Rust-native substrate spine for Theseus, an epistemic engine. Three claims define it.
+Theorem is the Rust-native graph and harness layer for Theseus, an epistemic engine. Three claims define it.
 
-## It is a substrate, not a pipeline
+## It is a graph that accumulates, not a pipeline
 
 Most retrieval systems are pipelines: text goes in, an index is built, queries come out, and the index is a disposable artifact rebuilt on a schedule. Theorem inverts that. There is one graph store, and everything writes to it: parsed code symbols, crawled web pages, agent memory documents, harness run events, the outcomes of tool selections. Work accumulates as graph structure. The next run reads what the last run left.
 
-This is why an epistemic engine built on Theorem gets better at whatever it is pointed at. Pointing it at a codebase grows a code graph that later code questions traverse. Pointing it at the web grows a quarantined corpus tier that later searches rank against. The improvement is not a model weight update; it is structure on the substrate.
+This is why an epistemic engine built on Theorem gets better at whatever it is pointed at. Pointing it at a codebase grows a code graph that later code questions traverse. Pointing it at the web grows a quarantined corpus tier that later searches rank against. The improvement is not a model weight update; it is structure in the graph store.
 
 ## It is the Rust projection of a canonical system
 
