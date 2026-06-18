@@ -24,6 +24,7 @@ members = [
     "crates/rustyred-web",
     "crates/rustyred-thg-code",
     "crates/rustyred-thg-memory",
+    "crates/rustyred-thg-catalog",
     "crates/scene-os-core",
     "crates/scene-os-web",
     "crates/theorem-harness-core",

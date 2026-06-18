@@ -6763,6 +6763,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-catalog"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "rustyred-thg-code"
 version = "0.7.0"
 dependencies = [
