@@ -144,6 +144,9 @@ export function mount(pkg: unknown): SceneRenderer | null {
     },
   });
   renderer.resize();
+  // Phase 1-3: spawn from the omni-bar origin, settle, then reveal the model
+  // explanation callouts (reduced-motion reveals the settled layout directly).
+  renderer.playEnter();
   activeRenderer = renderer;
 
   // Header: projection label + atom/relation counts, read from the resolved
@@ -153,7 +156,8 @@ export function mount(pkg: unknown): SceneRenderer | null {
     h.title.textContent = layout ? layout.projectionLabel : candidate.projection.id;
   }
   if (h.meta) {
-    const atomCount = candidate.atoms.length;
+    // Count graph atoms only; annotation atoms render as callouts, not nodes.
+    const atomCount = candidate.atoms.filter((a) => a.kind !== 'annotation').length;
     const relCount = candidate.relations.length;
     h.meta.textContent =
       `${atomCount} atom${atomCount === 1 ? '' : 's'}, ` +

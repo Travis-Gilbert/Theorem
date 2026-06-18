@@ -70,10 +70,21 @@ export interface AnnotationViewport {
   height: number;
 }
 
+/** A model-explanation callout (phase 3): a short title plus the wrapped body
+ *  (the model's explanation), anchored at a node's screen position. */
+export interface AnnotationCallout {
+  title: string;
+  body: string;
+  x: number;
+  y: number;
+}
+
 /**
- * Controls the single-callout explanation overlay. Construct once with the
- * overlay `<svg>` element and a viewport accessor; call `showCallout` when an
- * atom is selected and `clear` when the selection is dropped.
+ * Controls the explanation overlay. Two independent callout layers share the
+ * overlay `<svg>`: the SELECTION callout (one atom the user clicked) and the
+ * MODEL callouts (phase 3, the GL-Fusion explanations pinned to anchor nodes).
+ * They live in separate `<g>` groups so dropping a selection never wipes the
+ * model explanations, and vice versa.
  */
 export class AnnotationLayer {
   private readonly svg: SVGSVGElement;
@@ -85,19 +96,14 @@ export class AnnotationLayer {
   }
 
   /**
-   * Render a single callout for `atom` anchored at (screenX, screenY) in the
-   * overlay's coordinate space (the same CSS-pixel space the canvas hover uses,
-   * since the overlay is sized to the stage). Replaces any prior callout.
+   * Render a single selection callout for `atom` anchored at (screenX, screenY)
+   * in the overlay's coordinate space. Replaces any prior selection callout but
+   * leaves the model-explanation callouts intact.
    */
   showCallout(atom: Atom, screenX: number, screenY: number): void {
-    this.clear();
     const viewport = this.getViewport();
-
     // Lead the note toward whichever side has more room so it stays on-screen.
     const leadRight = screenX < viewport.width * 0.6;
-    const dx = leadRight ? 32 : -32;
-    const dy = screenY > viewport.height * 0.55 ? -28 : 28;
-
     const spec: AnnotationSpec = {
       note: {
         title: atom.label ?? atom.id,
@@ -109,18 +115,62 @@ export class AnnotationLayer {
       },
       x: screenX,
       y: screenY,
-      dx,
-      dy,
+      dx: leadRight ? 32 : -32,
+      dy: screenY > viewport.height * 0.55 ? -28 : 28,
       id: atom.id,
     };
+    this.renderInto('scene-annotation-selection', [spec]);
+  }
 
-    const builder = makeBuilder().type(calloutType).annotations([spec]);
+  /**
+   * Phase 3: render the model-explanation callouts, each pinned to its anchor
+   * node's screen position. Persists across selection changes (own group).
+   */
+  showAnnotations(items: AnnotationCallout[]): void {
+    const viewport = this.getViewport();
+    const specs: AnnotationSpec[] = items.map((item) => {
+      const leadRight = item.x < viewport.width * 0.6;
+      return {
+        note: {
+          title: item.title,
+          label: item.body,
+          wrap: 220,
+          padding: 6,
+          align: leadRight ? 'left' : 'right',
+          orientation: 'leftRight',
+        },
+        x: item.x,
+        y: item.y,
+        dx: leadRight ? 44 : -44,
+        dy: item.y > viewport.height * 0.55 ? -40 : 40,
+      };
+    });
+    this.renderInto('scene-annotation-model', specs);
+  }
 
-    // Mount into a fresh <g>. The builder reads title/label via d3's .text()
-    // (textContent), so the untrusted atom label cannot inject markup.
+  /** Remove the selection callout only (selection dropped); model callouts stay. */
+  clear(): void {
+    this.removeGroup('scene-annotation-selection');
+  }
+
+  /** Remove every callout (teardown). `replaceChildren()` empties the SVG
+   *  without parsing any HTML (project rule: never innerHTML). */
+  clearAll(): void {
+    this.svg.replaceChildren();
+  }
+
+  /**
+   * Mount `specs` into a fresh `<g>` of class `className`, replacing any prior
+   * group of that class. The builder reads title/label via d3's `.text()`
+   * (textContent), so untrusted labels cannot inject markup.
+   */
+  private renderInto(className: string, specs: AnnotationSpec[]): void {
+    this.removeGroup(className);
+    if (specs.length === 0) return;
+    const builder = makeBuilder().type(calloutType).annotations(specs);
     const group = select(this.svg)
       .append('g')
-      .attr('class', 'scene-annotation') as Selection<
+      .attr('class', `scene-annotation ${className}`) as Selection<
       SVGGElement,
       unknown,
       null,
@@ -129,9 +179,7 @@ export class AnnotationLayer {
     builder(group);
   }
 
-  /** Remove the current callout. `replaceChildren()` empties the SVG without
-   *  parsing any HTML (project rule: never innerHTML). */
-  clear(): void {
-    this.svg.replaceChildren();
+  private removeGroup(className: string): void {
+    select(this.svg).selectAll(`g.${className}`).remove();
   }
 }
