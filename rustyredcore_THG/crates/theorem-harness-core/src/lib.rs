@@ -1,3 +1,26 @@
+//! # theorem-harness-core
+//!
+//! The pure harness kernel: run state, transition guards, content-addressed
+//! state hashing, replay/fork helpers, and permission-aware toolkit selection.
+//! It has no storage and no network — logic only, parity-tested against the
+//! Python reference corpora — so the GraphStore-backed persistence
+//! (`theorem-harness-runtime`) and the SDK surface (`theorem-harness`) layer on
+//! top without the kernel ever depending on them.
+//!
+//! Key modules:
+//! - [`state_machine`] and [`state_hash`]: the transition executor, guard table,
+//!   and the content-addressed hash of run state after each transition.
+//! - [`replay`]: deterministic replay and fork from a transition sequence.
+//! - [`toolgraph`]: permission-aware toolkit compilation (which tools a run may use).
+//! - [`job`]: the typed Dispatch v2 job domain.
+//! - [`work_graph`] and [`work_graph_verify`]: the durable multi-head work graph
+//!   and its adversarial-verify contracts.
+//! - [`affordances`]: the contract types learned tool selection ranks over.
+//! - [`agent_binding`], [`memory_contracts`], [`map_artifacts`]: shared contract
+//!   types the runtime and SDK persist.
+//!
+//! Product-level picture: see `docs/site/concepts/the-harness.md`.
+
 pub mod affordances;
 pub mod agent_binding;
 pub mod agent_head_registry;

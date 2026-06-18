@@ -1,3 +1,26 @@
+//! # theorem-harness-runtime
+//!
+//! GraphStore-backed persistence for the harness. It writes the kernel's
+//! (`theorem-harness-core`) transition receipts into a graph store as run and
+//! event nodes joined by an append-chain, keeping storage out of the
+//! parity-tested kernel, and carries the live coordination and dispatch
+//! primitives the MCP and HTTP transports expose.
+//!
+//! Key modules:
+//! - [`event_log`]: persist a run as run/event nodes plus append-chain edges;
+//!   the read side ([`load_run`], [`load_events`]) backs the run read contract.
+//! - [`coordination`] and [`coordination_push`]: rooms, intents, presence,
+//!   messages, durable records, and @mentions — the shared-awareness layer.
+//! - [`job_queue`]: the Dispatch v2 job board (submit/list/note/archive).
+//! - [`memory`]: durable memory documents (remember/recall/encode) and the
+//!   Obsidian-sync read and upsert surface.
+//! - [`binding_store`], [`skill_pack`], [`work_graph_store`]: AgentBinding
+//!   scratchpad persistence, skill packs, and the multi-head work graph store.
+//! - [`agent_runner`]: the in-process room runner that turns wake messages into
+//!   head invocations.
+//!
+//! Product-level picture: see `docs/site/concepts/the-harness.md`.
+
 pub mod agent_runner;
 pub mod binding_store;
 pub mod canonical_write;

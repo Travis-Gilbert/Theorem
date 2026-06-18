@@ -1,3 +1,16 @@
+//! # rustyred-thg-mcp
+//!
+//! The native Rust MCP server over the RustyRed graph store. It exposes the
+//! harness capabilities as MCP tools — memory, coordination, jobs, code
+//! intelligence, graph queries and algorithms, versioning, search, symbolic
+//! reasoning, and browsing — with no Python process in the loop. The same tool
+//! surface is served over stdio (via the bundled `theorems-harness` plugin) and
+//! over HTTP (`POST /mcp` on the graph server).
+//!
+//! Tools dispatch through one handler keyed by tool name; in read-only mode the
+//! write tools return a structured `mcp_read_only` error instead of mutating the
+//! graph. Full categorized catalog: `docs/site/reference/mcp-tools.md`.
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
