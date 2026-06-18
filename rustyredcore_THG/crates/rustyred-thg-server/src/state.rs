@@ -38,6 +38,7 @@ use theorem_harness_runtime::{
     ProviderHeadInvoker,
 };
 
+use crate::browser_pool::{BrowserLiveSessionRecord, LiveBrowserPool, RemoteBrowserPool};
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
 use crate::observability::Observability;
@@ -76,6 +77,8 @@ pub struct AppState {
     graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
     graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
     live_fetch_cascade: Arc<FetchCascade>,
+    live_browser_pool: Arc<RwLock<Option<Arc<dyn LiveBrowserPool>>>>,
+    live_browser_sessions: Arc<Mutex<BTreeMap<String, BrowserLiveSessionRecord>>>,
     search_providers: Arc<RwLock<Vec<Arc<dyn SearchProvider>>>>,
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
@@ -109,6 +112,8 @@ impl AppState {
             respect_robots_for_escalation: live_fetch_options.respect_robots,
         })
         .expect("default live fetch cascade options must build");
+        let live_browser_pool =
+            RemoteBrowserPool::from_env().map(|pool| Arc::new(pool) as Arc<dyn LiveBrowserPool>);
         Self {
             config: Arc::new(config),
             observability,
@@ -117,11 +122,39 @@ impl AppState {
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
             live_fetch_cascade: Arc::new(live_fetch_cascade),
+            live_browser_pool: Arc::new(RwLock::new(live_browser_pool)),
+            live_browser_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             search_providers: Arc::new(RwLock::new(search_providers)),
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             plan_steering: Arc::new(crate::cypher::planner::PlanSteeringState::default()),
+        }
+    }
+
+    pub fn live_browser_pool(&self) -> Option<Arc<dyn LiveBrowserPool>> {
+        self.live_browser_pool
+            .read()
+            .ok()
+            .and_then(|pool| pool.as_ref().cloned())
+    }
+
+    pub fn set_live_browser_pool(&self, pool: Option<Arc<dyn LiveBrowserPool>>) {
+        if let Ok(mut live_browser_pool) = self.live_browser_pool.write() {
+            *live_browser_pool = pool;
+        }
+    }
+
+    pub fn live_browser_session(&self, run_id: &str) -> Option<BrowserLiveSessionRecord> {
+        self.live_browser_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(run_id).cloned())
+    }
+
+    pub fn upsert_live_browser_session(&self, session: BrowserLiveSessionRecord) {
+        if let Ok(mut sessions) = self.live_browser_sessions.lock() {
+            sessions.insert(session.run_id.clone(), session);
         }
     }
 

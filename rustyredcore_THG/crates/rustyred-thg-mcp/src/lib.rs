@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
@@ -11,12 +11,16 @@ use ensemble::{
     PackExposure, PackKind, TrustTier,
 };
 use rustyred_thg_core::{
-    checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
-    merge_graph_snapshots, update_graph_ref_cas, CodeKgManifest, Direction, EdgeRecord,
-    EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore,
-    GraphStoreError, GraphStoreResult, GraphVersionRepository, HarnessInstantKg,
-    HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-    RedCoreGraphStore, SessionDelta, VectorDesignation, VerifyReport,
+    checkout_graph_version, compile_graph_pack, compile_user_subgraph, diff_graph_snapshots,
+    epistemic_shadow_ppr, graph_version_log, merge_graph_snapshots, read_epistemic_shadow,
+    run_epistemic_cron_pass, update_graph_ref_cas, CodeKgManifest, Direction, EdgeRecord,
+    EpistemicAnnotations, EpistemicCronInput, EpistemicEnricher, EpistemicEnrichmentError,
+    EpistemicEnrichmentMode, EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphSnapshot,
+    GraphStats, GraphStore, GraphStoreError, GraphStoreResult, GraphVersionRepository,
+    HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
+    NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta, UserSubgraph, VectorDesignation,
+    VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, SAME_ECLASS,
+    UNDERCUTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -49,10 +53,11 @@ use theorem_harness_runtime::{
     CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
     CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
     HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
-    MemoryGraphStore, MemoryWriteInput, PresenceInput, RecallMemoryInput, RelateMemoryInput,
-    ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput, SkillPackGraphStore,
-    SkillPackListInput, SkillPackPublishInput, UpsertNoteInput, WriteIntentInput,
-    WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
+    MemoryGraphStore, MemoryWriteInput, PresenceInput, RealHeadInvoker, RecallMemoryInput,
+    RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput,
+    SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput, UpsertNoteInput,
+    WriteIntentInput, WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO,
+    TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -910,6 +915,24 @@ fn call_tool<P: McpGraphProvider>(
         "rustyred_thg_graph_index_status" => index_status_payload(&tenant, &backend)?,
         "rustyred_thg_graph_explain" => explain_payload(&tenant, &arguments),
         "rustyred_thg_graph_query" => query_payload(&tenant, &backend, &arguments)?,
+        "epistemic_dirty_frontier" | "rustyred_thg_epistemic_dirty_frontier" => {
+            epistemic_dirty_frontier_payload(&tenant, &backend, &arguments)?
+        }
+        "epistemic_compile_subgraph" | "rustyred_thg_epistemic_compile_subgraph" => {
+            epistemic_compile_subgraph_payload(&tenant, &backend, &arguments)?
+        }
+        "epistemic_shadow_ppr" | "rustyred_thg_epistemic_shadow_ppr" => {
+            epistemic_shadow_ppr_payload(&tenant, &backend, &arguments)?
+        }
+        "epistemic_enrich_apply" | "rustyred_thg_epistemic_enrich_apply" if config.read_only => {
+            return Ok(tool_result_error(json!({
+                "error": "read_only",
+                "message": "epistemic_enrich_apply is unavailable while read-only mode is active."
+            })))
+        }
+        "epistemic_enrich_apply" | "rustyred_thg_epistemic_enrich_apply" => {
+            epistemic_enrich_apply_payload(&tenant, &mut backend, &arguments)?
+        }
         "rustyred_thg_graph_version_compile"
         | "rustyred_thg_git_compile"
         | "rustyred.graph.version.compile"
@@ -2228,6 +2251,336 @@ fn query_payload(
         "stats": { "returned": neighbors.len(), "truncated": truncated },
         "explain": explain_payload(tenant, arguments)
     }))
+}
+
+fn epistemic_dirty_frontier_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let store = in_memory_store_from_backend(backend)?;
+    let explicit = argument_string_list(arguments, &["content_ids", "content_node_ids"]);
+    let k_hops = argument_u64(arguments, &["k_hops", "kHops"]).unwrap_or(2) as usize;
+    let limit = argument_u64(arguments, &["limit"]).unwrap_or(10_000) as usize;
+    let mut frontier = if explicit.is_empty() {
+        inferred_epistemic_dirty_nodes(&store)?
+    } else {
+        explicit
+    };
+    frontier = expand_epistemic_frontier(&store, frontier, k_hops, limit)?;
+    Ok(json!({
+        "tenant": tenant,
+        "content_ids": frontier,
+        "k_hops": k_hops,
+        "limit": limit,
+    }))
+}
+
+fn epistemic_compile_subgraph_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let store = in_memory_store_from_backend(backend)?;
+    let content_ids = argument_string_list(arguments, &["content_ids", "content_node_ids"]);
+    let subgraph = compile_user_subgraph(&store, &content_ids);
+    Ok(json!({
+        "tenant": tenant,
+        "content_ids": content_ids,
+        "nodes": subgraph.nodes,
+        "edges": subgraph.edges,
+    }))
+}
+
+fn epistemic_shadow_ppr_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let store = in_memory_store_from_backend(backend)?;
+    let seeds: HashMap<String, f64> =
+        serde_json::from_value(arguments.get("seeds").cloned().ok_or_else(|| {
+            McpError::invalid_params("epistemic_shadow_ppr requires seeds object")
+        })?)
+        .map_err(|error| McpError::invalid_params(format!("seeds must be an object: {error}")))?;
+    let top_k = argument_u64(arguments, &["top_k", "topK"])
+        .unwrap_or(10)
+        .max(1) as usize;
+    let alpha = arguments
+        .get("alpha")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.15);
+    let epsilon = arguments
+        .get("epsilon")
+        .and_then(Value::as_f64)
+        .unwrap_or(1e-6);
+    let max_pushes =
+        argument_u64(arguments, &["max_pushes", "maxPushes"]).unwrap_or(100_000) as usize;
+    let scores = epistemic_shadow_ppr(&store, &seeds, top_k, alpha, epsilon, max_pushes)
+        .into_iter()
+        .map(|(shadow_node_id, score)| json!({ "shadow_node_id": shadow_node_id, "score": score }))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "tenant": tenant,
+        "scores": scores,
+        "top_k": top_k,
+        "alpha": alpha,
+        "epsilon": epsilon,
+        "max_pushes": max_pushes,
+    }))
+}
+
+fn epistemic_enrich_apply_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let annotations_value = arguments
+        .get("annotations")
+        .cloned()
+        .ok_or_else(|| McpError::invalid_params("epistemic_enrich_apply requires annotations"))?;
+    let annotations: EpistemicAnnotations = serde_json::from_value(annotations_value)
+        .map_err(|error| McpError::invalid_params(format!("invalid annotations: {error}")))?;
+    let mut content_node_ids =
+        argument_string_list(arguments, &["content_ids", "content_node_ids"]);
+    if content_node_ids.is_empty() {
+        content_node_ids = annotation_content_ids(&annotations);
+    }
+    let mode = match argument_text(arguments, &["mode"])
+        .unwrap_or_else(|| "delta".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "full" => EpistemicEnrichmentMode::Full,
+        _ => EpistemicEnrichmentMode::Delta,
+    };
+    let engine = argument_text(arguments, &["engine"])
+        .unwrap_or_else(|| "theseus.epistemic_enrichment".to_string());
+    let engine_version = argument_text(arguments, &["engine_version", "engineVersion"])
+        .unwrap_or_else(|| "epistemic-v1".to_string());
+    let density_floor = arguments
+        .get("density_floor")
+        .or_else(|| arguments.get("densityFloor"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let computed_at = arguments
+        .get("computed_at")
+        .or_else(|| arguments.get("computedAt"))
+        .and_then(value_i64)
+        .unwrap_or_else(now_unix_ms);
+    let mut store = in_memory_store_from_backend(backend)?;
+    let input = EpistemicCronInput {
+        content_node_ids,
+        mode,
+        engine,
+        engine_version,
+        computed_at,
+        density_floor,
+    };
+    let enricher = StaticEpistemicEnricher { annotations };
+    let report = run_epistemic_cron_pass(&mut store, input, &enricher)?;
+    let persisted = persist_epistemic_projection(backend, &store)?;
+    let shadows_written = report.shadows_written;
+    let shadow_edges_written = report.shadow_edges_written;
+    Ok(json!({
+        "tenant": tenant,
+        "report": report,
+        "shadows_written": shadows_written,
+        "shadow_edges_written": shadow_edges_written,
+        "persisted_shadow_nodes": persisted.0,
+        "persisted_shadow_edges": persisted.1,
+    }))
+}
+
+struct StaticEpistemicEnricher {
+    annotations: EpistemicAnnotations,
+}
+
+impl EpistemicEnricher for StaticEpistemicEnricher {
+    fn enrich(
+        &self,
+        _subgraph: UserSubgraph,
+        _mode: EpistemicEnrichmentMode,
+    ) -> Result<EpistemicAnnotations, EpistemicEnrichmentError> {
+        Ok(self.annotations.clone())
+    }
+}
+
+fn in_memory_store_from_backend(
+    backend: &impl McpGraphBackend,
+) -> Result<InMemoryGraphStore, McpError> {
+    let snapshot = backend.graph_snapshot()?;
+    let mut store = InMemoryGraphStore::new();
+    for node in snapshot.nodes {
+        GraphStore::upsert_node(&mut store, node)?;
+    }
+    for edge in snapshot.edges {
+        GraphStore::upsert_edge(&mut store, edge)?;
+    }
+    Ok(store)
+}
+
+fn persist_epistemic_projection(
+    backend: &mut impl McpGraphBackend,
+    store: &InMemoryGraphStore,
+) -> Result<(usize, usize), McpError> {
+    let snapshot = GraphStore::graph_snapshot(store)?;
+    let mut nodes = 0usize;
+    let mut edges = 0usize;
+    for node in snapshot.nodes {
+        if is_epistemic_shadow_node(&node) {
+            backend.upsert_node(node)?;
+            nodes += 1;
+        }
+    }
+    for edge in snapshot.edges {
+        if is_epistemic_shadow_edge(&edge) {
+            backend.upsert_edge(edge)?;
+            edges += 1;
+        }
+    }
+    Ok((nodes, edges))
+}
+
+fn inferred_epistemic_dirty_nodes(store: &InMemoryGraphStore) -> Result<Vec<String>, McpError> {
+    let nodes = store.query_nodes(NodeQuery::default().with_limit(100_000));
+    let mut dirty = Vec::new();
+    for node in nodes {
+        if is_epistemic_shadow_node(&node) {
+            continue;
+        }
+        if node_bool(
+            &node,
+            &["epistemic_shadow_dirty", "shadow_dirty", "epistemic_dirty"],
+        ) {
+            dirty.push(node.id);
+            continue;
+        }
+        let Some(shadow) = read_epistemic_shadow(store, &node.id) else {
+            dirty.push(node.id);
+            continue;
+        };
+        if node_timestamp(
+            &node,
+            &[
+                "updated_at",
+                "updated_at_ms",
+                "modified_at",
+                "modified_at_ms",
+            ],
+        )
+        .is_some_and(|updated_at| updated_at > shadow.computed_at)
+        {
+            dirty.push(node.id);
+        }
+    }
+    Ok(dirty)
+}
+
+fn expand_epistemic_frontier(
+    store: &InMemoryGraphStore,
+    seeds: Vec<String>,
+    k_hops: usize,
+    limit: usize,
+) -> Result<Vec<String>, McpError> {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for seed in seeds {
+        if seen.insert(seed.clone()) {
+            queue.push_back((seed, 0usize));
+        }
+    }
+    while let Some((node_id, depth)) = queue.pop_front() {
+        if depth >= k_hops || seen.len() >= limit {
+            continue;
+        }
+        for query in [NeighborQuery::out(&node_id), NeighborQuery::in_(&node_id)] {
+            for hit in store.neighbors(query) {
+                if seen.len() >= limit {
+                    break;
+                }
+                if store
+                    .get_node(&hit.node_id)
+                    .is_some_and(|node| !is_epistemic_shadow_node(node))
+                    && seen.insert(hit.node_id.clone())
+                {
+                    queue.push_back((hit.node_id, depth + 1));
+                }
+            }
+        }
+    }
+    Ok(seen.into_iter().take(limit).collect())
+}
+
+fn annotation_content_ids(annotations: &EpistemicAnnotations) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for annotation in &annotations.annotations {
+        if !annotation.content_node_id.trim().is_empty() {
+            ids.insert(annotation.content_node_id.clone());
+        }
+    }
+    for relation in annotations
+        .support_relations
+        .iter()
+        .chain(annotations.attack_relations.iter())
+    {
+        if !relation.from_content_id.trim().is_empty() {
+            ids.insert(relation.from_content_id.clone());
+        }
+        if !relation.to_content_id.trim().is_empty() {
+            ids.insert(relation.to_content_id.clone());
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn argument_string_list(arguments: &Value, keys: &[&str]) -> Vec<String> {
+    argument_array(arguments, keys)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn is_epistemic_shadow_node(node: &NodeRecord) -> bool {
+    node.labels
+        .iter()
+        .any(|label| label == EPISTEMIC_SHADOW_LABEL)
+}
+
+fn is_epistemic_shadow_edge(edge: &EdgeRecord) -> bool {
+    matches!(
+        edge.edge_type.as_str(),
+        HAS_EPISTEMIC_SHADOW | UNDERCUTS | EPISTEMIC_SUPPORTS | SAME_ECLASS
+    )
+}
+
+fn node_bool(node: &NodeRecord, keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        node.properties
+            .get(*key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+fn node_timestamp(node: &NodeRecord, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| node.properties.get(*key).and_then(value_i64))
+}
+
+fn value_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 // ============================================================================
@@ -7563,6 +7916,23 @@ fn composed_agent_run_to_store<S: GraphStore>(
     task: String,
     claims: Vec<GroundedClaim>,
 ) -> Result<Value, McpError> {
+    if composed_agent_real_invoker_enabled() {
+        let invoker = RealHeadInvoker::from_env().map_err(mcp_head_invocation_error)?;
+        let result = if claims.is_empty() {
+            theorem_harness_runtime::run_composed_agent(store, &binding_id, &task, &invoker)
+        } else {
+            theorem_harness_runtime::run_composed_agent_with_claims(
+                store,
+                &binding_id,
+                &task,
+                claims,
+                &invoker,
+            )
+        }
+        .map_err(mcp_composed_agent_error)?;
+        return composed_agent_result_value(result);
+    }
+
     let invoker = FakeHeadInvoker::default();
     let result = if claims.is_empty() {
         theorem_harness_runtime::run_composed_agent(store, &binding_id, &task, &invoker)
@@ -7576,6 +7946,21 @@ fn composed_agent_run_to_store<S: GraphStore>(
         )
     }
     .map_err(mcp_composed_agent_error)?;
+    composed_agent_result_value(result)
+}
+
+fn composed_agent_real_invoker_enabled() -> bool {
+    std::env::var("THEOREM_COMPOSED_AGENT_INVOKER")
+        .map(|value| value.trim().eq_ignore_ascii_case("real"))
+        .unwrap_or(false)
+        || std::env::var("THEOREM_COMPOSED_AGENT_REAL")
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+}
+
+fn composed_agent_result_value(
+    result: theorem_harness_runtime::ComposedAgentRunResult,
+) -> Result<Value, McpError> {
     serde_json::to_value(result).map_err(|error| {
         McpError::internal(format!(
             "composed_agent_run payload serialization failed: {error}"
@@ -7779,6 +8164,14 @@ fn mcp_composed_agent_error(error: theorem_harness_runtime::ComposedAgentRuntime
         code: -32603,
         message: error.to_string(),
         data: Some(json!({ "code": "composed_agent_runtime_error" })),
+    }
+}
+
+fn mcp_head_invocation_error(error: theorem_harness_core::HeadInvocationError) -> McpError {
+    McpError {
+        code: -32603,
+        message: error.to_string(),
+        data: Some(json!({ "code": "head_invocation_error" })),
     }
 }
 
@@ -8900,6 +9293,71 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "recency_half_life_seconds": { "type": "number", "default": 0 },
                     "recencyHalfLifeSeconds": { "type": "number" }
                 }
+            }),
+        ),
+        tool(
+            "epistemic_dirty_frontier",
+            "Return content nodes whose EpistemicShadow is absent, explicitly dirty, or stale, expanded by k hops.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "content_ids": { "type": "array", "items": { "type": "string" } },
+                    "content_node_ids": { "type": "array", "items": { "type": "string" } },
+                    "k_hops": { "type": "integer", "default": 2 },
+                    "limit": { "type": "integer", "default": 10000 }
+                }
+            }),
+        ),
+        tool(
+            "epistemic_compile_subgraph",
+            "Compile the user's content subgraph or dirty delta for Theseus epistemic enrichment.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "content_ids": { "type": "array", "items": { "type": "string" } },
+                    "content_node_ids": { "type": "array", "items": { "type": "string" } }
+                }
+            }),
+        ),
+        tool(
+            "epistemic_shadow_ppr",
+            "Run personalized PageRank over EpistemicShadow nodes and shadow-layer edges.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "seeds": { "type": "object" },
+                    "top_k": { "type": "integer", "default": 10 },
+                    "alpha": { "type": "number", "default": 0.15 },
+                    "epsilon": { "type": "number", "default": 0.000001 },
+                    "max_pushes": { "type": "integer", "default": 100000 }
+                },
+                "required": ["seeds"]
+            }),
+        ),
+        tool_write(
+            "epistemic_enrich_apply",
+            "Apply Theseus epistemic annotations to EpistemicShadow nodes and shadow edges only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "annotations": { "type": "object" },
+                    "content_ids": { "type": "array", "items": { "type": "string" } },
+                    "content_node_ids": { "type": "array", "items": { "type": "string" } },
+                    "mode": { "type": "string", "enum": ["delta", "full"], "default": "delta" },
+                    "engine": { "type": "string", "default": "theseus.epistemic_enrichment" },
+                    "engine_version": { "type": "string", "default": "epistemic-v1" },
+                    "density_floor": { "type": "number", "default": 0 },
+                    "computed_at": { "type": "integer" }
+                },
+                "required": ["annotations"]
             }),
         ),
         tool(
@@ -11148,6 +11606,96 @@ mod tests {
             panic!("tool call failed for {name}: {error}");
         }
         response["result"]["structuredContent"].clone()
+    }
+
+    #[test]
+    fn epistemic_cron_tools_compile_apply_and_rank_shadow_graph() {
+        let (provider, config) = fixture();
+        let listed = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        let names = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "epistemic_dirty_frontier",
+            "epistemic_compile_subgraph",
+            "epistemic_enrich_apply",
+            "epistemic_shadow_ppr",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
+
+        let compiled = call_tool_json(
+            &provider,
+            &config,
+            "epistemic_compile_subgraph",
+            json!({"content_ids": ["node:a", "node:b"]}),
+        );
+        assert_eq!(compiled["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(compiled["edges"].as_array().unwrap().len(), 1);
+
+        let dirty = call_tool_json(
+            &provider,
+            &config,
+            "epistemic_dirty_frontier",
+            json!({"limit": 10, "k_hops": 0}),
+        );
+        assert!(dirty["content_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node.as_str() == Some("node:a")));
+
+        let applied = call_tool_json(
+            &provider,
+            &config,
+            "epistemic_enrich_apply",
+            json!({
+                "engine_version": "test-epistemic-v1",
+                "annotations": {
+                    "annotations": [
+                        {
+                            "content_node_id": "node:a",
+                            "grounded_extension_status": "in",
+                            "predicted_edges": [{
+                                "target_content_id": "node:b",
+                                "relation": "supports",
+                                "confidence": 0.8,
+                                "quarantine": true
+                            }]
+                        },
+                        {
+                            "content_node_id": "node:b",
+                            "grounded_extension_status": "out"
+                        }
+                    ],
+                    "support_relations": [{
+                        "from_content_id": "node:a",
+                        "to_content_id": "node:b",
+                        "kind": "supports",
+                        "confidence": 0.9,
+                        "evidence": "fixture support"
+                    }],
+                    "attack_relations": []
+                }
+            }),
+        );
+        assert_eq!(applied["shadows_written"].as_u64(), Some(2));
+        assert_eq!(applied["shadow_edges_written"].as_u64(), Some(1));
+
+        let ranked = call_tool_json(
+            &provider,
+            &config,
+            "epistemic_shadow_ppr",
+            json!({"seeds": {"node:a": 1.0}, "top_k": 4}),
+        );
+        assert!(!ranked["scores"].as_array().unwrap().is_empty());
     }
 
     fn call_tool_json_with_context(

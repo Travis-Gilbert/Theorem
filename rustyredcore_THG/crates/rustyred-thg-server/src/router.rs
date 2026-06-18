@@ -46,8 +46,9 @@ use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
     configured_qwen3_embedding_4b_client_from_env, fanout_search_providers, gate_search_graph,
     gate_search_graph_with_hippo_query_vector, render_serp_html, run_live_crawl, search_substrate,
-    warm_pages_task, web_consume_to_graph, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope,
-    PageRecord, PageState, RustyWebError, SearchOptions, SearchOpts, TextEmbedder,
+    warm_pages_task, web_consume_to_graph, ActionOptions, AutomationActionReceipt,
+    BrowserActionPolicy, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope, Locator,
+    LocatorAction, PageRecord, PageState, RustyWebError, SearchOptions, SearchOpts, TextEmbedder,
     WebCommonsFragment, WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt,
     WebConsumeReceipt, WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
     LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION,
@@ -69,6 +70,7 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::{authenticate, require_scope, require_scope_for_tenant, AuthContext};
+use crate::browser_pool::{BrowserActionCommand, BrowserCheckoutRequest, BrowserLiveSessionRecord};
 use crate::graph_cache::{
     GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody, GraphCacheStatsBody,
 };
@@ -221,6 +223,12 @@ struct BrowserUseJob {
     wait: bool,
     ingest: bool,
     control_mode: String,
+    session_id: Option<String>,
+    action: Option<Value>,
+    confirm: bool,
+    veto: bool,
+    human_demonstration: Option<Value>,
+    policy: BrowserActionPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1022,6 +1030,13 @@ fn browser_use_job(
             BrowserSurface::BrowseForMe => "agent_drive".to_string(),
             BrowserSurface::WebConsume => "read".to_string(),
         });
+    let confirm = argument_bool_any(
+        arguments,
+        &["confirm", "confirmed", "approve", "approved", "apply"],
+    )
+    .unwrap_or(false);
+    let veto = argument_bool_any(arguments, &["veto", "reject", "cancel_action"]).unwrap_or(false);
+    let policy = browser_action_policy(arguments, confirm)?;
 
     Ok(BrowserUseJob {
         tool_name: canonical_tool_name,
@@ -1036,7 +1051,67 @@ fn browser_use_job(
         wait: live_web_wait_requested(arguments),
         ingest,
         control_mode,
+        session_id: argument_text_any(arguments, &["session_id", "sessionId"]),
+        action: arguments
+            .get("action")
+            .or_else(|| arguments.get("next_action"))
+            .or_else(|| arguments.get("nextAction"))
+            .cloned(),
+        confirm,
+        veto,
+        human_demonstration: arguments
+            .get("human_demonstration")
+            .or_else(|| arguments.get("humanDemonstration"))
+            .or_else(|| arguments.get("demonstration"))
+            .cloned(),
+        policy,
     })
+}
+
+fn browser_action_policy(arguments: &Value, confirm: bool) -> Result<BrowserActionPolicy, Value> {
+    let mut policy = match arguments.get("policy") {
+        Some(value) => {
+            serde_json::from_value::<BrowserActionPolicy>(value.clone()).map_err(|error| {
+                json!({
+                    "error": "invalid_browser_policy",
+                    "message": format!("browser action policy did not parse: {error}")
+                })
+            })?
+        }
+        None => BrowserActionPolicy::default(),
+    };
+    if confirm {
+        policy.confirmed = true;
+    }
+    if let Some(allow) = argument_bool_any(
+        arguments,
+        &[
+            "allow_state_changing",
+            "allowStateChanging",
+            "state_changing",
+        ],
+    ) {
+        policy.allow_state_changing = allow;
+    }
+    if let Some(confirmed) = argument_bool_any(arguments, &["confirmed", "confirm"]) {
+        policy.confirmed = confirmed;
+    }
+    if let Some(require_robots) = argument_bool_any(arguments, &["require_robots", "requireRobots"])
+    {
+        policy.require_robots = require_robots;
+    }
+    if let Some(domains) = argument_string_list_any(
+        arguments,
+        &["permitted_domains", "permittedDomains", "allow_domains"],
+    ) {
+        policy.permitted_domains = domains;
+    }
+    if let Some(upload_roots) =
+        argument_string_list_any(arguments, &["upload_roots", "uploadRoots"])
+    {
+        policy.upload_roots = upload_roots;
+    }
+    Ok(policy)
 }
 
 async fn execute_browser_use(state: &AppState, job: &BrowserUseJob) -> Result<Value, Value> {
@@ -1055,45 +1130,53 @@ async fn execute_browser_use(state: &AppState, job: &BrowserUseJob) -> Result<Va
         })
     })?;
     let mut web_consume = None;
+    let mut live_browser = None;
     let mut page_observation = None;
     let mut pages_reached: Vec<String> = Vec::new();
     if let Some(url) = &job.url {
-        let cascade = state.live_fetch_cascade();
-        if job.surface == BrowserSurface::BrowseForMe {
-            // browse_for_me autopilot: a bounded link-following loop. Each step
-            // consumes a page through the robots-checked fetch cascade and
-            // ingests it into the quarantined graph, so the visited pages turn
-            // up in the closing perception. The step cap is a fixed budget until
-            // an Ensemble budget is wired in.
-            let steps =
-                run_browse_for_me_loop(&mut browser_store, cascade.as_ref(), job, url).await?;
-            pages_reached = steps.pages_reached;
-            page_observation = steps.last_page.as_ref().map(page_observation_from_state);
-            web_consume = Some(Value::Array(steps.step_payloads));
+        if should_use_live_browser(state, job) {
+            let outcome = execute_live_browser_use(state, job, url).await?;
+            pages_reached = outcome.pages_reached;
+            page_observation = Some(page_observation_from_state(&outcome.page));
+            live_browser = Some(outcome.payload);
         } else {
-            let receipt = web_consume_to_graph(
-                &mut browser_store,
-                cascade.as_ref(),
-                WebConsumeRequest {
-                    run_id: job.run_id.clone(),
-                    url: url.clone(),
-                    actor_id: job.actor_id.clone(),
-                    namespace: "open_web_unverified".to_string(),
-                    max_bytes: job.max_bytes,
-                    ingest: job.ingest,
-                    respect_robots: true,
-                },
-            )
-            .await
-            .map_err(|error| {
-                json!({
-                    "error": "browser_web_consume_failed",
-                    "message": format!("{error:?}")
-                })
-            })?;
-            pages_reached.push(receipt.url.clone());
-            page_observation = Some(page_observation_from_state(&receipt.page));
-            web_consume = Some(web_consume_receipt_payload(&receipt));
+            let cascade = state.live_fetch_cascade();
+            if job.surface == BrowserSurface::BrowseForMe {
+                // browse_for_me autopilot: a bounded link-following loop. Each step
+                // consumes a page through the robots-checked fetch cascade and
+                // ingests it into the quarantined graph, so the visited pages turn
+                // up in the closing perception. The step cap is a fixed budget until
+                // an Ensemble budget is wired in.
+                let steps =
+                    run_browse_for_me_loop(&mut browser_store, cascade.as_ref(), job, url).await?;
+                pages_reached = steps.pages_reached;
+                page_observation = steps.last_page.as_ref().map(page_observation_from_state);
+                web_consume = Some(Value::Array(steps.step_payloads));
+            } else {
+                let receipt = web_consume_to_graph(
+                    &mut browser_store,
+                    cascade.as_ref(),
+                    WebConsumeRequest {
+                        run_id: job.run_id.clone(),
+                        url: url.clone(),
+                        actor_id: job.actor_id.clone(),
+                        namespace: "open_web_unverified".to_string(),
+                        max_bytes: job.max_bytes,
+                        ingest: job.ingest,
+                        respect_robots: true,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    json!({
+                        "error": "browser_web_consume_failed",
+                        "message": format!("{error:?}")
+                    })
+                })?;
+                pages_reached.push(receipt.url.clone());
+                page_observation = Some(page_observation_from_state(&receipt.page));
+                web_consume = Some(web_consume_receipt_payload(&receipt));
+            }
         }
     }
 
@@ -1130,6 +1213,10 @@ async fn execute_browser_use(state: &AppState, job: &BrowserUseJob) -> Result<Va
     );
     let action_rail = build_action_rail(&command, &perception);
     let browsing_run = browsing_run_receipt(&job.run_id, &command, &perception, &action_rail);
+    let mut browsing_run_value = serde_json::to_value(&browsing_run).unwrap_or_else(|_| json!({}));
+    if let (Value::Object(map), Some(live_browser)) = (&mut browsing_run_value, &live_browser) {
+        map.insert("live_browser".to_string(), live_browser.clone());
+    }
 
     // C: publish the playbooks as native skill packs (idempotent) and persist
     // the BrowsingRun as a content-addressed graph node so the run plus its
@@ -1139,7 +1226,6 @@ async fn execute_browser_use(state: &AppState, job: &BrowserUseJob) -> Result<Va
     let (playbook_pack_ids, browsing_run_node) = if job.ingest {
         let playbook_pack_ids =
             publish_browser_playbooks(&mut browser_store, &job.tenant, &job.actor_id);
-        let browsing_run_value = serde_json::to_value(&browsing_run).unwrap_or_else(|_| json!({}));
         let browsing_run_node = persist_browsing_run_node(
             &mut browser_store,
             &job.tenant,
@@ -1163,13 +1249,329 @@ async fn execute_browser_use(state: &AppState, job: &BrowserUseJob) -> Result<Va
         "context_command": command,
         "perception": perception,
         "action_rail": action_rail,
-        "browsing_run": browsing_run,
+        "browsing_run": browsing_run_value,
         "browsing_run_node": browsing_run_node,
         "playbook_pack_ids": playbook_pack_ids,
         "web_consume": web_consume,
+        "live_browser": live_browser,
         "pages_reached": pages_reached,
         "mode": "sync"
     }))
+}
+
+fn should_use_live_browser(state: &AppState, job: &BrowserUseJob) -> bool {
+    job.surface != BrowserSurface::WebConsume && state.live_browser_pool().is_some()
+}
+
+struct LiveBrowserUseOutcome {
+    page: PageState,
+    pages_reached: Vec<String>,
+    payload: Value,
+}
+
+async fn execute_live_browser_use(
+    state: &AppState,
+    job: &BrowserUseJob,
+    url: &str,
+) -> Result<LiveBrowserUseOutcome, Value> {
+    let pool = state.live_browser_pool().ok_or_else(|| {
+        json!({
+            "error": "live_browser_pool_unavailable",
+            "message": "no live browser pool is configured"
+        })
+    })?;
+    let existing = state.live_browser_session(&job.run_id);
+    let session_id = job
+        .session_id
+        .clone()
+        .or_else(|| existing.as_ref().map(|record| record.session_id.clone()));
+    let mut session = pool
+        .checkout(BrowserCheckoutRequest {
+            tenant: job.tenant.clone(),
+            run_id: job.run_id.clone(),
+            session_id,
+            url: Some(url.to_string()),
+            max_bytes: job.max_bytes,
+            actor_id: job.actor_id.clone(),
+        })
+        .await
+        .map_err(browser_engine_payload)?;
+    let mut record = existing.unwrap_or_else(|| {
+        BrowserLiveSessionRecord::new(job.run_id.clone(), session.session_id().to_string())
+    });
+    record.session_id = session.session_id().to_string();
+    record.last_page = Some(session.current_page().map_err(browser_engine_payload)?);
+    if let Some(demonstration) = &job.human_demonstration {
+        record.demonstrations.push(demonstration.clone());
+    }
+
+    if job.veto {
+        record.pending_action = None;
+        let page = session.current_page().map_err(browser_engine_payload)?;
+        record.last_page = Some(page.clone());
+        state.upsert_live_browser_session(record);
+        return Ok(LiveBrowserUseOutcome {
+            page: page.clone(),
+            pages_reached: vec![page.url.clone()],
+            payload: json!({
+                "status": "vetoed",
+                "transport": pool.transport(),
+                "session_id": session.session_id(),
+                "page": page_state_payload(&page)
+            }),
+        });
+    }
+
+    if job.surface == BrowserSurface::BrowseWithMe && job.action.is_some() && !job.confirm {
+        record.pending_action = job.action.clone();
+        let page = session.current_page().map_err(browser_engine_payload)?;
+        record.last_page = Some(page.clone());
+        state.upsert_live_browser_session(record);
+        return Ok(LiveBrowserUseOutcome {
+            page: page.clone(),
+            pages_reached: vec![page.url.clone()],
+            payload: json!({
+                "status": "preview_pending",
+                "transport": pool.transport(),
+                "session_id": session.session_id(),
+                "pending_action": job.action.clone(),
+                "page": page_state_payload(&page)
+            }),
+        });
+    }
+
+    let action_to_apply = if job.confirm {
+        job.action.clone().or_else(|| record.pending_action.take())
+    } else {
+        job.action.clone()
+    };
+    let action_receipt = match action_to_apply {
+        Some(action) => {
+            let command = parse_browser_action_command(&action)?;
+            let receipt = session
+                .run_action(&command, &job.policy)
+                .await
+                .map_err(browser_engine_payload)?;
+            record.pending_action = None;
+            Some(receipt)
+        }
+        None => None,
+    };
+    let page = session.current_page().map_err(browser_engine_payload)?;
+    record.last_page = Some(page.clone());
+    state.upsert_live_browser_session(record.clone());
+
+    Ok(LiveBrowserUseOutcome {
+        page: page.clone(),
+        pages_reached: vec![page.url.clone()],
+        payload: json!({
+            "status": if action_receipt.is_some() { "actuated" } else { "session_ready" },
+            "transport": pool.transport(),
+            "session_id": session.session_id(),
+            "pending_action": record.pending_action,
+            "demonstration_count": record.demonstrations.len(),
+            "action_receipt": action_receipt.as_ref().map(action_receipt_payload),
+            "page": page_state_payload(&page)
+        }),
+    })
+}
+
+fn browser_engine_payload(error: rustyred_web::BrowserEngineError) -> Value {
+    json!({
+        "error": "live_browser_action_failed",
+        "message": format!("{error:?}")
+    })
+}
+
+fn action_receipt_payload(receipt: &AutomationActionReceipt) -> Value {
+    serde_json::to_value(receipt).unwrap_or_else(|_| json!({}))
+}
+
+fn parse_browser_action_command(value: &Value) -> Result<BrowserActionCommand, Value> {
+    let locator = parse_action_locator(value)?;
+    let action = parse_locator_action(value)?;
+    let options = value
+        .get("options")
+        .cloned()
+        .map(serde_json::from_value::<ActionOptions>)
+        .transpose()
+        .map_err(|error| {
+            json!({
+                "error": "invalid_browser_action",
+                "message": format!("action options did not parse: {error}")
+            })
+        })?
+        .unwrap_or_default();
+    Ok(BrowserActionCommand {
+        locator,
+        action,
+        options,
+    })
+}
+
+fn parse_action_locator(value: &Value) -> Result<Locator, Value> {
+    if let Some(locator) = value.get("locator") {
+        return serde_json::from_value::<Locator>(locator.clone()).map_err(|error| {
+            json!({
+                "error": "invalid_browser_action",
+                "message": format!("locator did not parse: {error}")
+            })
+        });
+    }
+    let selector = value.get("selector").unwrap_or(value);
+    let mut locator = if let Some(selector_text) = selector.as_str() {
+        Locator::css(selector_text)
+    } else if let Some(selector) = selector.as_object() {
+        if let Some(element_id) = selector
+            .get("element_id")
+            .or_else(|| selector.get("elementId"))
+            .and_then(Value::as_str)
+        {
+            Locator::get_by_test_id(element_id)
+        } else if let Some(test_id) = selector
+            .get("test_id")
+            .or_else(|| selector.get("testId"))
+            .and_then(Value::as_str)
+        {
+            Locator::get_by_test_id(test_id)
+        } else if let Some(css) = selector.get("css").and_then(Value::as_str) {
+            Locator::css(css)
+        } else if let Some(role) = selector.get("role").and_then(Value::as_str) {
+            Locator::get_by_role(
+                role,
+                rustyred_web::RoleOptions {
+                    name: selector
+                        .get("name")
+                        .or_else(|| selector.get("accessible_name"))
+                        .or_else(|| selector.get("accessibleName"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                },
+            )
+        } else if let Some(text) = selector.get("text").and_then(Value::as_str) {
+            Locator::get_by_text(
+                text,
+                selector
+                    .get("exact")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )
+        } else if let Some(label) = selector.get("label").and_then(Value::as_str) {
+            Locator::get_by_label(label)
+        } else {
+            return Err(json!({
+                "error": "invalid_browser_action",
+                "message": "selector must include locator, element_id, test_id, css, role, text, or label"
+            }));
+        }
+    } else {
+        return Err(json!({
+            "error": "invalid_browser_action",
+            "message": "action requires a selector or locator"
+        }));
+    };
+    if let Some(nth) = selector.get("nth").and_then(Value::as_u64) {
+        locator = locator.nth(nth as usize);
+    }
+    Ok(locator)
+}
+
+fn parse_locator_action(value: &Value) -> Result<LocatorAction, Value> {
+    let Some(action) = value
+        .get("action")
+        .or_else(|| value.get("locator_action"))
+        .or_else(|| value.get("locatorAction"))
+        .or_else(|| value.get("kind"))
+    else {
+        return Err(json!({
+            "error": "invalid_browser_action",
+            "message": "action requires action or kind"
+        }));
+    };
+    if action.is_object() {
+        return serde_json::from_value::<LocatorAction>(action.clone()).map_err(|error| {
+            json!({
+                "error": "invalid_browser_action",
+                "message": format!("locator action did not parse: {error}")
+            })
+        });
+    }
+    let Some(kind) = action.as_str().map(|kind| kind.trim().to_ascii_lowercase()) else {
+        return Err(json!({
+            "error": "invalid_browser_action",
+            "message": "action kind must be a string or tagged action object"
+        }));
+    };
+    match kind.as_str() {
+        "click" => Ok(LocatorAction::Click),
+        "double_click" | "doubleclick" | "dblclick" => Ok(LocatorAction::DoubleClick),
+        "check" => Ok(LocatorAction::Check),
+        "set_checked" | "setchecked" => Ok(LocatorAction::SetChecked {
+            checked: value
+                .get("checked")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        }),
+        "tap" => Ok(LocatorAction::Tap),
+        "fill" | "type" => {
+            let text = value
+                .get("value")
+                .or_else(|| value.get("text"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    json!({
+                        "error": "invalid_browser_action",
+                        "message": "fill/type action requires value or text"
+                    })
+                })?;
+            Ok(LocatorAction::Fill {
+                value: text.to_string(),
+            })
+        }
+        "hover" => Ok(LocatorAction::Hover),
+        "scroll_into_view" | "scrollintoview" => Ok(LocatorAction::ScrollIntoView),
+        "select_option" | "selectoption" | "select" => {
+            let selected = value.get("value").and_then(Value::as_str).ok_or_else(|| {
+                json!({
+                    "error": "invalid_browser_action",
+                    "message": "select option action requires value"
+                })
+            })?;
+            Ok(LocatorAction::SelectOption {
+                value: selected.to_string(),
+            })
+        }
+        "set_input_files" | "setinputfiles" | "upload_file" | "upload" => {
+            let paths = value
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .or_else(|| {
+                    value
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(|path| vec![path.to_string()])
+                })
+                .unwrap_or_default();
+            if paths.is_empty() {
+                return Err(json!({
+                    "error": "invalid_browser_action",
+                    "message": "set input files action requires paths or path"
+                }));
+            }
+            Ok(LocatorAction::SetInputFiles { paths })
+        }
+        _ => Err(json!({
+            "error": "invalid_browser_action",
+            "message": format!("unsupported action kind: {kind}")
+        })),
+    }
 }
 
 const BROWSE_FOR_ME_MAX_STEPS: usize = 4;
@@ -2813,6 +3215,17 @@ fn argument_bool_any(arguments: &Value, keys: &[&str]) -> Option<bool> {
                 _ => None,
             },
             _ => None,
+        }
+    })
+}
+
+fn argument_string_list_any(arguments: &Value, keys: &[&str]) -> Option<Vec<String>> {
+    keys.iter().find_map(|key| {
+        let values = string_array_argument(arguments, key);
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
         }
     })
 }
@@ -7805,6 +8218,213 @@ mod tests {
         assert_eq!(consume.surface, BrowserSurface::WebConsume);
         assert!(!consume.ingest);
         assert_eq!(consume.task, "consume https://example.com/source");
+        assert!(!super::should_use_live_browser(&state, &consume));
+    }
+
+    #[tokio::test]
+    async fn browse_with_me_live_session_previews_then_confirms_action() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let pool = Arc::new(crate::browser_pool::ScriptedBrowserPool::new(
+            crate::browser_pool::scripted_page_with_textbox(),
+        ));
+        state.set_live_browser_pool(Some(pool.clone()));
+        let config = state.mcp_config();
+        let action = json!({
+            "selector": { "element_id": "name" },
+            "action": "fill",
+            "value": "Travis",
+            "options": { "timeout_ms": 1 }
+        });
+
+        let first = super::browser_use_payload(
+            &state,
+            &config,
+            "browse_with_me",
+            &json!({
+                "tenant": "default",
+                "run_id": "live-run",
+                "task": "fill the name field",
+                "url": "https://example.test/form",
+                "action": action,
+                "wait": true
+            }),
+        )
+        .await
+        .expect("preview response");
+
+        assert_eq!(first["live_browser"]["status"], "preview_pending");
+        assert!(
+            pool.receipts().is_empty(),
+            "preview must not actuate before confirm"
+        );
+
+        let second = super::browser_use_payload(
+            &state,
+            &config,
+            "browse_with_me",
+            &json!({
+                "tenant": "default",
+                "run_id": "live-run",
+                "task": "fill the name field",
+                "url": "https://example.test/form",
+                "confirm": true,
+                "wait": true
+            }),
+        )
+        .await
+        .expect("confirm response");
+
+        assert_eq!(second["live_browser"]["status"], "actuated");
+        assert_eq!(
+            second["live_browser"]["page"]["interactive_elements"][0]["value"],
+            "Travis"
+        );
+        assert_eq!(pool.receipts().len(), 1);
+        assert!(
+            second["browsing_run"]["live_browser"]["action_receipt"]["applied"]
+                .as_bool()
+                .unwrap_or(false),
+            "browsing run ledger should include the applied actuation receipt"
+        );
+    }
+
+    // handoff-7 acceptance #1: with a live pool, a browse_for_me task applies a real
+    // click/type on the page through run_action (not link-following), the DOM change
+    // shows up in the closing perception, and the BrowsingRun ledger records the
+    // actuation -- not only navigation. Hermetic: the live branch replaces the
+    // cascade fetch, so the scripted pool drives it with no network.
+    #[tokio::test]
+    async fn browse_for_me_live_session_actuates_through_run_action() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let pool = Arc::new(crate::browser_pool::ScriptedBrowserPool::new(
+            crate::browser_pool::scripted_page_with_textbox(),
+        ));
+        state.set_live_browser_pool(Some(pool.clone()));
+        let config = state.mcp_config();
+
+        let response = super::browser_use_payload(
+            &state,
+            &config,
+            "browse_for_me",
+            &json!({
+                "tenant": "default",
+                "run_id": "bfm-live-run",
+                "task": "fill the name field",
+                "url": "https://example.test/form",
+                "action": {
+                    "selector": { "element_id": "name" },
+                    "action": "fill",
+                    "value": "Servo",
+                    "options": { "timeout_ms": 1 }
+                },
+                "wait": true
+            }),
+        )
+        .await
+        .expect("browse_for_me live response");
+
+        // The supplied action actuated immediately (no preview gate on browse_for_me).
+        assert_eq!(response["live_browser"]["status"], "actuated");
+        // The DOM change is in the closing perception (the returned page state).
+        assert_eq!(
+            response["live_browser"]["page"]["interactive_elements"][0]["value"],
+            "Servo"
+        );
+        // The ledger records the actuation receipt, not only a navigation.
+        assert!(
+            response["browsing_run"]["live_browser"]["action_receipt"]["applied"]
+                .as_bool()
+                .unwrap_or(false),
+            "browsing run should record the actuation"
+        );
+        assert_eq!(
+            pool.receipts().len(),
+            1,
+            "exactly one real run_action actuation drove the page"
+        );
+    }
+
+    // handoff-7 acceptance #4 (server half): the server derives the governance policy
+    // it feeds into run_action -- a state-changing action stays unconfirmed (so the
+    // engine blocks it) unless confirm is set, and the robots gate stays required by
+    // default. The engine-side enforcement of this policy (action_allowed_by_policy /
+    // action_allowed_by_robots / domain_policy_blocks_off_domain_link_before_fetch) is
+    // proven in rustyred_web::browser_engine tests; this proves the server feeds it.
+    #[test]
+    fn browser_action_policy_gates_state_change_and_robots() {
+        let default_policy = super::browser_action_policy(&json!({}), false).expect("policy");
+        assert!(
+            !default_policy.confirmed,
+            "no confirm -> unconfirmed (a state-changing action is blocked downstream)"
+        );
+        assert!(
+            !default_policy.allow_state_changing,
+            "state-changing actuation is off by default (needs a higher trust tier)"
+        );
+        assert!(
+            default_policy.require_robots,
+            "the robots gate is required by default"
+        );
+
+        // The confirm-before-write path flips confirmed true for the supervised action.
+        let confirmed = super::browser_action_policy(&json!({}), true).expect("policy");
+        assert!(confirmed.confirmed);
+
+        // Explicit opt-ins (higher trust tier) are honored, including permitted domains.
+        let opted = super::browser_action_policy(
+            &json!({
+                "allow_state_changing": true,
+                "require_robots": false,
+                "permitted_domains": ["example.test"]
+            }),
+            true,
+        )
+        .expect("policy");
+        assert!(opted.allow_state_changing && opted.confirmed && !opted.require_robots);
+        assert_eq!(opted.permitted_domains, vec!["example.test".to_string()]);
+    }
+
+    // handoff-7 acceptance #6 + Decision 2: web_consume is the read primitive. Even
+    // with a live pool configured it stays on the cascade path (never actuates), and
+    // ingest=false carries no graph write; the write variant is blocked under
+    // read-only. Hermetic: asserted at the gate/job layer, before any fetch.
+    #[tokio::test]
+    async fn web_consume_stays_cascade_read_path_and_write_gated() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let pool = Arc::new(crate::browser_pool::ScriptedBrowserPool::new(
+            crate::browser_pool::scripted_page_with_textbox(),
+        ));
+        state.set_live_browser_pool(Some(pool.clone()));
+        let config = state.mcp_config();
+
+        let consume_job = super::browser_use_job(
+            &config,
+            "web_consume",
+            &json!({ "url": "https://example.test/source", "ingest": false }),
+        )
+        .expect("web_consume job");
+        assert!(!consume_job.ingest, "ingest=false carries no graph write");
+        assert!(
+            !super::should_use_live_browser(&state, &consume_job),
+            "web_consume stays on the cascade path even when a live pool is present"
+        );
+        assert!(
+            pool.receipts().is_empty(),
+            "web_consume actuates nothing on the live pool"
+        );
+
+        // The write variant (ingest=true) is blocked under read-only, before any fetch.
+        let ro_state = memory_product_state();
+        let ro_config = ro_state.mcp_config();
+        let blocked = super::browser_use_payload(
+            &ro_state,
+            &ro_config,
+            "web_consume",
+            &json!({ "url": "https://example.test/source", "ingest": true }),
+        )
+        .await
+        .expect_err("ingest=true must be blocked under read-only");
+        assert_eq!(blocked["error"], "mcp_read_only");
     }
 
     #[tokio::test]

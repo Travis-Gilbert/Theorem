@@ -2,6 +2,7 @@
 
 mod agent_space;
 mod auth;
+mod browser_pool;
 mod bulk;
 pub mod config;
 mod coordination_push;
