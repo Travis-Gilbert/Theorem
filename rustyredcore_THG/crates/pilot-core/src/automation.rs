@@ -372,7 +372,6 @@ pub struct AutomationActionReceipt {
     pub engine_receipt: Option<Value>,
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContextOptions {
     pub context_id: String,
@@ -708,4 +707,3 @@ fn assertion_message(assertion: &AssertionKind, passed: bool, actual_count: usiz
 fn default_timeout_ms() -> u64 {
     30_000
 }
-

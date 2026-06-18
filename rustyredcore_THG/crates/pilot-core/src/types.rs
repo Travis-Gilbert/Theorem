@@ -154,12 +154,20 @@ pub type BrowserEngineResult<T> = Result<T, BrowserEngineError>;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BrowserEngineError {
     NoCurrentPage,
-    ElementNotFound { element_id: String },
-    UnsupportedAction { reason: String },
-    ActionBlocked { reason: String },
+    ElementNotFound {
+        element_id: String,
+    },
+    UnsupportedAction {
+        reason: String,
+    },
+    ActionBlocked {
+        reason: String,
+    },
     /// A backend-specific error (e.g. a fetch/transport failure in the
     /// fetch-cascade engine). The driver crate maps its own error type here.
-    Backend { message: String },
+    Backend {
+        message: String,
+    },
 }
 
 /// Governance policy for an actuation: what is permitted, plus the

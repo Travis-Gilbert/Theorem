@@ -124,10 +124,9 @@ pub fn stamp_listwise_rank(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
     let denom = len.max(1) as f32;
     for (index, candidate) in candidates.iter_mut().enumerate() {
         let score = (len - index) as f32 / denom;
-        candidate.metadata.insert(
-            LISTWISE_RANK_SCORE_KEY.to_string(),
-            format!("{score:.6}"),
-        );
+        candidate
+            .metadata
+            .insert(LISTWISE_RANK_SCORE_KEY.to_string(), format!("{score:.6}"));
     }
     candidates
 }

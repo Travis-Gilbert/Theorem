@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use rustyred_membrane::{Candidate, ScoreContext, Scorer};
 use reqwest::blocking::Client;
+use rustyred_membrane::{Candidate, ScoreContext, Scorer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 

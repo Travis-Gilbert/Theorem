@@ -15,8 +15,8 @@ use crate::{
     rank_trained_pairformer_densification_candidates, reflexive_match_inference,
     register_model_artifact, register_trained_pairformer_artifact, save_pairformer_file,
     score_links_with_trained, tenant_node_id, train_pairformer, BurnPairformerConfig,
-    DensificationRequest,
-    MatchInferenceScorer, ModelArtifactInput, PairformerConfig, PairformerTrainingConfig,
+    DensificationRequest, MatchInferenceScorer, ModelArtifactInput, PairformerConfig,
+    PairformerTrainingConfig,
 };
 
 /// Burn's backend RNG is a process-global mutex; these tests seed it, so

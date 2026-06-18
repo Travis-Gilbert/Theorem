@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::automation::{
-    ActionabilityRequirement, ActionabilityVerdict, ActionOptions, AutomationActionReceipt,
+    ActionOptions, ActionabilityRequirement, ActionabilityVerdict, AutomationActionReceipt,
     ElementHandle, Locator, LocatorAction,
 };
 use crate::types::{
@@ -78,7 +78,11 @@ pub fn css_to_device_point(css_x: f32, css_y: f32, dppx: f32, origin: DevicePoin
 
 /// The device point at a rectangle's center, the click/hover target for
 /// coordinate synthesis.
-pub fn device_point_at_rect_center(rect: &ElementBox, dppx: f32, origin: DevicePoint) -> DevicePoint {
+pub fn device_point_at_rect_center(
+    rect: &ElementBox,
+    dppx: f32,
+    origin: DevicePoint,
+) -> DevicePoint {
     let (cx, cy) = rect_center_css(rect);
     css_to_device_point(cx, cy, dppx, origin)
 }
@@ -199,9 +203,7 @@ fn round_to_i32(value: f64) -> i32 {
 
 impl From<SnapshotElement> for InteractiveElement {
     fn from(element: SnapshotElement) -> Self {
-        let value = element
-            .value
-            .filter(|value| !value.is_empty());
+        let value = element.value.filter(|value| !value.is_empty());
         InteractiveElement {
             element_id: element.handle,
             role: element.role,
@@ -282,7 +284,10 @@ pub enum SemanticAction {
 pub enum ActuationKind {
     /// Mechanism A (V1): synthesize input events at a Paint-hit-tested device
     /// point via `notify_input_event`.
-    CoordinateSynthesis { point: DevicePoint, pointer: PointerKind },
+    CoordinateSynthesis {
+        point: DevicePoint,
+        pointer: PointerKind,
+    },
     /// Focus by coordinate, then commit text (keyboard / IME).
     Keyboard { point: DevicePoint, text: String },
     /// Mechanism B: open a Servo-rendered native control, then respond through
@@ -295,7 +300,10 @@ pub enum ActuationKind {
     Scroll { point: DevicePoint },
     /// The #4344 route: activate the element by AccessKit node id. The engine
     /// phase fills this in; V1 drivers reject it.
-    SemanticActivation { node_id: u64, action: SemanticAction },
+    SemanticActivation {
+        node_id: u64,
+        action: SemanticAction,
+    },
 }
 
 /// A resolved actuation: the gesture plus the handle it targets (so a driver
@@ -514,9 +522,11 @@ pub fn browser_action_for_plan(plan: &ActuationPlan) -> BrowserEngineResult<Brow
                 value: value.clone(),
             }),
             EmbedderControlPlan::SetInputFiles { paths } => {
-                let path = paths.first().ok_or_else(|| BrowserEngineError::UnsupportedAction {
-                    reason: "set_input_files requires at least one path".to_string(),
-                })?;
+                let path = paths
+                    .first()
+                    .ok_or_else(|| BrowserEngineError::UnsupportedAction {
+                        reason: "set_input_files requires at least one path".to_string(),
+                    })?;
                 Ok(BrowserAction::UploadFile {
                     element_id,
                     path: path.clone(),
@@ -642,9 +652,17 @@ mod tests {
         assert_eq!(page.interactive_elements[0].element_id, "t0");
         assert_eq!(
             page.interactive_elements[0].bbox,
-            Some(ElementBox { x: 10, y: 20, width: 80, height: 24 })
+            Some(ElementBox {
+                x: 10,
+                y: 20,
+                width: 80,
+                height: 24
+            })
         );
-        assert_eq!(page.interactive_elements[0].test_id.as_deref(), Some("save"));
+        assert_eq!(
+            page.interactive_elements[0].test_id.as_deref(),
+            Some("save")
+        );
         // Empty value strings collapse to None (parity with the HTML reader).
         assert!(page.interactive_elements[1].value.is_none());
         assert!(!page.interactive_elements[1].enabled);
@@ -653,7 +671,12 @@ mod tests {
 
     #[test]
     fn coordinate_transform_lands_device_point_at_rect_center() {
-        let rect = ElementBox { x: 100, y: 40, width: 60, height: 20 };
+        let rect = ElementBox {
+            x: 100,
+            y: 40,
+            width: 60,
+            height: 20,
+        };
         // center css = (130, 50); dppx 2.0; origin (10, 5) => (270, 105).
         let point = device_point_at_rect_center(&rect, 2.0, DevicePoint { x: 10.0, y: 5.0 });
         assert_eq!(point, DevicePoint { x: 270.0, y: 105.0 });
@@ -673,20 +696,47 @@ mod tests {
         // Frame 0: the field is disabled. Frame 1: enabled. The loop must
         // re-snapshot and succeed on the second attempt without a sleep call.
         let disabled = page(vec![element(
-            "t0", "text", "q", true, false, true, false,
-            Some(ElementBox { x: 0, y: 0, width: 100, height: 20 }),
+            "t0",
+            "text",
+            "q",
+            true,
+            false,
+            true,
+            false,
+            Some(ElementBox {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 20,
+            }),
         )]);
         let enabled = page(vec![element(
-            "t0", "text", "q", true, true, true, false,
-            Some(ElementBox { x: 0, y: 0, width: 100, height: 20 }),
+            "t0",
+            "text",
+            "q",
+            true,
+            true,
+            true,
+            false,
+            Some(ElementBox {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 20,
+            }),
         )]);
         let mut driver = FakeDriver::new(vec![disabled, enabled], 1.0, DevicePoint::ZERO);
 
         let receipt = run_action(
             &mut driver,
             &Locator::get_by_label("q"),
-            LocatorAction::Fill { value: "servo".to_string() },
-            ActionOptions { timeout_ms: 1_000, force: false },
+            LocatorAction::Fill {
+                value: "servo".to_string(),
+            },
+            ActionOptions {
+                timeout_ms: 1_000,
+                force: false,
+            },
             &BrowserActionPolicy::default(),
         )
         .await
@@ -707,16 +757,35 @@ mod tests {
         // A degraded button never receives events; clicking must fail closed at
         // the deadline (not fire blind), with the gating check reported.
         let occluded = page(vec![element(
-            "t0", "button", "Save", true, true, false, true,
-            Some(ElementBox { x: 0, y: 0, width: 80, height: 24 }),
+            "t0",
+            "button",
+            "Save",
+            true,
+            true,
+            false,
+            true,
+            Some(ElementBox {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            }),
         )]);
         let mut driver = FakeDriver::new(vec![occluded], 1.0, DevicePoint::ZERO);
 
         let receipt = run_action(
             &mut driver,
-            &Locator::get_by_role("button", RoleOptions { name: Some("Save".to_string()) }),
+            &Locator::get_by_role(
+                "button",
+                RoleOptions {
+                    name: Some("Save".to_string()),
+                },
+            ),
             LocatorAction::Click,
-            ActionOptions { timeout_ms: 60, force: false },
+            ActionOptions {
+                timeout_ms: 60,
+                force: false,
+            },
             &BrowserActionPolicy::default(),
         )
         .await
@@ -734,16 +803,35 @@ mod tests {
     #[tokio::test]
     async fn force_clicks_a_degraded_button_through_the_gate() {
         let occluded = page(vec![element(
-            "t0", "button", "Save", true, true, false, true,
-            Some(ElementBox { x: 0, y: 0, width: 80, height: 24 }),
+            "t0",
+            "button",
+            "Save",
+            true,
+            true,
+            false,
+            true,
+            Some(ElementBox {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            }),
         )]);
         let mut driver = FakeDriver::new(vec![occluded], 1.0, DevicePoint::ZERO);
 
         let receipt = run_action(
             &mut driver,
-            &Locator::get_by_role("button", RoleOptions { name: Some("Save".to_string()) }),
+            &Locator::get_by_role(
+                "button",
+                RoleOptions {
+                    name: Some("Save".to_string()),
+                },
+            ),
             LocatorAction::Click,
-            ActionOptions { timeout_ms: 1_000, force: true },
+            ActionOptions {
+                timeout_ms: 1_000,
+                force: true,
+            },
             &BrowserActionPolicy::default(),
         )
         .await
@@ -752,7 +840,10 @@ mod tests {
         assert!(receipt.applied);
         assert!(matches!(
             driver.actuated.borrow()[0].kind,
-            ActuationKind::CoordinateSynthesis { pointer: PointerKind::Click, .. }
+            ActuationKind::CoordinateSynthesis {
+                pointer: PointerKind::Click,
+                ..
+            }
         ));
     }
 
@@ -765,7 +856,10 @@ mod tests {
             &mut driver,
             &Locator::get_by_test_id("ghost"),
             LocatorAction::Click,
-            ActionOptions { timeout_ms: 50, force: false },
+            ActionOptions {
+                timeout_ms: 50,
+                force: false,
+            },
             &BrowserActionPolicy::default(),
         )
         .await
@@ -777,8 +871,19 @@ mod tests {
     #[tokio::test]
     async fn semantic_activation_is_rejected_by_a_coordinate_only_driver() {
         let occluded = page(vec![element(
-            "t0", "button", "Save", true, true, false, false,
-            Some(ElementBox { x: 0, y: 0, width: 80, height: 24 }),
+            "t0",
+            "button",
+            "Save",
+            true,
+            true,
+            false,
+            false,
+            Some(ElementBox {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            }),
         )]);
         let mut driver = FakeDriver::new(vec![occluded], 1.0, DevicePoint::ZERO);
         // The #4344 variant is structurally present; a coordinate-only driver
