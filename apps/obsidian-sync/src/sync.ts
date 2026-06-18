@@ -8,7 +8,6 @@ import {
   assignBasenames,
   kindFolder,
   LinkResolver,
-  notePathFor,
   renderNote,
   userBody,
 } from "./notes";
@@ -320,6 +319,20 @@ export class Syncer {
 function basenameOf(path: string): string {
   const file = path.split("/").pop() ?? path;
   return file.replace(/\.md$/, "");
+}
+
+function notePathFor(
+  syncFolder: string,
+  kind: string,
+  basename: string,
+  folderByKind: boolean
+): string {
+  const segments = [syncFolder];
+  if (folderByKind) {
+    segments.push(kindFolder(kind));
+  }
+  segments.push(`${basename}.md`);
+  return segments.filter(Boolean).join("/");
 }
 
 function conflictCopyPath(path: string): string {

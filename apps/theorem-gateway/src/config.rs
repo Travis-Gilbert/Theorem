@@ -125,9 +125,9 @@ impl GatewayConfig {
     }
 
     /// AC5: the public `ingestCodebase`/`reindexCodebase` mutations only accept
-    /// repo URLs whose normalized form starts with an allowlisted prefix. An
-    /// empty allowlist refuses everything (fail closed) — the safe default for
-    /// a public browser boundary. The check is pure: it never dials gRPC.
+    /// repo URLs whose normalized form matches an allowlisted prefix at a URL
+    /// boundary. An empty allowlist refuses everything (fail closed) - the safe
+    /// default for a public browser boundary. The check is pure: it never dials gRPC.
     pub fn ingest_url_allowed(&self, repo_url: &str) -> bool {
         let candidate = repo_url.trim();
         if candidate.is_empty() {
@@ -135,7 +135,7 @@ impl GatewayConfig {
         }
         self.ingest_allowlist
             .iter()
-            .any(|prefix| candidate.starts_with(prefix.as_str()))
+            .any(|prefix| url_prefix_matches(candidate, prefix))
     }
 }
 
@@ -165,6 +165,20 @@ pub fn normalize_grpc_url(raw: &str) -> String {
     } else {
         format!("http://{trimmed}")
     }
+}
+
+fn url_prefix_matches(candidate: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim();
+    if prefix.is_empty() || !candidate.starts_with(prefix) {
+        return false;
+    }
+    if candidate.len() == prefix.len() || prefix.ends_with('/') {
+        return true;
+    }
+    matches!(
+        candidate.as_bytes().get(prefix.len()),
+        Some(b'/' | b'?' | b'#')
+    )
 }
 
 #[cfg(test)]
@@ -208,6 +222,14 @@ mod tests {
     }
 
     #[test]
+    fn allowlisted_prefix_without_trailing_slash_still_requires_a_url_boundary() {
+        let cfg = cfg_with_allowlist(&["https://github.com/Travis-Gilbert"]);
+        assert!(cfg.ingest_url_allowed("https://github.com/Travis-Gilbert/RustyRed-Graph-Database"));
+        assert!(!cfg
+            .ingest_url_allowed("https://github.com/Travis-Gilbert.evil/RustyRed-Graph-Database"));
+    }
+
+    #[test]
     fn non_allowlisted_url_is_refused() {
         let cfg = cfg_with_allowlist(&["https://github.com/Travis-Gilbert/"]);
         assert!(!cfg.ingest_url_allowed("https://github.com/someone-else/evil"));
@@ -216,7 +238,9 @@ mod tests {
     #[test]
     fn empty_allowlist_fails_closed() {
         let cfg = cfg_with_allowlist(&[]);
-        assert!(!cfg.ingest_url_allowed("https://github.com/Travis-Gilbert/RustyRed-Graph-Database"));
+        assert!(
+            !cfg.ingest_url_allowed("https://github.com/Travis-Gilbert/RustyRed-Graph-Database")
+        );
         assert!(!cfg.ingest_url_allowed(""));
     }
 

@@ -79,21 +79,6 @@ export function assignBasenames(
   return out;
 }
 
-/** The vault path for a note, honoring the folder-by-kind layout. */
-export function notePathFor(
-  syncFolder: string,
-  kind: string,
-  basename: string,
-  folderByKind: boolean
-): string {
-  const segments = [syncFolder];
-  if (folderByKind) {
-    segments.push(kindFolder(kind));
-  }
-  segments.push(`${basename}.md`);
-  return segments.filter(Boolean).join("/");
-}
-
 export function slugify(value: string): string {
   return value
     .toLowerCase()

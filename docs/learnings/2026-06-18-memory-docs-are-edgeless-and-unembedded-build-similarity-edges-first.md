@@ -33,7 +33,9 @@ must compute it. Use `rustyred_thg_memory::similarity::compute_memory_similarity
 tenant, embedder, opts)` (embed -> O(n^2) cosine kNN -> write `MEMORY_SIMILAR` edges with a
 deterministic `memory_edge_id` so re-runs are idempotent). Reuse the crate's private
 `memory_nodes` (enumerates `MemoryDocument`-labeled nodes by tenant), `prop_str`, and
-`memory_edge_id` from a child module — do not re-walk the store. The default `HashEmbedder`
+`memory_edge_id` from a child module - do not re-walk the store. The default options exclude
+graph-internal `community_summary` and `orchestrate` docs, and `SimilarityOptions` can override
+the include/exclude kind lists for full-corpus maintenance runs. The default `HashEmbedder`
 is a deterministic offline token-hash bag-of-words: it proves the mechanism and is testable,
 but it carries NO learned semantics, so cluster QUALITY needs a real SBERT/GL-Fusion encoder
 behind the `MemoryEmbedder` trait. And surfacing the edges to a reader (the Obsidian plugin's
@@ -43,9 +45,9 @@ behind the `MemoryEmbedder` trait. And surfacing the edges to a reader (the Obsi
 ## Evidence
 
 - `compute_memory_similarity_edges` shipped in `rustyred-thg-memory/src/similarity.rs`
-  (commit `bd6f3cab`); 4 acceptance tests in `tests/similarity_acceptance.rs` prove
+  (commit `bd6f3cab`); 5 acceptance tests in `tests/similarity_acceptance.rs` prove
   intra-cluster linking, no cross-cluster edges, tenant scoping, idempotent re-run, threshold
-  pruning.
+  pruning, and kind filtering.
 - `persist_memory_document` (theorem-harness-runtime/src/memory.rs ~1610) creates only
   `MEMORY_RELATES` edges from the `links` array; no embed call.
 - `memory_docs_list` (rustyred-thg-server/src/router.rs ~5424) returns `links` only; a new

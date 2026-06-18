@@ -3,7 +3,7 @@
 //! Memory docs are otherwise edgeless for layout: only authored `MEMORY_RELATES`
 //! wikilinks and lifecycle edges (`MEMORY_SUPERSEDES`, `DERIVED_FROM`, ...) connect
 //! them, and most docs carry none. This builder gives the memory graph a navigable,
-//! clusterable topology: it embeds every memory doc for a tenant and writes a
+//! clusterable topology: it embeds filtered memory docs for a tenant and writes a
 //! `MEMORY_SIMILAR` edge to each doc's top-k nearest neighbors by cosine similarity.
 //! Those edges drive the native graph view in the Obsidian mirror and the dense
 //! semantic galaxy in Theseus / Scene OS.
@@ -20,10 +20,11 @@
 use rustyred_thg_core::{now_ms, EdgeRecord, GraphStore, GraphStoreResult, NodeRecord};
 use serde_json::json;
 
-use crate::{memory_edge_id, memory_nodes, normalized_tenant_pair, prop_str};
+use crate::{memory_edge_id, memory_nodes, normalized_tenant_pair, prop_str, MEMORY_DOCUMENT_LABEL};
 
 /// Edge type written between two semantically-close memory docs.
 pub const MEMORY_SIMILAR: &str = "MEMORY_SIMILAR";
+pub const DEFAULT_EXCLUDED_SIMILARITY_KINDS: &[&str] = &["community_summary", "orchestrate"];
 
 /// Maps a doc's text to a fixed-dimension embedding. The default is [`HashEmbedder`];
 /// a real model implements this trait to produce semantically-meaningful vectors.
@@ -72,12 +73,16 @@ impl MemoryEmbedder for HashEmbedder {
 }
 
 /// Knobs for the edge builder.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SimilarityOptions {
     /// Max neighbors to link per doc (the k in kNN).
     pub k: usize,
     /// Minimum cosine similarity for an edge; prunes weak links.
     pub min_score: f64,
+    /// Optional kind allowlist. Empty means every kind not denied is eligible.
+    pub include_kinds: Vec<String>,
+    /// Kind denylist. Exclude wins over include.
+    pub exclude_kinds: Vec<String>,
 }
 
 impl Default for SimilarityOptions {
@@ -85,6 +90,11 @@ impl Default for SimilarityOptions {
         Self {
             k: 8,
             min_score: 0.15,
+            include_kinds: Vec::new(),
+            exclude_kinds: DEFAULT_EXCLUDED_SIMILARITY_KINDS
+                .iter()
+                .map(|kind| kind.to_string())
+                .collect(),
         }
     }
 }
@@ -96,10 +106,10 @@ pub struct SimilarityStats {
     pub edges_written: usize,
 }
 
-/// Embed every memory doc for `tenant_slug` and write `MEMORY_SIMILAR` edges to each
-/// doc's top-k nearest neighbors above `opts.min_score`. O(n^2) cosine, which is fine
-/// at memory scale (hundreds of docs per tenant). Deterministic edge ids make a
-/// re-run over the same doc set idempotent.
+/// Embed filtered memory docs for `tenant_slug` and write `MEMORY_SIMILAR` edges to
+/// each doc's top-k nearest neighbors above `opts.min_score`. O(n^2) cosine, which
+/// is fine at memory scale (hundreds of docs per tenant). Deterministic edge ids
+/// make a re-run over the same doc set idempotent.
 pub fn compute_memory_similarity_edges<S: GraphStore>(
     store: &mut S,
     tenant_slug: &str,
@@ -107,7 +117,15 @@ pub fn compute_memory_similarity_edges<S: GraphStore>(
     opts: &SimilarityOptions,
 ) -> GraphStoreResult<SimilarityStats> {
     let tenant = normalized_tenant_pair("", tenant_slug);
-    let nodes = memory_nodes(&*store, &tenant, false)?;
+    let nodes: Vec<NodeRecord> = memory_nodes(&*store, &tenant, false)?
+        .into_iter()
+        .filter(|node| {
+            node.labels
+                .iter()
+                .any(|label| label == MEMORY_DOCUMENT_LABEL)
+        })
+        .filter(|node| kind_allowed(node, opts))
+        .collect();
     let embedded: Vec<(String, Vec<f32>)> = nodes
         .iter()
         .map(|node| (node.id.clone(), embedder.embed(&memory_text(node))))
@@ -169,6 +187,26 @@ fn memory_text(node: &NodeRecord) -> String {
     .flatten()
     .collect::<Vec<_>>()
     .join("\n")
+}
+
+fn kind_allowed(node: &NodeRecord, opts: &SimilarityOptions) -> bool {
+    let kind = normalize_kind(prop_str(&node.properties, "kind").unwrap_or_default());
+    if !opts.include_kinds.is_empty()
+        && !opts
+            .include_kinds
+            .iter()
+            .any(|candidate| normalize_kind(candidate) == kind)
+    {
+        return false;
+    }
+    !opts
+        .exclude_kinds
+        .iter()
+        .any(|candidate| normalize_kind(candidate) == kind)
+}
+
+fn normalize_kind(kind: impl AsRef<str>) -> String {
+    kind.as_ref().trim().to_lowercase()
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {

@@ -13,9 +13,13 @@ There is no root Cargo workspace. The `-p <crate>` flag only works inside the re
 ## Build the engine
 
 ```bash
-cd rustyredcore_THG && cargo build
+cd rustyredcore_THG && cargo check --workspace
 cd rustyredcore_THG && cargo test -p rustyred-thg-core
 ```
+
+Use `maturin develop` for the root PyO3 module. A plain workspace build reaches
+the Python extension link step and is not the right compile oracle for member
+crates.
 
 ## Test the harness kernel and runtime
 

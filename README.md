@@ -79,7 +79,7 @@ There is **no root Cargo workspace**. Pick the right workspace/crate:
 
 ```bash
 # RustyRed/THG core workspace (the engine + bridge)
-cd rustyredcore_THG && cargo build            # build the workspace
+cd rustyredcore_THG && cargo check --workspace # type-check the workspace; use maturin for PyO3
 cd rustyredcore_THG && cargo test -p rustyred-thg-core   # test the core
 cd rustyredcore_THG && cargo test --no-run -p rustyred-thg-core  # compile-only coherence check
 cd rustyredcore_THG && cargo test -p theorem-harness-core # test the Rust-native harness kernel

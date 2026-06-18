@@ -1,12 +1,11 @@
 // Navigable-vault layout: human basenames with collision handling, kind folders,
-// path construction, and the computed "Related" block.
+// and the computed "Related" block.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   assignBasenames,
   kindFolder,
-  notePathFor,
   renderRelatedBlock,
   type LinkResolver,
 } from "../src/notes";
@@ -67,17 +66,6 @@ test("kindFolder maps known kinds and falls back to Notes", () => {
   assert.equal(kindFolder("something_unmapped"), "Notes");
   assert.equal(kindFolder(undefined), "Notes");
   assert.equal(kindFolder("  SOLUTION "), "Solutions", "case/space-insensitive");
-});
-
-test("notePathFor honors the folder-by-kind switch", () => {
-  assert.equal(
-    notePathFor("Theorem", "solution", "a-real-solution", true),
-    "Theorem/Solutions/a-real-solution.md"
-  );
-  assert.equal(
-    notePathFor("Theorem", "solution", "a-real-solution", false),
-    "Theorem/a-real-solution.md"
-  );
 });
 
 test("renderRelatedBlock emits a delimited Related block, or nothing when empty", () => {

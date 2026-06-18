@@ -12,6 +12,17 @@ use rustyred_thg_memory::{
 use serde_json::json;
 
 fn add_doc(store: &mut InMemoryGraphStore, id: &str, tenant: &str, title: &str, content: &str) {
+    add_doc_with_kind(store, id, tenant, "note", title, content);
+}
+
+fn add_doc_with_kind(
+    store: &mut InMemoryGraphStore,
+    id: &str,
+    tenant: &str,
+    kind: &str,
+    title: &str,
+    content: &str,
+) {
     store
         .upsert_node(NodeRecord::new(
             id,
@@ -19,6 +30,7 @@ fn add_doc(store: &mut InMemoryGraphStore, id: &str, tenant: &str, title: &str, 
             json!({
                 "tenant_id": tenant,
                 "tenant_slug": tenant,
+                "kind": kind,
                 "title": title,
                 "summary": "",
                 "content": content,
@@ -53,7 +65,11 @@ fn seeded_store() -> InMemoryGraphStore {
 }
 
 fn options() -> SimilarityOptions {
-    SimilarityOptions { k: 3, min_score: 0.1 }
+    SimilarityOptions {
+        k: 3,
+        min_score: 0.1,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -113,9 +129,65 @@ fn the_score_threshold_prunes_weak_links() {
         &mut store,
         "t",
         &HashEmbedder::new(256),
-        &SimilarityOptions { k: 8, min_score: 0.999 },
+        &SimilarityOptions {
+            k: 8,
+            min_score: 0.999,
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(stats.edges_written, 0, "nothing clears a near-1.0 cosine threshold");
     assert!(similar_ids(&store, "doc_pg1").is_empty());
+}
+
+#[test]
+fn kind_filter_excludes_internal_docs_and_can_allowlist_real_kinds() {
+    let mut store = seeded_store();
+    add_doc_with_kind(
+        &mut store,
+        "doc_orchestrate",
+        "t",
+        "orchestrate",
+        "Agent exhaust",
+        "postgres database index tuning queries",
+    );
+    add_doc_with_kind(
+        &mut store,
+        "doc_decision",
+        "t",
+        "decision",
+        "Database decision",
+        "postgres database index tuning queries",
+    );
+
+    let stats =
+        compute_memory_similarity_edges(&mut store, "t", &HashEmbedder::new(256), &options()).unwrap();
+
+    assert_eq!(
+        stats.docs, 5,
+        "default options exclude graph-internal orchestrate docs before embedding"
+    );
+    assert!(
+        similar_ids(&store, "doc_orchestrate").is_empty(),
+        "excluded docs must not receive MEMORY_SIMILAR edges"
+    );
+
+    let mut allowlisted = seeded_store();
+    add_doc_with_kind(
+        &mut allowlisted,
+        "doc_decision",
+        "t",
+        "decision",
+        "Database decision",
+        "postgres database index tuning queries",
+    );
+    let opts = SimilarityOptions {
+        include_kinds: vec!["decision".to_string()],
+        exclude_kinds: Vec::new(),
+        ..options()
+    };
+    let stats =
+        compute_memory_similarity_edges(&mut allowlisted, "t", &HashEmbedder::new(256), &opts).unwrap();
+    assert_eq!(stats.docs, 1, "include_kinds limits the source set");
+    assert_eq!(stats.edges_written, 0, "one allowed doc has no neighbor to link");
 }
