@@ -168,6 +168,26 @@ impl OrderedIndex {
         Ok(out)
     }
 
+    /// Ascending members with `score <= max_score`, up to `limit` (0 = no cap).
+    /// Early-stops at the first score above `max_score`: the index is
+    /// score-ordered, so this is O(result + log n), NOT the O(n) filter-every-
+    /// entry walk `zrange_by_score` does. This is the eviction frontier's
+    /// "coldest k below the cutoff" read, the pop-not-scan property the storage
+    /// spine depends on.
+    pub fn range_to(&self, max_score: f64, limit: usize) -> Vec<(OrderedMember, f64)> {
+        let mut out = Vec::new();
+        for ((score, member), _) in self.by_score.iter() {
+            if score.get() > max_score {
+                break;
+            }
+            out.push((member.clone(), score.get()));
+            if limit != 0 && out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
     pub fn zrem(&mut self, member: &[u8]) -> bool {
         let Some(score) = self.by_member.remove(member) else {
             return false;
@@ -226,6 +246,91 @@ impl OrderedIndexRegistry {
 
     pub fn index(&self, name: &str) -> Option<&OrderedIndex> {
         self.indexes.get(name)
+    }
+}
+
+/// The eviction frontier (storage spine, cut 6): a persistent, per-scope
+/// [`OrderedIndex`] over `last_accessed_ms`. It turns eviction from an O(n) walk
+/// of every memory node into O(k log n) ordered-index work over just the coldest
+/// k below a cutoff.
+///
+/// - `recall()` is the zadd site: it already writes `last_accessed_ms` on every
+///   access, so it [`touch`](Self::touch)es the node here on each recall.
+/// - `decay()` reads the coldest tail via [`coldest_below`](Self::coldest_below)
+///   and [`forget`](Self::forget)s each node it actually evicts.
+///
+/// `ops()` is the cumulative ordered-index operation count -- the analogue of
+/// the chunk-visit counter [`diff_graph_trees`](crate::versioned_graph::diff_graph_trees)
+/// returns -- so an acceptance test can prove eviction is a pop, not a scan.
+#[derive(Clone, Debug, Default)]
+pub struct EvictionFrontier {
+    scopes: BTreeMap<String, OrderedIndex>,
+    ops: usize,
+}
+
+impl EvictionFrontier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// zadd: record or refresh a node's coldness key (`last_accessed_ms`) on
+    /// access. Counts one ordered-index op.
+    pub fn touch(&mut self, scope: &str, id: &str, last_accessed_ms: i64) -> GraphStoreResult<()> {
+        self.ops += 1;
+        self.scopes
+            .entry(scope.to_string())
+            .or_insert_with(OrderedIndex::persistent)
+            .zadd(id.as_bytes().to_vec(), last_accessed_ms as f64)?;
+        Ok(())
+    }
+
+    /// zrem: drop a node from the frontier (it was evicted to, or rehydrated
+    /// out of, the cold tail). Counts one ordered-index op.
+    pub fn forget(&mut self, scope: &str, id: &str) -> bool {
+        self.ops += 1;
+        self.scopes
+            .get_mut(scope)
+            .map(|index| index.zrem(id.as_bytes()))
+            .unwrap_or(false)
+    }
+
+    /// The coldest members in `scope` whose `last_accessed_ms <= cutoff`, up to
+    /// `limit` (0 = uncapped). O(result + log n) via an early-stopping ascending
+    /// range -- never a full scan. Each visited entry counts as one op.
+    pub fn coldest_below(&mut self, scope: &str, cutoff: i64, limit: usize) -> Vec<(String, f64)> {
+        let Some(index) = self.scopes.get(scope) else {
+            self.ops += 1;
+            return Vec::new();
+        };
+        let entries = index.range_to(cutoff as f64, limit);
+        self.ops += entries.len().max(1);
+        entries
+            .into_iter()
+            .filter_map(|(member, score)| String::from_utf8(member).ok().map(|id| (id, score)))
+            .collect()
+    }
+
+    /// Cumulative ordered-index operation count since the last [`reset_ops`](Self::reset_ops).
+    pub fn ops(&self) -> usize {
+        self.ops
+    }
+
+    pub fn reset_ops(&mut self) {
+        self.ops = 0;
+    }
+
+    pub fn len(&self, scope: &str) -> usize {
+        self.scopes.get(scope).map(OrderedIndex::zcard).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self, scope: &str) -> bool {
+        self.len(scope) == 0
+    }
+
+    pub fn score(&self, scope: &str, id: &str) -> Option<f64> {
+        self.scopes
+            .get(scope)
+            .and_then(|index| index.zscore(id.as_bytes()))
     }
 }
 

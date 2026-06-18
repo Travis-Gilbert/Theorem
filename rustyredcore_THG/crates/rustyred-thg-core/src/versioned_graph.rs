@@ -1517,6 +1517,41 @@ pub fn build_prolly_tree_from_entries(entries: Vec<GraphTreeEntry>) -> GraphProl
     }
 }
 
+/// Build the content-addressed object for a node, payload included. The cold
+/// tier (storage spine, cut 6) commits this on eviction: `key = node/{id}`,
+/// `hash` is the node's content hash, and `payload` is the full serialized
+/// `NodeRecord` so a later rehydration reconstructs the node exactly. Mirrors
+/// what `snapshot_content_objects` produces per node, exposed for the single-
+/// node commit-on-evict path.
+pub fn node_to_content_object(node: &NodeRecord) -> GraphContentObject {
+    node_content_object(node, true)
+}
+
+/// Edge counterpart of [`node_to_content_object`] (warm-tier scope parking
+/// commits incident edges alongside their nodes).
+pub fn edge_to_content_object(edge: &EdgeRecord) -> GraphContentObject {
+    edge_content_object(edge, true)
+}
+
+/// Reconstruct a `NodeRecord` from a content object fetched out of the cold
+/// tier. Inverse of [`node_to_content_object`]; returns `None` when the object
+/// is not a node or carries no payload.
+pub fn node_from_content_object(object: &GraphContentObject) -> Option<NodeRecord> {
+    if object.kind != GraphObjectKind::Node {
+        return None;
+    }
+    serde_json::from_value(object.payload.clone()?).ok()
+}
+
+/// Reconstruct an `EdgeRecord` from a content object fetched out of the cold
+/// tier. Inverse of [`edge_to_content_object`].
+pub fn edge_from_content_object(object: &GraphContentObject) -> Option<EdgeRecord> {
+    if object.kind != GraphObjectKind::Edge {
+        return None;
+    }
+    serde_json::from_value(object.payload.clone()?).ok()
+}
+
 fn node_content_object(node: &NodeRecord, include_payload: bool) -> GraphContentObject {
     GraphContentObject {
         key: format!("node/{}", node.id),

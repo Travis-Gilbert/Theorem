@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustyred_thg_core::{
-    cached_single_seed_personalized_pagerank, edge_time_interval, merge_ppr_scores, now_ms,
-    personalized_pagerank, stable_hash, ActorId, EdgeRecord, EpistemicType, GraphStore,
-    GraphStoreError, GraphStoreResult, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
+    cached_single_seed_personalized_pagerank, checkout_graph_version, compile_graph_pack,
+    edge_time_interval, merge_ppr_scores, node_from_content_object, node_to_content_object, now_ms,
+    personalized_pagerank, read_epistemic_shadow, stable_hash, update_graph_ref, ActorId,
+    ColdIndex, ColdIndexEntry, ColdObjectStore, ColdScopeEntry, ColdTierKind, EdgeRecord,
+    EpistemicType, EvictionFrontier, GraphCompileOptions, GraphSnapshot, GraphStore,
+    GraphStoreError, GraphStoreResult, GraphVersionRepository, InMemoryColdIndex,
+    InMemoryObjectStore, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
     PluginCapabilityKind, PluginOperationContext, PluginOperationRegistration, PluginRegistry,
     RustyRedPlugin, TimeInterval,
 };
@@ -50,6 +54,8 @@ pub struct MemoryRecallInput {
     pub budget_tokens: i64,
     #[serde(default = "default_true")]
     pub bump_activation: bool,
+    #[serde(default)]
+    pub include_epistemic: bool,
 }
 
 impl Default for MemoryRecallInput {
@@ -66,6 +72,7 @@ impl Default for MemoryRecallInput {
             as_of_ms: None,
             budget_tokens: default_budget_tokens(),
             bump_activation: true,
+            include_epistemic: false,
         }
     }
 }
@@ -343,6 +350,17 @@ pub fn recall<S: GraphStore>(
         selected.push(item);
     }
 
+    if input.include_epistemic {
+        for item in &mut selected {
+            if let Some(readout) = read_epistemic_shadow(store, &item.graph_id) {
+                if let Ok(value) = serde_json::to_value(readout) {
+                    item.provenance
+                        .insert("epistemic_shadow".to_string(), value);
+                }
+            }
+        }
+    }
+
     if input.bump_activation {
         for item in &selected {
             if let Some(mut node) = store.get_node(&item.graph_id).cloned() {
@@ -470,6 +488,384 @@ pub fn decay<S: GraphStore>(store: &mut S, input: DecayInput) -> GraphStoreResul
         }
     }
     Ok(output)
+}
+
+// ============================================================================
+// Storage spine (cut 6): real eviction past the archive flag.
+//
+// `decay()` above flags a node archived but leaves it resident in RAM. The cold
+// tier closes that loop: after a stale, low-activation node is durably retained
+// in the content-addressed cold object store, it is EVICTED from the operating
+// store so it stops occupying RAM, and a later recall rehydrates it by a keyed
+// cold-index lookup. The operating store stays RAM-first; the cold tail spills
+// to disk; eviction is a frontier pop, not a scan; and residency changes never
+// bump the graph version, so the PPR cache stays warm for the live nodes.
+// ============================================================================
+
+/// The cold tier: a durable content-addressed object store (the cold tail's
+/// home), a cold index (id -> tier/object-hash, the keyed rehydration map), and
+/// the per-scope eviction frontier (the coldest-first ordered index over
+/// `last_accessed_ms`). Bundled so the eviction spine threads one `&mut`.
+pub struct ColdTier {
+    objects: Box<dyn ColdObjectStore>,
+    index: Box<dyn ColdIndex>,
+    frontier: EvictionFrontier,
+}
+
+impl ColdTier {
+    /// Build a cold tier over an explicit object store and cold index (disk- or
+    /// Postgres-backed in production, in-memory in tests).
+    pub fn new(objects: Box<dyn ColdObjectStore>, index: Box<dyn ColdIndex>) -> Self {
+        Self {
+            objects,
+            index,
+            frontier: EvictionFrontier::new(),
+        }
+    }
+
+    /// An all-in-memory cold tier. For tests/scratch only -- it does not survive
+    /// a restart, so it cannot satisfy the durability property; use disk- or
+    /// Postgres-backed stores for a real cold tier.
+    pub fn in_memory() -> Self {
+        Self::new(
+            Box::new(InMemoryObjectStore::new()),
+            Box::new(InMemoryColdIndex::new()),
+        )
+    }
+
+    pub fn frontier(&self) -> &EvictionFrontier {
+        &self.frontier
+    }
+
+    pub fn frontier_mut(&mut self) -> &mut EvictionFrontier {
+        &mut self.frontier
+    }
+
+    pub fn objects(&self) -> &dyn ColdObjectStore {
+        self.objects.as_ref()
+    }
+
+    pub fn index(&self) -> &dyn ColdIndex {
+        self.index.as_ref()
+    }
+}
+
+/// Observable accounting for one `evict_decayed` pass. `frontier_ops` vs
+/// `candidates_examined` is the proof that eviction is O(k log n), not an O(n)
+/// walk of all memory nodes (the chunk-visit-counter analogue); `scanned_nodes`
+/// is the count of nodes materialized via the full memory-node scan during
+/// eviction and is 0 by construction -- the path reads the frontier and loads
+/// each candidate by id.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct EvictionReport {
+    pub tenant_id: String,
+    pub scope: String,
+    pub evicted: usize,
+    pub evicted_nodes: Vec<String>,
+    pub frontier_ops: usize,
+    pub scanned_nodes: usize,
+    pub candidates_examined: usize,
+}
+
+/// One-time bootstrap of the eviction frontier for a tenant scope. In steady
+/// state the frontier is maintained incrementally by `recall_with_cold_tier`
+/// (the zadd-on-access site, since recall already writes `last_accessed_ms`);
+/// this O(n) pass seeds it once for a store that already holds memory nodes
+/// written before the cold tier was attached. Subsequent evictions read the
+/// persistent frontier in O(k log n).
+pub fn seed_frontier<S: GraphStore>(
+    store: &S,
+    cold: &mut ColdTier,
+    input: &DecayInput,
+) -> GraphStoreResult<usize> {
+    let tenant_id = normalized_tenant_pair(&input.tenant_id, &input.tenant_slug);
+    let mut seeded = 0;
+    for node in memory_nodes(store, &tenant_id, false)? {
+        if prop_bool(&node.properties, "archive_tier") {
+            continue;
+        }
+        let last_accessed = prop_i64(&node.properties, "last_accessed_ms")
+            .or_else(|| prop_i64(&node.properties, "updated_at_ms"))
+            .unwrap_or(0);
+        cold.frontier.touch(&tenant_id, &node.id, last_accessed)?;
+        seeded += 1;
+    }
+    Ok(seeded)
+}
+
+/// The eviction spine. For each memory node in the tenant's cold tail (coldest
+/// `last_accessed_ms` at or below the staleness cutoff) whose activation is at
+/// or below the threshold: flag the durable copy archived, commit its content
+/// object to the cold store, record the cold-index address, then evict it from
+/// the operating store and drop it from the frontier.
+///
+/// Candidates come from the frontier (`coldest_below`, O(k log n)), never the
+/// O(n) memory-node scan. Eviction is version-neutral (`evict_node` never bumps
+/// the graph version), so the cached structural priors of the live nodes stay
+/// valid. This is the cut-6 superset of `decay`: same staleness/activation gate,
+/// plus durable retention and real RAM reclamation.
+pub fn evict_decayed<S: GraphStore>(
+    store: &mut S,
+    cold: &mut ColdTier,
+    input: DecayInput,
+) -> GraphStoreResult<EvictionReport> {
+    let tenant_id = normalized_tenant_pair(&input.tenant_id, &input.tenant_slug);
+    let now = input.now_ms.unwrap_or_else(now_ms);
+    let cutoff = now.saturating_sub(input.inactive_after_ms.max(1));
+    cold.frontier.reset_ops();
+    let candidates = cold.frontier.coldest_below(&tenant_id, cutoff, 0);
+    let mut report = EvictionReport {
+        tenant_id: tenant_id.clone(),
+        scope: tenant_id.clone(),
+        candidates_examined: candidates.len(),
+        ..EvictionReport::default()
+    };
+    for (id, _score) in candidates {
+        // Point lookup by id (O(log n)), never a scan. include_expired so an
+        // already-flagged-resident node is still visible here.
+        let Some(node) = store.get_node_including_expired(&id).cloned() else {
+            cold.frontier.forget(&tenant_id, &id);
+            continue;
+        };
+        if !node_matches_tenant(&node, &tenant_id) || !is_memory_node(&node) {
+            cold.frontier.forget(&tenant_id, &id);
+            continue;
+        }
+        let activation = prop_f64(&node.properties, "activation").unwrap_or(0.0);
+        if activation > input.activation_threshold {
+            // Cold by time but hot by activation: protected. Leave it resident
+            // and in the frontier; a later, colder pass re-examines it cheaply.
+            continue;
+        }
+        // Flag the cold copy archived. The flag lives ONLY in the durable copy;
+        // we never upsert it into the operating store (which would bump the
+        // version). Then commit -> record -> evict -> forget.
+        let mut cold_copy = node.clone();
+        set_prop_bool(&mut cold_copy.properties, "archive_tier", true);
+        set_prop_str(&mut cold_copy.properties, "status", "archived");
+        set_prop_i64(&mut cold_copy.properties, "archived_at_ms", now);
+        cold_copy.content_hash = None;
+        let object = node_to_content_object(&cold_copy);
+        cold.objects.put_object(&object)?;
+        cold.index
+            .record(ColdIndexEntry::cold(&id, &tenant_id, &object.hash))?;
+        store.evict_node(&id)?;
+        cold.frontier.forget(&tenant_id, &id);
+        report.evicted += 1;
+        report.evicted_nodes.push(id);
+    }
+    report.frontier_ops = cold.frontier.ops();
+    Ok(report)
+}
+
+/// Rehydrate a node from the cold tier back into the operating store. The
+/// natural trigger is a recall that resolves to an id absent from the operating
+/// store. Reads the cold index for the id's object hash (a KEYED lookup, never a
+/// repository scan), fetches the object, reconstructs the node, clears the
+/// archive flags (it is being accessed again), re-admits it version-neutrally,
+/// and re-touches the frontier. A Warm-tier id rehydrates its whole parked
+/// scope. Returns true when something was rehydrated.
+pub fn rehydrate<S: GraphStore>(
+    store: &mut S,
+    cold: &mut ColdTier,
+    id: &str,
+) -> GraphStoreResult<bool> {
+    let Some(entry) = cold.index.lookup(id)? else {
+        return Ok(false);
+    };
+    if matches!(entry.tier, ColdTierKind::Warm) {
+        return unpark_scope(store, cold, &entry.scope).map(|count| count > 0);
+    }
+    let Some(object) = cold.objects.get_object(&entry.object_hash)? else {
+        return Err(GraphStoreError::new(
+            "cold_object_missing",
+            format!(
+                "cold index points {id} at object {} but it is absent",
+                entry.object_hash
+            ),
+        ));
+    };
+    let Some(mut node) = node_from_content_object(&object) else {
+        return Err(GraphStoreError::new(
+            "cold_object_not_node",
+            format!("cold object for {id} is not a node payload"),
+        ));
+    };
+    // It is being accessed again: clear the archive flags so recall sees it and
+    // refresh recency. Clearing content_hash forces a recompute on readmit.
+    remove_prop(&mut node.properties, "archive_tier");
+    set_prop_str(&mut node.properties, "status", "active");
+    set_prop_i64(&mut node.properties, "last_accessed_ms", now_ms());
+    node.content_hash = None;
+    store.readmit_node(node)?;
+    cold.index.remove(id)?;
+    cold.frontier.touch(&entry.scope, id, now_ms())?;
+    Ok(true)
+}
+
+/// Recall with cold-tier integration. Before ranking, any requested seed id that
+/// is absent from the operating store is rehydrated from the cold tier (recall
+/// is the natural rehydration trigger). After ranking, every returned memory is
+/// touched in the eviction frontier (recall is the zadd site, since it already
+/// writes `last_accessed_ms`). Everything else is plain `recall`.
+pub fn recall_with_cold_tier<S: GraphStore>(
+    store: &mut S,
+    cold: &mut ColdTier,
+    input: MemoryRecallInput,
+) -> GraphStoreResult<RankedMemories> {
+    let tenant_id = normalized_tenant(&input);
+    for seed in input.seeds.clone() {
+        if store.get_node(&seed).is_none() {
+            rehydrate(store, cold, &seed)?;
+        }
+    }
+    let result = recall(store, input)?;
+    let touched_at = now_ms();
+    for memory in &result.memories {
+        cold.frontier
+            .touch(&tenant_id, &memory.graph_id, touched_at)?;
+    }
+    Ok(result)
+}
+
+/// Park a whole scope (e.g. a repo's code KG, or a tenant subgraph) to the warm
+/// tier. Compiles the scope's subgraph to a `CompiledGraphPack`, persists the
+/// pack to the cold object store, records the parked scope (and each member as a
+/// Warm cold-index entry so a member recall unparks the whole scope), then
+/// evicts every scope node and incident edge from the operating store. The
+/// scope is absent from the operating store until first access. Boundary-
+/// crossing edges are parked too, so the operating store is left with no
+/// dangling endpoints. Version-neutral.
+pub fn park_scope<S: GraphStore>(
+    store: &mut S,
+    cold: &mut ColdTier,
+    scope: &str,
+    node_ids: &[String],
+) -> GraphStoreResult<ColdScopeEntry> {
+    let mut nodes = Vec::new();
+    for id in node_ids {
+        if let Some(node) = store.get_node_including_expired(id).cloned() {
+            nodes.push(node);
+        }
+    }
+    let mut edge_ids: BTreeSet<String> = BTreeSet::new();
+    for id in node_ids {
+        for hit in store.neighbors(NeighborQuery::out(id).with_include_expired(true)) {
+            edge_ids.insert(hit.edge_id);
+        }
+        for hit in store.neighbors(NeighborQuery::in_(id).with_include_expired(true)) {
+            edge_ids.insert(hit.edge_id);
+        }
+    }
+    let mut edges = Vec::new();
+    for edge_id in &edge_ids {
+        if let Some(edge) = store.get_edge(edge_id).cloned() {
+            edges.push(edge);
+        }
+    }
+    let snapshot = GraphSnapshot {
+        version: store.stats().version,
+        nodes: nodes.clone(),
+        edges: edges.clone(),
+    };
+    let pack = compile_graph_pack(
+        &snapshot,
+        GraphCompileOptions {
+            name: Some(format!("warm-scope-{scope}")),
+            message: Some(format!("park warm scope {scope}")),
+            ..GraphCompileOptions::default()
+        },
+    );
+    cold.objects.put_pack(&pack)?;
+    let entry = ColdScopeEntry {
+        scope: scope.to_string(),
+        commit_hash: pack.commit.commit_hash.clone(),
+        node_ids: node_ids.to_vec(),
+        edge_ids: edges.iter().map(|edge| edge.id.clone()).collect(),
+        parked: true,
+    };
+    cold.index.record_scope(entry.clone())?;
+    for node in &nodes {
+        cold.index.record(ColdIndexEntry {
+            id: node.id.clone(),
+            scope: scope.to_string(),
+            tier: ColdTierKind::Warm,
+            object_hash: String::new(),
+            commit_hash: Some(pack.commit.commit_hash.clone()),
+        })?;
+    }
+    for edge in &edges {
+        store.evict_edge(&edge.id)?;
+    }
+    for node in &nodes {
+        store.evict_node(&node.id)?;
+        cold.frontier.forget(scope, &node.id);
+    }
+    Ok(entry)
+}
+
+/// Unpark a warm scope: load its parked pack and reconstruct the subgraph via
+/// `checkout_graph_version` (the same reader the versioned-graph checkout round-
+/// trip test asserts on), re-admit every node then every edge version-neutrally,
+/// re-touch the frontier, and clear the scope's cold records. Returns the number
+/// of nodes rehydrated.
+pub fn unpark_scope<S: GraphStore>(
+    store: &mut S,
+    cold: &mut ColdTier,
+    scope: &str,
+) -> GraphStoreResult<usize> {
+    let Some(entry) = cold.index.scope(scope)? else {
+        return Ok(0);
+    };
+    if !entry.parked {
+        return Ok(0);
+    }
+    let Some(pack) = cold.objects.get_pack(&entry.commit_hash)? else {
+        return Err(GraphStoreError::new(
+            "cold_pack_missing",
+            format!(
+                "warm scope {scope} points at commit {} but the pack is absent",
+                entry.commit_hash
+            ),
+        ));
+    };
+    // Reuse the versioned-graph checkout reader: assemble a one-pack repository
+    // and check out the parked commit to reconstruct the subgraph snapshot.
+    let update = update_graph_ref(GraphVersionRepository::default(), pack, None, None);
+    let checkout =
+        checkout_graph_version(&update.repository, &entry.commit_hash).ok_or_else(|| {
+            GraphStoreError::new(
+                "cold_pack_checkout_failed",
+                format!("could not check out parked commit {}", entry.commit_hash),
+            )
+        })?;
+    let touched_at = now_ms();
+    for node in &checkout.snapshot.nodes {
+        store.readmit_node(node.clone())?;
+        cold.frontier.touch(scope, &node.id, touched_at)?;
+    }
+    for edge in &checkout.snapshot.edges {
+        store.readmit_edge(edge.clone())?;
+    }
+    for node_id in &entry.node_ids {
+        cold.index.remove(node_id)?;
+    }
+    cold.index.remove_scope(scope)?;
+    Ok(checkout.snapshot.nodes.len())
+}
+
+fn is_memory_node(node: &NodeRecord) -> bool {
+    node.labels.iter().any(|label| {
+        label == MEMORY_DOCUMENT_LABEL
+            || label == MEMORY_NODE_LABEL
+            || label == MEMORY_SUMMARY_LABEL
+    })
+}
+
+fn remove_prop(properties: &mut Value, key: &str) {
+    if let Some(object) = properties.as_object_mut() {
+        object.remove(key);
+    }
 }
 
 pub fn invalidate_memory_edge<S: GraphStore>(
@@ -1175,7 +1571,9 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyred_thg_core::InMemoryGraphStore;
+    use rustyred_thg_core::{
+        structural_epistemic_pass, InMemoryGraphStore, StructuralEpistemicInput,
+    };
 
     fn memory_doc(id: &str, title: &str, content: &str) -> NodeRecord {
         NodeRecord::new(
@@ -1212,6 +1610,54 @@ mod tests {
                 "source": MEMORY_PLUGIN_SOURCE,
             }),
         )
+    }
+
+    #[test]
+    fn recall_include_epistemic_attaches_shadow_without_changing_default() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(memory_doc("m1", "Cache claim", "cache is enabled"))
+            .unwrap();
+        structural_epistemic_pass(
+            &mut store,
+            StructuralEpistemicInput {
+                batch_node_ids: vec!["m1".to_string()],
+                ..StructuralEpistemicInput::default()
+            },
+        )
+        .unwrap();
+
+        let plain = recall(
+            &mut store,
+            MemoryRecallInput {
+                tenant_id: "theorem".to_string(),
+                query: "cache".to_string(),
+                bump_activation: false,
+                ..MemoryRecallInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plain.memories.len(), 1);
+        assert!(!plain.memories[0]
+            .provenance
+            .contains_key("epistemic_shadow"));
+
+        let with_epistemic = recall(
+            &mut store,
+            MemoryRecallInput {
+                tenant_id: "theorem".to_string(),
+                query: "cache".to_string(),
+                include_epistemic: true,
+                bump_activation: false,
+                ..MemoryRecallInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(with_epistemic.memories.len(), 1);
+        assert_eq!(
+            with_epistemic.memories[0].provenance["epistemic_shadow"]["source_kind"].as_str(),
+            Some("structural")
+        );
     }
 
     fn link_project(store: &mut InMemoryGraphStore, tenant: &str, memory: &str, project: &str) {

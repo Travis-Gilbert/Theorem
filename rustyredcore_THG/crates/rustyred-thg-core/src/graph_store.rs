@@ -366,6 +366,50 @@ pub trait GraphStore {
         Ok(0)
     }
 
+    // ---- Working-set / cold-tier residency (storage spine, cut 6) ----
+    //
+    // Eviction and rehydration are RESIDENCY changes, not logical mutations.
+    // A node's durable home is the cold tier (the content-addressed object
+    // store); moving it out of, or back into, the in-RAM operating store must
+    // NOT change the graph version. The scoped PPR cache (`ppr_cache.rs`) keys
+    // on `stats().version`, so a residency change that bumped the version would
+    // wrongly miss every other node's cached structural prior. Stores with a
+    // working-set/cold-tier split override these with version-neutral impls;
+    // the defaults keep non-tiered stores compiling (evict reports "not
+    // evicted", readmit falls back to a full version-bumping upsert).
+
+    /// Remove a node from the operating (in-RAM working-set) store and return
+    /// it, WITHOUT changing the graph version. Returns `Ok(None)` when the node
+    /// is absent or the store does not support a cold tier. Callers must have
+    /// durably committed the node to the cold tier first (commit -> record cold
+    /// index -> evict).
+    fn evict_node(&mut self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Re-admit a node previously evicted (rehydrated from the cold tier) into
+    /// the operating store WITHOUT changing the graph version; the node keeps
+    /// its stored `version`. Default falls back to `upsert_node` (which DOES
+    /// bump the version); cold-tier stores override with a version-neutral
+    /// re-admit.
+    fn readmit_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        self.upsert_node(node).map(|_| ())
+    }
+
+    /// Edge counterpart of `evict_node` (version-neutral). Used by warm-tier
+    /// scope parking, which evicts a whole subgraph (nodes + incident edges).
+    fn evict_edge(&mut self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Edge counterpart of `readmit_node` (version-neutral). Re-admit edges
+    /// only after their endpoints have been re-admitted.
+    fn readmit_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.upsert_edge(edge).map(|_| ())
+    }
+
     /// Return nodes whose `_ttl_expires_at_ms <= ts_ms`, ordered by expiration.
     /// Used by callers that need "what's about to time out" visibility
     /// (mentions queue, presence keys, coordinator agents).
@@ -1962,6 +2006,82 @@ impl InMemoryGraphStore {
             self.remove_node_indexes(&node);
             self.nodes.remove(id);
         }
+        Ok(())
+    }
+
+    /// Remove a live node from the operating store and return it, leaving the
+    /// graph version unchanged. A residency change, not a logical mutation (see
+    /// the `GraphStore::evict_node` contract): the node's durable home is the
+    /// cold tier. Drops the node and every secondary index entry exactly like
+    /// `apply_recovered_delete`, but NEVER touches `self.version`, so the cached
+    /// structural priors of the remaining live nodes (PPR cache keyed on the
+    /// store version) stay valid. Returns `None` if the node is absent.
+    pub fn evict_node(&mut self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        let Some(node) = self.nodes.get(id).cloned() else {
+            return Ok(None);
+        };
+        self.remove_node_indexes(&node);
+        self.nodes.remove(id);
+        Ok(Some(node))
+    }
+
+    /// Re-admit a node rehydrated from the cold tier WITHOUT changing the graph
+    /// version. Unlike `apply_recovered_node` (which raises the version to the
+    /// node's stored version), this leaves `self.version` completely untouched:
+    /// rehydration is a pure residency change and must not invalidate the PPR
+    /// cache keyed on the store version. The node is inserted verbatim -- it
+    /// already carries its `content_hash` and `version` from when it was
+    /// committed to the cold tier.
+    pub fn readmit_node(&mut self, mut node: NodeRecord) -> GraphStoreResult<()> {
+        if node.id.trim().is_empty() {
+            return Err(GraphStoreError::empty_field("node.id"));
+        }
+        node.labels = normalize_labels(node.labels);
+        if node.content_hash.is_none() {
+            node.content_hash = Some(node.checksum());
+        }
+        if let Some(existing) = self.nodes.get(&node.id).cloned() {
+            self.remove_node_indexes(&existing);
+        }
+        if !node.tombstone {
+            self.add_node_indexes(&node);
+            self.auto_index_vectors(&node);
+        }
+        self.nodes.insert(node.id.clone(), node);
+        Ok(())
+    }
+
+    /// Edge counterpart of `evict_node`: remove an edge and its indexes from the
+    /// operating store, version unchanged. Returns `None` if absent. Used by
+    /// warm-tier scope parking to evict a subgraph's incident edges.
+    pub fn evict_edge(&mut self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        let Some(edge) = self.edges.get(id).cloned() else {
+            return Ok(None);
+        };
+        self.remove_edge_indexes(&edge);
+        self.edges.remove(id);
+        Ok(Some(edge))
+    }
+
+    /// Edge counterpart of `readmit_node`, version-neutral. Mirrors
+    /// `apply_recovered_edge` (live-endpoint guard included, since warm-tier
+    /// unpark re-admits nodes before edges) but never bumps `self.version`.
+    pub fn readmit_edge(&mut self, mut edge: EdgeRecord) -> GraphStoreResult<()> {
+        validate_edge_shape(&edge)?;
+        if edge.content_hash.is_none() {
+            edge.content_hash = Some(edge.checksum());
+        }
+        if !edge.tombstone {
+            self.require_live_endpoint(&edge, "from", &edge.from_id)?;
+            self.require_live_endpoint(&edge, "to", &edge.to_id)?;
+        }
+        if let Some(existing) = self.edges.get(&edge.id).cloned() {
+            self.remove_edge_indexes(&existing);
+        }
+        if !edge.tombstone {
+            self.add_edge_indexes(&edge);
+        }
+        self.edges.insert(edge.id.clone(), edge);
         Ok(())
     }
 
@@ -4862,6 +4982,22 @@ impl GraphStore for InMemoryGraphStore {
 
     fn purge_expired_nodes(&mut self) -> GraphStoreResult<usize> {
         InMemoryGraphStore::purge_expired_nodes(self)
+    }
+
+    fn evict_node(&mut self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        InMemoryGraphStore::evict_node(self, id)
+    }
+
+    fn readmit_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        InMemoryGraphStore::readmit_node(self, node)
+    }
+
+    fn evict_edge(&mut self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        InMemoryGraphStore::evict_edge(self, id)
+    }
+
+    fn readmit_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        InMemoryGraphStore::readmit_edge(self, edge)
     }
 
     fn nodes_expiring_before(&self, ts_ms: i64, limit: usize) -> Vec<NodeRecord> {

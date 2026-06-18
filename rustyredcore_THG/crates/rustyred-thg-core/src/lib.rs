@@ -4,8 +4,10 @@
 //! PyO3 in-process bindings and the standalone HTTP server call this same
 //! executor.
 
+pub mod cold_index;
 pub mod commands;
 pub mod crdt;
+pub mod epistemic;
 pub mod errors;
 pub mod executor;
 pub mod fulltext;
@@ -16,6 +18,7 @@ pub mod graph_csr;
 pub mod graph_store;
 pub mod hooks;
 pub mod instant_kg;
+pub mod object_store;
 pub mod ordered;
 pub mod plugin;
 pub mod ppr_cache;
@@ -27,10 +30,26 @@ pub mod store;
 pub mod symbolic;
 pub mod versioned_graph;
 
+pub use cold_index::{
+    ColdIndex, ColdIndexEntry, ColdScopeEntry, ColdTierKind, DiskColdIndex, InMemoryColdIndex,
+};
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use crdt::{
     diff_since, join_delta, ActorId, Hlc, HlcClock, JoinReport, StampedBatch, StampedMutation,
     VersionVector,
+};
+pub use epistemic::{
+    compile_user_subgraph, epistemic_shadow_edge_id, epistemic_shadow_node_id,
+    epistemic_shadow_ppr, has_epistemic_shadow_edge_id, read_epistemic_shadow,
+    run_epistemic_cron_pass, structural_epistemic_pass, EpistemicAnnotation, EpistemicAnnotations,
+    EpistemicCandidatePair, EpistemicChokepoint, EpistemicCronInput, EpistemicCronReport,
+    EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicFieldProvenance,
+    EpistemicReadout, EpistemicRelationInput, EpistemicRelationKind, EpistemicRelationReadout,
+    EpistemicShadowReadout, EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer,
+    SourceReliability, StructuralEpistemicConfig, StructuralEpistemicInput, UserSubgraph,
+    DEFAULT_EPISTEMIC_ENGINE_VERSION, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
+    HAS_EPISTEMIC_SHADOW, LEARNED_EPISTEMIC_ENGINE, SAME_ECLASS, STRUCTURAL_EPISTEMIC_ENGINE,
+    UNDERCUTS,
 };
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
@@ -68,9 +87,10 @@ pub use instant_kg::{
     InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
     INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
 };
+pub use object_store::{ColdObjectStore, DiskObjectStore, InMemoryObjectStore};
 pub use ordered::{
-    OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember, OrderedMode,
-    OrderedScore,
+    EvictionFrontier, OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember,
+    OrderedMode, OrderedScore,
 };
 pub use plugin::{
     normalize_plugin_command, PluginCapability, PluginCapabilityKind, PluginExecutionOutput,
@@ -97,10 +117,11 @@ pub use symbolic::{
 pub use versioned_graph::{
     apply_graph_mutation_batch, build_prolly_tree, build_prolly_tree_from_entries,
     build_prolly_tree_incremental, checkout_graph_version, compile_graph_pack,
-    compile_graph_pack_incremental, diff_graph_snapshots, diff_graph_trees, graph_version_log,
-    merge_graph_snapshots, prolly_validation_enabled, resolve_auto_confidence_edge,
-    snapshot_content_objects, update_graph_ref, update_graph_ref_cas, CommitCost,
-    CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
+    compile_graph_pack_incremental, diff_graph_snapshots, diff_graph_trees,
+    edge_from_content_object, edge_to_content_object, graph_version_log, merge_graph_snapshots,
+    node_from_content_object, node_to_content_object, prolly_validation_enabled,
+    resolve_auto_confidence_edge, snapshot_content_objects, update_graph_ref, update_graph_ref_cas,
+    CommitCost, CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
     GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
     GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide, GraphMergeStrategy,
     GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefConflict, GraphRefUpdate,
