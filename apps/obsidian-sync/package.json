@@ -1,6 +1,6 @@
 {
   "name": "theorem-harness-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Obsidian plugin that mirrors a Theorem harness memory graph into a vault and writes note edits back into the graph.",
   "main": "main.js",
   "scripts": {

@@ -18,11 +18,20 @@ plugin already runs. No delivery layer, no git repo, no cron, no Tailscale.
 ## What it does
 
 - **Pull (Phase 1).** On a `Sync now` command or on a timer, it GETs the tenant's
-  memory documents and writes or updates one note per doc. Filename is
-  `slug(title)-<shortDocId>.md` (stable, collision-free, human-readable).
-  Frontmatter carries the scalar fields and tags; the body is the doc content,
-  followed by a generated links block rendering each outgoing link as a
-  `[[wikilink]]`.
+  memory documents and writes or updates one note per doc, into a **navigable**
+  vault:
+  - **Kind filter.** Graph-internal kinds (`community_summary` stubs, `orchestrate`
+    coordination exhaust) are dropped client-side so they do not bury real memory.
+  - **Folder by kind.** Each note lands in `<syncFolder>/<Kind>/` (Solutions,
+    Decisions, Postmortems, Feedback, Revisions, Notes).
+  - **Human filenames.** The filename is `slug(title).md`; identity lives in the
+    frontmatter `doc_id`, so a title or kind change *renames or moves* the note
+    instead of duplicating it. Collisions disambiguate with a short doc_id.
+  - **Generated indexes.** A root `📍 Memory Map` plus one annotated `_<Kind>`
+    index per folder are regenerated each sync (Map-of-Content pattern).
+  - Frontmatter carries the scalar fields and tags; the body is the doc content,
+    followed by a generated **Links** block (authored `[[wikilinks]]`) and, when the
+    server surfaces them, a **Related** block (computed `MEMORY_SIMILAR` neighbors).
 - **Write-back (Phase 2).** When you edit a synced note or create a new note in the
   capture scope, the plugin pushes it back. A note that carries a `doc_id` updates
   that document in place; a new note becomes a new document. Wikilinks become link
@@ -122,6 +131,14 @@ Settings -> Theorem Harness Sync:
   the allowlist. Filtering changes the next pull only; it does not delete notes
   already synced for a now-excluded kind (delete the sync folder and Full resync
   for a clean slate).
+- **Folder by kind** - on by default. Places each note in a per-kind subfolder.
+  Off keeps one flat folder. Switching it on takes full effect on the next Full
+  resync (notes move as their docs are re-seen).
+- **Generate index notes** - on by default. Writes the root `📍 Memory Map` and
+  the per-kind `_<Kind>` indexes each sync. They carry `theorem_generated: index`
+  and never write back. The per-kind indexes render with no extra plugin; the root
+  map's live tables need Dataview.
+- **Memory map name** - basename of the root Map-of-Content note.
 - **Enable write-back** - off by default. Turn it on to push edits.
 - **Allow commons write-back** - off by default. While off, write-back refuses to push
   into the commons (`default`, or an empty tenant) so hand-written notes never land in
@@ -161,6 +178,33 @@ reference and creates the real edge when the target note is later created or syn
 (it matches the unresolved entry against the new note's title or doc_id). This
 mirrors Obsidian's own unresolved-link behavior; no node is created for the target
 until it exists.
+
+## The graph view (and why there is no built-in galaxy)
+
+The memory graph used to be *edgeless*: a few hand-authored wikilinks across
+hundreds of notes, so the native graph view was a dust cloud and there were no
+communities to color. The fix is two computed layers, not a bolted-on renderer:
+
+1. **The substrate computes edges over memory.** A kNN-over-embeddings builder in
+   the harness (`rustyred-thg-memory`) writes `MEMORY_SIMILAR` edges between
+   semantically close docs. When the read endpoint surfaces them, the plugin
+   renders them in each note's **Related** block, so Obsidian's *own* graph view
+   clusters by meaning.
+2. **Color by kind in the graph view.** Graph view -> Settings (gear) -> Groups,
+   one query per kind on a viridis ramp:
+
+   ```
+   ["kind":"solution"]    #22a884
+   ["kind":"decision"]    #7ad151
+   ["kind":"postmortem"]  #fde725
+   ["kind":"feedback"]    #414487
+   ["kind":"encode"]      #2a788e
+   ```
+
+This is deliberately **not** a second cosmos.gl/WebGL galaxy inside the plugin.
+The dense-semantic GPU galaxy lives in Theseus / Scene OS, fed by the same
+`MEMORY_SIMILAR` edges; duplicating it here would be a weaker copy to maintain.
+The plugin's job is sync + a navigable vault + feeding the native graph.
 
 ## Notes on the implementation vs. the plan
 

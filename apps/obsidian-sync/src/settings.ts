@@ -49,10 +49,24 @@ export interface HarnessSyncSettings {
    */
   includeKinds: string[];
   /**
-   * Pull denylist of kinds skipped on sync (e.g. `orchestrate` agent-coordination
-   * exhaust). A kind here is dropped even if it is also in `includeKinds`.
+   * Pull denylist of kinds skipped on sync. Defaults to the graph-internal kinds
+   * (`community_summary` stubs and `orchestrate` coordination exhaust) that bury
+   * real memory. A kind here is dropped even if it is also in `includeKinds`.
    */
   excludeKinds: string[];
+  /**
+   * Place each note in a per-kind subfolder (`<syncFolder>/<KindFolder>/`) instead
+   * of one flat folder. Makes the emitted vault navigable.
+   */
+  folderByKind: boolean;
+  /**
+   * Generate Map-of-Content index notes each sync: one per kind folder plus a root
+   * map. Plugin-owned files; they carry `theorem_generated: index` and never write
+   * back.
+   */
+  generateIndexes: boolean;
+  /** Basename of the root Map-of-Content note (no extension). */
+  indexFileName: string;
   /** How to resolve a doc that changed on both sides since the last sync. */
   conflictMode: ConflictMode;
   /** Default kind for hand-written new notes with no `kind` in frontmatter. */
@@ -71,7 +85,10 @@ export const DEFAULT_SETTINGS: HarnessSyncSettings = {
   syncIntervalMinutes: 15,
   includeInactive: false,
   includeKinds: [],
-  excludeKinds: ["orchestrate"],
+  excludeKinds: ["community_summary", "orchestrate"],
+  folderByKind: true,
+  generateIndexes: true,
+  indexFileName: "📍 Memory Map",
   conflictMode: "conflict-copy",
   defaultKind: "note",
 };
@@ -209,9 +226,9 @@ export class HarnessSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Exclude kinds")
       .setDesc(
-        "Comma-separated kinds to skip on pull. Defaults to `orchestrate` " +
-          "(agent-coordination exhaust) so it does not bury real memory notes. " +
-          "Clear it to mirror every kind."
+        "Comma-separated kinds to skip on pull. Defaults to the graph-internal " +
+          "kinds (`community_summary` stubs, `orchestrate` coordination exhaust) " +
+          "so they do not bury real memory notes. Clear it to mirror every kind."
       )
       .addText((text) =>
         text
@@ -248,6 +265,55 @@ export class HarnessSyncSettingTab extends PluginSettingTab {
     });
     filterNote.style.fontSize = "var(--font-ui-smaller)";
     filterNote.style.color = "var(--text-muted)";
+
+    containerEl.createEl("h2", { text: "Vault structure" });
+
+    new Setting(containerEl)
+      .setName("Folder by kind")
+      .setDesc(
+        "Place each note in a per-kind subfolder (Solutions, Decisions, " +
+          "Postmortems, ...) instead of one flat folder. Filenames become the " +
+          "note titles; identity stays in the frontmatter doc_id, so a title or " +
+          "kind change renames or moves the note instead of duplicating it."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.folderByKind)
+          .onChange(async (value) => {
+            this.plugin.settings.folderByKind = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Generate index notes")
+      .setDesc(
+        "Write a root Map-of-Content note plus one annotated index per kind " +
+          "folder each sync. These are plugin-owned (they never write back). The " +
+          "per-kind indexes render without any extra plugin; the root map gains " +
+          "live tables if you have Dataview."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.generateIndexes)
+          .onChange(async (value) => {
+            this.plugin.settings.generateIndexes = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Memory map name")
+      .setDesc("Basename of the root Map-of-Content note (no extension).")
+      .addText((text) =>
+        text
+          .setPlaceholder("📍 Memory Map")
+          .setValue(this.plugin.settings.indexFileName)
+          .onChange(async (value) => {
+            this.plugin.settings.indexFileName = value.trim() || "📍 Memory Map";
+            await this.plugin.saveSettings();
+          })
+      );
 
     containerEl.createEl("h2", { text: "Write-back (Phase 2)" });
 

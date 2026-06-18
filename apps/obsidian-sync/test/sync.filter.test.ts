@@ -99,6 +99,9 @@ const settings: HarnessSyncSettings = {
   includeInactive: false,
   includeKinds: [],
   excludeKinds: ["orchestrate"],
+  folderByKind: false,
+  generateIndexes: false,
+  indexFileName: "📍 Memory Map",
   conflictMode: "conflict-copy",
   defaultKind: "note",
 };

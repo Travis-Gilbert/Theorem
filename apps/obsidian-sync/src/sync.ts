@@ -5,12 +5,14 @@ import type { HarnessDoc, SyncJournal } from "./types";
 import { localHash } from "./hash";
 import { filterDocsByKind } from "./kinds";
 import {
+  assignBasenames,
+  kindFolder,
   LinkResolver,
-  noteBasename,
-  notePath,
+  notePathFor,
   renderNote,
   userBody,
 } from "./notes";
+import { generateIndexFiles, type IndexedNote } from "./indexes";
 import type { SyncGuard } from "./guard";
 
 export interface SyncSummary {
@@ -55,14 +57,24 @@ export class Syncer {
       conflicts: 0,
     };
 
-    // Build the link-name index over the FULL response, not just the kept docs:
-    // a kept note may link to a filtered doc, and naming it by title (rather
-    // than a raw id) is still better even when that note is not mirrored.
+    // Assign each kept doc a human, globally-unique basename from its title.
+    // Identity stays in the frontmatter doc_id, so filenames can be clean and
+    // change on rename. Seed the reservation set from the journal so an
+    // incremental pull (only changed docs) does not collide with notes on disk.
+    const reserved: Array<[string, string]> = Object.entries(this.journal.docs)
+      .filter(([, state]) => state.path)
+      .map(([docId, state]) => [basenameOf(state.path), docId]);
+    const basenames = assignBasenames(kept, reserved);
+
+    // Resolve a link target to its note basename. Prefer the freshly-assigned
+    // basenames (so wikilinks match the files written this pull), then the journal
+    // for targets outside this batch (including filtered docs already on disk).
     const byId = new Map(response.docs.map((doc) => [doc.doc_id, doc]));
     const resolveLink: LinkResolver = (target) => {
-      const inBatch = byId.get(target);
-      if (inBatch) {
-        return { basename: noteBasename(inBatch.title, inBatch.doc_id), title: inBatch.title };
+      const assigned = basenames.get(target);
+      if (assigned) {
+        const doc = byId.get(target);
+        return { basename: assigned, title: doc?.title ?? assigned };
       }
       const known = this.journal.docs[target];
       if (known) {
@@ -72,16 +84,28 @@ export class Syncer {
     };
 
     await this.ensureFolder(this.settings.syncFolder);
+    if (this.settings.folderByKind) {
+      const folders = new Set(kept.map((doc) => kindFolder(doc.kind)));
+      for (const folder of folders) {
+        await this.ensureFolder(`${this.settings.syncFolder}/${folder}`);
+      }
+    }
 
     this.guard.beginRemote();
     try {
       for (const doc of kept) {
-        const outcome = await this.applyDoc(doc, resolveLink);
+        const basename = basenames.get(doc.doc_id) ?? "untitled";
+        const targetPath = normalizePath(
+          notePathFor(this.settings.syncFolder, doc.kind, basename, this.settings.folderByKind)
+        );
+        const outcome = await this.applyDoc(doc, targetPath, resolveLink);
         summary[outcome] += 1;
       }
     } finally {
       this.guard.endRemote();
     }
+
+    await this.writeIndexes();
 
     if (response.max_updated_at && response.max_updated_at > this.journal.watermark) {
       this.journal.watermark = response.max_updated_at;
@@ -92,10 +116,9 @@ export class Syncer {
 
   private async applyDoc(
     doc: HarnessDoc,
+    targetPath: string,
     resolveLink: LinkResolver
   ): Promise<"created" | "updated" | "skipped" | "conflicts"> {
-    const folder = this.settings.syncFolder;
-    const targetPath = normalizePath(notePath(folder, noteBasename(doc.title, doc.doc_id)));
     const desired = renderNote(doc, resolveLink);
     const desiredBody = (doc.content ?? "").trim();
     const state = this.journal.docs[doc.doc_id];
@@ -214,6 +237,8 @@ export class Syncer {
       path,
       title: doc.title,
       updatedAt: doc.updated_at,
+      kind: doc.kind,
+      summary: doc.summary,
     };
   }
 
@@ -228,8 +253,48 @@ export class Syncer {
         path: "",
         title: doc.title,
         updatedAt: doc.updated_at,
+        kind: doc.kind,
+        summary: doc.summary,
       };
     }
+  }
+
+  /**
+   * Regenerate the Map-of-Content indexes from the journal (every synced note, not
+   * just this batch). Plugin-owned: each carries the generated flag, so write-back
+   * skips them; the read-compare avoids rewriting an unchanged index.
+   */
+  private async writeIndexes(): Promise<void> {
+    if (!this.settings.generateIndexes) {
+      return;
+    }
+    const notes: IndexedNote[] = Object.values(this.journal.docs)
+      .filter((state) => state.path)
+      .map((state) => ({
+        basename: basenameOf(state.path),
+        title: state.title,
+        kind: state.kind ?? "",
+        summary: state.summary ?? "",
+      }));
+    for (const file of generateIndexFiles(notes, this.settings)) {
+      await this.writeIndexFile(normalizePath(file.path), file.content);
+    }
+  }
+
+  private async writeIndexFile(path: string, content: string): Promise<void> {
+    const parent = path.split("/").slice(0, -1).join("/");
+    await this.ensureFolder(parent);
+    await this.guard.write(path, async () => {
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      if (existing instanceof TFile) {
+        const current = await this.app.vault.read(existing);
+        if (current !== content) {
+          await this.app.vault.modify(existing, content);
+        }
+      } else {
+        await this.app.vault.create(path, content);
+      }
+    });
   }
 
   private async ensureFolder(folder: string): Promise<void> {

@@ -4,6 +4,7 @@ import { isCommonsTenant, type HarnessSyncSettings } from "./settings";
 import type { SyncJournal, UpsertNoteArgs } from "./types";
 import { localHash } from "./hash";
 import { extractWikilinks, isCaptured, userBody } from "./notes";
+import { GENERATED_FRONTMATTER_KEY } from "./indexes";
 import type { SyncGuard } from "./guard";
 
 const ENCODE_KINDS = new Set(["encode", "feedback", "solution", "postmortem"]);
@@ -37,6 +38,12 @@ export class WriteBack {
 
     const cache = this.app.metadataCache.getFileCache(file);
     const frontmatter = (cache?.frontmatter as Record<string, unknown> | undefined) ?? null;
+
+    // Plugin-owned generated index notes carry the generated flag; never push them.
+    if (frontmatter?.[GENERATED_FRONTMATTER_KEY]) {
+      return false;
+    }
+
     const existingDocId = asString(frontmatter?.doc_id);
 
     // A note already bound to a doc always round-trips; a new note must be captured.
@@ -77,6 +84,8 @@ export class WriteBack {
       path: file.path,
       title: args.title,
       updatedAt: receipt.document.updated_at,
+      kind: args.kind,
+      summary: args.summary ?? "",
     };
     if (receipt.document.updated_at > this.journal.watermark) {
       this.journal.watermark = receipt.document.updated_at;

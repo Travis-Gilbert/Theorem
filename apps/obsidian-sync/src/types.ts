@@ -1,9 +1,21 @@
 // Shared types for the Theorem Harness Sync plugin.
 
 /**
+ * A computed semantic neighbor (a `MEMORY_SIMILAR` edge) the server may attach to a
+ * doc. Distinct from authored `links` (wikilinks / `MEMORY_RELATES`): these come
+ * from the substrate's kNN-over-embeddings edge builder, not from the user.
+ */
+export interface SimilarLink {
+  doc_id: string;
+  score?: number;
+}
+
+/**
  * A memory document as returned by the harness read endpoint
  * `GET /v1/tenants/:tenant/memory/docs`. `links` are the outgoing link targets as
- * doc_ids; `content_hash` is the server-computed echo gate value.
+ * doc_ids; `content_hash` is the server-computed echo gate value. `similar` is an
+ * optional set of computed semantic neighbors (present only when the server
+ * surfaces `MEMORY_SIMILAR` edges); it is rendered as a separate "Related" block.
  */
 export interface HarnessDoc {
   doc_id: string;
@@ -15,6 +27,7 @@ export interface HarnessDoc {
   status: string;
   tags: string[];
   links: string[];
+  similar?: SimilarLink[];
   created_at: string;
   updated_at: string;
 }
@@ -83,6 +96,12 @@ export interface DocSyncState {
   path: string;
   title: string;
   updatedAt: string;
+  /** Kind + summary are mirrored here so the Map-of-Content indexes can be
+   * regenerated from the journal alone (an incremental pull only returns the
+   * changed docs, but the index must list every synced note). Optional for
+   * backward compatibility with journals written before indexes existed. */
+  kind?: string;
+  summary?: string;
 }
 
 /** Plugin data persisted via `saveData` (separate from user settings). */
