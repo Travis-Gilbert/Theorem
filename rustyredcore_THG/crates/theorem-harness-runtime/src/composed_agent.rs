@@ -106,19 +106,25 @@ pub fn run_composed_agent_with_claims<S: GraphStore>(
         .events
         .iter()
         .find(|event| event.event_type == "POLICY.CHECKED");
+    let alignment_verdict = policy_event
+        .map(|event| Value::Object(event.payload.clone()))
+        .unwrap_or_else(|| json!({ "allowed": false, "reason": "policy_event_missing" }));
+    let published_claims = if verdict_allowed(&alignment_verdict) {
+        result
+            .invocation_receipts
+            .last()
+            .map(|receipt| receipt.claims.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Ok(ComposedAgentRunResult {
         binding_id: binding_id.clone(),
         run_id: result.binding.lifecycle.run_id.clone(),
         task: task.to_string(),
-        published_claims: result
-            .invocation_receipts
-            .last()
-            .map(|receipt| receipt.claims.clone())
-            .unwrap_or_default(),
+        published_claims,
         consensus_head_set: result.binding.trace_scope.synthesis_heads.clone(),
-        alignment_verdict: policy_event
-            .map(|event| Value::Object(event.payload.clone()))
-            .unwrap_or_else(|| json!({ "allowed": false, "reason": "policy_event_missing" })),
+        alignment_verdict,
         events: result.events,
         scratchpad_revisions: result.scratchpad_revisions,
         invocation_receipts: result.invocation_receipts,
@@ -192,6 +198,13 @@ fn normalize_binding_id(binding_id: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn verdict_allowed(verdict: &Value) -> bool {
+    verdict
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 impl From<HeadInvocationError> for ComposedAgentRuntimeError {

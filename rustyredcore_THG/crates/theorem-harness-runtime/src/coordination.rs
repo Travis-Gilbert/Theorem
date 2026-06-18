@@ -779,6 +779,35 @@ pub fn read_mentions_for_actor<S: GraphStore>(
     consume: bool,
     limit: usize,
 ) -> CoordinationResult<Vec<CoordinationMessageState>> {
+    read_mentions_for_actor_filtered(store, tenant_slug, None, actor_id, consume, limit)
+}
+
+pub fn read_mentions_for_actor_in_room<S: GraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    room_id: &str,
+    actor_id: &str,
+    consume: bool,
+    limit: usize,
+) -> CoordinationResult<Vec<CoordinationMessageState>> {
+    read_mentions_for_actor_filtered(
+        store,
+        tenant_slug,
+        Some(normalize_room_id(room_id)),
+        actor_id,
+        consume,
+        limit,
+    )
+}
+
+fn read_mentions_for_actor_filtered<S: GraphStore>(
+    store: &mut S,
+    tenant_slug: &str,
+    room_id: Option<String>,
+    actor_id: &str,
+    consume: bool,
+    limit: usize,
+) -> CoordinationResult<Vec<CoordinationMessageState>> {
     let tenant_slug = normalize_tenant_slug(tenant_slug);
     let actor_id = require_text("actor_id", actor_id)?;
     let mut messages = store
@@ -794,6 +823,10 @@ pub fn read_mentions_for_actor<S: GraphStore>(
         .filter_map(|result| match result {
             Ok(message)
                 if message.mentions.iter().any(|mention| mention == &actor_id)
+                    && room_id
+                        .as_ref()
+                        .map(|room_id| message.room_id == room_id.as_str())
+                        .unwrap_or(true)
                     && !message
                         .consumed_by
                         .iter()

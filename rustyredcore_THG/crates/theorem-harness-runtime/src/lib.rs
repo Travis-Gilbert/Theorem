@@ -1,3 +1,4 @@
+pub mod agent_runner;
 pub mod binding_store;
 pub mod canonical_write;
 pub mod composed_agent;
@@ -5,6 +6,7 @@ pub mod compound_engineering;
 pub mod coordination;
 pub mod coordination_push;
 pub mod event_log;
+pub mod head_invoker;
 pub mod job_queue;
 pub mod library_encoding;
 pub mod memory;
@@ -15,6 +17,11 @@ pub mod skill_pack;
 pub mod work_graph_store;
 pub mod writing_style;
 
+pub use agent_runner::{
+    run_agent_room_cycle, AgentRoomRunnerConfig, AgentRoomRunnerCycle, AgentRoomRunnerError,
+    AgentRoomRunnerTurn, AgentRoomRunnerTurnStatus, DEFAULT_AGENT_ACTOR, DEFAULT_AGENT_SURFACE,
+    DEFAULT_HEARTBEAT_TTL_SECONDS, DEFAULT_MENTION_LIMIT,
+};
 pub use binding_store::{
     append_binding_transition, binding_event_node_id, binding_node_id, load_binding,
     load_binding_events, load_scratchpad_revisions, persist_binding, persist_binding_event_state,
@@ -53,12 +60,12 @@ pub use coordination::{
     coordination_record_node_id, coordination_room_binding_edge_id, coordination_room_node_id,
     end_presence, heartbeat_presence, infer_coordination_room_id, join_room, list_presence,
     load_presence, normalize_coordination_urgency, parse_coordination_mentions,
-    read_intents_for_room, read_mentions_for_actor, read_messages_for_room, read_records_for_room,
-    room_status, stable_coordination_message_id, stable_coordination_record_id, write_intent,
-    write_message, write_record, CoordinationError, CoordinationIntentState,
-    CoordinationMessageState, CoordinationPresenceState, CoordinationRecordState,
-    CoordinationResult, CoordinationRoomMember, CoordinationRoomState, JoinRoomInput,
-    PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
+    read_intents_for_room, read_mentions_for_actor, read_mentions_for_actor_in_room,
+    read_messages_for_room, read_records_for_room, room_status, stable_coordination_message_id,
+    stable_coordination_record_id, write_intent, write_message, write_record, CoordinationError,
+    CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
+    CoordinationRecordState, CoordinationResult, CoordinationRoomMember, CoordinationRoomState,
+    JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
 };
 pub use coordination_push::{
     agent_space_event_kind, agent_space_event_matches, agent_space_high_water_seq,
@@ -113,7 +120,11 @@ pub use patch_sequencer::{
     PatchSequencerResult,
 };
 pub mod provider_invoker;
-pub use provider_invoker::{CredentialResolver, EndpointMap, ProviderHeadInvoker};
+pub use head_invoker::{
+    api_provider_profile, default_api_profiles, ApiProviderProfile, ApiRequestShape,
+    CredentialResolutionError, CredentialResolver, EndpointMap, ProviderHeadInvoker,
+    RealHeadInvoker,
+};
 pub use skill_pack::{
     apply_skill_pack, get_skill_pack, list_skill_packs, publish_skill_pack,
     skill_pack_artifact_node_id, skill_pack_node_id, skill_pack_source_node_id,
