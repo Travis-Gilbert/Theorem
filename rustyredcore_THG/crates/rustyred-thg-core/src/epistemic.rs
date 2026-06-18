@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+use egg::{Id, RecExpr, Runner, SymbolLang};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -18,6 +19,11 @@ pub const SAME_ECLASS: &str = "SameEClass";
 pub const DEFAULT_EPISTEMIC_ENGINE_VERSION: &str = "epistemic-v1";
 pub const STRUCTURAL_EPISTEMIC_ENGINE: &str = "rustyred-thg-core.structural_epistemic";
 pub const LEARNED_EPISTEMIC_ENGINE: &str = "theseus.epistemic_enrichment";
+/// Engine tag for the e-graph dedup pass (Strand A phase 3 / cut 9). The
+/// equivalence relation is a symbolic, model-free computation over the shadow
+/// claim forms, so it carries the `structural` source kind on the edges it
+/// writes.
+pub const EGRAPH_EPISTEMIC_ENGINE: &str = "rustyred-thg-core.epistemic_egraph";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +138,22 @@ pub struct EpistemicShadowReadout {
     pub computed_at: i64,
     pub quarantine: bool,
     pub field_provenance: BTreeMap<String, EpistemicFieldProvenance>,
+    /// Set when this shadow has been collapsed onto another shadow as a member
+    /// of a `SameEClass` equivalence class (Strand A phase 3 / cut 9). `None`
+    /// means the shadow is either a class representative or was never deduped.
+    #[serde(default)]
+    pub same_eclass: Option<SameEClassRef>,
+}
+
+/// A back-reference from a deduped shadow to the `SameEClass` representative it
+/// was collapsed onto. Read off the member shadow's `SameEClass` out-edge, so it
+/// is always consistent with the edge layer that `epistemic_shadow_ppr`
+/// traverses.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SameEClassRef {
+    pub representative_shadow_id: String,
+    pub class_id: String,
+    pub canonical_form: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -361,6 +383,18 @@ pub fn epistemic_shadow_edge_id(
     )
 }
 
+pub fn same_eclass_edge_id(
+    from_shadow_id: &str,
+    to_shadow_id: &str,
+    engine_version: &str,
+) -> String {
+    format!(
+        "epistemic:edge:{}:{}",
+        SAME_ECLASS,
+        stable_hash(json!([from_shadow_id, to_shadow_id, engine_version]))
+    )
+}
+
 pub fn structural_epistemic_pass<S: GraphStore>(
     store: &mut S,
     input: StructuralEpistemicInput,
@@ -522,10 +556,39 @@ pub fn read_epistemic_shadow<S: GraphStore>(
             .iter()
             .any(|label| label == EPISTEMIC_SHADOW_LABEL)
         {
-            return shadow_readout_from_node(content_node_id, shadow);
+            let mut readout = shadow_readout_from_node(content_node_id, shadow)?;
+            readout.same_eclass = read_same_eclass(store, &readout.shadow_node_id);
+            return Some(readout);
         }
     }
     None
+}
+
+/// Read the `SameEClass` representative a shadow was collapsed onto, if any.
+/// Returns `None` for a class representative (it has no outgoing `SameEClass`
+/// edge) or a shadow that was never deduped.
+pub fn read_same_eclass<S: GraphStore>(
+    store: &S,
+    shadow_node_id: &str,
+) -> Option<SameEClassRef> {
+    let hit = store
+        .neighbors(NeighborQuery::out(shadow_node_id).with_edge_type(SAME_ECLASS))
+        .into_iter()
+        .next()?;
+    let (class_id, canonical_form) = store
+        .get_edge(&hit.edge_id)
+        .map(|edge| {
+            (
+                prop_str(&edge.properties, "class_id").unwrap_or_default(),
+                prop_str(&edge.properties, "canonical_form").unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+    Some(SameEClassRef {
+        representative_shadow_id: hit.node_id,
+        class_id,
+        canonical_form,
+    })
 }
 
 pub fn epistemic_shadow_ppr<S: GraphStore>(
@@ -1177,6 +1240,9 @@ fn shadow_readout_from_node(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
+        // Populated by callers that hold a store handle (e.g.
+        // `read_epistemic_shadow`); the node alone cannot reach its out-edge.
+        same_eclass: None,
     })
 }
 
@@ -1367,6 +1433,403 @@ fn default_true() -> bool {
     true
 }
 
+// =========================================================================== //
+// Strand A phase 3 / cut 9: e-graph equivalence-class dedup.
+//
+// Collapses provably-equivalent epistemic shadow STATES many-to-one onto a
+// single `SameEClass` representative. The equivalence relation is decided by an
+// `egg` e-graph: each shadow becomes the term `(shadow <status> <claim-term>)`
+// (or `<claim-term>` alone in claim-only mode), the e-graph runs the epistemic
+// rewrite rules to congruence-closure saturation, and two shadows are
+// equivalent iff their terms land in the same e-class.
+//
+// Why an e-graph and not a string compare: the claim-term encodes negation
+// STRUCTURALLY -- `(not (not p))` -- and the rule `(not (not ?x)) => ?x` proves
+// that "p" and "not not p" are the same proposition. A string-tuple dedup
+// (`dedupe_relations`) can never see that. Grouping is driven by the e-graph's
+// `find()`, so adding richer provable-equivalence rules later (commutativity,
+// idempotence, domain rewrites -- the egglog/Datalog upgrade path) re-clusters
+// automatically with no change to the grouping code.
+//
+// Non-breaking: this pass writes ONLY `SameEClass` edges. It never mutates a
+// content node, and never mutates or deletes a shadow node. `epistemic_shadow_ppr`
+// already traverses `SameEClass`, so the new edges light up clustering for free,
+// and `read_epistemic_shadow` reads the membership back off the edge.
+//
+// Scope notes (surfaced, not buried):
+//   * v1 congruence is the double-negation rule only. The negation parity is
+//     best-effort: it reuses the existing whole-claim negation lexicon
+//     (`count_negations` mirrors `without_negation`), so "without"/multi-negation
+//     resolve to XOR parity rather than scoped logic. A mis-parity only ever
+//     fails-to-merge (conservative) or mislabels the cosmetic `canonical_form`;
+//     it cannot corrupt the content graph. Richer rules are an additive change.
+//   * Egglog as the backend for the byte-parity Datalog layer (`symbolic.rs`
+//     `derive_datalog_receipt`) is deliberately DEFERRED, not done here: that
+//     engine has a Python-reference byte-parity gate an egglog rewrite would
+//     break. This e-graph is structured as the reusable substrate for that
+//     upgrade, but swapping the Datalog engine is its own gated change.
+//   * Read path is wired: recall surfaces `same_eclass` via `read_epistemic_shadow`.
+//     The WRITE trigger (a cron/MCP/server caller of `epistemic_egraph_dedup`)
+//     is deferred and named, matching the rest of the epistemic strand's
+//     core-first, wiring-later split.
+// =========================================================================== //
+
+/// Which fields define epistemic-shadow equivalence for the dedup pass.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpistemicCongruence {
+    /// Two shadows are equivalent iff their claim logical forms are congruent
+    /// AND their grounded-extension status is identical. The default: a shadow
+    /// STATE includes its standing, so the same claim marked `in` versus `out`
+    /// is two distinct states and is not collapsed (collapsing it would hide a
+    /// disagreement).
+    #[default]
+    ClaimAndStanding,
+    /// Equivalence on the claim logical form alone; standing is ignored, so
+    /// equivalent claims merge regardless of grounded status.
+    ClaimOnly,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct EpistemicDedupConfig {
+    pub engine: String,
+    pub engine_version: String,
+    pub computed_at: i64,
+    pub congruence: EpistemicCongruence,
+}
+
+impl Default for EpistemicDedupConfig {
+    fn default() -> Self {
+        Self {
+            engine: EGRAPH_EPISTEMIC_ENGINE.to_string(),
+            engine_version: DEFAULT_EPISTEMIC_ENGINE_VERSION.to_string(),
+            computed_at: now_ms(),
+            congruence: EpistemicCongruence::default(),
+        }
+    }
+}
+
+/// One equivalence class with at least two members (singletons are not
+/// reported). `member_*` vectors are sorted and include the representative.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EpistemicEquivalenceClass {
+    pub class_id: String,
+    pub canonical_form: String,
+    pub representative_content_id: String,
+    pub representative_shadow_id: String,
+    pub member_content_ids: Vec<String>,
+    pub member_shadow_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EpistemicDedupReport {
+    /// Shadows that produced an e-graph term (had a non-empty claim form).
+    pub shadows_examined: usize,
+    /// Shadows that formed their own singleton class (no equivalent peer).
+    pub singleton_count: usize,
+    /// Equivalence classes with >= 2 members.
+    pub classes: Vec<EpistemicEquivalenceClass>,
+    /// Sum over classes of (members - 1): the count of shadows folded onto a
+    /// representative.
+    pub members_collapsed: usize,
+    /// `SameEClass` edges written (== `members_collapsed`).
+    pub same_eclass_edges_written: usize,
+}
+
+/// The logical form of a claim: a proposition plus a negation parity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClaimForm {
+    /// Negation-stripped, normalized proposition tokens joined by spaces.
+    prop: String,
+    /// Number of negation tokens observed (the e-graph reduces parity).
+    neg_count: usize,
+}
+
+impl ClaimForm {
+    fn negated(&self) -> bool {
+        self.neg_count % 2 == 1
+    }
+
+    /// A human-readable canonical label for the (proposition, parity) pair.
+    fn canonical_label(&self) -> String {
+        if self.negated() {
+            format!("not {}", self.prop)
+        } else {
+            self.prop.clone()
+        }
+    }
+
+    /// The `egg` term for the claim: a `p_`-prefixed proposition leaf wrapped in
+    /// `neg_count` `(not ...)` layers, which the double-negation rule reduces to
+    /// parity. The `p_` prefix keeps the leaf disjoint from the `not`/`shadow`
+    /// operators and `s_*` status symbols.
+    fn claim_term(&self) -> String {
+        let mut term = format!("p_{}", self.prop.replace(' ', "_"));
+        for _ in 0..self.neg_count {
+            term = format!("(not {term})");
+        }
+        term
+    }
+}
+
+fn claim_logical_form(text: &str) -> Option<ClaimForm> {
+    let normalized = normalize_claim(text);
+    let prop = without_negation(&normalized);
+    if prop.is_empty() {
+        return None;
+    }
+    Some(ClaimForm {
+        prop,
+        neg_count: count_negations(&normalized),
+    })
+}
+
+// Best-effort negation parity: this MUST use the same lexicon as
+// `without_negation` (above) or the stripped proposition and the parity would
+// disagree. See the module-header scope notes for why this is intentionally
+// best-effort (whole-claim, not scoped).
+fn count_negations(normalized: &str) -> usize {
+    normalized
+        .split_whitespace()
+        .filter(|token| matches!(*token, "not" | "no" | "never" | "without"))
+        .count()
+}
+
+fn grounded_status_symbol(raw: &str) -> &'static str {
+    match parse_grounded_status(raw) {
+        GroundedExtensionStatus::In => "s_in",
+        GroundedExtensionStatus::Out => "s_out",
+        GroundedExtensionStatus::Undecided => "s_undecided",
+    }
+}
+
+/// A shadow staged for the e-graph: the term plus the identity needed to write
+/// edges and report membership.
+struct DedupCandidate {
+    shadow_id: String,
+    content_id: String,
+    form: ClaimForm,
+    term: RecExpr<SymbolLang>,
+}
+
+/// Run the e-graph dedup pass over the given content nodes' shadows (or every
+/// shadow when `content_node_ids` is empty). Writes `SameEClass` edges from each
+/// non-representative member to its class representative and returns the report.
+pub fn epistemic_egraph_dedup<S: GraphStore>(
+    store: &mut S,
+    content_node_ids: &[String],
+    config: EpistemicDedupConfig,
+) -> GraphStoreResult<EpistemicDedupReport> {
+    let shadow_nodes = collect_dedup_shadows(store, content_node_ids);
+
+    // Stage each shadow as an e-graph term.
+    let mut candidates: Vec<DedupCandidate> = Vec::new();
+    for shadow in &shadow_nodes {
+        let content_id = prop_str(&shadow.properties, "content_node_id")
+            .unwrap_or_else(|| shadow.id.clone());
+        let Some(content_node) = store.get_node(&content_id) else {
+            continue;
+        };
+        let Some(form) = claim_logical_form(&claim_text(content_node)) else {
+            continue;
+        };
+        let term_str = match config.congruence {
+            EpistemicCongruence::ClaimOnly => form.claim_term(),
+            EpistemicCongruence::ClaimAndStanding => {
+                let status = grounded_status_symbol(
+                    &prop_str(&shadow.properties, "grounded_extension_status")
+                        .unwrap_or_else(|| "undecided".to_string()),
+                );
+                format!("(shadow {status} {})", form.claim_term())
+            }
+        };
+        let Ok(term) = term_str.parse::<RecExpr<SymbolLang>>() else {
+            continue;
+        };
+        candidates.push(DedupCandidate {
+            shadow_id: shadow.id.clone(),
+            content_id,
+            form,
+            term,
+        });
+    }
+
+    let mut report = EpistemicDedupReport {
+        shadows_examined: candidates.len(),
+        ..EpistemicDedupReport::default()
+    };
+    if candidates.is_empty() {
+        return Ok(report);
+    }
+
+    // Saturate one e-graph holding every term, then group by canonical e-class.
+    let class_roots = egraph_class_roots(&candidates);
+    let mut groups: BTreeMap<Id, Vec<usize>> = BTreeMap::new();
+    for (idx, root) in class_roots.into_iter().enumerate() {
+        groups.entry(root).or_default().push(idx);
+    }
+
+    let mut classes: Vec<EpistemicEquivalenceClass> = Vec::new();
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            report.singleton_count += 1;
+            continue;
+        }
+        // Deterministic representative: smallest (content_id, shadow_id).
+        let mut sorted = members.clone();
+        sorted.sort_by(|&a, &b| {
+            candidates[a]
+                .content_id
+                .cmp(&candidates[b].content_id)
+                .then_with(|| candidates[a].shadow_id.cmp(&candidates[b].shadow_id))
+        });
+        let rep = &candidates[sorted[0]];
+        let representative_content_id = rep.content_id.clone();
+        let representative_shadow_id = rep.shadow_id.clone();
+        let canonical_form = rep.form.canonical_label();
+
+        let mut member_content_ids: Vec<String> =
+            sorted.iter().map(|&i| candidates[i].content_id.clone()).collect();
+        let mut member_shadow_ids: Vec<String> =
+            sorted.iter().map(|&i| candidates[i].shadow_id.clone()).collect();
+        member_content_ids.sort();
+        member_shadow_ids.sort();
+        member_content_ids.dedup();
+        member_shadow_ids.dedup();
+        let class_id = format!("eclass:{}", stable_hash(json!(member_shadow_ids)));
+
+        for &idx in sorted.iter().skip(1) {
+            let member = &candidates[idx];
+            write_same_eclass_edge(
+                store,
+                &member.shadow_id,
+                &representative_shadow_id,
+                &class_id,
+                &canonical_form,
+                &config,
+            )?;
+            report.same_eclass_edges_written += 1;
+            report.members_collapsed += 1;
+        }
+
+        classes.push(EpistemicEquivalenceClass {
+            class_id,
+            canonical_form,
+            representative_content_id,
+            representative_shadow_id,
+            member_content_ids,
+            member_shadow_ids,
+        });
+    }
+    classes.sort_by(|a, b| a.class_id.cmp(&b.class_id));
+    report.classes = classes;
+    Ok(report)
+}
+
+fn collect_dedup_shadows<S: GraphStore>(
+    store: &S,
+    content_node_ids: &[String],
+) -> Vec<NodeRecord> {
+    if content_node_ids.is_empty() {
+        // Full-store mode bounds at 100_000 shadows, matching the rest of the
+        // epistemic module (`compile_user_subgraph`, `epistemic_shadow_ppr`). A
+        // tenant whose shadow set exceeds that should drive the dedup with an
+        // explicit `content_node_ids` batch rather than the whole-store scan.
+        let mut nodes = store
+            .query_nodes(NodeQuery::label(EPISTEMIC_SHADOW_LABEL).with_limit(100_000));
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        return nodes;
+    }
+    let mut seen = BTreeSet::new();
+    let mut nodes = Vec::new();
+    for content_id in content_node_ids {
+        for hit in store
+            .neighbors(NeighborQuery::out(content_id).with_edge_type(HAS_EPISTEMIC_SHADOW))
+            .into_iter()
+        {
+            if !seen.insert(hit.node_id.clone()) {
+                continue;
+            }
+            if let Some(shadow) = store.get_node(&hit.node_id) {
+                if shadow
+                    .labels
+                    .iter()
+                    .any(|label| label == EPISTEMIC_SHADOW_LABEL)
+                {
+                    nodes.push(shadow.clone());
+                }
+            }
+        }
+    }
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    nodes
+}
+
+/// Saturate one e-graph over all candidate terms and return, per candidate (in
+/// input order), the canonical e-class id it belongs to.
+///
+/// The whole seed graph is built with `with_expr` (unbounded `add_expr`) BEFORE
+/// `run()`, and a large batch can push it past egg's default `node_limit`
+/// (10_000). When the seed exceeds that limit, egg's `check_limits()` returns
+/// `Err(NodeLimit)` and short-circuits rewrite application, so the congruence
+/// rule would fire on ZERO terms and the dedup would silently degenerate to
+/// exact-string hashconsing. We therefore lift the limits explicitly. This is
+/// safe: the only rule `(not (not ?x)) => ?x` strictly shrinks term nesting and
+/// never grows the graph beyond the seed, so it reaches `Saturated` in a handful
+/// of iterations regardless of batch size.
+fn egraph_class_roots(candidates: &[DedupCandidate]) -> Vec<Id> {
+    let rules: Vec<egg::Rewrite<SymbolLang, ()>> =
+        vec![egg::rewrite!("epistemic-double-negation"; "(not (not ?x))" => "?x")];
+    let mut runner: Runner<SymbolLang, ()> = Runner::default()
+        .with_node_limit(usize::MAX)
+        .with_iter_limit(usize::MAX)
+        .with_time_limit(std::time::Duration::from_secs(3600));
+    for candidate in candidates {
+        runner = runner.with_expr(&candidate.term);
+    }
+    let runner = runner.run(&rules);
+    runner
+        .roots
+        .iter()
+        .map(|root| runner.egraph.find(*root))
+        .collect()
+}
+
+fn write_same_eclass_edge<S: GraphStore>(
+    store: &mut S,
+    member_shadow_id: &str,
+    representative_shadow_id: &str,
+    class_id: &str,
+    canonical_form: &str,
+    config: &EpistemicDedupConfig,
+) -> GraphStoreResult<()> {
+    let edge = EdgeRecord::new(
+        same_eclass_edge_id(member_shadow_id, representative_shadow_id, &config.engine_version),
+        member_shadow_id,
+        SAME_ECLASS,
+        representative_shadow_id,
+        json!({
+            "class_id": class_id,
+            "canonical_form": canonical_form,
+            "confidence": 1.0,
+            "evidence": "egraph_congruence",
+            "source_kind": "structural",
+            "engine": config.engine,
+            "engine_version": config.engine_version,
+            "computed_at": config.computed_at,
+            "quarantine": true,
+        }),
+    )
+    .with_confidence(1.0)
+    .with_provenance(Provenance {
+        source_id: Some(config.engine.clone()),
+        timestamp: Some(config.computed_at.to_string()),
+        method: Some("epistemic_egraph_dedup".to_string()),
+    });
+    store.upsert_edge(edge)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1554,5 +2017,157 @@ mod tests {
         assert_eq!(after.predicted_edges.len(), 1);
         assert!(after.predicted_edges[0].quarantine);
         assert_eq!(after.source_kind, EpistemicSourceKind::Mixed);
+    }
+
+    fn shadows_for(store: &mut InMemoryGraphStore, ids: &[&str]) {
+        structural_epistemic_pass(
+            store,
+            StructuralEpistemicInput {
+                batch_node_ids: ids.iter().map(|s| s.to_string()).collect(),
+                ..StructuralEpistemicInput::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn egraph_dedup_collapses_double_negation_equivalent_claims() {
+        // The e-graph win: "X" and "not not X" are proven equal by the
+        // double-negation rule, so they collapse into one class. A plain
+        // string-tuple dedup would keep them apart.
+        let mut store = InMemoryGraphStore::new();
+        store.upsert_node(claim("plain", "feature is enabled")).unwrap();
+        store
+            .upsert_node(claim("double", "feature is not not enabled"))
+            .unwrap();
+        shadows_for(&mut store, &["plain", "double"]);
+
+        let report =
+            epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).unwrap();
+        assert_eq!(report.shadows_examined, 2);
+        assert_eq!(report.classes.len(), 1, "the two claims form one class");
+        assert_eq!(report.members_collapsed, 1);
+        assert_eq!(report.same_eclass_edges_written, 1);
+        let class = &report.classes[0];
+        assert_eq!(class.member_content_ids, vec!["double", "plain"]);
+        // canonical_form is the parity-reduced proposition (no leading "not").
+        assert_eq!(class.canonical_form, "feature is enabled");
+    }
+
+    #[test]
+    fn egraph_dedup_single_negation_stays_distinct_from_positive() {
+        let mut store = InMemoryGraphStore::new();
+        store.upsert_node(claim("pos", "cache is enabled")).unwrap();
+        store
+            .upsert_node(claim("neg", "cache is not enabled"))
+            .unwrap();
+        shadows_for(&mut store, &["pos", "neg"]);
+        let report =
+            epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).unwrap();
+        assert_eq!(report.classes.len(), 0, "p and (not p) are different states");
+        assert_eq!(report.same_eclass_edges_written, 0);
+        assert_eq!(report.singleton_count, 2);
+    }
+
+    #[test]
+    fn egraph_dedup_is_idempotent_and_many_to_one() {
+        let mut store = InMemoryGraphStore::new();
+        for id in ["a", "b", "c"] {
+            store.upsert_node(claim(id, "the sky is blue")).unwrap();
+        }
+        shadows_for(&mut store, &["a", "b", "c"]);
+
+        let first =
+            epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).unwrap();
+        assert_eq!(first.classes.len(), 1);
+        // Three members, two collapse onto one representative (many-to-one).
+        assert_eq!(first.members_collapsed, 2);
+        let rep = &first.classes[0].representative_shadow_id;
+
+        // Every non-representative member points at exactly the representative.
+        let mut edge_targets = Vec::new();
+        for content in ["a", "b", "c"] {
+            let shadow_id = epistemic_shadow_node_id(content, DEFAULT_EPISTEMIC_ENGINE_VERSION);
+            if &shadow_id == rep {
+                continue;
+            }
+            let same = read_same_eclass(&store, &shadow_id).expect("member has SameEClass edge");
+            edge_targets.push(same.representative_shadow_id);
+        }
+        assert!(edge_targets.iter().all(|t| t == rep));
+
+        // Re-running writes the same edge ids: edge count is unchanged.
+        let edges_before = store.stats().edges_total;
+        let second =
+            epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).unwrap();
+        assert_eq!(second.members_collapsed, first.members_collapsed);
+        assert_eq!(second.classes[0].class_id, first.classes[0].class_id);
+        assert_eq!(store.stats().edges_total, edges_before, "idempotent: no new edges");
+    }
+
+    #[test]
+    fn claim_and_standing_keeps_distinct_status_apart() {
+        // Same claim, but planted so one shadow is grounded `out` (attacked) and
+        // the other is `in`. ClaimAndStanding must NOT merge them.
+        let mut store = InMemoryGraphStore::new();
+        store.upsert_node(claim("winner", "the build passes")).unwrap();
+        store.upsert_node(claim("loser", "the build passes")).unwrap();
+        store.upsert_node(claim("attacker", "the build fails")).unwrap();
+        // attacker --CONTRADICTS--> loser  => loser is grounded `out`.
+        store
+            .upsert_edge(EdgeRecord::new(
+                "atk",
+                "attacker",
+                "CONTRADICTS",
+                "loser",
+                json!({}),
+            ))
+            .unwrap();
+        shadows_for(&mut store, &["winner", "loser", "attacker"]);
+
+        let standing =
+            epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).unwrap();
+        // winner(in) and loser(out) share a claim but differ in standing.
+        assert!(
+            !standing
+                .classes
+                .iter()
+                .any(|c| c.member_content_ids.contains(&"winner".to_string())
+                    && c.member_content_ids.contains(&"loser".to_string())),
+            "ClaimAndStanding must keep in/out apart"
+        );
+
+        // ClaimOnly ignores standing and merges the two identical claims.
+        let mut store2 = InMemoryGraphStore::new();
+        store2.upsert_node(claim("winner", "the build passes")).unwrap();
+        store2.upsert_node(claim("loser", "the build passes")).unwrap();
+        store2.upsert_node(claim("attacker", "the build fails")).unwrap();
+        store2
+            .upsert_edge(EdgeRecord::new(
+                "atk",
+                "attacker",
+                "CONTRADICTS",
+                "loser",
+                json!({}),
+            ))
+            .unwrap();
+        shadows_for(&mut store2, &["winner", "loser", "attacker"]);
+        let claim_only = epistemic_egraph_dedup(
+            &mut store2,
+            &[],
+            EpistemicDedupConfig {
+                congruence: EpistemicCongruence::ClaimOnly,
+                ..EpistemicDedupConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            claim_only
+                .classes
+                .iter()
+                .any(|c| c.member_content_ids.contains(&"winner".to_string())
+                    && c.member_content_ids.contains(&"loser".to_string())),
+            "ClaimOnly merges identical claims across standing"
+        );
     }
 }

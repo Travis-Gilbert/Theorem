@@ -14,11 +14,13 @@
 use std::collections::HashMap;
 
 use rustyred_thg_core::epistemic::{
-    epistemic_shadow_ppr, read_epistemic_shadow, run_epistemic_cron_pass,
-    structural_epistemic_pass, EpistemicAnnotation, EpistemicAnnotations, EpistemicCandidatePair,
-    EpistemicCronInput, EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode,
+    epistemic_egraph_dedup, epistemic_shadow_node_id, epistemic_shadow_ppr, read_epistemic_shadow,
+    read_same_eclass, run_epistemic_cron_pass, structural_epistemic_pass, EpistemicAnnotation,
+    EpistemicAnnotations, EpistemicCandidatePair, EpistemicCongruence, EpistemicCronInput,
+    EpistemicDedupConfig, EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode,
     EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer, SourceReliability,
-    StructuralEpistemicConfig, StructuralEpistemicInput, EPISTEMIC_SHADOW_LABEL,
+    StructuralEpistemicConfig, StructuralEpistemicInput, DEFAULT_EPISTEMIC_ENGINE_VERSION,
+    EPISTEMIC_SHADOW_LABEL, SAME_ECLASS,
 };
 use rustyred_thg_core::{EdgeRecord, GraphStore, InMemoryGraphStore, NodeQuery, NodeRecord};
 use serde_json::json;
@@ -443,4 +445,277 @@ fn epistemicrag_ppr_over_shadow_layer_returns_ranking() {
     seeds.insert("a".to_string(), 1.0);
     let ranking = epistemic_shadow_ppr(&store, &seeds, 10, 0.85, 1e-6, 1000);
     assert!(!ranking.is_empty(), "shadow-layer PPR returns a ranking");
+}
+
+// --------------------------------------------------------------------------- //
+// Strand A phase 3 / cut 9: e-graph SameEClass dedup
+// --------------------------------------------------------------------------- //
+
+/// Count edges of a given type in the store (no public edge-count accessor).
+fn edge_type_count(store: &InMemoryGraphStore, edge_type: &str) -> usize {
+    store
+        .query_nodes(NodeQuery::default().with_limit(100_000))
+        .into_iter()
+        .flat_map(|node| {
+            store
+                .neighbors(
+                    rustyred_thg_core::NeighborQuery::out(&node.id).with_edge_type(edge_type),
+                )
+                .into_iter()
+                .map(|hit| hit.edge_id)
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+#[test]
+fn dedup_collapses_provably_equivalent_states_onto_one_eclass() {
+    // CUT 9: provably-equivalent shadow states collapse many-to-one. "enabled"
+    // and "not not enabled" are the same proposition by double-negation; the
+    // e-graph proves it where a string dedup cannot.
+    let mut store = InMemoryGraphStore::new();
+    store.upsert_node(claim("a", "telemetry is on")).unwrap();
+    store.upsert_node(claim("b", "telemetry is on")).unwrap();
+    store
+        .upsert_node(claim("c", "telemetry is not not on"))
+        .unwrap();
+    store.upsert_node(claim("solo", "logging is off")).unwrap();
+    run_structural(&mut store, &["a", "b", "c", "solo"], vec![]);
+
+    let report =
+        epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
+
+    assert_eq!(report.shadows_examined, 4);
+    assert_eq!(report.classes.len(), 1, "a/b/c form a single class");
+    let class = &report.classes[0];
+    assert_eq!(class.member_content_ids, vec!["a", "b", "c"]);
+    // Two non-representatives collapse onto one representative (many-to-one).
+    assert_eq!(report.members_collapsed, 2);
+    assert_eq!(report.same_eclass_edges_written, 2);
+    assert_eq!(report.singleton_count, 1, "the 'solo' claim stands alone");
+    // The representative carries no outgoing SameEClass edge; the other two do.
+    let rep_shadow = &class.representative_shadow_id;
+    let mut pointed_at_rep = 0;
+    for content in ["a", "b", "c"] {
+        let shadow = epistemic_shadow_node_id(content, DEFAULT_EPISTEMIC_ENGINE_VERSION);
+        match read_same_eclass(&store, &shadow) {
+            Some(same) => {
+                assert_eq!(&same.representative_shadow_id, rep_shadow);
+                pointed_at_rep += 1;
+            }
+            None => assert_eq!(&shadow, rep_shadow, "only the representative has no edge"),
+        }
+    }
+    assert_eq!(pointed_at_rep, 2);
+}
+
+#[test]
+fn dedup_never_mutates_the_content_graph() {
+    // CUT 9 invariant: the dedup writes ONLY SameEClass edges. Content nodes,
+    // content edges, and the shadow node set are all untouched.
+    let mut store = InMemoryGraphStore::new();
+    store.upsert_node(claim("a", "the disk is full")).unwrap();
+    store.upsert_node(claim("b", "the disk is full")).unwrap();
+    store
+        .upsert_edge(EdgeRecord::new("rel", "a", "CITES", "b", json!({})))
+        .unwrap();
+    run_structural(&mut store, &["a", "b"], vec![]);
+
+    let nodes_before = store.stats().nodes_total;
+    let shadows_before = shadow_count(&store);
+    let cites_before = edge_type_count(&store, "CITES");
+    // Content node "a" snapshot.
+    let a_before = store.get_node("a").cloned().expect("a exists");
+
+    let report =
+        epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
+    assert_eq!(report.same_eclass_edges_written, 1);
+
+    assert_eq!(store.stats().nodes_total, nodes_before, "no nodes added");
+    assert_eq!(shadow_count(&store), shadows_before, "no shadows added/removed");
+    assert_eq!(edge_type_count(&store, "CITES"), cites_before, "content edges intact");
+    assert_eq!(
+        store.get_node("a").cloned().expect("a still exists"),
+        a_before,
+        "content node payload byte-identical"
+    );
+    // The only new edges are SameEClass.
+    assert_eq!(edge_type_count(&store, SAME_ECLASS), 1);
+}
+
+#[test]
+fn dedup_same_eclass_edges_feed_shadow_ppr() {
+    // CUT 9 payoff: SameEClass edges are part of the shadow-PPR adjacency, so a
+    // seed at one class member reaches the representative through the new edge.
+    let mut store = InMemoryGraphStore::new();
+    store.upsert_node(claim("a", "the model converged")).unwrap();
+    store.upsert_node(claim("b", "the model converged")).unwrap();
+    run_structural(&mut store, &["a", "b"], vec![]);
+    // No SUPPORTS/UNDERCUTS were inferred (no candidate pairs), so the only
+    // shadow-to-shadow edge after dedup is SameEClass.
+    let report =
+        epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
+    let rep = report.classes[0].representative_shadow_id.clone();
+    let member = report
+        .classes[0]
+        .member_shadow_ids
+        .iter()
+        .find(|id| **id != rep)
+        .cloned()
+        .expect("a non-representative member");
+
+    // Seed the member's content node; PPR should rank the representative shadow.
+    let member_content = if epistemic_shadow_node_id("a", DEFAULT_EPISTEMIC_ENGINE_VERSION) == member
+    {
+        "a"
+    } else {
+        "b"
+    };
+    let mut seeds = HashMap::new();
+    seeds.insert(member_content.to_string(), 1.0);
+    let ranking = epistemic_shadow_ppr(&store, &seeds, 10, 0.85, 1e-6, 5000);
+    assert!(
+        ranking.iter().any(|(id, _)| id == &rep),
+        "SameEClass edge carries PPR mass to the representative"
+    );
+}
+
+#[test]
+fn dedup_surfaces_through_recall_readout_and_is_idempotent() {
+    // CUT 9 read path + idempotency: read_epistemic_shadow surfaces same_eclass
+    // for a collapsed member and None for the representative; a second run adds
+    // no edges.
+    let mut store = InMemoryGraphStore::new();
+    store.upsert_node(claim("a", "the queue is empty")).unwrap();
+    store.upsert_node(claim("b", "the queue is empty")).unwrap();
+    run_structural(&mut store, &["a", "b"], vec![]);
+
+    let first =
+        epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
+    let rep = first.classes[0].representative_content_id.clone();
+    let member = if rep == "a" { "b" } else { "a" };
+
+    let member_readout = read_epistemic_shadow(&store, member).expect("member shadow");
+    let same = member_readout.same_eclass.expect("member carries same_eclass");
+    assert_eq!(
+        same.representative_shadow_id,
+        epistemic_shadow_node_id(&rep, DEFAULT_EPISTEMIC_ENGINE_VERSION)
+    );
+    assert_eq!(same.canonical_form, "the queue is empty");
+
+    let rep_readout = read_epistemic_shadow(&store, &rep).expect("rep shadow");
+    assert!(
+        rep_readout.same_eclass.is_none(),
+        "the representative is a class head, not a member"
+    );
+
+    // Idempotent: re-running yields the same class and writes no new edges.
+    let edges_before = edge_type_count(&store, SAME_ECLASS);
+    let second =
+        epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
+    assert_eq!(second.classes[0].class_id, first.classes[0].class_id);
+    assert_eq!(edge_type_count(&store, SAME_ECLASS), edges_before);
+}
+
+#[test]
+fn dedup_claim_and_standing_default_keeps_in_and_out_apart() {
+    // CUT 9 congruence predicate: the default (ClaimAndStanding) treats standing
+    // as part of the state, so an attacked (`out`) claim is not merged with an
+    // unattacked (`in`) copy of the same proposition.
+    let mut store = InMemoryGraphStore::new();
+    store.upsert_node(claim("win", "rollout is healthy")).unwrap();
+    store.upsert_node(claim("lose", "rollout is healthy")).unwrap();
+    store.upsert_node(claim("atk", "rollout is broken")).unwrap();
+    store
+        .upsert_edge(EdgeRecord::new("a", "atk", "CONTRADICTS", "lose", json!({})))
+        .unwrap();
+    run_structural(&mut store, &["win", "lose", "atk"], vec![]);
+
+    // Sanity: lose is grounded out, win is in.
+    assert_eq!(
+        read_epistemic_shadow(&store, "lose").unwrap().grounded_extension_status,
+        GroundedExtensionStatus::Out
+    );
+    assert_eq!(
+        read_epistemic_shadow(&store, "win").unwrap().grounded_extension_status,
+        GroundedExtensionStatus::In
+    );
+
+    let default_run =
+        epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
+    assert!(
+        !default_run.classes.iter().any(|c| {
+            c.member_content_ids.contains(&"win".to_string())
+                && c.member_content_ids.contains(&"lose".to_string())
+        }),
+        "ClaimAndStanding must not merge an `in` claim with an `out` claim"
+    );
+
+    // ClaimOnly ignores standing and merges them.
+    let mut store2 = InMemoryGraphStore::new();
+    store2.upsert_node(claim("win", "rollout is healthy")).unwrap();
+    store2.upsert_node(claim("lose", "rollout is healthy")).unwrap();
+    store2.upsert_node(claim("atk", "rollout is broken")).unwrap();
+    store2
+        .upsert_edge(EdgeRecord::new("a", "atk", "CONTRADICTS", "lose", json!({})))
+        .unwrap();
+    run_structural(&mut store2, &["win", "lose", "atk"], vec![]);
+    let claim_only = epistemic_egraph_dedup(
+        &mut store2,
+        &[],
+        EpistemicDedupConfig {
+            congruence: EpistemicCongruence::ClaimOnly,
+            ..EpistemicDedupConfig::default()
+        },
+    )
+    .expect("dedup");
+    assert!(
+        claim_only.classes.iter().any(|c| {
+            c.member_content_ids.contains(&"win".to_string())
+                && c.member_content_ids.contains(&"lose".to_string())
+        }),
+        "ClaimOnly merges identical claims across standing"
+    );
+}
+
+/// Plant a content node plus its EpistemicShadow directly (bypassing the
+/// O(n^2) structural pass) so scale tests stay fast.
+fn plant_shadow(store: &mut InMemoryGraphStore, content_id: &str, text: &str, status: &str) {
+    store.upsert_node(claim(content_id, text)).unwrap();
+    let shadow_id = epistemic_shadow_node_id(content_id, DEFAULT_EPISTEMIC_ENGINE_VERSION);
+    store
+        .upsert_node(NodeRecord::new(
+            &shadow_id,
+            [EPISTEMIC_SHADOW_LABEL],
+            json!({ "content_node_id": content_id, "grounded_extension_status": status }),
+        ))
+        .unwrap();
+}
+
+#[test]
+fn dedup_congruence_runs_at_scale_beyond_default_node_limit() {
+    // Regression for the egg node_limit cliff: a batch whose seed e-graph
+    // exceeds egg's default 10_000-node limit must STILL apply the
+    // double-negation rule and collapse every planted pair. On the unfixed code
+    // (Runner::default()) the rule fires on zero terms and this asserts to ~0
+    // collapses; with explicit limits it saturates and collapses all pairs.
+    let mut store = InMemoryGraphStore::new();
+    let pairs = 4_000usize; // ~5 e-graph nodes/pair => ~20k nodes, well past 10k.
+    for i in 0..pairs {
+        let prop = format!("proposition number {i} holds");
+        plant_shadow(&mut store, &format!("p{i}"), &prop, "in");
+        plant_shadow(&mut store, &format!("d{i}"), &format!("not not {prop}"), "in");
+    }
+
+    let report =
+        epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
+
+    assert_eq!(report.shadows_examined, pairs * 2);
+    assert_eq!(
+        report.classes.len(),
+        pairs,
+        "each plain/double-negation pair must collapse despite the large batch"
+    );
+    assert_eq!(report.members_collapsed, pairs);
+    assert_eq!(report.same_eclass_edges_written, pairs);
 }

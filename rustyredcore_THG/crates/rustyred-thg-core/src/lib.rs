@@ -39,17 +39,19 @@ pub use crdt::{
     VersionVector,
 };
 pub use epistemic::{
-    compile_user_subgraph, epistemic_shadow_edge_id, epistemic_shadow_node_id,
-    epistemic_shadow_ppr, has_epistemic_shadow_edge_id, read_epistemic_shadow,
-    run_epistemic_cron_pass, structural_epistemic_pass, EpistemicAnnotation, EpistemicAnnotations,
-    EpistemicCandidatePair, EpistemicChokepoint, EpistemicCronInput, EpistemicCronReport,
-    EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicFieldProvenance,
-    EpistemicReadout, EpistemicRelationInput, EpistemicRelationKind, EpistemicRelationReadout,
-    EpistemicShadowReadout, EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer,
+    compile_user_subgraph, epistemic_egraph_dedup, epistemic_shadow_edge_id,
+    epistemic_shadow_node_id, epistemic_shadow_ppr, has_epistemic_shadow_edge_id,
+    read_epistemic_shadow, read_same_eclass, run_epistemic_cron_pass, same_eclass_edge_id,
+    structural_epistemic_pass, EpistemicAnnotation, EpistemicAnnotations, EpistemicCandidatePair,
+    EpistemicChokepoint, EpistemicCongruence, EpistemicCronInput, EpistemicCronReport,
+    EpistemicDedupConfig, EpistemicDedupReport, EpistemicEnricher, EpistemicEnrichmentError,
+    EpistemicEnrichmentMode, EpistemicEquivalenceClass, EpistemicFieldProvenance, EpistemicReadout,
+    EpistemicRelationInput, EpistemicRelationKind, EpistemicRelationReadout, EpistemicShadowReadout,
+    EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer, SameEClassRef,
     SourceReliability, StructuralEpistemicConfig, StructuralEpistemicInput, UserSubgraph,
-    DEFAULT_EPISTEMIC_ENGINE_VERSION, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
-    HAS_EPISTEMIC_SHADOW, LEARNED_EPISTEMIC_ENGINE, SAME_ECLASS, STRUCTURAL_EPISTEMIC_ENGINE,
-    UNDERCUTS,
+    DEFAULT_EPISTEMIC_ENGINE_VERSION, EGRAPH_EPISTEMIC_ENGINE, EPISTEMIC_SHADOW_LABEL,
+    EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, LEARNED_EPISTEMIC_ENGINE, SAME_ECLASS,
+    STRUCTURAL_EPISTEMIC_ENGINE, UNDERCUTS,
 };
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};

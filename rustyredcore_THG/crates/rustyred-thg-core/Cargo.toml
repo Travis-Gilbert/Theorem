@@ -20,6 +20,7 @@ tantivy = ["dep:tantivy"]
 s2 = ["dep:s2"]
 
 [dependencies]
+egg = "0.10"
 fs2 = "0.4"
 h3o = "0.7"
 imbl = { version = "7.0.0", features = ["serde"] }
