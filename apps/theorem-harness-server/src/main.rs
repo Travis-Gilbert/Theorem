@@ -43,7 +43,10 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use theorem_dispatch::{priority_from_harness, DispatchError, DispatchQueue, Job as DispatchJob};
 use theorem_harness_core::{JobSubmission, Priority, TargetHead};
-use theorem_harness_runtime::{job_submit, CoordinationError, HarnessRuntimeError};
+use theorem_harness_runtime::{
+    job_submit, run_agent_room_cycle, AgentRoomRunnerConfig, CoordinationError,
+    HarnessRuntimeError, RealHeadInvoker, DEFAULT_BINDING_ID,
+};
 use theorem_harness_server::push::write_room_message;
 use theorem_harness_server::{
     connectors_json, github_router, intents_json, map_json, maps_json, mentions_json,
@@ -167,6 +170,7 @@ async fn main() {
     // so the always-on cost of the whole push feature is one subscription.
     let bus = RoomBus::with_command_spawn(DEFAULT_BUS_CAPACITY);
     spawn_wake_listener(bus.clone(), state.clone());
+    maybe_spawn_theorem_agent_runner(state.clone());
     let push = push_router(PushState {
         store: state.clone(),
         bus: bus.clone(),
@@ -218,6 +222,65 @@ async fn dispatch_queue_from_env() -> Option<DispatchQueue> {
             .await
             .expect("connect Postgres dispatch queue"),
     )
+}
+
+fn maybe_spawn_theorem_agent_runner(state: SharedStore) {
+    if !env_truthy("THEOREM_AGENT_ROOM_RUNNER") {
+        tracing::info!("Theorem agent room runner disabled");
+        return;
+    }
+    let tenant_slug = std::env::var("THEOREM_AGENT_TENANT_SLUG")
+        .or_else(|_| std::env::var("THEOREM_TENANT_ID"))
+        .unwrap_or_else(|_| "Travis-Gilbert".to_string());
+    let room_id =
+        std::env::var("THEOREM_AGENT_ROOM_ID").unwrap_or_else(|_| DEFAULT_JOB_ROOM_ID.to_string());
+    let binding_id =
+        std::env::var("THEOREM_AGENT_BINDING_ID").unwrap_or_else(|_| DEFAULT_BINDING_ID.to_string());
+    let interval_ms = std::env::var("THEOREM_AGENT_RUNNER_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(15_000);
+
+    tracing::info!(%tenant_slug, %room_id, %binding_id, interval_ms, "starting Theorem agent room runner");
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+        loop {
+            interval.tick().await;
+            let state = state.clone();
+            let tenant_slug = tenant_slug.clone();
+            let room_id = room_id.clone();
+            let binding_id = binding_id.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let invoker = RealHeadInvoker::from_env().map_err(|error| error.to_string())?;
+                let mut store = state.lock().map_err(|_| "store lock".to_string())?;
+                let mut config = AgentRoomRunnerConfig::new(tenant_slug, room_id, binding_id);
+                config.repo = "Theorem".to_string();
+                config.branch = "main".to_string();
+                config.task = "theorem agent room runner".to_string();
+                run_agent_room_cycle(&mut *store, config, &invoker).map_err(|error| error.to_string())
+            })
+            .await;
+            match outcome {
+                Ok(Ok(cycle)) if !cycle.turns.is_empty() => {
+                    tracing::info!(turns = cycle.turns.len(), "Theorem agent runner processed room turns");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Theorem agent room runner cycle failed");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Theorem agent room runner task failed");
+                }
+            }
+        }
+    });
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn jobs_router(state: JobHttpState) -> Router {

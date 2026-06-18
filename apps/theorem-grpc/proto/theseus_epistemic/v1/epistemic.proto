@@ -1,0 +1,117 @@
+// EpistemicRAG enrich contract: Theorem (client) -> Theseus (server).
+//
+// SPEC-EPISTEMICRAG deliverable 4. Theorem sends the user's own content
+// subgraph (or the dirty delta); Theseus runs its engines (Pairformer/EdgeMPNN
+// completion, the TMS, the argumentation-framework grounded-extension solver,
+// Beta-Bernoulli source reliability) ON the user's graph and returns the
+// learned-epistemic annotations plus the support/attack relations. Theseus's
+// trained weights are NOT transferred; the engines run as algorithms on the
+// user's own graph (self-supervised), carrying no domain transfer.
+//
+// Field shapes mirror the Rust types in rustyred_thg_core::epistemic
+// (UserSubgraph, EpistemicAnnotations, EpistemicAnnotation, PredictedEdgePointer,
+// SourceReliability, EpistemicRelationInput) so the bridge round-trips without a
+// translation layer. Properties travel as JSON strings to keep the schema
+// version-neutral against the property-graph node/edge model.
+
+syntax = "proto3";
+
+package theseus_epistemic.v1;
+
+// The enrichment service Theseus exposes and Theorem dials. Graceful
+// degradation is the client's responsibility: on timeout or a dropped
+// connection the Theorem cron logs and no-ops; it never partial-writes learned
+// fields and never deletes existing shadow nodes.
+service EpistemicEnrichmentService {
+  rpc Enrich(EnrichRequest) returns (EnrichResponse);
+}
+
+enum EnrichmentMode {
+  ENRICHMENT_MODE_UNSPECIFIED = 0;
+  // Only the dirty k-hop delta is pushed (the leaning).
+  ENRICHMENT_MODE_DELTA = 1;
+  // The full user subgraph is pushed (the nightly drift-correcting pass).
+  ENRICHMENT_MODE_FULL = 2;
+}
+
+message NodeRecord {
+  string id = 1;
+  repeated string labels = 2;
+  // Serialized property map (serde_json of NodeRecord.properties).
+  string properties_json = 3;
+}
+
+message EdgeRecord {
+  string id = 1;
+  string from_id = 2;
+  string to_id = 3;
+  string type = 4;
+  string properties_json = 5;
+  optional double confidence = 6;
+  // Optional content-edge epistemic type (supports|contradicts|tension|...).
+  optional string epistemic_type = 7;
+}
+
+// The content nodes and edges, or the dirty delta, with the feature schema the
+// engines expect.
+message UserSubgraph {
+  repeated NodeRecord nodes = 1;
+  repeated EdgeRecord edges = 2;
+}
+
+message EnrichRequest {
+  string tenant_id = 1;
+  UserSubgraph subgraph = 2;
+  EnrichmentMode mode = 3;
+  // The engine_version that keys the idempotent writeback; echoed in the
+  // response so the cron writes are (content_node_id, engine_version)-keyed.
+  string engine_version = 4;
+}
+
+// A predicted edge surfaced by completion. Quarantined by default: returned at
+// recall as a labeled pointer, never auto-hydrated and never a content edge.
+message PredictedEdge {
+  string target_content_id = 1;
+  string relation = 2;
+  double confidence = 3;
+  bool quarantine = 4;
+}
+
+// Beta-Bernoulli source-reliability posterior.
+message SourceReliability {
+  double alpha = 1;
+  double beta = 2;
+  double mean = 3;
+}
+
+// Per content node: the learned-epistemic fields plus the grounded-extension
+// status from the AF solver.
+message EpistemicAnnotation {
+  string content_node_id = 1;
+  repeated PredictedEdge predicted_edges = 2;
+  optional double completion_confidence = 3;
+  repeated float structural_role_vector = 4;
+  optional SourceReliability source_reliability = 5;
+  optional string community_id = 6;
+  // in | out | undecided (from the grounded-extension solver).
+  optional string grounded_extension_status = 7;
+}
+
+// A support or attack relation from the TMS output, written as a shadow-to-shadow
+// SUPPORTS / UNDERCUTS edge.
+message EpistemicRelation {
+  string from_content_id = 1;
+  string to_content_id = 2;
+  // supports | undercuts
+  string kind = 3;
+  double confidence = 4;
+  string evidence = 5;
+}
+
+message EnrichResponse {
+  repeated EpistemicAnnotation annotations = 1;
+  repeated EpistemicRelation support_relations = 2;
+  repeated EpistemicRelation attack_relations = 3;
+  string engine = 4;
+  string engine_version = 5;
+}

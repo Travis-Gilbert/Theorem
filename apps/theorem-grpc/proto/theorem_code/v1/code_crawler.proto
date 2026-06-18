@@ -76,6 +76,9 @@ message IngestCodebaseResponse {
   // unchanged from the prior generation (incremental reindex).
   uint64 files_parsed = 14;
   uint64 files_carried = 15;
+  // JSON-encoded EpistemicRAG instant structural readout. Empty on submission
+  // acknowledgements; populated on completed ingest/reindex responses.
+  string epistemic_readout_json = 16;
 }
 
 message WatchIngestRequest {

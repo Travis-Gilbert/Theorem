@@ -324,6 +324,7 @@ fn ingest_to_pb(output: IngestCodebaseOutput, job_id: &str) -> pb::IngestCodebas
         job_id: job_id.to_string(),
         files_parsed: output.files_parsed,
         files_carried: output.files_carried,
+        epistemic_readout_json: output.epistemic_readout.to_string(),
     }
 }
 
