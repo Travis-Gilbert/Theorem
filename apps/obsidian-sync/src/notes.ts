@@ -94,11 +94,6 @@ export function notePathFor(
   return segments.filter(Boolean).join("/");
 }
 
-export function notePath(folder: string, basename: string): string {
-  const prefix = folder ? `${folder}/` : "";
-  return `${prefix}${basename}.md`;
-}
-
 export function slugify(value: string): string {
   return value
     .toLowerCase()

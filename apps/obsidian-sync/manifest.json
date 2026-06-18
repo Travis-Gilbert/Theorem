@@ -1,7 +1,7 @@
 {
   "id": "theorem-harness-sync",
   "name": "Theorem Harness Sync",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "minAppVersion": "1.4.0",
   "description": "Mirror your Theorem harness memory graph into this vault as markdown notes, and write note edits and [[wikilinks]] back into the graph. Note-linking is graph construction.",
   "author": "Theorem",
