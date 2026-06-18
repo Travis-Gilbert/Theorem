@@ -20,6 +20,12 @@ pub const SUPPORTS: &str = "supports";
 pub const MEMORY_IN_PROJECT: &str = "MEMORY_IN_PROJECT";
 pub const MEMORY_PLUGIN_SOURCE: &str = "rustyred_thg_memory";
 
+pub mod similarity;
+pub use similarity::{
+    compute_memory_similarity_edges, HashEmbedder, MemoryEmbedder, SimilarityOptions,
+    SimilarityStats, MEMORY_SIMILAR,
+};
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MemoryRecallInput {
     #[serde(default)]
