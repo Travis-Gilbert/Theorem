@@ -18,12 +18,14 @@ use rustyred_thg_core::{
     HookDispatcherConfig, HookRegistration, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
     PluginCapabilityKind, PluginExecutionOutput, PluginOperationContext,
     PluginOperationRegistration, PluginRegistry, RedCoreDurability, RedCoreGraphStore,
-    RedCoreOptions, RustyRedPlugin,
+    RedCoreOptions, RustyRedPlugin, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
+    HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
 use serde_json::{json, Value};
 use syn::visit::Visit;
 
 mod code_embed_hook;
+mod code_epistemic_hook;
 mod code_hooks;
 mod context_pack;
 mod ensure;
@@ -32,6 +34,10 @@ mod map_projection;
 mod repo_fetch;
 
 pub use code_embed_hook::{incremental_embed_hook, EMBEDDING_DIM, EMBEDDING_PROPERTY};
+pub use code_epistemic_hook::{
+    code_epistemic_hook, run_code_epistemic_pass_for_repo, CodeDriftFinding, CodeEpistemicReadout,
+    CODE_EPISTEMIC_ENGINE, DEFAULT_CODE_EPISTEMIC_TOP_K,
+};
 pub use code_hooks::{code_kg_hooks, incremental_centrality_hook, CENTRALITY_PROPERTY};
 pub use context_pack::{
     code_context_pack_in_store, context_pack, context_pack_fetch, AdmittedSymbol,
@@ -183,12 +189,17 @@ impl CodeParsingPlugin {
                 CODE_FILE_LABEL,
                 CODE_SYMBOL_LABEL,
                 CODE_RECEIPT_LABEL,
+                EPISTEMIC_SHADOW_LABEL,
             ],
             edge_types: &[
                 CONTAINS_FILE,
                 DECLARES_SYMBOL,
                 CALLS_SYMBOL,
                 DEPENDS_ON_SYMBOL,
+                HAS_EPISTEMIC_SHADOW,
+                UNDERCUTS,
+                EPISTEMIC_SUPPORTS,
+                SAME_ECLASS,
             ],
             capabilities: self.capabilities(),
             operations,
@@ -1517,6 +1528,7 @@ pub struct IngestCodebaseOutput {
     pub receipt_json: String,
     pub status: String,
     pub message: String,
+    pub epistemic_readout: Value,
     pub stage_timings: IngestStageTimings,
     pub language_stats: BTreeMap<String, LanguageIngestStats>,
     pub skip_stats: IngestSkipStats,
@@ -1538,6 +1550,7 @@ impl IngestCodebaseOutput {
             "receipt_hash": self.receipt_hash,
             "status": self.status,
             "message": self.message,
+            "epistemic_readout": self.epistemic_readout,
             "stage_timings": self.stage_timings.to_json(),
             "language_stats": language_stats_json(&self.language_stats),
             "skip_stats": self.skip_stats.to_json(),
@@ -1595,6 +1608,10 @@ pub(crate) fn ingest_output_from_json(value: &Value) -> Option<IngestCodebaseOut
         receipt_json: String::new(),
         status: str_at("status"),
         message: str_at("message"),
+        epistemic_readout: value
+            .get("epistemic_readout")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
         stage_timings: IngestStageTimings {
             clone_ms: timing("clone_ms"),
             resolve_ms: timing("resolve_ms"),
@@ -2845,6 +2862,15 @@ pub(crate) fn commit_prepared_ingest(
     let transaction = store
         .commit_batch(GraphMutationBatch::new(prepared.mutations))
         .map_err(CodeIndexError::from_store)?;
+
+    let epistemic = code_epistemic_hook::run_code_epistemic_pass_for_repo(
+        store,
+        &prepared.config.tenant_id,
+        &prepared.config.repo_id,
+        Some(prepared.config.generation),
+    )?;
+    let epistemic_readout = epistemic.to_json();
+
     prepared.stage_timings.write_ms = elapsed_ms(write_started);
     prepared.stage_timings.total_ms = elapsed_ms(prepared.started);
 
@@ -2879,6 +2905,7 @@ pub(crate) fn commit_prepared_ingest(
         "files_skipped": prepared.files_skipped,
         "graph_version": transaction.graph_version,
         "actor": prepared.config.actor.clone(),
+        "epistemic_readout": epistemic_readout,
         "stage_timings": prepared.stage_timings.to_json(),
         "language_stats": language_stats_json(&prepared.language_stats),
         "skip_stats": prepared.skip_stats.to_json(),
@@ -2907,6 +2934,7 @@ pub(crate) fn commit_prepared_ingest(
         receipt_json: receipt.receipt_json,
         status,
         message,
+        epistemic_readout,
         stage_timings: prepared.stage_timings,
         language_stats: prepared.language_stats,
         skip_stats: prepared.skip_stats,
@@ -3944,9 +3972,15 @@ fn push_symbol_edges(
 
 fn symbol_from_line(line: &str, language: &str) -> Option<(String, String)> {
     if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+        if language == "markdown" {
+            return markdown_claim_from_line(line);
+        }
         return None;
     }
     let normalized = strip_leading_modifiers(line);
+    if language == "markdown" {
+        return markdown_claim_from_line(normalized);
+    }
     if language == "go" {
         return go_symbol_from_line(normalized);
     }
@@ -3991,6 +4025,32 @@ fn symbol_from_line(line: &str, language: &str) -> Option<(String, String)> {
             .and_then(symbol_name)
             .map(|name| ((*kind).to_string(), name))
     })
+}
+
+fn markdown_claim_from_line(line: &str) -> Option<(String, String)> {
+    let cleaned = line
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches('-')
+        .trim_start_matches('*')
+        .trim();
+    if cleaned.len() < 8 {
+        return None;
+    }
+    let lower = cleaned.to_ascii_lowercase();
+    let claim_like = lower.starts_with("claim:")
+        || lower.contains(" references ")
+        || lower.contains(" reference ")
+        || lower.contains(" calls ")
+        || lower.contains(" uses ")
+        || lower.contains(" depends on ")
+        || lower.contains(" requires ")
+        || lower.contains(" is not ");
+    if !claim_like {
+        return None;
+    }
+    let hash = stable_hash(cleaned);
+    Some(("claim".to_string(), format!("claim_{}", &hash[..12])))
 }
 
 fn go_symbol_from_line(line: &str) -> Option<(String, String)> {
@@ -5073,6 +5133,70 @@ mod tests {
         .unwrap();
         let store_dir = unique_dir("store");
         (repo_dir, store_dir)
+    }
+
+    fn write_epistemic_fixture_repo() -> PathBuf {
+        let repo_dir = unique_dir("epistemic-repo");
+        fs::create_dir_all(repo_dir.join("src")).unwrap();
+        fs::write(
+            repo_dir.join("README.md"),
+            "Claim: cache is enabled\nClaim: cache is not enabled\nClaim: docs references MissingCacheAdapter\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn cache_entry() -> bool {\n    true\n}\n",
+        )
+        .unwrap();
+        repo_dir
+    }
+
+    #[test]
+    fn ingest_returns_instant_epistemic_readout_with_drift_and_bounded_pairs() {
+        let repo_dir = write_epistemic_fixture_repo();
+        let mut store = RedCoreGraphStore::memory();
+        let output = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:epistemic-fixture".to_string(),
+                actor: "test".to_string(),
+                ..IngestCodebaseInput::default()
+            },
+        )
+        .unwrap();
+
+        let readout = &output.epistemic_readout;
+        assert_eq!(readout["repo_id"], "repo:epistemic-fixture");
+        assert!(
+            readout["readout"]["contradictions"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()),
+            "planted README contradiction appears as an Undercuts relation: {readout}"
+        );
+        assert!(
+            readout["drift"].as_array().is_some_and(|items| items
+                .iter()
+                .any(|item| { item["missing_target"].as_str() == Some("MissingCacheAdapter") })),
+            "missing code entity appears as drift: {readout}"
+        );
+        let shadows = readout["readout"]["shadows"].as_array().unwrap();
+        assert!(shadows.iter().any(|shadow| {
+            shadow["source_kind"].as_str() == Some("structural")
+                && shadow["support_in_degree"].as_u64().is_some()
+                && shadow["attack_in_degree"].as_u64().is_some()
+                && shadow["field_provenance"]["grounded_extension_status"]["source_kind"].as_str()
+                    == Some("structural")
+        }));
+        let checked = readout["checked_pair_count"].as_u64().unwrap();
+        let bound = (shadows.len() * DEFAULT_CODE_EPISTEMIC_TOP_K) as u64;
+        assert!(
+            checked <= bound,
+            "candidate checks stay bounded by k times claim count: {checked} <= {bound}"
+        );
+
+        fs::remove_dir_all(&repo_dir).ok();
     }
 
     fn write_go_fixture_repo() -> (PathBuf, PathBuf) {

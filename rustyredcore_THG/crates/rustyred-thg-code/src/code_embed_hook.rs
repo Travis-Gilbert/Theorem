@@ -90,7 +90,7 @@ fn embed_handler(
 
 /// Designate `(CodeSymbol, embedding)` as a vector field once. Re-designating is
 /// avoided because it re-indexes every matching node.
-fn ensure_embedding_designation(store: &mut RedCoreGraphStore) -> Result<(), HookError> {
+pub(crate) fn ensure_embedding_designation(store: &mut RedCoreGraphStore) -> Result<(), HookError> {
     let already = store.vector_designations().into_iter().any(|designation| {
         designation.label == CODE_SYMBOL_LABEL && designation.property == EMBEDDING_PROPERTY
     });
@@ -103,7 +103,7 @@ fn ensure_embedding_designation(store: &mut RedCoreGraphStore) -> Result<(), Hoo
 }
 
 /// Assemble the embeddable text from the symbol's available fields.
-fn symbol_embedding_text(properties: &Value) -> String {
+pub(crate) fn symbol_embedding_text(properties: &Value) -> String {
     let mut parts = Vec::new();
     for key in ["name", "signature", "snippet", "doc"] {
         if let Some(value) = property_string(properties, key) {
@@ -117,7 +117,7 @@ fn symbol_embedding_text(properties: &Value) -> String {
 
 /// Deterministic offline embedding: hashed bag-of-tokens with signed buckets,
 /// L2-normalized. Stable across runs (idempotent) and dependency-free.
-fn embed_text(text: &str, dim: usize) -> Vec<f32> {
+pub(crate) fn embed_text(text: &str, dim: usize) -> Vec<f32> {
     let mut vector = vec![0f32; dim];
     for token in text
         .split(|c: char| !c.is_alphanumeric())
@@ -146,7 +146,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn extract_float_vec(properties: &Value, key: &str) -> Option<Vec<f32>> {
+pub(crate) fn extract_float_vec(properties: &Value, key: &str) -> Option<Vec<f32>> {
     properties
         .get(key)?
         .as_array()?
@@ -159,7 +159,7 @@ fn vectors_close(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= EMBED_EPSILON)
 }
 
-fn set_embedding(node: &mut NodeRecord, vector: &[f32]) {
+pub(crate) fn set_embedding(node: &mut NodeRecord, vector: &[f32]) {
     let array: Vec<Value> = vector.iter().map(|v| json!(*v)).collect();
     match node.properties.as_object_mut() {
         Some(map) => {

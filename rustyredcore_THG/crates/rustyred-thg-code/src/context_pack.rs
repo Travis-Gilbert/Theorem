@@ -82,6 +82,7 @@ pub struct CodeContextPackOutput {
     pub total_candidates: u64,
     pub receipt_hash: String,
     pub receipt_json: String,
+    pub epistemic_readout: Option<Value>,
 }
 
 impl CodeContextPackOutput {
@@ -95,6 +96,7 @@ impl CodeContextPackOutput {
             "tokens_admitted": self.admission.tokens_admitted,
             "tokens_deferred": self.admission.tokens_deferred,
             "total_candidates": self.total_candidates,
+            "epistemic_readout": self.epistemic_readout,
             "receipt": self.receipt,
             "receipt_hash": self.receipt_hash,
         })
@@ -127,6 +129,7 @@ pub struct ContextPackOutput {
     /// reindex vs full ingest). `None` when the pack ran over an
     /// already-resident graph with no entry step.
     pub ingest_status: Option<RepoKgStatus>,
+    pub epistemic_readout: Option<Value>,
     pub receipt: MembraneReceipt,
     pub receipt_hash: String,
 }
@@ -145,6 +148,7 @@ impl ContextPackOutput {
             "total_candidates": self.total_candidates,
             "reranker_version": self.reranker_version,
             "ingest_status": self.ingest_status.as_ref().map(RepoKgStatus::to_json),
+            "epistemic_readout": self.epistemic_readout,
             "receipt": self.receipt,
             "receipt_hash": self.receipt_hash,
         })
@@ -245,6 +249,7 @@ pub fn context_pack(
         total_candidates: pack.total_candidates as usize,
         reranker_version: pack.receipt.reranker_version.clone(),
         ingest_status,
+        epistemic_readout: pack.epistemic_readout,
         receipt: pack.receipt,
         receipt_hash: pack.receipt_hash,
     })
@@ -348,6 +353,11 @@ fn build_code_context_pack(
     };
     let membrane_receipt_hash =
         emit_receipt(store, &receipt).map_err(CodeIndexError::from_store)?;
+    let epistemic_readout = if repo_id.trim().is_empty() {
+        None
+    } else {
+        Some(crate::run_code_epistemic_pass_for_repo(store, &tenant_id, &repo_id, None)?.to_json())
+    };
     let mut receipt_payload = json!({
         "tenant_id": tenant_id,
         "operation": "code_context_pack",
@@ -358,6 +368,7 @@ fn build_code_context_pack(
         "tokens_admitted": admission.tokens_admitted,
         "tokens_deferred": admission.tokens_deferred,
         "membrane_receipt_hash": membrane_receipt_hash,
+        "epistemic_readout": epistemic_readout,
     });
     if let (Some(status), Some(map)) = (ingest_status, receipt_payload.as_object_mut()) {
         map.insert("ingest_status".to_string(), status.to_json());
@@ -373,6 +384,7 @@ fn build_code_context_pack(
         total_candidates,
         receipt_hash: stored_receipt.receipt_hash,
         receipt_json: stored_receipt.receipt_json,
+        epistemic_readout,
     })
 }
 
