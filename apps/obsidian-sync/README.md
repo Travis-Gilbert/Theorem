@@ -49,20 +49,53 @@ partition.
 
 ## Install (manual)
 
-This plugin is not in the community store. Build it and drop it into your vault:
+This plugin is not in the community store, and it does not need to be: the
+built `main.js` is committed beside `manifest.json`, so a checkout is already a
+loadable plugin. (The whole reason a GitHub copy used to "silently not run" was
+that `main.js` was gitignored, so there was nothing to load.)
+
+Copy three files into `<your-vault>/.obsidian/plugins/theorem-harness-sync/`:
+
+- `manifest.json`
+- `main.js`
+- (no `styles.css`; this plugin has none)
+
+Then enable it in Settings -> Community plugins (reload the list first). On
+mobile, sync that plugin folder into the vault.
+
+If you changed the source, rebuild before copying:
 
 ```bash
 cd apps/obsidian-sync
-npm install
-npm run build        # produces main.js
+npm install          # first time only
+npm run build        # produces main.js (production, no sourcemap)
 ```
 
-Then copy `manifest.json` and `main.js` into
-`<your-vault>/.obsidian/plugins/theorem-harness-sync/` and enable it in
-Settings -> Community plugins. (On mobile, sync that plugin folder into the vault.)
-
 For iterative development, `npm run dev` rebuilds on change; symlink the plugin
-folder into a test vault.
+folder into a test vault. Do not commit a dev build: `npm run dev` writes an
+inline sourcemap into `main.js`; only the `npm run build` output should be
+committed.
+
+## Install via BRAT (auto-updating)
+
+[BRAT](https://github.com/TfTHacker/obsidian42-brat) installs a plugin straight
+from a GitHub repo and keeps it updated, with no community-store review. BRAT
+reads `manifest.json` at the repo's default-branch root and pulls the release
+assets whose tag matches that version, so it needs the plugin to live at a
+repo root, not in a monorepo subdirectory.
+
+To use BRAT, publish this folder as its own public repo (it holds no secrets;
+the token is entered by the user at runtime):
+
+1. Create a public repo, e.g. `Travis-Gilbert/theorem-harness-sync`.
+2. Copy this folder's `manifest.json`, `main.js`, `versions.json`, and source
+   to its root.
+3. Cut a GitHub release whose tag equals the manifest version (`0.2.0`) with
+   `manifest.json` and `main.js` attached as assets.
+4. In Obsidian: BRAT -> "Add beta plugin" -> the repo URL.
+
+Until then, the committed `main.js` above is the in-repo install path, and the
+optional Obsidian-Git mirror below keeps a checkout in sync on each device.
 
 ## Configure
 
@@ -78,6 +111,17 @@ Settings -> Theorem Harness Sync:
 - **Sync folder** - where mirrored notes are written.
 - **Include superseded / archived** - off keeps the vault to current notes.
 - **Auto-sync interval** - minutes; 0 makes sync manual only.
+- **Exclude kinds** - comma-separated kinds skipped on pull. Defaults to
+  `orchestrate` because a tenant's feed is often dominated by agent-coordination
+  exhaust (for one real tenant, ~185 of ~236 docs), which would otherwise bury
+  the real memory (solution / feedback / postmortem / encode / decision / note).
+  The read endpoint ignores a server-side kind filter, so this filtering happens
+  client-side, before any note is written. Clear it to mirror every kind.
+- **Only these kinds (allowlist)** - comma-separated; when set, only these kinds
+  are pulled. Empty means "all kinds except the excluded ones". Exclude wins over
+  the allowlist. Filtering changes the next pull only; it does not delete notes
+  already synced for a now-excluded kind (delete the sync folder and Full resync
+  for a clean slate).
 - **Enable write-back** - off by default. Turn it on to push edits.
 - **Allow commons write-back** - off by default. While off, write-back refuses to push
   into the commons (`default`, or an empty tenant) so hand-written notes never land in

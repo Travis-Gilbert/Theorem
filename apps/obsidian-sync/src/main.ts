@@ -176,9 +176,10 @@ export default class TheoremHarnessSyncPlugin extends Plugin {
     const notice = new Notice("Theorem: syncing...", 0);
     try {
       const summary = await this.syncer.pull();
+      const filtered = summary.filtered > 0 ? `, ${summary.filtered} filtered` : "";
       notice.setMessage(
         `Theorem: ${summary.created} new, ${summary.updated} updated, ` +
-          `${summary.conflicts} conflict(s) (${summary.pulled} pulled).`
+          `${summary.conflicts} conflict(s) (${summary.pulled} pulled${filtered}).`
       );
       window.setTimeout(() => notice.hide(), 4000);
     } catch (error) {

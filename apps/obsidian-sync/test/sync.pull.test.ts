@@ -104,6 +104,8 @@ const settings: HarnessSyncSettings = {
   allowCommonsWriteback: false,
   syncIntervalMinutes: 0,
   includeInactive: false,
+  includeKinds: [],
+  excludeKinds: [],
   conflictMode: "conflict-copy",
   defaultKind: "note",
 };

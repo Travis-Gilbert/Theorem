@@ -3,6 +3,7 @@ import type { HarnessClient } from "./harness";
 import type { HarnessSyncSettings } from "./settings";
 import type { HarnessDoc, SyncJournal } from "./types";
 import { localHash } from "./hash";
+import { filterDocsByKind } from "./kinds";
 import {
   LinkResolver,
   noteBasename,
@@ -13,7 +14,10 @@ import {
 import type { SyncGuard } from "./guard";
 
 export interface SyncSummary {
+  /** Docs that passed the kind filter and were processed this pull. */
   pulled: number;
+  /** Docs the server returned that the kind filter dropped before processing. */
+  filtered: number;
   created: number;
   updated: number;
   skipped: number;
@@ -38,14 +42,22 @@ export class Syncer {
 
   async pull(): Promise<SyncSummary> {
     const response = await this.client.listDocs(this.journal.watermark);
+    // Drop excluded kinds (e.g. orchestrate exhaust) before writing any notes.
+    // The filter is a pull policy: it decides which graph docs become notes and
+    // never touches write-back.
+    const kept = filterDocsByKind(response.docs, this.settings);
     const summary: SyncSummary = {
-      pulled: response.docs.length,
+      pulled: kept.length,
+      filtered: response.docs.length - kept.length,
       created: 0,
       updated: 0,
       skipped: 0,
       conflicts: 0,
     };
 
+    // Build the link-name index over the FULL response, not just the kept docs:
+    // a kept note may link to a filtered doc, and naming it by title (rather
+    // than a raw id) is still better even when that note is not mirrored.
     const byId = new Map(response.docs.map((doc) => [doc.doc_id, doc]));
     const resolveLink: LinkResolver = (target) => {
       const inBatch = byId.get(target);
@@ -63,7 +75,7 @@ export class Syncer {
 
     this.guard.beginRemote();
     try {
-      for (const doc of response.docs) {
+      for (const doc of kept) {
         const outcome = await this.applyDoc(doc, resolveLink);
         summary[outcome] += 1;
       }

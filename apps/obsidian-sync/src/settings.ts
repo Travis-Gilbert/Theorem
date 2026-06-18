@@ -1,5 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import { HarnessClient } from "./harness";
+import { formatKindList, parseKindList } from "./kinds";
 import type TheoremHarnessSyncPlugin from "./main";
 
 export type ConflictMode = "conflict-copy" | "graph-wins" | "local-wins";
@@ -42,6 +43,16 @@ export interface HarnessSyncSettings {
   syncIntervalMinutes: number;
   /** Pull superseded and archived documents too, not just active ones. */
   includeInactive: boolean;
+  /**
+   * Pull allowlist of kinds. Empty means "all kinds". When non-empty, only docs
+   * whose kind is listed are mirrored. Case-insensitive.
+   */
+  includeKinds: string[];
+  /**
+   * Pull denylist of kinds skipped on sync (e.g. `orchestrate` agent-coordination
+   * exhaust). A kind here is dropped even if it is also in `includeKinds`.
+   */
+  excludeKinds: string[];
   /** How to resolve a doc that changed on both sides since the last sync. */
   conflictMode: ConflictMode;
   /** Default kind for hand-written new notes with no `kind` in frontmatter. */
@@ -59,6 +70,8 @@ export const DEFAULT_SETTINGS: HarnessSyncSettings = {
   allowCommonsWriteback: false,
   syncIntervalMinutes: 15,
   includeInactive: false,
+  includeKinds: [],
+  excludeKinds: ["orchestrate"],
   conflictMode: "conflict-copy",
   defaultKind: "note",
 };
@@ -190,6 +203,51 @@ export class HarnessSyncSettingTab extends PluginSettingTab {
             this.plugin.restartTimer();
           })
       );
+
+    containerEl.createEl("h2", { text: "Pull filter" });
+
+    new Setting(containerEl)
+      .setName("Exclude kinds")
+      .setDesc(
+        "Comma-separated kinds to skip on pull. Defaults to `orchestrate` " +
+          "(agent-coordination exhaust) so it does not bury real memory notes. " +
+          "Clear it to mirror every kind."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("orchestrate")
+          .setValue(formatKindList(this.plugin.settings.excludeKinds))
+          .onChange(async (value) => {
+            this.plugin.settings.excludeKinds = parseKindList(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Only these kinds (allowlist)")
+      .setDesc(
+        "Comma-separated. If set, only these kinds are pulled and all others " +
+          "are skipped. Leave empty to pull every kind except the excluded ones. " +
+          "Exclude wins over the allowlist."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("(all kinds)")
+          .setValue(formatKindList(this.plugin.settings.includeKinds))
+          .onChange(async (value) => {
+            this.plugin.settings.includeKinds = parseKindList(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    const filterNote = containerEl.createEl("p", {
+      text:
+        "Filtering changes which docs are mirrored on the next pull; it does not " +
+        "delete notes already synced for an excluded kind. For a clean slate, " +
+        "delete the sync folder and run Full resync.",
+    });
+    filterNote.style.fontSize = "var(--font-ui-smaller)";
+    filterNote.style.color = "var(--text-muted)";
 
     containerEl.createEl("h2", { text: "Write-back (Phase 2)" });
 
