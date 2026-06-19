@@ -139,7 +139,10 @@ pub use spatial::{
 };
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};
 pub use store::{InMemoryThgStore, ThgStore};
-pub use stream::{StreamDelta, StreamEvent, StreamKey, StreamLog, StreamRegistry, StreamUrgency};
+pub use stream::{
+    StreamDelta, StreamError, StreamEvent, StreamKey, StreamLog, StreamRegistry, StreamStore,
+    StreamUrgency, DEFAULT_READ_LIMIT as STREAM_READ_LIMIT,
+};
 pub use symbolic::{
     derive_datalog_receipt, derive_datalog_receipt_from_json, evolution_archive,
     evolution_archive_from_json, probabilistic_expected_value,
