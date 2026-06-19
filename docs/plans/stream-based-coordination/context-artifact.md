@@ -1,6 +1,6 @@
-# Context Artifact — Stream-Based Coordination (substrate slice)
+# Context Artifact - Stream-Based Coordination (substrate slice)
 
-**Harness run:** `multihead:unix_ms:1781845659652` (tenant `travis-gilbert`, actor `claude-code`)
+**Harness run:** `multihead:unix_ms:1781845659652` (tenant `Travis-Gilbert`, actor `claude-code`)
 **Context Brief signature:** `a3443ba455b836b3e86831371e3acdb23eec64f1768be17dcff1b9f78b2c6f69`
 **Repo / branch:** `Theorem` @ `Travis-Gilbert/stream-based-coordination` (cut from `origin/main` `069c6c7`)
 **Worktree:** `Creative/Website/Theorem-jobintel-main-ship` (the `Creative/Website/Theorem` main worktree is untouched)
@@ -25,7 +25,7 @@ and awareness, not shared state.
   keeps `ThgState` clones copy-on-write.
 
 ### Confirmed against the post-commit tree
-- Target crate is `rustyred-thg-core` (the spec's `rustyred-thg-core` — confirmed
+- Target crate is `rustyred-thg-core` (the spec's `rustyred-thg-core`, confirmed
   on `main`, **not** the standalone `RustyRed-Graph-Database`, and not the older
   `jobintel-main-ship` checkout which is 45 commits behind `main`).
 - `ordered.rs` exists on `main` and is the structure the stream is analogous to.
@@ -41,49 +41,49 @@ and awareness, not shared state.
 |---|---|
 | `crates/rustyred-thg-core/src/stream.rs` | **New.** `StreamEvent`, `StreamUrgency` (`info`/`ask`/`block`), `StreamStore` (append-log + cursors + subscriptions + pending-ping queue), `resolve_stream_key`, full unit tests. |
 | `crates/rustyred-thg-core/src/state.rs` | `ThgState.streams: StreamStore` (`#[serde(default)]`). |
-| `crates/rustyred-thg-core/src/commands.rs` | 5 `ThgCommand` variants + `from_name`/`name` → `RUSTYRED_THG.STREAM.{PUBLISH,READ,SUBSCRIBE,UNSUBSCRIBE,MENTIONS}`. |
+| `crates/rustyred-thg-core/src/commands.rs` | 5 `ThgCommand` variants + `from_name`/`name` -> `RUSTYRED_THG.STREAM.{PUBLISH,READ,SUBSCRIBE,UNSUBSCRIBE,MENTIONS}`. |
 | `crates/rustyred-thg-core/src/executor.rs` | 5 handlers (writes via `state_mut()`), dispatch arms, command-level integration test. |
 | `crates/rustyred-thg-core/src/lib.rs` | `pub mod stream;` + re-exports. |
 
 ### Observable command surface (the tool contract, at the core level)
-- `RUSTYRED_THG.STREAM.PUBLISH` `(tenant, stream, actor, kind, payload, urgency=info, target_actor?)` → `{event_id, ordering_token, stream_key, urgency, pinged}`
-- `RUSTYRED_THG.STREAM.READ` `(actor, tenant, streams[]?, advance=true, limit?)` → `{events, new_cursors, count, advanced}`
-- `RUSTYRED_THG.STREAM.SUBSCRIBE` / `…UNSUBSCRIBE` `(actor, tenant, stream)` → `{subscriptions}`
-- `RUSTYRED_THG.STREAM.MENTIONS` `(actor, advance=true)` → `{mentions, count, drained}` — the drain seam for the warm-head Stop-hook / cold-head wake.
+- `RUSTYRED_THG.STREAM.PUBLISH` `(tenant, stream, actor, kind, payload, urgency=info, target_actor?)` -> `{event_id, ordering_token, stream_key, urgency, pinged}`
+- `RUSTYRED_THG.STREAM.READ` `(actor, tenant, streams[]?, advance=true, limit?)` -> `{events, new_cursors, count, advanced}`
+- `RUSTYRED_THG.STREAM.SUBSCRIBE` / `UNSUBSCRIBE` `(actor, tenant, stream)` -> `{subscriptions}`
+- `RUSTYRED_THG.STREAM.MENTIONS` `(actor, tenant, advance=true)` -> `{mentions, count, drained}` - the tenant-scoped drain seam for the warm-head Stop-hook / cold-head wake.
 
 ### Semantics decisions
 - **Ordering token:** global monotonic `StreamStore.seq`; every event id is unique
   and each per-stream subsequence is strictly increasing. A single `&mut`
-  executor serializes appends → total order, no merge step.
+  executor serializes appends into a total order, no merge step.
 - **Subscription = attend now:** a first-time subscriber's cursor is initialized
   to the stream head, so it receives future events, not the full backlog.
-  Re-subscribe resumes from the stored cursor. Backlog remains reachable by
-  reading a stream explicitly (`streams: [topic]`).
+  Re-subscribe resumes from the stored cursor. Historical replay needs a future
+  cursor-override API; this slice intentionally exposes delta reads only.
 - **Ping = publish with `ask`/`block` + `target_actor`:** lands on the stream AND
   enqueues a `(stream_key, ordering_token)` ref to the target's pending-ping
   queue, bypassing subscription attention. `MENTIONS` drains it.
 
-## Acceptance criteria → coverage
+## Acceptance criteria -> coverage
 
 All five are covered by tests in `stream.rs` (primitive) and replayed through the
 command surface in `executor.rs`:
 
-1. Offline-for-N-turns delta after cursor, in order, no miss/dup → `offline_head_pulls_exact_delta_after_cursor`.
-2. Ping appears in target's mention drain → `ping_lands_in_targets_mention_drain` + command test.
-3. Concurrent publishers get distinct tokens, single total order, no merge → `concurrent_publishers_get_distinct_tokens_in_total_order`.
-4. Publish+read share a stream under a tenant; empty tenant rejected → `tenant_scope_shares_stream_and_rejects_empty` + command test.
-5. Subscribe/unsubscribe changes read deltas; ping reaches an unsubscribed target → `attention_controls_reads_but_ping_bypasses_it`.
+1. Offline-for-N-turns delta after cursor, in order, no miss/dup -> `offline_head_pulls_exact_delta_after_cursor`.
+2. Ping appears in target's mention drain -> `ping_lands_in_targets_mention_drain` + command test.
+3. Concurrent publishers get distinct tokens, single total order, no merge -> `concurrent_publishers_get_distinct_tokens_in_total_order`.
+4. Publish+read share a stream under a tenant; empty tenant rejected -> `tenant_scope_shares_stream_and_rejects_empty` + command test.
+5. Subscribe/unsubscribe changes read deltas; ping reaches an unsubscribed target -> `attention_controls_reads_but_ping_bypasses_it`.
 
 ## Verify
 
-```
+```bash
 cd rustyredcore_THG
-cargo test -p rustyred-thg-core --lib stream     # 8 tests (7 primitive + 1 command)
-cargo test -p rustyred-thg-core --lib            # 193 pass, 0 fail
-cargo clippy -p rustyred-thg-core --lib          # stream.rs clean
+cargo test -p rustyred-thg-core --lib stream     # 12 tests
+cargo test -p rustyred-thg-core --lib            # 197 pass, 0 fail
+cargo clippy -p rustyred-thg-core --lib          # completes; baseline warnings remain outside stream.rs
 ```
 
-## Explicit scope boundary — remaining integration (NOT a silent cut)
+## Explicit scope boundary - remaining integration (NOT a silent cut)
 
 This slice delivers the native primitive + the observable core command surface +
 the ping/mention seam, all tested. The following wiring is required to make

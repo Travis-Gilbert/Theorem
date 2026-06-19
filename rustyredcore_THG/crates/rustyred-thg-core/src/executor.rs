@@ -364,7 +364,7 @@ impl InMemoryThgExecutor {
                     command,
                     ThgError::new("invalid_graph_query", error.to_string()),
                     self.state_hash(),
-                )
+                );
             }
         };
         let operation = if query.label.is_some() || !query.properties.is_empty() {
@@ -400,7 +400,7 @@ impl InMemoryThgExecutor {
                     command,
                     ThgError::new("invalid_graph_query", error.to_string()),
                     self.state_hash(),
-                )
+                );
             }
         };
         let hits = self.graph_store.neighbors(query);
@@ -461,7 +461,14 @@ impl InMemoryThgExecutor {
         let topic = string_arg(&args, "stream")
             .or_else(|| string_arg(&args, "topic"))
             .unwrap_or_default();
-        let actor = string_arg(&args, "actor").unwrap_or_else(|| "agent".to_string());
+        let actor = string_arg(&args, "actor").unwrap_or_default();
+        if actor.trim().is_empty() {
+            return ThgResponse::err(
+                command,
+                ThgError::new("missing_actor", "stream publish requires an actor"),
+                self.state_hash(),
+            );
+        }
         let kind = string_arg(&args, "kind").unwrap_or_else(|| "message".to_string());
         let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
         let urgency_raw = string_arg(&args, "urgency").unwrap_or_default();
@@ -475,7 +482,7 @@ impl InMemoryThgExecutor {
                         format!("unknown urgency: {urgency_raw}; expected info|ask|block"),
                     ),
                     self.state_hash(),
-                )
+                );
             }
         };
         let target_actor = string_arg(&args, "target_actor");
@@ -555,14 +562,24 @@ impl InMemoryThgExecutor {
                         command,
                         ThgError::new(error.code, error.message),
                         self.state_hash(),
-                    )
+                    );
                 }
             }
         }
-        let (events, new_cursors) = self
+        let (events, new_cursors) = match self
             .state_mut()
             .streams
-            .read(&actor, &resolved, advance, limit);
+            .read(&tenant, &actor, &resolved, advance, limit)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(error.code, error.message),
+                    self.state_hash(),
+                );
+            }
+        };
         let events_json: Vec<Value> = events
             .iter()
             .map(|event| serde_json::to_value(event).unwrap_or_else(|_| json!({})))
@@ -607,13 +624,26 @@ impl InMemoryThgExecutor {
                     command,
                     ThgError::new(error.code, error.message),
                     self.state_hash(),
-                )
+                );
             }
         };
-        let subscriptions = if subscribe {
-            self.state_mut().streams.subscribe(&actor, &stream_key)
+        let subscriptions = match if subscribe {
+            self.state_mut()
+                .streams
+                .subscribe(&tenant, &actor, &stream_key)
         } else {
-            self.state_mut().streams.unsubscribe(&actor, &stream_key)
+            self.state_mut()
+                .streams
+                .unsubscribe(&tenant, &actor, &stream_key)
+        } {
+            Ok(subscriptions) => subscriptions,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(error.code, error.message),
+                    self.state_hash(),
+                );
+            }
         };
         ThgResponse::ok(
             command,
@@ -638,8 +668,22 @@ impl InMemoryThgExecutor {
                 self.state_hash(),
             );
         }
+        let tenant = string_arg(&args, "tenant").unwrap_or_default();
         let advance = bool_arg(&args, "advance").unwrap_or(true);
-        let mentions = self.state_mut().streams.drain_mentions(&actor, advance);
+        let mentions = match self
+            .state_mut()
+            .streams
+            .drain_mentions(&tenant, &actor, advance)
+        {
+            Ok(mentions) => mentions,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(error.code, error.message),
+                    self.state_hash(),
+                );
+            }
+        };
         let mentions_json: Vec<Value> = mentions
             .iter()
             .map(|event| serde_json::to_value(event).unwrap_or_else(|_| json!({})))
@@ -1060,7 +1104,10 @@ mod tests {
         ));
         assert!(publish.ok);
         assert_eq!(publish.payload["ordering_token"], 1);
-        assert_ne!(pre_hash, publish.state_hash, "publish advances the state hash");
+        assert_ne!(
+            pre_hash, publish.state_hash,
+            "publish advances the state hash"
+        );
 
         // bob reads exactly one event via his subscription; cursor advances.
         let read = executor.execute_request(ThgRequest::new(
@@ -1092,9 +1139,28 @@ mod tests {
         assert_eq!(ping.payload["pinged"], true);
         let mentions = executor.execute_request(ThgRequest::new(
             ThgCommand::StreamMentions.name(),
-            json!({ "actor": "carol", "advance": true }),
+            json!({ "actor": "carol", "tenant": "acme", "advance": true }),
         ));
         assert_eq!(mentions.payload["count"], 1);
+
+        let beta_ping = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "beta", "stream": "room", "actor": "alice", "kind": "q", "urgency": "ask", "target_actor": "carol" }),
+        ));
+        assert!(beta_ping.ok);
+        let wrong_tenant_mentions = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamMentions.name(),
+            json!({ "actor": "carol", "tenant": "acme", "advance": false }),
+        ));
+        assert_eq!(
+            wrong_tenant_mentions.payload["count"], 0,
+            "tenant-scoped mention drain must not leak beta pings into acme"
+        );
+        let beta_mentions = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamMentions.name(),
+            json!({ "actor": "carol", "tenant": "beta", "advance": true }),
+        ));
+        assert_eq!(beta_mentions.payload["count"], 1);
 
         // An ask without a target is rejected.
         let bad_ping = executor.execute_request(ThgRequest::new(
@@ -1105,6 +1171,16 @@ mod tests {
         assert_eq!(
             bad_ping.error.as_ref().map(|e| e.code.as_str()),
             Some("missing_target_actor")
+        );
+
+        let missing_actor = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "acme", "stream": "room" }),
+        ));
+        assert!(!missing_actor.ok);
+        assert_eq!(
+            missing_actor.error.as_ref().map(|e| e.code.as_str()),
+            Some("missing_actor")
         );
 
         // Empty tenant is rejected, not routed to a default.
