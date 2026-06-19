@@ -1,0 +1,13 @@
+[package]
+name = "commonplace"
+version = "0.1.0"
+edition = "2021"
+description = "CommonPlace consumer object model (Item/Collection/Tag) and auto-structuring ingest, graph-native over the RustyRedCore-THG substrate."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
