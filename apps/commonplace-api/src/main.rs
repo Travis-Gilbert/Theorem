@@ -14,11 +14,17 @@ use async_graphql::http::GraphiQLSource;
 use async_graphql::Request;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
 use commonplace_api::{build_schema, in_memory_store, ApiKeyRegistry, ApiKeyToken, ConsumerSchema};
+
+#[derive(Clone)]
+struct AppState {
+    schema: ConsumerSchema,
+    registry: Arc<ApiKeyRegistry>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -26,12 +32,13 @@ async fn main() {
     let instance =
         std::env::var("COMMONPLACE_INSTANCE_ID").unwrap_or_else(|_| "default".to_string());
     let registry = Arc::new(ApiKeyRegistry::new().with_key(api_key, instance));
-    let schema = build_schema(in_memory_store(), registry);
+    let schema = build_schema(in_memory_store(), Arc::clone(&registry));
+    let state = AppState { schema, registry };
 
     let app = Router::new()
         .route("/graphql", get(graphiql).post(graphql_handler))
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(schema);
+        .with_state(state);
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -51,16 +58,17 @@ async fn graphiql() -> impl IntoResponse {
 }
 
 async fn graphql_handler(
-    State(schema): State<ConsumerSchema>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     req: GraphQLRequest,
-) -> GraphQLResponse {
-    let mut request: Request = req.into_inner();
-    if let Some(key) = headers
+) -> Result<GraphQLResponse, StatusCode> {
+    let key = headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
-    {
-        request = request.data(ApiKeyToken(key.to_string()));
-    }
-    schema.execute(request).await.into()
+        .filter(|key| state.registry.resolve(key).is_some())
+        .ok_or(StatusCode::FORBIDDEN)?;
+
+    let mut request: Request = req.into_inner();
+    request = request.data(ApiKeyToken(key.to_string()));
+    Ok(state.schema.execute(request).await.into())
 }

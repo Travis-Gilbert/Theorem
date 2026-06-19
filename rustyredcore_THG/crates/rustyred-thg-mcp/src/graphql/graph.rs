@@ -90,6 +90,8 @@ fn node_ids(value: &Value) -> Vec<String> {
 
 /// Parse the bulk-upsert payload into the typed result.
 fn bulk_result(value: &Value) -> BulkResult {
+    // Bulk calls are already bounded well below i32::MAX by request-size and
+    // practical memory limits; GraphQL exposes signed 32-bit integers.
     BulkResult {
         ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
         inserted: value.get("inserted").and_then(Value::as_i64).unwrap_or(0) as i32,
@@ -131,6 +133,8 @@ impl GraphQuery {
             obj.insert("epsilon".to_string(), json!(epsilon));
         }
         if let Some(top_k) = top_k {
+            // Support both backend spellings while flat tools migrate from
+            // snake_case to GraphQL-style camelCase.
             obj.insert("top_k".to_string(), json!(top_k));
             obj.insert("topK".to_string(), json!(top_k));
         }

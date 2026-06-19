@@ -43,13 +43,14 @@ fn main() {
             }
         };
         if let Some(response) = mcp::handle_request(&mut cp, &request) {
-            if writeln!(
-                out,
-                "{}",
-                serde_json::to_string(&response).unwrap_or_default()
-            )
-            .is_err()
-            {
+            let json = match serde_json::to_string(&response) {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("mcp response serialization error: {error}");
+                    break;
+                }
+            };
+            if writeln!(out, "{json}").is_err() {
                 break;
             }
             let _ = out.flush();

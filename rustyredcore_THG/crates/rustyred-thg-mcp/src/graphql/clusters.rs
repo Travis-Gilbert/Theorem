@@ -36,7 +36,7 @@ impl ClustersQuery {
     /// Fetch a harness run's detail by id (wraps `harness_run`).
     async fn harness_run(&self, run_id: String) -> GqlResult<Json> {
         let args = json!({ "run_id": run_id });
-        with_invoker(|inv| Ok(Json(inv.harness_run(args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.harness_run(args).map_err(map_err)?)))
     }
 
     /// List skill packs (wraps `skill_list`).
@@ -49,23 +49,19 @@ impl ClustersQuery {
             ("status", status.map(Value::from)),
             ("include_retired", include_retired.map(Value::from)),
         ]);
-        with_invoker(|inv| Ok(Json(inv.skill("list", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.skill("list", args).map_err(map_err)?)))
     }
 
     /// Fetch a single skill pack (wraps `skill_get`). `input` carries the
     /// selector the tool expects (id / name / slug / version).
     async fn skill_get(&self, input: Json) -> GqlResult<Json> {
-        with_invoker(|inv| Ok(Json(inv.skill("get", input.0.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.skill("get", input.0).map_err(map_err)?)))
     }
 
     /// Select a capability pack for a task under budget (wraps `ensemble_select`).
     /// `input` carries the task/query plus budget and trust knobs.
     async fn ensemble_select(&self, input: Json) -> GqlResult<Json> {
-        with_invoker(|inv| {
-            Ok(Json(
-                inv.ensemble("select", input.0.clone()).map_err(map_err)?,
-            ))
-        })
+        with_invoker(|inv| Ok(Json(inv.ensemble("select", input.0).map_err(map_err)?)))
     }
 
     /// List dispatch-board jobs (wraps `job_list`).
@@ -74,7 +70,7 @@ impl ClustersQuery {
             ("repo", repo.map(Value::from)),
             ("state", state.map(Value::from)),
         ]);
-        with_invoker(|inv| Ok(Json(inv.job("list", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.job("list", args).map_err(map_err)?)))
     }
 }
 
@@ -86,32 +82,24 @@ impl ClustersMutation {
     /// Publish a skill pack (wraps `skill_publish`). `input` carries the pack
     /// payload the tool expects.
     async fn skill_publish(&self, input: Json) -> GqlResult<Json> {
-        with_invoker(|inv| {
-            Ok(Json(
-                inv.skill("publish", input.0.clone()).map_err(map_err)?,
-            ))
-        })
+        with_invoker(|inv| Ok(Json(inv.skill("publish", input.0).map_err(map_err)?)))
     }
 
     /// Apply (record use of) a skill pack (wraps `skill_apply`).
     async fn skill_apply(&self, input: Json) -> GqlResult<Json> {
-        with_invoker(|inv| Ok(Json(inv.skill("apply", input.0.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.skill("apply", input.0).map_err(map_err)?)))
     }
 
     /// Register a capability pack in the ensemble registry (wraps
     /// `ensemble_register`). `input` carries the pack plus content/artifact hashes.
     async fn ensemble_register(&self, input: Json) -> GqlResult<Json> {
-        with_invoker(|inv| {
-            Ok(Json(
-                inv.ensemble("register", input.0.clone()).map_err(map_err)?,
-            ))
-        })
+        with_invoker(|inv| Ok(Json(inv.ensemble("register", input.0).map_err(map_err)?)))
     }
 
     /// Submit a job to the dispatch board (wraps `job_submit`). `input` carries
     /// the job submission (spec_ref / spec_inline, priority, target head, etc.).
     async fn job_submit(&self, input: Json) -> GqlResult<Json> {
-        with_invoker(|inv| Ok(Json(inv.job("submit", input.0.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.job("submit", input.0).map_err(map_err)?)))
     }
 
     /// Append a note/receipt to a job (wraps `job_note`).
@@ -128,7 +116,7 @@ impl ClustersMutation {
             ("actor", actor.map(Value::from)),
             ("refs", refs.map(|r| json!(r))),
         ]);
-        with_invoker(|inv| Ok(Json(inv.job("note", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.job("note", args).map_err(map_err)?)))
     }
 
     /// Archive a job with a reason (wraps `job_archive`).
@@ -143,6 +131,6 @@ impl ClustersMutation {
             ("reason", Some(Value::from(reason))),
             ("actor", actor.map(Value::from)),
         ]);
-        with_invoker(|inv| Ok(Json(inv.job("archive", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.job("archive", args).map_err(map_err)?)))
     }
 }

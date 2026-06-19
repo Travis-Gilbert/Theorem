@@ -3918,9 +3918,15 @@ fn max_persisted_stream_token(
     Ok(max_token)
 }
 
+fn stream_publish_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Reserve the next monotonic ordering token for a stream (read-modify-write on
-/// the head node). MCP dispatch is serialized, so two heads publishing
-/// concurrently receive distinct tokens with no merge step.
+/// the head node). Callers hold the process-local stream publish lock across
+/// reservation and event persistence, so concurrent publishers in one MCP server
+/// receive distinct tokens with no merge step.
 fn reserve_stream_token(
     backend: &mut impl McpGraphBackend,
     tenant: &str,
@@ -3941,7 +3947,7 @@ fn reserve_stream_token(
     head.tenant_slug = tenant.to_string();
     head.topic = topic.to_string();
     head.stream_key = stream_key.to_string();
-    head.next_token = token + 1;
+    head.next_token = token.saturating_add(1);
     head.updated_at = now.to_string();
     let node = NodeRecord::new(
         coordination_stream_node_id(tenant, topic),
@@ -4126,6 +4132,9 @@ fn stream_publish_payload(
     );
     let stream_key = canonical_stream_key(tenant, &topic);
 
+    let _publish_guard = stream_publish_lock()
+        .lock()
+        .map_err(|_| McpError::internal("stream publish lock poisoned"))?;
     let token = reserve_stream_token(backend, tenant, &topic, &stream_key, &created_at)?;
     let event_id = format!(
         "sevt:{}",
@@ -7828,6 +7837,8 @@ fn coordination_tool_requires_tenant(tool_name: &str) -> bool {
             | "theorem_harness_stream_subscribe"
             | "stream_unsubscribe"
             | "theorem_harness_stream_unsubscribe"
+            | "graphql_mutate"
+            | "theorem_harness_graphql_mutate"
             | "mentions"
             | "theorem_harness_mentions"
             | "read_messages_for_room"

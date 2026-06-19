@@ -1,4 +1,4 @@
-# A wire-protocol server must not splice client text into SQL on the strength of a CLAIMED type, nor allocate on an unvalidated wire length
+# A wire-protocol server must not splice client text into SQL based on a CLAIMED type, nor allocate on an unvalidated wire length
 
 **Kind:** rule
 **Captured:** 2026-06-19
@@ -14,7 +14,7 @@ Peer review of `rustyred-thg-pg-server`'s parameter rendering found two real def
 
 ## Rule
 
-In any wire-protocol server: (1) NEVER emit a value into a downstream sink (SQL, a path, a command) on the strength of a CLAIMED type -- parse/validate it AS that type and re-serialize the parsed value; on parse failure fall back to a safe escaped literal. A "numeric" parameter must be proven numeric before it goes into SQL unquoted. (2) NEVER `i32 as usize` (or otherwise widen) a wire length without first range-checking it: `if !(MIN..=MAX).contains(&len) { reject }`. A negative or oversized length must be rejected before any allocation sized by it. Bound every length-prefixed read with a sane max.
+In any wire-protocol server: (1) NEVER emit a value into a downstream sink (SQL, a path, a command) based on a CLAIMED type -- parse/validate it AS that type and re-serialize the parsed value; on parse failure fall back to a safe escaped literal. A "numeric" parameter must be proven numeric before it goes into SQL unquoted. (2) NEVER `i32 as usize` (or otherwise widen) a wire length without first range-checking it: `if !(MIN..=MAX).contains(&len) { reject }`. A negative or oversized length must be rejected before any allocation sized by it. Bound every length-prefixed read with a sane max.
 
 ## Evidence
 

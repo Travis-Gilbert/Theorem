@@ -159,7 +159,7 @@ Spec: `SPEC-RUSTYRED-PG-WIRE.md`.
 - **E0 embedded mode.** The core as a linkable library and a single local binary;
   capabilities as local calls; the folder tree as the agent's working filesystem;
   a local persistence path with restart rehydration; single-tenant local config.
-  Spec: `[spec to write, the embedded-mode north-star]`. Acceptance: an agent
+  Spec: `E0-embedded-mode.md`. Acceptance: an agent
   runs the engine in-process over a local directory, restarts, and rehydrates.
 - **E1 stream transport.** Passive subscribe, intentional ping, selective
   attention; a local live-tail for warm heads and the console. Spec:
@@ -196,6 +196,6 @@ Specs: `SPEC-MEMORY-FOUR-LAYER.md`, `compound-engineering-corpora-backlog.md`,
 - E0 precedes E1 and E2 (local streams and native graph conditioning land most
   cleanly embedded).
 - A2 and E1 share the stream seam; build them aware of each other.
-- The specs marked `[spec to write]` (A2 coordination slice, D0 visual, D2 LiDAR,
-  E0 embedded mode) gate their units; writing each is a planning unit that comes
-  before its execution.
+- The specs marked `[spec to write]` (A2 coordination slice, D0 visual, D2 LiDAR)
+  gate their units; writing each is a planning unit that comes before its
+  execution. E0's spec (`E0-embedded-mode.md`) is complete.

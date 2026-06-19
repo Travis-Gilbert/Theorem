@@ -32,7 +32,7 @@ the function that needs it:
 - caption: Florence-2 via `transformers` (lazy; degrades to empty captions).
 - dataset build: `playwright` (lazy).
 
-```
+```text
 perception_visual/
   detector/   base.py (Box + Detector protocol) | rfdetr_detector.py | heuristic_detector.py
   pipeline/   som.py (parse + SOM merge) | ocr.py | caption.py | _png.py (stdlib PNG fallback)

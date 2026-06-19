@@ -16,7 +16,7 @@ fn external_model_reads_and_writes_items_over_mcp() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_commonplace-mcp"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn commonplace-mcp");
 
@@ -41,7 +41,18 @@ fn external_model_reads_and_writes_items_over_mcp() {
         .expect("stdout")
         .read_to_string(&mut out)
         .expect("read stdout");
-    let _ = child.wait();
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut err)
+        .expect("read stderr");
+    let status = child.wait().expect("wait for child");
+    assert!(
+        status.success(),
+        "commonplace-mcp exited with {status}; stderr: {err}; stdout: {out}"
+    );
 
     // initialize answered with protocol version + server identity.
     assert!(

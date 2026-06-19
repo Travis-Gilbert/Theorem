@@ -1110,10 +1110,10 @@ pub fn coordination_record_edge_id(tenant_slug: &str, room_id: &str, record_id: 
     )
 }
 
-/// The canonical `(tenant, topic)` stream key string. Mirrors
-/// [`StreamKey::canonical`](rustyred_thg_core::StreamKey::canonical): the tenant
-/// is normalized (casing preserved, never defaulted here -- the caller rejects
-/// empties) and joined to the trimmed topic with a unit separator so a topic that
+/// The canonical `(tenant, topic)` stream key string for the runtime layer.
+/// Unlike core [`StreamKey::canonical`](rustyred_thg_core::StreamKey::canonical),
+/// this applies tenant normalization (including the runtime empty-tenant default)
+/// and trims the topic before joining them with a unit separator. A topic that
 /// embeds the separator text can never forge a different scope.
 pub fn canonical_stream_key(tenant_slug: &str, topic: &str) -> String {
     format!(

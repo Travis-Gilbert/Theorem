@@ -1201,7 +1201,7 @@ fn collect_retrieval_from_payload(used: &mut UsedItems, payload: &Map<String, Va
 }
 
 fn collect_tools_from_payload(used: &mut UsedItems, payload: &Map<String, Value>) {
-    for key in ["tool_id", "tool_name", "selected_tools", "tools"] {
+    for key in ["tool_id", "tool_name", "tools"] {
         collect_strings(payload.get(key), &mut used.tools);
     }
 }
@@ -2851,6 +2851,18 @@ mod tests {
                 json!({
                     "adapter": "codex",
                     "started_at": TS
+                }),
+            ),
+        )
+        .unwrap();
+        append_transition_from_store(
+            store,
+            transition(
+                run_id,
+                "SESSION.EVENT_RECORDED",
+                json!({
+                    "event_subtype": "tool_invocation",
+                    "tool_id": "apply_patch"
                 }),
             ),
         )

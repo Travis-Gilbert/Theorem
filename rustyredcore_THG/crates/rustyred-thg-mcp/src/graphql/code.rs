@@ -59,7 +59,7 @@ impl CodeQuery {
         limit: Option<i32>,
     ) -> GqlResult<Json> {
         let args = code_args(Some(query), repo, None, limit, None);
-        with_invoker(|inv| Ok(Json(inv.code("search", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.code("search", args).map_err(map_err)?)))
     }
 
     /// Assemble a context pack around a symbol or query (operation `context`).
@@ -71,7 +71,7 @@ impl CodeQuery {
         limit: Option<i32>,
     ) -> GqlResult<Json> {
         let args = code_args(query, repo, node_id, limit, None);
-        with_invoker(|inv| Ok(Json(inv.code("context", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.code("context", args).map_err(map_err)?)))
     }
 
     /// Explore the neighborhood of a code symbol (operation `explore`).
@@ -83,7 +83,7 @@ impl CodeQuery {
         limit: Option<i32>,
     ) -> GqlResult<Json> {
         let args = code_args(query, repo, node_id, limit, None);
-        with_invoker(|inv| Ok(Json(inv.code("explore", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.code("explore", args).map_err(map_err)?)))
     }
 
     /// Explain a code symbol or edge (operation `explain`).
@@ -94,13 +94,13 @@ impl CodeQuery {
         repo: Option<String>,
     ) -> GqlResult<Json> {
         let args = code_args(query, repo, node_id, None, None);
-        with_invoker(|inv| Ok(Json(inv.code("explain", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.code("explain", args).map_err(map_err)?)))
     }
 
     /// Recognize a snippet against the indexed code (operation `recognize`).
     async fn code_recognize(&self, query: String, repo: Option<String>) -> GqlResult<Json> {
         let args = code_args(Some(query), repo, None, None, None);
-        with_invoker(|inv| Ok(Json(inv.code("recognize", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.code("recognize", args).map_err(map_err)?)))
     }
 
     /// List the repositories ingested into the code graph (operation `list_repos`).
@@ -118,12 +118,12 @@ impl CodeMutation {
     /// repo id, URL, or local path; the payload normalizes it.
     async fn ingest_codebase(&self, repo: String, actor: Option<String>) -> GqlResult<Json> {
         let args = code_args(None, Some(repo), None, None, actor);
-        with_invoker(|inv| Ok(Json(inv.code("ingest", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.code("ingest", args).map_err(map_err)?)))
     }
 
     /// Re-index a codebase incrementally (operation `reindex`).
     async fn reindex_codebase(&self, repo: String, actor: Option<String>) -> GqlResult<Json> {
         let args = code_args(None, Some(repo), None, None, actor);
-        with_invoker(|inv| Ok(Json(inv.code("reindex", args.clone()).map_err(map_err)?)))
+        with_invoker(|inv| Ok(Json(inv.code("reindex", args).map_err(map_err)?)))
     }
 }

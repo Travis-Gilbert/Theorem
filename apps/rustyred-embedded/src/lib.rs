@@ -269,7 +269,6 @@ impl Engine {
             )
             .map_err(|error| EngineError::Open(error.message))?;
         let hash = entry.content_hash.clone().unwrap_or_default();
-        self.persist_doc_tree()?;
 
         let mut properties = serde_json::Map::new();
         properties.insert(DOC_TREE_PATH_PROPERTY.to_string(), json!(path));
@@ -289,6 +288,7 @@ impl Engine {
             "mutation($n:JSON!){ bulkNodes(nodes:$n){ inserted } }",
             json!({ "n": [node] }),
         )?;
+        self.persist_doc_tree()?;
         Ok(hash)
     }
 

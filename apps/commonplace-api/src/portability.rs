@@ -9,10 +9,13 @@
 //! written with their original ids (so `IN_COLLECTION` edges re-link). `created_at`
 //! survives; `updated_at` refreshes because an import is itself a write.
 
+use std::collections::BTreeMap;
+
 use commonplace::{
-    BlobStore, Collection, Commonplace, EmbeddingGraphStore, Item, ItemBody, COLLECTION_LABEL,
+    content_hash, BlobStore, Collection, Commonplace, EmbeddingGraphStore, Item, ItemBody,
+    COLLECTION_LABEL,
 };
-use rustyred_thg_core::{GraphStore, GraphStoreResult, NodeQuery, NodeRecord};
+use rustyred_thg_core::{GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -25,6 +28,8 @@ pub struct ExportDocument {
     pub version: u32,
     pub items: Vec<Item>,
     pub collections: Vec<Collection>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub blobs: BTreeMap<String, Vec<u8>>,
 }
 
 /// What an import wrote.
@@ -41,6 +46,18 @@ where
     B: BlobStore,
 {
     let items = cp.all_items()?;
+    let mut blobs = BTreeMap::new();
+    for item in &items {
+        if let ItemBody::Blob { content_hash, .. } = &item.body {
+            let bytes = cp.read_blob(item)?.ok_or_else(|| {
+                GraphStoreError::new(
+                    "commonplace_export_missing_blob",
+                    format!("item {} references missing blob {content_hash}", item.id),
+                )
+            })?;
+            blobs.insert(content_hash.clone(), bytes);
+        }
+    }
     let collection_ids: Vec<String> = cp
         .store()
         .query_nodes(NodeQuery::label(COLLECTION_LABEL).with_limit(usize::MAX))
@@ -57,6 +74,7 @@ where
         version: EXPORT_VERSION,
         items,
         collections,
+        blobs,
     })
 }
 
@@ -127,13 +145,52 @@ where
     S: EmbeddingGraphStore,
     B: BlobStore,
 {
+    let mut embedding_dimension = None;
+    for item in &document.items {
+        if let Some(embedding) = item.embedding.as_ref() {
+            if embedding.is_empty() {
+                return Err(GraphStoreError::new(
+                    "commonplace_import_empty_embedding",
+                    format!("item {} has an empty embedding vector", item.id),
+                ));
+            }
+            match embedding_dimension {
+                Some(dimension) if dimension != embedding.len() => {
+                    return Err(GraphStoreError::new(
+                        "commonplace_import_embedding_dimension_mismatch",
+                        format!(
+                            "item {} has embedding dimension {}, expected {dimension}",
+                            item.id,
+                            embedding.len()
+                        ),
+                    ));
+                }
+                None => embedding_dimension = Some(embedding.len()),
+                _ => {}
+            }
+        }
+        if let ItemBody::Blob { content_hash, .. } = &item.body {
+            if !document.blobs.contains_key(content_hash) {
+                return Err(GraphStoreError::new(
+                    "commonplace_import_missing_blob",
+                    format!("item {} references missing blob {content_hash}", item.id),
+                ));
+            }
+        }
+    }
+
+    for (expected_hash, bytes) in &document.blobs {
+        let actual_hash = cp.blobs().put(bytes)?;
+        if actual_hash != *expected_hash || content_hash(bytes) != *expected_hash {
+            return Err(GraphStoreError::new(
+                "commonplace_import_blob_hash_mismatch",
+                format!("blob bytes do not match exported hash {expected_hash}"),
+            ));
+        }
+    }
+
     // Re-index item embeddings if present, so imported items stay searchable.
-    if let Some(dimension) = document
-        .items
-        .iter()
-        .find_map(|item| item.embedding.as_ref().map(Vec::len))
-        .filter(|dimension| *dimension > 0)
-    {
+    if let Some(dimension) = embedding_dimension {
         cp.store_mut()
             .designate_commonplace_item_embedding(dimension)?;
     }

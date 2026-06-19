@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 _model = None
 _processor = None
 _MODEL_ID = "microsoft/Florence-2-base"  # MIT
+_MODEL_REVISION = "dc7e6928b12c148726d4cee0ff011cfe2cebddea"
 
 
 def _load():
@@ -22,8 +23,14 @@ def _load():
         return _model, _processor
     from transformers import AutoModelForCausalLM, AutoProcessor  # type: ignore  # MIT (Florence-2)
 
-    _model = AutoModelForCausalLM.from_pretrained(_MODEL_ID, trust_remote_code=True)
-    _processor = AutoProcessor.from_pretrained(_MODEL_ID, trust_remote_code=True)
+    # trust_remote_code executes model-repo Python during load; pin the revision
+    # so deploys do not silently track upstream code changes.
+    _model = AutoModelForCausalLM.from_pretrained(
+        _MODEL_ID, revision=_MODEL_REVISION, trust_remote_code=True
+    )
+    _processor = AutoProcessor.from_pretrained(
+        _MODEL_ID, revision=_MODEL_REVISION, trust_remote_code=True
+    )
     _model.eval()
     return _model, _processor
 

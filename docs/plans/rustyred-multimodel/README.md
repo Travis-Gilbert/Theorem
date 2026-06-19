@@ -9,6 +9,7 @@ rooms can all reference the same artifact from inside the checkout.
 - `NORTH-STAR-RUSTYRED-MULTIMODEL.md`: the unit graph and acceptance map.
 - `SPEC-GRAPHQL-MCP.md`: GraphQL MCP surface, including A2 coordination.
 - `SPEC-RUSTYRED-STREAM-COORDINATION.md`: append-only stream coordination.
+- `E0-embedded-mode.md`: embedded-mode execution handoff.
 
 ## Loop contract
 
@@ -46,6 +47,7 @@ Present in this folder:
 
 - `SPEC-GRAPHQL-MCP.md`
 - `SPEC-RUSTYRED-STREAM-COORDINATION.md`
+- `E0-embedded-mode.md`
 
 The North Star also references specs that still need to be copied or written
 in-tree:

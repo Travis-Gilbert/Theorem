@@ -11,11 +11,11 @@ Run: python perception_visual/eval/fixtures/_generate_heldout.py
 from __future__ import annotations
 
 import json
-import struct
-import zlib
 from pathlib import Path
 
 import numpy as np
+
+from perception_visual.pipeline._png import encode_png
 
 HERE = Path(__file__).resolve().parent
 HELDOUT = HERE / "heldout"
@@ -32,25 +32,6 @@ LAYOUTS = [
 SIZE = 256
 BG = 30
 FG = 225
-
-
-def encode_png(rgb: np.ndarray) -> bytes:
-    arr = np.ascontiguousarray(rgb[:, :, :3].astype(np.uint8))
-    h, w = arr.shape[:2]
-    raw = bytearray()
-    for y in range(h):
-        raw.append(0)
-        raw.extend(arr[y].tobytes())
-
-    def chunk(typ, data):
-        c = typ + data
-        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
-
-    out = b"\x89PNG\r\n\x1a\n"
-    out += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-    out += chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-    out += chunk(b"IEND", b"")
-    return out
 
 
 def main() -> None:
