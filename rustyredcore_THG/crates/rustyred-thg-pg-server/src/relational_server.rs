@@ -56,6 +56,10 @@ pub type SharedRelationalStore = Arc<Mutex<RelationalStore>>;
 const PROTOCOL_VERSION_3: i32 = 196608;
 const SSL_REQUEST: i32 = 80877103;
 const GSS_REQUEST: i32 = 80877104;
+/// Upper bound on a single wire message body so a malicious/garbage length
+/// cannot drive an unbounded allocation (a negative i32 length would otherwise
+/// sign-extend to a huge usize).
+const MAX_MESSAGE_LEN: i32 = 64 * 1024 * 1024;
 
 // ----------------------------------------------------------------------------
 // Errors carry a Postgres SQLSTATE so clients get a correct ErrorResponse.
@@ -1325,15 +1329,26 @@ fn render_param(value: Option<&[u8]>, format: i16, oid: u32) -> String {
         return sql_literal_string(&String::from_utf8_lossy(bytes));
     }
     let text = String::from_utf8_lossy(bytes);
-    if oid == Type::INT8.oid()
-        || oid == Type::INT4.oid()
-        || oid == Type::FLOAT8.oid()
-        || oid == Type::NUMERIC.oid()
-    {
-        return text.to_string();
+    let trimmed = text.trim();
+    // Never splice raw client text into the SQL on the strength of a CLAIMED
+    // numeric OID. Validate it actually parses as that type and re-serialize the
+    // parsed value; on failure fall back to a quoted string literal. Otherwise a
+    // client could declare $1 as INT8 and send text like "0 AND x > 1",
+    // injecting a predicate fragment into the parameterized path.
+    if oid == Type::INT8.oid() || oid == Type::INT4.oid() {
+        return match trimmed.parse::<i64>() {
+            Ok(value) => value.to_string(),
+            Err(_) => sql_literal_string(&text),
+        };
+    }
+    if oid == Type::FLOAT8.oid() || oid == Type::NUMERIC.oid() {
+        return match trimmed.parse::<f64>() {
+            Ok(value) if value.is_finite() => value.to_string(),
+            _ => sql_literal_string(&text),
+        };
     }
     if oid == Type::BOOL.oid() {
-        return if matches!(text.as_ref(), "t" | "true" | "TRUE" | "1") {
+        return if matches!(trimmed, "t" | "true" | "TRUE" | "1") {
             "TRUE"
         } else {
             "FALSE"
@@ -1474,12 +1489,13 @@ enum FrontendMessage {
 fn read_startup(stream: &mut TcpStream) -> std::io::Result<bool> {
     loop {
         let len = match read_i32_opt(stream)? {
-            Some(len) => len as usize,
+            Some(len) => len,
             None => return Ok(false),
         };
-        if len < 8 {
-            return Err(invalid_data("invalid startup packet length"));
+        if !(8..=MAX_MESSAGE_LEN).contains(&len) {
+            return Err(invalid_data("startup packet length out of range"));
         }
+        let len = len as usize;
         let mut body = vec![0_u8; len - 4];
         stream.read_exact(&mut body)?;
         let code = i32::from_be_bytes(body[..4].try_into().unwrap());
@@ -1503,10 +1519,11 @@ fn read_frontend_message(stream: &mut TcpStream) -> std::io::Result<Option<Front
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
-    let len = read_i32(stream)? as usize;
-    if len < 4 {
-        return Err(invalid_data("invalid frontend message length"));
+    let len = read_i32(stream)?;
+    if !(4..=MAX_MESSAGE_LEN).contains(&len) {
+        return Err(invalid_data("frontend message length out of range"));
     }
+    let len = len as usize;
     let mut body = vec![0_u8; len - 4];
     stream.read_exact(&mut body)?;
     Ok(Some(parse_frontend_message(tag[0], &body)?))
@@ -2009,5 +2026,18 @@ mod tests {
         assert_eq!(render_param(Some(b"a'b"), 0, Type::TEXT.oid()), "'a''b'");
         assert_eq!(render_param(Some(b"1000"), 0, Type::INT8.oid()), "1000");
         assert_eq!(render_param(None, 1, Type::INT8.oid()), "NULL");
+    }
+
+    #[test]
+    fn numeric_param_text_is_validated_not_spliced_raw() {
+        // A client declaring $1 as INT8 but sending a text injection attempt must
+        // NOT be spliced raw; it falls back to a quoted (harmless) string literal.
+        assert_eq!(
+            render_param(Some(b"0 AND created_ms > 0"), 0, Type::INT8.oid()),
+            "'0 AND created_ms > 0'"
+        );
+        // a genuine numeric text value is re-serialized as a bare number
+        assert_eq!(render_param(Some(b"  42 "), 0, Type::INT8.oid()), "42");
+        assert_eq!(render_param(Some(b"1.5x"), 0, Type::FLOAT8.oid()), "'1.5x'");
     }
 }
