@@ -1,11 +1,13 @@
 browser
 browser-substrate
+commonplace-api
 desktop
 ios
 jobintel
 notebook
 obsidian-sync
 orchestrate
+rustyred-embedded
 theorem-agentd
 theorem-gateway
 theorem-grpc

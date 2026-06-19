@@ -9,7 +9,8 @@
 //!   5. eviction leaves the structural store version (the PPR cache key) intact
 
 use rustyred_thg_core::{
-    DiskColdIndex, DiskObjectStore, EdgeRecord, InMemoryGraphStore, NodeRecord,
+    DiskColdIndex, DiskObjectStore, EdgeRecord, InMemoryGraphStore, InMemoryObjectStore,
+    NodeRecord, OrderedColdIndex,
 };
 use rustyred_thg_memory::{
     evict_decayed, park_scope, recall_with_cold_tier, rehydrate, seed_frontier, ColdTier,
@@ -124,6 +125,83 @@ fn decayed_node_is_evicted_yet_survives_rehydration() {
     );
     // No longer cold.
     assert!(cold.index().lookup("mem:cold").unwrap().is_none());
+}
+
+// SPEC-RUSTYRED-RELATIONAL-CORE sec6 / acceptance #1: the native ordered.rs-
+// backed cold index (`OrderedColdIndex`) is a drop-in for the eviction path.
+// Evict-yet-rehydrate works identically to `InMemoryColdIndex` with no sqlx
+// call and no network hop, and scope->ids is served from `ordered.rs`
+// (`OrderedIndex`) rather than a directory or table scan.
+#[test]
+fn ordered_cold_index_is_a_drop_in_for_evict_and_rehydrate() {
+    let mut store = InMemoryGraphStore::new();
+    store
+        .upsert_node(mem_node(
+            "mem:cold",
+            "theorem",
+            "Stale",
+            "old cold content",
+            0.0,
+            10,
+        ))
+        .unwrap();
+    store
+        .upsert_node(mem_node(
+            "mem:hot",
+            "theorem",
+            "Fresh",
+            "recent hot content",
+            0.0,
+            9_500,
+        ))
+        .unwrap();
+
+    // The ordered.rs-backed cold index. Keep a shared handle (it is `Arc`-backed,
+    // so the clone shares state) to read scope->ids after eviction.
+    let index = OrderedColdIndex::new();
+    let mut cold = ColdTier::new(
+        Box::new(InMemoryObjectStore::new()),
+        Box::new(index.clone()),
+    );
+    let decay = stale_decay("theorem");
+    seed_frontier(&store, &mut cold, &decay).unwrap();
+
+    let report = evict_decayed(&mut store, &mut cold, decay).unwrap();
+    assert_eq!(report.evicted, 1);
+    assert_eq!(report.evicted_nodes, vec!["mem:cold".to_string()]);
+    assert!(store.get_node("mem:cold").is_none());
+    assert!(store.get_node("mem:hot").is_some());
+
+    // Durable in the ordered.rs-backed cold tier: id->residency is a keyed
+    // lookup, and scope->ids comes off the `OrderedIndex`.
+    assert!(cold.index().lookup("mem:cold").unwrap().is_some());
+    assert_eq!(
+        index.ids_for_scope("theorem", 0).unwrap(),
+        vec!["mem:cold".to_string()]
+    );
+
+    // A recall reaching the id rehydrates it back into the operating store.
+    let recalled = recall_with_cold_tier(
+        &mut store,
+        &mut cold,
+        MemoryRecallInput {
+            tenant_id: "theorem".to_string(),
+            seeds: vec!["mem:cold".to_string()],
+            query: "cold".to_string(),
+            top_k: 5,
+            budget_tokens: 500,
+            ..MemoryRecallInput::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        store.get_node("mem:cold").is_some(),
+        "rehydrated back into the operating store"
+    );
+    assert!(recalled.memories.iter().any(|m| m.graph_id == "mem:cold"));
+    // Rehydration clears both the keyed map and the scope ordered index.
+    assert!(cold.index().lookup("mem:cold").unwrap().is_none());
+    assert!(index.ids_for_scope("theorem", 0).unwrap().is_empty());
 }
 
 // 2. Eviction is a pop, not a scan: evicting k cold nodes out of n performs

@@ -1110,6 +1110,75 @@ pub fn coordination_record_edge_id(tenant_slug: &str, room_id: &str, record_id: 
     )
 }
 
+/// The canonical `(tenant, topic)` stream key string for the runtime layer.
+/// Unlike core [`StreamKey::canonical`](rustyred_thg_core::StreamKey::canonical),
+/// this applies tenant normalization (including the runtime empty-tenant default)
+/// and trims the topic before joining them with a unit separator. A topic that
+/// embeds the separator text can never forge a different scope.
+pub fn canonical_stream_key(tenant_slug: &str, topic: &str) -> String {
+    format!(
+        "{}\u{1}{}",
+        normalize_tenant_slug(tenant_slug),
+        topic.trim()
+    )
+}
+
+/// The per-`(tenant, topic)` stream head node id. Holds the monotonic
+/// `next_token` allocator and stream metadata.
+pub fn coordination_stream_node_id(tenant_slug: &str, topic: &str) -> String {
+    format!(
+        "harness:coordination:stream:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(topic).if_empty("ungrouped")
+    )
+}
+
+/// A single append-log event node id. The zero-padded token keeps node ids in
+/// lexical order with token order, so a label+property scan reads back sorted.
+pub fn coordination_stream_event_node_id(tenant_slug: &str, topic: &str, token: u64) -> String {
+    format!(
+        "harness:coordination:stream-event:{}:{}:{:020}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(topic).if_empty("ungrouped"),
+        token
+    )
+}
+
+/// The edge from a stream event back to its stream head node.
+pub fn coordination_stream_event_edge_id(tenant_slug: &str, topic: &str, token: u64) -> String {
+    format!(
+        "harness:coordination:edge:stream-event:{}:{}:{:020}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(topic).if_empty("ungrouped"),
+        token
+    )
+}
+
+/// The per-`(actor, stream)` cursor node id: an actor's last consumed position on
+/// one stream.
+pub fn coordination_stream_cursor_node_id(
+    tenant_slug: &str,
+    actor_id: &str,
+    topic: &str,
+) -> String {
+    format!(
+        "harness:coordination:stream-cursor:{}:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(actor_id).if_empty("unknown"),
+        slugify_room_part(topic).if_empty("ungrouped")
+    )
+}
+
+/// The per-actor subscription-set node id: which streams an actor's reads attend
+/// to.
+pub fn coordination_stream_subscription_node_id(tenant_slug: &str, actor_id: &str) -> String {
+    format!(
+        "harness:coordination:stream-sub:{}:{}",
+        normalize_tenant_slug(tenant_slug),
+        slugify_room_part(actor_id).if_empty("unknown")
+    )
+}
+
 pub fn coordination_binding_id(agent_id: &str) -> String {
     let agent_id = normalize_agent_id(agent_id);
     if agent_id == "theorem" {

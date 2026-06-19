@@ -10,7 +10,7 @@
 //! - [`event_log`]: persist a run as run/event nodes plus append-chain edges;
 //!   the read side ([`load_run`], [`load_events`]) backs the run read contract.
 //! - [`coordination`] and [`coordination_push`]: rooms, intents, presence,
-//!   messages, durable records, and @mentions — the shared-awareness layer.
+//!   messages, durable records, and @mentions -- the shared-awareness layer.
 //! - [`job_queue`]: the Dispatch v2 job board (submit/list/note/archive).
 //! - [`memory`]: durable memory documents (remember/recall/encode) and the
 //!   Obsidian-sync read and upsert surface.
@@ -78,14 +78,17 @@ pub use compound_engineering::{
     COMPOUND_ROOM_ID, COMPOUND_STATE_NODE_LABEL,
 };
 pub use coordination::{
-    coordination_binding_id, coordination_intent_edge_id, coordination_intent_node_id,
-    coordination_intent_scratchpad_edge_id, coordination_member_edge_id,
-    coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
-    coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
-    coordination_record_node_id, coordination_room_binding_edge_id, coordination_room_node_id,
-    end_presence, heartbeat_presence, infer_coordination_room_id, join_room, list_presence,
-    load_presence, normalize_coordination_urgency, parse_coordination_mentions,
-    read_intents_for_room, read_mentions_for_actor, read_mentions_for_actor_in_room,
+    canonical_stream_key, coordination_binding_id, coordination_intent_edge_id,
+    coordination_intent_node_id, coordination_intent_scratchpad_edge_id,
+    coordination_member_edge_id, coordination_member_node_id, coordination_mention_edge_id,
+    coordination_message_edge_id, coordination_message_node_id, coordination_presence_node_id,
+    coordination_record_edge_id, coordination_record_node_id, coordination_room_binding_edge_id,
+    coordination_room_node_id, coordination_stream_cursor_node_id,
+    coordination_stream_event_edge_id, coordination_stream_event_node_id,
+    coordination_stream_node_id, coordination_stream_subscription_node_id, end_presence,
+    heartbeat_presence, infer_coordination_room_id, join_room, list_presence, load_presence,
+    normalize_coordination_urgency, parse_coordination_mentions, read_intents_for_room,
+    read_mentions_for_actor, read_mentions_for_actor_in_room,
     read_mentions_for_actor_in_room_with_urgencies, read_mentions_for_actor_with_urgencies,
     read_messages_for_room, read_records_for_room, room_status, stable_coordination_message_id,
     stable_coordination_record_id, write_intent, write_message, write_record, CoordinationError,

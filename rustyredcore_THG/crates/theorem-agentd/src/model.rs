@@ -23,10 +23,22 @@ pub enum MessageRole {
     Tool,
 }
 
+/// A base64-encoded image attached to a chat message. The OpenAI-compatible
+/// client sends this as an `image_url` content part with a data URL.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputImage {
+    /// Media type, e.g. "image/png" or "image/jpeg".
+    pub media_type: String,
+    /// Base64-encoded image bytes without a data URL prefix.
+    pub data_base64: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<InputImage>,
 }
 
 impl ChatMessage {
@@ -34,6 +46,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::System,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -41,6 +54,15 @@ impl ChatMessage {
         Self {
             role: MessageRole::User,
             content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<InputImage>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+            images,
         }
     }
 
@@ -48,6 +70,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -55,6 +78,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::Tool,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 }
@@ -166,15 +190,7 @@ impl OpenAiModelClient {
         _grammar: &str,
     ) -> AgentdResult<ModelOutput> {
         let url = chat_completions_url(&self.config.base_url);
-        let request_messages = messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": role_name(&message.role),
-                    "content": message.content
-                })
-            })
-            .collect::<Vec<_>>();
+        let request_messages = request_messages(messages);
         // Tool-calling models (Gemma via llama-server) return structured
         // `tool_calls` when given an OpenAI `tools` array. This is more reliable
         // than constraining free-form JSON with a GBNF grammar, which Gemma's
@@ -425,6 +441,40 @@ fn chat_completions_url(base_url: &str) -> String {
     }
 }
 
+fn request_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            if message.images.is_empty() {
+                json!({
+                    "role": role_name(&message.role),
+                    "content": message.content
+                })
+            } else {
+                let mut content = vec![json!({
+                    "type": "text",
+                    "text": message.content
+                })];
+                content.extend(message.images.iter().map(|image| {
+                    json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!(
+                                "data:{};base64,{}",
+                                image.media_type, image.data_base64
+                            )
+                        }
+                    })
+                }));
+                json!({
+                    "role": role_name(&message.role),
+                    "content": content
+                })
+            }
+        })
+        .collect()
+}
+
 fn role_name(role: &MessageRole) -> &'static str {
     match role {
         MessageRole::System => "system",
@@ -492,5 +542,107 @@ mod tests {
             chat_completions_url("http://127.0.0.1:8080/v1"),
             "http://127.0.0.1:8080/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn text_only_message_serializes_as_string_content() {
+        let messages = request_messages(&[ChatMessage::user("hello")]);
+
+        assert_eq!(messages[0], json!({"role": "user", "content": "hello"}));
+        assert!(messages[0]["content"].is_string());
+    }
+
+    #[test]
+    fn image_message_serializes_as_content_array() {
+        let messages = request_messages(&[ChatMessage::user_with_images(
+            "what is visible?",
+            vec![InputImage {
+                media_type: "image/png".to_string(),
+                data_base64: "iVBORw0KGgo=".to_string(),
+            }],
+        )]);
+
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "what is visible?"})
+        );
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgo="
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn multiple_images_emit_multiple_parts() {
+        let messages = request_messages(&[ChatMessage::user_with_images(
+            "compare these",
+            vec![
+                InputImage {
+                    media_type: "image/png".to_string(),
+                    data_base64: "first".to_string(),
+                },
+                InputImage {
+                    media_type: "image/jpeg".to_string(),
+                    data_base64: "second".to_string(),
+                },
+            ],
+        )]);
+
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0], json!({"type": "text", "text": "compare these"}));
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,first"
+        );
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "data:image/jpeg;base64,second"
+        );
+    }
+
+    #[test]
+    #[ignore = "live smoke: requires llama-server started with --mmproj"]
+    fn live_image_turn_against_llama_server() {
+        let Ok(base_url) = std::env::var("THEOREM_AGENTD_LIVE_MODEL_BASE_URL") else {
+            eprintln!("set THEOREM_AGENTD_LIVE_MODEL_BASE_URL to run the live image smoke");
+            return;
+        };
+        let model = std::env::var("THEOREM_AGENTD_LIVE_MODEL_NAME")
+            .unwrap_or_else(|_| "gemma-4-12b-it-q4".to_string());
+        let config = ModelConfig {
+            provider: ModelProvider::OpenAiCompatible,
+            base_url,
+            model,
+            api_key_env: std::env::var("THEOREM_AGENTD_LIVE_MODEL_API_KEY_ENV").ok(),
+            temperature: 0.0,
+            max_tokens: 120,
+            request_timeout_secs: 120,
+            grammar_constrained: true,
+        };
+        let client = OpenAiModelClient::new(config).unwrap();
+        let catalog = ToolCatalog::default_catalog();
+        let output = client
+            .decide(
+                &[ChatMessage::user_with_images(
+                    "Describe this single-pixel test image briefly. Do not call tools.",
+                    vec![InputImage {
+                        media_type: "image/png".to_string(),
+                        data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=".to_string(),
+                    }],
+                )],
+                &catalog,
+                &catalog.gbnf_grammar(),
+            )
+            .unwrap();
+
+        assert!(!output.raw_content.trim().is_empty());
     }
 }
