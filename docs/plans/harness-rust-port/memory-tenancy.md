@@ -5,6 +5,10 @@ Status: Historical convention plus live-drift warning. This records the intended
 partitioning model for Travis's harness memory on the deployed V2 server
 (`rustyredcore-theorem-production`, self-id `rusty-red-graph-database`), but the
 2026-06-16 production check below supersedes the old lowercase assumption.
+2026-06-18 implementation note: runtime memory receipts now preserve the caller's
+tenant casing for new writes, and memory reads inside an already-opened tenant
+partition also check legacy lowercase row metadata for compatibility. Do not use
+this compatibility read as permission to address the lowercased split partition.
 
 NOTE: the memory itself is LIVE DATA in the RustyRed graph store, not in git.
 This file is the durable record of the convention + the operations performed; it
@@ -68,10 +72,9 @@ is recoverable without dominating normal recall.
 
 - A "tenant" is a **keyspace partition** keyed by a sanitized slug, not a row
   with a display name. `GraphStore::tenant(...)` + `tenant_prefix(base, id)`
-  namespace every key; `sanitize_tenant_segment` keeps `[A-Za-z0-9-_]` and drops
-  everything else (so "Travis Gilbert" -> "TravisGilbert"; the clean slug is
-  `travis-gilbert`). There is no separate display-name field: the slug IS the
-  name everywhere (`tenant_slug` in results).
+  namespace every key; `sanitize_tenant_segment` percent-encodes unsafe bytes
+  and preserves ASCII casing. In practice, `Travis-Gilbert` and
+  `travis-gilbert` are different partitions on the deployed store.
 - `default` is the **catch-all** the server uses when no tenant is named. The
   default is env-configurable: `RUSTY_RED_MCP_DEFAULT_TENANT` /
   `RUSTYRED_THG_MCP_DEFAULT_TENANT` (falls back to `"default"`,
@@ -81,10 +84,11 @@ is recoverable without dominating normal recall.
 
 ## The convention (binding)
 
-- **Travis's harness memory belongs under `travis-gilbert`, never the catch-all
-  `default`.** Memory landed in `default` only because un-tenanted writes fall
-  back there.
-- **ALWAYS pass `tenant=travis-gilbert`** on his memory ops (`remember`,
+- **Travis's harness memory belongs under `Travis-Gilbert`, never the
+  lowercased split partition and never the catch-all `default`.** Memory landed
+  in `default` only because un-tenanted writes fall back there; lowercase
+  receipts caused a separate split-read footgun.
+- **ALWAYS pass `tenant=Travis-Gilbert`** on his memory ops (`remember`,
   `recall`, `encode`, `self_note`, `self_revise`, `relate`, `forget`) and on
   `graph_query` reads of his memory.
 - **Do NOT change the global default tenant** (`RUSTY_RED_MCP_DEFAULT_TENANT`
@@ -97,7 +101,7 @@ is recoverable without dominating normal recall.
 
 - **Now** (single real user; the `/mcp` endpoint has no per-user auth): the
   tenant is carried per-call by convention. There is no per-connection tenant
-  binding, so it depends on each session passing `tenant=travis-gilbert`.
+  binding, so it depends on each session passing `tenant=Travis-Gilbert`.
 - **Eventually** (multi-user): tenant is **derived from auth** (bearer token ->
   tenant) so un-tenanted writes can't happen and each user's memory auto-scopes.
   This is the same work as locking the public write endpoint (superset plan
@@ -149,6 +153,6 @@ All via the native MCP verbs over the deployed server; idempotent + reversible.
 
 The leak recurs until auth-derived tenancy lands: any future session that writes
 memory un-tenanted will land in `default` again. Until Lane O3, future sessions
-must pass `tenant=travis-gilbert`, and a periodic sweep (same mechanism above)
+must pass `tenant=Travis-Gilbert`, and a periodic sweep (same mechanism above)
 catches any that slipped. Recorded as cross-session memory in the agent's
 `harness-mcp-v2-split` note.

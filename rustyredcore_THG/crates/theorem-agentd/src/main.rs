@@ -18,7 +18,11 @@ fn main() {
 
 fn run() -> AgentdResult<()> {
     let args = Args::parse(std::env::args().skip(1).collect())?;
-    let config = AgentdConfig::load(&args.config_path)?;
+    let config = if args.config_path_explicit {
+        AgentdConfig::load(&args.config_path)?
+    } else {
+        AgentdConfig::load_or_default(&args.config_path)?
+    };
     let catalog = ToolCatalog::default_catalog();
     if args.print_tool_grammar {
         println!("{}", catalog.gbnf_grammar());
@@ -68,6 +72,7 @@ fn run() -> AgentdResult<()> {
 
 struct Args {
     config_path: PathBuf,
+    config_path_explicit: bool,
     once: Option<String>,
     no_receiver: bool,
     print_tool_grammar: bool,
@@ -77,6 +82,7 @@ struct Args {
 impl Args {
     fn parse(args: Vec<String>) -> AgentdResult<Self> {
         let mut config_path = PathBuf::from("theorem-agentd.toml");
+        let mut config_path_explicit = false;
         let mut once = None;
         let mut no_receiver = false;
         let mut print_tool_grammar = false;
@@ -109,12 +115,14 @@ impl Args {
                 }
                 value => {
                     config_path = PathBuf::from(value);
+                    config_path_explicit = true;
                 }
             }
             i += 1;
         }
         Ok(Self {
             config_path,
+            config_path_explicit,
             once,
             no_receiver,
             print_tool_grammar,
@@ -125,7 +133,7 @@ impl Args {
 
 fn print_help() {
     println!(
-        "usage: theorem-agentd [--once <prompt>] [--capture-once] [--no-receiver] [--print-tool-grammar] [config.toml]"
+        "usage: theorem-agentd [--once <prompt>] [--capture-once] [--no-receiver] [--print-tool-grammar] [config.toml]\n\nIf the implicit theorem-agentd.toml is absent, theorem-agentd starts with no-config local defaults. Explicit config paths must exist."
     );
 }
 
@@ -143,11 +151,13 @@ mod tests {
         .unwrap();
         assert_eq!(args.once, Some("hello".to_string()));
         assert_eq!(args.config_path, PathBuf::from("agentd.toml"));
+        assert!(args.config_path_explicit);
     }
 
     #[test]
     fn parses_no_receiver() {
         let args = Args::parse(vec!["--no-receiver".to_string()]).unwrap();
         assert!(args.no_receiver);
+        assert!(!args.config_path_explicit);
     }
 }

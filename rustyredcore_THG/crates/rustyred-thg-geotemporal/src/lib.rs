@@ -1,6 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use rustyred_thg_core::{NodeRecord, SpatialDesignation, SpatialIndex, TimeInterval};
+use rustyred_thg_core::{
+    AccessMethod, NodeRecord, PluginCapability, PluginCapabilityKind, RustyRedPlugin,
+    SpatialDesignation, SpatialIndex, TimeInterval, TimeSeriesAccessMethod,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -44,6 +48,30 @@ pub struct GeoTemporalIndex {
     indexes: HashMap<TenantSpatialKey, SpatialIndex>,
     intervals: HashMap<(String, NodeId), TimeInterval>,
     labels: HashMap<(String, NodeId), BTreeSet<String>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GeoTemporalAccessPlugin;
+
+impl RustyRedPlugin for GeoTemporalAccessPlugin {
+    fn name(&self) -> &'static str {
+        "rustyred.geotemporal"
+    }
+
+    fn capabilities(&self) -> Vec<PluginCapability> {
+        vec![PluginCapability {
+            kind: PluginCapabilityKind::Index,
+            name: "time_series".to_string(),
+        }]
+    }
+
+    fn access_methods(&self) -> Vec<Arc<dyn AccessMethod>> {
+        vec![Arc::new(TimeSeriesAccessMethod::new())]
+    }
+}
+
+pub fn geotemporal_access_plugin() -> GeoTemporalAccessPlugin {
+    GeoTemporalAccessPlugin
 }
 
 impl GeoTemporalIndex {
@@ -249,6 +277,13 @@ mod tests {
                 end_ms: Some(10)
             })
         );
+    }
+
+    #[test]
+    fn geotemporal_plugin_registers_time_range_access_method() {
+        let plugin = geotemporal_access_plugin();
+        assert_eq!(plugin.capabilities()[0].kind, PluginCapabilityKind::Index);
+        assert_eq!(plugin.access_methods()[0].name(), "time_series");
     }
 
     #[test]

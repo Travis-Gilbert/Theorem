@@ -532,8 +532,16 @@ fn dedup_never_mutates_the_content_graph() {
     assert_eq!(report.same_eclass_edges_written, 1);
 
     assert_eq!(store.stats().nodes_total, nodes_before, "no nodes added");
-    assert_eq!(shadow_count(&store), shadows_before, "no shadows added/removed");
-    assert_eq!(edge_type_count(&store, "CITES"), cites_before, "content edges intact");
+    assert_eq!(
+        shadow_count(&store),
+        shadows_before,
+        "no shadows added/removed"
+    );
+    assert_eq!(
+        edge_type_count(&store, "CITES"),
+        cites_before,
+        "content edges intact"
+    );
     assert_eq!(
         store.get_node("a").cloned().expect("a still exists"),
         a_before,
@@ -548,16 +556,19 @@ fn dedup_same_eclass_edges_feed_shadow_ppr() {
     // CUT 9 payoff: SameEClass edges are part of the shadow-PPR adjacency, so a
     // seed at one class member reaches the representative through the new edge.
     let mut store = InMemoryGraphStore::new();
-    store.upsert_node(claim("a", "the model converged")).unwrap();
-    store.upsert_node(claim("b", "the model converged")).unwrap();
+    store
+        .upsert_node(claim("a", "the model converged"))
+        .unwrap();
+    store
+        .upsert_node(claim("b", "the model converged"))
+        .unwrap();
     run_structural(&mut store, &["a", "b"], vec![]);
     // No SUPPORTS/UNDERCUTS were inferred (no candidate pairs), so the only
     // shadow-to-shadow edge after dedup is SameEClass.
     let report =
         epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).expect("dedup");
     let rep = report.classes[0].representative_shadow_id.clone();
-    let member = report
-        .classes[0]
+    let member = report.classes[0]
         .member_shadow_ids
         .iter()
         .find(|id| **id != rep)
@@ -565,12 +576,12 @@ fn dedup_same_eclass_edges_feed_shadow_ppr() {
         .expect("a non-representative member");
 
     // Seed the member's content node; PPR should rank the representative shadow.
-    let member_content = if epistemic_shadow_node_id("a", DEFAULT_EPISTEMIC_ENGINE_VERSION) == member
-    {
-        "a"
-    } else {
-        "b"
-    };
+    let member_content =
+        if epistemic_shadow_node_id("a", DEFAULT_EPISTEMIC_ENGINE_VERSION) == member {
+            "a"
+        } else {
+            "b"
+        };
     let mut seeds = HashMap::new();
     seeds.insert(member_content.to_string(), 1.0);
     let ranking = epistemic_shadow_ppr(&store, &seeds, 10, 0.85, 1e-6, 5000);
@@ -596,7 +607,9 @@ fn dedup_surfaces_through_recall_readout_and_is_idempotent() {
     let member = if rep == "a" { "b" } else { "a" };
 
     let member_readout = read_epistemic_shadow(&store, member).expect("member shadow");
-    let same = member_readout.same_eclass.expect("member carries same_eclass");
+    let same = member_readout
+        .same_eclass
+        .expect("member carries same_eclass");
     assert_eq!(
         same.representative_shadow_id,
         epistemic_shadow_node_id(&rep, DEFAULT_EPISTEMIC_ENGINE_VERSION)
@@ -623,21 +636,37 @@ fn dedup_claim_and_standing_default_keeps_in_and_out_apart() {
     // as part of the state, so an attacked (`out`) claim is not merged with an
     // unattacked (`in`) copy of the same proposition.
     let mut store = InMemoryGraphStore::new();
-    store.upsert_node(claim("win", "rollout is healthy")).unwrap();
-    store.upsert_node(claim("lose", "rollout is healthy")).unwrap();
-    store.upsert_node(claim("atk", "rollout is broken")).unwrap();
     store
-        .upsert_edge(EdgeRecord::new("a", "atk", "CONTRADICTS", "lose", json!({})))
+        .upsert_node(claim("win", "rollout is healthy"))
+        .unwrap();
+    store
+        .upsert_node(claim("lose", "rollout is healthy"))
+        .unwrap();
+    store
+        .upsert_node(claim("atk", "rollout is broken"))
+        .unwrap();
+    store
+        .upsert_edge(EdgeRecord::new(
+            "a",
+            "atk",
+            "CONTRADICTS",
+            "lose",
+            json!({}),
+        ))
         .unwrap();
     run_structural(&mut store, &["win", "lose", "atk"], vec![]);
 
     // Sanity: lose is grounded out, win is in.
     assert_eq!(
-        read_epistemic_shadow(&store, "lose").unwrap().grounded_extension_status,
+        read_epistemic_shadow(&store, "lose")
+            .unwrap()
+            .grounded_extension_status,
         GroundedExtensionStatus::Out
     );
     assert_eq!(
-        read_epistemic_shadow(&store, "win").unwrap().grounded_extension_status,
+        read_epistemic_shadow(&store, "win")
+            .unwrap()
+            .grounded_extension_status,
         GroundedExtensionStatus::In
     );
 
@@ -653,11 +682,23 @@ fn dedup_claim_and_standing_default_keeps_in_and_out_apart() {
 
     // ClaimOnly ignores standing and merges them.
     let mut store2 = InMemoryGraphStore::new();
-    store2.upsert_node(claim("win", "rollout is healthy")).unwrap();
-    store2.upsert_node(claim("lose", "rollout is healthy")).unwrap();
-    store2.upsert_node(claim("atk", "rollout is broken")).unwrap();
     store2
-        .upsert_edge(EdgeRecord::new("a", "atk", "CONTRADICTS", "lose", json!({})))
+        .upsert_node(claim("win", "rollout is healthy"))
+        .unwrap();
+    store2
+        .upsert_node(claim("lose", "rollout is healthy"))
+        .unwrap();
+    store2
+        .upsert_node(claim("atk", "rollout is broken"))
+        .unwrap();
+    store2
+        .upsert_edge(EdgeRecord::new(
+            "a",
+            "atk",
+            "CONTRADICTS",
+            "lose",
+            json!({}),
+        ))
         .unwrap();
     run_structural(&mut store2, &["win", "lose", "atk"], vec![]);
     let claim_only = epistemic_egraph_dedup(
@@ -704,7 +745,12 @@ fn dedup_congruence_runs_at_scale_beyond_default_node_limit() {
     for i in 0..pairs {
         let prop = format!("proposition number {i} holds");
         plant_shadow(&mut store, &format!("p{i}"), &prop, "in");
-        plant_shadow(&mut store, &format!("d{i}"), &format!("not not {prop}"), "in");
+        plant_shadow(
+            &mut store,
+            &format!("d{i}"),
+            &format!("not not {prop}"),
+            "in",
+        );
     }
 
     let report =

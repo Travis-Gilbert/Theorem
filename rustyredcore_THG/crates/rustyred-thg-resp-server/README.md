@@ -1,5 +1,11 @@
 # rustyred-thg-resp-server
 
+RESP protocol server for RustyRedCore-THG ordered-index commands.
+
+## What it is
+
+`rustyred-thg-resp-server` is a small Tokio RESP command loop over `OrderedIndexRegistry`. It accepts Redis-shaped commands, parses both array and whitespace command forms, executes ordered-index protocol operations, and returns RESP-encoded responses for focused compatibility and smoke testing.
+
 ## Build and test
 
 ```bash

@@ -1305,18 +1305,17 @@ fn consolidation_key(node: &NodeRecord) -> String {
 /// This MUST resolve to the same id the write path (`theorem-harness-runtime::memory`)
 /// produces, because the membership edge `member --MEMORY_IN_PROJECT--> anchor` is
 /// written there and read here: recall only sees the edge when this id matches the
-/// edge's `to_id`. The write path slugifies the project segment and lowercases the
-/// tenant, so a trim-only id here would silently miss the membership for any slug with
-/// caps/spaces/punctuation (the bias would vanish with no error). We therefore mirror
-/// the write path's normalization exactly. A cross-crate parity test
+/// edge's `to_id`. The write path preserves tenant casing because the deployed graph
+/// partitions are case-sensitive, while slugifying the project segment. We therefore
+/// mirror the write path's normalization exactly. A cross-crate parity test
 /// (`theorem-harness-runtime/tests/project_anchor_parity.rs`) fails if the two ever drift.
 pub fn project_anchor_node_id(tenant_id: &str, project_slug: &str) -> String {
     let tenant = {
-        let normalized = tenant_id.trim().to_lowercase();
+        let normalized = tenant_id.trim();
         if normalized.is_empty() {
             "default".to_string()
         } else {
-            normalized
+            normalized.to_string()
         }
     };
     let slug = {
@@ -1439,8 +1438,26 @@ fn normalized_tenant_pair(tenant_id: &str, tenant_slug: &str) -> String {
 fn node_matches_tenant(node: &NodeRecord, tenant_id: &str) -> bool {
     prop_str(&node.properties, "tenant_id")
         .or_else(|| prop_str(&node.properties, "tenant_slug"))
-        .map(|value| value == tenant_id)
+        .map(|value| {
+            tenant_aliases(tenant_id)
+                .iter()
+                .any(|alias| alias == &value)
+        })
         .unwrap_or(false)
+}
+
+fn tenant_aliases(tenant_id: &str) -> Vec<String> {
+    let canonical = if tenant_id.trim().is_empty() {
+        "default".to_string()
+    } else {
+        tenant_id.trim().to_string()
+    };
+    let legacy_lowercase = canonical.to_lowercase();
+    if legacy_lowercase == canonical {
+        vec![canonical]
+    } else {
+        vec![canonical, legacy_lowercase]
+    }
 }
 
 fn lexical_score(query: &str, node: &NodeRecord) -> f64 {

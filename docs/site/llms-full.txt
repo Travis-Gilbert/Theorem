@@ -1,0 +1,92 @@
+# Theorem agent onboarding
+
+This file is the single source a coding agent can read to get started on
+Theorem. It is intentionally operational: choose the right front door, ground in
+the repo, and prove changes with the narrowest real oracle.
+
+## First commands
+
+```bash
+git pull
+sed -n '1,220p' AGENTS.md
+sed -n '1,220p' CLAUDE.md
+```
+
+The repo root is the working directory. There is no root Cargo workspace.
+`rustyredcore_THG/` is the main Cargo workspace; apps under `apps/` are mostly
+standalone roots.
+
+## Fast developer install
+
+Use the `theorem` wrapper as the dev front door:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Travis-Gilbert/Theorem/main/scripts/install.sh | bash
+theorem init
+theorem once "hello from Theorem"
+```
+
+`theorem init` writes a no-secret starter `theorem-agentd.toml`. It uses:
+
+- deterministic `rule` model provider
+- local MCP URL `http://127.0.0.1:8380/mcp`
+- tenant slug `Travis-Gilbert`
+- receiver, capture, and relay disabled
+- ledger `.theorem/agentd-token-ledger.jsonl`
+
+Do not put secrets in TOML, docs, AGENTS.md, or committed files. Hosted sync is
+opt-in. If a live model is needed, set `[model].provider = "openai-compatible"`
+and point it at a local OpenAI-compatible endpoint; keep API keys in environment
+variables.
+
+## Human front door
+
+The desktop app lives at `apps/desktop/`. It is the human-facing local-first
+front door. The CLI is for developers and agents; the desktop is for people.
+
+## Common build and test oracles
+
+```bash
+cd rustyredcore_THG && cargo test -p theorem-agentd
+cd rustyredcore_THG && cargo test -p theorem-harness-core
+cd rustyredcore_THG && cargo test -p theorem-harness-runtime
+cd apps/theorem-harness-node && npm run build:debug && npm run smoke
+```
+
+Pick the oracle for the files you changed. Do not claim product success from
+code inspection alone.
+
+## Harness rules
+
+- Tenant slug is `Travis-Gilbert`.
+- Use the Harness for grounded work: recall before answering past-decision
+  questions, announce coordination footprint when multiple heads may overlap,
+  and encode only load-bearing decisions or reusable lessons.
+- Coordinate by footprint, not file ownership.
+- If another head already has dirty changes, preserve them and keep edits scoped.
+
+## Repository map
+
+- `rustyredcore_THG/crates/theorem-agentd/`: local assistant daemon and MCP tool
+  host; the `theorem` wrapper starts this.
+- `rustyredcore_THG/crates/theorem-receiver/`: dispatch receiver that launches
+  Claude or Codex sessions from jobs.
+- `rustyredcore_THG/crates/theorem-harness-core/`: pure harness kernel.
+- `rustyredcore_THG/crates/theorem-harness-runtime/`: GraphStore-backed runtime,
+  memory, jobs, and coordination persistence.
+- `rustyredcore_THG/crates/rustyred-thg-mcp/`: MCP server surface at `POST /mcp`.
+- `apps/theorem-harness-server/`: HTTP transport for runs, rooms, mentions,
+  jobs, and push/SSE.
+- `apps/desktop/`: Tauri + React desktop shell.
+- `docs/site/`: public docs.
+- `docs/plans/`: implementation plans and handoffs.
+
+## Editing discipline
+
+Read the named spec or source before editing. If a spec names a path, signature,
+or reference output, treat that as a requirement by position. For Rust work,
+prefer focused package tests from the relevant workspace. For UI work, preserve
+tokens, focus states, reduced motion, and measured accessibility claims.
+
+Commits use `<type>(<scope>): <description>`, with a required scope. Do not add
+`Co-Authored-By` lines.

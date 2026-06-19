@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
+use crate::tenant::normalize_tenant_slug;
 use rustyred_thg_core::{EdgeRecord, GraphStore, GraphStoreError, NodeRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -160,10 +161,10 @@ pub fn canonicalize_on_write<S: GraphStore>(
     store: &mut S,
     input: CanonicalizeOnWriteInput,
 ) -> CanonicalWriteResult<CanonicalWriteReceipt> {
-    let tenant = normalize_tenant(&input.tenant_slug);
     validate_fact(&input.fact)?;
     validate_nominations(&input.nominations)?;
     validate_aliases(&input.aliases)?;
+    let tenant = require_tenant(&input.tenant_slug)?;
 
     let canonical_node_id =
         canonical_fact_node_id(&tenant, &input.fact.fact_type, &input.fact.canonical_key);
@@ -446,12 +447,17 @@ fn dedupe_aliases(aliases: &[AliasWitness]) -> Vec<&AliasWitness> {
 }
 
 fn normalize_tenant(tenant: &str) -> String {
-    let trimmed = tenant.trim();
-    if trimmed.is_empty() {
-        "default".to_string()
-    } else {
-        trimmed.to_string()
+    normalize_tenant_slug(tenant)
+}
+
+fn require_tenant(tenant: &str) -> CanonicalWriteResult<String> {
+    if tenant.trim().is_empty() {
+        return Err(CanonicalWriteError::InvalidInput {
+            field: "tenant_slug".to_string(),
+            message: "is required".to_string(),
+        });
     }
+    Ok(normalize_tenant_slug(tenant))
 }
 
 fn timestamp_or_now(value: &str) -> String {
@@ -608,6 +614,31 @@ mod tests {
             .expect("embedding nomination edge exists");
         assert_eq!(edge.edge_type, EDGE_EMBEDDING_NOMINATED);
         assert_eq!(edge.to_id, receipt.canonical_node_id);
+    }
+
+    #[test]
+    fn valid_canonical_write_requires_tenant() {
+        let mut store = InMemoryGraphStore::new();
+        let error = canonicalize_on_write(
+            &mut store,
+            CanonicalizeOnWriteInput {
+                fact: fact("tenant-required"),
+                ..CanonicalizeOnWriteInput::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CanonicalWriteError::InvalidInput { ref field, .. } if field == "tenant_slug"
+        ));
+        assert!(store
+            .get_node(&canonical_fact_node_id(
+                "default",
+                "project_decision",
+                "tenant-required"
+            ))
+            .is_none());
     }
 
     #[test]

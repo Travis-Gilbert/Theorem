@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::access_method::AccessMethod;
 use crate::graph_store::{GraphStoreError, GraphStoreResult, RedCoreGraphStore};
 use crate::hooks::HookRegistration;
 
@@ -65,6 +66,13 @@ pub trait RustyRedPlugin: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
+    /// Planner-facing access methods supplied by index-capability plugins.
+    /// Command dispatch remains available for direct operations; this seam lets
+    /// the relational planner ask loaded indexes for cost and row-id scans.
+    fn access_methods(&self) -> Vec<Arc<dyn AccessMethod>> {
+        Vec::new()
+    }
+
     /// Graph-level hooks this plugin registers. Default empty so existing
     /// plugins compile unchanged. The registry collects these at init; an
     /// embedder feeds them to a `crate::hooks::HookDispatcher`.
@@ -73,10 +81,28 @@ pub trait RustyRedPlugin: Send + Sync + std::fmt::Debug {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PluginRegistry {
     plugins: Vec<Arc<dyn RustyRedPlugin>>,
     operations: BTreeMap<String, PluginOperationRegistration>,
+    access_methods: Vec<Arc<dyn AccessMethod>>,
+}
+
+impl std::fmt::Debug for PluginRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginRegistry")
+            .field("plugins", &self.plugins.len())
+            .field("operations", &self.operations)
+            .field(
+                "access_methods",
+                &self
+                    .access_methods
+                    .iter()
+                    .map(|method| method.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl PluginRegistry {
@@ -89,6 +115,7 @@ impl PluginRegistry {
         for operation in plugin.operations() {
             self.insert_operation(operation);
         }
+        self.access_methods.extend(plugin.access_methods());
         self.plugins.push(plugin);
     }
 
@@ -122,6 +149,13 @@ impl PluginRegistry {
 
     pub fn operations(&self) -> Vec<&PluginOperationRegistration> {
         self.operations.values().collect()
+    }
+
+    pub fn access_methods(&self) -> Vec<&dyn AccessMethod> {
+        self.access_methods
+            .iter()
+            .map(|method| method.as_ref() as &dyn AccessMethod)
+            .collect()
     }
 
     pub fn execute(
@@ -218,6 +252,7 @@ fn plugin_arg_bool(arguments: &Value, keys: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access_method::OrderedAccessMethod;
 
     #[derive(Debug)]
     struct NoopPlugin;
@@ -280,5 +315,34 @@ mod tests {
         assert_eq!(output.command, "RUSTYRED_THG.PLUGIN.ECHO");
         assert!(!output.writes_graph);
         assert_eq!(output.result["arguments"]["value"], 1);
+    }
+
+    #[derive(Debug)]
+    struct IndexPlugin;
+
+    impl RustyRedPlugin for IndexPlugin {
+        fn name(&self) -> &'static str {
+            "test.index"
+        }
+
+        fn capabilities(&self) -> Vec<PluginCapability> {
+            vec![PluginCapability {
+                kind: PluginCapabilityKind::Index,
+                name: "ordered".to_string(),
+            }]
+        }
+
+        fn access_methods(&self) -> Vec<Arc<dyn AccessMethod>> {
+            vec![Arc::new(OrderedAccessMethod::new())]
+        }
+    }
+
+    #[test]
+    fn registry_exposes_index_plugin_access_methods() {
+        let mut registry = PluginRegistry::new();
+        registry.register(IndexPlugin);
+
+        assert_eq!(registry.capabilities()[0].kind, PluginCapabilityKind::Index);
+        assert_eq!(registry.access_methods()[0].name(), "ordered");
     }
 }

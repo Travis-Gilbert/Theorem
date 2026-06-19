@@ -2,6 +2,25 @@
 
 Theorem is a polyglot repository with no single root build. You pick the workspace or crate for the task. This page covers the most common entry points.
 
+## Fast path: install the dev front door
+
+For a fresh developer machine, install the `theorem` wrapper and start
+`theorem-agentd` with no-secret defaults:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Travis-Gilbert/Theorem/main/scripts/install.sh | bash
+theorem init
+theorem once "hello from Theorem"
+```
+
+The generated `theorem-agentd.toml` uses the deterministic rule provider, the
+local MCP route (`http://127.0.0.1:8380/mcp`), tenant `Travis-Gilbert`, and no
+bearer/model env vars. Hosted sync and OpenAI-compatible local models are opt-in
+edits once those surfaces are available.
+
+For agent self-onboarding, point Codex, Claude Code, or another coding head at
+[`llms-full.txt`](llms-full.txt).
+
 ## Layout in one minute
 
 - `rustyredcore_THG/` is the main Cargo workspace: the graph engine, the harness kernel and runtime, and the PyO3 bridge. Its crates live in `rustyredcore_THG/crates/`.

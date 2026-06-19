@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly DEFAULT_SOURCE_DIR="$HOME/.theorem/source"
+readonly THEOREM_HOME_DIR="${THEOREM_HOME:-$HOME/.theorem}"
+readonly PID_FILE="$THEOREM_HOME_DIR/agentd.pid"
+readonly OUT_LOG="$THEOREM_HOME_DIR/agentd.out.log"
+readonly ERR_LOG="$THEOREM_HOME_DIR/agentd.err.log"
+
+usage() {
+    cat <<'EOF'
+usage: theorem <command> [args]
+
+Commands:
+  init [--force] [dir]     Create a no-secret starter config and first-turn note.
+  start [agentd args...]   Start theorem-agentd in the foreground.
+  once <prompt>            Run one theorem-agentd turn and print the transcript.
+  stop                     Stop the background agentd started by install.sh.
+  status                   Show background agentd status and source checkout.
+  logs                     Tail background agentd logs.
+  doctor                   Check local prerequisites and repo discovery.
+  agentd [args...]         Pass arguments directly to theorem-agentd.
+  repo                     Print the source checkout used by this wrapper.
+EOF
+}
+
+log() {
+    printf '[theorem] %s\n' "$*" >&2
+}
+
+find_repo() {
+    if [[ -n "${THEOREM_REPO:-}" && -f "$THEOREM_REPO/rustyredcore_THG/Cargo.toml" ]]; then
+        printf '%s\n' "$THEOREM_REPO"
+        return 0
+    fi
+
+    local dir=$PWD
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/rustyredcore_THG/Cargo.toml" ]]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+
+    local script_repo
+    script_repo="$(cd "$SCRIPT_DIR/.." && pwd)"
+    if [[ -f "$script_repo/rustyredcore_THG/Cargo.toml" ]]; then
+        printf '%s\n' "$script_repo"
+        return 0
+    fi
+
+    if [[ -f "$DEFAULT_SOURCE_DIR/rustyredcore_THG/Cargo.toml" ]]; then
+        printf '%s\n' "$DEFAULT_SOURCE_DIR"
+        return 0
+    fi
+
+    log "cannot find a Theorem checkout. Set THEOREM_REPO or run scripts/install.sh."
+    return 1
+}
+
+agentd_config_arg() {
+    if [[ -n "${THEOREM_AGENTD_CONFIG:-}" ]]; then
+        printf '%s\n' "$THEOREM_AGENTD_CONFIG"
+        return 0
+    fi
+
+    if [[ -f "$PWD/theorem-agentd.toml" ]]; then
+        printf '%s\n' "$PWD/theorem-agentd.toml"
+        return 0
+    fi
+
+    return 1
+}
+
+run_agentd() {
+    local repo
+    repo="$(find_repo)"
+    cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd -- "$@"
+}
+
+exec_agentd() {
+    local repo
+    repo="$(find_repo)"
+    exec cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd -- "$@"
+}
+
+write_agentd_config() {
+    local file=$1
+    local force=$2
+    if [[ -f "$file" && "$force" != "true" ]]; then
+        log "kept existing $file"
+        return 0
+    fi
+
+    cat >"$file" <<'EOF'
+# Created by `theorem init`.
+# Safe first-run config: no bearer token, model API key, or data-dir env var.
+
+default_room_id = "repo:theorem:branch:main"
+actor = "theorem-agentd"
+operator_memory_tenant = "Travis-Gilbert"
+
+[model]
+provider = "rule"
+temperature = 0.2
+max_tokens = 1200
+request_timeout_secs = 120
+grammar_constrained = true
+
+# To use a resident OpenAI-compatible model:
+#
+# provider = "openai-compatible"
+# base_url = "http://127.0.0.1:8080"
+# model = "gemma-4-12b-it-q4"
+# api_key_env = "THEOREM_MODEL_API_KEY"
+#
+# Put real secrets in environment variables, never in this file.
+
+[harness]
+name = "harness"
+url = "http://127.0.0.1:8380/mcp"
+tenant_slug = "Travis-Gilbert"
+
+# Hosted sync is opt-in. For the hosted Theorem MCP, change url to:
+# url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
+
+[receiver]
+enabled = false
+config_path = "theorem-receiver.toml"
+
+[loop_config]
+max_iterations = 8
+tick_interval_secs = 60
+storm_guard_window_secs = 600
+
+[ledger]
+path = ".theorem/agentd-token-ledger.jsonl"
+mirror_to_graph = true
+
+[capture]
+enabled = false
+repo = "Travis-Gilbert/theorem"
+dispatched_subtask_title = "dispatched"
+
+[relay]
+enabled = false
+EOF
+}
+
+write_first_turn_note() {
+    local file=$1
+    local force=$2
+    if [[ -f "$file" && "$force" != "true" ]]; then
+        log "kept existing $file"
+        return 0
+    fi
+
+    cat >"$file" <<'EOF'
+# First Theorem turn
+
+Run a no-secret smoke:
+
+```bash
+theorem once "hello from Theorem"
+```
+
+That prints a JSON transcript and writes `.theorem/agentd-token-ledger.jsonl`.
+When you are ready for live model decisions, edit `theorem-agentd.toml` and set
+`[model].provider = "openai-compatible"` plus your local model endpoint.
+EOF
+}
+
+cmd_init() {
+    local force=false
+    local target_dir=.
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force)
+                force=true
+                ;;
+            -h | --help)
+                printf 'usage: theorem init [--force] [dir]\n'
+                return 0
+                ;;
+            -*)
+                log "unknown init flag $1"
+                return 1
+                ;;
+            *)
+                target_dir=$1
+                ;;
+        esac
+        shift
+    done
+
+    mkdir -p "$target_dir/.theorem/examples"
+    write_agentd_config "$target_dir/theorem-agentd.toml" "$force"
+    write_first_turn_note "$target_dir/.theorem/examples/first-turn.md" "$force"
+    log "initialized $target_dir"
+    log "next: cd $target_dir && theorem once \"hello from Theorem\""
+}
+
+cmd_once() {
+    if [[ $# -lt 1 ]]; then
+        log "once requires a prompt"
+        return 1
+    fi
+    local prompt=$1
+    shift
+    local word
+    for word in "$@"; do
+        prompt+=" $word"
+    done
+    local config_path
+    if config_path="$(agentd_config_arg)"; then
+        run_agentd --once "$prompt" "$config_path"
+    else
+        run_agentd --once "$prompt"
+    fi
+}
+
+cmd_start() {
+    mkdir -p "$THEOREM_HOME_DIR"
+    local config_path
+    if [[ $# -eq 0 ]] && config_path="$(agentd_config_arg)"; then
+        exec_agentd "$config_path"
+    fi
+    exec_agentd "$@"
+}
+
+cmd_stop() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        log "no pid file at $PID_FILE"
+        return 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid"
+        log "stopped agentd pid $pid"
+    else
+        log "agentd pid $pid is not running"
+    fi
+    rm -f "$PID_FILE"
+}
+
+cmd_status() {
+    local repo
+    repo="$(find_repo)"
+    printf 'source: %s\n' "$repo"
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid="$(cat "$PID_FILE")"
+        if kill -0 "$pid" 2>/dev/null; then
+            printf 'agentd: running (pid %s)\n' "$pid"
+            return 0
+        fi
+        printf 'agentd: stale pid file (%s)\n' "$pid"
+        return 0
+    fi
+    printf 'agentd: not started by install.sh\n'
+}
+
+cmd_logs() {
+    mkdir -p "$THEOREM_HOME_DIR"
+    touch "$OUT_LOG" "$ERR_LOG"
+    tail -f "$OUT_LOG" "$ERR_LOG"
+}
+
+cmd_doctor() {
+    local ok=true
+    if ! command -v cargo >/dev/null 2>&1; then
+        log "cargo not found"
+        ok=false
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        log "git not found"
+        ok=false
+    fi
+    if find_repo >/dev/null; then
+        log "source checkout: $(find_repo)"
+    else
+        ok=false
+    fi
+    if [[ "$ok" == "true" ]]; then
+        log "doctor passed"
+        return 0
+    fi
+    return 1
+}
+
+main() {
+    local command=${1:-help}
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+
+    case "$command" in
+        init)
+            cmd_init "$@"
+            ;;
+        start)
+            cmd_start "$@"
+            ;;
+        once)
+            cmd_once "$@"
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        status)
+            cmd_status
+            ;;
+        logs)
+            cmd_logs
+            ;;
+        doctor)
+            cmd_doctor
+            ;;
+        agentd)
+            run_agentd "$@"
+            ;;
+        repo)
+            find_repo
+            ;;
+        help | -h | --help)
+            usage
+            ;;
+        *)
+            log "unknown command $command"
+            usage >&2
+            return 1
+            ;;
+    esac
+}
+
+main "$@"

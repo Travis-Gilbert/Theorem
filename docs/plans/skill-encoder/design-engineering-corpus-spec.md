@@ -118,3 +118,9 @@ Validation Defaults: the css_static and token_lint runner invocations, axe_rende
 - A component fixture lift exists: at minimum the APG-pattern fixtures ship as `design_component_fixture` artifacts with content hashes chained.
 - The pack compiles to `skill-pack:design-engineering-general-v0.1` with honest provenance (scanned, promotion block populated) and exports to the marketplace layout.
 - The 20-task held-out set exists; the gate runs on the static axes and records which axes were scored.
+
+## Implementation Notes
+
+- Considered: adding a standalone Python helper package vs a Theorem-native crate.
+- Chose: `rustyredcore_THG/crates/design-check`, mirroring `prose-check`, because this checkout already carries the Rust `SkillPack` publishing/apply path while `apps/notebook/encode/` is not present here.
+- The first landed slice implements real `css_static` and `token_lint` fixture checks, CSS and token lowering, WCAG contrast math, APG fixture artifacts, corpus packet metadata, the 20-task held-out manifest, honest pending `axe_render`/`apg_behavioral` declarations, and a pack payload for `skill-pack:design-engineering-general-v0.1`.

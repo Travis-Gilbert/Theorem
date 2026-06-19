@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph_store::{GraphStoreError, GraphStoreResult};
 use crate::object_store::safe_filename;
+use crate::ordered::{OrderedIndex, OrderedMode};
 use crate::state::stable_hash;
 
 /// Which tier a record currently lives in.
@@ -155,6 +156,122 @@ impl ColdIndex for InMemoryColdIndex {
 
     fn len(&self) -> usize {
         self.entries.lock().map(|map| map.len()).unwrap_or(0)
+    }
+}
+
+/// Native ordered-index-backed cold residency catalog. This is the in-process
+/// replacement for the Postgres hot-path adapter: id lookups stay keyed in RAM,
+/// while scope membership is maintained through [`OrderedIndex`] so promotion,
+/// rehydration, and scope scans do not leave the process.
+#[derive(Clone, Debug, Default)]
+pub struct OrderedColdIndex {
+    state: Arc<Mutex<OrderedColdIndexState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct OrderedColdIndexState {
+    entries: BTreeMap<String, ColdIndexEntry>,
+    scopes: BTreeMap<String, ColdScopeEntry>,
+    scope_members: BTreeMap<String, OrderedIndex>,
+    seq: u64,
+}
+
+impl OrderedColdIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn ids_for_scope(&self, scope: &str, limit: usize) -> GraphStoreResult<Vec<String>> {
+        let state = self.state.lock().map_err(poisoned)?;
+        let Some(index) = state.scope_members.get(scope) else {
+            return Ok(Vec::new());
+        };
+        let cap = if limit == 0 { usize::MAX } else { limit };
+        index
+            .entries()
+            .into_iter()
+            .take(cap)
+            .map(|(member, _)| {
+                String::from_utf8(member)
+                    .map_err(|error| GraphStoreError::new("cold_index_member", error.to_string()))
+            })
+            .collect()
+    }
+}
+
+impl ColdIndex for OrderedColdIndex {
+    fn record(&self, entry: ColdIndexEntry) -> GraphStoreResult<()> {
+        let mut state = self.state.lock().map_err(poisoned)?;
+        let previous_scope = state
+            .entries
+            .get(&entry.id)
+            .map(|previous| previous.scope.clone());
+        if let Some(previous_scope) = previous_scope {
+            if previous_scope != entry.scope {
+                if let Some(index) = state.scope_members.get_mut(&previous_scope) {
+                    index.zrem(entry.id.as_bytes());
+                }
+            }
+        }
+        state.seq = state.seq.saturating_add(1);
+        let score = state.seq as f64;
+        state
+            .scope_members
+            .entry(entry.scope.clone())
+            .or_insert_with(|| OrderedIndex::new(OrderedMode::Persistent))
+            .zadd(entry.id.as_bytes().to_vec(), score)?;
+        state.entries.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    fn lookup(&self, id: &str) -> GraphStoreResult<Option<ColdIndexEntry>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(poisoned)?
+            .entries
+            .get(id)
+            .cloned())
+    }
+
+    fn remove(&self, id: &str) -> GraphStoreResult<()> {
+        let mut state = self.state.lock().map_err(poisoned)?;
+        if let Some(entry) = state.entries.remove(id) {
+            if let Some(index) = state.scope_members.get_mut(&entry.scope) {
+                index.zrem(id.as_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    fn record_scope(&self, entry: ColdScopeEntry) -> GraphStoreResult<()> {
+        let mut state = self.state.lock().map_err(poisoned)?;
+        state.scopes.insert(entry.scope.clone(), entry);
+        Ok(())
+    }
+
+    fn scope(&self, scope: &str) -> GraphStoreResult<Option<ColdScopeEntry>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(poisoned)?
+            .scopes
+            .get(scope)
+            .cloned())
+    }
+
+    fn remove_scope(&self, scope: &str) -> GraphStoreResult<()> {
+        let mut state = self.state.lock().map_err(poisoned)?;
+        state.scopes.remove(scope);
+        state.scope_members.remove(scope);
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.entries.len())
+            .unwrap_or(0)
     }
 }
 
@@ -318,5 +435,34 @@ mod tests {
         assert_eq!(scope.node_ids.len(), 2);
         index.remove_scope("repo:theorem").unwrap();
         assert_eq!(index.scope("repo:theorem").unwrap(), None);
+    }
+
+    #[test]
+    fn ordered_cold_index_keeps_hot_path_native_and_scope_ordered() {
+        let index = OrderedColdIndex::new();
+        index
+            .record(ColdIndexEntry::cold("mem:a", "tenant:a", "sha256:a"))
+            .unwrap();
+        index
+            .record(ColdIndexEntry::cold("mem:b", "tenant:a", "sha256:b"))
+            .unwrap();
+        index
+            .record(ColdIndexEntry::cold("mem:c", "tenant:b", "sha256:c"))
+            .unwrap();
+
+        assert_eq!(
+            index.lookup("mem:a").unwrap().unwrap().object_hash,
+            "sha256:a"
+        );
+        assert_eq!(
+            index.ids_for_scope("tenant:a", 0).unwrap(),
+            vec!["mem:a".to_string(), "mem:b".to_string()]
+        );
+        index.remove("mem:a").unwrap();
+        assert_eq!(index.lookup("mem:a").unwrap(), None);
+        assert_eq!(
+            index.ids_for_scope("tenant:a", 0).unwrap(),
+            vec!["mem:b".to_string()]
+        );
     }
 }

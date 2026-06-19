@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::graph_store::{GraphStoreError, GraphStoreResult};
 use crate::versioned_graph::{CompiledGraphPack, GraphContentObject};
+use serde::{de::DeserializeOwned, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Durable, content-addressed home for the cold tail.
 ///
@@ -116,6 +118,7 @@ impl DiskObjectStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("objects")).map_err(io_err("create objects dir"))?;
         fs::create_dir_all(root.join("packs")).map_err(io_err("create packs dir"))?;
+        fs::create_dir_all(root.join("documents")).map_err(io_err("create documents dir"))?;
         Ok(Self { root })
     }
 
@@ -131,6 +134,12 @@ impl DiskObjectStore {
             .join(format!("{}.json", safe_filename(commit_hash)))
     }
 
+    pub fn document_path(&self, content_hash: &str) -> PathBuf {
+        self.root
+            .join("documents")
+            .join(format!("{}.zst", safe_filename(content_hash)))
+    }
+
     /// Atomic write: serialize to a sibling `.tmp` then rename, so a crash mid-
     /// write never leaves a half-written object at a content address.
     fn write_atomic(path: &Path, bytes: &[u8]) -> GraphStoreResult<()> {
@@ -138,6 +147,29 @@ impl DiskObjectStore {
         fs::write(&tmp, bytes).map_err(io_err("write cold object tmp"))?;
         fs::rename(&tmp, path).map_err(io_err("rename cold object"))?;
         Ok(())
+    }
+
+    /// Store arbitrary document bytes under sha256(raw bytes). The on-disk
+    /// representation is zstd-compressed, but the address stays the raw-body
+    /// content hash so compression never changes identity.
+    pub fn put_document_bytes(&self, body: &[u8]) -> GraphStoreResult<String> {
+        let hash = content_hash_bytes(body);
+        let path = self.document_path(&hash);
+        if path.exists() {
+            return Ok(hash);
+        }
+        let bytes = compress_cold_bytes(body)?;
+        Self::write_atomic(&path, &bytes)?;
+        Ok(hash)
+    }
+
+    pub fn get_document_bytes(&self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+        let path = self.document_path(content_hash);
+        match fs::read(&path) {
+            Ok(bytes) => decompress_or_raw(&bytes).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_err("read cold document")(error)),
+        }
     }
 }
 
@@ -147,17 +179,14 @@ impl ColdObjectStore for DiskObjectStore {
         if path.exists() {
             return Ok(()); // content-addressed: already durable
         }
-        let bytes = serde_json::to_vec(object)
-            .map_err(|error| GraphStoreError::new("cold_object_encode", error.to_string()))?;
+        let bytes = encode_compressed_json(object, "cold_object_encode")?;
         Self::write_atomic(&path, &bytes)
     }
 
     fn get_object(&self, hash: &str) -> GraphStoreResult<Option<GraphContentObject>> {
         let path = self.object_path(hash);
         match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|error| GraphStoreError::new("cold_object_decode", error.to_string())),
+            Ok(bytes) => decode_compressed_json(&bytes, "cold_object_decode").map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(io_err("read cold object")(error)),
         }
@@ -165,17 +194,14 @@ impl ColdObjectStore for DiskObjectStore {
 
     fn put_pack(&self, pack: &CompiledGraphPack) -> GraphStoreResult<()> {
         let path = self.pack_path(&pack.commit.commit_hash);
-        let bytes = serde_json::to_vec(pack)
-            .map_err(|error| GraphStoreError::new("cold_pack_encode", error.to_string()))?;
+        let bytes = encode_compressed_json(pack, "cold_pack_encode")?;
         Self::write_atomic(&path, &bytes)
     }
 
     fn get_pack(&self, commit_hash: &str) -> GraphStoreResult<Option<CompiledGraphPack>> {
         let path = self.pack_path(commit_hash);
         match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|error| GraphStoreError::new("cold_pack_decode", error.to_string())),
+            Ok(bytes) => decode_compressed_json(&bytes, "cold_pack_decode").map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(io_err("read cold pack")(error)),
         }
@@ -201,6 +227,45 @@ pub(crate) fn safe_filename(hash: &str) -> String {
             }
         })
         .collect()
+}
+
+pub(crate) fn content_hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+pub(crate) fn compress_cold_bytes(bytes: &[u8]) -> GraphStoreResult<Vec<u8>> {
+    zstd::stream::encode_all(bytes, 0)
+        .map_err(|error| GraphStoreError::new("cold_object_compress", error.to_string()))
+}
+
+pub(crate) fn decompress_cold_bytes(bytes: &[u8]) -> GraphStoreResult<Vec<u8>> {
+    zstd::stream::decode_all(bytes)
+        .map_err(|error| GraphStoreError::new("cold_object_decompress", error.to_string()))
+}
+
+fn decompress_or_raw(bytes: &[u8]) -> GraphStoreResult<Vec<u8>> {
+    match decompress_cold_bytes(bytes) {
+        Ok(decoded) => Ok(decoded),
+        Err(_) => Ok(bytes.to_vec()),
+    }
+}
+
+fn encode_compressed_json<T: Serialize>(
+    value: &T,
+    context: &'static str,
+) -> GraphStoreResult<Vec<u8>> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| GraphStoreError::new(context, error.to_string()))?;
+    compress_cold_bytes(&bytes)
+}
+
+fn decode_compressed_json<T: DeserializeOwned>(
+    bytes: &[u8],
+    context: &'static str,
+) -> GraphStoreResult<T> {
+    let bytes = decompress_or_raw(bytes)?;
+    serde_json::from_slice(&bytes).map_err(|error| GraphStoreError::new(context, error.to_string()))
 }
 
 fn io_err(context: &'static str) -> impl Fn(std::io::Error) -> GraphStoreError {
@@ -264,6 +329,38 @@ mod tests {
         store.put_object(&object).unwrap();
         store.put_object(&object).unwrap();
         assert_eq!(store.object_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_store_compresses_objects_at_rest_without_changing_hash() {
+        let dir = std::env::temp_dir().join(format!("cold-compressed-{}", std::process::id()));
+        let store = DiskObjectStore::open(&dir).unwrap();
+        let object = object_for("mem:compressed", "payload");
+        let original_hash = object.hash.clone();
+        store.put_object(&object).unwrap();
+
+        let raw = std::fs::read(store.object_path(&object.hash)).unwrap();
+        assert_ne!(raw.first(), Some(&b'{'));
+        let fetched = store.get_object(&object.hash).unwrap().unwrap();
+        assert_eq!(fetched.hash, original_hash);
+        assert_eq!(
+            node_from_content_object(&fetched).unwrap().id,
+            "mem:compressed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn document_bytes_are_compressed_at_rest_and_hashed_uncompressed() {
+        let dir = std::env::temp_dir().join(format!("doc-compressed-{}", std::process::id()));
+        let store = DiskObjectStore::open(&dir).unwrap();
+        let body = b"small memory document body";
+        let hash = store.put_document_bytes(body).unwrap();
+        assert_eq!(hash, content_hash_bytes(body));
+        let raw = std::fs::read(store.document_path(&hash)).unwrap();
+        assert_ne!(raw, body);
+        assert_eq!(store.get_document_bytes(&hash).unwrap().unwrap(), body);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

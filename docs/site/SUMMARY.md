@@ -3,6 +3,7 @@
 * [Theorem](README.md)
 * [The mental model](concepts/mental-model.md)
 * [Getting started](getting-started.md)
+* [Agent onboarding text](llms-full.txt)
 
 ## Concepts
 

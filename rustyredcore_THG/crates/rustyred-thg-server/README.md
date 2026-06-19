@@ -1,5 +1,11 @@
 # rustyred-thg-server
 
+Product HTTP/gRPC/MCP surface over RustyRedCore-THG: tenant graph routes, query/Cypher APIs, harness coordination, browser actions, fractal expansion, and TTL sweeping.
+
+## What it is
+
+`rustyred-thg-server` is the product server for the RustyRed/THG graph substrate. It builds the Axum router, merges the gRPC routes, owns `AppState`, runs the TTL sweep loop, and hosts the higher-level tenant surfaces that sit over `rustyred-thg-core`, `rustyred-thg-mcp`, `theorem-harness-runtime`, RustyWeb, and the browser/fractal layers.
+
 ## Build and test
 
 ```bash

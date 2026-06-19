@@ -7188,22 +7188,25 @@ mod tests {
         let prefix = super::RedisGraphKeyspace::tenant_prefix("rrgdb", "Tenant One!");
         let keyspace = super::RedisGraphKeyspace::new(prefix);
 
-        assert_eq!(keyspace.prefix(), "rrgdb:{tenant:TenantOne}:graph:v1");
+        assert_eq!(
+            keyspace.prefix(),
+            "rrgdb:{tenant:pct_Tenant%20One%21}:graph:v1"
+        );
         assert_eq!(
             keyspace.node("node:a"),
-            "rrgdb:{tenant:TenantOne}:graph:v1:node:h6e6f64653a61"
+            "rrgdb:{tenant:pct_Tenant%20One%21}:graph:v1:node:h6e6f64653a61"
         );
         assert_eq!(
             keyspace.out_adjacency("node:a", "LINKS"),
-            "rrgdb:{tenant:TenantOne}:graph:v1:adj:out:h6e6f64653a61:h4c494e4b53"
+            "rrgdb:{tenant:pct_Tenant%20One%21}:graph:v1:adj:out:h6e6f64653a61:h4c494e4b53"
         );
         assert_eq!(
             keyspace.property_value("path", "\"src/lib.rs\""),
-            "rrgdb:{tenant:TenantOne}:graph:v1:property:h70617468:h227372632f6c69622e727322"
+            "rrgdb:{tenant:pct_Tenant%20One%21}:graph:v1:property:h70617468:h227372632f6c69622e727322"
         );
         assert_eq!(
             keyspace.events(),
-            "rrgdb:{tenant:TenantOne}:graph:v1:events"
+            "rrgdb:{tenant:pct_Tenant%20One%21}:graph:v1:events"
         );
     }
 
@@ -7303,7 +7306,7 @@ mod tests {
     fn redis_keyspace_normalizes_tenants_and_encodes_dynamic_key_segments() {
         assert_eq!(
             super::RedisGraphKeyspace::tenant_prefix("rrgdb", "Tenant.One!"),
-            "rrgdb:{tenant:TenantOne}:graph:v1"
+            "rrgdb:{tenant:pct_Tenant.One%21}:graph:v1"
         );
 
         let keyspace = super::RedisGraphKeyspace::new("rrgdb:{tenant:T}:graph:v1");

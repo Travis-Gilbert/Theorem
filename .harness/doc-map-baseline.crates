@@ -1,3 +1,4 @@
+design-check
 ensemble
 pilot-core
 prose-check
@@ -16,6 +17,7 @@ rustyred-thg-fractal
 rustyred-thg-geotemporal
 rustyred-thg-mcp
 rustyred-thg-memory
+rustyred-thg-pg-server
 rustyred-thg-resp-server
 rustyred-thg-server
 rustyred-web

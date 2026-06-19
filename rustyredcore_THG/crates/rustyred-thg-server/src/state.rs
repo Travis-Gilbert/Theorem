@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustyred_thg_affordances::theorem_grpc_timeout_ms;
+use rustyred_thg_affordances::{theorem_grpc_timeout_ms, AffordanceGraphStore};
 use rustyred_thg_core::store::RedisThgStore;
 use rustyred_thg_core::{
     make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
@@ -2512,6 +2512,40 @@ impl rustyred_thg_adapters::AdapterGraphStore for TenantGraphStore {
 
     fn stats(&self) -> GraphStoreResult<GraphStats> {
         TenantGraphStore::stats(self)
+    }
+}
+
+impl AffordanceGraphStore for TenantGraphStore {
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
+        TenantGraphStore::upsert_node(self, node)
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+        TenantGraphStore::upsert_edge(self, edge)
+    }
+
+    fn commit_batch(&mut self, batch: GraphMutationBatch) -> GraphStoreResult<GraphTransaction> {
+        TenantGraphStore::commit_batch(self, batch)
+    }
+
+    fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        TenantGraphStore::get_node(self, id)
+    }
+
+    fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        TenantGraphStore::get_edge(self, id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        TenantGraphStore::query_nodes(self, query)
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        TenantGraphStore::neighbors(self, query)
+    }
+
+    fn snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        TenantGraphStore::graph_snapshot(self)
     }
 }
 

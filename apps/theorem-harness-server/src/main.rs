@@ -51,9 +51,8 @@ use theorem_harness_server::push::write_room_message;
 use theorem_harness_server::{
     connectors_json, github_router, intents_json, map_json, maps_json, mentions_json,
     openapi_document, presence_json, push_router, records_json, room_json, run_json, runs_json,
-    spawn_wake_listener,
-    Delivery, GithubApp, GithubWebhookState, GraphStoreMapArtifactSink, MessagePost, PushState,
-    RoomBus, DEFAULT_BUS_CAPACITY,
+    spawn_wake_listener, Delivery, GithubApp, GithubWebhookState, GraphStoreMapArtifactSink,
+    MessagePost, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
@@ -96,14 +95,9 @@ struct JobSubmitHttpBody {
 }
 
 impl JobSubmitHttpBody {
-    fn tenant_slug(&self) -> String {
-        self.tenant_slug
-            .as_deref()
-            .or(self.tenant.as_deref())
-            .map(str::trim)
-            .filter(|tenant| !tenant.is_empty())
-            .unwrap_or("default")
-            .to_string()
+    fn tenant_slug(&self) -> Result<String, (StatusCode, String)> {
+        request_tenant_slug(self.tenant_slug.as_deref(), self.tenant.as_deref())
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))
     }
 
     fn submitted_by(&self) -> String {
@@ -126,14 +120,9 @@ impl JobSubmitHttpBody {
 }
 
 impl CoordinationQuery {
-    fn tenant_slug(&self) -> String {
-        self.tenant_slug
-            .as_deref()
-            .or(self.tenant.as_deref())
-            .map(str::trim)
-            .filter(|tenant| !tenant.is_empty())
-            .unwrap_or("default")
-            .to_string()
+    fn tenant_slug(&self) -> Result<String, StatusCode> {
+        request_tenant_slug(self.tenant_slug.as_deref(), self.tenant.as_deref())
+            .map_err(|_| StatusCode::BAD_REQUEST)
     }
 
     fn statuses(&self) -> Vec<String> {
@@ -159,6 +148,33 @@ impl CoordinationQuery {
             .map(split_csv)
             .unwrap_or_default()
     }
+}
+
+fn request_tenant_slug(tenant_slug: Option<&str>, tenant: Option<&str>) -> Result<String, String> {
+    tenant_slug
+        .into_iter()
+        .chain(tenant)
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty())
+        .find(|_| true)
+        .map(str::to_string)
+        .or_else(configured_request_tenant_slug)
+        .ok_or_else(|| "tenant or tenant_slug is required".to_string())
+}
+
+fn configured_request_tenant_slug() -> Option<String> {
+    [
+        "THEOREM_HARNESS_TENANT_SLUG",
+        "THEOREM_AGENT_TENANT_SLUG",
+        "THEOREM_TENANT_ID",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "default")
+    })
 }
 
 #[tokio::main]
@@ -246,8 +262,8 @@ fn maybe_spawn_theorem_agent_runner(state: SharedStore) {
         .unwrap_or_else(|_| "Travis-Gilbert".to_string());
     let room_id =
         std::env::var("THEOREM_AGENT_ROOM_ID").unwrap_or_else(|_| DEFAULT_JOB_ROOM_ID.to_string());
-    let binding_id =
-        std::env::var("THEOREM_AGENT_BINDING_ID").unwrap_or_else(|_| DEFAULT_BINDING_ID.to_string());
+    let binding_id = std::env::var("THEOREM_AGENT_BINDING_ID")
+        .unwrap_or_else(|_| DEFAULT_BINDING_ID.to_string());
     let interval_ms = std::env::var("THEOREM_AGENT_RUNNER_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -270,12 +286,16 @@ fn maybe_spawn_theorem_agent_runner(state: SharedStore) {
                 config.repo = "Theorem".to_string();
                 config.branch = "main".to_string();
                 config.task = "theorem agent room runner".to_string();
-                run_agent_room_cycle(&mut *store, config, &invoker).map_err(|error| error.to_string())
+                run_agent_room_cycle(&mut *store, config, &invoker)
+                    .map_err(|error| error.to_string())
             })
             .await;
             match outcome {
                 Ok(Ok(cycle)) if !cycle.turns.is_empty() => {
-                    tracing::info!(turns = cycle.turns.len(), "Theorem agent runner processed room turns");
+                    tracing::info!(
+                        turns = cycle.turns.len(),
+                        "Theorem agent runner processed room turns"
+                    );
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
@@ -343,7 +363,7 @@ async fn submit_job(
     State(state): State<JobHttpState>,
     Json(body): Json<JobSubmitHttpBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let tenant_slug = body.tenant_slug();
+    let tenant_slug = body.tenant_slug()?;
     let submitted_by = body.submitted_by();
     let room_id = body.room_id();
     let submission = body.submission;
@@ -425,9 +445,10 @@ async fn dispatch_job_counts(
 async fn list_maps(
     State(store): State<SharedStore>,
     Query(query): Query<CoordinationQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let store = store.lock().expect("store lock");
-    Json(maps_json(&*store, &query.tenant_slug()))
+    Ok(Json(maps_json(&*store, &tenant_slug)))
 }
 
 async fn get_map(
@@ -435,8 +456,9 @@ async fn get_map(
     Path(map_id): Path<String>,
     Query(query): Query<CoordinationQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let store = store.lock().expect("store lock");
-    map_json(&*store, &query.tenant_slug(), &map_id)
+    map_json(&*store, &tenant_slug, &map_id)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -463,8 +485,9 @@ async fn get_room(
     Path(room_id): Path<String>,
     Query(query): Query<CoordinationQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let store = store.lock().expect("store lock");
-    room_json(&*store, &query.tenant_slug(), &room_id)
+    room_json(&*store, &tenant_slug, &room_id)
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -474,8 +497,9 @@ async fn get_room_presence(
     Path(_room_id): Path<String>,
     Query(query): Query<CoordinationQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let store = store.lock().expect("store lock");
-    presence_json(&*store, &query.tenant_slug())
+    presence_json(&*store, &tenant_slug)
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -485,8 +509,9 @@ async fn get_room_intents(
     Path(room_id): Path<String>,
     Query(query): Query<CoordinationQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let store = store.lock().expect("store lock");
-    intents_json(&*store, &query.tenant_slug(), &room_id, &query.statuses())
+    intents_json(&*store, &tenant_slug, &room_id, &query.statuses())
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -496,10 +521,11 @@ async fn get_actor_mentions(
     Path(actor_id): Path<String>,
     Query(query): Query<CoordinationQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let mut store = store.lock().expect("store lock");
     mentions_json(
         &mut *store,
-        &query.tenant_slug(),
+        &tenant_slug,
         &actor_id,
         &query.urgencies(),
         query.consume.unwrap_or(false),
@@ -514,10 +540,11 @@ async fn get_room_records(
     Path(room_id): Path<String>,
     Query(query): Query<CoordinationQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let store = store.lock().expect("store lock");
     records_json(
         &*store,
-        &query.tenant_slug(),
+        &tenant_slug,
         &room_id,
         &query.record_types(),
         query.limit.unwrap_or(50),
@@ -534,6 +561,8 @@ async fn get_room_records(
 struct RegisterConnectorBody {
     #[serde(default)]
     tenant: Option<String>,
+    #[serde(default)]
+    tenant_slug: Option<String>,
     server_id: String,
     #[serde(default)]
     label: String,
@@ -545,9 +574,10 @@ struct RegisterConnectorBody {
 async fn list_connectors(
     State(store): State<SharedStore>,
     Query(query): Query<CoordinationQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
     let store = store.lock().expect("store lock");
-    Json(connectors_json(&*store, &query.tenant_slug()))
+    Ok(Json(connectors_json(&*store, &tenant_slug)))
 }
 
 /// `POST /connectors/register` -> connect to an MCP server, list its tools, and
@@ -560,13 +590,8 @@ async fn register_connector_route(
     State(store): State<SharedStore>,
     Json(body): Json<RegisterConnectorBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let tenant = body
-        .tenant
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("default")
-        .to_string();
+    let tenant = request_tenant_slug(body.tenant_slug.as_deref(), body.tenant.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let server_id = body.server_id.trim().to_string();
     if server_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "server_id is required".to_string()));
@@ -688,6 +713,22 @@ mod tests {
         assert_eq!(priority_urgency(Priority::P0), "block");
         assert_eq!(priority_urgency(Priority::P1), "ask");
         assert_eq!(priority_urgency(Priority::P2), "info");
+    }
+
+    #[test]
+    fn request_tenant_preserves_explicit_casing() {
+        assert_eq!(
+            request_tenant_slug(Some(" Travis-Gilbert "), None).unwrap(),
+            "Travis-Gilbert"
+        );
+        assert_eq!(
+            request_tenant_slug(None, Some(" Travis-Gilbert ")).unwrap(),
+            "Travis-Gilbert"
+        );
+        assert_eq!(
+            request_tenant_slug(Some(" "), Some(" Travis-Gilbert ")).unwrap(),
+            "Travis-Gilbert"
+        );
     }
 
     #[test]

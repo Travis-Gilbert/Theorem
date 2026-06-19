@@ -18,6 +18,7 @@ members = [
     "crates/rustyred-thg-compat-server",
     "crates/rustyred-thg-server",
     "crates/rustyred-thg-resp-server",
+    "crates/rustyred-thg-pg-server",
     "crates/rustyred-membrane",
     "crates/rustyred-rerank",
     "crates/rustyred-hipporag",
@@ -38,6 +39,7 @@ members = [
     "crates/rustyred-thg-connectors",
     "crates/ensemble",
     "crates/prose-check",
+    "crates/design-check",
     "crates/pilot-core",
 ]
 resolver = "2"

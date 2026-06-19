@@ -395,7 +395,7 @@ mod tests {
 
         let records = read_records_for_room(
             &store,
-            "travis-gilbert",
+            "Travis-Gilbert",
             "room",
             &["tension".to_string()],
             10,

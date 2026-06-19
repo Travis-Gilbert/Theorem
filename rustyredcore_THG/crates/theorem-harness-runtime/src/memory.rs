@@ -13,7 +13,6 @@ use theorem_harness_core::stable_value_hash;
 
 pub type MemoryResult<T> = Result<T, MemoryError>;
 
-const DEFAULT_TENANT: &str = "default";
 const DEFAULT_STATUS: &str = "active";
 const DOCUMENT_STATUSES: &[&str] = &["active", "superseded", "archived", "deleted"];
 const NODE_MEMORY_KINDS: &[&str] = &["claim", "finding"];
@@ -924,7 +923,7 @@ pub fn revise_memory_document<S: MemoryGraphStore>(
         &tenant_slug,
         "MEMORY_SUPERSEDES",
         &memory_document_node_id(&tenant_slug, &revised.doc_id),
-        &memory_document_node_id(&tenant_slug, &original.doc_id),
+        &memory_document_node_id(&original.tenant_slug, &original.doc_id),
         json!({ "reason": input.reason, "updated_at": revised.updated_at }),
     )?;
     link_doc_id_list(
@@ -1018,10 +1017,10 @@ pub fn archive_memory_document<S: MemoryGraphStore>(
     )?;
     upsert_memory_edge(
         store,
-        &tenant_slug,
+        &archive.tenant_slug,
         "MEMORY_ARCHIVED_AS",
-        &memory_document_node_id(&tenant_slug, &archived.doc_id),
-        &memory_document_node_id(&tenant_slug, &archive.doc_id),
+        &memory_document_node_id(&archived.tenant_slug, &archived.doc_id),
+        &memory_document_node_id(&archive.tenant_slug, &archive.doc_id),
         json!({ "reason": input.reason, "archived_at": archived.updated_at }),
     )?;
     Ok(ArchiveMemoryReceipt { archived, archive })
@@ -1247,7 +1246,7 @@ pub fn upsert_note<S: MemoryGraphStore>(
             .insert("fitness".to_string(), Value::Object(fitness));
     }
 
-    let source_node_id = memory_document_node_id(&tenant_slug, &document.doc_id);
+    let source_node_id = memory_document_node_id(&document.tenant_slug, &document.doc_id);
 
     let previous_targets: Vec<(String, String)> = store
         .memory_neighbors(NeighborQuery {
@@ -1317,7 +1316,7 @@ fn reconcile_incoming_links<S: MemoryGraphStore>(
     tenant_slug: &str,
     document: &MemoryDocumentState,
 ) -> MemoryResult<Vec<String>> {
-    let source_node_id = memory_document_node_id(tenant_slug, &document.doc_id);
+    let source_node_id = memory_document_node_id(&document.tenant_slug, &document.doc_id);
     let doc_id_key = document.doc_id.to_lowercase();
     let title_key = document.title.trim().to_lowercase();
     let mut reconciled = Vec::new();
@@ -1345,10 +1344,10 @@ fn reconcile_incoming_links<S: MemoryGraphStore>(
         if !matched {
             continue;
         }
-        let other_node_id = memory_document_node_id(tenant_slug, &other.doc_id);
+        let other_node_id = memory_document_node_id(&other.tenant_slug, &other.doc_id);
         upsert_memory_edge(
             store,
-            tenant_slug,
+            &other.tenant_slug,
             "MEMORY_RELATES",
             &other_node_id,
             &source_node_id,
@@ -1500,10 +1499,19 @@ pub fn load_memory_document<S: MemoryGraphStore>(
     } else {
         memory_document_node_id(&tenant_slug, doc_id)
     };
-    store
-        .memory_get_node(&graph_id)?
-        .map(document_from_node)
-        .transpose()
+    if let Some(node) = store.memory_get_node(&graph_id)? {
+        return document_from_node(node).map(Some);
+    }
+    if doc_id.starts_with("mem:doc:") {
+        return Ok(None);
+    }
+    for alias in tenant_slug_aliases(&tenant_slug).into_iter().skip(1) {
+        let alias_graph_id = memory_document_node_id(&alias, doc_id);
+        if let Some(node) = store.memory_get_node(&alias_graph_id)? {
+            return document_from_node(node).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 pub fn load_memory_node<S: MemoryGraphStore>(
@@ -1521,10 +1529,19 @@ pub fn load_memory_node<S: MemoryGraphStore>(
     } else {
         memory_node_node_id(&tenant_slug, node_id)
     };
-    store
-        .memory_get_node(&graph_id)?
-        .map(node_from_node)
-        .transpose()
+    if let Some(node) = store.memory_get_node(&graph_id)? {
+        return node_from_node(node).map(Some);
+    }
+    if node_id.starts_with("mem:node:") {
+        return Ok(None);
+    }
+    for alias in tenant_slug_aliases(&tenant_slug).into_iter().skip(1) {
+        let alias_graph_id = memory_node_node_id(&alias, node_id);
+        if let Some(node) = store.memory_get_node(&alias_graph_id)? {
+            return node_from_node(node).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 pub fn memory_document_node_id(tenant_slug: &str, doc_id: &str) -> String {
@@ -1707,22 +1724,26 @@ fn load_memory_documents<S: MemoryGraphStore>(
     include_inactive: bool,
 ) -> MemoryResult<Vec<MemoryDocumentState>> {
     let tenant_slug = normalize_tenant_slug(tenant_slug);
-    let mut documents = store
-        .memory_query_nodes(
+    let mut seen_nodes = BTreeSet::new();
+    let mut documents = Vec::new();
+    for alias in tenant_slug_aliases(&tenant_slug) {
+        for node in store.memory_query_nodes(
             NodeQuery::label("MemoryDocument")
-                .with_property("tenant_slug", Value::String(tenant_slug))
+                .with_property("tenant_slug", Value::String(alias))
                 .with_limit(MAX_GRAPH_QUERY_LIMIT),
-        )?
-        .into_iter()
-        .map(document_from_node)
-        .filter_map(|result| match result {
-            Ok(document) if include_inactive || document.status == DEFAULT_STATUS => {
-                Some(Ok(document))
+        )? {
+            if !seen_nodes.insert(node.id.clone()) {
+                continue;
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<MemoryResult<Vec<_>>>()?;
+            match document_from_node(node) {
+                Ok(document) if include_inactive || document.status == DEFAULT_STATUS => {
+                    documents.push(document)
+                }
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     documents.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(documents)
 }
@@ -1733,20 +1754,24 @@ fn load_memory_nodes<S: MemoryGraphStore>(
     include_inactive: bool,
 ) -> MemoryResult<Vec<MemoryNodeState>> {
     let tenant_slug = normalize_tenant_slug(tenant_slug);
-    let mut nodes = store
-        .memory_query_nodes(
+    let mut seen_nodes = BTreeSet::new();
+    let mut nodes = Vec::new();
+    for alias in tenant_slug_aliases(&tenant_slug) {
+        for record in store.memory_query_nodes(
             NodeQuery::label("MemoryNode")
-                .with_property("tenant_slug", Value::String(tenant_slug))
+                .with_property("tenant_slug", Value::String(alias))
                 .with_limit(MAX_GRAPH_QUERY_LIMIT),
-        )?
-        .into_iter()
-        .map(node_from_node)
-        .filter_map(|result| match result {
-            Ok(node) if include_inactive || node.status == DEFAULT_STATUS => Some(Ok(node)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<MemoryResult<Vec<_>>>()?;
+        )? {
+            if !seen_nodes.insert(record.id.clone()) {
+                continue;
+            }
+            match node_from_node(record) {
+                Ok(node) if include_inactive || node.status == DEFAULT_STATUS => nodes.push(node),
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     nodes.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(nodes)
 }
@@ -3230,13 +3255,15 @@ fn resolve_memory_graph_id<S: MemoryGraphStore>(
     if store.memory_get_node(id)?.is_some() {
         return Ok(Some(id.to_string()));
     }
-    let document_id = memory_document_node_id(tenant_slug, id);
-    if store.memory_get_node(&document_id)?.is_some() {
-        return Ok(Some(document_id));
-    }
-    let node_id = memory_node_node_id(tenant_slug, id);
-    if store.memory_get_node(&node_id)?.is_some() {
-        return Ok(Some(node_id));
+    for alias in tenant_slug_aliases(tenant_slug) {
+        let document_id = memory_document_node_id(&alias, id);
+        if store.memory_get_node(&document_id)?.is_some() {
+            return Ok(Some(document_id));
+        }
+        let node_id = memory_node_node_id(&alias, id);
+        if store.memory_get_node(&node_id)?.is_some() {
+            return Ok(Some(node_id));
+        }
     }
     Ok(None)
 }
@@ -3376,12 +3403,11 @@ fn insert_search_text(
 }
 
 pub fn normalize_tenant_slug(value: &str) -> String {
-    let value = value.trim().to_lowercase();
-    if value.is_empty() {
-        DEFAULT_TENANT.to_string()
-    } else {
-        value
-    }
+    crate::tenant::normalize_tenant_slug(value)
+}
+
+fn tenant_slug_aliases(value: &str) -> Vec<String> {
+    crate::tenant::tenant_slug_aliases(value)
 }
 
 fn normalize_kind(value: &str, field: &str) -> MemoryResult<String> {
@@ -3668,6 +3694,152 @@ mod tests {
     const T1: &str = "2026-06-01T00:00:00Z";
     const T2: &str = "2026-06-01T00:01:00Z";
     const T3: &str = "2026-06-01T00:02:00Z";
+
+    #[test]
+    fn memory_receipts_preserve_canonical_tenant_casing() {
+        let mut store = InMemoryGraphStore::new();
+
+        let document = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: "Travis-Gilbert".to_string(),
+                kind: "decision".to_string(),
+                title: "Tenant casing".to_string(),
+                content: "Receipts must echo the partition casing callers can reuse.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(document.tenant_slug, "Travis-Gilbert");
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: "Travis-Gilbert".to_string(),
+                query: "tenant casing".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        let recalled = results
+            .iter()
+            .find_map(|item| item.document.as_ref())
+            .unwrap();
+        assert_eq!(recalled.tenant_slug, "Travis-Gilbert");
+    }
+
+    #[test]
+    fn capitalized_tenant_reads_legacy_lowercase_memory_rows() {
+        let mut store = InMemoryGraphStore::new();
+        let legacy = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: "travis-gilbert".to_string(),
+                kind: "decision".to_string(),
+                title: "Legacy row".to_string(),
+                content: "Rows written before canonical tenant receipts used lowercase metadata."
+                    .to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        let loaded = load_memory_document(&store, "Travis-Gilbert", &legacy.doc_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.doc_id, legacy.doc_id);
+        assert_eq!(loaded.tenant_slug, "travis-gilbert");
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: "Travis-Gilbert".to_string(),
+                query: "legacy row".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        assert!(results.iter().any(|item| item.id == legacy.doc_id));
+    }
+
+    #[test]
+    fn capitalized_tenant_reconciles_legacy_lowercase_note_edges() {
+        let mut store = InMemoryGraphStore::new();
+        let target = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: "travis-gilbert".to_string(),
+                title: "Legacy target".to_string(),
+                content: "target".to_string(),
+                created_at: T1.to_string(),
+                updated_at: T1.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+
+        let canonical_source = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: "Travis-Gilbert".to_string(),
+                title: "Canonical source".to_string(),
+                content: "source".to_string(),
+                links: vec![target.document.doc_id.clone()],
+                created_at: T1.to_string(),
+                updated_at: T1.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            canonical_source.resolved_links,
+            vec![target.document.doc_id.clone()]
+        );
+
+        let legacy_source = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: "travis-gilbert".to_string(),
+                title: "Legacy source".to_string(),
+                content: "source".to_string(),
+                links: vec![target.document.doc_id.clone()],
+                created_at: T1.to_string(),
+                updated_at: T1.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+
+        let updated = upsert_note(
+            &mut store,
+            UpsertNoteInput {
+                tenant_slug: "Travis-Gilbert".to_string(),
+                doc_id: legacy_source.document.doc_id.clone(),
+                title: "Legacy source".to_string(),
+                content: "source updated".to_string(),
+                links: Vec::new(),
+                updated_at: T2.to_string(),
+                ..UpsertNoteInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.action, "updated");
+        assert_eq!(updated.document.tenant_slug, "travis-gilbert");
+        assert_eq!(updated.removed_links.len(), 1);
+        assert!(store
+            .get_node(&memory_document_node_id(
+                "Travis-Gilbert",
+                &legacy_source.document.doc_id
+            ))
+            .is_none());
+    }
 
     struct MissingFulltextStore {
         inner: InMemoryGraphStore,

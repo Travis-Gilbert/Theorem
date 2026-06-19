@@ -37,6 +37,7 @@ pub mod node_type_binding;
 pub mod overlap;
 pub mod patch_sequencer;
 pub mod skill_pack;
+pub mod tenant;
 pub mod work_graph_store;
 pub mod writing_style;
 
@@ -102,6 +103,14 @@ pub use coordination_push::{
     AgentSpaceEvent, AgentSpaceEventBus, CausalMeta, CrdtDelta, DeltaOp, RoomEventBus,
     RoomMessageDelivery, RoomMessageEvent, DEFAULT_ROOM_BUS_CAPACITY,
 };
+pub use design_check::{
+    contrast_ratio as design_contrast_ratio, css_static_report, design_engineering_pack_payload,
+    design_rules, fixture_reports as design_fixture_reports, lower_css as lower_design_css,
+    lower_tokens_json as lower_design_tokens_json, pack_hash as design_pack_hash,
+    parse_hex_color as parse_design_hex_color, relative_luminance as design_relative_luminance,
+    token_lint_report, CheckerFinding as DesignCheckerFinding, CssStaticInput, DesignAtom,
+    DesignCheckReport, DesignRule,
+};
 pub use event_log::{
     append_transition, append_transition_from_store, event_node_id, load_events, load_run,
     persist_transition_result, replay_persisted_run, run_node_id, HarnessRuntimeError,
@@ -120,13 +129,13 @@ pub use memory::{
     archive_memory_document, create_memory_document, create_memory_node, encode_memory,
     forget_memory, handoff_memory, list_memory_documents_since, load_memory_document,
     load_memory_node, memory_content_hash, memory_document_node_id, memory_edge_id,
-    memory_node_node_id, normalize_tenant_slug, recall_archived_memory, recall_memory,
-    relate_memory, remember_memory, revise_memory_document, self_note_memory, upsert_note,
-    ArchiveMemoryInput, ArchiveMemoryReceipt, EncodeMemoryInput, ForgetMemoryInput,
-    ForgetMemoryReceipt, HandoffMemoryInput, MemoryDocumentState, MemoryError, MemoryGraphStore,
-    MemoryNodeState, MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput,
-    RecallMemoryInput, RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput,
-    ReviseMemoryReceipt, UpsertNoteInput, UpsertNoteReceipt,
+    memory_node_node_id, recall_archived_memory, recall_memory, relate_memory, remember_memory,
+    revise_memory_document, self_note_memory, upsert_note, ArchiveMemoryInput,
+    ArchiveMemoryReceipt, EncodeMemoryInput, ForgetMemoryInput, ForgetMemoryReceipt,
+    HandoffMemoryInput, MemoryDocumentState, MemoryError, MemoryGraphStore, MemoryNodeState,
+    MemoryRecallItem, MemoryRelationItem, MemoryResult, MemoryWriteInput, RecallMemoryInput,
+    RelateMemoryInput, RememberMemoryReceipt, ReviseMemoryInput, ReviseMemoryReceipt,
+    UpsertNoteInput, UpsertNoteReceipt,
 };
 pub use node_type_binding::{
     bind_node_type_skill_packs, load_node_type_skill_pack_binding, node_type_binding_node_id,
@@ -143,6 +152,9 @@ pub use overlap::{
 pub use patch_sequencer::{
     PatchApplyReceipt, PatchApplyStatus, PatchProposal, PatchSequencer, PatchSequencerError,
     PatchSequencerResult,
+};
+pub use tenant::{
+    normalize_actor_id, normalize_tenant_slug, tenant_slug_aliases, DEFAULT_TENANT_SLUG,
 };
 pub mod provider_invoker;
 pub use head_invoker::{

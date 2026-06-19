@@ -27,6 +27,7 @@ curl -s localhost:50080/harness/jobs \
   -H 'content-type: application/json' \
   -d '{
         "title": "Document the harness API",
+        "tenant": "Travis-Gilbert",
         "repo": "Theorem",
         "priority": "P1",
         "target_head": "claude"
@@ -37,7 +38,7 @@ The response includes the minted `job_id`, whether it was newly `created`, wheth
 
 ```json
 {
-  "tenant": "default",
+  "tenant": "Travis-Gilbert",
   "room_id": "repo:theorem:branch:main",
   "job_id": "job-01J...",
   "created": true,
@@ -56,8 +57,8 @@ The response includes the minted `job_id`, whether it was newly `created`, wheth
 Submitting a job writes a wake message into the room `repo:theorem:branch:main`. Read that room's records and intents:
 
 ```bash
-curl -s 'localhost:50080/harness/rooms/repo:theorem:branch:main/records?tenant=default&limit=10'
-curl -s 'localhost:50080/harness/rooms/repo:theorem:branch:main/intents?tenant=default'
+curl -s 'localhost:50080/harness/rooms/repo:theorem:branch:main/records?tenant=Travis-Gilbert&limit=10'
+curl -s 'localhost:50080/harness/rooms/repo:theorem:branch:main/intents?tenant=Travis-Gilbert'
 ```
 
 ## 4. Watch the room live
@@ -65,7 +66,7 @@ curl -s 'localhost:50080/harness/rooms/repo:theorem:branch:main/intents?tenant=d
 Open a Server-Sent Events stream and you will see each new message as it is written. The `tenant` query parameter is required here.
 
 ```bash
-curl -N 'localhost:50080/harness/rooms/repo:theorem:branch:main/stream?tenant=default'
+curl -N 'localhost:50080/harness/rooms/repo:theorem:branch:main/stream?tenant=Travis-Gilbert'
 ```
 
 Leave that running, submit another job from a second terminal, and the wake event arrives on the stream.
@@ -78,13 +79,13 @@ To make an external MCP server's tools available as learnable affordances:
 curl -s localhost:50080/connectors/register \
   -H 'content-type: application/json' \
   -d '{
-        "tenant": "default",
+        "tenant": "Travis-Gilbert",
         "server_id": "my-tools",
         "target": { "type": "stdio", "command": "my-mcp-server", "args": [] }
       }'
 ```
 
-The server spawns the target, performs the MCP handshake, lists its tools, and registers each as an affordance. List them back with `GET /connectors?tenant=default`.
+The server spawns the target, performs the MCP handshake, lists its tools, and registers each as an affordance. List them back with `GET /connectors?tenant=Travis-Gilbert`.
 
 ## A reminder on auth
 

@@ -1,56 +1,50 @@
 # theorem-agentd configuration.
 #
-# Secrets stay in environment variables. The daemon reads THEOREM_MODEL_API_KEY
-# and THEOREM_HARNESS_TOKEN when those env vars are configured below.
+# This file is intentionally safe to run as-is: no bearer token, model key, or
+# local data-dir env var is required. It uses the deterministic rule provider so
+# a first `theorem-agentd --once "hello" theorem-agentd.toml` proves the loop,
+# ledger, and MCP routing without requiring a resident model.
 
 default_room_id = "repo:theorem:branch:main"
 actor = "theorem-agentd"
+operator_memory_tenant = "Travis-Gilbert"
 
 [model]
-provider = "openai-compatible"
-base_url = "http://127.0.0.1:8080"
-model = "gemma-4-12b-it-q4"
-api_key_env = "THEOREM_MODEL_API_KEY"
+provider = "rule"
 temperature = 0.2
 max_tokens = 1200
 request_timeout_secs = 120
 grammar_constrained = true
 
+# To use a resident OpenAI-compatible model, switch to:
+#
+# provider = "openai-compatible"
+# base_url = "http://127.0.0.1:8080"
+# model = "gemma-4-12b-it-q4"
+# api_key_env = "THEOREM_MODEL_API_KEY"
+#
+# Secrets stay in environment variables; do not put real keys in this file.
+
 [harness]
 name = "harness"
-url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
-token_env = "THEOREM_HARNESS_TOKEN"
-tenant_slug = "default"
+url = "http://127.0.0.1:8380/mcp"
+tenant_slug = "Travis-Gilbert"
 
-# Bucket B local tools. Set session = true for any spec-compliant streamable-HTTP
-# MCP server (initialize -> mcp-session-id -> notifications/initialized ->
-# tools/call over SSE). TickTick below is a real, verified example.
-[[mcp_servers]]
-name = "ticktick"
-url = "https://ticktick-mcp-production-8a84.up.railway.app/mcp"
-session = true
-tenant_slug = "default"
+# Hosted sync is opt-in. For the hosted Theorem MCP, change url to:
+# url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
 
-[[mcp_servers]]
-name = "gmail"
-url = "http://127.0.0.1:7332/mcp"
-# session = true   # enable if your Gmail MCP is a streamable-HTTP server
-tenant_slug = "default"
-
-[[mcp_servers]]
-name = "calendar"
-url = "http://127.0.0.1:7333/mcp"
+# Bucket B local tools can be added here. Set session = true for any
+# spec-compliant streamable-HTTP MCP server (initialize -> mcp-session-id ->
+# notifications/initialized -> tools/call over SSE).
+#
+# [[mcp_servers]]
+# name = "filesystem"
+# url = "http://127.0.0.1:7334/mcp"
 # session = true
-tenant_slug = "default"
-
-[[mcp_servers]]
-name = "filesystem"
-url = "http://127.0.0.1:7334/mcp"
-# session = true
-tenant_slug = "default"
+# tenant_slug = "Travis-Gilbert"
 
 [receiver]
-enabled = true
+enabled = false
 config_path = "theorem-receiver.toml"
 
 [loop_config]
@@ -64,22 +58,16 @@ path = ".theorem/agentd-token-ledger.jsonl"
 # factory). The JSONL ledger remains the source of truth and is never rotated.
 mirror_to_graph = true
 
-# The operator's personal memory (recall/remember/encode) is routed to this
-# named tenant. Coordination rooms, jobs, runs, and shared substrate stay on the
-# harness server's own tenant. Defaults to "default" so a misrouted personal
-# write lands visibly in an empty default. Set this to a named tenant.
-operator_memory_tenant = "operator:travis"
-
 # Agent Queue capture: the local loop's inbound edge. A dedicated TickTick list
 # is the ONLY capture trigger; tasks anywhere else are never converted. On each
 # tick every task here becomes a job (title -> title, content -> spec_inline,
 # TickTick priority -> P0/P1/P2), the job id is stamped into the task, its
 # `dispatched` subtask is checked, and it is moved to the product list.
 [capture]
-enabled = true
-agent_queue_project_id = "6a2911688f08a8907c774531"   # the "Agent Queue" list
+enabled = false
+# agent_queue_project_id = "..."                       # the "Agent Queue" list
 # agent_queue_project_name = "Agent Queue"             # resolve the id by name instead
-dispatched_project_id = "689cdbfd8f083a8c93d0134e"     # "Work in Progress" list
+# dispatched_project_id = "..."                        # "Work in Progress"
 repo = "Travis-Gilbert/theorem"
 # target_head = "either"                               # claude | codex | either
 dispatched_subtask_title = "dispatched"
@@ -90,5 +78,4 @@ dispatched_subtask_title = "dispatched"
 # records the merge. The milestone prose is model-written; the transitions,
 # dedup, and completion are mechanical.
 [relay]
-enabled = true
-
+enabled = false

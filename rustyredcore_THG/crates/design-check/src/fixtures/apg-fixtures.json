@@ -1,0 +1,26 @@
+[
+  {
+    "name": "dialog-focus-trap",
+    "pattern": "dialog",
+    "checker_engine": "apg_behavioral",
+    "body": "<button id=\"open\">Open</button><div role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"title\"><h2 id=\"title\">Confirm</h2><button>Cancel</button><button>Apply</button></div>"
+  },
+  {
+    "name": "tabs-arrow-navigation",
+    "pattern": "tabs",
+    "checker_engine": "apg_behavioral",
+    "body": "<div role=\"tablist\"><button role=\"tab\" aria-selected=\"true\">Overview</button><button role=\"tab\">Details</button></div><section role=\"tabpanel\">Overview</section>"
+  },
+  {
+    "name": "combobox-expanded-listbox",
+    "pattern": "combobox",
+    "checker_engine": "apg_behavioral",
+    "body": "<label for=\"city\">City</label><input id=\"city\" role=\"combobox\" aria-expanded=\"true\" aria-controls=\"city-list\"><ul id=\"city-list\" role=\"listbox\"><li role=\"option\">Flint</li></ul>"
+  },
+  {
+    "name": "menu-roving-tabindex",
+    "pattern": "menu",
+    "checker_engine": "apg_behavioral",
+    "body": "<button aria-haspopup=\"menu\" aria-expanded=\"true\">Actions</button><div role=\"menu\"><button role=\"menuitem\" tabindex=\"0\">Rename</button><button role=\"menuitem\" tabindex=\"-1\">Archive</button></div>"
+  }
+]

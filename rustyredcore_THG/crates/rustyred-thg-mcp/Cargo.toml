@@ -16,6 +16,8 @@ serde_json = "1.0"
 ensemble = { path = "../ensemble" }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 rustyred-thg-code = { path = "../rustyred-thg-code" }
+rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
+rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
 theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }
 tokio = { version = "1", features = ["sync"] }

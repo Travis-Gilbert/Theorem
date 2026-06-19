@@ -3,6 +3,7 @@ use crate::binding_store::{
     BindingRuntimeError,
 };
 use crate::overlap::{detect_and_emit_overlap_tensions, Footprint};
+use crate::tenant::{normalize_actor_id, normalize_tenant_slug, tenant_slug_aliases};
 use crate::{default_theorem_binding, writing_style, DEFAULT_BINDING_ID};
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, HarnessInstantKg, NodeQuery,
@@ -22,7 +23,6 @@ use theorem_harness_core::{
 
 pub type CoordinationResult<T> = Result<T, CoordinationError>;
 
-const DEFAULT_TENANT: &str = "default";
 const DEFAULT_ROOM: &str = "room:ungrouped";
 const DEFAULT_MODE: &str = "collaborating";
 const DEFAULT_PRESENCE_TTL_SECONDS: u64 = 60;
@@ -401,8 +401,8 @@ pub fn join_room<S: GraphStore>(
     store: &mut S,
     input: JoinRoomInput,
 ) -> CoordinationResult<CoordinationRoomState> {
-    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
-    let actor_id = require_text("actor_id", &input.actor_id)?;
+    let tenant_slug = require_tenant_slug(&input.tenant_slug)?;
+    let actor_id = require_actor_id("actor_id", &input.actor_id)?;
     let room_id = resolve_room_id(
         &input.room_id,
         &input.repo,
@@ -412,7 +412,7 @@ pub fn join_room<S: GraphStore>(
     );
     let now = timestamp_or_now(&input.updated_at);
 
-    let mut state = load_room(store, &tenant_slug, &room_id)?
+    let mut state = load_room_exact(store, &tenant_slug, &room_id)?
         .unwrap_or_else(|| empty_room_state(&tenant_slug, &room_id, &now));
     let existing = state.members.get(&actor_id);
     let joined_at = existing
@@ -466,7 +466,7 @@ pub fn room_status<S: GraphStore>(
     tenant_slug: &str,
     room_id: &str,
 ) -> CoordinationResult<CoordinationRoomState> {
-    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let tenant_slug = require_tenant_slug(tenant_slug)?;
     let room_id = normalize_room_id(room_id);
     Ok(load_room(store, &tenant_slug, &room_id)?
         .unwrap_or_else(|| empty_room_state(&tenant_slug, &room_id, "")))
@@ -476,20 +476,20 @@ pub fn write_intent<S: GraphStore>(
     store: &mut S,
     input: WriteIntentInput,
 ) -> CoordinationResult<CoordinationIntentState> {
-    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let tenant_slug = require_tenant_slug(&input.tenant_slug)?;
     let agent_id = normalize_binding_agent_id(&input.agent_id, &input.binding_id);
     let binding_id = resolve_coordination_binding_id(&input.binding_id, &agent_id);
     let room_id = normalize_room_id(&input.room_id);
-    let actor_id = require_text("actor_id", &input.actor_id)?;
+    let actor_id = require_actor_id("actor_id", &input.actor_id)?;
     let summary = require_text("summary", &input.summary)?;
     let status = normalize_status(&input.status)?;
     let now = timestamp_or_now(&input.updated_at);
 
-    if load_room(store, &tenant_slug, &room_id)?.is_none() {
+    if load_room_exact(store, &tenant_slug, &room_id)?.is_none() {
         persist_room_state(store, &empty_room_state(&tenant_slug, &room_id, &now))?;
     }
 
-    let prior = load_intent(store, &tenant_slug, &room_id, &actor_id)?;
+    let prior = load_intent_exact(store, &tenant_slug, &room_id, &actor_id)?;
     let started_at = prior
         .as_ref()
         .map(|intent| intent.started_at.clone())
@@ -567,7 +567,7 @@ pub fn read_intents_for_room<S: GraphStore>(
     room_id: &str,
     statuses: &[String],
 ) -> CoordinationResult<Vec<CoordinationIntentState>> {
-    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let tenant_slug = require_tenant_slug(tenant_slug)?;
     let room_id = normalize_room_id(room_id);
     let status_filter = statuses
         .iter()
@@ -575,28 +575,20 @@ pub fn read_intents_for_room<S: GraphStore>(
         .filter(|status| !status.is_empty())
         .collect::<BTreeSet<_>>();
 
-    let mut intents = store
-        .query_nodes(
+    let mut intents = Vec::new();
+    for tenant_alias in tenant_slug_aliases(&tenant_slug) {
+        for node in store.query_nodes(
             NodeQuery::label("CoordinationIntent")
-                .with_property("tenant_slug", Value::String(tenant_slug))
-                .with_property("room_id", Value::String(room_id)),
-        )
-        .into_iter()
-        .map(|node| {
-            serde_json::from_value::<CoordinationIntentState>(node.properties)
-                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
-        })
-        .filter_map(|result| match result {
-            Ok(intent) => {
-                if status_filter.is_empty() || status_filter.contains(&intent.status) {
-                    Some(Ok(intent))
-                } else {
-                    None
-                }
+                .with_property("tenant_slug", Value::String(tenant_alias))
+                .with_property("room_id", Value::String(room_id.clone())),
+        ) {
+            let intent = serde_json::from_value::<CoordinationIntentState>(node.properties)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()))?;
+            if status_filter.is_empty() || status_filter.contains(&intent.status) {
+                intents.push(intent);
             }
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<CoordinationResult<Vec<_>>>()?;
+        }
+    }
     intents.sort_by(|left, right| {
         right
             .updated_at
@@ -610,8 +602,8 @@ pub fn heartbeat_presence<S: GraphStore>(
     store: &mut S,
     input: PresenceInput,
 ) -> CoordinationResult<CoordinationPresenceState> {
-    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
-    let actor_id = require_text("actor_id", &input.actor_id)?;
+    let tenant_slug = require_tenant_slug(&input.tenant_slug)?;
+    let actor_id = require_actor_id("actor_id", &input.actor_id)?;
     let ttl_seconds = input.ttl_seconds.max(1);
     let refreshed_at = timestamp_or_now(&input.refreshed_at);
     let expires_at = if input.expires_at.trim().is_empty() {
@@ -655,36 +647,39 @@ pub fn load_presence<S: GraphStore>(
     tenant_slug: &str,
     actor_id: &str,
 ) -> CoordinationResult<Option<CoordinationPresenceState>> {
-    let tenant_slug = normalize_tenant_slug(tenant_slug);
-    let actor_id = actor_id.trim();
+    let tenant_slug = require_tenant_slug(tenant_slug)?;
+    let actor_id = normalize_actor_id(actor_id);
     if actor_id.is_empty() {
         return Ok(None);
     }
-    store
-        .get_node(&coordination_presence_node_id(&tenant_slug, actor_id))
-        .map(|node| {
-            serde_json::from_value::<CoordinationPresenceState>(node.properties.clone())
-                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
-        })
-        .transpose()
+    for tenant_alias in tenant_slug_aliases(&tenant_slug) {
+        if let Some(node) = store.get_node(&coordination_presence_node_id(&tenant_alias, &actor_id))
+        {
+            return serde_json::from_value::<CoordinationPresenceState>(node.properties.clone())
+                .map(Some)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 pub fn list_presence<S: GraphStore>(
     store: &S,
     tenant_slug: &str,
 ) -> CoordinationResult<Vec<CoordinationPresenceState>> {
-    let tenant_slug = normalize_tenant_slug(tenant_slug);
-    let mut records = store
-        .query_nodes(
+    let tenant_slug = require_tenant_slug(tenant_slug)?;
+    let mut records = Vec::new();
+    for tenant_alias in tenant_slug_aliases(&tenant_slug) {
+        for node in store.query_nodes(
             NodeQuery::label("CoordinationPresence")
-                .with_property("tenant_slug", Value::String(tenant_slug)),
-        )
-        .into_iter()
-        .map(|node| {
-            serde_json::from_value::<CoordinationPresenceState>(node.properties)
-                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
-        })
-        .collect::<CoordinationResult<Vec<_>>>()?;
+                .with_property("tenant_slug", Value::String(tenant_alias)),
+        ) {
+            records.push(
+                serde_json::from_value::<CoordinationPresenceState>(node.properties)
+                    .map_err(|error| CoordinationError::Deserialization(error.to_string()))?,
+            );
+        }
+    }
     records.sort_by(|left, right| {
         (left.status != "active")
             .cmp(&(right.status != "active"))
@@ -697,9 +692,9 @@ pub fn write_message<S: GraphStore>(
     store: &mut S,
     input: WriteMessageInput,
 ) -> CoordinationResult<CoordinationMessageState> {
-    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let tenant_slug = require_tenant_slug(&input.tenant_slug)?;
     let room_id = normalize_room_id(&input.room_id);
-    let actor_id = require_text("actor_id", &input.actor_id)?;
+    let actor_id = require_actor_id("actor_id", &input.actor_id)?;
     let message = require_text("message", &input.message)?;
     let urgency = normalize_urgency(&input.urgency)?;
     let delivery = normalize_delivery(&input.delivery)?;
@@ -711,7 +706,7 @@ pub fn write_message<S: GraphStore>(
         input.message_id.trim().to_string()
     };
 
-    if load_room(store, &tenant_slug, &room_id)?.is_none() {
+    if load_room_exact(store, &tenant_slug, &room_id)?.is_none() {
         persist_room_state(
             store,
             &empty_room_state(&tenant_slug, &room_id, &created_at),
@@ -746,20 +741,21 @@ pub fn read_messages_for_room<S: GraphStore>(
     room_id: &str,
     limit: usize,
 ) -> CoordinationResult<Vec<CoordinationMessageState>> {
-    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let tenant_slug = require_tenant_slug(tenant_slug)?;
     let room_id = normalize_room_id(room_id);
-    let mut messages = store
-        .query_nodes(
+    let mut messages = Vec::new();
+    for tenant_alias in tenant_slug_aliases(&tenant_slug) {
+        for node in store.query_nodes(
             NodeQuery::label("CoordinationMessage")
-                .with_property("tenant_slug", Value::String(tenant_slug))
-                .with_property("room_id", Value::String(room_id)),
-        )
-        .into_iter()
-        .map(|node| {
-            serde_json::from_value::<CoordinationMessageState>(node.properties)
-                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
-        })
-        .collect::<CoordinationResult<Vec<_>>>()?;
+                .with_property("tenant_slug", Value::String(tenant_alias))
+                .with_property("room_id", Value::String(room_id.clone())),
+        ) {
+            messages.push(
+                serde_json::from_value::<CoordinationMessageState>(node.properties)
+                    .map_err(|error| CoordinationError::Deserialization(error.to_string()))?,
+            );
+        }
+    }
     messages.sort_by(|left, right| {
         right
             .created_at
@@ -849,42 +845,39 @@ fn read_mentions_for_actor_filtered<S: GraphStore>(
     consume: bool,
     limit: usize,
 ) -> CoordinationResult<Vec<CoordinationMessageState>> {
-    let tenant_slug = normalize_tenant_slug(tenant_slug);
-    let actor_id = require_text("actor_id", actor_id)?;
+    let tenant_slug = require_tenant_slug(tenant_slug)?;
+    let actor_id = require_actor_id("actor_id", actor_id)?;
     let urgency_filter = urgencies
         .iter()
         .map(|urgency| urgency.trim().to_ascii_lowercase())
         .filter(|urgency| !urgency.is_empty())
         .collect::<BTreeSet<_>>();
-    let mut messages = store
-        .query_nodes(
+    let mut messages = Vec::new();
+    for tenant_alias in tenant_slug_aliases(&tenant_slug) {
+        for node in store.query_nodes(
             NodeQuery::label("CoordinationMessage")
-                .with_property("tenant_slug", Value::String(tenant_slug.clone())),
-        )
-        .into_iter()
-        .map(|node| {
-            serde_json::from_value::<CoordinationMessageState>(node.properties)
-                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
-        })
-        .filter_map(|result| match result {
-            Ok(message)
-                if message.mentions.iter().any(|mention| mention == &actor_id)
-                    && room_id
-                        .as_ref()
-                        .map(|room_id| message.room_id == room_id.as_str())
-                        .unwrap_or(true)
-                    && (urgency_filter.is_empty() || urgency_filter.contains(&message.urgency))
-                    && !message
-                        .consumed_by
-                        .iter()
-                        .any(|consumer| consumer == &actor_id) =>
+                .with_property("tenant_slug", Value::String(tenant_alias)),
+        ) {
+            let message = serde_json::from_value::<CoordinationMessageState>(node.properties)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()))?;
+            if message
+                .mentions
+                .iter()
+                .any(|mention| normalize_actor_id(mention) == actor_id)
+                && room_id
+                    .as_ref()
+                    .map(|room_id| message.room_id == room_id.as_str())
+                    .unwrap_or(true)
+                && (urgency_filter.is_empty() || urgency_filter.contains(&message.urgency))
+                && !message
+                    .consumed_by
+                    .iter()
+                    .any(|consumer| normalize_actor_id(consumer) == actor_id)
             {
-                Some(Ok(message))
+                messages.push(message);
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<CoordinationResult<Vec<_>>>()?;
+        }
+    }
     messages.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
@@ -907,9 +900,9 @@ pub fn write_record<S: GraphStore>(
     store: &mut S,
     input: WriteRecordInput,
 ) -> CoordinationResult<CoordinationRecordState> {
-    let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
+    let tenant_slug = require_tenant_slug(&input.tenant_slug)?;
     let room_id = normalize_room_id(&input.room_id);
-    let actor_id = require_text("actor_id", &input.actor_id)?;
+    let actor_id = require_actor_id("actor_id", &input.actor_id)?;
     let record_type = normalize_record_type(&input.record_type)?;
     let summary = require_text("summary", &input.summary)?;
     let created_at = timestamp_or_now(&input.created_at);
@@ -926,7 +919,7 @@ pub fn write_record<S: GraphStore>(
         input.record_id.trim().to_string()
     };
 
-    if load_room(store, &tenant_slug, &room_id)?.is_none() {
+    if load_room_exact(store, &tenant_slug, &room_id)?.is_none() {
         persist_room_state(
             store,
             &empty_room_state(&tenant_slug, &room_id, &created_at),
@@ -956,32 +949,27 @@ pub fn read_records_for_room<S: GraphStore>(
     record_types: &[String],
     limit: usize,
 ) -> CoordinationResult<Vec<CoordinationRecordState>> {
-    let tenant_slug = normalize_tenant_slug(tenant_slug);
+    let tenant_slug = require_tenant_slug(tenant_slug)?;
     let room_id = normalize_room_id(room_id);
     let type_filter = record_types
         .iter()
         .map(|record_type| record_type.trim().to_lowercase())
         .filter(|record_type| !record_type.is_empty())
         .collect::<BTreeSet<_>>();
-    let mut records = store
-        .query_nodes(
+    let mut records = Vec::new();
+    for tenant_alias in tenant_slug_aliases(&tenant_slug) {
+        for node in store.query_nodes(
             NodeQuery::label("CoordinationRecord")
-                .with_property("tenant_slug", Value::String(tenant_slug))
-                .with_property("room_id", Value::String(room_id)),
-        )
-        .into_iter()
-        .map(|node| {
-            serde_json::from_value::<CoordinationRecordState>(node.properties)
-                .map_err(|error| CoordinationError::Deserialization(error.to_string()))
-        })
-        .filter_map(|result| match result {
-            Ok(record) if type_filter.is_empty() || type_filter.contains(&record.record_type) => {
-                Some(Ok(record))
+                .with_property("tenant_slug", Value::String(tenant_alias))
+                .with_property("room_id", Value::String(room_id.clone())),
+        ) {
+            let record = serde_json::from_value::<CoordinationRecordState>(node.properties)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()))?;
+            if type_filter.is_empty() || type_filter.contains(&record.record_type) {
+                records.push(record);
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<CoordinationResult<Vec<_>>>()?;
+        }
+    }
     records.sort_by(|left, right| {
         right
             .created_at
@@ -1399,6 +1387,21 @@ fn load_room<S: GraphStore>(
     tenant_slug: &str,
     room_id: &str,
 ) -> CoordinationResult<Option<CoordinationRoomState>> {
+    for tenant_alias in tenant_slug_aliases(tenant_slug) {
+        if let Some(node) = store.get_node(&coordination_room_node_id(&tenant_alias, room_id)) {
+            return serde_json::from_value::<CoordinationRoomState>(node.properties.clone())
+                .map(Some)
+                .map_err(|error| CoordinationError::Deserialization(error.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn load_room_exact<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    room_id: &str,
+) -> CoordinationResult<Option<CoordinationRoomState>> {
     store
         .get_node(&coordination_room_node_id(tenant_slug, room_id))
         .map(|node| {
@@ -1408,7 +1411,7 @@ fn load_room<S: GraphStore>(
         .transpose()
 }
 
-fn load_intent<S: GraphStore>(
+fn load_intent_exact<S: GraphStore>(
     store: &S,
     tenant_slug: &str,
     room_id: &str,
@@ -1798,15 +1801,6 @@ fn normalize_room_id(room_id: &str) -> String {
     }
 }
 
-fn normalize_tenant_slug(tenant_slug: &str) -> String {
-    let tenant_slug = tenant_slug.trim().to_lowercase();
-    if tenant_slug.is_empty() {
-        DEFAULT_TENANT.to_string()
-    } else {
-        tenant_slug
-    }
-}
-
 fn require_text(field: &str, value: &str) -> CoordinationResult<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1816,6 +1810,29 @@ fn require_text(field: &str, value: &str) -> CoordinationResult<String> {
         })
     } else {
         Ok(value.to_string())
+    }
+}
+
+fn require_actor_id(field: &str, value: &str) -> CoordinationResult<String> {
+    let value = normalize_actor_id(value);
+    if value.is_empty() {
+        Err(CoordinationError::InvalidInput {
+            field: field.to_string(),
+            message: "is required".to_string(),
+        })
+    } else {
+        Ok(value)
+    }
+}
+
+fn require_tenant_slug(value: &str) -> CoordinationResult<String> {
+    if value.trim().is_empty() {
+        Err(CoordinationError::InvalidInput {
+            field: "tenant_slug".to_string(),
+            message: "is required".to_string(),
+        })
+    } else {
+        Ok(normalize_tenant_slug(value))
     }
 }
 
@@ -1854,7 +1871,7 @@ fn merge_mentions(left: Vec<String>, right: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut merged = Vec::new();
     for value in left.into_iter().chain(right) {
-        let value = value.trim();
+        let value = normalize_actor_id(&value);
         if value.is_empty() || !seen.insert(value.to_string()) {
             continue;
         }
@@ -1901,7 +1918,7 @@ fn parse_mentions(message: &str) -> Vec<String> {
             end += 1;
         }
         if let Some(actor_id) = message.get(start..end) {
-            let actor_id = actor_id.trim();
+            let actor_id = normalize_actor_id(actor_id);
             if !actor_id.is_empty() && seen.insert(actor_id.to_string()) {
                 mentions.push(actor_id.to_string());
             }
@@ -2033,6 +2050,95 @@ mod tests {
     const ROOM: &str = "harness-rust-port";
     const T1: &str = "2026-06-01T00:00:00+00:00";
     const T2: &str = "2026-06-01T00:01:00+00:00";
+
+    #[test]
+    fn coordination_writes_reject_missing_tenant() {
+        let mut store = InMemoryGraphStore::new();
+        let error = write_message(
+            &mut store,
+            WriteMessageInput {
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                message: "@claude-code missing tenant".to_string(),
+                created_at: T1.to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinationError::InvalidInput { ref field, .. } if field == "tenant_slug"
+        ));
+        assert!(read_messages_for_room(&store, "default", ROOM, 10)
+            .is_ok_and(|messages| messages.is_empty()));
+    }
+
+    #[test]
+    fn coordination_preserves_canonical_tenant_and_reads_legacy_lowercase_rows() {
+        let mut store = InMemoryGraphStore::new();
+        let legacy = write_message(
+            &mut store,
+            WriteMessageInput {
+                tenant_slug: "travis-gilbert".to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "claude-code".to_string(),
+                message: "@codex legacy row".to_string(),
+                created_at: T1.to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .unwrap();
+        let canonical = write_message(
+            &mut store,
+            WriteMessageInput {
+                tenant_slug: "Travis-Gilbert".to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "codex".to_string(),
+                message: "@claude-code canonical row".to_string(),
+                created_at: T2.to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(canonical.tenant_slug, "Travis-Gilbert");
+        let messages = read_messages_for_room(&store, "Travis-Gilbert", ROOM, 10).unwrap();
+        let ids = messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&legacy.message_id.as_str()));
+        assert!(ids.contains(&canonical.message_id.as_str()));
+    }
+
+    #[test]
+    fn mentions_trim_sentence_punctuation_from_actor_ids() {
+        let mut store = InMemoryGraphStore::new();
+        let message = write_message(
+            &mut store,
+            WriteMessageInput {
+                tenant_slug: TENANT.to_string(),
+                room_id: ROOM.to_string(),
+                actor_id: "claude-code.".to_string(),
+                message: "@codex. Please also ping @claude.ai.".to_string(),
+                mentions: vec!["deepseek.".to_string()],
+                created_at: T1.to_string(),
+                ..WriteMessageInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(message.actor_id, "claude-code");
+        assert_eq!(message.mentions, vec!["codex", "claude.ai", "deepseek"]);
+        assert_eq!(
+            parse_coordination_mentions("@codex. and `@ignored.`"),
+            vec!["codex"]
+        );
+        let codex = read_mentions_for_actor(&mut store, TENANT, "codex.", false, 10).unwrap();
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].message_id, message.message_id);
+    }
 
     #[test]
     fn join_room_persists_membership_and_graph_edges() {

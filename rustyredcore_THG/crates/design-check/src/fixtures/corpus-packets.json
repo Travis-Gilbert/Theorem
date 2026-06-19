@@ -1,0 +1,43 @@
+[
+  {
+    "packet_id": "rules://design-standards-wcag-apg-v0.1",
+    "layer": "standards_as_authored_rules",
+    "source_class": "design_as_facts",
+    "sources": [
+      { "name": "WCAG 2.2 thresholds", "license": "facts only", "ingest": "authored_rule" },
+      { "name": "ARIA APG keyboard contracts", "license": "facts only", "ingest": "authored_rule" }
+    ]
+  },
+  {
+    "packet_id": "github://design-systems-v0.1",
+    "layer": "design_system_repos",
+    "source_class": "code_corpus_v1",
+    "sources": [
+      { "name": "radix-ui/primitives", "license": "MIT", "ingest": "tokens_components_fixtures" },
+      { "name": "uswds/uswds", "license": "public-domain", "ingest": "tokens_components_fixtures" },
+      { "name": "alphagov/govuk-frontend", "license": "MIT", "ingest": "tokens_components_fixtures" },
+      { "name": "carbon-design-system/carbon", "license": "Apache-2.0", "ingest": "tokens_components_fixtures" },
+      { "name": "material-components/material-web", "license": "Apache-2.0", "ingest": "tokens_components_fixtures" },
+      { "name": "primer/react", "license": "MIT", "ingest": "tokens_components_fixtures" },
+      { "name": "shadcn-ui/ui", "license": "MIT", "ingest": "tokens_components_fixtures" }
+    ]
+  },
+  {
+    "packet_id": "github://design-motion-viz-v0.1",
+    "layer": "motion_and_viz",
+    "source_class": "code_corpus_v1",
+    "sources": [
+      { "name": "observablehq/plot", "license": "ISC", "ingest": "viz_patterns" },
+      { "name": "juliangarnier/anime", "license": "MIT", "ingest": "motion_patterns" }
+    ]
+  },
+  {
+    "packet_id": "local://design-engineering-first-party-v0.1",
+    "layer": "first_party",
+    "source_class": "local_design_system",
+    "sources": [
+      { "name": "Travis-Gilbert/travisgilbert.me", "license": "first-party", "ingest": "tokens_components" },
+      { "name": "rustyredcore_THG/crates/scene-os-web", "license": "first-party", "ingest": "tokens_components" }
+    ]
+  }
+]

@@ -2,6 +2,7 @@
 name = "rustyred-thg-server"
 version = "0.5.0"
 edition = "2021"
+description = "Product HTTP/gRPC/MCP surface over RustyRedCore-THG: tenant graph routes, query/Cypher APIs, harness coordination, browser actions, fractal expansion, and TTL sweeping."
 build = "build.rs"
 
 [dependencies]
@@ -24,6 +25,7 @@ theorem-dispatch = { path = "../theorem-dispatch" }
 theorem-browser-agent = { path = "../theorem-browser-agent" }
 rustyred-thg-adapters = { path = "../rustyred-thg-adapters", features = ["pairformer-burn-cubecl"] }
 rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
+rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
 rustyred-thg-mcp = { path = "../rustyred-thg-mcp", features = ["redis-store"] }
 rustyred-thg-fractal = { path = "../rustyred-thg-fractal" }
 rustyred-web = { path = "../rustyred-web" }

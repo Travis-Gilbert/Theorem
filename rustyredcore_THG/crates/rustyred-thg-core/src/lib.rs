@@ -4,9 +4,12 @@
 //! PyO3 in-process bindings and the standalone HTTP server call this same
 //! executor.
 
+pub mod access_method;
+pub mod cold_fragments;
 pub mod cold_index;
 pub mod commands;
 pub mod crdt;
+pub mod doc_tree;
 pub mod epistemic;
 pub mod errors;
 pub mod executor;
@@ -20,8 +23,10 @@ pub mod hooks;
 pub mod instant_kg;
 pub mod object_store;
 pub mod ordered;
+pub mod planner;
 pub mod plugin;
 pub mod ppr_cache;
+pub mod relational;
 pub mod spatial;
 #[cfg(feature = "s2")]
 pub mod spatial_s2;
@@ -29,14 +34,29 @@ pub mod state;
 pub mod store;
 pub mod symbolic;
 pub mod versioned_graph;
+pub mod working_log;
 
+pub use access_method::{
+    AccessMethod, AccessMethodRegistry, AccessMethodStats, AmResult, ColumnId, Cost,
+    OrderedAccessMethod, Predicate, RegionRef, RelationId, RowChange, RowChangeKind, RowId,
+    RowIdStream, ScalarBound, ScalarValue, TimeSeriesAccessMethod,
+};
+pub use cold_fragments::{
+    ColdFragment, ColdFragmentStore, CompressionFilter, FragmentColumn, FragmentRangeResult,
+    FragmentRangeStats, PromotionOutcome, PromotionPolicy, ZoneMap,
+};
 pub use cold_index::{
     ColdIndex, ColdIndexEntry, ColdScopeEntry, ColdTierKind, DiskColdIndex, InMemoryColdIndex,
+    OrderedColdIndex,
 };
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
 pub use crdt::{
     diff_since, join_delta, ActorId, Hlc, HlcClock, JoinReport, StampedBatch, StampedMutation,
     VersionVector,
+};
+pub use doc_tree::{
+    DocEntry, DocTree, PathKey, DEFAULT_INLINE_THRESHOLD, DOC_TREE_CONTENT_HASH_PROPERTY,
+    DOC_TREE_PATH_PROPERTY,
 };
 pub use epistemic::{
     compile_user_subgraph, epistemic_egraph_dedup, epistemic_shadow_edge_id,
@@ -46,12 +66,12 @@ pub use epistemic::{
     EpistemicChokepoint, EpistemicCongruence, EpistemicCronInput, EpistemicCronReport,
     EpistemicDedupConfig, EpistemicDedupReport, EpistemicEnricher, EpistemicEnrichmentError,
     EpistemicEnrichmentMode, EpistemicEquivalenceClass, EpistemicFieldProvenance, EpistemicReadout,
-    EpistemicRelationInput, EpistemicRelationKind, EpistemicRelationReadout, EpistemicShadowReadout,
-    EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer, SameEClassRef,
-    SourceReliability, StructuralEpistemicConfig, StructuralEpistemicInput, UserSubgraph,
-    DEFAULT_EPISTEMIC_ENGINE_VERSION, EGRAPH_EPISTEMIC_ENGINE, EPISTEMIC_SHADOW_LABEL,
-    EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, LEARNED_EPISTEMIC_ENGINE, SAME_ECLASS,
-    STRUCTURAL_EPISTEMIC_ENGINE, UNDERCUTS,
+    EpistemicRelationInput, EpistemicRelationKind, EpistemicRelationReadout,
+    EpistemicShadowReadout, EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer,
+    SameEClassRef, SourceReliability, StructuralEpistemicConfig, StructuralEpistemicInput,
+    UserSubgraph, DEFAULT_EPISTEMIC_ENGINE_VERSION, EGRAPH_EPISTEMIC_ENGINE,
+    EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, LEARNED_EPISTEMIC_ENGINE,
+    SAME_ECLASS, STRUCTURAL_EPISTEMIC_ENGINE, UNDERCUTS,
 };
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
@@ -94,6 +114,10 @@ pub use ordered::{
     EvictionFrontier, OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember,
     OrderedMode, OrderedScore,
 };
+pub use planner::{
+    compile_graphql_selection, execute_query, AccessPathTrace, GraphqlJoinSelection,
+    GraphqlSelection, JoinPredicate, PlanTrace, Projection, QueryIr, QueryRelation, QueryResult,
+};
 pub use plugin::{
     normalize_plugin_command, PluginCapability, PluginCapabilityKind, PluginExecutionOutput,
     PluginOperationContext, PluginOperationHandler, PluginOperationRegistration, PluginRegistry,
@@ -102,6 +126,11 @@ pub use plugin::{
 pub use ppr_cache::{
     cached_personalized_pagerank, cached_single_seed_personalized_pagerank, clear_scoped_ppr_cache,
     merge_ppr_scores, scoped_ppr_cache_len,
+};
+pub use relational::{
+    ColumnSchema, NativeAuthPrincipalRecord, NativeBillingAccountRecord, NativeCatalog,
+    NativeProjectRecord, NativeTenantRecord, Relation, RelationSchema, RelationalRow,
+    RelationalStore,
 };
 pub use spatial::{
     make_spatial_backend, make_spatial_backend_from_value, SpatialBackend, SpatialDesignation,
@@ -131,4 +160,7 @@ pub use versioned_graph::{
     GraphVersionRef, GraphVersionRepository, IncrementalGraphPack, IncrementalTreeBuild,
     DEFAULT_GRAPH_BRANCH, GRAPH_CHUNK_FORMAT_VERSION, GRAPH_PACK_COMPILER_VERSION,
     VERSIONED_GRAPH_PROTOCOL_VERSION,
+};
+pub use working_log::{
+    RecencyCounter, RecencyState, TemporalFact, WorkingLog, WorkingLogEvent, WorkingLogEventKind,
 };

@@ -11,7 +11,7 @@ The **Harness server** is the product transport: it is what most integrations ta
 
 ## Authentication
 
-> The Harness server performs **no authentication** today. The tenant is a plain `tenant` (or `tenant_slug`) query/body string, defaulting to `default`. Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, `POST /harness/rooms/{room_id}/messages`) are unauthenticated. Run it on a trusted network, or put an authenticating proxy in front of it, before exposing it publicly.
+> The Harness server performs **no authentication** today. The tenant is a plain `tenant` (or `tenant_slug`) query/body string, or a non-default configured value from `THEOREM_HARNESS_TENANT_SLUG`, `THEOREM_AGENT_TENANT_SLUG`, or `THEOREM_TENANT_ID`; silent fallback to `default` is refused on tenant-sensitive routes. Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, `POST /harness/rooms/{room_id}/messages`) are unauthenticated. Run it on a trusted network, or put an authenticating proxy in front of it, before exposing it publicly.
 
 The graph engine is different: it requires `Authorization: Bearer <token>` and enforces per-command scopes (see its own `/openapi.json` and `/v1/diagnostics/config`).
 

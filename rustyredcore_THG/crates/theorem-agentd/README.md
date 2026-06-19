@@ -11,25 +11,35 @@ does the local launch.
 
 ## Run one turn
 
+No config file is required for the first smoke. If `theorem-agentd.toml` is
+absent, the daemon uses safe local defaults: deterministic `rule` model, local
+MCP route (`http://127.0.0.1:8380/mcp`), tenant `Travis-Gilbert`,
+receiver/capture/relay off, and the ledger at `.theorem/agentd-token-ledger.jsonl`.
+
 ```bash
-cp crates/theorem-agentd/theorem-agentd.example.toml ./theorem-agentd.toml
-THEOREM_HARNESS_TOKEN=<bearer> \
-  cargo run -p theorem-agentd -- --once "what are the agents working on" ./theorem-agentd.toml
+cd rustyredcore_THG
+cargo run -p theorem-agentd -- --once "hello from agentd"
 ```
 
 The command prints a full JSON transcript: context reads, model decision, tool
-calls, tool results, final text, and ledger status.
-Single-turn mode does not start the receiver sidecar; daemon mode does.
+calls, tool results, final text, and ledger status. Single-turn mode does not
+start the receiver sidecar; daemon mode does.
 
-For offline development, set `[model].provider = "rule"` in a copy of the config.
-That provider is deterministic and only exists to test the daemon loop without a
-resident model.
+To pin settings explicitly:
+
+```bash
+cp crates/theorem-agentd/theorem-agentd.example.toml ./theorem-agentd.toml
+cargo run -p theorem-agentd -- --once "hello from configured agentd" ./theorem-agentd.toml
+```
+
+Switch `[model].provider` to `openai-compatible` only when a resident model is
+available. Keep model keys in environment variables, not in TOML.
 
 ## Run as a daemon
 
 ```bash
-THEOREM_HARNESS_TOKEN=<bearer> \
-  cargo run -p theorem-agentd -- ./theorem-agentd.toml
+cd rustyredcore_THG
+cargo run -p theorem-agentd -- ./theorem-agentd.toml
 ```
 
 If `[receiver].enabled = true`, startup also loads `theorem-receiver.toml` and
@@ -39,6 +49,19 @@ receiver communicate only through the coordination room.
 `theorem-agentd.launchd.plist.example` shows the single-job launchd shape. Do
 not store real tokens in the plist; set them through launchctl or another secret
 manager.
+
+## Use through the `theorem` wrapper
+
+The repo-level wrapper gives the install/onboarding path a single command:
+
+```bash
+scripts/theorem init
+scripts/theorem once "hello from the wrapper"
+scripts/theorem start
+```
+
+`scripts/install.sh` installs that wrapper as `theorem` and can start agentd
+with the same no-config defaults.
 
 ## Tool-call guardrail
 

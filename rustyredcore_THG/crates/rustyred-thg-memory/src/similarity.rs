@@ -20,7 +20,9 @@
 use rustyred_thg_core::{now_ms, EdgeRecord, GraphStore, GraphStoreResult, NodeRecord};
 use serde_json::json;
 
-use crate::{memory_edge_id, memory_nodes, normalized_tenant_pair, prop_str, MEMORY_DOCUMENT_LABEL};
+use crate::{
+    memory_edge_id, memory_nodes, normalized_tenant_pair, prop_str, MEMORY_DOCUMENT_LABEL,
+};
 
 /// Edge type written between two semantically-close memory docs.
 pub const MEMORY_SIMILAR: &str = "MEMORY_SIMILAR";

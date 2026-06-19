@@ -110,6 +110,7 @@ Read and compute over the graph store.
 |---|---|
 | `rustyred_thg_graph_neighbors` | Read adjacency neighbors. |
 | `rustyred_thg_graph_query` | Bounded neighbors / exact-match query. |
+| `rustyred_thg_relational_query` | Run a native relational planner query or GraphQL-style selection across graph-backed relations. |
 | `rustyred_thg_graph_explain` | Explain a bounded query plan. |
 | `rustyred_thg_graph_schema` | Labels, edge types, stats, capabilities. |
 | `rustyred_thg_graph_index_status` | Index health and drift. |

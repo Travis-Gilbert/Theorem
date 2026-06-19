@@ -36,6 +36,12 @@ pub fn api_provider_profile(provider: &str) -> Option<ApiProviderProfile> {
             default_endpoint: "https://api.deepseek.com/chat/completions",
             request_shape: ApiRequestShape::OpenAiChatCompletions,
         }),
+        "openai" | "openapi" => Some(ApiProviderProfile {
+            provider: "openai",
+            env_endpoint: "OPENAI_CHAT_URL",
+            default_endpoint: "https://api.openai.com/v1/chat/completions",
+            request_shape: ApiRequestShape::OpenAiChatCompletions,
+        }),
         "zhipu" | "zai" | "z.ai" | "glm" => Some(ApiProviderProfile {
             provider: "zhipu",
             env_endpoint: "ZHIPU_CHAT_URL",
@@ -75,6 +81,7 @@ pub fn default_api_profiles() -> Vec<ApiProviderProfile> {
     [
         "anthropic",
         "deepseek",
+        "openai",
         "zhipu",
         "minimax",
         "mistral",
@@ -359,6 +366,8 @@ mod tests {
         for provider in [
             "anthropic",
             "deepseek",
+            "openai",
+            "openapi",
             "zhipu",
             "minimax",
             "mistral",

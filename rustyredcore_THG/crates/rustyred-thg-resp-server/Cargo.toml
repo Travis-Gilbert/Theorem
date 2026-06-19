@@ -2,6 +2,7 @@
 name = "rustyred-thg-resp-server"
 version = "0.5.0"
 edition = "2021"
+description = "RESP protocol server for RustyRedCore-THG ordered-index commands."
 
 [dependencies]
 redis-protocol = "5"

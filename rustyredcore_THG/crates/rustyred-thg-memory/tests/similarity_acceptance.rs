@@ -54,13 +54,43 @@ fn similar_ids(store: &InMemoryGraphStore, id: &str) -> Vec<String> {
 fn seeded_store() -> InMemoryGraphStore {
     let mut store = InMemoryGraphStore::new();
     // Cluster A: Postgres / database (disjoint vocabulary from cluster B).
-    add_doc(&mut store, "doc_pg1", "t", "Postgres tuning", "postgres database index tuning speeds queries");
-    add_doc(&mut store, "doc_pg2", "t", "Database speed", "database queries faster postgres index tuning");
+    add_doc(
+        &mut store,
+        "doc_pg1",
+        "t",
+        "Postgres tuning",
+        "postgres database index tuning speeds queries",
+    );
+    add_doc(
+        &mut store,
+        "doc_pg2",
+        "t",
+        "Database speed",
+        "database queries faster postgres index tuning",
+    );
     // Cluster B: Servo / browser.
-    add_doc(&mut store, "doc_sv1", "t", "Servo render", "servo browser renders pages graph");
-    add_doc(&mut store, "doc_sv2", "t", "Browser ingest", "browser servo ingest pages render graph");
+    add_doc(
+        &mut store,
+        "doc_sv1",
+        "t",
+        "Servo render",
+        "servo browser renders pages graph",
+    );
+    add_doc(
+        &mut store,
+        "doc_sv2",
+        "t",
+        "Browser ingest",
+        "browser servo ingest pages render graph",
+    );
     // A doc in a different tenant, vocabulary matching cluster A.
-    add_doc(&mut store, "doc_other", "other", "Postgres elsewhere", "postgres database index tuning queries");
+    add_doc(
+        &mut store,
+        "doc_other",
+        "other",
+        "Postgres elsewhere",
+        "postgres database index tuning queries",
+    );
     store
 }
 
@@ -76,9 +106,13 @@ fn options() -> SimilarityOptions {
 fn computes_intra_cluster_edges_and_none_across_clusters() {
     let mut store = seeded_store();
     let stats =
-        compute_memory_similarity_edges(&mut store, "t", &HashEmbedder::new(256), &options()).unwrap();
+        compute_memory_similarity_edges(&mut store, "t", &HashEmbedder::new(256), &options())
+            .unwrap();
 
-    assert_eq!(stats.docs, 4, "only the four tenant-t docs are enumerated (not the 'other' tenant)");
+    assert_eq!(
+        stats.docs, 4,
+        "only the four tenant-t docs are enumerated (not the 'other' tenant)"
+    );
 
     // Postgres doc links to the other Postgres doc, and to neither browser doc.
     assert_eq!(similar_ids(&store, "doc_pg1"), vec!["doc_pg2".to_string()]);
@@ -117,7 +151,10 @@ fn re_run_is_idempotent() {
     let after = similar_ids(&store, "doc_pg1");
 
     assert_eq!(first, second, "stats stable across runs");
-    assert_eq!(before, after, "neighbor set unchanged; deterministic edge ids overwrite, no duplicates");
+    assert_eq!(
+        before, after,
+        "neighbor set unchanged; deterministic edge ids overwrite, no duplicates"
+    );
     assert_eq!(after, vec!["doc_pg2".to_string()]);
 }
 
@@ -136,7 +173,10 @@ fn the_score_threshold_prunes_weak_links() {
         },
     )
     .unwrap();
-    assert_eq!(stats.edges_written, 0, "nothing clears a near-1.0 cosine threshold");
+    assert_eq!(
+        stats.edges_written, 0,
+        "nothing clears a near-1.0 cosine threshold"
+    );
     assert!(similar_ids(&store, "doc_pg1").is_empty());
 }
 
@@ -161,7 +201,8 @@ fn kind_filter_excludes_internal_docs_and_can_allowlist_real_kinds() {
     );
 
     let stats =
-        compute_memory_similarity_edges(&mut store, "t", &HashEmbedder::new(256), &options()).unwrap();
+        compute_memory_similarity_edges(&mut store, "t", &HashEmbedder::new(256), &options())
+            .unwrap();
 
     assert_eq!(
         stats.docs, 5,
@@ -187,7 +228,11 @@ fn kind_filter_excludes_internal_docs_and_can_allowlist_real_kinds() {
         ..options()
     };
     let stats =
-        compute_memory_similarity_edges(&mut allowlisted, "t", &HashEmbedder::new(256), &opts).unwrap();
+        compute_memory_similarity_edges(&mut allowlisted, "t", &HashEmbedder::new(256), &opts)
+            .unwrap();
     assert_eq!(stats.docs, 1, "include_kinds limits the source set");
-    assert_eq!(stats.edges_written, 0, "one allowed doc has no neighbor to link");
+    assert_eq!(
+        stats.edges_written, 0,
+        "one allowed doc has no neighbor to link"
+    );
 }

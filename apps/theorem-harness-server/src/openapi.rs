@@ -34,8 +34,10 @@ pub fn openapi_document() -> Value {
                 "Scope: this is the Harness product transport only. The graph engine ",
                 "(`rustyred-thg-server`) is a separate service with its own, larger API published ",
                 "at its own `GET /openapi.json`.\n\n",
-                "Authentication: this server performs NO authentication today. The tenant is a ",
-                "plain `tenant` (or `tenant_slug`) string per request, defaulting to `default`. ",
+                "Authentication: this server performs NO authentication today. The tenant is supplied ",
+                "as a plain `tenant` (or `tenant_slug`) string per request, or by a non-default ",
+                "configured value from `THEOREM_HARNESS_TENANT_SLUG`, `THEOREM_AGENT_TENANT_SLUG`, ",
+                "or `THEOREM_TENANT_ID`; silent fallback to `default` is refused. ",
                 "Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, ",
                 "`POST /harness/rooms/{room_id}/messages`) are therefore unauthenticated. Run it ",
                 "on a trusted network or behind an authenticating proxy before exposing it ",
@@ -345,7 +347,7 @@ pub fn openapi_document() -> Value {
                 "post": {
                     "tags": ["jobs"],
                     "summary": "Submit a dispatch job",
-                    "description": "Creates or upserts a pending Job. Defaults: tenant -> default, room -> repo:theorem:branch:main, submitted_by -> theorem-harness-server. If THEOREM_DISPATCH_DATABASE_URL is set, the job is mirrored into the Postgres dispatch queue and a wake event is emitted to the target head.",
+                    "description": "Creates or upserts a pending Job. The tenant must be supplied as `tenant`/`tenant_slug` unless the server has a non-default tenant env configured. Defaults: room -> repo:theorem:branch:main, submitted_by -> theorem-harness-server. If THEOREM_DISPATCH_DATABASE_URL is set, the job is mirrored into the Postgres dispatch queue and a wake event is emitted to the target head.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSubmitBody" } } }
@@ -465,8 +467,8 @@ pub fn openapi_document() -> Value {
             "parameters": {
                 "Tenant": {
                     "name": "tenant", "in": "query", "required": false,
-                    "schema": { "type": "string", "default": "default" },
-                    "description": "Tenant slug. Alias `tenant_slug` is also accepted. Defaults to `default`."
+                    "schema": { "type": "string", "example": "Travis-Gilbert" },
+                    "description": "Tenant slug. Alias `tenant_slug` is also accepted. Required unless the server has a non-default tenant env configured."
                 },
                 "RunId": { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } },
                 "MapId": { "name": "map_id", "in": "path", "required": true, "schema": { "type": "string" } },
@@ -515,7 +517,7 @@ pub fn openapi_document() -> Value {
                     "type": "object",
                     "required": ["actor_id", "message"],
                     "properties": {
-                        "tenant_slug": { "type": "string", "default": "default" },
+                        "tenant_slug": { "type": "string", "example": "Travis-Gilbert" },
                         "actor_id": { "type": "string" },
                         "message": { "type": "string" },
                         "urgency": { "type": "string", "description": "Coordination urgency.", "enum": ["info", "ask", "block"] },
@@ -600,7 +602,7 @@ pub fn openapi_document() -> Value {
                     "type": "object",
                     "required": ["server_id", "target"],
                     "properties": {
-                        "tenant": { "type": "string", "default": "default" },
+                        "tenant": { "type": "string", "example": "Travis-Gilbert" },
                         "server_id": { "type": "string" },
                         "label": { "type": "string", "description": "Defaults to server_id if empty." },
                         "target": { "$ref": "#/components/schemas/ConnectionTarget" }

@@ -11,6 +11,8 @@
 //! write tools return a structured `mcp_read_only` error instead of mutating the
 //! graph. Full categorized catalog: `docs/site/reference/mcp-tools.md`.
 
+mod connector_gateway;
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -24,14 +26,15 @@ use ensemble::{
     PackExposure, PackKind, TrustTier,
 };
 use rustyred_thg_core::{
-    checkout_graph_version, compile_graph_pack, compile_user_subgraph, diff_graph_snapshots,
-    epistemic_shadow_ppr, graph_version_log, merge_graph_snapshots, read_epistemic_shadow,
-    run_epistemic_cron_pass, update_graph_ref_cas, CodeKgManifest, Direction, EdgeRecord,
-    EpistemicAnnotations, EpistemicCronInput, EpistemicEnricher, EpistemicEnrichmentError,
-    EpistemicEnrichmentMode, EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphSnapshot,
-    GraphStats, GraphStore, GraphStoreError, GraphStoreResult, GraphVersionRepository,
-    HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, RedCoreGraphStore, SessionDelta, UserSubgraph, VectorDesignation,
+    checkout_graph_version, compile_graph_pack, compile_graphql_selection, compile_user_subgraph,
+    diff_graph_snapshots, epistemic_shadow_ppr, execute_query, graph_version_log,
+    merge_graph_snapshots, read_epistemic_shadow, run_epistemic_cron_pass, update_graph_ref_cas,
+    CodeKgManifest, Direction, EdgeRecord, EpistemicAnnotations, EpistemicCronInput,
+    EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicType,
+    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
+    GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
+    HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    QueryIr, RedCoreGraphStore, RelationalStore, SessionDelta, UserSubgraph, VectorDesignation,
     VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, SAME_ECLASS,
     UNDERCUTS,
 };
@@ -55,7 +58,7 @@ use theorem_harness_runtime::{
     coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
     coordination_record_node_id, coordination_room_binding_edge_id, coordination_room_node_id,
     default_theorem_binding, encode_memory, forget_memory, get_skill_pack, handoff_memory,
-    infer_coordination_room_id, list_skill_packs, load_events, load_run,
+    infer_coordination_room_id, list_skill_packs, load_events, load_run, normalize_actor_id,
     normalize_coordination_urgency, parse_coordination_mentions,
     publish_coordination_room_event_from_state, publish_footprint_event, publish_presence_event,
     publish_record_event, publish_skill_pack, publish_work_graph_transition,
@@ -906,12 +909,32 @@ fn call_tool<P: McpGraphProvider>(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let tenant = tenant_from_args(&arguments, config);
+    let tenant = tenant_from_args_for_tool(name, &arguments, config)?;
     let mut backend = provider.backend_for_tenant(&tenant)?;
 
     let payload = match name {
         "tool_result_fetch" | "theorem_harness_tool_result_fetch" => {
             tool_result_fetch_payload(&arguments)?
+        }
+        "tool_search" | "gateway_tool_search" => {
+            connector_gateway::search_payload(&tenant, &mut backend, &arguments)?
+        }
+        "describe" | "gateway_describe" => {
+            connector_gateway::describe_payload(&tenant, &mut backend, &arguments)?
+        }
+        "invoke" | "gateway_invoke" => {
+            let dry_run = arguments
+                .get("dry_run")
+                .or_else(|| arguments.get("dryRun"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if config.read_only && !dry_run {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "gateway invoke is unavailable while read-only mode is active unless dry_run=true."
+                })));
+            }
+            connector_gateway::invoke_payload(&tenant, &mut backend, &arguments)?
         }
         "rustyred_thg_graph_neighbors" => {
             let query = neighbor_query_from_value(&arguments)?;
@@ -928,6 +951,9 @@ fn call_tool<P: McpGraphProvider>(
         "rustyred_thg_graph_index_status" => index_status_payload(&tenant, &backend)?,
         "rustyred_thg_graph_explain" => explain_payload(&tenant, &arguments),
         "rustyred_thg_graph_query" => query_payload(&tenant, &backend, &arguments)?,
+        "rustyred_thg_relational_query" | "rustyred_relational_query" => {
+            relational_query_payload(&tenant, &backend, &arguments)?
+        }
         "epistemic_dirty_frontier" | "rustyred_thg_epistemic_dirty_frontier" => {
             epistemic_dirty_frontier_payload(&tenant, &backend, &arguments)?
         }
@@ -2263,6 +2289,46 @@ fn query_payload(
         "neighbors": neighbors,
         "stats": { "returned": neighbors.len(), "truncated": truncated },
         "explain": explain_payload(tenant, arguments)
+    }))
+}
+
+fn relational_query_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let snapshot = backend.graph_snapshot()?;
+    let store = RelationalStore::from_graph_snapshot(&snapshot)?;
+    let query = if let Some(query_ir) = arguments
+        .get("query_ir")
+        .or_else(|| arguments.get("queryIr"))
+    {
+        serde_json::from_value::<QueryIr>(query_ir.clone())
+            .map_err(|error| McpError::invalid_params(format!("invalid query_ir: {error}")))?
+    } else if let Some(selection) = arguments
+        .get("selection")
+        .or_else(|| arguments.get("graphql_selection"))
+        .or_else(|| arguments.get("graphqlSelection"))
+    {
+        let selection = serde_json::from_value::<GraphqlSelection>(selection.clone())
+            .map_err(|error| McpError::invalid_params(format!("invalid selection: {error}")))?;
+        compile_graphql_selection(selection)
+    } else {
+        return Err(McpError::invalid_params(
+            "rustyred_thg_relational_query requires query_ir or selection",
+        ));
+    };
+    let result = execute_query(&store, query)?;
+    Ok(json!({
+        "tenant": tenant,
+        "planner": "rustyred-native-relational",
+        "rows": result.rows,
+        "trace": result.trace,
+        "stats": {
+            "returned": result.rows.len(),
+            "graph_snapshot_version": snapshot.version,
+            "relations": store.relations().map(|relation| relation.schema.relation.clone()).collect::<Vec<_>>()
+        }
     }))
 }
 
@@ -5045,14 +5111,14 @@ fn join_coordination_room(
     input: JoinRoomInput,
 ) -> Result<CoordinationRoomState, McpError> {
     let tenant_slug = normalize_tenant_slug(&input.tenant_slug);
-    let actor_id = require_nonempty(input.actor_id.trim(), "coordination_room requires actor")?;
+    let actor_id = require_actor_id(&input.actor_id, "coordination_room requires actor")?;
     let room_id = if input.room_id.trim().is_empty() {
         infer_coordination_room_id(&input.repo, &input.branch, &input.task, &input.session_id)
     } else {
         input.room_id.trim().to_string()
     };
     let now = timestamp_or_now(&input.updated_at);
-    let mut state = load_coordination_room(backend, &tenant_slug, &room_id)?
+    let mut state = load_coordination_room_exact(backend, &tenant_slug, &room_id)?
         .unwrap_or_else(|| empty_coordination_room(&tenant_slug, &room_id, &now));
     let existing = state.members.get(&actor_id);
     let joined_at = existing
@@ -5111,17 +5177,17 @@ fn write_coordination_intent(
     } else {
         input.room_id.trim().to_string()
     };
-    let actor_id = require_nonempty(input.actor_id.trim(), "write_intent requires actor")?;
+    let actor_id = require_actor_id(&input.actor_id, "write_intent requires actor")?;
     let summary = require_nonempty(input.summary.trim(), "write_intent requires summary")?;
     let status = normalize_coordination_status(&input.status)?;
     let now = timestamp_or_now(&input.updated_at);
-    if load_coordination_room(backend, &tenant_slug, &room_id)?.is_none() {
+    if load_coordination_room_exact(backend, &tenant_slug, &room_id)?.is_none() {
         persist_coordination_room(
             backend,
             &empty_coordination_room(&tenant_slug, &room_id, &now),
         )?;
     }
-    let prior = load_coordination_intent(backend, &tenant_slug, &room_id, &actor_id)?;
+    let prior = load_coordination_intent_exact(backend, &tenant_slug, &room_id, &actor_id)?;
     let started_at = prior
         .as_ref()
         .map(|intent| intent.started_at.clone())
@@ -5473,7 +5539,7 @@ fn write_coordination_presence(
     };
     let presence = CoordinationPresenceState {
         tenant_slug: normalize_tenant_slug(&input.tenant_slug),
-        actor_id: require_nonempty(input.actor_id.trim(), "presence requires actor")?,
+        actor_id: require_actor_id(&input.actor_id, "presence requires actor")?,
         session_id: input.session_id.trim().to_string(),
         surface: input.surface.trim().to_string(),
         status: if input.status.trim().is_empty() {
@@ -5503,22 +5569,22 @@ fn write_coordination_message(
     } else {
         input.room_id.trim().to_string()
     };
-    let actor_id = require_nonempty(input.actor_id.trim(), "coordinate requires actor")?;
+    let actor_id = require_actor_id(&input.actor_id, "coordinate requires actor")?;
     let message = require_nonempty(input.message.trim(), "coordinate requires message")?;
     let urgency = normalize_coordination_urgency(&input.urgency)
         .map_err(|error| McpError::invalid_params(error.to_string()))?;
     let delivery = normalize_coordination_delivery(&input.delivery)?;
     let created_at = timestamp_or_now(&input.created_at);
-    let mentions = merge_string_vecs(
+    let mentions = merge_actor_vecs(
         parse_coordination_mentions(&message),
-        normalize_string_vec(input.mentions),
+        normalize_actor_vec(input.mentions),
     );
     let message_id = if input.message_id.trim().is_empty() {
         stable_coordination_message_id(&tenant_slug, &room_id, &actor_id, &message, &created_at)
     } else {
         input.message_id.trim().to_string()
     };
-    if load_coordination_room(backend, &tenant_slug, &room_id)?.is_none() {
+    if load_coordination_room_exact(backend, &tenant_slug, &room_id)?.is_none() {
         persist_coordination_room(
             backend,
             &empty_coordination_room(&tenant_slug, &room_id, &created_at),
@@ -5552,7 +5618,7 @@ fn write_coordination_record(
     } else {
         input.room_id.trim().to_string()
     };
-    let actor_id = require_nonempty(input.actor_id.trim(), "coordination_record requires actor")?;
+    let actor_id = require_actor_id(&input.actor_id, "coordination_record requires actor")?;
     let record_type = normalize_coordination_record_type(&input.record_type)?;
     let summary = require_nonempty(input.summary.trim(), "coordination_record requires summary")?;
     let created_at = timestamp_or_now(&input.created_at);
@@ -5568,7 +5634,7 @@ fn write_coordination_record(
     } else {
         input.record_id.trim().to_string()
     };
-    if load_coordination_room(backend, &tenant_slug, &room_id)?.is_none() {
+    if load_coordination_room_exact(backend, &tenant_slug, &room_id)?.is_none() {
         persist_coordination_room(
             backend,
             &empty_coordination_room(&tenant_slug, &room_id, &created_at),
@@ -5600,22 +5666,19 @@ fn read_coordination_intents(
         .into_iter()
         .map(|status| status.to_lowercase())
         .collect::<Vec<_>>();
-    let mut intents = backend
-        .query_nodes(
+    let mut intents = Vec::new();
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        for node in backend.query_nodes(
             NodeQuery::label("CoordinationIntent")
-                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant)))
+                .with_property("tenant_slug", Value::String(tenant_alias))
                 .with_property("room_id", Value::String(room_id.to_string())),
-        )?
-        .into_iter()
-        .map(|node| parse_node_properties::<CoordinationIntentState>(node.properties))
-        .filter_map(|result| match result {
-            Ok(intent) if filters.is_empty() || filters.contains(&intent.status) => {
-                Some(Ok(intent))
+        )? {
+            let intent = parse_node_properties::<CoordinationIntentState>(node.properties)?;
+            if filters.is_empty() || filters.contains(&intent.status) {
+                intents.push(intent);
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        }
+    }
     intents.sort_by(|left, right| {
         right
             .updated_at
@@ -5631,15 +5694,18 @@ fn read_coordination_messages(
     room_id: &str,
     limit: usize,
 ) -> Result<Vec<CoordinationMessageState>, McpError> {
-    let mut messages = backend
-        .query_nodes(
+    let mut messages = Vec::new();
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        for node in backend.query_nodes(
             NodeQuery::label("CoordinationMessage")
-                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant)))
+                .with_property("tenant_slug", Value::String(tenant_alias))
                 .with_property("room_id", Value::String(room_id.to_string())),
-        )?
-        .into_iter()
-        .map(|node| parse_node_properties::<CoordinationMessageState>(node.properties))
-        .collect::<Result<Vec<_>, _>>()?;
+        )? {
+            messages.push(parse_node_properties::<CoordinationMessageState>(
+                node.properties,
+            )?);
+        }
+    }
     messages.sort_by(|left, right| {
         right
             .created_at
@@ -5663,22 +5729,19 @@ fn read_coordination_records(
         .into_iter()
         .map(|record_type| record_type.to_lowercase())
         .collect::<Vec<_>>();
-    let mut records = backend
-        .query_nodes(
+    let mut records = Vec::new();
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        for node in backend.query_nodes(
             NodeQuery::label("CoordinationRecord")
-                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant)))
+                .with_property("tenant_slug", Value::String(tenant_alias))
                 .with_property("room_id", Value::String(room_id.to_string())),
-        )?
-        .into_iter()
-        .map(|node| parse_node_properties::<CoordinationRecordState>(node.properties))
-        .filter_map(|result| match result {
-            Ok(record) if filters.is_empty() || filters.contains(&record.record_type) => {
-                Some(Ok(record))
+        )? {
+            let record = parse_node_properties::<CoordinationRecordState>(node.properties)?;
+            if filters.is_empty() || filters.contains(&record.record_type) {
+                records.push(record);
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        }
+    }
     records.sort_by(|left, right| {
         right
             .created_at
@@ -5698,28 +5761,27 @@ fn read_coordination_mentions(
     consume: bool,
     limit: usize,
 ) -> Result<Vec<CoordinationMessageState>, McpError> {
-    let actor_id = require_nonempty(actor_id.trim(), "mentions requires actor")?;
-    let mut messages = backend
-        .query_nodes(
+    let actor_id = require_actor_id(actor_id, "mentions requires actor")?;
+    let mut messages = Vec::new();
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        for node in backend.query_nodes(
             NodeQuery::label("CoordinationMessage")
-                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant))),
-        )?
-        .into_iter()
-        .map(|node| parse_node_properties::<CoordinationMessageState>(node.properties))
-        .filter_map(|result| match result {
-            Ok(message)
-                if message.mentions.iter().any(|mention| mention == &actor_id)
-                    && !message
-                        .consumed_by
-                        .iter()
-                        .any(|consumer| consumer == &actor_id) =>
+                .with_property("tenant_slug", Value::String(tenant_alias)),
+        )? {
+            let message = parse_node_properties::<CoordinationMessageState>(node.properties)?;
+            if message
+                .mentions
+                .iter()
+                .any(|mention| normalize_actor_id(mention) == actor_id)
+                && !message
+                    .consumed_by
+                    .iter()
+                    .any(|consumer| normalize_actor_id(consumer) == actor_id)
             {
-                Some(Ok(message))
+                messages.push(message);
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        }
+    }
     messages.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
@@ -5742,14 +5804,17 @@ fn list_coordination_presence(
     backend: &impl McpGraphBackend,
     tenant: &str,
 ) -> Result<Vec<CoordinationPresenceState>, McpError> {
-    let mut presence = backend
-        .query_nodes(
+    let mut presence = Vec::new();
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        for node in backend.query_nodes(
             NodeQuery::label("CoordinationPresence")
-                .with_property("tenant_slug", Value::String(normalize_tenant_slug(tenant))),
-        )?
-        .into_iter()
-        .map(|node| parse_node_properties::<CoordinationPresenceState>(node.properties))
-        .collect::<Result<Vec<_>, _>>()?;
+                .with_property("tenant_slug", Value::String(tenant_alias)),
+        )? {
+            presence.push(parse_node_properties::<CoordinationPresenceState>(
+                node.properties,
+            )?);
+        }
+    }
     presence.sort_by(|left, right| {
         (left.status != "active")
             .cmp(&(right.status != "active"))
@@ -5763,13 +5828,26 @@ fn load_coordination_room(
     tenant: &str,
     room_id: &str,
 ) -> Result<Option<CoordinationRoomState>, McpError> {
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        if let Some(node) = backend.get_node(&coordination_room_node_id(&tenant_alias, room_id))? {
+            return parse_node_properties::<CoordinationRoomState>(node.properties).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn load_coordination_room_exact(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+) -> Result<Option<CoordinationRoomState>, McpError> {
     backend
         .get_node(&coordination_room_node_id(tenant, room_id))?
         .map(|node| parse_node_properties::<CoordinationRoomState>(node.properties))
         .transpose()
 }
 
-fn load_coordination_intent(
+fn load_coordination_intent_exact(
     backend: &impl McpGraphBackend,
     tenant: &str,
     room_id: &str,
@@ -5786,10 +5864,14 @@ fn load_coordination_presence(
     tenant: &str,
     actor_id: &str,
 ) -> Result<Option<CoordinationPresenceState>, McpError> {
-    backend
-        .get_node(&coordination_presence_node_id(tenant, actor_id))?
-        .map(|node| parse_node_properties::<CoordinationPresenceState>(node.properties))
-        .transpose()
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        if let Some(node) =
+            backend.get_node(&coordination_presence_node_id(&tenant_alias, actor_id))?
+        {
+            return parse_node_properties::<CoordinationPresenceState>(node.properties).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn persist_coordination_room(
@@ -6162,11 +6244,21 @@ fn normalize_coordination_delivery_lossy(delivery: &str) -> String {
 }
 
 fn normalize_tenant_slug(tenant: &str) -> String {
-    let tenant = tenant.trim().to_lowercase();
+    let tenant = tenant.trim();
     if tenant.is_empty() {
         "default".to_string()
     } else {
-        tenant
+        tenant.to_string()
+    }
+}
+
+fn tenant_slug_aliases(tenant: &str) -> Vec<String> {
+    let canonical = normalize_tenant_slug(tenant);
+    let legacy_lowercase = canonical.to_lowercase();
+    if legacy_lowercase == canonical {
+        vec![canonical]
+    } else {
+        vec![canonical, legacy_lowercase]
     }
 }
 
@@ -6205,6 +6297,23 @@ fn normalize_string_vec(values: Vec<String>) -> Vec<String> {
 
 fn merge_string_vecs(left: Vec<String>, right: Vec<String>) -> Vec<String> {
     normalize_string_vec(left.into_iter().chain(right).collect())
+}
+
+fn normalize_actor_vec(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = normalize_actor_id(&value);
+        if value.is_empty() || !seen.insert(value.to_string()) {
+            continue;
+        }
+        normalized.push(value);
+    }
+    normalized
+}
+
+fn merge_actor_vecs(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    normalize_actor_vec(left.into_iter().chain(right).collect())
 }
 
 fn timestamp_or_now(value: &str) -> String {
@@ -6664,12 +6773,74 @@ fn tenant_from_args(arguments: &Value, config: &McpServerConfig) -> String {
         .unwrap_or_else(|| config.default_tenant.clone())
 }
 
+fn tenant_from_args_for_tool(
+    tool_name: &str,
+    arguments: &Value,
+    config: &McpServerConfig,
+) -> Result<String, McpError> {
+    if !coordination_tool_requires_tenant(tool_name) {
+        return Ok(tenant_from_args(arguments, config));
+    }
+    if let Some(tenant) = explicit_tenant_arg(arguments) {
+        return Ok(tenant);
+    }
+    let configured = config.default_tenant.trim();
+    if !configured.is_empty() && configured != "default" {
+        return Ok(configured.to_string());
+    }
+    Err(McpError::invalid_params(format!(
+        "{tool_name} requires tenant or tenant_slug; refusing to fall back to default"
+    )))
+}
+
+fn explicit_tenant_arg(arguments: &Value) -> Option<String> {
+    arguments
+        .get("tenant")
+        .or_else(|| arguments.get("tenant_id"))
+        .or_else(|| arguments.get("tenantId"))
+        .or_else(|| arguments.get("tenant_slug"))
+        .or_else(|| arguments.get("tenantSlug"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty())
+        .map(str::to_string)
+}
+
+fn coordination_tool_requires_tenant(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "coordination_room"
+            | "theorem_harness_coordination_room"
+            | "presence"
+            | "theorem_harness_presence"
+            | "coordination_intent"
+            | "write_intent"
+            | "theorem_harness_write_intent"
+            | "read_intents_for_room"
+            | "theorem_harness_read_intents_for_room"
+            | "coordinate"
+            | "theorem_harness_coordinate"
+            | "mentions"
+            | "theorem_harness_mentions"
+            | "read_messages_for_room"
+            | "theorem_harness_read_messages_for_room"
+            | "coordination_record"
+            | "write_coordination_record"
+            | "theorem_harness_write_record"
+    )
+}
+
 fn required_str<'a>(arguments: &'a Value, key: &str, tool_name: &str) -> Result<&'a str, McpError> {
     arguments
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| McpError::invalid_params(format!("{tool_name} requires {key}")))
+}
+
+fn require_actor_id(value: &str, message: &str) -> Result<String, McpError> {
+    let actor_id = normalize_actor_id(value);
+    require_nonempty(&actor_id, message)
 }
 
 fn required_f64(arguments: &Value, key: &str, tool_name: &str) -> Result<f64, McpError> {
@@ -8522,6 +8693,63 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "tool_search",
+            "Search tenant-scoped federated MCP affordances through the connector gateway without advertising every spoke tool schema upfront.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "query": { "type": "string" },
+                    "task_type": { "type": "string" },
+                    "k": { "type": "integer", "default": 10 },
+                    "limit": { "type": "integer", "default": 10 },
+                    "allow_affordance_ids": { "type": "array", "items": { "type": "string" } },
+                    "allow_servers": { "type": "array", "items": { "type": "string" } },
+                    "allow_families": { "type": "array", "items": { "type": "string" } },
+                    "allow_tags": { "type": "array", "items": { "type": "string" } },
+                    "min_fitness": { "type": "number" },
+                    "ppr_damping": { "type": "number" },
+                    "ppr_max_iter": { "type": "integer" }
+                },
+                "required": ["query"]
+            }),
+        ),
+        tool(
+            "describe",
+            "Materialize one federated affordance's full input schema on demand by affordance_id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "affordance_id": { "type": "string" }
+                },
+                "required": ["affordance_id"]
+            }),
+        ),
+        tool_write(
+            "invoke",
+            "Invoke a selected federated MCP affordance through its persisted connector target; use dry_run=true to plan without firing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "affordance_id": { "type": "string" },
+                    "arguments": { "type": "object" },
+                    "tool_arguments": { "type": "object" },
+                    "task_type": { "type": "string" },
+                    "query": { "type": "string" },
+                    "candidate_affordance_ids": { "type": "array", "items": { "type": "string" } },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "dry_run": { "type": "boolean", "default": false }
+                },
+                "required": ["affordance_id", "arguments"]
+            }),
+        ),
+        tool(
             "rustyred_thg_graph_neighbors",
             "Read graph neighbors through THG adjacency indexes.",
             json!({
@@ -8549,6 +8777,25 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "edge_type": { "type": "string" },
                     "label": { "type": "string" },
                     "properties": { "type": "object" },
+                    "budget": { "type": "object" }
+                }
+            }),
+        ),
+        tool(
+            "rustyred_thg_relational_query",
+            "Run a native relational planner query over the tenant graph snapshot. Accepts QueryIr or a GraphQL-style selection AST and returns planner trace receipts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "query_ir": {
+                        "type": "object",
+                        "description": "Native QueryIr: relations, predicates, joins, projection, limit."
+                    },
+                    "selection": {
+                        "type": "object",
+                        "description": "GraphQL-style selection AST: relation, fields, joins, limit."
+                    },
                     "budget": { "type": "object" }
                 }
             }),
@@ -11215,6 +11462,9 @@ mod tests {
     use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rustyred_thg_affordances::registry::register_connector_with_target;
+    use rustyred_thg_affordances::{ConnectorManifest, ToolManifest};
+    use rustyred_thg_connectors::ConnectionTarget;
     use rustyred_thg_core::{
         EdgeRecord, EpistemicType, GraphSnapshot, GraphStats, GraphStoreResult,
         HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
@@ -11585,6 +11835,69 @@ mod tests {
         )
     }
 
+    fn register_gateway_connector(provider: &FixtureProvider) {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("x-test".to_string(), "redacted".to_string());
+        let target = ConnectionTarget::Http {
+            url: "http://127.0.0.1:9/mcp".to_string(),
+            headers,
+            auth: None,
+        };
+        let target_value = serde_json::to_value(target).unwrap();
+        let manifest = ConnectorManifest {
+            tenant_id: "smoke".to_string(),
+            server_id: "github".to_string(),
+            label: "GitHub MCP".to_string(),
+            tools: vec![
+                ToolManifest {
+                    name: "create_issue".to_string(),
+                    label: "Create issue".to_string(),
+                    description: "Create a GitHub issue in a repository.".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "owner": { "type": "string" },
+                            "repo": { "type": "string" },
+                            "title": { "type": "string" }
+                        },
+                        "required": ["owner", "repo", "title"]
+                    }),
+                    permissions: vec!["issues:write".to_string()],
+                    cost: json!({}),
+                    writeback_policy: "write".to_string(),
+                    tags: vec!["github".to_string(), "issue".to_string()],
+                    description_embedding: None,
+                },
+                ToolManifest {
+                    name: "get_issue".to_string(),
+                    label: "Get issue".to_string(),
+                    description: "Read one GitHub issue.".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "owner": { "type": "string" },
+                            "repo": { "type": "string" },
+                            "issue_number": { "type": "integer" }
+                        },
+                        "required": ["owner", "repo", "issue_number"]
+                    }),
+                    permissions: vec!["issues:read".to_string()],
+                    cost: json!({}),
+                    writeback_policy: "read-only".to_string(),
+                    tags: vec!["github".to_string(), "issue".to_string()],
+                    description_embedding: None,
+                },
+            ],
+        };
+        register_connector_with_target(
+            &mut *provider.0.borrow_mut(),
+            manifest,
+            Some(target_value),
+            Some("test"),
+        )
+        .unwrap();
+    }
+
     fn unique_code_repo(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -11619,6 +11932,91 @@ mod tests {
             panic!("tool call failed for {name}: {error}");
         }
         response["result"]["structuredContent"].clone()
+    }
+
+    #[test]
+    fn connector_gateway_meta_tools_progressively_disclose_affordances() {
+        let (provider, config) = fixture();
+        let before = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        let before_tools = before["result"]["tools"].as_array().unwrap();
+        let before_count = before_tools.len();
+        let before_names = before_tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(before_names.contains(&"tool_search"));
+        assert!(before_names.contains(&"describe"));
+        assert!(before_names.contains(&"invoke"));
+
+        register_gateway_connector(&provider);
+
+        let after = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        let after_tools = after["result"]["tools"].as_array().unwrap();
+        assert_eq!(
+            after_tools.len(),
+            before_count,
+            "connecting spokes must not enlarge the inbound tools/list"
+        );
+        let after_names = after_tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !after_names.contains(&"github.create_issue"),
+            "per-affordance tools must stay out of the inbound catalog"
+        );
+
+        let searched = call_tool_json(
+            &provider,
+            &config,
+            "tool_search",
+            json!({ "query": "github issue", "k": 5 }),
+        );
+        assert_eq!(
+            searched["results"][0]["affordance_id"],
+            "github.create_issue"
+        );
+        assert!(
+            searched["results"][0].get("input_schema").is_none(),
+            "search results stay compact; schema materializes only on describe"
+        );
+
+        let described = call_tool_json(
+            &provider,
+            &config,
+            "describe",
+            json!({ "affordance_id": "github.create_issue" }),
+        );
+        assert_eq!(
+            described["input_schema"]["required"],
+            json!(["owner", "repo", "title"])
+        );
+
+        let invoked = call_tool_json(
+            &provider,
+            &config,
+            "invoke",
+            json!({
+                "affordance_id": "github.create_issue",
+                "arguments": { "owner": "Travis-Gilbert", "repo": "Theorem", "title": "Test" },
+                "task_type": "github issue",
+                "dry_run": true
+            }),
+        );
+        assert_eq!(invoked["fired"], json!(false));
+        assert_eq!(invoked["planned"]["server_id"], "github");
+        assert!(
+            invoked["planned"].get("connection_target").is_none(),
+            "invoke must not leak persisted connector targets or auth material"
+        );
     }
 
     #[test]
@@ -12812,6 +13210,37 @@ mod tests {
     }
 
     #[test]
+    fn native_coordination_tools_reject_unscoped_default_tenant() {
+        let (provider, mut config) = fixture();
+        config.default_tenant = "default".to_string();
+        config.read_only = false;
+
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "coordinate",
+                "method": "tools/call",
+                "params": {
+                    "name": "coordinate",
+                    "arguments": {
+                        "actor": "codex",
+                        "room_id": "harness-rust-port",
+                        "message": "@claude-code this should not fall into default"
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires tenant or tenant_slug"));
+    }
+
+    #[test]
     fn native_coordination_tools_round_trip_through_mcp() {
         let (provider, mut config) = fixture();
         config.read_only = false;
@@ -12903,19 +13332,20 @@ mod tests {
             "coordinate",
             json!({
                 "tenant": "smoke",
-                "actor": "codex",
+                "actor": "codex.",
                 "room_id": "harness-rust-port",
                 "urgency": "ask",
                 "delivery": "wake",
-                "message": "@claude-code please test native MCP",
+                "message": "@claude-code. please test native MCP",
+                "mentions": ["deepseek."],
                 "metadata": { "commit": "pending" },
                 "created_at": "2026-06-01T00:03:00Z"
             }),
         );
         assert_eq!(receipt["ok"], true);
-        assert_eq!(receipt["mentions"], json!(["claude-code"]));
+        assert_eq!(receipt["mentions"], json!(["claude-code", "deepseek"]));
         assert_eq!(receipt["delivery"], "wake");
-        assert_eq!(receipt["unread_count"], 1);
+        assert_eq!(receipt["unread_count"], 2);
         assert_eq!(receipt["urgency"], "ask");
         let room_event = room_events.try_recv().expect("room event emitted");
         assert_eq!(room_event.tenant_slug, "smoke");
@@ -12925,7 +13355,10 @@ mod tests {
             receipt["message_id"].as_str().unwrap()
         );
         assert_eq!(room_event.author, "codex");
-        assert_eq!(room_event.mentions, vec!["claude-code".to_string()]);
+        assert_eq!(
+            room_event.mentions,
+            vec!["claude-code".to_string(), "deepseek".to_string()]
+        );
         assert_eq!(room_event.delivery, "wake");
 
         let mentions = call_tool_json(
@@ -12934,7 +13367,7 @@ mod tests {
             "mentions",
             json!({
                 "tenant": "smoke",
-                "actor": "claude-code",
+                "actor": "claude-code.",
                 "consume": false
             }),
         );
@@ -12994,7 +13427,7 @@ mod tests {
         assert_eq!(messages["count"], 1);
         assert_eq!(
             messages["messages"][0]["message"],
-            "@claude-code please test native MCP"
+            "@claude-code. please test native MCP"
         );
         assert_eq!(messages["messages"][0]["delivery"], "wake");
 
@@ -13855,6 +14288,57 @@ mod tests {
             response["result"]["structuredContent"]["stats"]["truncated"],
             true
         );
+    }
+
+    #[test]
+    fn relational_query_tool_resolves_graphql_selection_join() {
+        let (provider, config) = fixture();
+        let listed = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "rustyred_thg_relational_query"));
+
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "rel",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred_thg_relational_query",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "selection": {
+                            "relation": "person",
+                            "alias": "p",
+                            "fields": ["id", "name"],
+                            "joins": [{
+                                "relation": "knows",
+                                "alias": "k",
+                                "left_column": "id",
+                                "right_column": "from_id",
+                                "fields": ["to_id", "since"]
+                            }]
+                        }
+                    }
+                }
+            }),
+        );
+
+        let content = &response["result"]["structuredContent"];
+        assert_eq!(content["planner"], "rustyred-native-relational");
+        assert_eq!(content["trace"]["join_algorithm"], "hash_join");
+        let rows = content["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row["k.to_id"] == "node:b"));
+        assert!(rows.iter().any(|row| row["k.to_id"] == "node:c"));
     }
 
     #[test]

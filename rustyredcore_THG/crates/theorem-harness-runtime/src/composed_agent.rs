@@ -13,6 +13,7 @@ use theorem_harness_core::{
 };
 
 pub const DEFAULT_BINDING_ID: &str = "agent:theorem";
+pub const THEOREM_AGENT_HEADS_ENV: &str = "THEOREM_AGENT_HEADS";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComposedAgentRunResult {
@@ -132,6 +133,18 @@ pub fn run_composed_agent_with_claims<S: GraphStore>(
 }
 
 pub fn default_theorem_binding(binding_id: &str) -> Result<AgentBinding, BindingError> {
+    let configured_heads = configured_agent_heads_from_env();
+    let (active_head_set, heads) = if configured_heads.is_empty() {
+        legacy_default_heads()
+    } else {
+        (
+            configured_heads
+                .iter()
+                .map(|head| head.head_id.clone())
+                .collect(),
+            configured_heads,
+        )
+    };
     let mut binding = AgentBinding::new(
         BindingIdentity {
             agent_id: "theorem".to_string(),
@@ -140,32 +153,78 @@ pub fn default_theorem_binding(binding_id: &str) -> Result<AgentBinding, Binding
             composition_hash: String::new(),
             version: 1,
             trust_tier: "first_party".to_string(),
-            active_head_set: vec!["claude".to_string(), "deepseek".to_string()],
+            active_head_set,
         },
-        BindingComposition {
-            heads: vec![
-                head(
-                    "claude",
-                    "anthropic",
-                    std::env::var("ANTHROPIC_MODEL")
-                        .unwrap_or_else(|_| "claude-3-5-sonnet-latest".to_string()),
-                    "env:ANTHROPIC_API_KEY",
-                    HeadTransport::Api,
-                ),
-                head(
-                    "deepseek",
-                    "deepseek",
-                    std::env::var("DEEPSEEK_MODEL")
-                        .unwrap_or_else(|_| "deepseek-reasoner".to_string()),
-                    "env:DEEPSEEK_API_KEY",
-                    HeadTransport::Mcp,
-                ),
-            ],
-        },
+        BindingComposition { heads },
         BindingBudgetScope::new("theorem", 32_000.0, 2),
     )?;
     binding.lifecycle.run_id = normalize_binding_id(binding_id);
     Ok(binding)
+}
+
+fn legacy_default_heads() -> (Vec<String>, Vec<AgentHead>) {
+    (
+        vec!["claude".to_string(), "deepseek".to_string()],
+        vec![
+            head(
+                "claude",
+                "anthropic",
+                std::env::var("ANTHROPIC_MODEL")
+                    .unwrap_or_else(|_| "claude-3-5-sonnet-latest".to_string()),
+                "env:ANTHROPIC_API_KEY",
+                HeadTransport::Api,
+            ),
+            head(
+                "deepseek",
+                "deepseek",
+                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-reasoner".to_string()),
+                "env:DEEPSEEK_API_KEY",
+                HeadTransport::Mcp,
+            ),
+        ],
+    )
+}
+
+fn configured_agent_heads_from_env() -> Vec<AgentHead> {
+    std::env::var(THEOREM_AGENT_HEADS_ENV)
+        .ok()
+        .map(|value| {
+            split_csv(&value)
+                .into_iter()
+                .map(|head_id| env_configured_head(&head_id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn env_configured_head(head_id: &str) -> AgentHead {
+    let head_id = head_id.trim();
+    let head_slug = env_slug(head_id);
+    let provider = env_first([
+        format!("THEOREM_AGENT_HEAD_{head_slug}_PROVIDER"),
+        format!("{head_slug}_PROVIDER"),
+    ])
+    .unwrap_or_else(|| normalize_provider(head_id));
+    let provider_slug = env_slug(&provider);
+    let model = env_first([
+        format!("THEOREM_AGENT_HEAD_{head_slug}_MODEL"),
+        format!("{head_slug}_MODEL"),
+        format!("{provider_slug}_MODEL"),
+    ])
+    .unwrap_or_else(|| default_model_for_provider(&provider));
+    let credential_ref = env_first([
+        format!("THEOREM_AGENT_HEAD_{head_slug}_CREDENTIAL_REF"),
+        format!("THEOREM_AGENT_HEAD_{head_slug}_CREDENTIAL"),
+    ])
+    .unwrap_or_else(|| format!("env:{provider_slug}_API_KEY"));
+    let transport = env_first([
+        format!("THEOREM_AGENT_HEAD_{head_slug}_TRANSPORT"),
+        format!("{head_slug}_TRANSPORT"),
+    ])
+    .as_deref()
+    .and_then(parse_transport)
+    .unwrap_or(HeadTransport::Api);
+    head(head_id, &provider, model, &credential_ref, transport)
 }
 
 fn head(
@@ -188,6 +247,69 @@ fn head(
         reliability_profile: HeadReliabilityProfile::default(),
         allowed_tools: Vec::new(),
         trace_tier: TraceTier::Receipt,
+    }
+}
+
+fn env_first<const N: usize>(names: [String; N]) -> Option<String> {
+    names.into_iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn env_slug(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn normalize_provider(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "openapi" => "openai".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn default_model_for_provider(provider: &str) -> String {
+    match normalize_provider(provider).as_str() {
+        "anthropic" | "claude" => "claude-3-5-sonnet-latest".to_string(),
+        "deepseek" => "deepseek-reasoner".to_string(),
+        "gemma" => "gemma3:latest".to_string(),
+        "minimax" => "MiniMax-Text-01".to_string(),
+        "mistral" => "mistral-large-latest".to_string(),
+        "openai" => "gpt-4.1-mini".to_string(),
+        "zhipu" => "glm-4-plus".to_string(),
+        "ai21" => "jamba-large".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_transport(value: &str) -> Option<HeadTransport> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "api" => Some(HeadTransport::Api),
+        "mcp" => Some(HeadTransport::Mcp),
+        "local" => Some(HeadTransport::Local),
+        "hosted" => Some(HeadTransport::Hosted),
+        _ => None,
     }
 }
 
@@ -217,10 +339,14 @@ impl From<HeadInvocationError> for ComposedAgentRuntimeError {
 mod tests {
     use super::*;
     use rustyred_thg_core::InMemoryGraphStore;
+    use std::sync::Mutex;
     use theorem_harness_core::FakeHeadInvoker;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn composed_agent_run_persists_binding_events_and_scratchpad() {
+        let _env = ScopedEnv::new([]);
         let mut store = InMemoryGraphStore::new();
         let result = run_composed_agent_with_claims(
             &mut store,
@@ -241,5 +367,107 @@ mod tests {
                 .len(),
             result.events.len()
         );
+    }
+
+    #[test]
+    fn default_binding_uses_env_configured_api_heads() {
+        let _env = ScopedEnv::new([
+            (THEOREM_AGENT_HEADS_ENV, "mistral,openai,minimax,deepseek"),
+            ("MISTRAL_MODEL", "mistral-small-latest"),
+            ("OPENAI_MODEL", "gpt-4.1-mini"),
+            ("MINIMAX_MODEL", "MiniMax-Text-01"),
+            ("DEEPSEEK_MODEL", "deepseek-chat"),
+        ]);
+
+        let binding = default_theorem_binding("agent:env").unwrap();
+
+        assert_eq!(
+            binding.identity.active_head_set,
+            vec!["deepseek", "minimax", "mistral", "openai"]
+        );
+        let mistral = binding.head("mistral").unwrap();
+        assert_eq!(mistral.provider, "mistral");
+        assert_eq!(mistral.model, "mistral-small-latest");
+        assert_eq!(mistral.credential_ref, "env:MISTRAL_API_KEY");
+        assert_eq!(mistral.transport, HeadTransport::Api);
+        let openai = binding.head("openai").unwrap();
+        assert_eq!(openai.provider, "openai");
+        assert_eq!(openai.credential_ref, "env:OPENAI_API_KEY");
+        let minimax = binding.head("minimax").unwrap();
+        assert_eq!(minimax.provider, "minimax");
+        assert_eq!(minimax.credential_ref, "env:MINIMAX_API_KEY");
+        let deepseek = binding.head("deepseek").unwrap();
+        assert_eq!(deepseek.transport, HeadTransport::Api);
+    }
+
+    #[test]
+    fn env_configured_heads_support_openapi_alias_and_transport_override() {
+        let _env = ScopedEnv::new([
+            (THEOREM_AGENT_HEADS_ENV, "openapi,deepseek"),
+            ("THEOREM_AGENT_HEAD_OPENAPI_MODEL", "gpt-4.1-mini"),
+            ("THEOREM_AGENT_HEAD_DEEPSEEK_TRANSPORT", "mcp"),
+        ]);
+
+        let binding = default_theorem_binding("agent:env-alias").unwrap();
+
+        let openapi = binding.head("openapi").unwrap();
+        assert_eq!(openapi.provider, "openai");
+        assert_eq!(openapi.model, "gpt-4.1-mini");
+        assert_eq!(openapi.credential_ref, "env:OPENAI_API_KEY");
+        let deepseek = binding.head("deepseek").unwrap();
+        assert_eq!(deepseek.transport, HeadTransport::Mcp);
+    }
+
+    struct ScopedEnv {
+        saved: Vec<(String, Option<String>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnv {
+        fn new<const N: usize>(pairs: [(&'static str, &'static str); N]) -> Self {
+            let guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut names = vec![
+                THEOREM_AGENT_HEADS_ENV.to_string(),
+                "MISTRAL_MODEL".to_string(),
+                "OPENAI_MODEL".to_string(),
+                "MINIMAX_MODEL".to_string(),
+                "DEEPSEEK_MODEL".to_string(),
+                "THEOREM_AGENT_HEAD_OPENAPI_MODEL".to_string(),
+                "THEOREM_AGENT_HEAD_DEEPSEEK_TRANSPORT".to_string(),
+            ];
+            for (name, _) in pairs {
+                names.push(name.to_string());
+            }
+            names.sort();
+            names.dedup();
+            let saved = names
+                .into_iter()
+                .map(|name| {
+                    let value = std::env::var(&name).ok();
+                    std::env::remove_var(&name);
+                    (name, value)
+                })
+                .collect::<Vec<_>>();
+            for (name, value) in pairs {
+                std::env::set_var(name, value);
+            }
+            Self {
+                saved,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 }

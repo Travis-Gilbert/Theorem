@@ -27,12 +27,12 @@
         }
       },
       "Tenant": {
-        "description": "Tenant slug. Alias `tenant_slug` is also accepted. Defaults to `default`.",
+        "description": "Tenant slug. Alias `tenant_slug` is also accepted. Required unless the server has a non-default tenant env configured.",
         "in": "query",
         "name": "tenant",
         "required": false,
         "schema": {
-          "default": "default",
+          "example": "Travis-Gilbert",
           "type": "string"
         }
       }
@@ -261,7 +261,7 @@
             "type": "object"
           },
           "tenant_slug": {
-            "default": "default",
+            "example": "Travis-Gilbert",
             "type": "string"
           },
           "urgency": {
@@ -293,7 +293,7 @@
             "$ref": "#/components/schemas/ConnectionTarget"
           },
           "tenant": {
-            "default": "default",
+            "example": "Travis-Gilbert",
             "type": "string"
           }
         },
@@ -363,7 +363,7 @@
     }
   },
   "info": {
-    "description": "The HTTP surface of `theorem-harness-server`: a thin Axum server over a durable file-backed graph store. It serves the read contract Theorem clients consume (runs, codebase maps, coordination rooms, presence, intents, records, mentions) plus write endpoints for room messages, dispatch jobs, and MCP connector registration.\n\nScope: this is the Harness product transport only. The graph engine (`rustyred-thg-server`) is a separate service with its own, larger API published at its own `GET /openapi.json`.\n\nAuthentication: this server performs NO authentication today. The tenant is a plain `tenant` (or `tenant_slug`) string per request, defaulting to `default`. Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, `POST /harness/rooms/{room_id}/messages`) are therefore unauthenticated. Run it on a trusted network or behind an authenticating proxy before exposing it publicly.\n\nResponse shapes: envelope keys are stable and documented here. Inner objects (a run, an event, a room, an intent) are serialized graph-node state; their fields are described where pinned and otherwise left open rather than guessed.",
+    "description": "The HTTP surface of `theorem-harness-server`: a thin Axum server over a durable file-backed graph store. It serves the read contract Theorem clients consume (runs, codebase maps, coordination rooms, presence, intents, records, mentions) plus write endpoints for room messages, dispatch jobs, and MCP connector registration.\n\nScope: this is the Harness product transport only. The graph engine (`rustyred-thg-server`) is a separate service with its own, larger API published at its own `GET /openapi.json`.\n\nAuthentication: this server performs NO authentication today. The tenant is supplied as a plain `tenant` (or `tenant_slug`) string per request, or by a non-default configured value from `THEOREM_HARNESS_TENANT_SLUG`, `THEOREM_AGENT_TENANT_SLUG`, or `THEOREM_TENANT_ID`; silent fallback to `default` is refused. Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, `POST /harness/rooms/{room_id}/messages`) are therefore unauthenticated. Run it on a trusted network or behind an authenticating proxy before exposing it publicly.\n\nResponse shapes: envelope keys are stable and documented here. Inner objects (a run, an event, a room, an intent) are serialized graph-node state; their fields are described where pinned and otherwise left open rather than guessed.",
     "summary": "HTTP/JSON transport for Theorem's Harness — runs, rooms, jobs, and connectors.",
     "title": "Theorem Harness HTTP API",
     "version": "0.1.0"
@@ -615,7 +615,7 @@
     },
     "/harness/jobs": {
       "post": {
-        "description": "Creates or upserts a pending Job. Defaults: tenant -> default, room -> repo:theorem:branch:main, submitted_by -> theorem-harness-server. If THEOREM_DISPATCH_DATABASE_URL is set, the job is mirrored into the Postgres dispatch queue and a wake event is emitted to the target head.",
+        "description": "Creates or upserts a pending Job. The tenant must be supplied as `tenant`/`tenant_slug` unless the server has a non-default tenant env configured. Defaults: room -> repo:theorem:branch:main, submitted_by -> theorem-harness-server. If THEOREM_DISPATCH_DATABASE_URL is set, the job is mirrored into the Postgres dispatch queue and a wake event is emitted to the target head.",
         "requestBody": {
           "content": {
             "application/json": {

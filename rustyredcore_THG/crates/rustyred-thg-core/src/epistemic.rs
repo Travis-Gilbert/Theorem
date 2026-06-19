@@ -567,10 +567,7 @@ pub fn read_epistemic_shadow<S: GraphStore>(
 /// Read the `SameEClass` representative a shadow was collapsed onto, if any.
 /// Returns `None` for a class representative (it has no outgoing `SameEClass`
 /// edge) or a shadow that was never deduped.
-pub fn read_same_eclass<S: GraphStore>(
-    store: &S,
-    shadow_node_id: &str,
-) -> Option<SameEClassRef> {
+pub fn read_same_eclass<S: GraphStore>(store: &S, shadow_node_id: &str) -> Option<SameEClassRef> {
     let hit = store
         .neighbors(NeighborQuery::out(shadow_node_id).with_edge_type(SAME_ECLASS))
         .into_iter()
@@ -1625,8 +1622,8 @@ pub fn epistemic_egraph_dedup<S: GraphStore>(
     // Stage each shadow as an e-graph term.
     let mut candidates: Vec<DedupCandidate> = Vec::new();
     for shadow in &shadow_nodes {
-        let content_id = prop_str(&shadow.properties, "content_node_id")
-            .unwrap_or_else(|| shadow.id.clone());
+        let content_id =
+            prop_str(&shadow.properties, "content_node_id").unwrap_or_else(|| shadow.id.clone());
         let Some(content_node) = store.get_node(&content_id) else {
             continue;
         };
@@ -1688,10 +1685,14 @@ pub fn epistemic_egraph_dedup<S: GraphStore>(
         let representative_shadow_id = rep.shadow_id.clone();
         let canonical_form = rep.form.canonical_label();
 
-        let mut member_content_ids: Vec<String> =
-            sorted.iter().map(|&i| candidates[i].content_id.clone()).collect();
-        let mut member_shadow_ids: Vec<String> =
-            sorted.iter().map(|&i| candidates[i].shadow_id.clone()).collect();
+        let mut member_content_ids: Vec<String> = sorted
+            .iter()
+            .map(|&i| candidates[i].content_id.clone())
+            .collect();
+        let mut member_shadow_ids: Vec<String> = sorted
+            .iter()
+            .map(|&i| candidates[i].shadow_id.clone())
+            .collect();
         member_content_ids.sort();
         member_shadow_ids.sort();
         member_content_ids.dedup();
@@ -1726,17 +1727,14 @@ pub fn epistemic_egraph_dedup<S: GraphStore>(
     Ok(report)
 }
 
-fn collect_dedup_shadows<S: GraphStore>(
-    store: &S,
-    content_node_ids: &[String],
-) -> Vec<NodeRecord> {
+fn collect_dedup_shadows<S: GraphStore>(store: &S, content_node_ids: &[String]) -> Vec<NodeRecord> {
     if content_node_ids.is_empty() {
         // Full-store mode bounds at 100_000 shadows, matching the rest of the
         // epistemic module (`compile_user_subgraph`, `epistemic_shadow_ppr`). A
         // tenant whose shadow set exceeds that should drive the dedup with an
         // explicit `content_node_ids` batch rather than the whole-store scan.
-        let mut nodes = store
-            .query_nodes(NodeQuery::label(EPISTEMIC_SHADOW_LABEL).with_limit(100_000));
+        let mut nodes =
+            store.query_nodes(NodeQuery::label(EPISTEMIC_SHADOW_LABEL).with_limit(100_000));
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         return nodes;
     }
@@ -1804,7 +1802,11 @@ fn write_same_eclass_edge<S: GraphStore>(
     config: &EpistemicDedupConfig,
 ) -> GraphStoreResult<()> {
     let edge = EdgeRecord::new(
-        same_eclass_edge_id(member_shadow_id, representative_shadow_id, &config.engine_version),
+        same_eclass_edge_id(
+            member_shadow_id,
+            representative_shadow_id,
+            &config.engine_version,
+        ),
         member_shadow_id,
         SAME_ECLASS,
         representative_shadow_id,
@@ -2036,7 +2038,9 @@ mod tests {
         // double-negation rule, so they collapse into one class. A plain
         // string-tuple dedup would keep them apart.
         let mut store = InMemoryGraphStore::new();
-        store.upsert_node(claim("plain", "feature is enabled")).unwrap();
+        store
+            .upsert_node(claim("plain", "feature is enabled"))
+            .unwrap();
         store
             .upsert_node(claim("double", "feature is not not enabled"))
             .unwrap();
@@ -2064,7 +2068,11 @@ mod tests {
         shadows_for(&mut store, &["pos", "neg"]);
         let report =
             epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).unwrap();
-        assert_eq!(report.classes.len(), 0, "p and (not p) are different states");
+        assert_eq!(
+            report.classes.len(),
+            0,
+            "p and (not p) are different states"
+        );
         assert_eq!(report.same_eclass_edges_written, 0);
         assert_eq!(report.singleton_count, 2);
     }
@@ -2102,7 +2110,11 @@ mod tests {
             epistemic_egraph_dedup(&mut store, &[], EpistemicDedupConfig::default()).unwrap();
         assert_eq!(second.members_collapsed, first.members_collapsed);
         assert_eq!(second.classes[0].class_id, first.classes[0].class_id);
-        assert_eq!(store.stats().edges_total, edges_before, "idempotent: no new edges");
+        assert_eq!(
+            store.stats().edges_total,
+            edges_before,
+            "idempotent: no new edges"
+        );
     }
 
     #[test]
@@ -2110,9 +2122,15 @@ mod tests {
         // Same claim, but planted so one shadow is grounded `out` (attacked) and
         // the other is `in`. ClaimAndStanding must NOT merge them.
         let mut store = InMemoryGraphStore::new();
-        store.upsert_node(claim("winner", "the build passes")).unwrap();
-        store.upsert_node(claim("loser", "the build passes")).unwrap();
-        store.upsert_node(claim("attacker", "the build fails")).unwrap();
+        store
+            .upsert_node(claim("winner", "the build passes"))
+            .unwrap();
+        store
+            .upsert_node(claim("loser", "the build passes"))
+            .unwrap();
+        store
+            .upsert_node(claim("attacker", "the build fails"))
+            .unwrap();
         // attacker --CONTRADICTS--> loser  => loser is grounded `out`.
         store
             .upsert_edge(EdgeRecord::new(
@@ -2139,9 +2157,15 @@ mod tests {
 
         // ClaimOnly ignores standing and merges the two identical claims.
         let mut store2 = InMemoryGraphStore::new();
-        store2.upsert_node(claim("winner", "the build passes")).unwrap();
-        store2.upsert_node(claim("loser", "the build passes")).unwrap();
-        store2.upsert_node(claim("attacker", "the build fails")).unwrap();
+        store2
+            .upsert_node(claim("winner", "the build passes"))
+            .unwrap();
+        store2
+            .upsert_node(claim("loser", "the build passes"))
+            .unwrap();
+        store2
+            .upsert_node(claim("attacker", "the build fails"))
+            .unwrap();
         store2
             .upsert_edge(EdgeRecord::new(
                 "atk",

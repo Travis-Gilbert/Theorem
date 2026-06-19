@@ -25,7 +25,7 @@ After `tools/list`, the tools in the [catalog](../reference/mcp-tools.md) are ca
 - **Code intelligence** — `compute_code`, `code_ingest`, `harness_kg_*`.
 - **Graph** — neighbors, algorithms, vector/full-text/spatial search, versioning.
 
-A tenant scopes everything; tools take a `tenant` (or `tenant_slug`) argument, defaulting to `default`.
+A tenant scopes everything. Tools take a `tenant` or `tenant_slug` argument, and coordination-sensitive HTTP routes require one unless the server has a non-default tenant env configured.
 
 ## Read-only mode
 
@@ -38,11 +38,11 @@ The Harness can also consume *other* MCP servers and turn their tools into learn
 ```bash
 curl -s localhost:50080/connectors/register \
   -H 'content-type: application/json' \
-  -d '{ "tenant": "default", "server_id": "my-tools",
+  -d '{ "tenant": "Travis-Gilbert", "server_id": "my-tools",
         "target": { "type": "stdio", "command": "my-mcp-server", "args": [] } }'
 ```
 
-The harness spawns the target, runs the MCP handshake, lists its tools, and registers each as an affordance under `(tenant, server_id)`. List them back with `GET /connectors?tenant=default`. Over time the system learns which affordance to reach for from invocation outcomes. See the [first-job guide](first-job.md) for the full connector flow.
+The harness spawns the target, runs the MCP handshake, lists its tools, and registers each as an affordance under `(tenant, server_id)`. List them back with `GET /connectors?tenant=Travis-Gilbert`. Over time the system learns which affordance to reach for from invocation outcomes. See the [first-job guide](first-job.md) for the full connector flow.
 
 ## Which surface should I use?
 

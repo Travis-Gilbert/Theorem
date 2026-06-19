@@ -4,6 +4,9 @@ use serde::Deserialize;
 
 use crate::{AgentdError, AgentdResult};
 
+pub const DEFAULT_HARNESS_MCP_URL: &str = "http://127.0.0.1:8380/mcp";
+pub const DEFAULT_TENANT_SLUG: &str = "Travis-Gilbert";
+
 fn default_actor() -> String {
     "theorem-agentd".to_string()
 }
@@ -50,6 +53,10 @@ fn default_ledger_path() -> PathBuf {
 
 fn default_operator_memory_tenant() -> String {
     "default".to_string()
+}
+
+fn default_local_operator_memory_tenant() -> String {
+    DEFAULT_TENANT_SLUG.to_string()
 }
 
 fn default_capture_repo() -> String {
@@ -115,6 +122,36 @@ impl AgentdConfig {
         Ok(config)
     }
 
+    /// Load the named config when it exists; otherwise use the no-config local
+    /// default. This is the happy path for `theorem start` and first-run
+    /// `theorem-agentd --once ...`: no token, tenant, data-dir, or model env var
+    /// is required just to prove the loop is alive.
+    pub fn load_or_default(path: impl AsRef<Path>) -> AgentdResult<Self> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Self::load(path);
+        }
+        let config = Self::default_local();
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn default_local() -> Self {
+        Self {
+            actor: default_actor(),
+            default_room_id: default_room_id(),
+            model: ModelConfig::rule_default(),
+            harness: McpServerConfig::default_harness(),
+            mcp_servers: Vec::new(),
+            receiver: ReceiverSidecarConfig::default(),
+            loop_config: LoopConfig::default(),
+            ledger: LedgerConfig::default(),
+            operator_memory_tenant: default_local_operator_memory_tenant(),
+            capture: CaptureConfig::default(),
+            relay: RelayConfig::default(),
+        }
+    }
+
     pub fn all_mcp_servers(&self) -> Vec<McpServerConfig> {
         let mut servers = Vec::with_capacity(self.mcp_servers.len() + 1);
         servers.push(self.harness.clone());
@@ -166,6 +203,21 @@ pub struct ModelConfig {
     pub grammar_constrained: bool,
 }
 
+impl ModelConfig {
+    pub fn rule_default() -> Self {
+        Self {
+            provider: ModelProvider::Rule,
+            base_url: String::new(),
+            model: String::new(),
+            api_key_env: None,
+            temperature: default_temperature(),
+            max_tokens: default_max_tokens(),
+            request_timeout_secs: default_timeout(),
+            grammar_constrained: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
@@ -184,6 +236,16 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
+    pub fn default_harness() -> Self {
+        Self {
+            name: "harness".to_string(),
+            url: DEFAULT_HARNESS_MCP_URL.to_string(),
+            token_env: None,
+            tenant_slug: DEFAULT_TENANT_SLUG.to_string(),
+            session: false,
+        }
+    }
+
     fn validate(&self) -> AgentdResult<()> {
         if self.name.trim().is_empty() {
             return Err(AgentdError::Config(
@@ -356,6 +418,24 @@ url = "https://example.test/mcp"
         assert_eq!(config.capture.repo, "Travis-Gilbert/theorem");
         assert_eq!(config.capture.dispatched_subtask_title, "dispatched");
         assert!(config.ledger.mirror_to_graph);
+    }
+
+    #[test]
+    fn missing_config_uses_no_config_local_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "theorem-agentd-missing-{}.toml",
+            std::process::id()
+        ));
+        let config = AgentdConfig::load_or_default(&path).unwrap();
+        assert_eq!(config.actor, "theorem-agentd");
+        assert_eq!(config.model.provider, ModelProvider::Rule);
+        assert_eq!(config.harness.name, "harness");
+        assert_eq!(config.harness.url, DEFAULT_HARNESS_MCP_URL);
+        assert_eq!(config.harness.tenant_slug, DEFAULT_TENANT_SLUG);
+        assert_eq!(config.operator_memory_tenant, DEFAULT_TENANT_SLUG);
+        assert!(!config.receiver.enabled);
+        assert!(!config.capture.enabled);
+        assert!(!config.relay.enabled);
     }
 
     #[test]

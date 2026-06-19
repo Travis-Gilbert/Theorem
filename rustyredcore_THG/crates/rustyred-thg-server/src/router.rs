@@ -24,6 +24,8 @@ use rustyred_rerank::{
     RerankScorer, GTE_RERANKER_MODERNBERT_BASE, JINA_RERANKER_V3,
 };
 use rustyred_thg_adapters::execute_adapter_command;
+use rustyred_thg_affordances::CONNECTOR_LABEL;
+use rustyred_thg_connectors::{connect_target, ConnectionTarget};
 use rustyred_thg_core::commands::{ThgCommand, ThgRequest, ThgResponse};
 use rustyred_thg_core::errors::ThgError;
 use rustyred_thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
@@ -243,6 +245,16 @@ pub struct FederateSubmitBody {
     pub receipt: Option<CrawlReceipt>,
     #[serde(default)]
     pub fragment: Option<WebCommonsFragment>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConnectorConnectBody {
+    pub server_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub target: ConnectionTarget,
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,6 +505,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/tenants/:tenant_id/graph/stats", get(graph_stats))
         .route("/v1/tenants/:tenant_id/memory/docs", get(memory_docs_list))
+        .route("/v1/tenants/:tenant_id/connectors", get(connectors_list))
+        .route(
+            "/v1/tenants/:tenant_id/connectors/connect",
+            post(connector_connect),
+        )
         .route("/v1/tenants/:tenant_id/graph/verify", get(graph_verify))
         .route(
             "/v1/tenants/:tenant_id/graph/rebuild-indexes",
@@ -5508,6 +5525,144 @@ async fn memory_docs_list(
     .into_response()
 }
 
+async fn connectors_list(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope_for_tenant(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+        &tenant_id,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let nodes = match store.query_nodes(
+        NodeQuery::label(CONNECTOR_LABEL)
+            .with_property("tenant_id", json!(tenant_id.clone()))
+            .with_limit(10_000),
+    ) {
+        Ok(nodes) => nodes,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let mut connectors = nodes.iter().map(connector_list_item).collect::<Vec<_>>();
+    connectors.sort_by(|left, right| {
+        left["server_id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["server_id"].as_str().unwrap_or_default())
+    });
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "count": connectors.len(),
+        "connectors": connectors,
+    }))
+    .into_response()
+}
+
+async fn connector_connect(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ConnectorConnectBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope_for_tenant(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+        &tenant_id,
+    ) {
+        return status.into_response();
+    }
+    let server_id = body.server_id.trim().to_string();
+    if server_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "invalid_connector",
+                "message": "server_id is required"
+            })),
+        )
+            .into_response();
+    }
+    let label = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&server_id)
+        .to_string();
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match connect_target(
+        body.target,
+        &mut store,
+        &tenant_id,
+        &server_id,
+        &label,
+        body.actor.as_deref(),
+    ) {
+        Ok(result) => {
+            let tool_count = result.registration.affordance_node_ids.len();
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "server_id": server_id,
+                "server_info": {
+                    "name": result.server_info.server_name,
+                    "version": result.server_info.server_version,
+                    "protocol_version": result.server_info.protocol_version,
+                },
+                "registration": {
+                    "connector_node_id": result.registration.connector_node_id,
+                    "affordance_node_ids": result.registration.affordance_node_ids,
+                    "tool_count": tool_count,
+                    "transaction": result.registration.transaction,
+                }
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "ok": false,
+                "tenant": tenant_id,
+                "server_id": server_id,
+                "error": "connector_connect_failed",
+                "message": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn connector_list_item(node: &NodeRecord) -> Value {
+    let target = node.properties.get("connection_target");
+    json!({
+        "node_id": node.id.clone(),
+        "server_id": node.properties.get("server_id").and_then(Value::as_str).unwrap_or_default(),
+        "label": node.properties.get("label").and_then(Value::as_str).unwrap_or_default(),
+        "tool_count": node.properties.get("tool_count").and_then(Value::as_u64).unwrap_or(0),
+        "has_connection_target": target.is_some(),
+        "transport": target
+            .and_then(|value| value.get("transport"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    })
+}
+
 async fn graph_verify(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -7930,6 +8085,9 @@ mod tests {
         metrics::diagnostics_config,
         state::AppState,
     };
+    use rustyred_thg_affordances::registry::register_connector_with_target;
+    use rustyred_thg_affordances::{ConnectorManifest, ToolManifest};
+    use rustyred_thg_connectors::{ConnectionTarget, ConnectorAuth};
     use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
     use rustyred_thg_mcp::{handle_mcp_request_with_context, McpRequestContext};
     use rustyred_web::{SearchCandidate, SearchProvider, StaticSearchProvider};
@@ -8935,6 +9093,78 @@ mod tests {
             source["links"].as_array().unwrap()[0].as_str().unwrap(),
             target_doc_id
         );
+    }
+
+    #[tokio::test]
+    async fn connectors_list_route_redacts_persisted_targets() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let tenant = "connector-list-test";
+        {
+            let mut store = state.tenant_graph_store(tenant).unwrap();
+            let target = ConnectionTarget::Http {
+                url: "https://example.invalid/mcp".to_string(),
+                headers: BTreeMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer header-secret".to_string(),
+                )]),
+                auth: Some(ConnectorAuth::Bearer {
+                    token: "auth-secret".to_string(),
+                }),
+            };
+            register_connector_with_target(
+                &mut store,
+                ConnectorManifest {
+                    tenant_id: tenant.to_string(),
+                    server_id: "github".to_string(),
+                    label: "GitHub MCP".to_string(),
+                    tools: vec![ToolManifest {
+                        name: "get_issue".to_string(),
+                        label: "Get issue".to_string(),
+                        description: "Read one issue.".to_string(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "owner": { "type": "string" },
+                                "repo": { "type": "string" },
+                                "issue_number": { "type": "integer" }
+                            }
+                        }),
+                        permissions: Vec::new(),
+                        cost: json!({}),
+                        writeback_policy: "read-only".to_string(),
+                        tags: vec!["github".to_string()],
+                        description_embedding: None,
+                    }],
+                },
+                Some(serde_json::to_value(target).unwrap()),
+                Some("test"),
+            )
+            .unwrap();
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/tenants/{tenant}/connectors"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["count"], 1);
+        assert_eq!(payload["connectors"][0]["server_id"], "github");
+        assert_eq!(payload["connectors"][0]["transport"], "http");
+        assert_eq!(payload["connectors"][0]["has_connection_target"], true);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains("header-secret"));
+        assert!(!serialized.contains("auth-secret"));
+        assert!(!serialized.contains("Authorization"));
     }
 
     #[tokio::test]
