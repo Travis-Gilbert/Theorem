@@ -1,0 +1,23 @@
+[package]
+name = "commonplace-api"
+version = "0.1.0"
+edition = "2021"
+description = "CommonPlace interoperability API seam (plan unit F3): a typed consumer GraphQL profile over the CommonPlace object model, gated by per-instance API keys. The universal connection point so any front end or self-hosted instance talks to the database with one API."
+license = "MIT"
+rust-version = "1.85"
+
+# Own Cargo root (bare [workspace]) so this stays out of the rustyredcore_THG
+# workspace members and adds no edit there. Path-deps reach into the substrate
+# crates; commonplace's default features never pull turbovec, so the parent's
+# turbovec patch is not needed here (same pattern as apps/theorem-grpc).
+[workspace]
+
+[dependencies]
+commonplace = { path = "../../rustyredcore_THG/crates/commonplace" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+async-graphql = "7"
+async-graphql-axum = "7"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

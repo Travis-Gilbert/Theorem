@@ -7,7 +7,14 @@ use crate::memory::{
 use crate::skill_pack::{get_skill_pack, skill_pack_node_id, SkillPackGetInput, SkillPackState};
 use crate::writing_style::{summarize_style_receipts_for_fitness, STYLE_RECEIPTS_FIELD};
 use crate::{HarnessRuntimeError, RuntimeResult};
-use rustyred_thg_core::{GraphStore, NodeQuery, NodeRecord};
+use rustyred_thg_affordances::{
+    affordance_node_id, record_invocation, AffordanceGraphStore, InvocationRecordRequest,
+};
+use rustyred_thg_core::{
+    EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, GraphStore, GraphStoreError,
+    GraphStoreResult, GraphTransaction, GraphWriteResult, NeighborHit, NeighborQuery, NodeQuery,
+    NodeRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +66,8 @@ pub struct CompoundHookReceipt {
     pub used_memory_doc_ids: Vec<String>,
     #[serde(default)]
     pub retrieval_attributions: Vec<RetrievalAttribution>,
+    #[serde(default)]
+    pub recorded_affordance_receipts: Vec<Value>,
     pub promotion_proposals: Vec<Value>,
     pub demotions: Vec<Value>,
     pub decayed_items: Vec<Value>,
@@ -181,6 +190,66 @@ struct UsedPack {
     pack_content_hash: String,
 }
 
+struct CompoundAffordanceStore<'a, S: GraphStore> {
+    store: &'a mut S,
+}
+
+impl<S: GraphStore> AffordanceGraphStore for CompoundAffordanceStore<'_, S> {
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
+        self.store.upsert_node(node)
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+        self.store.upsert_edge(edge)
+    }
+
+    fn commit_batch(&mut self, batch: GraphMutationBatch) -> GraphStoreResult<GraphTransaction> {
+        if batch.mutations.is_empty() {
+            return Err(GraphStoreError::new(
+                "empty_graph_transaction",
+                "graph transaction requires at least one mutation",
+            ));
+        }
+        let mut writes = Vec::with_capacity(batch.mutations.len());
+        for mutation in batch.mutations {
+            match mutation {
+                GraphMutation::NodeUpsert(node) => writes.push(self.store.upsert_node(node)?),
+                GraphMutation::EdgeUpsert(edge) => writes.push(self.store.upsert_edge(edge)?),
+            }
+        }
+        let graph_version = self.store.stats().version;
+        Ok(GraphTransaction {
+            txn_id: graph_version,
+            graph_version,
+            writes,
+        })
+    }
+
+    fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        Ok(self.store.get_node(id).cloned())
+    }
+
+    fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        Ok(self.store.get_edge(id).cloned())
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        Ok(self.store.query_nodes(query))
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        Ok(self.store.neighbors(query))
+    }
+
+    fn snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        Ok(GraphSnapshot {
+            version: self.store.stats().version,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OutcomeClass {
     Positive,
@@ -212,6 +281,14 @@ impl OutcomeClass {
             Self::Positive => "pinned",
             Self::Negative => "contradicted",
             Self::Mixed | Self::Neutral => "cited",
+        }
+    }
+
+    fn outcome_value(&self) -> f32 {
+        match self {
+            Self::Positive => 1.0,
+            Self::Mixed | Self::Neutral => 0.5,
+            Self::Negative => 0.0,
         }
     }
 }
@@ -311,7 +388,7 @@ pub fn list_compound_captures<S: GraphStore>(
 
     Ok(documents
         .into_iter()
-        .filter(|document| document_is_compound_capture(document))
+        .filter(document_is_compound_capture)
         .filter(|document| match cluster_filter {
             Some(cluster) => document_matches_cluster(document, cluster),
             None => true,
@@ -385,6 +462,8 @@ pub fn apply_run_close_hook<S: GraphStore>(
     let outcome = classify_outcome(run, &events);
     let cluster_key = cluster_key_for_run(run, &events, &tenant);
     let used = collect_used_items(store, &tenant, &run.run_id, &events);
+    let recorded_affordance_receipts =
+        record_used_affordance_outcomes(store, &tenant, run, &outcome, &used)?;
 
     let captured_doc_id = capture_run_if_qualifies(
         store,
@@ -450,6 +529,7 @@ pub fn apply_run_close_hook<S: GraphStore>(
                 .cloned()
                 .collect::<Vec<_>>(),
             "used_tools": used.tools.iter().cloned().collect::<Vec<_>>(),
+            "recorded_affordance_receipts": recorded_affordance_receipts.clone(),
             "positive_reinforcement_applied": outcome == OutcomeClass::Positive,
         }),
     )?;
@@ -492,10 +572,69 @@ pub fn apply_run_close_hook<S: GraphStore>(
             .collect(),
         used_memory_doc_ids: used.memory_doc_ids.into_iter().collect(),
         retrieval_attributions: used.retrieval_attributions.into_values().collect(),
+        recorded_affordance_receipts,
         promotion_proposals,
         demotions,
         decayed_items,
     })
+}
+
+fn record_used_affordance_outcomes<S: GraphStore>(
+    store: &mut S,
+    tenant: &str,
+    run: &RunState,
+    outcome: &OutcomeClass,
+    used: &UsedItems,
+) -> RuntimeResult<Vec<Value>> {
+    let mut affordance_store = CompoundAffordanceStore { store };
+    let mut receipts = Vec::new();
+    let mut previous_affordance_id = None;
+    for tool_id in &used.tools {
+        let affordance_node = affordance_node_id(tenant, tool_id);
+        if affordance_store.get_node(&affordance_node)?.is_none() {
+            continue;
+        }
+        let result = record_invocation(
+            &mut affordance_store,
+            InvocationRecordRequest {
+                tenant_id: tenant.to_string(),
+                task_type: compound_task_type(run),
+                candidate_affordance_ids: vec![tool_id.clone()],
+                selected_affordance_id: tool_id.clone(),
+                outcome_value: outcome.outcome_value(),
+                outcome_weight: 1.0,
+                outcome_label: outcome.as_str().to_string(),
+                previous_affordance_id: previous_affordance_id.clone(),
+                query_text: run.task.clone(),
+                recorded_at_ms: None,
+            },
+            Some("compound-engineering"),
+        )
+        .map_err(thg_runtime_error)?;
+        receipts.push(json!({
+            "tool_id": tool_id,
+            "receipt_node_id": result.receipt_node_id,
+            "receipt_hash": result.receipt_hash,
+            "effective_fitness": result.effective_fitness,
+            "graph_version": result.graph_version,
+        }));
+        previous_affordance_id = Some(tool_id.clone());
+    }
+    Ok(receipts)
+}
+
+fn compound_task_type(run: &RunState) -> String {
+    run.scope
+        .get("task_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "compound_run_close".to_string())
+}
+
+fn thg_runtime_error(error: rustyred_thg_core::ThgError) -> HarnessRuntimeError {
+    HarnessRuntimeError::Store(GraphStoreError::new(error.code, error.message))
 }
 
 fn append_compound_event<S: GraphStore>(
@@ -1721,7 +1860,11 @@ mod tests {
         SkillPackGetInput, SkillPackPublishInput,
     };
     use prose_check::{pack_hash, writing_engineering_pack_payload};
-    use rustyred_thg_core::InMemoryGraphStore;
+    use rustyred_thg_affordances::{
+        affordance_node_id, task_type_node_id, upsert_affordance, Affordance,
+        INVOCATION_RECEIPT_LABEL, PRODUCED_OUTCOME, SERVED_TASK,
+    };
+    use rustyred_thg_core::{InMemoryGraphStore, NeighborQuery};
     use serde_json::json;
     use theorem_harness_core::TransitionInput;
 
@@ -2442,6 +2585,76 @@ mod tests {
             capture.metadata["retrieval_attributions"][0]["expansion_depth"],
             json!(2)
         );
+    }
+
+    #[test]
+    fn run_close_hook_records_registered_tool_affordance_outcomes() {
+        let mut store = InMemoryGraphStore::new();
+        upsert_affordance(
+            &mut store,
+            Affordance {
+                tenant_id: "default".to_string(),
+                affordance_id: "apply_patch".to_string(),
+                server_id: "codex-tools".to_string(),
+                tool_name: "apply_patch".to_string(),
+                family: "developer_tool".to_string(),
+                label: "apply_patch".to_string(),
+                description: "Apply a source patch".to_string(),
+                input_schema: json!({ "type": "object" }),
+                permissions: vec!["graph:write".to_string()],
+                cost: json!({}),
+                writeback_policy: "write".to_string(),
+                tags: vec!["compound".to_string()],
+                embedding: None,
+                fitness: 0.5,
+                version: 1,
+                created_at_ms: 1,
+                manifest_version: 1,
+            },
+            Some("test"),
+        )
+        .unwrap();
+
+        close_successful_run(
+            &mut store,
+            "run-affordance-close",
+            "Patch the runtime close hook",
+            "Patch done. Tests pass.",
+            &[],
+            &[],
+        );
+
+        let fitness = compound_event(&store, "run-affordance-close", "COMPOUND.FITNESS_APPLIED");
+        let recorded = fitness.payload["recorded_affordance_receipts"]
+            .as_array()
+            .expect("recorded affordance receipts");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["tool_id"], json!("apply_patch"));
+
+        let receipt_node_id = recorded[0]["receipt_node_id"]
+            .as_str()
+            .expect("receipt node id");
+        let receipt = store
+            .get_node(receipt_node_id)
+            .expect("invocation receipt node");
+        assert!(receipt
+            .labels
+            .iter()
+            .any(|label| label == INVOCATION_RECEIPT_LABEL));
+        assert_eq!(receipt.properties["outcome_label"], json!("positive"));
+        assert_eq!(receipt.properties["outcome_value"], json!(1.0));
+        assert_eq!(receipt.properties["task_type"], json!("compound_run_close"));
+
+        let affordance_node = affordance_node_id("default", "apply_patch");
+        let task_type_node = task_type_node_id("default", "compound_run_close");
+        assert!(store
+            .neighbors(NeighborQuery::out(&affordance_node).with_edge_type(SERVED_TASK))
+            .iter()
+            .any(|hit| hit.node_id == task_type_node));
+        assert!(store
+            .neighbors(NeighborQuery::out(&affordance_node).with_edge_type(PRODUCED_OUTCOME))
+            .iter()
+            .any(|hit| hit.node_id == receipt_node_id));
     }
 
     #[test]

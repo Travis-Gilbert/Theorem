@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustyred_thg_core::{
     cached_single_seed_personalized_pagerank, checkout_graph_version, compile_graph_pack,
-    edge_time_interval, merge_ppr_scores, node_from_content_object, node_to_content_object, now_ms,
-    personalized_pagerank, read_epistemic_shadow, stable_hash, update_graph_ref, ActorId,
-    ColdIndex, ColdIndexEntry, ColdObjectStore, ColdScopeEntry, ColdTierKind, EdgeRecord,
-    EpistemicType, EvictionFrontier, GraphCompileOptions, GraphSnapshot, GraphStore,
-    GraphStoreError, GraphStoreResult, GraphVersionRepository, InMemoryColdIndex,
-    InMemoryObjectStore, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
+    edge_time_interval, join_delta, merge_ppr_scores, node_from_content_object,
+    node_to_content_object, now_ms, personalized_pagerank, read_epistemic_shadow, stable_hash,
+    update_graph_ref, ActorId, ColdIndex, ColdIndexEntry, ColdObjectStore, ColdScopeEntry,
+    ColdTierKind, EdgeRecord, EpistemicType, EvictionFrontier, GraphCompileOptions, GraphMutation,
+    GraphSnapshot, GraphStore, GraphStoreError, GraphStoreResult, GraphVersionRepository, Hlc,
+    InMemoryColdIndex, InMemoryObjectStore, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
     PluginCapabilityKind, PluginOperationContext, PluginOperationRegistration, PluginRegistry,
-    RustyRedPlugin, TimeInterval,
+    RustyRedPlugin, StampedBatch, StampedMutation, TimeInterval,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -943,7 +943,13 @@ pub fn invalidate_on_contradiction<S: GraphStore>(
             "invalidated_by_edge_id",
             &new_edge.id,
         );
-        store.upsert_edge(existing.clone())?;
+        join_delta(
+            store,
+            StampedBatch::new([StampedMutation::new(
+                GraphMutation::EdgeUpsert(existing.clone()),
+                Hlc::new(invalidated_at_ms, 0, by_actor),
+            )]),
+        );
         contradictions.push(Contradiction {
             existing_edge_id: existing.id,
             invalidated_at_ms,
@@ -2066,19 +2072,62 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_on_contradiction_stamps_invalidated_edge_hlc() {
+        let mut store = InMemoryGraphStore::new();
+        for id in ["person:1", "city:a", "city:b"] {
+            store
+                .upsert_node(NodeRecord::new(id, ["Entity"], json!({})))
+                .unwrap();
+        }
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:old-home",
+                "person:1",
+                "LIVES_IN",
+                "city:a",
+                json!({ "t_start_ms": 10 }),
+            ))
+            .unwrap();
+        let new_edge = EdgeRecord::new(
+            "edge:new-home",
+            "person:1",
+            "LIVES_IN",
+            "city:b",
+            json!({ "valid_at_ms": 50, "actor": "claude" }),
+        );
+
+        let contradictions = invalidate_on_contradiction(
+            &mut store,
+            &new_edge,
+            &ContradictionPolicy::functional(["LIVES_IN"]),
+        )
+        .unwrap();
+
+        assert_eq!(contradictions.len(), 1);
+        assert_eq!(contradictions[0].existing_edge_id, "edge:old-home");
+        assert_eq!(contradictions[0].invalidated_at_ms, 50);
+        assert_eq!(contradictions[0].by_actor, ActorId::from_label("claude"));
+
+        let invalidated = store
+            .get_edge("edge:old-home")
+            .expect("invalidated edge should stay present");
+        assert_eq!(invalidated.properties["invalid_at_ms"], json!(50));
+        assert_eq!(invalidated.properties["t_end_ms"], json!(50));
+        let hlc = &invalidated.properties["_crdt_hlc"];
+        assert_eq!(hlc["record"]["physical_ms"], json!(50));
+        assert_eq!(hlc["properties"]["invalid_at_ms"]["physical_ms"], json!(50));
+        assert_eq!(
+            hlc["properties"]["invalidated_by_edge_id"]["physical_ms"],
+            json!(50)
+        );
+    }
+
+    #[test]
     fn concurrent_contradiction_converges_by_hlc() {
         // SPEC Part 4 A4.4: two replicas concurrently invalidate the same
         // functional edge. Shipped as Hlc-stamped facts through the CRDT join,
         // both replicas converge to one deterministic validity (the Hlc-max
         // invalidation), and the edge stays present - never deleted.
-        //
-        // FINDING (punch-list): production invalidate_on_contradiction writes
-        // invalid_at via plain upsert_edge WITHOUT an _crdt_hlc stamp, so
-        // diff_since skips it (merge.rs only ships records with record_max_hlc)
-        // and it will not propagate over the sync transport as-is. This test
-        // ships the invalidations as the Hlc-stamped facts the spec requires
-        // (Part 4 #2: "stamped with Hlc"); invalidate_on_contradiction should
-        // stamp likewise so the property holds end-to-end.
         use rustyred_thg_core::{join_delta, GraphMutation, Hlc, StampedBatch, StampedMutation};
 
         let invalidation = |end_ms: i64| {

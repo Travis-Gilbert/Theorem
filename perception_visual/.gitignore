@@ -1,0 +1,13 @@
+# Local verification virtualenv and Python build artifacts.
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+# Training outputs / pulled model weights (never commit weights).
+checkpoints/
+weights/
+*.pt
+*.pth
+*.safetensors
+*.onnx

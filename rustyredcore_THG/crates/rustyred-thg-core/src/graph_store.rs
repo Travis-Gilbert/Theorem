@@ -2087,7 +2087,7 @@ impl InMemoryGraphStore {
 
     /// Return nodes whose `_ttl_expires_at_ms <= ts_ms`, sorted by
     /// expiration ascending (soonest first). Used by callers that need
-    /// "what's about to time out" visibility — mentions queue,
+    /// "what's about to time out" visibility -- mentions queue,
     /// presence keys, coordinator agents.
     pub fn nodes_expiring_before(&self, ts_ms: i64, limit: usize) -> Vec<NodeRecord> {
         let cap = if limit == 0 { usize::MAX } else { limit };
@@ -3065,7 +3065,7 @@ impl RedCoreGraphStore {
     pub fn purge_expired_nodes(&mut self) -> GraphStoreResult<usize> {
         // Stage a clone, drain expired ids from the staged copy. Doing
         // the work on the staged copy means a journal failure (disk full,
-        // permission error) rolls back cleanly — the live store is
+        // permission error) rolls back cleanly -- the live store is
         // unchanged because we only swap it in after the AOF append
         // succeeds. Matches the commit_batch staging pattern.
         let mut staged = self.store.clone();
@@ -6047,7 +6047,7 @@ mod tests {
             assert_eq!(store.ttl_active_count(), 1);
         }
 
-        // Reopen — AOF replays NodeUpsert (initial) + NodeUpsert (TTL-set).
+        // Reopen -- AOF replays NodeUpsert (initial) + NodeUpsert (TTL-set).
         // add_node_indexes fires during replay for both, rebuilding ttl_index.
         let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
         let node = store
@@ -6800,6 +6800,43 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{label}-{unique}"))
+    }
+
+    #[test]
+    fn in_memory_stats_version_increments_per_upsert() {
+        let mut store = InMemoryGraphStore::default();
+        assert_eq!(store.stats().version, 0);
+
+        let node_write = store
+            .upsert_node(NodeRecord::new("node:a", ["Entity"], json!({})))
+            .unwrap();
+        assert_eq!(node_write.version, 1);
+        assert_eq!(store.stats().version, 1);
+
+        let node_update = store
+            .upsert_node(NodeRecord::new(
+                "node:a",
+                ["Entity"],
+                json!({ "name": "A" }),
+            ))
+            .unwrap();
+        assert_eq!(node_update.version, 2);
+        assert_eq!(store.stats().version, 2);
+
+        store
+            .upsert_node(NodeRecord::new("node:b", ["Entity"], json!({})))
+            .unwrap();
+        let edge_write = store
+            .upsert_edge(EdgeRecord::new(
+                "edge:ab",
+                "node:a",
+                "RELATED",
+                "node:b",
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(edge_write.version, 4);
+        assert_eq!(store.stats().version, 4);
     }
 
     #[test]

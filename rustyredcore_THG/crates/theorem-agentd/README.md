@@ -35,6 +35,21 @@ cargo run -p theorem-agentd -- --once "hello from configured agentd" ./theorem-a
 Switch `[model].provider` to `openai-compatible` only when a resident model is
 available. Keep model keys in environment variables, not in TOML.
 
+## Resident Gemma vision serving
+
+Image-bearing turns are sent through the same OpenAI-compatible
+`/chat/completions` path as text turns. For Gemma 4 12B, llama-server must load
+the multimodal projector or image parts are inert:
+
+```bash
+llama-server -m gemma-4-12b-it-q4.gguf --mmproj mmproj-gemma-4-12b-it.gguf -c <ctx>
+```
+
+If a prebuilt 12B projector is not available, convert it from the Hugging Face
+checkpoint with llama.cpp's `convert_hf_to_gguf.py --mmproj`. This crate only
+adds vision image input plumbing; audio projectors and screenshot capture are
+separate follow-ups.
+
 ## Run as a daemon
 
 ```bash

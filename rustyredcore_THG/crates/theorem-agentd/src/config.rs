@@ -376,17 +376,11 @@ impl Default for CaptureConfig {
 
 /// Milestone relay + completion (CHK009-015). Gemma composes the milestone prose;
 /// the loop gates transitions, dedupes, posts, and completes-on-merge.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct RelayConfig {
     /// Master switch. Off by default.
     #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for RelayConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 #[cfg(test)]

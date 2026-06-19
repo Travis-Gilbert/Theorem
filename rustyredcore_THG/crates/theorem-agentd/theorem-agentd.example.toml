@@ -23,6 +23,11 @@ grammar_constrained = true
 # model = "gemma-4-12b-it-q4"
 # api_key_env = "THEOREM_MODEL_API_KEY"
 #
+# For Gemma vision/image input, start llama-server with the matching multimodal
+# projector, for example:
+#
+# llama-server -m gemma-4-12b-it-q4.gguf --mmproj mmproj-gemma-4-12b-it.gguf -c <ctx>
+#
 # Secrets stay in environment variables; do not put real keys in this file.
 
 [harness]

@@ -4,6 +4,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 
 | Crate | What it is |
 |-------|------------|
+| `commonplace` | CommonPlace consumer object model (Item/Collection/Tag) and auto-structuring ingest, graph-native over the RustyRedCore-THG substrate. |
 | `design-check` | Static design-engineering checker and skill-pack payload for Theorem harness design systems. |
 | `ensemble` | Ensemble: the capability-pack registry, budgeted selector, and trust ladder over RustyRedCore-THG. |
 | `pilot-core` | Servo-free, Playwright-class browser automation core: locator, actionability + auto-wait, geometry snapshot, coordinate synthesis, and web-first assertions behind a BrowserDriver trait. |
@@ -14,14 +15,14 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `rustyred-rerank` | Reranker scorer implementations for RustyRed membrane admission. |
 | `rustyred-thg-adapters` | LoRA adapter catalog and routing over RustyRedCore-THG graph records. |
 | `rustyred-thg-affordances` | Connector-as-substrate learning registry: MCP tools as first-class Affordance graph nodes with learned, scoped selection over RustyRedCore-THG. |
-| `rustyred-thg-catalog` | Compatibility sqlx/Postgres catalog for tenants, projects, billing, auth, and legacy cold-index rows; the hot native relational/cold-index path now lives in rustyred-thg-core. |
+| `rustyred-thg-catalog` | Relational catalog (tenants, projects, billing, auth) and the cold index for the RustyRedCore-THG storage spine, over sqlx/Postgres. |
 | `rustyred-thg-code` | Code parsing plugin/runtime for RustyRedCore-THG tenant graph stores. |
 | `rustyred-thg-compat-server` | Standalone HTTP control server for THG-Core. |
 | `rustyred-thg-connectors` | Live MCP connector transport: connect to an external MCP server, list its tools, and register them as learnable Affordance graph nodes via rustyred-thg-affordances. |
-| `rustyred-thg-core` | Theorem HotGraph core command executor, GraphStore, native relational planner/access-method seam, ordered cold index, document tree, compressed object store, cold fragments, and working log. |
+| `rustyred-thg-core` | Theorem HotGraph core command executor and state machine. |
 | `rustyred-thg-fractal` | Native Rust fractal expansion pipeline over RustyRed and RustyWeb. |
-| `rustyred-thg-geotemporal` | Tenant-scoped geotemporal composition over THG H3 spatial indexes, plus the planner-facing time-series access-method plugin. |
-| `rustyred-thg-mcp` | Model Context Protocol adapter for the Theorem HotGraph graph database, including the native relational query planner tool. |
+| `rustyred-thg-geotemporal` | Tenant-scoped geotemporal composition over THG H3 spatial indexes. |
+| `rustyred-thg-mcp` | Model Context Protocol adapter for the Theorem HotGraph graph database. |
 | `rustyred-thg-memory` | Graph-native memory recall, consolidation, decay, and validity plugin for RustyRedCore-THG. |
 | `rustyred-thg-pg-server` | Postgres wire protocol server for RustyRedCore-THG native views. |
 | `rustyred-thg-resp-server` | RESP protocol server for RustyRedCore-THG ordered-index commands. |
@@ -31,6 +32,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `scene-os-web` | Theorem SceneOS renderer bundle (Lane B): embeds the self-contained canvas renderer and serves a scene-package-v2 as one HTML asset, the SERP injection pattern. |
 | `theorem-agentd` | Local Theorem assistant daemon: OpenAI-compatible model loop, MCP tool host, receiver sidecar, and compute-offload ledger. |
 | `theorem-browser-agent` | Rust-native Theorem browser-use perceive/govern/afford contracts and kernels. |
+| `theorem-copresence` | Headless co-presence peer and surface-adapter seam over the RustyRed substrate. |
 | `theorem-dispatch` | Postgres hot execution queue for Theorem Dispatch v2. |
 | `theorem-harness-core` | Rust-native Theorem harness run controller: state transitions, guards, hashes, and replay/fork contracts. |
 | `theorem-harness-runtime` | Rust-native Theorem harness runtime: GraphStore-backed event log and run persistence. |

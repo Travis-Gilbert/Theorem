@@ -26,6 +26,10 @@ use crate::tools::ToolCatalog;
 pub trait Vocab {
     /// Number of tokens in the vocabulary.
     fn len(&self) -> usize;
+    /// Whether the vocabulary contains no tokens.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// The string piece token `id` appends (may be empty for control tokens).
     fn piece(&self, id: usize) -> &str;
 }
@@ -102,8 +106,8 @@ fn envelope_viable(s: &str, tool_names: &[String]) -> bool {
     }
     // The type value: a quoted string that must prefix-match "tool_call" or "final".
     match cur.expect_enum_string(&["tool_call", "final"]) {
-        EnumStep::Partial => return true,
-        EnumStep::Reject => return false,
+        EnumStep::Partial => true,
+        EnumStep::Reject => false,
         EnumStep::Ok(value) => match value.as_str() {
             "tool_call" => tool_call_tail(&mut cur, tool_names),
             "final" => final_tail(&mut cur),

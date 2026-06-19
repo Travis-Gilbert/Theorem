@@ -1,9 +1,9 @@
 //! # rustyred-thg-mcp
 //!
 //! The native Rust MCP server over the RustyRed graph store. It exposes the
-//! harness capabilities as MCP tools — memory, coordination, jobs, code
+//! harness capabilities as MCP tools -- memory, coordination, jobs, code
 //! intelligence, graph queries and algorithms, versioning, search, symbolic
-//! reasoning, and browsing — with no Python process in the loop. The same tool
+//! reasoning, and browsing -- with no Python process in the loop. The same tool
 //! surface is served over stdio (via the bundled `theorems-harness` plugin) and
 //! over HTTP (`POST /mcp` on the graph server).
 //!
@@ -12,9 +12,12 @@
 //! graph. Full categorized catalog: `docs/site/reference/mcp-tools.md`.
 
 mod connector_gateway;
+mod graphql;
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,9 +37,9 @@ use rustyred_thg_core::{
     GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
     GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
     HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-    QueryIr, RedCoreGraphStore, RelationalStore, SessionDelta, UserSubgraph, VectorDesignation,
-    VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, SAME_ECLASS,
-    UNDERCUTS,
+    QueryIr, RedCoreGraphStore, RelationalStore, SessionDelta, StreamEvent, StreamLog,
+    StreamUrgency, UserSubgraph, VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL,
+    EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -52,20 +55,22 @@ use theorem_harness_core::{
 use theorem_harness_runtime::subscribe_coordination_room_events;
 use theorem_harness_runtime::{
     append_transition_from_store, apply_skill_pack, archive_memory_document, binding_node_id,
-    coordination_binding_id, coordination_intent_edge_id, coordination_intent_node_id,
-    coordination_intent_scratchpad_edge_id, coordination_member_edge_id,
-    coordination_member_node_id, coordination_mention_edge_id, coordination_message_edge_id,
-    coordination_message_node_id, coordination_presence_node_id, coordination_record_edge_id,
-    coordination_record_node_id, coordination_room_binding_edge_id, coordination_room_node_id,
-    default_theorem_binding, encode_memory, forget_memory, get_skill_pack, handoff_memory,
-    infer_coordination_room_id, list_skill_packs, load_events, load_run, normalize_actor_id,
-    normalize_coordination_urgency, parse_coordination_mentions,
-    publish_coordination_room_event_from_state, publish_footprint_event, publish_presence_event,
-    publish_record_event, publish_skill_pack, publish_work_graph_transition,
-    recall_archived_memory, recall_memory, relate_memory, remember_memory, revise_memory_document,
-    scratchpad_revision_node_id, self_note_memory, stable_coordination_message_id,
-    stable_coordination_record_id, task_node_graph_id, upsert_note, AddOrRemove,
-    ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
+    canonical_stream_key, coordination_binding_id, coordination_intent_edge_id,
+    coordination_intent_node_id, coordination_intent_scratchpad_edge_id,
+    coordination_member_edge_id, coordination_member_node_id, coordination_mention_edge_id,
+    coordination_message_edge_id, coordination_message_node_id, coordination_presence_node_id,
+    coordination_record_edge_id, coordination_record_node_id, coordination_room_binding_edge_id,
+    coordination_room_node_id, coordination_stream_cursor_node_id,
+    coordination_stream_event_edge_id, coordination_stream_event_node_id,
+    coordination_stream_node_id, coordination_stream_subscription_node_id, default_theorem_binding,
+    encode_memory, forget_memory, get_skill_pack, handoff_memory, infer_coordination_room_id,
+    list_skill_packs, load_events, load_run, normalize_actor_id, normalize_coordination_urgency,
+    parse_coordination_mentions, publish_coordination_room_event_from_state,
+    publish_footprint_event, publish_presence_event, publish_record_event, publish_skill_pack,
+    publish_work_graph_transition, recall_archived_memory, recall_memory, relate_memory,
+    remember_memory, revise_memory_document, scratchpad_revision_node_id, self_note_memory,
+    stable_coordination_message_id, stable_coordination_record_id, task_node_graph_id, upsert_note,
+    AddOrRemove, ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
     CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
     CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
     HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
@@ -630,6 +635,316 @@ pub trait McpGraphProvider {
     fn backend_for_tenant(&self, tenant: &str) -> Result<Self::Backend, McpError>;
 }
 
+/// A cheaply-shareable handle to a single owned `McpGraphBackend` store, for the
+/// embedded / in-process case (North Star E0): one durable store (e.g. a
+/// `RedCoreGraphStore`) lives behind an `Rc<RefCell<_>>`, and each
+/// `backend_for_tenant` call clones the handle rather than re-opening or
+/// deep-copying the store. `SharedStore<S>` forwards EVERY `McpGraphBackend`
+/// method transparently to the inner `S`, so `S`'s overrides (RedCore's native
+/// code search, real upserts, etc.) are preserved -- forwarding only the required
+/// methods would silently fall back to the trait defaults for the ~27 methods a
+/// durable store overrides. It is also its own `McpGraphProvider`, so an embedded
+/// host can pass `SharedStore::new(store)` straight to `handle_mcp_request`.
+///
+/// Single-threaded by construction (`Rc`/`RefCell`); the embedded surface
+/// executes synchronously on one thread, matching the GraphQL dispatch model.
+pub struct SharedStore<S>(Rc<RefCell<S>>);
+
+impl<S> Clone for SharedStore<S> {
+    fn clone(&self) -> Self {
+        SharedStore(Rc::clone(&self.0))
+    }
+}
+
+impl<S: McpGraphBackend> SharedStore<S> {
+    /// Wrap an owned store in a shared, in-process handle.
+    pub fn new(store: S) -> Self {
+        SharedStore(Rc::new(RefCell::new(store)))
+    }
+
+    /// Run a closure with mutable access to the inner store (e.g. to read durable
+    /// state directly between GraphQL calls).
+    pub fn with_store<R>(&self, f: impl FnOnce(&mut S) -> R) -> R {
+        f(&mut self.0.borrow_mut())
+    }
+}
+
+impl<S: McpGraphBackend> McpGraphProvider for SharedStore<S> {
+    type Backend = SharedStore<S>;
+
+    fn backend_for_tenant(&self, _tenant: &str) -> Result<Self::Backend, McpError> {
+        Ok(self.clone())
+    }
+}
+
+impl<S: McpGraphBackend> McpGraphBackend for SharedStore<S> {
+    fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.0.borrow().get_node(id)
+    }
+    fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.0.borrow().get_edge(id)
+    }
+    fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.0.borrow().query_nodes(query)
+    }
+    fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+        self.0.borrow().neighbors(query)
+    }
+    fn stats(&self) -> GraphStoreResult<GraphStats> {
+        self.0.borrow().stats()
+    }
+    fn verify(&self) -> GraphStoreResult<VerifyReport> {
+        self.0.borrow().verify()
+    }
+    fn labels(&self) -> GraphStoreResult<Vec<String>> {
+        self.0.borrow().labels()
+    }
+    fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
+        self.0.borrow().edge_types()
+    }
+    fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+        self.0.borrow().property_keys()
+    }
+    fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+        self.0.borrow().list_edges()
+    }
+    fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+        self.0.borrow().graph_snapshot()
+    }
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        self.0.borrow_mut().upsert_node(node)
+    }
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.0.borrow_mut().upsert_edge(edge)
+    }
+    fn append_harness_transition(
+        &mut self,
+        transition: TransitionInput,
+    ) -> Result<Value, McpError> {
+        self.0.borrow_mut().append_harness_transition(transition)
+    }
+    fn harness_run_detail(&self, run_id: &str) -> Result<Option<Value>, McpError> {
+        self.0.borrow().harness_run_detail(run_id)
+    }
+    fn composed_agent_run(
+        &mut self,
+        binding_id: String,
+        task: String,
+        claims: Vec<GroundedClaim>,
+    ) -> Result<Value, McpError> {
+        self.0
+            .borrow_mut()
+            .composed_agent_run(binding_id, task, claims)
+    }
+    fn job_submit(
+        &mut self,
+        submission: JobSubmission,
+        submitted_by: String,
+    ) -> Result<Value, McpError> {
+        self.0.borrow_mut().job_submit(submission, submitted_by)
+    }
+    fn job_list(&self, repo: Option<String>, state: Option<String>) -> Result<Value, McpError> {
+        self.0.borrow().job_list(repo, state)
+    }
+    fn job_note(&mut self, job_id: String, input: JobNoteInput) -> Result<Value, McpError> {
+        self.0.borrow_mut().job_note(job_id, input)
+    }
+    fn job_archive(
+        &mut self,
+        job_id: String,
+        reason: String,
+        actor: String,
+    ) -> Result<Value, McpError> {
+        self.0.borrow_mut().job_archive(job_id, reason, actor)
+    }
+    fn dispatch_handoff(&self, dispatch: HandoffDispatch) -> Result<(), McpError> {
+        self.0.borrow().dispatch_handoff(dispatch)
+    }
+    fn invoke_app_affordance(
+        &mut self,
+        invocation: AppAffordanceInvocation,
+    ) -> Result<Value, McpError> {
+        self.0.borrow_mut().invoke_app_affordance(invocation)
+    }
+    fn invoke_code_search(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        self.0
+            .borrow_mut()
+            .invoke_code_search(tenant, arguments, operation)
+    }
+    fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+        self.0.borrow().vector_designations()
+    }
+    fn designate_vector_property(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+    ) -> GraphStoreResult<()> {
+        self.0
+            .borrow_mut()
+            .designate_vector_property(label, property_name, dimension)
+    }
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.0
+            .borrow()
+            .vector_search(label, property_name, query, k)
+    }
+    fn hybrid_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        alpha: f32,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.0
+            .borrow()
+            .hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
+    }
+    fn hybrid_scoring_config(&self) -> HybridScoringConfig {
+        self.0.borrow().hybrid_scoring_config()
+    }
+    fn hybrid_search_with_config(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        k: usize,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.0.borrow().hybrid_search_with_config(
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            config,
+        )
+    }
+    fn designate_fulltext_property(&mut self, label: &str, property: &str) -> GraphStoreResult<()> {
+        self.0
+            .borrow_mut()
+            .designate_fulltext_property(label, property)
+    }
+    fn fulltext_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.0.borrow().fulltext_search(label, property, query, k)
+    }
+    fn designate_spatial_property(
+        &mut self,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        resolution: u8,
+    ) -> GraphStoreResult<()> {
+        self.0.borrow_mut().designate_spatial_property(
+            label,
+            lat_property,
+            lon_property,
+            resolution,
+        )
+    }
+    fn spatial_radius_search(
+        &self,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        self.0.borrow().spatial_radius_search(
+            label,
+            lat_property,
+            lon_property,
+            lat,
+            lon,
+            radius_km,
+        )
+    }
+    fn spatial_bbox_search(
+        &self,
+        label: &str,
+        lat_property: &str,
+        lon_property: &str,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+    ) -> GraphStoreResult<Vec<String>> {
+        self.0.borrow().spatial_bbox_search(
+            label,
+            lat_property,
+            lon_property,
+            min_lat,
+            min_lon,
+            max_lat,
+            max_lon,
+        )
+    }
+    fn epistemic_neighbors(
+        &self,
+        node_id: &str,
+        epistemic_types: Option<&[EpistemicType]>,
+        min_confidence: Option<f64>,
+        max_depth: Option<usize>,
+    ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+        self.0
+            .borrow()
+            .epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+    }
+    fn algo_ppr(
+        &self,
+        seeds: &HashMap<String, f64>,
+        alpha: f64,
+        epsilon: f64,
+        max_pushes: usize,
+    ) -> GraphStoreResult<HashMap<String, f64>> {
+        self.0.borrow().algo_ppr(seeds, alpha, epsilon, max_pushes)
+    }
+    fn algo_components(&self, directed: bool) -> GraphStoreResult<Vec<Vec<String>>> {
+        self.0.borrow().algo_components(directed)
+    }
+    fn algo_pagerank(
+        &self,
+        damping: f64,
+        max_iter: usize,
+        tolerance: f64,
+    ) -> GraphStoreResult<HashMap<String, f64>> {
+        self.0.borrow().algo_pagerank(damping, max_iter, tolerance)
+    }
+    fn algo_communities(&self) -> GraphStoreResult<(HashMap<String, u64>, f64)> {
+        self.0.borrow().algo_communities()
+    }
+    fn bulk_upsert_nodes(&mut self, records: Vec<NodeRecord>) -> GraphStoreResult<(usize, usize)> {
+        self.0.borrow_mut().bulk_upsert_nodes(records)
+    }
+    fn bulk_upsert_edges(&mut self, records: Vec<EdgeRecord>) -> GraphStoreResult<(usize, usize)> {
+        self.0.borrow_mut().bulk_upsert_edges(records)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpServerConfig {
     pub name: String,
@@ -641,6 +956,13 @@ pub struct McpServerConfig {
     pub tool_result_budget_bytes: usize,
     #[serde(default)]
     pub tool_result_family_budgets: HashMap<String, usize>,
+    /// When true, advertise GraphQL as the default agent surface: the flat tools
+    /// whose capability is covered by the typed GraphQL schema (Area A) are hidden
+    /// from tools/list, leaving the three graphql_* transport tools plus the
+    /// not-yet-covered flat tools. Default off, so the flat surface is unchanged
+    /// unless a deployment opts in. (North Star A7 cutover.)
+    #[serde(default)]
+    pub graphql_default_surface: bool,
 }
 
 impl Default for McpServerConfig {
@@ -653,6 +975,7 @@ impl Default for McpServerConfig {
             allow_admin: false,
             tool_result_budget_bytes: default_tool_result_budget_bytes(),
             tool_result_family_budgets: HashMap::new(),
+            graphql_default_surface: false,
         }
     }
 }
@@ -936,17 +1259,7 @@ fn call_tool<P: McpGraphProvider>(
             }
             connector_gateway::invoke_payload(&tenant, &mut backend, &arguments)?
         }
-        "rustyred_thg_graph_neighbors" => {
-            let query = neighbor_query_from_value(&arguments)?;
-            let mut neighbors = backend.neighbors(query)?;
-            let budget = Budget::from_args(&arguments);
-            let truncated = apply_neighbor_budget(&mut neighbors, budget);
-            json!({
-                "tenant": tenant,
-                "neighbors": neighbors,
-                "stats": { "returned": neighbors.len(), "truncated": truncated }
-            })
-        }
+        "rustyred_thg_graph_neighbors" => graph_neighbors_payload(&tenant, &backend, &arguments)?,
         "rustyred_thg_graph_schema" => schema_payload(&tenant, &backend)?,
         "rustyred_thg_graph_index_status" => index_status_payload(&tenant, &backend)?,
         "rustyred_thg_graph_explain" => explain_payload(&tenant, &arguments),
@@ -1116,116 +1429,22 @@ fn call_tool<P: McpGraphProvider>(
             algorithm_communities_payload(&tenant, &backend)?
         }
         "rustyred_thg_instant_kg_status" | "harness_kg_status" => {
-            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
-            json!({
-                "tenant": tenant,
-                "status": view.status(),
-                "stats": view.stats()
-            })
+            instant_kg_payload(&tenant, &backend, &arguments, "status", name)?
         }
         "rustyred_thg_instant_kg_ppr" | "harness_kg_ppr" => {
-            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
-            let seeds: HashMap<String, f64> =
-                serde_json::from_value(arguments.get("seeds").cloned().ok_or_else(|| {
-                    McpError::invalid_params("harness_kg_ppr requires seeds object")
-                })?)
-                .map_err(|error| {
-                    McpError::invalid_params(format!("seeds must be an object: {error}"))
-                })?;
-            let alpha = arguments
-                .get("alpha")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.15);
-            let epsilon = arguments
-                .get("epsilon")
-                .and_then(Value::as_f64)
-                .unwrap_or(1e-4);
-            let max_pushes = arguments
-                .get("max_pushes")
-                .and_then(Value::as_u64)
-                .unwrap_or(200_000) as usize;
-            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
-            json!({
-                "tenant": tenant,
-                "status": view.status(),
-                "results": view.ppr(&seeds, alpha, epsilon, max_pushes, top_k)
-            })
+            instant_kg_payload(&tenant, &backend, &arguments, "ppr", name)?
         }
         "rustyred_thg_instant_kg_impact" | "harness_kg_impact" => {
-            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
-            let seed_arg = arguments
-                .get("seed")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let symbol_arg = arguments
-                .get("symbol_name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let seed = if let Some(seed) = seed_arg {
-                seed.to_string()
-            } else if let Some(symbol_name) = symbol_arg {
-                view.resolve_symbol_name(symbol_name).ok_or_else(|| {
-                    McpError::invalid_params("harness_kg_impact could not resolve symbol_name")
-                })?
-            } else {
-                return Err(McpError::invalid_params(
-                    "harness_kg_impact requires seed or symbol_name",
-                ));
-            };
-            let direction = instant_kg_direction(
-                arguments
-                    .get("direction")
-                    .and_then(Value::as_str)
-                    .unwrap_or("out"),
-            );
-            let max_depth = arguments
-                .get("max_depth")
-                .and_then(Value::as_u64)
-                .unwrap_or(2) as usize;
-            json!({
-                "tenant": tenant,
-                "seed": seed,
-                "status": view.status(),
-                "results": view.impact(&seed, direction, max_depth)
-            })
+            instant_kg_payload(&tenant, &backend, &arguments, "impact", name)?
         }
         "rustyred_thg_instant_kg_related_objects" | "harness_kg_related_objects" => {
-            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
-            let seed = required_str(&arguments, "seed", name)?;
-            let kinds = string_array(&arguments, "kinds");
-            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
-            json!({
-                "tenant": tenant,
-                "seed": seed,
-                "status": view.status(),
-                "results": view.related_objects(seed, &kinds, top_k)
-            })
+            instant_kg_payload(&tenant, &backend, &arguments, "related_objects", name)?
         }
         "rustyred_thg_instant_kg_search" | "harness_kg_search" => {
-            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
-            let query = required_str(&arguments, "query", name)?;
-            let kinds = string_array(&arguments, "kinds");
-            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
-            json!({
-                "tenant": tenant,
-                "query": query,
-                "status": view.status(),
-                "results": view.search(query, &kinds, top_k)
-            })
+            instant_kg_payload(&tenant, &backend, &arguments, "search", name)?
         }
         "rustyred_thg_instant_kg_explain_edge" | "harness_kg_explain_edge" => {
-            let view = instant_kg_view_payload(&tenant, &backend, &arguments)?;
-            let src = required_str(&arguments, "src", name)?;
-            let dst = required_str(&arguments, "dst", name)?;
-            json!({
-                "tenant": tenant,
-                "src": src,
-                "dst": dst,
-                "status": view.status(),
-                "explanations": view.explain_edge(src, dst)
-            })
+            instant_kg_payload(&tenant, &backend, &arguments, "explain_edge", name)?
         }
         // RR-INLINE-08: inline-adjacency algorithm tools. These bypass the
         // tenant entirely; the adjacency is read from the request arguments,
@@ -1308,6 +1527,38 @@ fn call_tool<P: McpGraphProvider>(
                 })));
             }
             coordinate_payload(&tenant, &mut backend, &arguments)?
+        }
+        "stream_publish" | "theorem_harness_stream_publish" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Stream publishes are unavailable while read-only mode is active."
+                })));
+            }
+            stream_publish_payload(&tenant, &mut backend, &arguments)?
+        }
+        "stream_read" | "theorem_harness_stream_read" => {
+            // Passive read is the default and stays available read-only; only the
+            // cursor advance (a write) is suppressed when the server is read-only.
+            stream_read_payload(&tenant, &mut backend, &arguments, !config.read_only)?
+        }
+        "stream_subscribe" | "theorem_harness_stream_subscribe" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Stream subscription changes are unavailable while read-only mode is active."
+                })));
+            }
+            stream_subscription_payload(&tenant, &mut backend, &arguments, true)?
+        }
+        "stream_unsubscribe" | "theorem_harness_stream_unsubscribe" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Stream subscription changes are unavailable while read-only mode is active."
+                })));
+            }
+            stream_subscription_payload(&tenant, &mut backend, &arguments, false)?
         }
         "fractal_expansion" | "harness_fractal_expansion" | "theorem_harness_fractal_expansion" => {
             if config.read_only {
@@ -1728,17 +1979,21 @@ fn call_tool<P: McpGraphProvider>(
         "observe" | "theorem_harness_observe" => {
             observe_payload(&tenant, &mut backend, &arguments)?
         }
+        "graphql_query" | "theorem_harness_graphql_query" => {
+            graphql::execute_graphql(&tenant, backend, &arguments, graphql::OpKind::Query)?
+        }
+        "graphql_mutate" | "theorem_harness_graphql_mutate" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "GraphQL mutations are unavailable while read-only mode is active."
+                })));
+            }
+            graphql::execute_graphql(&tenant, backend, &arguments, graphql::OpKind::Mutate)?
+        }
+        "graphql_introspect" | "theorem_harness_graphql_introspect" => graphql::introspect_sdl(),
         "rustyred_thg_fulltext_search" | "rustyred_thg_graph_fulltext_search" => {
-            let property = required_str(&arguments, "property", name)?;
-            let query = required_str(&arguments, "query", name)?;
-            let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
-            let label = arguments.get("label").and_then(Value::as_str);
-            let results = backend.fulltext_search(label, property, query, k)?;
-            json!({
-                "tenant": tenant,
-                "results": results.iter().map(|(node_id, score)| json!({"node_id": node_id, "score": score})).collect::<Vec<_>>(),
-                "stats": { "returned": results.len(), "k": k }
-            })
+            fulltext_search_payload(&tenant, &backend, &arguments, name)?
         }
         "rustyred_thg_fulltext_designate" | "rustyred_thg_graph_fulltext_designate"
             if config.read_only =>
@@ -1749,57 +2004,13 @@ fn call_tool<P: McpGraphProvider>(
             })))
         }
         "rustyred_thg_fulltext_designate" | "rustyred_thg_graph_fulltext_designate" => {
-            let label = required_str(&arguments, "label", name)?;
-            let property = required_str(&arguments, "property", name)?;
-            backend.designate_fulltext_property(label, property)?;
-            json!({
-                "tenant": tenant,
-                "designated": { "label": label, "property": property }
-            })
+            fulltext_designate_payload(&tenant, &mut backend, &arguments, name)?
         }
         "rustyred_thg_spatial_radius" | "rustyred_thg_graph_spatial_radius" => {
-            let label = required_str(&arguments, "label", name)?;
-            let lat_property = required_str(&arguments, "lat_property", name)?;
-            let lon_property = required_str(&arguments, "lon_property", name)?;
-            let lat = required_f64(&arguments, "lat", name)?;
-            let lon = required_f64(&arguments, "lon", name)?;
-            let radius_km = required_f64(&arguments, "radius_km", name)?;
-            let node_ids = backend.spatial_radius_search(
-                label,
-                lat_property,
-                lon_property,
-                lat,
-                lon,
-                radius_km,
-            )?;
-            json!({
-                "tenant": tenant,
-                "node_ids": node_ids,
-                "stats": { "returned": node_ids.len() }
-            })
+            spatial_radius_payload(&tenant, &backend, &arguments, name)?
         }
         "rustyred_thg_spatial_bbox" | "rustyred_thg_graph_spatial_bbox" => {
-            let label = required_str(&arguments, "label", name)?;
-            let lat_property = required_str(&arguments, "lat_property", name)?;
-            let lon_property = required_str(&arguments, "lon_property", name)?;
-            let min_lat = required_f64(&arguments, "min_lat", name)?;
-            let min_lon = required_f64(&arguments, "min_lon", name)?;
-            let max_lat = required_f64(&arguments, "max_lat", name)?;
-            let max_lon = required_f64(&arguments, "max_lon", name)?;
-            let node_ids = backend.spatial_bbox_search(
-                label,
-                lat_property,
-                lon_property,
-                min_lat,
-                min_lon,
-                max_lat,
-                max_lon,
-            )?;
-            json!({
-                "tenant": tenant,
-                "node_ids": node_ids,
-                "stats": { "returned": node_ids.len() }
-            })
+            spatial_bbox_payload(&tenant, &backend, &arguments, name)?
         }
         "rustyred_thg_spatial_designate" | "rustyred_thg_graph_spatial_designate"
             if config.read_only =>
@@ -1810,24 +2021,7 @@ fn call_tool<P: McpGraphProvider>(
             })))
         }
         "rustyred_thg_spatial_designate" | "rustyred_thg_graph_spatial_designate" => {
-            let label = required_str(&arguments, "label", name)?;
-            let lat_property = required_str(&arguments, "lat_property", name)?;
-            let lon_property = required_str(&arguments, "lon_property", name)?;
-            let resolution = arguments
-                .get("resolution")
-                .and_then(Value::as_u64)
-                .unwrap_or(9)
-                .min(u8::MAX as u64) as u8;
-            backend.designate_spatial_property(label, lat_property, lon_property, resolution)?;
-            json!({
-                "tenant": tenant,
-                "designated": {
-                    "label": label,
-                    "lat_property": lat_property,
-                    "lon_property": lon_property,
-                    "resolution": resolution
-                }
-            })
+            spatial_designate_payload(&tenant, &mut backend, &arguments, name)?
         }
         "rustyred_thg_bulk_nodes" | "rustyred_thg_graph_bulk_nodes" if config.read_only => {
             return Ok(tool_result_error(json!({
@@ -1836,40 +2030,7 @@ fn call_tool<P: McpGraphProvider>(
             })))
         }
         "rustyred_thg_bulk_nodes" | "rustyred_thg_graph_bulk_nodes" => {
-            let records = arguments
-                .get("nodes")
-                .or_else(|| arguments.get("records"))
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_bulk_nodes requires nodes array")
-                })?;
-            let mut inserted = 0usize;
-            let mut errors = Vec::new();
-            for (idx, raw) in records.iter().enumerate() {
-                match parse_node_record(raw) {
-                    Ok(node) => match backend.upsert_node(node.clone()) {
-                        Ok(()) => inserted += 1,
-                        Err(error) => errors.push(json!({
-                            "line": idx + 1,
-                            "code": error.code,
-                            "message": error.message,
-                            "record_id": node.id,
-                        })),
-                    },
-                    Err(error) => errors.push(json!({
-                        "line": idx + 1,
-                        "code": "invalid_node_record",
-                        "message": error.message,
-                    })),
-                }
-            }
-            json!({
-                "tenant": tenant,
-                "ok": errors.is_empty(),
-                "inserted": inserted,
-                "failed": errors.len(),
-                "errors": errors,
-            })
+            bulk_nodes_payload(&tenant, &mut backend, &arguments)?
         }
         "rustyred_thg_bulk_edges" | "rustyred_thg_graph_bulk_edges" if config.read_only => {
             return Ok(tool_result_error(json!({
@@ -1878,128 +2039,10 @@ fn call_tool<P: McpGraphProvider>(
             })))
         }
         "rustyred_thg_bulk_edges" | "rustyred_thg_graph_bulk_edges" => {
-            let records = arguments
-                .get("edges")
-                .or_else(|| arguments.get("records"))
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_bulk_edges requires edges array")
-                })?;
-            let mut inserted = 0usize;
-            let mut errors = Vec::new();
-            for (idx, raw) in records.iter().enumerate() {
-                match parse_edge_record(raw) {
-                    Ok(edge) => match backend.upsert_edge(edge.clone()) {
-                        Ok(()) => inserted += 1,
-                        Err(error) => errors.push(json!({
-                            "line": idx + 1,
-                            "code": error.code,
-                            "message": error.message,
-                            "record_id": edge.id,
-                        })),
-                    },
-                    Err(error) => errors.push(json!({
-                        "line": idx + 1,
-                        "code": "invalid_edge_record",
-                        "message": error.message,
-                    })),
-                }
-            }
-            json!({
-                "tenant": tenant,
-                "ok": errors.is_empty(),
-                "inserted": inserted,
-                "failed": errors.len(),
-                "errors": errors,
-            })
+            bulk_edges_payload(&tenant, &mut backend, &arguments)?
         }
-        "rustyred_thg_vector_search" => {
-            let property = arguments
-                .get("property")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_vector_search requires property")
-                })?;
-            let query = parse_f32_array(&arguments, "query")?;
-            let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
-            let label = arguments.get("label").and_then(Value::as_str);
-            let results = backend.vector_search(label, property, &query, k)?;
-            json!({
-                "tenant": tenant,
-                "results": results.iter().map(|(id, score)| json!({"node_id": id, "score": score})).collect::<Vec<_>>(),
-                "stats": { "returned": results.len(), "k": k }
-            })
-        }
-        "rustyred_thg_vector_hybrid" => {
-            let property = arguments
-                .get("property")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_vector_hybrid requires property")
-                })?;
-            let query = parse_f32_array(&arguments, "query")?;
-            let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
-            let label = arguments.get("label").and_then(Value::as_str);
-            let graph_seeds: Vec<String> = arguments
-                .get("graph_seeds")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_vector_hybrid requires graph_seeds")
-                })?;
-            let max_hops = arguments
-                .get("max_hops")
-                .and_then(Value::as_u64)
-                .unwrap_or(3) as usize;
-            let alpha = arguments
-                .get("alpha")
-                .and_then(Value::as_f64)
-                .map(|value| value as f32);
-            let mut scoring = backend.hybrid_scoring_config();
-            if let Some(alpha) = alpha {
-                scoring = scoring.with_alpha(alpha);
-            }
-            if let Some(confidence_weighted) = arguments
-                .get("confidence_weighted_graph_distance")
-                .and_then(Value::as_bool)
-            {
-                scoring.confidence_weighted_graph_distance = confidence_weighted;
-            }
-            if let Some(weights) = arguments.get("edge_type_weights") {
-                scoring.edge_type_weights =
-                    serde_json::from_value(weights.clone()).map_err(|error| {
-                        McpError::invalid_params(format!(
-                            "edge_type_weights must be an object of number weights: {error}"
-                        ))
-                    })?;
-            }
-            let results = backend.hybrid_search_with_config(
-                label,
-                property,
-                &query,
-                k,
-                &graph_seeds,
-                max_hops,
-                &scoring,
-            )?;
-            json!({
-                "tenant": tenant,
-                "results": results.iter().map(|(id, score)| json!({"node_id": id, "score": score})).collect::<Vec<_>>(),
-                "stats": {
-                    "returned": results.len(),
-                    "k": k,
-                    "alpha": scoring.alpha,
-                    "max_hops": max_hops,
-                    "confidence_weighted_graph_distance": scoring.confidence_weighted_graph_distance,
-                    "edge_type_weights": scoring.edge_type_weights
-                }
-            })
-        }
+        "rustyred_thg_vector_search" => vector_search_payload(&tenant, &backend, &arguments)?,
+        "rustyred_thg_vector_hybrid" => vector_hybrid_payload(&tenant, &backend, &arguments)?,
         "rustyred_thg_vector_designate" if config.read_only => {
             return Ok(tool_result_error(json!({
                 "error": "mcp_read_only",
@@ -2007,66 +2050,10 @@ fn call_tool<P: McpGraphProvider>(
             })))
         }
         "rustyred_thg_vector_designate" => {
-            let label = arguments
-                .get("label")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_vector_designate requires label")
-                })?;
-            let property = arguments
-                .get("property")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_vector_designate requires property")
-                })?;
-            let dimension = arguments
-                .get("dimension")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_vector_designate requires dimension")
-                })? as usize;
-            backend.designate_vector_property(label, property, dimension)?;
-            json!({
-                "tenant": tenant,
-                "designated": { "label": label, "property": property, "dimension": dimension }
-            })
+            vector_designate_payload(&tenant, &mut backend, &arguments)?
         }
         "rustyred_thg_epistemic_neighbors" => {
-            let node_id = arguments
-                .get("node_id")
-                .or_else(|| arguments.get("nodeId"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    McpError::invalid_params("rustyred_thg_epistemic_neighbors requires node_id")
-                })?;
-            let epistemic_types: Option<Vec<EpistemicType>> = arguments
-                .get("epistemic_types")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(|s| s.parse::<EpistemicType>())
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()
-                .map_err(McpError::from)?;
-            let min_confidence = arguments.get("min_confidence").and_then(Value::as_f64);
-            let max_depth = arguments
-                .get("max_depth")
-                .and_then(Value::as_u64)
-                .map(|v| v as usize);
-            let results = backend.epistemic_neighbors(
-                node_id,
-                epistemic_types.as_deref(),
-                min_confidence,
-                max_depth,
-            )?;
-            json!({
-                "tenant": tenant,
-                "node_id": node_id,
-                "results": results.iter().map(|(edge, node)| json!({"edge": edge, "node": node})).collect::<Vec<_>>(),
-                "stats": { "returned": results.len() }
-            })
+            epistemic_neighbors_payload(&tenant, &backend, &arguments)?
         }
         "rustyred_thg_admin_verify" if config.read_only => {
             return Ok(tool_result_error(json!({
@@ -2173,6 +2160,329 @@ fn get_prompt(params: &Value) -> Result<Value, McpError> {
             "role": "user",
             "content": { "type": "text", "text": text }
         }]
+    }))
+}
+
+fn graph_neighbors_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let query = neighbor_query_from_value(arguments)?;
+    let mut neighbors = backend.neighbors(query)?;
+    let budget = Budget::from_args(arguments);
+    let truncated = apply_neighbor_budget(&mut neighbors, budget);
+    Ok(json!({
+        "tenant": tenant,
+        "neighbors": neighbors,
+        "stats": { "returned": neighbors.len(), "truncated": truncated }
+    }))
+}
+
+fn fulltext_search_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+    name: &str,
+) -> Result<Value, McpError> {
+    let property = required_str(arguments, "property", name)?;
+    let query = required_str(arguments, "query", name)?;
+    let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let label = arguments.get("label").and_then(Value::as_str);
+    let results = backend.fulltext_search(label, property, query, k)?;
+    Ok(json!({
+        "tenant": tenant,
+        "results": results.iter().map(|(node_id, score)| json!({"node_id": node_id, "score": score})).collect::<Vec<_>>(),
+        "stats": { "returned": results.len(), "k": k }
+    }))
+}
+
+fn fulltext_designate_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    name: &str,
+) -> Result<Value, McpError> {
+    let label = required_str(arguments, "label", name)?;
+    let property = required_str(arguments, "property", name)?;
+    backend.designate_fulltext_property(label, property)?;
+    Ok(json!({
+        "tenant": tenant,
+        "designated": { "label": label, "property": property }
+    }))
+}
+
+fn spatial_radius_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+    name: &str,
+) -> Result<Value, McpError> {
+    let label = required_str(arguments, "label", name)?;
+    let lat_property = required_str(arguments, "lat_property", name)?;
+    let lon_property = required_str(arguments, "lon_property", name)?;
+    let lat = required_f64(arguments, "lat", name)?;
+    let lon = required_f64(arguments, "lon", name)?;
+    let radius_km = required_f64(arguments, "radius_km", name)?;
+    let node_ids =
+        backend.spatial_radius_search(label, lat_property, lon_property, lat, lon, radius_km)?;
+    Ok(json!({
+        "tenant": tenant,
+        "node_ids": node_ids,
+        "stats": { "returned": node_ids.len() }
+    }))
+}
+
+fn spatial_bbox_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+    name: &str,
+) -> Result<Value, McpError> {
+    let label = required_str(arguments, "label", name)?;
+    let lat_property = required_str(arguments, "lat_property", name)?;
+    let lon_property = required_str(arguments, "lon_property", name)?;
+    let min_lat = required_f64(arguments, "min_lat", name)?;
+    let min_lon = required_f64(arguments, "min_lon", name)?;
+    let max_lat = required_f64(arguments, "max_lat", name)?;
+    let max_lon = required_f64(arguments, "max_lon", name)?;
+    let node_ids = backend.spatial_bbox_search(
+        label,
+        lat_property,
+        lon_property,
+        min_lat,
+        min_lon,
+        max_lat,
+        max_lon,
+    )?;
+    Ok(json!({
+        "tenant": tenant,
+        "node_ids": node_ids,
+        "stats": { "returned": node_ids.len() }
+    }))
+}
+
+fn spatial_designate_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    name: &str,
+) -> Result<Value, McpError> {
+    let label = required_str(arguments, "label", name)?;
+    let lat_property = required_str(arguments, "lat_property", name)?;
+    let lon_property = required_str(arguments, "lon_property", name)?;
+    let resolution = arguments
+        .get("resolution")
+        .and_then(Value::as_u64)
+        .unwrap_or(9)
+        .min(u8::MAX as u64) as u8;
+    backend.designate_spatial_property(label, lat_property, lon_property, resolution)?;
+    Ok(json!({
+        "tenant": tenant,
+        "designated": {
+            "label": label,
+            "lat_property": lat_property,
+            "lon_property": lon_property,
+            "resolution": resolution
+        }
+    }))
+}
+
+fn bulk_nodes_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let records = arguments
+        .get("nodes")
+        .or_else(|| arguments.get("records"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::invalid_params("rustyred_thg_bulk_nodes requires nodes array"))?;
+    let mut inserted = 0usize;
+    let mut errors = Vec::new();
+    for (idx, raw) in records.iter().enumerate() {
+        match parse_node_record(raw) {
+            Ok(node) => match backend.upsert_node(node.clone()) {
+                Ok(()) => inserted += 1,
+                Err(error) => errors.push(json!({
+                    "line": idx + 1,
+                    "code": error.code,
+                    "message": error.message,
+                    "record_id": node.id,
+                })),
+            },
+            Err(error) => errors.push(json!({
+                "line": idx + 1,
+                "code": "invalid_node_record",
+                "message": error.message,
+            })),
+        }
+    }
+    Ok(json!({
+        "tenant": tenant,
+        "ok": errors.is_empty(),
+        "inserted": inserted,
+        "failed": errors.len(),
+        "errors": errors,
+    }))
+}
+
+fn bulk_edges_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let records = arguments
+        .get("edges")
+        .or_else(|| arguments.get("records"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::invalid_params("rustyred_thg_bulk_edges requires edges array"))?;
+    let mut inserted = 0usize;
+    let mut errors = Vec::new();
+    for (idx, raw) in records.iter().enumerate() {
+        match parse_edge_record(raw) {
+            Ok(edge) => match backend.upsert_edge(edge.clone()) {
+                Ok(()) => inserted += 1,
+                Err(error) => errors.push(json!({
+                    "line": idx + 1,
+                    "code": error.code,
+                    "message": error.message,
+                    "record_id": edge.id,
+                })),
+            },
+            Err(error) => errors.push(json!({
+                "line": idx + 1,
+                "code": "invalid_edge_record",
+                "message": error.message,
+            })),
+        }
+    }
+    Ok(json!({
+        "tenant": tenant,
+        "ok": errors.is_empty(),
+        "inserted": inserted,
+        "failed": errors.len(),
+        "errors": errors,
+    }))
+}
+
+fn vector_search_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let property = arguments
+        .get("property")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::invalid_params("rustyred_thg_vector_search requires property"))?;
+    let query = parse_f32_array(arguments, "query")?;
+    let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let label = arguments.get("label").and_then(Value::as_str);
+    let results = backend.vector_search(label, property, &query, k)?;
+    Ok(json!({
+        "tenant": tenant,
+        "results": results.iter().map(|(id, score)| json!({"node_id": id, "score": score})).collect::<Vec<_>>(),
+        "stats": { "returned": results.len(), "k": k }
+    }))
+}
+
+fn vector_hybrid_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let property = arguments
+        .get("property")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::invalid_params("rustyred_thg_vector_hybrid requires property"))?;
+    let query = parse_f32_array(arguments, "query")?;
+    let k = arguments.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let label = arguments.get("label").and_then(Value::as_str);
+    let graph_seeds: Vec<String> = arguments
+        .get("graph_seeds")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .ok_or_else(|| {
+            McpError::invalid_params("rustyred_thg_vector_hybrid requires graph_seeds")
+        })?;
+    let max_hops = arguments
+        .get("max_hops")
+        .and_then(Value::as_u64)
+        .unwrap_or(3) as usize;
+    let alpha = arguments
+        .get("alpha")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32);
+    let mut scoring = backend.hybrid_scoring_config();
+    if let Some(alpha) = alpha {
+        scoring = scoring.with_alpha(alpha);
+    }
+    if let Some(confidence_weighted) = arguments
+        .get("confidence_weighted_graph_distance")
+        .and_then(Value::as_bool)
+    {
+        scoring.confidence_weighted_graph_distance = confidence_weighted;
+    }
+    if let Some(weights) = arguments.get("edge_type_weights") {
+        scoring.edge_type_weights = serde_json::from_value(weights.clone()).map_err(|error| {
+            McpError::invalid_params(format!(
+                "edge_type_weights must be an object of number weights: {error}"
+            ))
+        })?;
+    }
+    let results = backend.hybrid_search_with_config(
+        label,
+        property,
+        &query,
+        k,
+        &graph_seeds,
+        max_hops,
+        &scoring,
+    )?;
+    Ok(json!({
+        "tenant": tenant,
+        "results": results.iter().map(|(id, score)| json!({"node_id": id, "score": score})).collect::<Vec<_>>(),
+        "stats": {
+            "returned": results.len(),
+            "k": k,
+            "alpha": scoring.alpha,
+            "max_hops": max_hops,
+            "confidence_weighted_graph_distance": scoring.confidence_weighted_graph_distance,
+            "edge_type_weights": scoring.edge_type_weights
+        }
+    }))
+}
+
+fn vector_designate_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let label = arguments
+        .get("label")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpError::invalid_params("rustyred_thg_vector_designate requires label"))?;
+    let property = arguments
+        .get("property")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            McpError::invalid_params("rustyred_thg_vector_designate requires property")
+        })?;
+    let dimension = arguments
+        .get("dimension")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            McpError::invalid_params("rustyred_thg_vector_designate requires dimension")
+        })? as usize;
+    backend.designate_vector_property(label, property, dimension)?;
+    Ok(json!({
+        "tenant": tenant,
+        "designated": { "label": label, "property": property, "dimension": dimension }
     }))
 }
 
@@ -2329,6 +2639,48 @@ fn relational_query_payload(
             "graph_snapshot_version": snapshot.version,
             "relations": store.relations().map(|relation| relation.schema.relation.clone()).collect::<Vec<_>>()
         }
+    }))
+}
+
+fn epistemic_neighbors_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let node_id = arguments
+        .get("node_id")
+        .or_else(|| arguments.get("nodeId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            McpError::invalid_params("rustyred_thg_epistemic_neighbors requires node_id")
+        })?;
+    let epistemic_types: Option<Vec<EpistemicType>> = arguments
+        .get("epistemic_types")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.parse::<EpistemicType>())
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(McpError::from)?;
+    let min_confidence = arguments.get("min_confidence").and_then(Value::as_f64);
+    let max_depth = arguments
+        .get("max_depth")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
+    let results = backend.epistemic_neighbors(
+        node_id,
+        epistemic_types.as_deref(),
+        min_confidence,
+        max_depth,
+    )?;
+    Ok(json!({
+        "tenant": tenant,
+        "node_id": node_id,
+        "results": results.iter().map(|(edge, node)| json!({"edge": edge, "node": node})).collect::<Vec<_>>(),
+        "stats": { "returned": results.len() }
     }))
 }
 
@@ -3462,6 +3814,532 @@ fn read_messages_payload(
         "room_id": room_id,
         "messages": messages,
         "count": messages.len()
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Stream-based coordination (SPEC: append-only event streams read by cursor).
+//
+// `stream_publish` / `stream_read` / `stream_subscribe` / `stream_unsubscribe`
+// are the cursor-delta surface that replaces the room poll. Each stream is
+// `(tenant, topic)`-scoped; events carry a monotonic ordering token; a cursor is
+// an actor's last-consumed token. The durable transport persists each event as a
+// `CoordinationStreamEvent` graph node and rehydrates a transient
+// [`StreamLog`](rustyred_thg_core::StreamLog) to run the identical `read_after`.
+// An `ask`/`block` publish with a `target_actor` additionally bridges onto the
+// existing mention/wake path via `write_coordination_message`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StreamHeadState {
+    #[serde(default)]
+    tenant_slug: String,
+    #[serde(default)]
+    topic: String,
+    #[serde(default)]
+    stream_key: String,
+    #[serde(default)]
+    next_token: u64,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StreamCursorState {
+    #[serde(default)]
+    tenant_slug: String,
+    #[serde(default)]
+    actor_id: String,
+    #[serde(default)]
+    topic: String,
+    #[serde(default)]
+    stream_key: String,
+    #[serde(default)]
+    cursor: u64,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StreamSubscriptionState {
+    #[serde(default)]
+    tenant_slug: String,
+    #[serde(default)]
+    actor_id: String,
+    #[serde(default)]
+    streams: Vec<String>,
+    #[serde(default)]
+    updated_at: String,
+}
+
+fn stream_topic_from_args(arguments: &Value) -> Option<String> {
+    argument_text(arguments, &["stream", "topic", "room_id", "roomId"])
+        .map(|topic| topic.trim().to_string())
+        .filter(|topic| !topic.is_empty())
+}
+
+fn load_stream_head(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    topic: &str,
+) -> Result<Option<StreamHeadState>, McpError> {
+    backend
+        .get_node(&coordination_stream_node_id(tenant, topic))?
+        .map(|node| parse_node_properties::<StreamHeadState>(node.properties))
+        .transpose()
+}
+
+/// The highest ordering token already persisted for a stream. Used only to
+/// bootstrap the head allocator if the head node is ever missing while events
+/// exist, so token assignment stays monotonic regardless.
+fn max_persisted_stream_token(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    topic: &str,
+) -> Result<u64, McpError> {
+    let mut max_token = 0;
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        for node in backend.query_nodes(
+            NodeQuery::label("CoordinationStreamEvent")
+                .with_property("tenant_slug", Value::String(tenant_alias))
+                .with_property("topic", Value::String(topic.to_string())),
+        )? {
+            if let Some(token) = node
+                .properties
+                .get("ordering_token")
+                .and_then(Value::as_u64)
+            {
+                max_token = max_token.max(token);
+            }
+        }
+    }
+    Ok(max_token)
+}
+
+/// Reserve the next monotonic ordering token for a stream (read-modify-write on
+/// the head node). MCP dispatch is serialized, so two heads publishing
+/// concurrently receive distinct tokens with no merge step.
+fn reserve_stream_token(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    topic: &str,
+    stream_key: &str,
+    now: &str,
+) -> Result<u64, McpError> {
+    let mut head = load_stream_head(backend, tenant, topic)?.unwrap_or_default();
+    let floor = if head.next_token == 0 {
+        max_persisted_stream_token(backend, tenant, topic)?.saturating_add(1)
+    } else {
+        head.next_token
+    };
+    let token = floor.max(1);
+    if head.created_at.is_empty() {
+        head.created_at = now.to_string();
+    }
+    head.tenant_slug = tenant.to_string();
+    head.topic = topic.to_string();
+    head.stream_key = stream_key.to_string();
+    head.next_token = token + 1;
+    head.updated_at = now.to_string();
+    let node = NodeRecord::new(
+        coordination_stream_node_id(tenant, topic),
+        ["HarnessCoordination", "CoordinationStream"],
+        serde_json::to_value(&head).map_err(|error| McpError::internal(error.to_string()))?,
+    );
+    upsert_node_if_changed(backend, node)?;
+    Ok(token)
+}
+
+fn persist_stream_event(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    topic: &str,
+    event: &StreamEvent,
+) -> Result<(), McpError> {
+    let mut properties = serde_json::to_value(event)
+        .map_err(|error| McpError::internal(error.to_string()))?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    properties.insert("tenant_slug".to_string(), Value::String(tenant.to_string()));
+    properties.insert("topic".to_string(), Value::String(topic.to_string()));
+    let node = NodeRecord::new(
+        coordination_stream_event_node_id(tenant, topic, event.ordering_token),
+        ["HarnessCoordination", "CoordinationStreamEvent"],
+        Value::Object(properties),
+    );
+    upsert_node_if_changed(backend, node)?;
+    let edge = EdgeRecord::new(
+        coordination_stream_event_edge_id(tenant, topic, event.ordering_token),
+        coordination_stream_event_node_id(tenant, topic, event.ordering_token),
+        "COORDINATION_STREAM_EVENT_OF",
+        coordination_stream_node_id(tenant, topic),
+        json!({
+            "tenant_slug": tenant,
+            "topic": topic,
+            "ordering_token": event.ordering_token,
+            "actor": event.actor,
+            "urgency": event.urgency.as_str(),
+            "created_at": event.created_at,
+        }),
+    );
+    upsert_edge_if_changed(backend, edge)?;
+    Ok(())
+}
+
+/// Rehydrate the durably-stored events for one stream into a transient
+/// [`StreamLog`] and return the delta strictly after `cursor`, in token order.
+/// This is the remote delta-pull transport running the exact core `read_after`.
+fn read_stream_delta_after(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    topic: &str,
+    cursor: u64,
+    limit: usize,
+) -> Result<Vec<StreamEvent>, McpError> {
+    let mut log = StreamLog::new();
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        for node in backend.query_nodes(
+            NodeQuery::label("CoordinationStreamEvent")
+                .with_property("tenant_slug", Value::String(tenant_alias))
+                .with_property("topic", Value::String(topic.to_string())),
+        )? {
+            log.ingest(parse_node_properties::<StreamEvent>(node.properties)?);
+        }
+    }
+    Ok(log.read_after(cursor, limit))
+}
+
+fn load_stream_cursor(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    actor_id: &str,
+    topic: &str,
+) -> Result<u64, McpError> {
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        if let Some(node) = backend.get_node(&coordination_stream_cursor_node_id(
+            &tenant_alias,
+            actor_id,
+            topic,
+        ))? {
+            return Ok(parse_node_properties::<StreamCursorState>(node.properties)?.cursor);
+        }
+    }
+    Ok(0)
+}
+
+fn persist_stream_cursor(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    actor_id: &str,
+    topic: &str,
+    stream_key: &str,
+    cursor: u64,
+    now: &str,
+) -> Result<(), McpError> {
+    let state = StreamCursorState {
+        tenant_slug: tenant.to_string(),
+        actor_id: actor_id.to_string(),
+        topic: topic.to_string(),
+        stream_key: stream_key.to_string(),
+        cursor,
+        updated_at: now.to_string(),
+    };
+    let node = NodeRecord::new(
+        coordination_stream_cursor_node_id(tenant, actor_id, topic),
+        ["HarnessCoordination", "CoordinationStreamCursor"],
+        serde_json::to_value(&state).map_err(|error| McpError::internal(error.to_string()))?,
+    );
+    upsert_node_if_changed(backend, node)?;
+    Ok(())
+}
+
+fn load_stream_subscriptions(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    actor_id: &str,
+) -> Result<Vec<String>, McpError> {
+    for tenant_alias in tenant_slug_aliases(tenant) {
+        if let Some(node) = backend.get_node(&coordination_stream_subscription_node_id(
+            &tenant_alias,
+            actor_id,
+        ))? {
+            return Ok(parse_node_properties::<StreamSubscriptionState>(node.properties)?.streams);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn persist_stream_subscriptions(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    actor_id: &str,
+    streams: &[String],
+    now: &str,
+) -> Result<(), McpError> {
+    let state = StreamSubscriptionState {
+        tenant_slug: tenant.to_string(),
+        actor_id: actor_id.to_string(),
+        streams: streams.to_vec(),
+        updated_at: now.to_string(),
+    };
+    let node = NodeRecord::new(
+        coordination_stream_subscription_node_id(tenant, actor_id),
+        ["HarnessCoordination", "CoordinationStreamSubscription"],
+        serde_json::to_value(&state).map_err(|error| McpError::internal(error.to_string()))?,
+    );
+    upsert_node_if_changed(backend, node)?;
+    Ok(())
+}
+
+fn stream_publish_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let topic = stream_topic_from_args(arguments)
+        .ok_or_else(|| McpError::invalid_params("stream_publish requires stream (topic)"))?;
+    let actor = require_actor_id(
+        &required_text_any(
+            arguments,
+            &["actor", "actor_id", "actorId"],
+            "stream_publish",
+        )?,
+        "stream_publish requires actor",
+    )?;
+    let kind = required_text_any(arguments, &["kind"], "stream_publish")?;
+    let urgency_arg = argument_text(arguments, &["urgency"]).unwrap_or_default();
+    let urgency = StreamUrgency::parse(&urgency_arg).ok_or_else(|| {
+        McpError::invalid_params("stream_publish urgency must be info, ask, or block")
+    })?;
+    let target_actor = argument_text(arguments, &["target_actor", "targetActor", "target"])
+        .map(|value| normalize_actor_id(&value))
+        .filter(|value| !value.is_empty());
+    let payload = arguments
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let created_at = timestamp_or_now(
+        &argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+    );
+    let stream_key = canonical_stream_key(tenant, &topic);
+
+    let token = reserve_stream_token(backend, tenant, &topic, &stream_key, &created_at)?;
+    let event_id = format!(
+        "sevt:{}",
+        &stable_value_hash(&json!({ "k": stream_key, "t": token }))[..16]
+    );
+    let mut event = StreamEvent::new(
+        event_id,
+        stream_key.clone(),
+        actor.clone(),
+        kind,
+        payload,
+        urgency,
+        target_actor.clone(),
+        created_at.clone(),
+    );
+    event.ordering_token = token;
+    persist_stream_event(backend, tenant, &topic, &event)?;
+
+    // Intentional-ping bridge: an ask/block to a target additionally lands on the
+    // existing mention/wake path so a warm head drains it at its next Stop hook
+    // and a cold head is woken. The stream event itself is already written above,
+    // so passive readers see it regardless.
+    let mut pinged = false;
+    if event.is_ping() {
+        if let Some(target) = target_actor.as_ref() {
+            write_coordination_message(
+                backend,
+                WriteMessageInput {
+                    tenant_slug: tenant.to_string(),
+                    room_id: topic.clone(),
+                    actor_id: actor.clone(),
+                    message_id: String::new(),
+                    urgency: urgency.as_str().to_string(),
+                    delivery: "wake".to_string(),
+                    message: format!(
+                        "@{target} stream ping ({}) on {topic}: {}",
+                        urgency.as_str(),
+                        event.kind
+                    ),
+                    mentions: vec![target.clone()],
+                    metadata: Map::from_iter([
+                        ("stream_ping".to_string(), Value::Bool(true)),
+                        ("stream".to_string(), Value::String(topic.clone())),
+                        (
+                            "stream_event_id".to_string(),
+                            Value::String(event.id.clone()),
+                        ),
+                        ("ordering_token".to_string(), Value::Number(token.into())),
+                    ]),
+                    created_at: created_at.clone(),
+                },
+            )?;
+            pinged = true;
+        }
+    }
+
+    Ok(json!({
+        "tenant": tenant,
+        "ok": true,
+        "stream": topic,
+        "stream_key": stream_key,
+        "event_id": event.id,
+        "ordering_token": token,
+        "urgency": urgency.as_str(),
+        "target_actor": target_actor,
+        "pinged": pinged,
+        "created_at": created_at,
+    }))
+}
+
+fn stream_read_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    allow_advance: bool,
+) -> Result<Value, McpError> {
+    let actor = require_actor_id(
+        &required_text_any(arguments, &["actor", "actor_id", "actorId"], "stream_read")?,
+        "stream_read requires actor",
+    )?;
+    let requested_advance = arguments
+        .get("advance")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let advance = requested_advance && allow_advance;
+    let limit = argument_u64(arguments, &["limit"]).unwrap_or(0) as usize;
+
+    // Explicit streams[] override the subscription set; otherwise read every
+    // stream the actor subscribes to (the passive turn-start read).
+    let mut topics = string_array_any(arguments, &["streams", "topics"])
+        .into_iter()
+        .map(|topic| topic.trim().to_string())
+        .filter(|topic| !topic.is_empty())
+        .collect::<Vec<_>>();
+    if let Some(single) = stream_topic_from_args(arguments) {
+        if !topics.contains(&single) {
+            topics.push(single);
+        }
+    }
+    let from_subscriptions = topics.is_empty();
+    if from_subscriptions {
+        topics = load_stream_subscriptions(backend, tenant, &actor)?
+            .into_iter()
+            .filter_map(|key| stream_topic_from_canonical(tenant, &key))
+            .collect();
+    }
+
+    let now = timestamp_or_now("");
+    let mut events_out = Vec::new();
+    let mut new_cursors = Map::new();
+    for topic in &topics {
+        let stream_key = canonical_stream_key(tenant, topic);
+        let cursor = load_stream_cursor(backend, tenant, &actor, topic)?;
+        let delta = read_stream_delta_after(backend, tenant, topic, cursor, limit)?;
+        let new_cursor = delta
+            .last()
+            .map(|event| event.ordering_token)
+            .unwrap_or(cursor);
+        if advance && new_cursor > cursor {
+            persist_stream_cursor(
+                backend,
+                tenant,
+                &actor,
+                topic,
+                &stream_key,
+                new_cursor,
+                &now,
+            )?;
+        }
+        new_cursors.insert(topic.clone(), Value::Number(new_cursor.into()));
+        for event in delta {
+            events_out.push(
+                serde_json::to_value(&event)
+                    .map_err(|error| McpError::internal(error.to_string()))?,
+            );
+        }
+    }
+
+    Ok(json!({
+        "tenant": tenant,
+        "actor_id": actor,
+        "streams": topics,
+        "from_subscriptions": from_subscriptions,
+        "events": events_out,
+        "count": events_out.len(),
+        "new_cursors": Value::Object(new_cursors),
+        "advanced": advance,
+    }))
+}
+
+/// Map a canonical `(tenant, topic)` key back to its topic for the read path.
+fn stream_topic_from_canonical(tenant: &str, stream_key: &str) -> Option<String> {
+    let prefix = format!("{}\u{1}", normalize_tenant_slug(tenant));
+    stream_key
+        .strip_prefix(&prefix)
+        .map(str::to_string)
+        .or_else(|| {
+            // Tolerate a bare topic stored without the canonical prefix.
+            (!stream_key.contains('\u{1}')).then(|| stream_key.to_string())
+        })
+        .filter(|topic| !topic.is_empty())
+}
+
+fn stream_subscription_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    subscribe: bool,
+) -> Result<Value, McpError> {
+    let tool = if subscribe {
+        "stream_subscribe"
+    } else {
+        "stream_unsubscribe"
+    };
+    let actor = require_actor_id(
+        &required_text_any(arguments, &["actor", "actor_id", "actorId"], tool)?,
+        "stream subscription requires actor",
+    )?;
+    let topic = stream_topic_from_args(arguments)
+        .ok_or_else(|| McpError::invalid_params(format!("{tool} requires stream (topic)")))?;
+    let stream_key = canonical_stream_key(tenant, &topic);
+
+    let mut streams = load_stream_subscriptions(backend, tenant, &actor)?;
+    let changed = if subscribe {
+        if streams.contains(&stream_key) {
+            false
+        } else {
+            streams.push(stream_key.clone());
+            true
+        }
+    } else {
+        let before = streams.len();
+        streams.retain(|existing| existing != &stream_key);
+        streams.len() != before
+    };
+    streams.sort();
+    streams.dedup();
+    let now = timestamp_or_now("");
+    if changed {
+        persist_stream_subscriptions(backend, tenant, &actor, &streams, &now)?;
+    }
+
+    let topics = streams
+        .iter()
+        .filter_map(|key| stream_topic_from_canonical(tenant, key))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "tenant": tenant,
+        "actor_id": actor,
+        "subscribed": subscribe,
+        "changed": changed,
+        "stream": topic,
+        "subscriptions": topics,
+        "count": topics.len(),
     }))
 }
 
@@ -4981,6 +5859,128 @@ fn observe_payload(
         "orchestrate_notes": [],
         "recall_results": recall_results
     }))
+}
+
+fn instant_kg_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+    name: &str,
+) -> Result<Value, McpError> {
+    let view = instant_kg_view_payload(tenant, backend, arguments)?;
+    let payload = match operation {
+        "status" => json!({
+            "tenant": tenant,
+            "status": view.status(),
+            "stats": view.stats()
+        }),
+        "ppr" => {
+            let seeds: HashMap<String, f64> =
+                serde_json::from_value(arguments.get("seeds").cloned().ok_or_else(|| {
+                    McpError::invalid_params("harness_kg_ppr requires seeds object")
+                })?)
+                .map_err(|error| {
+                    McpError::invalid_params(format!("seeds must be an object: {error}"))
+                })?;
+            let alpha = arguments
+                .get("alpha")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.15);
+            let epsilon = arguments
+                .get("epsilon")
+                .and_then(Value::as_f64)
+                .unwrap_or(1e-4);
+            let max_pushes = arguments
+                .get("max_pushes")
+                .and_then(Value::as_u64)
+                .unwrap_or(200_000) as usize;
+            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            json!({
+                "tenant": tenant,
+                "status": view.status(),
+                "results": view.ppr(&seeds, alpha, epsilon, max_pushes, top_k)
+            })
+        }
+        "impact" => {
+            let seed_arg = arguments
+                .get("seed")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let symbol_arg = arguments
+                .get("symbol_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let seed = if let Some(seed) = seed_arg {
+                seed.to_string()
+            } else if let Some(symbol_name) = symbol_arg {
+                view.resolve_symbol_name(symbol_name).ok_or_else(|| {
+                    McpError::invalid_params("harness_kg_impact could not resolve symbol_name")
+                })?
+            } else {
+                return Err(McpError::invalid_params(
+                    "harness_kg_impact requires seed or symbol_name",
+                ));
+            };
+            let direction = instant_kg_direction(
+                arguments
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or("out"),
+            );
+            let max_depth = arguments
+                .get("max_depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(2) as usize;
+            json!({
+                "tenant": tenant,
+                "seed": seed,
+                "status": view.status(),
+                "results": view.impact(&seed, direction, max_depth)
+            })
+        }
+        "related_objects" => {
+            let seed = required_str(arguments, "seed", name)?;
+            let kinds = string_array(arguments, "kinds");
+            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            json!({
+                "tenant": tenant,
+                "seed": seed,
+                "status": view.status(),
+                "results": view.related_objects(seed, &kinds, top_k)
+            })
+        }
+        "search" => {
+            let query = required_str(arguments, "query", name)?;
+            let kinds = string_array(arguments, "kinds");
+            let top_k = arguments.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            json!({
+                "tenant": tenant,
+                "query": query,
+                "status": view.status(),
+                "results": view.search(query, &kinds, top_k)
+            })
+        }
+        "explain_edge" => {
+            let src = required_str(arguments, "src", name)?;
+            let dst = required_str(arguments, "dst", name)?;
+            json!({
+                "tenant": tenant,
+                "src": src,
+                "dst": dst,
+                "status": view.status(),
+                "explanations": view.explain_edge(src, dst)
+            })
+        }
+        _ => {
+            return Err(McpError::invalid_params(format!(
+                "unsupported harness_kg operation `{operation}`"
+            )))
+        }
+    };
+    Ok(payload)
 }
 
 fn instant_kg_view_payload(
@@ -6820,6 +7820,14 @@ fn coordination_tool_requires_tenant(tool_name: &str) -> bool {
             | "theorem_harness_read_intents_for_room"
             | "coordinate"
             | "theorem_harness_coordinate"
+            | "stream_publish"
+            | "theorem_harness_stream_publish"
+            | "stream_read"
+            | "theorem_harness_stream_read"
+            | "stream_subscribe"
+            | "theorem_harness_stream_subscribe"
+            | "stream_unsubscribe"
+            | "theorem_harness_stream_unsubscribe"
             | "mentions"
             | "theorem_harness_mentions"
             | "read_messages_for_room"
@@ -7109,7 +8117,7 @@ fn multihead_claim_payload(
 
     let now = multihead_now(arguments);
     let expected_epoch = argument_u64(arguments, &["expected_epoch", "expectedEpoch", "epoch"])
-        .unwrap_or(node.claim_epoch) as u64;
+        .unwrap_or(node.claim_epoch);
     let ttl = lease_ttl_ms(arguments);
     let outcome =
         theorem_harness_core::claim_task_node(&mut node, &owner, expected_epoch, now, ttl);
@@ -8673,6 +9681,78 @@ fn resource_templates() -> Vec<Value> {
     ]
 }
 
+/// The flat tools whose capability is fully covered by the typed GraphQL schema
+/// (Area A). In `graphql_default_surface` mode these are hidden from tools/list so
+/// GraphQL is the advertised agent path; the three graphql_* transport tools and
+/// every not-yet-covered tool (web/browse/fractal, coordination/stream/multihead,
+/// raw graph_query, relational_query, version, harness_prepare, describe/invoke,
+/// etc.) stay visible. Conservative by design: a flat tool absent from this list
+/// simply stays advertised, so opting in never removes an uncovered capability.
+const GRAPHQL_COVERED_FLAT_TOOLS: &[&str] = &[
+    // memory domain
+    "recall",
+    "relate",
+    "remember",
+    "encode",
+    "self_revise",
+    "forget",
+    "handoff",
+    "self_recall_archive",
+    // graph algorithms (eight flat tools -> graphAlgorithm)
+    "rustyred_thg_algorithm_pagerank",
+    "rustyred_thg_algorithm_ppr",
+    "rustyred_thg_algorithm_communities",
+    "rustyred_thg_algorithm_components",
+    "rustyred_thg_algorithm_pagerank_inline",
+    "rustyred_thg_algorithm_ppr_inline",
+    "rustyred_thg_algorithm_communities_inline",
+    "rustyred_thg_algorithm_components_inline",
+    // graph reads, index designations, bulk upserts, symbolic
+    "rustyred_thg_graph_neighbors",
+    "rustyred_thg_graph_schema",
+    "rustyred_thg_vector_search",
+    "rustyred_thg_vector_hybrid",
+    "rustyred_thg_vector_designate",
+    "rustyred_thg_fulltext_search",
+    "rustyred_thg_fulltext_designate",
+    "rustyred_thg_spatial_radius",
+    "rustyred_thg_spatial_bbox",
+    "rustyred_thg_spatial_designate",
+    "rustyred_thg_bulk_nodes",
+    "rustyred_thg_bulk_edges",
+    "rustyred_thg_symbolic_datalog_derive",
+    "rustyred_thg_symbolic_probabilistic_source_reliability",
+    "rustyred_thg_symbolic_probabilistic_expected_value",
+    // epistemic shadow graph
+    "rustyred_thg_epistemic_neighbors",
+    "epistemic_dirty_frontier",
+    "epistemic_compile_subgraph",
+    "epistemic_shadow_ppr",
+    "epistemic_enrich_apply",
+    // code (CodeCrawler)
+    "compute_code",
+    "code_ingest",
+    // harness instant-KG
+    "harness_kg_status",
+    "harness_kg_search",
+    "harness_kg_ppr",
+    "harness_kg_impact",
+    "harness_kg_related_objects",
+    "harness_kg_explain_edge",
+    // clusters: skills / ensemble / jobs / harness-run
+    "skill_list",
+    "skill_get",
+    "skill_publish",
+    "skill_apply",
+    "ensemble_register",
+    "ensemble_select",
+    "job_submit",
+    "job_list",
+    "job_note",
+    "job_archive",
+    "harness_run",
+];
+
 fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
     let mut tools = vec![
         tool(
@@ -9257,6 +10337,24 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "room_id": { "type": "string" },
                     "limit": { "type": "integer", "default": 50 }
                 }
+            }),
+        ),
+        tool(
+            "stream_read",
+            "Pull the append-only coordination events after your stored cursor on your subscribed streams (or explicit streams[]). The passive, cursor-delta read that replaces the room poll; advance=true (default) consumes the window once.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "streams": { "type": "array", "items": { "type": "string" }, "description": "Explicit stream topics to read. Omit to read every stream you are subscribed to." },
+                    "stream": { "type": "string", "description": "A single stream topic to read (alias for streams: [stream])." },
+                    "advance": { "type": "boolean", "default": true, "description": "Advance your cursor past the events returned so they are not re-read." },
+                    "limit": { "type": "integer", "default": 0, "description": "Max events per stream; 0 = no cap." }
+                },
+                "required": ["actor"]
             }),
         ),
         tool(
@@ -10245,6 +11343,55 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ));
         tools.push(tool_write(
+            "stream_publish",
+            "Append an event to a (tenant, topic) coordination stream. Returns its monotonic ordering token. urgency ask|block with a target_actor also pings that actor (mention + wake).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "stream": { "type": "string", "description": "Stream topic: the room, optionally finer (per-task, per-actor)." },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "kind": { "type": "string", "description": "Application event kind, e.g. intent, handoff, note." },
+                    "payload": { "type": "object", "description": "Free-form event payload." },
+                    "urgency": { "type": "string", "enum": ["info", "ask", "block"], "default": "info" },
+                    "target_actor": { "type": "string", "description": "For ask/block: the pinged actor (lands on its mention/wake path)." }
+                },
+                "required": ["actor", "stream", "kind"]
+            }),
+        ));
+        tools.push(tool_write(
+            "stream_subscribe",
+            "Subscribe an actor to a coordination stream so stream_read returns its delta. Returns the updated subscription set.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "stream": { "type": "string" }
+                },
+                "required": ["actor", "stream"]
+            }),
+        ));
+        tools.push(tool_write(
+            "stream_unsubscribe",
+            "Unsubscribe an actor from a coordination stream. Returns the remaining subscription set. (A ping still reaches an unsubscribed target via mentions.)",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "stream": { "type": "string" }
+                },
+                "required": ["actor", "stream"]
+            }),
+        ));
+        tools.push(tool_write(
             "coordination_record",
             "Write a durable native Theorem harness coordination record.",
             json!({
@@ -10691,6 +11838,18 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "properties": { "tenant": { "type": "string" } }
             }),
         ));
+    }
+    tools.extend(graphql::graphql_tool_definitions(!config.read_only));
+    if config.graphql_default_surface {
+        // A7 cutover: GraphQL is the advertised agent path. Hide the flat tools the
+        // typed schema covers; the graphql_* transport tools and every uncovered
+        // tool stay listed.
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|name| !GRAPHQL_COVERED_FLAT_TOOLS.contains(&name))
+                .unwrap_or(true)
+        });
     }
     tools
 }
@@ -12017,6 +13176,423 @@ mod tests {
             invoked["planned"].get("connection_target").is_none(),
             "invoke must not leak persisted connector targets or auth material"
         );
+    }
+
+    fn stream_publish(
+        provider: &FixtureProvider,
+        config: &McpServerConfig,
+        tenant: &str,
+        stream: &str,
+        actor: &str,
+        kind: &str,
+    ) -> Value {
+        call_tool_json(
+            provider,
+            config,
+            "stream_publish",
+            json!({
+                "tenant": tenant,
+                "stream": stream,
+                "actor": actor,
+                "kind": kind,
+                "payload": { "note": kind }
+            }),
+        )
+    }
+
+    #[test]
+    fn stream_read_returns_exact_ordered_delta_after_stored_cursor() {
+        // AC1: a head offline for N turns, on reconnect, pulls exactly the events
+        // after its stored cursor, in order, cursor advancing; nothing missed or
+        // duplicated.
+        let (provider, config) = fixture();
+        let tenant = "travis-gilbert";
+        let stream = "room:harness-streams";
+        for kind in ["a", "b", "c"] {
+            stream_publish(&provider, &config, tenant, stream, "codex", kind);
+        }
+        // First reconnect drains the whole window in order and advances the cursor.
+        let first = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": stream }),
+        );
+        let tokens = first["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["ordering_token"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens, vec![1, 2, 3]);
+        assert_eq!(first["new_cursors"][stream], json!(3));
+
+        // Two more events arrive while offline.
+        for kind in ["d", "e"] {
+            stream_publish(&provider, &config, tenant, stream, "codex", kind);
+        }
+        // Reconnect again: only the new tail, in order, no overlap, no dup.
+        let second = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": stream }),
+        );
+        let kinds = second["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["d", "e"]);
+        assert_eq!(second["new_cursors"][stream], json!(5));
+
+        // Nothing new -> empty, cursor unchanged.
+        let third = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": stream }),
+        );
+        assert_eq!(third["count"], json!(0));
+        assert_eq!(third["new_cursors"][stream], json!(5));
+    }
+
+    #[test]
+    fn stream_ping_reaches_target_mentions_with_wake_delivery() {
+        // AC2: a ping (urgency ask|block plus target) appears in the target's
+        // mention drain (warm head) carrying wake delivery (the cold-head wake
+        // trigger). The stream event is also written for passive readers.
+        let (provider, config) = fixture();
+        let tenant = "travis-gilbert";
+        let stream = "room:harness-streams";
+        let published = call_tool_json(
+            &provider,
+            &config,
+            "stream_publish",
+            json!({
+                "tenant": tenant,
+                "stream": stream,
+                "actor": "codex",
+                "kind": "blocker",
+                "urgency": "block",
+                "target_actor": "claude-code",
+                "payload": { "why": "merge conflict" }
+            }),
+        );
+        assert_eq!(published["pinged"], json!(true));
+        assert_eq!(published["ordering_token"], json!(1));
+
+        let mentions = call_tool_json(
+            &provider,
+            &config,
+            "mentions",
+            json!({ "tenant": tenant, "actor": "claude-code", "consume": false }),
+        );
+        let inbox = mentions["mentions"].as_array().unwrap();
+        let ping = inbox
+            .iter()
+            .find(|message| message["metadata"]["stream_ping"] == json!(true))
+            .expect("ping lands on the target's mention path");
+        assert_eq!(ping["delivery"], json!("wake"));
+        assert_eq!(ping["urgency"], json!("block"));
+        assert_eq!(ping["metadata"]["stream"], json!(stream));
+
+        // The stream event itself is still readable by a passive subscriber.
+        let read = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "deepseek", "stream": stream }),
+        );
+        assert_eq!(read["count"], json!(1));
+        assert_eq!(read["events"][0]["urgency"], json!("block"));
+
+        // An info publish does NOT ping.
+        let info = call_tool_json(
+            &provider,
+            &config,
+            "stream_publish",
+            json!({
+                "tenant": tenant, "stream": stream, "actor": "codex",
+                "kind": "fyi", "urgency": "info", "target_actor": "claude-code"
+            }),
+        );
+        assert_eq!(info["pinged"], json!(false));
+    }
+
+    #[test]
+    fn concurrent_publishers_get_distinct_tokens_in_total_order() {
+        // AC3: two heads publishing to one stream receive distinct ordering
+        // tokens; both events read back in a single total order, no merge step.
+        let (provider, config) = fixture();
+        let tenant = "travis-gilbert";
+        let stream = "room:race";
+        let a = stream_publish(&provider, &config, tenant, stream, "codex", "from-codex");
+        let b = stream_publish(
+            &provider,
+            &config,
+            tenant,
+            stream,
+            "claude-code",
+            "from-claude",
+        );
+        assert_ne!(a["ordering_token"], b["ordering_token"]);
+        assert_eq!(a["ordering_token"], json!(1));
+        assert_eq!(b["ordering_token"], json!(2));
+
+        let read = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "observer", "stream": stream }),
+        );
+        let order = read["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                (
+                    event["actor"].as_str().unwrap().to_string(),
+                    event["ordering_token"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![("codex".to_string(), 1), ("claude-code".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn stream_publish_and_read_share_tenant_and_reject_empty_tenant() {
+        // AC4: a publish and a read under the configured tenant share a stream; a
+        // call with an empty tenant is rejected, not silently routed to a default.
+        let (provider, _) = fixture();
+        let strict = McpServerConfig {
+            default_tenant: "default".to_string(),
+            ..McpServerConfig::default()
+        };
+        // No tenant arg + a default-only config -> refused.
+        let refused = handle_mcp_request(
+            &provider,
+            &strict,
+            json!({
+                "jsonrpc": "2.0", "id": "no-tenant", "method": "tools/call",
+                "params": {
+                    "name": "stream_publish",
+                    "arguments": { "stream": "room:x", "actor": "codex", "kind": "k" }
+                }
+            }),
+        );
+        let refused_text = refused.to_string();
+        assert!(
+            refused["error"].is_object()
+                || refused["result"]["isError"] == json!(true)
+                || refused_text.contains("requires tenant"),
+            "empty tenant must be rejected, not defaulted: {refused_text}"
+        );
+
+        // Same tenant publish + read share the stream; a different tenant does not.
+        let tenant = "travis-gilbert";
+        let stream = "room:shared";
+        stream_publish(&provider, &strict, tenant, stream, "codex", "shared-1");
+        let same = call_tool_json(
+            &provider,
+            &strict,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": stream }),
+        );
+        assert_eq!(same["count"], json!(1));
+        let other = call_tool_json(
+            &provider,
+            &strict,
+            "stream_read",
+            json!({ "tenant": "someone-else", "actor": "claude-code", "stream": stream }),
+        );
+        assert_eq!(other["count"], json!(0));
+    }
+
+    #[test]
+    fn subscriptions_control_read_delta_but_ping_still_reaches_unsubscribed_target() {
+        // AC5: subscribing/unsubscribing changes which streams' deltas a read
+        // returns; a ping still reaches an unsubscribed target.
+        let (provider, config) = fixture();
+        let tenant = "travis-gilbert";
+        let room = "room:demo";
+        let task = "task:streams";
+        stream_publish(&provider, &config, tenant, room, "codex", "room-1");
+        stream_publish(&provider, &config, tenant, task, "codex", "task-1");
+
+        // No subscriptions -> a subscription-driven read returns nothing.
+        let none = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code" }),
+        );
+        assert_eq!(none["count"], json!(0));
+        assert_eq!(none["from_subscriptions"], json!(true));
+
+        // Subscribe to the room only.
+        let sub = call_tool_json(
+            &provider,
+            &config,
+            "stream_subscribe",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": room }),
+        );
+        assert_eq!(sub["subscriptions"], json!([room]));
+        let room_only = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code" }),
+        );
+        assert_eq!(room_only["count"], json!(1));
+        assert_eq!(room_only["streams"], json!([room]));
+
+        // Add the task stream; both deltas now return.
+        call_tool_json(
+            &provider,
+            &config,
+            "stream_subscribe",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": task }),
+        );
+        let both = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code" }),
+        );
+        // room-1 already consumed above; task-1 is fresh on the newly added stream.
+        let streams_read = both["streams"].as_array().unwrap();
+        assert!(streams_read.iter().any(|s| s == task));
+
+        // Unsubscribe from the task stream -> its delta no longer returned.
+        let unsub = call_tool_json(
+            &provider,
+            &config,
+            "stream_unsubscribe",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": task }),
+        );
+        assert_eq!(unsub["subscriptions"], json!([room]));
+        stream_publish(&provider, &config, tenant, task, "codex", "task-2");
+        let after = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code" }),
+        );
+        assert!(
+            after["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s != task),
+            "unsubscribed stream must not appear in subscription-driven reads"
+        );
+
+        // But a ping to the unsubscribed target still reaches it via mentions.
+        call_tool_json(
+            &provider,
+            &config,
+            "stream_publish",
+            json!({
+                "tenant": tenant, "stream": task, "actor": "codex",
+                "kind": "ask", "urgency": "ask", "target_actor": "claude-code"
+            }),
+        );
+        let mentions = call_tool_json(
+            &provider,
+            &config,
+            "mentions",
+            json!({ "tenant": tenant, "actor": "claude-code", "consume": false }),
+        );
+        assert!(
+            mentions["mentions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["metadata"]["stream"] == json!(task)),
+            "a ping reaches an unsubscribed target through the mention path"
+        );
+    }
+
+    #[test]
+    fn stream_read_only_mode_does_not_advance_cursor() {
+        // Passive read stays available read-only; the cursor advance (a write) is
+        // suppressed so the window can be re-read.
+        let (provider, _) = fixture();
+        let tenant = "travis-gilbert";
+        let stream = "room:ro";
+        let writable = McpServerConfig {
+            default_tenant: tenant.to_string(),
+            ..McpServerConfig::default()
+        };
+        stream_publish(&provider, &writable, tenant, stream, "codex", "a");
+        let read_only = McpServerConfig {
+            default_tenant: tenant.to_string(),
+            read_only: true,
+            ..McpServerConfig::default()
+        };
+        let first = call_tool_json(
+            &provider,
+            &read_only,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": stream }),
+        );
+        assert_eq!(first["count"], json!(1));
+        assert_eq!(first["advanced"], json!(false));
+        // Re-read returns the same event because the cursor did not advance.
+        let again = call_tool_json(
+            &provider,
+            &read_only,
+            "stream_read",
+            json!({ "tenant": tenant, "actor": "claude-code", "stream": stream }),
+        );
+        assert_eq!(again["count"], json!(1));
+
+        // Writes are refused read-only.
+        let refused = handle_mcp_request(
+            &provider,
+            &read_only,
+            json!({
+                "jsonrpc": "2.0", "id": "ro-pub", "method": "tools/call",
+                "params": {
+                    "name": "stream_publish",
+                    "arguments": { "tenant": tenant, "stream": stream, "actor": "codex", "kind": "k" }
+                }
+            }),
+        );
+        assert!(
+            refused.to_string().contains("read_only") || refused.to_string().contains("read-only"),
+            "stream_publish must be refused in read-only mode"
+        );
+    }
+
+    #[test]
+    fn stream_write_tools_hidden_in_read_only_listing() {
+        let (provider, _) = fixture();
+        let read_only = McpServerConfig {
+            read_only: true,
+            ..McpServerConfig::default()
+        };
+        let listed = handle_mcp_request(
+            &provider,
+            &read_only,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        let names = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        // The passive read stays available; the writes are hidden.
+        assert!(names.contains(&"stream_read"));
+        assert!(!names.contains(&"stream_publish"));
+        assert!(!names.contains(&"stream_subscribe"));
+        assert!(!names.contains(&"stream_unsubscribe"));
     }
 
     #[test]
@@ -13746,6 +15322,1387 @@ mod tests {
         assert_eq!(forgotten["document"]["status"], "deleted");
     }
 
+    // ---- GraphQL MCP surface acceptance (Memory slice + graphAlgorithm) ----
+
+    /// Drive a GraphQL transport tool and return the unwrapped GraphQL response
+    /// ({ data, errors }) carried in `result.structuredContent`.
+    fn graphql_tool_call(
+        provider: &FixtureProvider,
+        config: &McpServerConfig,
+        tool: &str,
+        query: &str,
+        variables: Value,
+    ) -> Value {
+        let mut arguments = json!({ "tenant": "smoke", "query": query });
+        if !variables.is_null() {
+            arguments["variables"] = variables;
+        }
+        call_tool_json(provider, config, tool, arguments)
+    }
+
+    fn assert_no_graphql_errors(response: &Value) {
+        let empty = response
+            .get("errors")
+            .map(|errors| {
+                errors.is_null() || errors.as_array().map(|a| a.is_empty()).unwrap_or(false)
+            })
+            .unwrap_or(true);
+        assert!(empty, "unexpected graphql errors: {response}");
+    }
+
+    fn seed_two_linked_memories(
+        provider: &FixtureProvider,
+        config: &McpServerConfig,
+    ) -> (String, String) {
+        let alpha = call_tool_json(
+            provider,
+            config,
+            "remember",
+            json!({
+                "tenant": "smoke", "actor": "codex", "kind": "insight",
+                "title": "Alpha", "content": "alpha memory atom",
+                "created_at": "2026-06-01T00:00:00Z"
+            }),
+        );
+        let alpha_id = alpha["document"]["doc_id"].as_str().unwrap().to_string();
+        let beta = call_tool_json(
+            provider,
+            config,
+            "remember",
+            json!({
+                "tenant": "smoke", "actor": "codex", "kind": "insight",
+                "title": "Beta", "content": "beta memory atom links alpha",
+                "links": [alpha_id.clone()],
+                "created_at": "2026-06-01T00:01:00Z"
+            }),
+        );
+        let beta_id = beta["document"]["doc_id"].as_str().unwrap().to_string();
+        (alpha_id, beta_id)
+    }
+
+    // AC1: a single GraphQL query returns a memory node together with its related
+    // neighbors and its resolved links, in one round trip.
+    #[test]
+    fn graphql_memory_query_resolves_related_and_links_in_one_shot() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+        let (alpha_id, beta_id) = seed_two_linked_memories(&provider, &config);
+
+        let response = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($q:String!){ memory(query:$q, limit:10){ id title \
+             related(edgeTypes:[\"MEMORY_RELATES\"], maxHops:1){ id } links{ id } } }",
+            json!({ "q": "memory" }),
+        );
+        assert_no_graphql_errors(&response);
+        let docs = response["data"]["memory"]
+            .as_array()
+            .expect("memory should resolve to an array");
+        let beta = docs
+            .iter()
+            .find(|doc| doc["id"] == json!(beta_id))
+            .expect("beta doc should be in recall results");
+        let related: Vec<&str> = beta["related"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["id"].as_str())
+            .collect();
+        let links: Vec<&str> = beta["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["id"].as_str())
+            .collect();
+        assert!(
+            related.contains(&alpha_id.as_str()),
+            "related must include alpha: {beta}"
+        );
+        assert!(
+            links.contains(&alpha_id.as_str()),
+            "links must include alpha: {beta}"
+        );
+    }
+
+    // AC2: rememberMemory with an outcome routes through encode (feedback); without
+    // an outcome it is a plain remember. Both return a typed MemoryDoc.
+    #[test]
+    fn graphql_remember_mutation_routes_outcome_to_encode() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let encoded = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($i:MemoryInput!){ rememberMemory(input:$i){ id kind outcome } }",
+            json!({ "i": { "kind": "solution", "content": "encode path atom", "outcome": "positive", "signal": "test" } }),
+        );
+        assert_no_graphql_errors(&encoded);
+        // Definitive: the recorded feedback outcome is only set by the encode path.
+        assert_eq!(
+            encoded["data"]["rememberMemory"]["outcome"], "positive",
+            "rememberMemory with an outcome must route through encode: {encoded}"
+        );
+
+        let plain = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($i:MemoryInput!){ rememberMemory(input:$i){ id kind outcome } }",
+            json!({ "i": { "kind": "insight", "content": "plain remember atom" } }),
+        );
+        assert_no_graphql_errors(&plain);
+        assert!(plain["data"]["rememberMemory"]["id"].as_str().is_some());
+        // No outcome supplied -> plain remember, no recorded feedback outcome.
+        assert!(
+            plain["data"]["rememberMemory"]["outcome"].is_null(),
+            "rememberMemory without an outcome must be a plain remember: {plain}"
+        );
+    }
+
+    // AC3: graphAlgorithm collapses the eight flat algorithm tools; PAGERANK and PPR
+    // both return ranked results through the one field.
+    #[test]
+    fn graphql_graph_algorithm_runs_pagerank_and_ppr() {
+        let (provider, config) = fixture();
+
+        let pagerank = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ graphAlgorithm(kind: PAGERANK){ result } }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&pagerank);
+        assert!(
+            !pagerank["data"]["graphAlgorithm"]["result"].is_null(),
+            "pagerank should return a result payload: {pagerank}"
+        );
+
+        let ppr = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($s:JSON){ graphAlgorithm(kind: PPR, seeds:$s){ result } }",
+            json!({ "s": { "node:a": 1.0 } }),
+        );
+        assert_no_graphql_errors(&ppr);
+        assert!(
+            !ppr["data"]["graphAlgorithm"]["result"].is_null(),
+            "ppr should return a result payload: {ppr}"
+        );
+    }
+
+    // AC4: the connection tenant is resolved once; a session with an empty tenant is
+    // rejected rather than defaulted.
+    #[test]
+    fn graphql_rejects_empty_connection_tenant() {
+        let (provider, config) = (
+            FixtureProvider(Rc::new(RefCell::new(InMemoryGraphStore::new()))),
+            McpServerConfig {
+                default_tenant: String::new(),
+                read_only: false,
+                ..McpServerConfig::default()
+            },
+        );
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0", "id": "t", "method": "tools/call",
+                "params": { "name": "graphql_query", "arguments": { "query": "query{ memory{ id } }" } }
+            }),
+        );
+        assert!(
+            response.get("error").is_some(),
+            "an empty connection tenant must be rejected, not defaulted: {response}"
+        );
+    }
+
+    // AC5: graphql_query refuses a mutation operation; mutations run only through
+    // graphql_mutate.
+    #[test]
+    fn graphql_query_refuses_mutation_operations() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let response = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "mutation($i:MemoryInput!){ rememberMemory(input:$i){ id } }",
+            json!({ "i": { "kind": "insight", "content": "should be refused" } }),
+        );
+        let errors = response
+            .get("errors")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !errors.is_empty(),
+            "graphql_query must refuse a mutation operation: {response}"
+        );
+        assert!(
+            response["data"].is_null(),
+            "a refused mutation must not produce data: {response}"
+        );
+    }
+
+    // AC6: the schema round-trips its SDL via graphql_introspect, and the flat tools
+    // still answer (coexistence, no big-bang replacement).
+    #[test]
+    fn graphql_introspect_returns_sdl_and_flat_tools_still_answer() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let sdl = call_tool_json(
+            &provider,
+            &config,
+            "graphql_introspect",
+            json!({ "tenant": "smoke" }),
+        );
+        let sdl = sdl
+            .as_str()
+            .expect("introspect should return an SDL string");
+        for fragment in [
+            "type MemoryDoc",
+            "graphAlgorithm",
+            "rememberMemory",
+            "scalar JSON",
+        ] {
+            assert!(sdl.contains(fragment), "SDL missing {fragment}:\n{sdl}");
+        }
+        // Structural half of connection-scoped tenancy: no field or input anywhere
+        // accepts a tenant, so a field cannot mis-scope it.
+        assert!(
+            !sdl.to_lowercase().contains("tenant"),
+            "no GraphQL field may carry a tenant argument:\n{sdl}"
+        );
+
+        // A flat tool still answers exactly as before.
+        let recall = call_tool_json(
+            &provider,
+            &config,
+            "recall",
+            json!({ "tenant": "smoke", "query": "anything", "limit": 5 }),
+        );
+        assert!(
+            recall.get("count").is_some(),
+            "flat recall must still answer: {recall}"
+        );
+    }
+
+    // ---- A3: Graph domain GraphQL surface acceptance (each field == its flat tool) ----
+
+    // A3.1: the typed bulk mutations write a graph, and graphNode + neighbors read it
+    // back; neighbors matches the flat rustyred_thg_graph_neighbors tool exactly.
+    #[test]
+    fn graphql_graph_domain_bulk_and_neighbors_match_flat_tool() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let nodes = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($n:JSON!){ bulkNodes(nodes:$n){ ok inserted failed } }",
+            json!({ "n": [
+                { "id": "g1", "labels": ["Doc"], "properties": { "title": "one" } },
+                { "id": "g2", "labels": ["Doc"], "properties": { "title": "two" } }
+            ]}),
+        );
+        assert_no_graphql_errors(&nodes);
+        assert_eq!(
+            nodes["data"]["bulkNodes"]["inserted"], 2,
+            "bulkNodes: {nodes}"
+        );
+        assert_eq!(nodes["data"]["bulkNodes"]["ok"], true);
+
+        let edges = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($e:JSON!){ bulkEdges(edges:$e){ inserted } }",
+            json!({ "e": [ { "id": "g1->g2", "from_id": "g1", "to_id": "g2", "type": "LINKS" } ]}),
+        );
+        assert_no_graphql_errors(&edges);
+        assert_eq!(
+            edges["data"]["bulkEdges"]["inserted"], 1,
+            "bulkEdges: {edges}"
+        );
+
+        let node = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ graphNode(id:\"g1\") }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&node);
+        assert!(
+            !node["data"]["graphNode"].is_null(),
+            "graphNode must return the inserted node: {node}"
+        );
+
+        let gql = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ neighbors(nodeId:\"g1\", direction:\"out\") }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&gql);
+        let flat = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_graph_neighbors",
+            json!({ "tenant": "smoke", "node_id": "g1", "direction": "out" }),
+        );
+        // The typed field lowers to the same payload: the neighbor lists are identical.
+        assert_eq!(
+            gql["data"]["neighbors"]["neighbors"], flat["neighbors"],
+            "GraphQL neighbors must match the flat tool: gql={gql} flat={flat}"
+        );
+        assert!(
+            !flat["neighbors"].as_array().unwrap().is_empty(),
+            "neighbors must find g2: {flat}"
+        );
+    }
+
+    // A3.2: graphSchema lowers to the same schema_payload the flat tool uses, so the
+    // two are byte-identical (faithful wrap, no reimplementation).
+    #[test]
+    fn graphql_graph_schema_matches_flat_tool() {
+        let (provider, config) = fixture();
+        let gql = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ graphSchema }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&gql);
+        let flat = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_graph_schema",
+            json!({ "tenant": "smoke" }),
+        );
+        assert_eq!(
+            gql["data"]["graphSchema"], flat,
+            "GraphQL graphSchema must match the flat tool exactly"
+        );
+    }
+
+    // A3.3: designateVector + bulkNodes (with vectors), then vectorSearch returns the
+    // same ranked node ids as the flat rustyred_thg_vector_search tool.
+    #[test]
+    fn graphql_vector_search_matches_flat_tool() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let designated = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation{ designateVector(label:\"Doc\", property:\"vec\", dimension:3) }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&designated);
+
+        let nodes = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($n:JSON!){ bulkNodes(nodes:$n){ inserted } }",
+            json!({ "n": [
+                { "id": "v1", "labels": ["Doc"], "properties": { "vec": [1.0, 0.0, 0.0] } },
+                { "id": "v2", "labels": ["Doc"], "properties": { "vec": [0.0, 1.0, 0.0] } }
+            ]}),
+        );
+        assert_no_graphql_errors(&nodes);
+        assert_eq!(
+            nodes["data"]["bulkNodes"]["inserted"], 2,
+            "bulkNodes: {nodes}"
+        );
+
+        let gql = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($q:[Float!]!){ vectorSearch(property:\"vec\", query:$q, label:\"Doc\", k:2){ nodeId score } }",
+            json!({ "q": [1.0, 0.0, 0.0] }),
+        );
+        assert_no_graphql_errors(&gql);
+        let gql_ids: Vec<&str> = gql["data"]["vectorSearch"]
+            .as_array()
+            .expect("vectorSearch should resolve to a list")
+            .iter()
+            .filter_map(|hit| hit["nodeId"].as_str())
+            .collect();
+
+        let flat = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_vector_search",
+            json!({ "tenant": "smoke", "property": "vec", "query": [1.0, 0.0, 0.0], "label": "Doc", "k": 2 }),
+        );
+        let flat_ids: Vec<&str> = flat["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hit| hit["node_id"].as_str())
+            .collect();
+
+        assert_eq!(
+            gql_ids, flat_ids,
+            "vectorSearch ids must match the flat tool: gql={gql} flat={flat}"
+        );
+        assert!(
+            gql_ids.contains(&"v1"),
+            "vectorSearch must rank v1 for query [1,0,0]: {gql}"
+        );
+    }
+
+    // A3.4: the symbolic deriveFacts field lowers to the same datalog payload as the
+    // flat tool; the receipts are byte-identical.
+    #[test]
+    fn graphql_symbolic_derive_facts_matches_flat_tool() {
+        let (provider, config) = fixture();
+        let facts = json!({
+            "facts": [
+                {"relation": "claim", "entity_id": "claim-1", "attributes": {"status": "proposed"}, "fact_id": "f1"},
+                {"relation": "object", "entity_id": "obj-1", "attributes": {"title": "Same"}, "fact_id": "f2"},
+                {"relation": "object", "entity_id": "obj-2", "attributes": {"title": "same"}, "fact_id": "f3"}
+            ]
+        });
+        let gql = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($i:JSON!){ deriveFacts(input:$i) }",
+            json!({ "i": facts.clone() }),
+        );
+        assert_no_graphql_errors(&gql);
+        let mut flat_args = facts;
+        flat_args["tenant"] = json!("smoke");
+        let flat = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_symbolic_datalog_derive",
+            flat_args,
+        );
+        assert_eq!(
+            gql["data"]["deriveFacts"], flat,
+            "GraphQL deriveFacts must match the flat tool receipt"
+        );
+        assert_eq!(gql["data"]["deriveFacts"]["derived_count"], 3, "{gql}");
+    }
+
+    // A3.5: the introspected SDL exposes the full Graph domain (reads, searches,
+    // symbolic, designate and bulk mutations) as one typed surface, still with no
+    // tenant argument anywhere.
+    #[test]
+    fn graphql_introspect_exposes_full_graph_domain() {
+        let (provider, config) = fixture();
+        let sdl = call_tool_json(
+            &provider,
+            &config,
+            "graphql_introspect",
+            json!({ "tenant": "smoke" }),
+        );
+        let sdl = sdl
+            .as_str()
+            .expect("introspect should return an SDL string");
+        for fragment in [
+            "graphNode",
+            "neighbors",
+            "graphSchema",
+            "vectorSearch",
+            "vectorHybrid",
+            "fulltextSearch",
+            "spatialRadius",
+            "spatialBbox",
+            "deriveFacts",
+            "sourceReliability",
+            "expectedValue",
+            "designateVector",
+            "designateSpatial",
+            "designateFulltext",
+            "bulkNodes",
+            "bulkEdges",
+            "type SearchHit",
+            "type BulkResult",
+        ] {
+            assert!(
+                sdl.contains(fragment),
+                "SDL missing graph-domain {fragment}:\n{sdl}"
+            );
+        }
+        assert!(
+            !sdl.to_lowercase().contains("tenant"),
+            "no GraphQL field may carry a tenant argument:\n{sdl}"
+        );
+    }
+
+    // A2.1: the coordination room GraphQL query returns messages, intents, and
+    // records in one response, backed by the native coordination payloads.
+    #[test]
+    fn graphql_coordination_room_returns_messages_intents_records() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+        let room = "repo:theorem:branch:gql-a2-room";
+
+        let writes = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($room:String!, $meta:JSON!, $payload:JSON!){ \
+                writeCoordinationIntent(roomId:$room, actor:\"codex\", summary:\"Wire A2 GraphQL\", footprint:[\"rustyred-thg-mcp/src/graphql/coordination.rs\"]) \
+                writeCoordinationRecord(roomId:$room, actor:\"codex\", recordType:\"decision\", summary:\"Expose coordination through GraphQL\", metadata:$meta) \
+                publishCoordinationEvent(stream:$room, actor:\"codex\", kind:\"needs-review\", payload:$payload, urgency:\"ask\", targetActor:\"claude-code\"){ ok stream eventId orderingToken pinged } \
+            }",
+            json!({
+                "room": room,
+                "meta": { "spec": "SPEC-GRAPHQL-MCP" },
+                "payload": { "summary": "Please review A2 GraphQL" }
+            }),
+        );
+        assert_no_graphql_errors(&writes);
+        assert_eq!(
+            writes["data"]["publishCoordinationEvent"]["stream"],
+            json!(room),
+            "publishCoordinationEvent must target the room stream: {writes}"
+        );
+        assert_eq!(
+            writes["data"]["publishCoordinationEvent"]["pinged"],
+            json!(true),
+            "ask event with targetActor must bridge to the mention path: {writes}"
+        );
+
+        let room_view = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($room:String!){ coordinationRoom(roomId:$room, actor:\"claude-code\", recordTypes:[\"decision\"]){ roomId counts intents messages records pendingMentions } }",
+            json!({ "room": room }),
+        );
+        assert_no_graphql_errors(&room_view);
+        let view = &room_view["data"]["coordinationRoom"];
+        assert_eq!(view["roomId"], json!(room));
+        assert_eq!(view["counts"]["intents"], json!(1), "{room_view}");
+        assert_eq!(view["counts"]["messages"], json!(1), "{room_view}");
+        assert_eq!(view["counts"]["records"], json!(1), "{room_view}");
+        assert_eq!(view["counts"]["pending_mentions"], json!(1), "{room_view}");
+        assert_eq!(view["intents"][0]["summary"], json!("Wire A2 GraphQL"));
+        assert_eq!(
+            view["records"][0]["summary"],
+            json!("Expose coordination through GraphQL")
+        );
+        assert_eq!(
+            view["messages"][0]["metadata"]["stream_event_id"],
+            writes["data"]["publishCoordinationEvent"]["eventId"]
+        );
+    }
+
+    // A2.2: a stream event published through GraphQL is read by another actor
+    // through the same stream seam, and the mutation read advances its cursor.
+    #[test]
+    fn graphql_coordination_stream_publish_read_round_trip() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+        let stream = "repo:theorem:branch:gql-a2-stream";
+
+        let published = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($stream:String!, $payload:JSON!){ publishCoordinationEvent(stream:$stream, actor:\"codex\", kind:\"checkpoint\", payload:$payload, urgency:\"info\"){ ok stream eventId orderingToken } }",
+            json!({
+                "stream": stream,
+                "payload": { "result": "ready" }
+            }),
+        );
+        assert_no_graphql_errors(&published);
+        assert_eq!(
+            published["data"]["publishCoordinationEvent"]["orderingToken"],
+            json!(1),
+            "{published}"
+        );
+
+        let peek = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($stream:String!){ coordinationStream(actor:\"claude-code\", stream:$stream, limit:10){ count advanced events } }",
+            json!({ "stream": stream }),
+        );
+        assert_no_graphql_errors(&peek);
+        assert_eq!(
+            peek["data"]["coordinationStream"]["count"],
+            json!(1),
+            "{peek}"
+        );
+        assert_eq!(
+            peek["data"]["coordinationStream"]["advanced"],
+            json!(false),
+            "query read must not advance cursor: {peek}"
+        );
+        assert_eq!(
+            peek["data"]["coordinationStream"]["events"][0]["kind"],
+            json!("checkpoint")
+        );
+
+        let advanced = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($stream:String!){ advanceCoordinationStream(actor:\"claude-code\", stream:$stream, limit:10){ count advanced newCursors } }",
+            json!({ "stream": stream }),
+        );
+        assert_no_graphql_errors(&advanced);
+        assert_eq!(
+            advanced["data"]["advanceCoordinationStream"]["count"],
+            json!(1),
+            "{advanced}"
+        );
+        assert_eq!(
+            advanced["data"]["advanceCoordinationStream"]["advanced"],
+            json!(true),
+            "{advanced}"
+        );
+        assert_eq!(
+            advanced["data"]["advanceCoordinationStream"]["newCursors"][stream],
+            json!(1),
+            "{advanced}"
+        );
+
+        let empty = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($stream:String!){ advanceCoordinationStream(actor:\"claude-code\", stream:$stream, limit:10){ count advanced } }",
+            json!({ "stream": stream }),
+        );
+        assert_no_graphql_errors(&empty);
+        assert_eq!(
+            empty["data"]["advanceCoordinationStream"]["count"],
+            json!(0),
+            "advanced cursor should prevent duplicate delivery: {empty}"
+        );
+    }
+
+    // A2.3: WorkGraph and TaskNode have typed GraphQL entry points over the
+    // native multi-head task payloads.
+    #[test]
+    fn graphql_coordination_work_graph_exposes_task_nodes() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+        let run_id = "run:gql-a2";
+
+        let created = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($run:String!){ createTaskNode(runId:$run, nodeId:\"task:a\", goal:\"Implement GraphQL A2\", kind:\"implementation\", actor:\"codex\"){ ok reused task } }",
+            json!({ "run": run_id }),
+        );
+        assert_no_graphql_errors(&created);
+        assert_eq!(
+            created["data"]["createTaskNode"]["ok"],
+            json!(true),
+            "{created}"
+        );
+        assert_eq!(
+            created["data"]["createTaskNode"]["task"]["id"],
+            json!("task:a")
+        );
+
+        let graph = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($run:String!){ workGraph(runId:$run){ ok graph tasks } nextTaskNode(runId:$run, head:\"codex\") }",
+            json!({ "run": run_id }),
+        );
+        assert_no_graphql_errors(&graph);
+        assert_eq!(graph["data"]["workGraph"]["ok"], json!(true), "{graph}");
+        assert_eq!(
+            graph["data"]["workGraph"]["tasks"][0]["id"],
+            json!("task:a")
+        );
+        assert_eq!(
+            graph["data"]["nextTaskNode"]["next_node_id"],
+            json!("task:a"),
+            "{graph}"
+        );
+    }
+
+    // ---- A4: Epistemic domain GraphQL surface acceptance (each field == its flat tool) ----
+
+    // A4.1 (the acceptance): on a populated shadow graph, epistemicNeighbors over
+    // GraphQL returns the shadow nodes the flat rustyred_thg_epistemic_neighbors
+    // call returns; shadowPpr and compileSubgraph also match their flat tools.
+    #[test]
+    fn graphql_epistemic_domain_matches_flat_tools() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        // Seed the shadow graph: node:a/node:b are fixture-seeded content nodes;
+        // enrich writes two shadows plus a Supports shadow edge.
+        let applied = call_tool_json(
+            &provider,
+            &config,
+            "epistemic_enrich_apply",
+            json!({
+                "engine_version": "a4-test-v1",
+                "annotations": {
+                    "annotations": [
+                        { "content_node_id": "node:a", "grounded_extension_status": "in",
+                          "predicted_edges": [{ "target_content_id": "node:b", "relation": "supports", "confidence": 0.8, "quarantine": true }] },
+                        { "content_node_id": "node:b", "grounded_extension_status": "out" }
+                    ],
+                    "support_relations": [{ "from_content_id": "node:a", "to_content_id": "node:b", "kind": "supports", "confidence": 0.9, "evidence": "a4 fixture" }],
+                    "attack_relations": []
+                }
+            }),
+        );
+        assert_eq!(
+            applied["shadows_written"].as_u64(),
+            Some(2),
+            "enrich should write shadows: {applied}"
+        );
+
+        // The A4 acceptance: epistemicNeighbors over GraphQL == the flat tool's shadow nodes.
+        let neighbors = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ epistemicNeighbors(nodeId:\"node:a\") }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&neighbors);
+        let flat_neighbors = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_epistemic_neighbors",
+            json!({ "tenant": "smoke", "node_id": "node:a" }),
+        );
+        assert_eq!(
+            neighbors["data"]["epistemicNeighbors"]["results"], flat_neighbors["results"],
+            "epistemicNeighbors must return the shadow nodes the flat tool returns: gql={neighbors} flat={flat_neighbors}"
+        );
+
+        // shadowPpr parity over the populated shadow layer.
+        let ppr = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($s:JSON!){ shadowPpr(seeds:$s, topK:4) }",
+            json!({ "s": { "node:a": 1.0 } }),
+        );
+        assert_no_graphql_errors(&ppr);
+        let flat_ppr = call_tool_json(
+            &provider,
+            &config,
+            "epistemic_shadow_ppr",
+            json!({ "tenant": "smoke", "seeds": { "node:a": 1.0 }, "top_k": 4 }),
+        );
+        assert_eq!(
+            ppr["data"]["shadowPpr"]["scores"], flat_ppr["scores"],
+            "shadowPpr must match the flat tool: gql={ppr} flat={flat_ppr}"
+        );
+
+        // compileSubgraph parity (guaranteed-equal: both lower to compile_user_subgraph).
+        let compiled = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($c:[String!]!){ compileSubgraph(contentIds:$c) }",
+            json!({ "c": ["node:a", "node:b"] }),
+        );
+        assert_no_graphql_errors(&compiled);
+        let flat_compiled = call_tool_json(
+            &provider,
+            &config,
+            "epistemic_compile_subgraph",
+            json!({ "tenant": "smoke", "content_ids": ["node:a", "node:b"] }),
+        );
+        assert_eq!(
+            compiled["data"]["compileSubgraph"], flat_compiled,
+            "compileSubgraph must match the flat tool"
+        );
+    }
+
+    // A4.2: the introspected SDL exposes the epistemic domain as one typed surface,
+    // still with no tenant argument.
+    #[test]
+    fn graphql_introspect_exposes_epistemic_domain() {
+        let (provider, config) = fixture();
+        let sdl = call_tool_json(
+            &provider,
+            &config,
+            "graphql_introspect",
+            json!({ "tenant": "smoke" }),
+        );
+        let sdl = sdl
+            .as_str()
+            .expect("introspect should return an SDL string");
+        for fragment in [
+            "epistemicNeighbors",
+            "epistemicFrontier",
+            "compileSubgraph",
+            "shadowPpr",
+            "enrichApply",
+        ] {
+            assert!(
+                sdl.contains(fragment),
+                "SDL missing epistemic-domain {fragment}:\n{sdl}"
+            );
+        }
+        assert!(
+            !sdl.to_lowercase().contains("tenant"),
+            "no GraphQL field may carry a tenant argument:\n{sdl}"
+        );
+    }
+
+    // ---- A5: Code domain GraphQL surface acceptance (each field == its compute_code op) ----
+
+    // A5.1 (the acceptance): codeSearch over GraphQL routes to the same compute_code
+    // `search` operation as the flat tool (same operation + affordance route).
+    #[test]
+    fn graphql_code_search_matches_flat_tool() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let gql = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ codeSearch(query:\"beta\", repo:\"demo-repo\", limit:5) }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&gql);
+        let flat = call_tool_json(
+            &provider,
+            &config,
+            "compute_code",
+            json!({ "tenant": "smoke", "operation": "search", "query": "beta", "repo": "demo-repo", "limit": 5 }),
+        );
+        // The typed field lowers to the same compute_code operation + affordance route.
+        assert_eq!(
+            gql["data"]["codeSearch"]["operation"], flat["operation"],
+            "codeSearch must run the same operation as compute_code: gql={gql} flat={flat}"
+        );
+        assert_eq!(
+            gql["data"]["codeSearch"]["affordance_id"], flat["affordance_id"],
+            "codeSearch must route to the same code affordance as compute_code"
+        );
+        assert_eq!(
+            gql["data"]["codeSearch"]["operation"],
+            json!("search"),
+            "{gql}"
+        );
+    }
+
+    // A5.2: the introspected SDL exposes the code domain (reads + ingest/reindex
+    // mutations) as one typed surface, still with no tenant argument.
+    #[test]
+    fn graphql_introspect_exposes_code_domain() {
+        let (provider, config) = fixture();
+        let sdl = call_tool_json(
+            &provider,
+            &config,
+            "graphql_introspect",
+            json!({ "tenant": "smoke" }),
+        );
+        let sdl = sdl
+            .as_str()
+            .expect("introspect should return an SDL string");
+        for fragment in [
+            "codeSearch",
+            "codeContext",
+            "codeExplore",
+            "codeExplain",
+            "codeRecognize",
+            "listRepos",
+            "ingestCodebase",
+            "reindexCodebase",
+        ] {
+            assert!(
+                sdl.contains(fragment),
+                "SDL missing code-domain {fragment}:\n{sdl}"
+            );
+        }
+        assert!(
+            !sdl.to_lowercase().contains("tenant"),
+            "no GraphQL field may carry a tenant argument:\n{sdl}"
+        );
+    }
+
+    // ---- A5-kg: harness instant-KG GraphQL surface acceptance (each field == its flat tool) ----
+
+    // A5-kg.1 (acceptance): harnessKgImpact + harnessKgStatus over GraphQL return what
+    // the flat harness_kg_* tools return, on the fixture's seeded instant KG.
+    #[test]
+    fn graphql_harness_kg_matches_flat_tools() {
+        let (provider, config) = fixture();
+
+        let gql = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ harnessKgImpact(symbolName:\"Ada\", direction:\"out\", maxDepth:1) }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&gql);
+        let flat = call_tool_json(
+            &provider,
+            &config,
+            "harness_kg_impact",
+            json!({ "tenant": "smoke", "symbol_name": "Ada", "direction": "out", "max_depth": 1 }),
+        );
+        // The typed field lowers to the same instant_kg payload: seed resolution + impact rows match.
+        assert_eq!(
+            gql["data"]["harnessKgImpact"]["seed"], flat["seed"],
+            "harnessKgImpact seed must match the flat tool: gql={gql} flat={flat}"
+        );
+        assert_eq!(
+            gql["data"]["harnessKgImpact"]["results"], flat["results"],
+            "harnessKgImpact results must match the flat tool"
+        );
+        assert_eq!(
+            gql["data"]["harnessKgImpact"]["seed"],
+            json!("node:a"),
+            "Ada should resolve to node:a: {gql}"
+        );
+
+        // harnessKgStatus also routes through the same payload and answers without error.
+        let status = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ harnessKgStatus }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&status);
+        assert!(
+            !status["data"]["harnessKgStatus"].is_null(),
+            "harnessKgStatus must return a status payload: {status}"
+        );
+    }
+
+    // A5-kg.2: SDL exposes the harness-KG domain, no tenant arg.
+    #[test]
+    fn graphql_introspect_exposes_harness_kg_domain() {
+        let (provider, config) = fixture();
+        let sdl = call_tool_json(
+            &provider,
+            &config,
+            "graphql_introspect",
+            json!({ "tenant": "smoke" }),
+        );
+        let sdl = sdl
+            .as_str()
+            .expect("introspect should return an SDL string");
+        for fragment in [
+            "harnessKgStatus",
+            "harnessKgSearch",
+            "harnessKgPpr",
+            "harnessKgImpact",
+            "harnessKgRelatedObjects",
+            "harnessKgExplainEdge",
+        ] {
+            assert!(
+                sdl.contains(fragment),
+                "SDL missing harness-kg {fragment}:\n{sdl}"
+            );
+        }
+        assert!(
+            !sdl.to_lowercase().contains("tenant"),
+            "no GraphQL field may carry a tenant argument:\n{sdl}"
+        );
+    }
+
+    // ---- A6: remaining-cluster GraphQL surface acceptance (each cluster == its flat tool) ----
+
+    // A6.1: a representative read per in-crate cluster (skills / harness-run / jobs)
+    // matches its flat tool, and the jobSubmit mutation round-trips into jobList.
+    #[test]
+    fn graphql_clusters_match_flat_tools() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let gql_skills = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ skillList }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&gql_skills);
+        let flat_skills = call_tool_json(
+            &provider,
+            &config,
+            "skill_list",
+            json!({ "tenant": "smoke" }),
+        );
+        assert_eq!(
+            gql_skills["data"]["skillList"], flat_skills,
+            "skillList must match flat skill_list"
+        );
+
+        let gql_run = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ harnessRun(runId:\"missing\") }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&gql_run);
+        let flat_run = call_tool_json(
+            &provider,
+            &config,
+            "harness_run",
+            json!({ "tenant": "smoke", "run_id": "missing" }),
+        );
+        assert_eq!(
+            gql_run["data"]["harnessRun"], flat_run,
+            "harnessRun must match flat harness_run"
+        );
+
+        // jobs: the dispatch board is RedCore-backed; the in-memory fixture does not
+        // implement the job_* trait methods, so the GraphQL field routes to the same
+        // backend.job_list the flat tool uses (proven by the identical backend gate).
+        // Runtime job round-trips are exercised against RedCore in the job_* shaping tests.
+        let gql_jobs = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ jobList }",
+            Value::Null,
+        );
+        assert!(
+            gql_jobs["data"].is_null()
+                && !gql_jobs["errors"]
+                    .as_array()
+                    .map(|e| e.is_empty())
+                    .unwrap_or(true),
+            "jobList must route to the backend (not silently return empty): {gql_jobs}"
+        );
+        let gql_jobs_err = gql_jobs["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            gql_jobs_err.contains("job_list is not supported"),
+            "jobList must route to backend.job_list, the same method the flat tool uses: {gql_jobs}"
+        );
+    }
+
+    // A6.2: the ensemble cluster round-trips through GraphQL -- register a pack then
+    // select it back, proving both the ensemble mutation and query lower correctly.
+    #[test]
+    fn graphql_ensemble_register_select_round_trips() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let registered = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($i:JSON!){ ensembleRegister(input:$i) }",
+            json!({ "i": { "pack": sample_capability_pack(), "source_content_hash": "hash-source", "artifact_hashes": ["hash-artifact"] } }),
+        );
+        assert_no_graphql_errors(&registered);
+        let pack_hash = registered["data"]["ensembleRegister"]["pack"]["pack_content_hash"]
+            .as_str()
+            .expect("registered pack hash")
+            .to_string();
+        assert!(
+            !pack_hash.is_empty(),
+            "ensembleRegister must return a pack hash: {registered}"
+        );
+
+        let selected = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($i:JSON!){ ensembleSelect(input:$i) }",
+            json!({ "i": { "task": "use rust graph store mcp code search", "kind": "skill_pack", "max_selected": 1 } }),
+        );
+        assert_no_graphql_errors(&selected);
+        assert_eq!(
+            selected["data"]["ensembleSelect"]["decision"]["selected"][0]["pack_content_hash"],
+            json!(pack_hash),
+            "ensembleSelect must select the registered pack: {selected}"
+        );
+    }
+
+    // A6.3: SDL exposes the cluster domains (reads + mutations), no tenant arg.
+    #[test]
+    fn graphql_introspect_exposes_cluster_domains() {
+        let (provider, config) = fixture();
+        let sdl = call_tool_json(
+            &provider,
+            &config,
+            "graphql_introspect",
+            json!({ "tenant": "smoke" }),
+        );
+        let sdl = sdl
+            .as_str()
+            .expect("introspect should return an SDL string");
+        for fragment in [
+            "harnessRun",
+            "skillList",
+            "skillGet",
+            "ensembleSelect",
+            "jobList",
+            "skillPublish",
+            "skillApply",
+            "ensembleRegister",
+            "jobSubmit",
+            "jobNote",
+            "jobArchive",
+        ] {
+            assert!(
+                sdl.contains(fragment),
+                "SDL missing cluster {fragment}:\n{sdl}"
+            );
+        }
+        assert!(
+            !sdl.to_lowercase().contains("tenant"),
+            "no GraphQL field may carry a tenant argument:\n{sdl}"
+        );
+    }
+
+    // ---- A7: GraphQL-default-surface cutover acceptance ----
+
+    fn tool_names(provider: &FixtureProvider, config: &McpServerConfig) -> Vec<String> {
+        let listed = handle_mcp_request(
+            provider,
+            config,
+            json!({ "jsonrpc": "2.0", "id": "list", "method": "tools/list" }),
+        );
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    // A7.1: graphql_default_surface hides the GraphQL-covered flat tools from
+    // tools/list while keeping the graphql_* transport tools and every uncovered
+    // tool; default-off leaves the flat surface unchanged.
+    #[test]
+    fn graphql_default_surface_hides_covered_flat_tools() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        // Default mode (flag off): the flat surface is unchanged -- covered tools present.
+        let default_names = tool_names(&provider, &config);
+        assert!(
+            default_names.iter().any(|n| n == "recall"),
+            "default mode keeps flat recall"
+        );
+        assert!(
+            default_names
+                .iter()
+                .any(|n| n == "rustyred_thg_graph_neighbors"),
+            "default keeps flat neighbors"
+        );
+        assert!(
+            default_names.iter().any(|n| n == "graphql_query"),
+            "graphql_query always listed"
+        );
+
+        // Every name in the covered set must be a real advertised tool (no dead names).
+        for covered in super::GRAPHQL_COVERED_FLAT_TOOLS {
+            assert!(
+                default_names.iter().any(|n| n == covered),
+                "covered list names a tool not advertised in default mode: {covered}"
+            );
+        }
+
+        // Cutover mode (flag on): covered flat tools vanish; graphql_* + uncovered stay.
+        config.graphql_default_surface = true;
+        let cut_names = tool_names(&provider, &config);
+        for hidden in [
+            "recall",
+            "rustyred_thg_graph_neighbors",
+            "rustyred_thg_algorithm_ppr",
+            "compute_code",
+            "job_list",
+            "harness_kg_search",
+        ] {
+            assert!(
+                !cut_names.iter().any(|n| n == hidden),
+                "cutover must hide covered flat tool {hidden}"
+            );
+        }
+        for kept in ["graphql_query", "graphql_introspect", "graphql_mutate"] {
+            assert!(
+                cut_names.iter().any(|n| n == kept),
+                "cutover must keep {kept}"
+            );
+        }
+        // An uncovered tool stays advertised (raw graph_query has no GraphQL field).
+        assert!(
+            cut_names.iter().any(|n| n == "rustyred_thg_graph_query"),
+            "cutover must keep an uncovered tool: {cut_names:?}"
+        );
+    }
+
+    // A7.2: in cutover mode an agent completes a full task through GraphQL alone --
+    // the covered flat tools are gone, but graphql_mutate + graphql_query carry it.
+    #[test]
+    fn graphql_default_surface_completes_task_through_graphql_alone() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.graphql_default_surface = true;
+        config.tool_result_budget_bytes = 0;
+
+        // The flat remember tool is hidden in this mode (GraphQL is the path).
+        assert!(
+            !tool_names(&provider, &config)
+                .iter()
+                .any(|n| n == "remember"),
+            "cutover hides flat remember"
+        );
+
+        // Write via graphql_mutate.
+        let remembered = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($i:MemoryInput!){ rememberMemory(input:$i){ id content } }",
+            json!({ "i": { "kind": "insight", "content": "graphql-only task atom" } }),
+        );
+        assert_no_graphql_errors(&remembered);
+        assert!(
+            remembered["data"]["rememberMemory"]["id"]
+                .as_str()
+                .is_some(),
+            "remember via graphql_mutate: {remembered}"
+        );
+
+        // Read it back via graphql_query.
+        let recalled = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query($q:String!){ memory(query:$q, limit:10){ id content } }",
+            json!({ "q": "graphql-only" }),
+        );
+        assert_no_graphql_errors(&recalled);
+        assert!(
+            recalled["data"]["memory"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "recall via graphql_query must find the written atom: {recalled}"
+        );
+
+        // Run a graph algorithm via graphql_query.
+        let pagerank = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ graphAlgorithm(kind: PAGERANK){ result } }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&pagerank);
+        assert!(
+            !pagerank["data"]["graphAlgorithm"]["result"].is_null(),
+            "graphAlgorithm via graphql_query: {pagerank}"
+        );
+    }
+
+    // ---- E0.1 (embedded mode): SharedStore in-process surface over a durable store ----
+
+    // E0.1 seam: SharedStore<S> turns one owned store into a cheap, in-process
+    // McpGraphProvider, so the full GraphQL surface runs over a RedCoreGraphStore
+    // with no socket and no async runtime -- the embedded-mode path. Drives
+    // graphql_mutate (bulkNodes/bulkEdges) then graphql_query (neighbors) entirely
+    // in-process through handle_mcp_request.
+    #[test]
+    fn embedded_shared_store_runs_graphql_in_process_over_redcore() {
+        let provider = super::SharedStore::new(RedCoreGraphStore::memory());
+        let config = McpServerConfig {
+            default_tenant: "embedded".to_string(),
+            read_only: false,
+            tool_result_budget_bytes: 0,
+            ..McpServerConfig::default()
+        };
+
+        let mutate = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0", "id": "m", "method": "tools/call",
+                "params": { "name": "graphql_mutate", "arguments": {
+                    "tenant": "embedded",
+                    "query": "mutation($n:JSON!){ bulkNodes(nodes:$n){ inserted } }",
+                    "variables": { "n": [
+                        { "id": "e1", "labels": ["Doc"], "properties": {} },
+                        { "id": "e2", "labels": ["Doc"], "properties": {} }
+                    ] }
+                } }
+            }),
+        );
+        assert_eq!(
+            mutate["result"]["structuredContent"]["data"]["bulkNodes"]["inserted"],
+            json!(2),
+            "embedded bulkNodes via graphql_mutate over RedCore: {mutate}"
+        );
+
+        let _edge = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0", "id": "e", "method": "tools/call",
+                "params": { "name": "graphql_mutate", "arguments": {
+                    "tenant": "embedded",
+                    "query": "mutation($e:JSON!){ bulkEdges(edges:$e){ inserted } }",
+                    "variables": { "e": [ { "id": "e1->e2", "from_id": "e1", "to_id": "e2", "type": "LINKS" } ] }
+                } }
+            }),
+        );
+
+        let query = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0", "id": "q", "method": "tools/call",
+                "params": { "name": "graphql_query", "arguments": {
+                    "tenant": "embedded",
+                    "query": "query{ neighbors(nodeId:\"e1\", direction:\"out\") }"
+                } }
+            }),
+        );
+        let neighbors = &query["result"]["structuredContent"]["data"]["neighbors"]["neighbors"];
+        assert!(
+            neighbors.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "embedded neighbors via graphql_query must find e2 in-process: {query}"
+        );
+    }
+
     #[test]
     fn spawn_session_writes_room_visible_coordination_record() {
         let (provider, mut config) = fixture();
@@ -13978,9 +16935,11 @@ mod tests {
     #[test]
     fn composed_agent_run_round_trips_through_mcp_with_fake_heads() {
         let provider = FixtureProvider(Rc::new(RefCell::new(InMemoryGraphStore::new())));
-        let mut config = McpServerConfig::default();
-        config.read_only = false;
-        config.tool_result_budget_bytes = 0;
+        let config = McpServerConfig {
+            read_only: false,
+            tool_result_budget_bytes: 0,
+            ..McpServerConfig::default()
+        };
 
         let result = call_tool_json(
             &provider,

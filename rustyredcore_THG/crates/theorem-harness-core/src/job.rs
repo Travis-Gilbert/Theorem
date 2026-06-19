@@ -101,7 +101,7 @@ impl JobSubmission {
                 self.spec_inline
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
-                    .map(|value| inline_spec_identity(value))
+                    .map(inline_spec_identity)
             })
     }
 }
@@ -237,9 +237,7 @@ impl Job {
     }
 
     pub fn spec_text_or_ref(&self) -> Option<&str> {
-        self.spec_inline
-            .as_deref()
-            .or_else(|| self.spec_ref.as_deref())
+        self.spec_inline.as_deref().or(self.spec_ref.as_deref())
     }
 }
 
