@@ -41,6 +41,8 @@ members = [
     "crates/prose-check",
     "crates/design-check",
     "crates/pilot-core",
+    "crates/commonplace",
+    "crates/theorem-copresence",
 ]
 resolver = "2"
 

@@ -246,7 +246,7 @@ fn first_pr_url(job: &JobView) -> Option<String> {
 /// Pull an `https://github.com/<owner>/<repo>/pull/<n>` URL out of free text.
 pub fn extract_pr_url(text: &str) -> Option<String> {
     text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '(' || c == ')')
-        .map(|token| token.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '>' | ']')))
+        .map(|token| token.trim_end_matches(['.', ',', ';', '>', ']']))
         .find(|token| {
             token.contains("github.com")
                 && token.contains("/pull/")

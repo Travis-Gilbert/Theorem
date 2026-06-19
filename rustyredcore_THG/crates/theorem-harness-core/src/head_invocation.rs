@@ -102,6 +102,7 @@ impl HeadInvocationRequest {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_context(
         head: ResolvedAgentHead,
         kind: HeadInvocationKind,

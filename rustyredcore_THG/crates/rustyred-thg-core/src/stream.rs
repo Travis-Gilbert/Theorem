@@ -30,6 +30,7 @@
 //! coordination/MCP layer passes a tenant it already canonicalized through the
 //! consolidation normalizer before calling in.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use imbl::{OrdMap, OrdSet, Vector};
@@ -84,6 +85,11 @@ impl StreamUrgency {
         matches!(self, Self::Ask | Self::Block)
     }
 
+    /// Alias used by the lower-level stream log API.
+    pub fn pings(self) -> bool {
+        self.is_ping()
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Info => "info",
@@ -105,7 +111,40 @@ pub struct StreamEvent {
     pub urgency: StreamUrgency,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_actor: Option<String>,
-    pub created_at: u64,
+    pub created_at: String,
+}
+
+impl StreamEvent {
+    /// A builder-light constructor. `ordering_token` is assigned by
+    /// [`StreamLog::append`]; callers pass `0` and read the returned token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: impl Into<String>,
+        stream_key: impl Into<String>,
+        actor: impl Into<String>,
+        kind: impl Into<String>,
+        payload: Value,
+        urgency: StreamUrgency,
+        target_actor: Option<String>,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            stream_key: stream_key.into(),
+            ordering_token: 0,
+            actor: actor.into(),
+            kind: kind.into(),
+            payload,
+            urgency,
+            target_actor: target_actor.filter(|value| !value.trim().is_empty()),
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Whether this event is an intentional ping (`ask`/`block` with a target).
+    pub fn is_ping(&self) -> bool {
+        self.urgency.is_ping() && self.target_actor.is_some()
+    }
 }
 
 /// A scope-resolution / validation failure. Carries a stable machine code that
@@ -149,7 +188,7 @@ pub struct StreamStore {
 
 impl StreamStore {
     fn next_token(&mut self) -> u64 {
-        self.seq += 1;
+        self.seq = self.seq.saturating_add(1);
         self.seq
     }
 
@@ -276,7 +315,7 @@ impl StreamStore {
             payload,
             urgency,
             target_actor: target_actor.clone(),
-            created_at: unix_ms() as u64,
+            created_at: format!("unix_ms:{}", unix_ms()),
         };
 
         // Append to the per-stream log (copy-on-write clone of the inner OrdMap).
@@ -524,6 +563,219 @@ impl StreamStore {
     }
 }
 
+/// The `(tenant, topic)` scope of a stream. `topic` is the room, optionally finer
+/// grained (per-task, per-actor). The [`canonical`](StreamKey::canonical) string
+/// is the opaque key used to address a [`StreamLog`] in a [`StreamRegistry`] and
+/// to key durable storage.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StreamKey {
+    pub tenant: String,
+    pub topic: String,
+}
+
+impl StreamKey {
+    pub fn new(tenant: impl Into<String>, topic: impl Into<String>) -> Self {
+        Self {
+            tenant: tenant.into(),
+            topic: topic.into(),
+        }
+    }
+
+    /// The opaque canonical key. Uses a unit-separator join so a tenant or topic
+    /// containing a literal separator can never forge a different scope.
+    pub fn canonical(&self) -> String {
+        format!("{}\u{1}{}", self.tenant, self.topic)
+    }
+}
+
+/// A single append-only stream: events keyed by a strictly-increasing ordering
+/// token. The append-only specialization of [`OrderedIndex`](crate::ordered::OrderedIndex).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StreamLog {
+    by_token: OrdMap<u64, StreamEvent>,
+    next_token: u64,
+}
+
+impl StreamLog {
+    pub fn new() -> Self {
+        Self {
+            by_token: OrdMap::new(),
+            next_token: 1,
+        }
+    }
+
+    /// Append an event, assigning it the next ordering token (always `>` every
+    /// token already in the log). Returns the assigned token. The event's
+    /// `ordering_token` field is overwritten with the assignment.
+    pub fn append(&mut self, mut event: StreamEvent) -> u64 {
+        let token = self.next_token.max(1);
+        event.ordering_token = token;
+        self.by_token.insert(token, event);
+        self.next_token = token.saturating_add(1);
+        token
+    }
+
+    /// Re-insert an event at its own recorded token (durable rehydration). Does
+    /// not assign a new token; keeps `next_token` ahead of every ingested token
+    /// so a later [`append`](Self::append) stays monotonic.
+    pub fn ingest(&mut self, event: StreamEvent) {
+        let token = event.ordering_token;
+        self.next_token = self.next_token.max(token.saturating_add(1));
+        self.by_token.insert(token, event);
+    }
+
+    /// Events strictly after `cursor`, in ascending token order, up to `limit`
+    /// (`0` = uncapped). Early-stopping range over `(cursor, ..]`: O(result +
+    /// log n), never an O(n) scan, and nothing in the window is missed or
+    /// duplicated.
+    pub fn read_after(&self, cursor: u64, limit: usize) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        for (_token, event) in self
+            .by_token
+            .range((Bound::Excluded(cursor), Bound::Unbounded))
+        {
+            out.push(event.clone());
+            if limit != 0 && out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The highest token currently in the log, or `0` if empty.
+    pub fn latest_token(&self) -> u64 {
+        self.by_token
+            .get_max()
+            .map(|(token, _)| *token)
+            .unwrap_or(0)
+    }
+
+    /// The token the next [`append`](Self::append) will assign.
+    pub fn next_token(&self) -> u64 {
+        self.next_token.max(1)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_token.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_token.is_empty()
+    }
+}
+
+/// The delta a [`read`](StreamRegistry::read) returns for one stream: the events
+/// plus the cursor callers should persist when `advance=true`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamDelta {
+    pub stream_key: String,
+    pub events: Vec<StreamEvent>,
+    pub new_cursor: u64,
+}
+
+/// Local embedded live-tail registry: many [`StreamLog`]s plus per-`(actor,
+/// stream)` cursors and per-actor subscription sets.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StreamRegistry {
+    streams: BTreeMap<String, StreamLog>,
+    cursors: BTreeMap<(String, String), u64>,
+    subscriptions: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl StreamRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn append(&mut self, stream_key: &str, event: StreamEvent) -> u64 {
+        self.streams
+            .entry(stream_key.to_string())
+            .or_default()
+            .append(event)
+    }
+
+    pub fn cursor(&self, actor: &str, stream_key: &str) -> u64 {
+        self.cursors
+            .get(&(actor.to_string(), stream_key.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn read(
+        &mut self,
+        actor: &str,
+        stream_key: &str,
+        advance: bool,
+        limit: usize,
+    ) -> StreamDelta {
+        let cursor = self.cursor(actor, stream_key);
+        let events = self
+            .streams
+            .get(stream_key)
+            .map(|log| log.read_after(cursor, limit))
+            .unwrap_or_default();
+        let new_cursor = events
+            .last()
+            .map(|event| event.ordering_token)
+            .unwrap_or(cursor);
+        if advance && new_cursor != cursor {
+            self.cursors
+                .insert((actor.to_string(), stream_key.to_string()), new_cursor);
+        }
+        StreamDelta {
+            stream_key: stream_key.to_string(),
+            events,
+            new_cursor,
+        }
+    }
+
+    pub fn subscribe(&mut self, actor: &str, stream_key: &str) -> Vec<String> {
+        self.subscriptions
+            .entry(actor.to_string())
+            .or_default()
+            .insert(stream_key.to_string());
+        self.subscriptions(actor)
+    }
+
+    pub fn unsubscribe(&mut self, actor: &str, stream_key: &str) -> Vec<String> {
+        if let Some(set) = self.subscriptions.get_mut(actor) {
+            set.remove(stream_key);
+            if set.is_empty() {
+                self.subscriptions.remove(actor);
+            }
+        }
+        self.subscriptions(actor)
+    }
+
+    pub fn subscriptions(&self, actor: &str) -> Vec<String> {
+        self.subscriptions
+            .get(actor)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn read_subscribed(
+        &mut self,
+        actor: &str,
+        advance: bool,
+        limit: usize,
+    ) -> Vec<StreamDelta> {
+        let streams = self.subscriptions(actor);
+        streams
+            .into_iter()
+            .map(|stream_key| self.read(actor, &stream_key, advance, limit))
+            .filter(|delta| !delta.events.is_empty())
+            .collect()
+    }
+
+    pub fn latest_token(&self, stream_key: &str) -> u64 {
+        self.streams
+            .get(stream_key)
+            .map(StreamLog::latest_token)
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +787,143 @@ mod tests {
 
     fn tokens(events: &[StreamEvent]) -> Vec<u64> {
         events.iter().map(|e| e.ordering_token).collect()
+    }
+
+    fn log_event(actor: &str, kind: &str) -> StreamEvent {
+        StreamEvent::new(
+            format!("evt:{actor}:{kind}"),
+            "tenant\u{1}room:demo",
+            actor,
+            kind,
+            json!({ "k": kind }),
+            StreamUrgency::Info,
+            None,
+            "t",
+        )
+    }
+
+    #[test]
+    fn append_assigns_strictly_increasing_tokens() {
+        let mut log = StreamLog::new();
+        let a = log.append(log_event("codex", "a"));
+        let b = log.append(log_event("claude-code", "b"));
+        let c = log.append(log_event("codex", "c"));
+        assert_eq!((a, b, c), (1, 2, 3));
+        assert_eq!(log.latest_token(), 3);
+        assert_eq!(log.next_token(), 4);
+    }
+
+    #[test]
+    fn read_after_returns_exact_ordered_delta_with_no_miss_or_dup() {
+        let mut log = StreamLog::new();
+        for kind in ["a", "b", "c", "d", "e"] {
+            log.append(log_event("codex", kind));
+        }
+        assert_eq!(tokens(&log.read_after(0, 0)), vec![1, 2, 3, 4, 5]);
+        assert_eq!(tokens(&log.read_after(2, 0)), vec![3, 4, 5]);
+        assert!(log.read_after(5, 0).is_empty());
+        assert_eq!(tokens(&log.read_after(0, 2)), vec![1, 2]);
+    }
+
+    #[test]
+    fn stream_log_concurrent_publishers_get_distinct_tokens_in_one_total_order() {
+        let mut log = StreamLog::new();
+        let t_codex = log.append(log_event("codex", "x"));
+        let t_claude = log.append(log_event("claude-code", "y"));
+        assert_ne!(t_codex, t_claude);
+        let order = log
+            .read_after(0, 0)
+            .into_iter()
+            .map(|event| (event.actor, event.ordering_token))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![("codex".to_string(), 1), ("claude-code".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn ingest_preserves_tokens_and_keeps_append_monotonic() {
+        let mut log = StreamLog::new();
+        let mut e7 = log_event("codex", "seven");
+        e7.ordering_token = 7;
+        let mut e3 = log_event("codex", "three");
+        e3.ordering_token = 3;
+        log.ingest(e7);
+        log.ingest(e3);
+        assert_eq!(tokens(&log.read_after(0, 0)), vec![3, 7]);
+        assert_eq!(log.append(log_event("codex", "next")), 8);
+    }
+
+    #[test]
+    fn registry_cursor_advances_and_consumes_window_once() {
+        let mut reg = StreamRegistry::new();
+        let key = "tenant\u{1}room:demo";
+        reg.append(key, log_event("codex", "a"));
+        reg.append(key, log_event("codex", "b"));
+
+        let first = reg.read("claude-code", key, true, 0);
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.new_cursor, 2);
+        let second = reg.read("claude-code", key, true, 0);
+        assert!(second.events.is_empty());
+        assert_eq!(second.new_cursor, 2);
+        let other = reg.read("deepseek", key, true, 0);
+        assert_eq!(other.events.len(), 2);
+    }
+
+    #[test]
+    fn passive_read_without_advance_is_repeatable() {
+        let mut reg = StreamRegistry::new();
+        let key = "tenant\u{1}room:demo";
+        reg.append(key, log_event("codex", "a"));
+        let peek_a = reg.read("claude-code", key, false, 0);
+        let peek_b = reg.read("claude-code", key, false, 0);
+        assert_eq!(peek_a.events.len(), 1);
+        assert_eq!(peek_b.events.len(), 1);
+        assert_eq!(reg.cursor("claude-code", key), 0);
+    }
+
+    #[test]
+    fn subscription_set_controls_which_deltas_a_read_returns() {
+        let mut reg = StreamRegistry::new();
+        let room = "tenant\u{1}room:demo";
+        let task = "tenant\u{1}task:stream";
+        reg.append(room, log_event("codex", "room-1"));
+        reg.append(task, log_event("codex", "task-1"));
+
+        assert!(reg.read_subscribed("claude-code", true, 0).is_empty());
+
+        let set = reg.subscribe("claude-code", room);
+        assert_eq!(set, vec![room.to_string()]);
+        let deltas = reg.read_subscribed("claude-code", true, 0);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].stream_key, room);
+
+        reg.subscribe("claude-code", task);
+        reg.append(room, log_event("codex", "room-2"));
+        let both = reg.read_subscribed("claude-code", true, 0);
+        let keys = both
+            .iter()
+            .map(|delta| delta.stream_key.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(keys.contains(room));
+        assert!(keys.contains(task));
+
+        let remaining = reg.unsubscribe("claude-code", task);
+        assert_eq!(remaining, vec![room.to_string()]);
+        reg.append(task, log_event("codex", "task-2"));
+        let after = reg.read_subscribed("claude-code", true, 0);
+        assert!(after.iter().all(|delta| delta.stream_key != task));
+    }
+
+    #[test]
+    fn stream_key_canonical_is_separator_safe() {
+        let key = StreamKey::new("travis-gilbert", "room:demo");
+        assert_eq!(key.canonical(), "travis-gilbert\u{1}room:demo");
+        let a = StreamKey::new("a", "b").canonical();
+        let b = StreamKey::new("a\u{1}b", "").canonical();
+        assert_ne!(a, b);
     }
 
     // --- Acceptance criterion 1 -------------------------------------------

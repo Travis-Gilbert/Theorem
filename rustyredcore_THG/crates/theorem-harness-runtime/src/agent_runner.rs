@@ -474,7 +474,28 @@ mod tests {
         WriteMessageInput,
     };
     use rustyred_thg_core::InMemoryGraphStore;
-    use theorem_harness_core::FakeHeadInvoker;
+    use theorem_harness_core::{
+        FakeHeadInvoker, HeadInvocationError, HeadInvocationReceipt, HeadInvocationRequest,
+    };
+
+    /// Test double whose every head invocation fails like an upstream provider
+    /// outage. Used to prove the room runner surfaces a `ProviderError` as a
+    /// blocked turn rather than panicking (T2 acceptance).
+    struct ProviderFailingInvoker;
+
+    impl HeadInvoker for ProviderFailingInvoker {
+        fn invoke(
+            &self,
+            _request: HeadInvocationRequest,
+        ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
+            Err(HeadInvocationError::ProviderError {
+                head_id: "anthropic".to_string(),
+                provider: "anthropic".to_string(),
+                status: 503,
+                detail: "simulated upstream provider failure".to_string(),
+            })
+        }
+    }
 
     #[test]
     fn runner_heartbeats_consumes_room_mention_and_posts_contribution() {
@@ -545,6 +566,68 @@ mod tests {
             read_records_for_room(&store, "tenant-b", "room:a", &["event".to_string()], 20)
                 .unwrap();
         assert!(tenant_b_records.is_empty());
+    }
+
+    #[test]
+    fn runner_surfaces_provider_failure_as_blocked_turn_without_panic() {
+        // T2 acceptance: a provider outage must surface as a blocked turn
+        // carrying the ProviderError, never panic the room runner. This swaps
+        // ONLY the invoker versus the contributing FakeHeadInvoker case above,
+        // so the provider failure is the sole cause of the Blocked outcome.
+        let mut store = InMemoryGraphStore::new();
+        write_room_mention(
+            &mut store,
+            "tenant-a",
+            "room:a",
+            "codex",
+            "please check @theorem",
+        );
+
+        let cycle = run_agent_room_cycle(
+            &mut store,
+            AgentRoomRunnerConfig::theorem_default("tenant-a", "room:a"),
+            &ProviderFailingInvoker,
+        )
+        .expect("runner returns Ok even when the provider fails");
+
+        // Presence still posted; the turn is blocked, not contributed.
+        assert_eq!(cycle.presence.actor_id, "theorem");
+        assert_eq!(cycle.turns.len(), 1);
+        assert_eq!(cycle.turns[0].status, AgentRoomRunnerTurnStatus::Blocked);
+        assert!(cycle.turns[0].contribution.is_none());
+        assert!(cycle.turns[0].run.is_none());
+
+        // The provider failure is captured in the turn reflection verdict.
+        let reflection = cycle.turns[0]
+            .reflection
+            .as_ref()
+            .expect("blocked turn writes a reflection");
+        let verdict = reflection
+            .metadata
+            .get("blocked_verdict")
+            .expect("reflection carries the blocked verdict");
+        assert_eq!(
+            verdict.get("reason").and_then(Value::as_str),
+            Some("composed_agent_runtime_error")
+        );
+        let detail = verdict
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            detail.contains("provider anthropic") && detail.contains("status 503"),
+            "verdict detail must surface the provider failure, got: {detail}"
+        );
+
+        // No room contribution event is written on a provider failure, but the
+        // mention is still drained so the runner does not spin on it.
+        let records =
+            read_records_for_room(&store, "tenant-a", "room:a", &["event".to_string()], 20)
+                .unwrap();
+        assert!(records.is_empty());
+        let mentions =
+            read_mentions_for_actor(&mut store, "tenant-a", "theorem", false, 20).unwrap();
+        assert!(mentions.is_empty());
     }
 
     fn write_room_mention(

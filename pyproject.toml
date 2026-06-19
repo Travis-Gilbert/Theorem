@@ -1,0 +1,39 @@
+# Packaging for the repo-root `perception_visual` package. Dependency and model
+# artifact license boundaries are documented in `perception_visual/LICENSES.md`.
+# This file is intentionally scoped to that one package via
+# `[tool.setuptools.packages.find].include`, so it is inert to the rest of this
+# Cargo-centric monorepo. The package also runs without install, via
+# `python -m perception_visual.<module>` from the repo root.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perception-visual"
+version = "0.1.0"
+description = "OmniParser-style visual GUI perception (RF-DETR detector, no Ultralytics/AGPL)."
+readme = "perception_visual/README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Theorem" }]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+detect = ["rfdetr>=1.8.1"]                            # RF-DETR core only; rf-detr_plus/PML excluded
+caption = ["transformers>=4.42", "torch>=2.2", "pillow>=10"]  # Florence-2 (MIT) captioner
+ocr = ["easyocr>=1.7.2"]                              # Apache-2.0 OCR
+serve = ["fastapi>=0.110", "uvicorn>=0.29", "pillow>=10", "pydantic>=2"]
+data = ["playwright>=1.44"]                           # accessibility-tree dataset capture
+dev = ["pytest>=8", "httpx>=0.28", "pillow>=10"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["perception_visual*"]
+
+[tool.setuptools.package-data]
+"perception_visual.eval" = ["fixtures/heldout/gt.json", "fixtures/heldout/images/*.png"]
+"perception_visual.tests" = ["fixtures/*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["perception_visual/tests"]

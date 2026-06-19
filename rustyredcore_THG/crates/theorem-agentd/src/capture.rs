@@ -458,10 +458,12 @@ mod tests {
             "job_submit",
             json!({ "job_id": "job-abc", "created": true, "job": { "job_id": "job-abc" } }),
         );
-        let mut config = CaptureConfig::default();
-        config.enabled = true;
-        config.agent_queue_project_id = Some("list-aq".to_string());
-        config.dispatched_project_id = Some("list-wip".to_string());
+        let config = CaptureConfig {
+            enabled: true,
+            agent_queue_project_id: Some("list-aq".to_string()),
+            dispatched_project_id: Some("list-wip".to_string()),
+            ..Default::default()
+        };
 
         let report = run_capture(&gateway, &config, "theorem-agentd").unwrap();
         assert_eq!(report.captured.len(), 1);
@@ -509,9 +511,11 @@ mod tests {
             "ticktick_get_project",
             json!({ "content": [{ "type": "text", "text": inner.to_string() }] }),
         );
-        let mut config = CaptureConfig::default();
-        config.enabled = true;
-        config.agent_queue_project_id = Some("list-aq".to_string());
+        let config = CaptureConfig {
+            enabled: true,
+            agent_queue_project_id: Some("list-aq".to_string()),
+            ..Default::default()
+        };
 
         let report = run_capture(&gateway, &config, "theorem-agentd").unwrap();
         assert_eq!(report.captured.len(), 0);
@@ -533,9 +537,11 @@ mod tests {
             "ticktick_get_project",
             json!({ "content": [{ "type": "text", "text": json!({"tasks": []}).to_string() }] }),
         );
-        let mut config = CaptureConfig::default();
-        config.enabled = true;
-        config.agent_queue_project_name = Some("Agent Queue".to_string());
+        let config = CaptureConfig {
+            enabled: true,
+            agent_queue_project_name: Some("Agent Queue".to_string()),
+            ..Default::default()
+        };
 
         let report = run_capture(&gateway, &config, "theorem-agentd").unwrap();
         assert_eq!(report.project_id, "list-aq");

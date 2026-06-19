@@ -659,6 +659,7 @@ impl AppState {
             default_tenant: self.config.mcp_default_tenant.clone(),
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,
+            graphql_default_surface: false,
             tool_result_budget_bytes: rustyred_thg_mcp::DEFAULT_TOOL_RESULT_BUDGET_BYTES,
             tool_result_family_budgets: Default::default(),
         }
@@ -778,7 +779,7 @@ impl AppState {
     ///
     /// Tenants only appear in the cache once they've been accessed at
     /// least once (lazy creation). The sweep doesn't try to enumerate
-    /// on-disk tenants that haven't been opened yet — those have no
+    /// on-disk tenants that haven't been opened yet -- those have no
     /// in-memory state to sweep and their TTL nodes will be filtered
     /// at read time by the InMemory expired-node filter the moment
     /// they ARE opened. Sweep visibility for never-accessed tenants is
@@ -1109,7 +1110,7 @@ impl RedCoreTenantExecutor {
     }
 
     /// Return nodes whose `_ttl_expires_at_ms <= ts_ms`, ordered by
-    /// expiration. Read-only — uses the committed snapshot.
+    /// expiration. Read-only -- uses the committed snapshot.
     pub fn nodes_expiring_before(
         &self,
         ts_ms: i64,

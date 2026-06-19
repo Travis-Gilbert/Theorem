@@ -1,0 +1,29 @@
+# rustyred-embedded: North Star E0 (embedded mode).
+#
+# Link this crate (or, later, drop the E0.3 single binary) and run RustyRed
+# in-process over a local directory -- graph/relational/vector/spatial/full-text/
+# time in one process, no server required. `Engine` owns a durable
+# RedCoreGraphStore behind the in-process `SharedStore` seam (rustyred-thg-mcp)
+# and drives the full typed GraphQL surface as plain local calls.
+#
+# Workspace placement: its OWN Cargo root (bare `[workspace]` table at the
+# bottom), NOT a member of rustyredcore_THG -- mirrors apps/theorem-grpc and
+# apps/browser. It path-deps INTO the THG core + mcp crates and builds/tests via
+# `cargo test --manifest-path apps/rustyred-embedded/Cargo.toml`.
+
+[package]
+name = "rustyred-embedded"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "North Star E0 embedded mode: run RustyRed in-process over a local directory, no server. Engine drives the typed GraphQL surface over a durable RedCoreGraphStore via the in-process SharedStore seam."
+
+[dependencies]
+rustyred-thg-mcp = { path = "../../rustyredcore_THG/crates/rustyred-thg-mcp" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[workspace]
