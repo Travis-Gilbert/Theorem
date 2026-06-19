@@ -32,6 +32,7 @@ pub mod spatial;
 pub mod spatial_s2;
 pub mod state;
 pub mod store;
+pub mod stream;
 pub mod symbolic;
 pub mod versioned_graph;
 pub mod working_log;
@@ -138,6 +139,9 @@ pub use spatial::{
 };
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};
 pub use store::{InMemoryThgStore, ThgStore};
+pub use stream::{
+    StreamDelta, StreamEvent, StreamKey, StreamLog, StreamRegistry, StreamUrgency,
+};
 pub use symbolic::{
     derive_datalog_receipt, derive_datalog_receipt_from_json, evolution_archive,
     evolution_archive_from_json, probabilistic_expected_value,

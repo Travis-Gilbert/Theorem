@@ -659,6 +659,7 @@ impl AppState {
             default_tenant: self.config.mcp_default_tenant.clone(),
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,
+            graphql_default_surface: false,
             tool_result_budget_bytes: rustyred_thg_mcp::DEFAULT_TOOL_RESULT_BUDGET_BYTES,
             tool_result_family_budgets: Default::default(),
         }
