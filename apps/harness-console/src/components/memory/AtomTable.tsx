@@ -123,7 +123,7 @@ export function AtomTable({
               data-selected={a.id === selectedId}
               onClick={() => onOpen(a)}
               tabIndex={0}
-              role="button"
+              aria-label={`Open ${a.title}`}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();

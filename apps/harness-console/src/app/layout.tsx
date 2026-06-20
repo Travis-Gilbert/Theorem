@@ -43,7 +43,22 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       className={`${vollkorn.variable} ${plexMono.variable} ${plexSans.variable}`}
       suppressHydrationWarning
     >
+      <head>
+        {/* Apply the saved theme before first paint so dark-mode users never see
+            a light flash (FOUC). Static literal, no user input. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `try{var t=localStorage.getItem("harness-console-theme");if(t){document.documentElement.dataset.theme=t;}}catch(e){}`,
+          }}
+        />
+      </head>
       <body className="font-sans antialiased">
+        <a
+          href="#main-content"
+          className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-md focus:border focus:border-line focus:bg-bg focus:px-3 focus:py-2 focus:text-body focus:text-ink"
+        >
+          Skip to content
+        </a>
         {/* Depth Layer 1: the ambient field, behind everything. */}
         <DotGrid />
         <Providers>{children}</Providers>

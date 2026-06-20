@@ -102,6 +102,7 @@ export function DynamicIsland() {
   const [query, setQuery] = React.useState("");
   const [results, setResults] = React.useState<SearchResult[]>([]);
   const [resultView, setResultView] = React.useState<"list" | "graph">("list");
+  const [activeIndex, setActiveIndex] = React.useState(0);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
   // Onboarding routes hide the island; it belongs to the authed console.
@@ -221,9 +222,9 @@ export function DynamicIsland() {
               className="max-h-[46vh] overflow-y-auto border-b border-line"
             >
               {mode === "search" ? (
-                <SearchPanel results={results} view={resultView} setView={setResultView} onChoose={choose} />
+                <SearchPanel results={results} activeIndex={activeIndex} view={resultView} setView={setResultView} onChoose={choose} />
               ) : (
-                <CommandPanel query={query} results={results} expandList={expandList} surfaceMode={surfaceMode} onChoose={choose} setPaletteOpen={setPaletteOpen} />
+                <CommandPanel query={query} results={results} activeIndex={activeIndex} expandList={expandList} surfaceMode={surfaceMode} onChoose={choose} setPaletteOpen={setPaletteOpen} />
               )}
             </motion.div>
           )}
@@ -262,7 +263,28 @@ export function DynamicIsland() {
               <input
                 ref={inputRef}
                 value={query}
-                onChange={(e) => runQuery(e.target.value)}
+                onChange={(e) => {
+                  setActiveIndex(0);
+                  runQuery(e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setActiveIndex((i) => Math.min(i + 1, results.length - 1));
+                  } else if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setActiveIndex((i) => Math.max(i - 1, 0));
+                  } else if (e.key === "Enter") {
+                    e.preventDefault();
+                    const r = results[activeIndex] ?? results[0];
+                    if (r) choose(r);
+                  }
+                }}
+                role="combobox"
+                aria-expanded
+                aria-controls="di-results"
+                aria-activedescendant={results[activeIndex] ? `di-opt-${activeIndex}` : undefined}
+                aria-label={mode === "search" ? "Search RustyWeb" : "Command palette"}
                 placeholder={mode === "search" ? "Search RustyWeb..." : "Type a command, > verb, @ nav, # tag, or ask..."}
                 className="flex-1 bg-transparent font-mono text-body text-ink outline-none placeholder:text-faint"
               />
@@ -272,7 +294,10 @@ export function DynamicIsland() {
               <button
                 className="rounded-lg bg-ox p-1.5 text-white hover:bg-[#73241f]"
                 aria-label="Submit"
-                onClick={() => results[0] && choose(results[0])}
+                onClick={() => {
+                  const r = results[activeIndex] ?? results[0];
+                  if (r) choose(r);
+                }}
               >
                 <ArrowUp size={15} />
               </button>
@@ -308,11 +333,13 @@ export function DynamicIsland() {
 
 function SearchPanel({
   results,
+  activeIndex,
   view,
   setView,
   onChoose,
 }: {
   results: SearchResult[];
+  activeIndex: number;
   view: "list" | "graph";
   setView: (v: "list" | "graph") => void;
   onChoose: (r: SearchResult) => void;
@@ -337,12 +364,18 @@ function SearchPanel({
         </div>
       </div>
       {view === "list" ? (
-        <ul className="flex flex-col">
-          {results.map((r) => (
+        <ul id="di-results" role="listbox" aria-label="RustyWeb results" className="flex flex-col">
+          {results.map((r, i) => (
             <li key={r.id}>
               <button
+                id={`di-opt-${i}`}
+                role="option"
+                aria-selected={i === activeIndex}
                 onClick={() => onChoose(r)}
-                className="flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-surface-2"
+                className={cn(
+                  "flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-surface-2",
+                  i === activeIndex && "bg-surface-2",
+                )}
               >
                 <span className="flex-1 truncate text-body text-ink">{r.title}</span>
                 {r.score != null && <span className="font-mono text-[11px] text-muted-foreground">{r.score.toFixed(2)}</span>}
@@ -366,6 +399,7 @@ function SearchPanel({
 function CommandPanel({
   query,
   results,
+  activeIndex,
   expandList,
   surfaceMode,
   onChoose,
@@ -373,6 +407,7 @@ function CommandPanel({
 }: {
   query: string;
   results: SearchResult[];
+  activeIndex: number;
   expandList: { id: string; title: string }[];
   surfaceMode: string;
   onChoose: (r: SearchResult) => void;
@@ -412,10 +447,19 @@ function CommandPanel({
     );
   }
   return (
-    <ul className="p-2">
-      {results.map((r) => (
+    <ul id="di-results" role="listbox" aria-label="Results" className="p-2">
+      {results.map((r, i) => (
         <li key={r.id}>
-          <button onClick={() => onChoose(r)} className="flex w-full flex-col gap-0.5 rounded px-2 py-2 text-left hover:bg-surface-2">
+          <button
+            id={`di-opt-${i}`}
+            role="option"
+            aria-selected={i === activeIndex}
+            onClick={() => onChoose(r)}
+            className={cn(
+              "flex w-full flex-col gap-0.5 rounded px-2 py-2 text-left hover:bg-surface-2",
+              i === activeIndex && "bg-surface-2",
+            )}
+          >
             <span className="truncate text-body text-ink">{r.title}</span>
             {r.subtitle && <span className="truncate text-label text-muted-foreground">{r.subtitle}</span>}
           </button>

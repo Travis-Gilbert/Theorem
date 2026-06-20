@@ -6,10 +6,10 @@ Built greenfield. It does **not** inherit Context-Theorem-UI. The only shared su
 
 ## Stack
 
-- Next.js 15 (App Router) + React 19 + TypeScript
-- Tailwind v3, tokens-first (the 4x4 design math lives in `src/app/globals.css`)
+- Next.js 16 (App Router) + React 19 + TypeScript (ESLint 9 flat config; Next 16 removed `next lint`)
+- Tailwind v4 (CSS-first), tokens-first: the 4x4 design math + a shadcn semantic-token bridge (`@theme inline`) live in `src/app/globals.css`
 - Radix primitives, hand-authored shadcn-style components (`src/components/ui`)
-- `motion` (Dynamic Island), `@cosmos.gl/graph` (Lane A memory graph), `d3` (Lane B)
+- `motion` (Dynamic Island), `@cosmos.gl/graph` (Lane A memory graph), `@xyflow/react` (Canvas), `d3` (declared for the planned Lane-B charts; not yet imported)
 - CodeMirror 6 (`@uiw/react-codemirror`) for editors; Yjs + `y-codemirror.next` for the collaborative agent IDE
 - `cmdk` (command palette), `sonner` (toasts), `react-dropzone` (ingestion)
 
@@ -40,3 +40,11 @@ Copy `.env.example` to `.env.local`. `NEXT_PUBLIC_HARNESS_SOURCE=mock` (default)
 ## Backend dependencies (server-side, not in this repo)
 
 Register endpoint (anonymous tenant + scoped key + claim URL), key issuance/resolution, per-tenant metering, the ingestion pipeline, the provider credential store, and the kind-filter on the memory list endpoint. The console names these as dependencies and calls them through the typed client.
+
+### Live-cutover gates (must be resolved before flipping `NEXT_PUBLIC_HARNESS_SOURCE=live`)
+
+The console ships mock-default; the `live` client (`src/lib/harness/mcp.ts`) is the wiring surface, and these are deliberately deferred to the backend cutover:
+
+- **Auth transport.** `EventSource` (the realtime stream in `useHarnessStream`) cannot set an `Authorization` header, and the MCP client's bearer-key parameter is plumbed but not yet sourced. Do NOT put the key in the URL (it leaks into logs/history). Authenticate via a same-site `HttpOnly` cookie, a Next route-handler proxy that injects the bearer server-side, or a short-lived stream ticket. Confirm the backend rejects unauthenticated tool/stream calls.
+- **`saveAtom` fidelity.** The live `reviseMemory` mutation currently sends only `id/title/body`; the editor also edits `kind/summary/tags/links`. Either extend the mutation to accept those fields or narrow the optimistic return so the UI doesn't report success for fields the backend never received.
+- **Search bindings.** Live `search` / graph-search (`fractal_expansion`, `web_search_graph`, `hippo_retrieve`) still read through the mock projection; wire them before claiming live search is feature-complete.

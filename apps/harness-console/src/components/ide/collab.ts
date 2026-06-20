@@ -97,19 +97,25 @@ export function runAgentParticipant(
   let cancelled = false;
   const tick = () => {
     if (cancelled) return;
-    const len = handle.agentText.length;
-    const at = Math.min(len, Math.max(0, Math.floor(len * 0.4)));
-    // Move the agent cursor using yCollab's relative-position format so the
-    // human editor's remote-cursor layer renders it correctly.
-    const rel = Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(handle.agentText, at));
-    handle.agentAwareness.setLocalStateField("cursor", { anchor: rel, head: rel });
+    // Type into the shared doc first (relayed to the human editor).
     if (i < opts.snippet.length) {
       const ch = opts.snippet.slice(i, i + 2);
+      const at = Math.max(0, Math.floor(handle.agentText.length * 0.4));
       handle.agentText.insert(Math.min(handle.agentText.length, at), ch);
       i += 2;
     } else {
       i = 0;
     }
+    // Move the agent cursor. Build the relative position against the HUMAN text
+    // (the doc the editor is bound to) and clamp to its length, so yCollab's
+    // remote-selection layer always resolves a valid position. Building it from
+    // the second synced doc (agentText) made the plugin resolve an out-of-range
+    // position and crash; and skip entirely while the doc is still empty.
+    const len = handle.humanText.length;
+    if (len === 0) return;
+    const at = Math.min(len, Math.max(0, Math.floor(len * 0.4)));
+    const rel = Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(handle.humanText, at));
+    handle.agentAwareness.setLocalStateField("cursor", { anchor: rel, head: rel });
   };
   const id = setInterval(tick, 240);
   return () => {

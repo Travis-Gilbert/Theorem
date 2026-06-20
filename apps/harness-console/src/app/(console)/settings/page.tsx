@@ -49,7 +49,7 @@ function readInitialTheme(): Theme {
 export default function SettingsPage() {
   usePageToc();
 
-  const [tenant, setTenant] = React.useState("rustyredcore-theorem-production");
+  const [tenant, setTenant] = React.useState(process.env.NEXT_PUBLIC_DEFAULT_TENANT ?? "default");
   const [scopes, setScopes] = React.useState<string[]>(DEFAULT_SCOPES);
 
   // Read the persisted theme lazily in the initializer (runs once, client-only):

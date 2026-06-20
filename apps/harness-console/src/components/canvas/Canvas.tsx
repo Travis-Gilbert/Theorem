@@ -91,6 +91,9 @@ function CanvasInner() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<CanvasEdge>(initial?.edges ?? []);
   const [ready, setReady] = React.useState(!!initial);
   const viewportRef = React.useRef<Viewport>(initial?.viewport ?? DEFAULT_VIEWPORT);
+  const nodesRef = React.useRef(nodes);
+  const edgesRef = React.useRef(edges);
+  const readyRef = React.useRef(ready);
   const saveTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const counter = React.useRef(0);
 
@@ -131,15 +134,33 @@ function CanvasInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist (debounced) on any structural change.
+  // Keep latest-state refs current and debounce a save on structural change.
+  // Both this path and onMoveEnd persist through the refs, so neither can write a
+  // stale node/edge snapshot (the two savers no longer race on a closure value).
   React.useEffect(() => {
+    nodesRef.current = nodes;
+    edgesRef.current = edges;
+    readyRef.current = ready;
     if (!ready) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => saveCanvas(TENANT, nodes, edges, viewportRef.current), 400);
+    saveTimer.current = setTimeout(
+      () => saveCanvas(TENANT, nodesRef.current, edgesRef.current, viewportRef.current),
+      400,
+    );
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
   }, [nodes, edges, ready]);
+
+  // Flush a pending save on unmount so a quick edit before navigating away
+  // (or a viewport-only change) is never lost.
+  React.useEffect(() => {
+    return () => {
+      if (saveTimer.current && readyRef.current) {
+        saveCanvas(TENANT, nodesRef.current, edgesRef.current, viewportRef.current);
+      }
+    };
+  }, []);
 
   const onConnect = React.useCallback(
     (c: Connection) => setEdges((eds) => addEdge({ ...c, id: `e_${counter.current++}_${Date.now() % 100000}` }, eds)),
@@ -187,7 +208,7 @@ function CanvasInner() {
       onMove={(_, vp) => (viewportRef.current = vp)}
       onMoveEnd={(_, vp) => {
         viewportRef.current = vp;
-        if (ready) saveCanvas(TENANT, nodes, edges, vp);
+        if (readyRef.current) saveCanvas(TENANT, nodesRef.current, edgesRef.current, vp);
       }}
       nodeTypes={nodeTypes}
       defaultViewport={initial?.viewport ?? DEFAULT_VIEWPORT}

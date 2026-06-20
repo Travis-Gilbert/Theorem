@@ -106,7 +106,7 @@ export function Rail({ horizontal = false }: { horizontal?: boolean }) {
 
       {/* tenant selector */}
       <button className="mx-3 mb-2 flex items-center justify-between rounded-md border border-line bg-bg px-2.5 py-1.5 font-mono text-label text-ink hover:bg-surface-2">
-        <span className="truncate">rustyredcore-theorem</span>
+        <span className="truncate">{process.env.NEXT_PUBLIC_DEFAULT_TENANT ?? "default"}</span>
         <ChevronDown size={13} className="text-muted-foreground" />
       </button>
 

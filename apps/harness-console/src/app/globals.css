@@ -29,8 +29,8 @@
   --surface: #f5f5f6; /* rail and cards, grey against the white field */
   --surface-2: #ececee; /* secondary surface, hover */
   --ink: #1a1a1d; /* primary text */
-  --muted: #6e6e74; /* secondary text, metadata */
-  --faint: #a3a3a9; /* hints */
+  --muted: #6a6a70; /* secondary text, metadata (>=4.5:1 incl. on surface-2) */
+  --faint: #6f6f77; /* hints / placeholders (>=4.5:1 on bg, was #a3a3a9 = 2.5:1) */
   --line: rgba(17, 17, 19, 0.16); /* black hairline outlines, 1px */
   --line-strong: rgba(17, 17, 19, 0.28);
   --ox: #8a2e29; /* the single accent, oxblood. 8.4:1 on white. */
@@ -83,7 +83,7 @@
   --surface-2: #232328;
   --ink: #ededf0;
   --muted: #9a9aa2;
-  --faint: #6a6a72;
+  --faint: #8c8c95; /* lightened so hints/placeholders clear AA on dark surfaces */
   --line: rgba(237, 237, 240, 0.16);
   --line-strong: rgba(237, 237, 240, 0.28);
   --ox: #c8554a; /* lighten oxblood to hold contrast on dark */

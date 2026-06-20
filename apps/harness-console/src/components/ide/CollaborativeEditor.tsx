@@ -103,6 +103,11 @@ export function CollaborativeEditor({
         </button>
       </div>
       <div className="overflow-hidden rounded-md border border-line bg-bg">
+        {/* `value` is the one-time seed @uiw/react-codemirror uses to build the
+            doc that yCollab then binds; it is SAFE here (not a controlled-vs-CRDT
+            conflict) because initialDoc is stable for the component's life -- the
+            editor is keyed by activeFile.path in SkillEditor, so it remounts per
+            file rather than re-pushing a changing value into the live doc. */}
         <CodeMirror
           value={initialDoc}
           theme={cmTheme}
