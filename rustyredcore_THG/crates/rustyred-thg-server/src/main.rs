@@ -9,6 +9,7 @@ mod coordination_push;
 mod cypher;
 mod graph_cache;
 mod grpc;
+mod items_changefeed;
 mod metrics;
 mod observability;
 mod openapi;

@@ -13,6 +13,10 @@
 
 mod connector_gateway;
 mod graphql;
+/// SPEC-2: the node-to-Item projection, re-exported so the async product server
+/// (`rustyred-thg-server`) can build Item deltas for the live changefeed from the
+/// same single projection the GraphQL `items` resolver uses.
+pub use graphql::projection;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};

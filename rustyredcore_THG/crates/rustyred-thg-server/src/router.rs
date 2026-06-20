@@ -452,6 +452,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/agent-space/snapshot",
             get(crate::agent_space::agent_space_snapshot),
         )
+        .route(
+            "/v1/items/stream",
+            get(crate::items_changefeed::items_stream),
+        )
         .route("/metrics", get(crate::metrics::metrics))
         .route(
             "/v1/diagnostics/slow_queries",

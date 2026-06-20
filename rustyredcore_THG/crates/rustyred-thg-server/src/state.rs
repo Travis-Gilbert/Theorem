@@ -730,13 +730,11 @@ impl AppState {
             RedCoreGraphStore::open(data_dir, options)?,
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if graph_hooks_enabled() {
-            if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
-                eprintln!(
-                    "[theorem] enable graph hooks failed for {tenant_id}: {}",
-                    err.message
-                );
-            }
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(), tenant_id) {
+            eprintln!(
+                "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                err.message
+            );
         }
         stores.insert(safe_tenant, store.clone());
         Ok(store)
@@ -759,13 +757,11 @@ impl AppState {
             RedCoreGraphStore::memory(),
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if graph_hooks_enabled() {
-            if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
-                eprintln!(
-                    "[theorem] enable graph hooks failed for {tenant_id}: {}",
-                    err.message
-                );
-            }
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(), tenant_id) {
+            eprintln!(
+                "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                err.message
+            );
         }
         stores.insert(safe_tenant, store.clone());
         Ok(store)
@@ -869,6 +865,22 @@ fn graph_hooks_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// The graph-level hook registrations to attach to a fresh per-tenant store.
+/// Crawl hooks ride `THEOREM_GRAPH_HOOKS`; the Item changefeed (SPEC-2) rides its
+/// own `THEOREM_ITEM_CHANGEFEED`, so the live changefeed can run without enabling
+/// the heavier reactive-compute hooks. Empty (the default) makes
+/// `enable_graph_hooks` a no-op.
+fn tenant_hook_registrations() -> Vec<HookRegistration> {
+    let mut registrations = Vec::new();
+    if graph_hooks_enabled() {
+        registrations.extend(rustyred_web::crawl_hooks());
+    }
+    if crate::items_changefeed::item_changefeed_enabled() {
+        registrations.push(crate::items_changefeed::changefeed_registration());
+    }
+    registrations
 }
 
 #[derive(Debug)]
@@ -2625,6 +2637,53 @@ mod tests {
             executor.get_node("derived:1").unwrap().is_some(),
             "hook-derived node visible via the executor read snapshot"
         );
+    }
+
+    // SPEC-2 acceptance 2 + 5: a projected-node write delivers a projected Item
+    // delta on the changefeed bus (shaped by the same projection the query uses),
+    // and the publishing hook obeys the hook contract (no graph writes, fail-open
+    // send, runs off the writer's critical path through the dispatcher).
+    #[test]
+    fn item_changefeed_publishes_a_delta_for_a_projected_write() {
+        // Subscribe BEFORE the write: a broadcast receiver only sees later sends.
+        let mut rx = crate::items_changefeed::subscribe();
+        let executor =
+            Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap());
+        executor
+            .enable_graph_hooks(
+                vec![crate::items_changefeed::changefeed_registration()],
+                "tenant-cf",
+            )
+            .unwrap();
+
+        executor
+            .upsert_node(NodeRecord::new(
+                "run-cf::task-9",
+                ["TaskNode"],
+                json!({ "goal": "watch me appear", "created_at_ms": 1, "updated_at_ms": 1 }),
+            ))
+            .unwrap();
+        assert!(executor.quiesce_hooks(Duration::from_secs(10)));
+
+        // Drain the shared bus and find our delta (parallel tests may interleave).
+        let mut found = None;
+        loop {
+            match rx.try_recv() {
+                Ok(delta) => {
+                    if delta.id == "run-cf::task-9" {
+                        found = Some(delta);
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        let delta = found.expect("changefeed delivered a delta for the projected task write");
+        assert_eq!(delta.tenant, "tenant-cf");
+        let item = delta.item.expect("an upsert delta carries the projected item");
+        assert_eq!(item.kind, "task");
+        assert_eq!(item.title, "watch me appear");
     }
 
     #[test]
