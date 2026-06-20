@@ -24,6 +24,61 @@
 //! resolved by `call_tool` before these arms) and carried on the invoker; no
 //! GraphQL field accepts a tenant argument, so a field cannot mis-scope it. An
 //! empty tenant is rejected rather than defaulted.
+//!
+//! ## Coverage map (the boundary of the typed surface)
+//!
+//! "Finished" has an edge: the typed surface covers the domains agents reach for
+//! most, and everything else is flat-only *by decision*, not by omission. Every
+//! flat-tool cluster is accounted for below. The authoritative covered-tool list
+//! (the names hidden from `tools/list` in GraphQL-default mode) is
+//! `crate::GRAPHQL_COVERED_FLAT_TOOLS`; this note is its human-readable rationale.
+//!
+//! Covered -> typed GraphQL field(s):
+//! - memory: `memory` / `memoryDoc` / `memoryArchive` (+ nested `links` /
+//!   `related`); mutations `rememberMemory` / `reviseMemory` / `forgetMemory` /
+//!   `createHandoff`. Wraps recall/relate/remember/encode/self_revise/forget/
+//!   handoff/self_recall_archive.
+//! - graph: `graphAlgorithm` (folds the eight pagerank/ppr/components/communities
+//!   flat tools, inline and stored), plus `graphNode` / `neighbors` /
+//!   `graphSchema` / `vectorSearch` / `vectorHybrid` / `fulltextSearch` /
+//!   `spatialRadius` / `spatialBbox` / the symbolic reads; mutations
+//!   `designate*` / `bulk*`.
+//! - coordination (core): `coordinationRoom` / `coordinationStream` / `workGraph`
+//!   / `nextTaskNode`; mutations `writeCoordinationIntent` /
+//!   `writeCoordinationRecord` / `publishCoordinationEvent` /
+//!   `advanceCoordinationStream` / `createTaskNode` / `claimTaskNode`. This is the
+//!   room-context, record, stream, and work-graph-status + task-claim path.
+//! - epistemic: `epistemicNeighbors` / `epistemicFrontier` / `compileSubgraph` /
+//!   `shadowPpr`; mutation `enrichApply`.
+//! - code (CodeCrawler): `codeSearch` / `codeContext` / `codeExplore` /
+//!   `codeExplain` / `codeRecognize` / `listRepos`; mutations `ingestCodebase` /
+//!   `reindexCodebase`.
+//! - instant-KG: `harnessKgStatus` / `harnessKgSearch` / `harnessKgPpr` /
+//!   `harnessKgImpact` / `harnessKgRelatedObjects` / `harnessKgExplainEdge`.
+//! - skills: `skillList` / `skillGet`; mutations `skillPublish` / `skillApply`.
+//! - ensemble: `ensembleSelect`; mutation `ensembleRegister`.
+//! - jobs: `jobList`; mutations `jobSubmit` / `jobNote` / `jobArchive`.
+//! - harness-run: `harnessRun` (run + event ledger).
+//!
+//! Flat-only by decision (NOT wrapped in this phase):
+//! - multihead lifecycle: `multihead_refine` / `_patch` / `_proof` / `_review` /
+//!   `_spawn_verify` / `_submit_verify`. The work-graph *status* and the
+//!   *task-claim* path are covered above; the lifecycle-heavy verbs stay flat
+//!   until a later phase.
+//! - short-TTL presence + attention: `presence` / `subscribe` / `mentions` /
+//!   `read_*_for_room`. Their freshness semantics fit the flat transport better
+//!   than a typed read.
+//! - server-only (no in-crate payload; the flat arm punts to the async product
+//!   server): `web_consume` / `web_search_graph` / `browse_with_me` /
+//!   `browse_for_me` / `fractal_expansion` / `hippo_retrieve` /
+//!   `rustyweb_search_acquisition` / `composed_agent_run` / `harness_prepare`.
+//!   Wrapping these belongs to a future server-domain slice.
+//! - low-level / utility transport: `invoke` / `tool_search` / `tool_result_fetch`
+//!   / `upsert_note` / `describe` / `observe` / `spawn_session` / `self_note` /
+//!   `self_archive` / `harness_append_transition`; the version-graph
+//!   (`rustyred_thg_graph_version_*`), relational (`rustyred_thg_relational_query`),
+//!   and raw graph-query/explain/index-status tools. These are either escape
+//!   hatches or are already low-level enough that a typed wrapper adds no value.
 
 mod clusters;
 mod code;
@@ -482,11 +537,16 @@ pub(crate) fn graphql_tool_definitions(include_mutations: bool) -> Vec<Value> {
         ),
     ];
     if include_mutations {
-        tools.push(crate::tool_write(
+        let mut mutate = crate::tool_write(
             "graphql_mutate",
             "Run a GraphQL MUTATION (write) over the typed Harness schema: rememberMemory / reviseMemory / forgetMemory / createHandoff, Graph designate/bulk writes, and Coordination writes (writeCoordinationIntent, writeCoordinationRecord, publishCoordinationEvent, advanceCoordinationStream, createTaskNode, claimTaskNode).",
             graphql_input_schema(),
-        ));
+        );
+        // graphql_mutate is the single door for destructive writes (forgetMemory,
+        // jobArchive, reviseMemory): flag it so MCP clients can gate it. The shared
+        // `tool_write` default is non-destructive, which is right for additive writes.
+        mutate["annotations"]["destructiveHint"] = json!(true);
+        tools.push(mutate);
     }
     tools
 }
@@ -501,4 +561,58 @@ fn graphql_input_schema() -> Value {
         "required": ["query"],
         "additionalProperties": false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} not in graphql definitions"))
+    }
+
+    // The GraphQL mutate entry point is the single door for destructive writes
+    // (forgetMemory, jobArchive, reviseMemory, ...), so it must hint that it can
+    // perform destructive updates -- a Connectors-Directory-style annotation.
+    #[test]
+    fn graphql_mutate_is_annotated_destructive() {
+        let tools = graphql_tool_definitions(true);
+        let mutate = tool_named(&tools, "graphql_mutate");
+        // A destructive hint is only meaningful on a non-read-only tool, so the
+        // mutate door must be both: not read-only, and destructive.
+        assert_eq!(
+            mutate["annotations"]["readOnlyHint"],
+            json!(false),
+            "graphql_mutate is a write door and must not be read-only"
+        );
+        assert_eq!(
+            mutate["annotations"]["destructiveHint"],
+            json!(true),
+            "graphql_mutate must hint that it can perform destructive updates"
+        );
+    }
+
+    // Guard: the two read entry points (query + the schema/introspect door) are
+    // annotated read-only, so a Connectors-Directory client can surface them
+    // without a write-gate.
+    #[test]
+    fn graphql_read_tools_are_annotated_read_only() {
+        let tools = graphql_tool_definitions(true);
+        for name in ["graphql_query", "graphql_introspect"] {
+            let tool = tool_named(&tools, name);
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"],
+                json!(true),
+                "{name} must be annotated read-only"
+            );
+            assert_eq!(
+                tool["annotations"]["destructiveHint"],
+                json!(false),
+                "{name} is a read door and must not be flagged destructive"
+            );
+        }
+    }
 }
