@@ -1,0 +1,439 @@
+@import "tailwindcss";
+
+/*
+ * ============================================================================
+ * THE TOKEN FILE (Tailwind v4, CSS-first)
+ * ----------------------------------------------------------------------------
+ * The 4x4 design math (Space, Type, Color, Hierarchy), the depth system
+ * (ambient field, surface materiality, elevation scale), and the starting
+ * palette, all as tokens. Discipline: tokens before pixels. Nothing freehand.
+ *
+ * Palette: white background, grey surfaces, black hairline outlines, one
+ * oxblood accent #A8301E, one status green #5f7d4f.
+ *
+ * THE BRIDGE: `@theme inline` maps the standard shadcn semantic token names
+ * (--color-background, --color-primary, --color-muted-foreground, ...) onto our
+ * palette variables, so third-party shadcn/21st.dev registry components inherit
+ * the oxblood/grey palette automatically (`bg-primary` is oxblood,
+ * `text-muted-foreground` is our grey) without per-component restyling.
+ * `inline` is what lets the [data-theme="dark"] overrides flow through.
+ * ============================================================================
+ */
+
+/* Dark mode is driven by [data-theme="dark"] on <html> (Settings theme control). */
+@custom-variant dark (&:is([data-theme="dark"] *));
+
+:root {
+  /* --- Axis 3: Color. Neutral value ramp + one accent + one status. --- */
+  --bg: #ffffff; /* content background */
+  --surface: #f5f5f6; /* rail and cards, grey against the white field */
+  --surface-2: #ececee; /* secondary surface, hover */
+  --ink: #1a1a1d; /* primary text */
+  --muted: #6a6a70; /* secondary text, metadata (>=4.5:1 incl. on surface-2) */
+  --faint: #6f6f77; /* hints / placeholders (>=4.5:1 on bg, was #a3a3a9 = 2.5:1) */
+  --line: rgba(17, 17, 19, 0.16); /* black hairline outlines, 1px */
+  --line-strong: rgba(17, 17, 19, 0.28);
+  --ox: #a8301e; /* the single accent, oxblood. 6.6:1 on white. */
+  --ox-tint: rgba(168, 48, 30, 0.08); /* faint accent wash for active nav */
+  --ox-ring: rgba(168, 48, 30, 0.4); /* focus ring */
+  --live: #5f7d4f; /* the single status color, calm green */
+  --warn: #9a6a1e; /* amber, used only for a missing provider key */
+
+  /* --- Axis 1: Space. Base unit 4px. Full scale 4..64. --- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+  --measure: 68ch; /* running-text measure stays 45-75 chars */
+
+  /* --- Radius (shadcn components compute their radii from --radius). --- */
+  --radius: 0.5rem;
+
+  /* --- Depth, Layer 3: the elevation scale. Four quantized levels. --- */
+  --elev-0: none;
+  --elev-1: 0 1px 2px rgba(17, 17, 19, 0.08), 0 2px 8px rgba(17, 17, 19, 0.06);
+  --elev-2: 0 6px 24px rgba(17, 17, 19, 0.12), 0 2px 8px rgba(17, 17, 19, 0.08);
+  --elev-3: 0 18px 56px rgba(17, 17, 19, 0.2), 0 8px 24px rgba(17, 17, 19, 0.12);
+  --backdrop-blur: 8px;
+  --glow-border-width: 1.5px;
+
+  /* --- Depth, Layer 2: surface materiality. --- */
+  --grain-opacity: 0.03;
+  --blueprint-opacity: 0.05;
+  --blueprint-size: 40px;
+  --hover-lift: -1px;
+
+  /* --- Depth, Layer 1: the ambient DotGrid field. --- */
+  --dot-color: 148, 148, 154;
+  --dot-ink: 26, 26, 29;
+
+  /* --- Shell geometry --- */
+  --rail-w: 228px;
+  --topbar-h: 56px;
+  --rail-bg: #101014;
+  --rail-bg-2: #1b1b1f;
+  --rail-bg-3: #232328;
+  --rail-ink: #ededf0;
+  --rail-muted: #a6a6af;
+  --rail-line: rgba(237, 237, 240, 0.16);
+  --rail-accent: #c8554a;
+  --rail-accent-tint: rgba(200, 85, 74, 0.16);
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --bg: #131316;
+  --surface: #1b1b1f;
+  --surface-2: #232328;
+  --ink: #ededf0;
+  --muted: #9a9aa2;
+  --faint: #8c8c95; /* lightened so hints/placeholders clear AA on dark surfaces */
+  --line: rgba(237, 237, 240, 0.16);
+  --line-strong: rgba(237, 237, 240, 0.28);
+  --ox: #c8554a; /* lighten oxblood to hold contrast on dark */
+  --ox-tint: rgba(200, 85, 74, 0.12);
+  --ox-ring: rgba(200, 85, 74, 0.5);
+  --live: #8bb277;
+  --warn: #d2a458;
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);
+  --elev-2: 0 6px 24px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.4);
+  --elev-3: 0 18px 56px rgba(0, 0, 0, 0.6), 0 8px 24px rgba(0, 0, 0, 0.5);
+  --dot-color: 110, 110, 120;
+  --dot-ink: 237, 237, 240;
+  --rail-bg: #101014;
+  --rail-bg-2: #1b1b1f;
+  --rail-bg-3: #232328;
+  --rail-ink: #ededf0;
+  --rail-muted: #a6a6af;
+  --rail-line: rgba(237, 237, 240, 0.16);
+  --rail-accent: #c8554a;
+  --rail-accent-tint: rgba(200, 85, 74, 0.16);
+  color-scheme: dark;
+}
+
+@theme inline {
+  /* --- Our palette, exposed as utilities (bg-bg, text-ink, border-line, ...) --- */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-ox: var(--ox);
+  --color-ox-tint: var(--ox-tint);
+  --color-live: var(--live);
+  --color-warn: var(--warn);
+
+  /* --- THE BRIDGE: standard shadcn semantic names -> our palette. --- */
+  --color-background: var(--bg);
+  --color-foreground: var(--ink);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--bg);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--ox);
+  --color-primary-foreground: #ffffff;
+  --color-secondary: var(--surface-2);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface-2); /* shadcn `bg-muted` = a light grey surface */
+  --color-muted-foreground: var(--muted); /* shadcn + our muted text grey */
+  --color-accent: var(--surface-2);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--ox); /* oxblood doubles as destructive (one accent) */
+  --color-destructive-foreground: #ffffff;
+  --color-border: var(--line);
+  --color-input: var(--line);
+  --color-ring: var(--ox-ring);
+
+  /* --- Axis 2: Type. One ratio 1.25; the four everyday sizes 12/15/19/24 + 30. --- */
+  --font-serif: var(--font-vollkorn), Georgia, serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, monospace;
+  --font-sans: var(--font-plex-sans), system-ui, sans-serif;
+  --text-label: 12px;
+  --text-label--line-height: 1.4;
+  --text-body: 15px;
+  --text-body--line-height: 1.5;
+  --text-subhead: 19px;
+  --text-subhead--line-height: 1.4;
+  --text-title: 24px;
+  --text-title--line-height: 1.25;
+  --text-display: 30px;
+  --text-display--line-height: 1.15;
+
+  /* --- Radius scale (consumed by shadcn components). --- */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* --- Depth Layer 3: elevation utilities (shadow-elev-*). --- */
+  --shadow-elev-0: none;
+  --shadow-elev-1: var(--elev-1);
+  --shadow-elev-2: var(--elev-2);
+  --shadow-elev-3: var(--elev-3);
+
+  /* --- Motion --- */
+  --animate-fade-in: fade-in 160ms ease-out;
+  --animate-island-rise: island-rise 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@layer base {
+  * {
+    border-color: var(--line);
+  }
+
+  html {
+    background: var(--bg);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-plex-sans), system-ui, sans-serif;
+    font-size: var(--text-body);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Axis 2 roles: serif for human titles. */
+  h1,
+  h2,
+  h3,
+  .font-title {
+    font-family: var(--font-vollkorn), Georgia, serif;
+  }
+
+  /* Axis 4: focus is always the oxblood ring, one accent. */
+  :focus-visible {
+    outline: 2px solid var(--ox-ring);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  ::selection {
+    background: var(--ox-tint);
+  }
+}
+
+@layer components {
+  /* Depth Layer 2: the materiality surface. Opaque grey, faint grain, optional
+     blueprint grid, two-layer soft shadow, hover-lift. A clean black hairline
+     does the structural work (rough.js dropped for the console). */
+  .material {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--elev-1);
+    transition: box-shadow 160ms ease, transform 160ms ease;
+  }
+
+  .material::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: var(--grain-opacity);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  .material-blueprint::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: var(--blueprint-opacity);
+    background-image: linear-gradient(var(--line-strong) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line-strong) 1px, transparent 1px);
+    background-size: var(--blueprint-size) var(--blueprint-size);
+  }
+
+  .material-lift:hover {
+    transform: translateY(var(--hover-lift));
+    box-shadow: var(--elev-2);
+  }
+
+  .elev-0 {
+    box-shadow: var(--elev-0);
+  }
+  .elev-1 {
+    box-shadow: var(--elev-1);
+  }
+  .elev-2 {
+    box-shadow: var(--elev-2);
+  }
+  .elev-3 {
+    box-shadow: var(--elev-3);
+  }
+
+  .backdrop-overlay {
+    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    backdrop-filter: blur(var(--backdrop-blur));
+    -webkit-backdrop-filter: blur(var(--backdrop-blur));
+  }
+
+  .rail-group-label {
+    font-family: var(--font-plex-mono), monospace;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .rail-shell .rail-group-label {
+    color: var(--rail-muted);
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    display: inline-block;
+    flex: none;
+  }
+
+  /* RetroUI treatment (Phase 3), retokenized: keep the hard border + offset
+     shadow, recolored to oxblood and black; drop the neon. */
+  .retro-frame {
+    border: 1.5px solid var(--ink);
+    border-radius: 8px;
+    background: var(--surface);
+    box-shadow: 4px 4px 0 0 var(--ink);
+  }
+  .retro-frame-accent {
+    box-shadow: 4px 4px 0 0 var(--ox);
+  }
+  .retro-press:active {
+    transform: translate(2px, 2px);
+    box-shadow: 2px 2px 0 0 var(--ink);
+  }
+
+  /* The Glowing Shadow card: an animated oxblood glow border. One hero only. */
+  .glow-border {
+    position: relative;
+    border-radius: 12px;
+    background: var(--surface);
+  }
+  .glow-border::before {
+    content: "";
+    position: absolute;
+    inset: calc(var(--glow-border-width) * -1);
+    border-radius: inherit;
+    padding: var(--glow-border-width);
+    background: conic-gradient(
+      from var(--glow-angle),
+      transparent 0deg,
+      var(--ox) 90deg,
+      transparent 180deg,
+      var(--ox) 270deg,
+      transparent 360deg
+    );
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: glow-spin 6s linear infinite;
+    pointer-events: none;
+  }
+
+  .wave-footer svg {
+    animation: wave-drift 14s linear infinite;
+  }
+}
+
+/* Animated glow border angle (CSS @property). */
+@property --glow-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes glow-spin {
+  to {
+    --glow-angle: 360deg;
+  }
+}
+@keyframes wave-drift {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes island-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Reduced motion: every depth/island/anime path must degrade. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .glow-border::before,
+  .wave-footer svg {
+    animation: none !important;
+  }
+}
+
+/* Thin scrollbars so dense surfaces (tables, ledgers, editors) stay calm. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--faint) transparent;
+}
+
+/* React Flow (Canvas surface), retokenized to the palette. */
+.react-flow__edge-path {
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+}
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--ox);
+}
+.react-flow__controls-button {
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+.react-flow__controls-button:hover {
+  background: var(--surface-2);
+}
+.react-flow__controls-button svg {
+  fill: var(--ink);
+}
+.react-flow__attribution {
+  background: transparent;
+  font-family: var(--font-plex-mono), monospace;
+  font-size: 9px;
+  color: var(--faint);
+}
+.react-flow__handle {
+  border: 0;
+}

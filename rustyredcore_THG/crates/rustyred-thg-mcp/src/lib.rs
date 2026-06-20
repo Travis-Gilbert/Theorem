@@ -14,6 +14,11 @@
 mod connector_gateway;
 mod graphql;
 
+pub use graphql::projection::{
+    is_projected_item_label, project_mutation_event, project_node_to_item, ProjectedItem,
+    ProjectedItemDelta, ITEM_SOURCE_LABELS,
+};
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::process::{Command, Stdio};

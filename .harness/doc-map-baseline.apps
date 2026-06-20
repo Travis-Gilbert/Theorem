@@ -2,6 +2,7 @@ browser
 browser-substrate
 commonplace-api
 desktop
+harness-console
 ios
 jobintel
 notebook
