@@ -5,6 +5,7 @@ import CodeMirror, { EditorView } from "@uiw/react-codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import { javascript } from "@codemirror/lang-javascript";
 import type { Extension } from "@codemirror/state";
+import { useIsClient } from "@/lib/hooks/useIsClient";
 
 /**
  * CodeMirror 6 editor, shared by Memory (prose markdown) and Skills (SKILL.md +
@@ -55,10 +56,9 @@ export function MarkdownEditor({
   minHeight?: string;
   extraExtensions?: Extension[];
 }) {
-  const [mounted, setMounted] = React.useState(false);
-  React.useEffect(() => setMounted(true), []);
+  const isClient = useIsClient();
 
-  if (!mounted) {
+  if (!isClient) {
     return (
       <div
         className="animate-[pulse_1.5s_ease-in-out_infinite] rounded-md border border-line bg-surface"

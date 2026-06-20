@@ -12,8 +12,6 @@ import type {
   MemoryQuery,
   Skill,
   SkillUseReceipt,
-  Room,
-  Run,
   AgentBinding,
   ChatMessage,
   HarnessKey,

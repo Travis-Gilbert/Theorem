@@ -300,7 +300,7 @@ function SignupStage({ onBack }: { onBack: () => void }) {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <CheckCircle2 size={16} className="text-live" /> You're in
+              <CheckCircle2 size={16} className="text-live" /> You&apos;re in
             </CardTitle>
             <CardDescription>
               A key named <span className="font-mono text-ink">{key.name}</span> is ready. Paste the block into your

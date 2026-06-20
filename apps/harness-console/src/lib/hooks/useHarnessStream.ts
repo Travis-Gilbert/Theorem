@@ -14,12 +14,11 @@ export function useHarnessStream<T = unknown>(
   options?: { mockEvery?: number; mockFactory?: (tick: number) => T },
 ) {
   const [events, setEvents] = useState<T[]>([]);
-  const [connected, setConnected] = useState(false);
+  const [liveConnected, setLiveConnected] = useState(false);
   const tick = useRef(0);
 
   useEffect(() => {
     if (HARNESS_SOURCE !== "live") {
-      setConnected(true);
       const every = options?.mockEvery ?? 0;
       if (!every || !options?.mockFactory) return;
       const id = setInterval(() => {
@@ -35,7 +34,7 @@ export function useHarnessStream<T = unknown>(
     let retry: ReturnType<typeof setTimeout>;
     const open = () => {
       source = new EventSource(url);
-      source.onopen = () => setConnected(true);
+      source.onopen = () => setLiveConnected(true);
       source.onmessage = (e) => {
         try {
           setEvents((prev) => [...prev.slice(-50), JSON.parse(e.data) as T]);
@@ -44,7 +43,7 @@ export function useHarnessStream<T = unknown>(
         }
       };
       source.onerror = () => {
-        setConnected(false);
+        setLiveConnected(false);
         source?.close();
         retry = setTimeout(open, 2000);
       };
@@ -57,5 +56,8 @@ export function useHarnessStream<T = unknown>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channel]);
 
+  // Mock mode is always connected; only the live EventSource toggles state, and
+  // it does so from async callbacks (onopen/onerror), not synchronously here.
+  const connected = HARNESS_SOURCE === "live" ? liveConnected : true;
   return { events, connected };
 }

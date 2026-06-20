@@ -27,15 +27,6 @@ Use when ...
 2. ...
 `;
 
-function previewHash(content: string): string {
-  let h = 2166136261;
-  for (let i = 0; i < content.length; i++) {
-    h ^= content.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return `sha256:${(h >>> 0).toString(16).padStart(8, "0")}`;
-}
-
 function draftSkill(): Skill {
   const id = `skill_draft_${Date.now().toString(36)}`;
   const now = new Date().toISOString();

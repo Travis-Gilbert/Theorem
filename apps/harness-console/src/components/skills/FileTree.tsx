@@ -29,17 +29,20 @@ interface TreeFolder {
   files: SkillFile[];
 }
 
-function iconFor(file: SkillFile) {
+/** Returns the icon ELEMENT for a file. Returning an element (not a component
+ *  reference rendered as `<Icon/>`) avoids the "components created during render"
+ *  rule while keeping the per-file-type icon. */
+function fileIcon(file: SkillFile, className: string) {
   switch (file.language) {
     case "markdown":
     case "text":
-      return FileText;
+      return <FileText size={13} className={className} />;
     case "python":
     case "typescript":
     case "rust":
-      return FileCode;
+      return <FileCode size={13} className={className} />;
     default:
-      return FileIcon;
+      return <FileIcon size={13} className={className} />;
   }
 }
 
@@ -56,7 +59,7 @@ function buildTree(files: SkillFile[]): TreeFolder {
   };
   for (const file of files) {
     const parts = file.path.split("/");
-    const fileName = parts.pop() as string;
+    parts.pop(); // drop the file name; the remaining parts are the folder path
     let node = root;
     let acc = "";
     for (const part of parts) {
@@ -142,7 +145,6 @@ function FileNode({
   onSelect: (path: string) => void;
   onDelete?: (path: string) => void;
 }) {
-  const Icon = iconFor(file);
   const active = file.path === activePath;
   const isRoot = file.path === "SKILL.md";
   const name = file.path.split("/").pop();
@@ -157,7 +159,7 @@ function FileNode({
         )}
         style={{ paddingLeft: 8 + depth * 14 + 13 }}
       >
-        <Icon size={13} className={cn("shrink-0", active ? "text-ox" : "text-faint")} />
+        {fileIcon(file, cn("shrink-0", active ? "text-ox" : "text-faint"))}
         <span className="truncate">{name}</span>
       </button>
       {onDelete && !isRoot && (

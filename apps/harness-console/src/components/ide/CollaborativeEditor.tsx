@@ -9,6 +9,7 @@ import type { Extension } from "@codemirror/state";
 import { createCollab, runAgentParticipant, type CollabHandle } from "./collab";
 import { LiveCursors, type Participant } from "./LiveCursors";
 import type { EditorLanguage } from "@/components/editor/MarkdownEditor";
+import { useIsClient } from "@/lib/hooks/useIsClient";
 
 /**
  * The collaborative agent IDE. The document is a Yjs doc and Yjs is the source
@@ -48,14 +49,13 @@ export function CollaborativeEditor({
   agentSnippet?: string;
   minHeight?: string;
 }) {
-  const [mounted, setMounted] = React.useState(false);
+  const isClient = useIsClient();
   const [agentLive, setAgentLive] = React.useState(true);
   const handleRef = React.useRef<CollabHandle | null>(null);
   const stopRef = React.useRef<(() => void) | null>(null);
   const [extensions, setExtensions] = React.useState<Extension[] | null>(null);
 
   React.useEffect(() => {
-    setMounted(true);
     const handle = createCollab(initialDoc);
     handleRef.current = handle;
     handle.humanAwareness.setLocalStateField("user", {
@@ -63,6 +63,9 @@ export function CollaborativeEditor({
       color: HUMAN.color,
       colorLight: `${HUMAN.color}22`,
     });
+    // Surfacing the Yjs-bound CodeMirror extensions built from the live doc is the
+    // external-system setup effects exist for; the single post-setup render is intended.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setExtensions([...lang(language), EditorView.lineWrapping, yCollab(handle.humanText, handle.humanAwareness)]);
 
     return () => {
@@ -84,7 +87,7 @@ export function CollaborativeEditor({
     return () => stopRef.current?.();
   }, [agentLive, agentSnippet]);
 
-  if (!mounted || !extensions) {
+  if (!isClient || !extensions) {
     return <div className="animate-[pulse_1.5s_ease-in-out_infinite] rounded-md border border-line bg-surface" style={{ minHeight }} />;
   }
 

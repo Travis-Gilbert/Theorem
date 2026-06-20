@@ -83,27 +83,21 @@ const nodeTypes = { card: CardNode };
  * Canvas
  * ------------------------------------------------------------------------- */
 function CanvasInner() {
-  const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<CanvasEdge>([]);
-  const [ready, setReady] = React.useState(false);
-  const initialViewport = React.useRef<Viewport>(DEFAULT_VIEWPORT);
-  const viewportRef = React.useRef<Viewport>(DEFAULT_VIEWPORT);
+  // Canvas renders client-only (dynamic ssr:false), so the saved arrangement is
+  // read synchronously at init: the stored branch needs no setState in an effect,
+  // and the initial viewport is a plain value rather than a ref read during render.
+  const initial = React.useMemo(() => loadCanvas(TENANT), []);
+  const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>(initial?.nodes ?? []);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<CanvasEdge>(initial?.edges ?? []);
+  const [ready, setReady] = React.useState(!!initial);
+  const viewportRef = React.useRef<Viewport>(initial?.viewport ?? DEFAULT_VIEWPORT);
   const saveTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const counter = React.useRef(0);
 
-  // Load the saved arrangement, or seed a starter from recent memory atoms.
+  // No saved arrangement yet: seed a starter from recent memory atoms. Every
+  // state update happens in the async resolution, not synchronously in the effect.
   React.useEffect(() => {
-    const stored = loadCanvas(TENANT);
-    if (stored) {
-      setNodes(stored.nodes);
-      setEdges(stored.edges);
-      if (stored.viewport) {
-        initialViewport.current = stored.viewport;
-        viewportRef.current = stored.viewport;
-      }
-      setReady(true);
-      return;
-    }
+    if (initial) return;
     let cancelled = false;
     harness
       .listMemory({ view: "active" })
@@ -196,7 +190,7 @@ function CanvasInner() {
         if (ready) saveCanvas(TENANT, nodes, edges, vp);
       }}
       nodeTypes={nodeTypes}
-      defaultViewport={initialViewport.current}
+      defaultViewport={initial?.viewport ?? DEFAULT_VIEWPORT}
       minZoom={0.2}
       maxZoom={2.5}
       deleteKeyCode={["Backspace", "Delete"]}

@@ -25,8 +25,12 @@ export function useAsync<T>(loader: () => Promise<T>, deps: unknown[] = []): Asy
 
   useEffect(() => {
     let cancelled = false;
+    // Reset to loading when the query (deps) changes, before the refetch -- the
+    // intended data-fetch behavior; the single extra render on query change is fine.
+    /* eslint-disable react-hooks/set-state-in-effect */
     setLoading(true);
     setError(null);
+    /* eslint-enable react-hooks/set-state-in-effect */
     loader()
       .then((d) => {
         if (!cancelled) setData(d);

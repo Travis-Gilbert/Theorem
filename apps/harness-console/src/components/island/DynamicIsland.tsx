@@ -223,7 +223,7 @@ export function DynamicIsland() {
               {mode === "search" ? (
                 <SearchPanel results={results} view={resultView} setView={setResultView} onChoose={choose} />
               ) : (
-                <CommandPanel query={query} results={results} expandList={expandList} surfaceMode={surfaceMode} onChoose={choose} router={router} setPaletteOpen={setPaletteOpen} />
+                <CommandPanel query={query} results={results} expandList={expandList} surfaceMode={surfaceMode} onChoose={choose} setPaletteOpen={setPaletteOpen} />
               )}
             </motion.div>
           )}
@@ -369,7 +369,6 @@ function CommandPanel({
   expandList,
   surfaceMode,
   onChoose,
-  router,
   setPaletteOpen,
 }: {
   query: string;
@@ -377,7 +376,6 @@ function CommandPanel({
   expandList: { id: string; title: string }[];
   surfaceMode: string;
   onChoose: (r: SearchResult) => void;
-  router: ReturnType<typeof useRouter>;
   setPaletteOpen: (v: boolean) => void;
 }) {
   // No query yet: show the TOC (content) or cluster list (memory) as the

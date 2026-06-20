@@ -85,6 +85,8 @@ export function CosmosGraph({
         onPointMouseOut: () => onNodeOut?.(),
       });
     } catch {
+      // The synchronous WebGL/Graph constructor threw; surface the fallback UI.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setFailed(true);
       return;
     }
