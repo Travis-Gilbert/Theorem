@@ -1,11 +1,11 @@
 use crate::head_invoker::{
-    object_payload, prompt_for_request, provider_send_error, provider_summary, truncate_detail,
-    CredentialResolver, EndpointMap,
+    object_payload, prompt_for_request, provider_send_error, provider_summary,
+    system_instruction_for_kind, truncate_detail, CredentialResolver, EndpointMap,
 };
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use theorem_harness_core::{
-    HeadInvocationError, HeadInvocationReceipt, HeadInvocationRequest, HeadTransport,
+    GroundedClaim, HeadInvocationError, HeadInvocationReceipt, HeadInvocationRequest, HeadTransport,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +51,7 @@ pub fn api_provider_profile(provider: &str) -> Option<ApiProviderProfile> {
         "minimax" => Some(ApiProviderProfile {
             provider: "minimax",
             env_endpoint: "MINIMAX_CHAT_URL",
-            default_endpoint: "https://api.minimax.io/v1/chat/completions",
+            default_endpoint: "https://api.minimaxi.com/v1/chat/completions",
             request_shape: ApiRequestShape::OpenAiChatCompletions,
         }),
         "mistral" => Some(ApiProviderProfile {
@@ -97,6 +97,7 @@ pub fn invoke_api_head(
     http: &Client,
     endpoints: &EndpointMap,
     credentials: &CredentialResolver,
+    fallback_cost_units: f64,
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
     let Some(profile) = api_provider_profile(&request.head.provider) else {
@@ -122,11 +123,16 @@ pub fn invoke_api_head(
 
     match profile.request_shape {
         ApiRequestShape::AnthropicMessages => {
-            invoke_anthropic_messages(http, endpoint, secret, request)
+            invoke_anthropic_messages(http, endpoint, secret, fallback_cost_units, request)
         }
-        ApiRequestShape::OpenAiChatCompletions => {
-            invoke_openai_chat_completions(http, endpoint, secret, request)
-        }
+        ApiRequestShape::OpenAiChatCompletions => invoke_openai_chat_completions(
+            http,
+            endpoint,
+            Some(secret),
+            HeadTransport::Api,
+            fallback_cost_units,
+            request,
+        ),
     }
 }
 
@@ -134,6 +140,7 @@ fn invoke_anthropic_messages(
     http: &Client,
     endpoint: &str,
     api_key: String,
+    fallback_cost_units: f64,
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
     let prompt = prompt_for_request(&request);
@@ -144,6 +151,8 @@ fn invoke_anthropic_messages(
         .json(&json!({
             "model": request.head.model,
             "max_tokens": 1024,
+            "temperature": 0.2,
+            "system": system_instruction_for_kind(request.kind),
             "messages": [{ "role": "user", "content": prompt }]
         }))
         .send()
@@ -166,6 +175,8 @@ fn invoke_anthropic_messages(
         return Err(empty_text_error(&request, status.as_u16()));
     }
     let usage = body_json.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let claims = claims_from_text(&request, &text);
+    let cost_units = anthropic_cost_units(&body_json, fallback_cost_units);
     let payload = object_payload(json!({
         "provider": request.head.provider,
         "model": request.head.model,
@@ -173,33 +184,51 @@ fn invoke_anthropic_messages(
         "request_shape": "anthropic_messages",
         "kind": request.kind.as_str(),
         "text": text,
+        "content": text,
         "prior_context": request.prior_context,
-        "usage": usage
+        "provider_response": {
+            "model": body_json.get("model").cloned().unwrap_or(Value::Null),
+            "finish_reason": body_json.get("stop_reason").cloned().unwrap_or(Value::Null),
+            "usage": usage
+        }
     }));
-    Ok(HeadInvocationReceipt::from_request(
+    let receipt = HeadInvocationReceipt::from_request(
         &request,
         provider_summary(
             request.kind,
             payload.get("text").and_then(Value::as_str).unwrap_or(""),
         ),
         payload,
-        anthropic_cost_units(&body_json),
-    ))
+        cost_units,
+    );
+    Ok(receipt_with_claims(receipt, claims))
 }
 
-fn invoke_openai_chat_completions(
+pub(crate) fn invoke_openai_chat_completions(
     http: &Client,
     endpoint: &str,
-    api_key: String,
+    api_key: Option<String>,
+    transport: HeadTransport,
+    fallback_cost_units: f64,
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
     let prompt = prompt_for_request(&request);
-    let response = http
-        .post(endpoint)
-        .bearer_auth(api_key)
+    let mut builder = http.post(endpoint);
+    if let Some(api_key) = api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|api_key| !api_key.is_empty())
+    {
+        builder = builder.bearer_auth(api_key);
+    }
+    let response = builder
         .json(&json!({
             "model": request.head.model,
-            "messages": [{ "role": "user", "content": prompt }],
+            "messages": [
+                { "role": "system", "content": system_instruction_for_kind(request.kind) },
+                { "role": "user", "content": prompt }
+            ],
+            "temperature": 0.2,
             "max_tokens": 1024
         }))
         .send()
@@ -223,26 +252,43 @@ fn invoke_openai_chat_completions(
     }
     let usage = body_json.get("usage").cloned().unwrap_or_else(|| json!({}));
     let reasoning = openai_reasoning_text(&body_json);
+    let claims = claims_from_text(&request, &text);
+    let cost_units = openai_cost_units(&body_json, fallback_cost_units);
     let payload = object_payload(json!({
         "provider": request.head.provider,
         "model": request.head.model,
-        "transport": "api",
+        "transport": transport_name(&transport),
         "request_shape": "openai_chat_completions",
         "kind": request.kind.as_str(),
         "text": text,
+        "content": text,
         "reasoning": reasoning,
         "prior_context": request.prior_context,
-        "usage": usage
+        "provider_response": {
+            "model": provider_model(&body_json),
+            "finish_reason": provider_finish_reason(&body_json),
+            "usage": usage
+        }
     }));
-    Ok(HeadInvocationReceipt::from_request(
+    let receipt = HeadInvocationReceipt::from_request(
         &request,
         provider_summary(
             request.kind,
             payload.get("text").and_then(Value::as_str).unwrap_or(""),
         ),
         payload,
-        openai_cost_units(&body_json),
-    ))
+        cost_units,
+    );
+    Ok(receipt_with_claims(receipt, claims))
+}
+
+fn transport_name(transport: &HeadTransport) -> &'static str {
+    match transport {
+        HeadTransport::Api => "api",
+        HeadTransport::Mcp => "mcp",
+        HeadTransport::Local => "local",
+        HeadTransport::Hosted => "hosted",
+    }
 }
 
 fn provider_json(
@@ -319,21 +365,26 @@ fn content_text(value: &Value) -> String {
     }
 }
 
-fn anthropic_cost_units(body: &Value) -> f64 {
+fn anthropic_cost_units(body: &Value, fallback: f64) -> f64 {
     let usage = body.get("usage").unwrap_or(&Value::Null);
-    usage
+    let cost = usage
         .get("input_tokens")
         .and_then(Value::as_f64)
         .unwrap_or(0.0)
         + usage
             .get("output_tokens")
             .and_then(Value::as_f64)
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+    if cost > 0.0 {
+        cost
+    } else {
+        fallback
+    }
 }
 
-fn openai_cost_units(body: &Value) -> f64 {
+fn openai_cost_units(body: &Value, fallback: f64) -> f64 {
     let usage = body.get("usage").unwrap_or(&Value::Null);
-    usage
+    let cost = usage
         .get("total_tokens")
         .and_then(Value::as_f64)
         .unwrap_or_else(|| {
@@ -345,7 +396,111 @@ fn openai_cost_units(body: &Value) -> f64 {
                     .get("completion_tokens")
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0)
+        });
+    if cost > 0.0 {
+        cost
+    } else {
+        fallback
+    }
+}
+
+fn provider_model(body: &Value) -> Value {
+    body.get("model").cloned().unwrap_or(Value::Null)
+}
+
+fn provider_finish_reason(body: &Value) -> Value {
+    body.get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn claims_from_text(request: &HeadInvocationRequest, text: &str) -> Vec<GroundedClaim> {
+    parse_claims_block(text).unwrap_or_else(|| {
+        vec![GroundedClaim::new(
+            provider_summary(request.kind, text),
+            format!("head:{}", request.head.head_id),
+        )]
+    })
+}
+
+fn parse_claims_block(text: &str) -> Option<Vec<GroundedClaim>> {
+    let start = claims_json_start(text)?;
+    let end = matching_json_array_end(&text[start..])?;
+    let raw = &text[start..start + end];
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let claims = value
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("text").and_then(Value::as_str)?.trim();
+            let provenance = item.get("provenance").and_then(Value::as_str)?.trim();
+            if text.is_empty() || provenance.is_empty() {
+                None
+            } else {
+                Some(GroundedClaim::new(text, provenance))
+            }
         })
+        .collect::<Vec<_>>();
+    if claims.is_empty() {
+        None
+    } else {
+        Some(claims)
+    }
+}
+
+fn claims_json_start(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    for marker in ["claims json:", "claims:", "grounded claims:"] {
+        if let Some(marker_start) = lower.rfind(marker) {
+            let after_marker = marker_start + marker.len();
+            if let Some(array_start) = text[after_marker..].find('[') {
+                return Some(after_marker + array_start);
+            }
+        }
+    }
+    text.rfind('[')
+}
+
+fn matching_json_array_end(raw: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index + character.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn receipt_with_claims(
+    mut receipt: HeadInvocationReceipt,
+    claims: Vec<GroundedClaim>,
+) -> HeadInvocationReceipt {
+    receipt.claims = claims;
+    receipt.receipt_hash = receipt.computed_receipt_hash();
+    receipt
 }
 
 fn empty_text_error(request: &HeadInvocationRequest, status: u16) -> HeadInvocationError {
@@ -392,7 +547,7 @@ mod tests {
 
         assert_eq!(openai_chat_text(&body), "answer");
         assert_eq!(openai_reasoning_text(&body), "reason");
-        assert_eq!(openai_cost_units(&body), 5.0);
+        assert_eq!(openai_cost_units(&body, 1.0), 5.0);
     }
 
     #[test]
@@ -403,6 +558,24 @@ mod tests {
         });
 
         assert_eq!(anthropic_text(&body), "hello");
-        assert_eq!(anthropic_cost_units(&body), 10.0);
+        assert_eq!(anthropic_cost_units(&body, 1.0), 10.0);
+    }
+
+    #[test]
+    fn parses_claims_block_from_model_text() {
+        let text = r#"Answer.
+
+Claims JSON:
+[
+  {"text":"alpha","provenance":"source:a"},
+  {"text":"beta","provenance":"source:b"}
+]
+"#;
+
+        let claims = parse_claims_block(text).unwrap();
+
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].text, "alpha");
+        assert_eq!(claims[1].provenance, "source:b");
     }
 }

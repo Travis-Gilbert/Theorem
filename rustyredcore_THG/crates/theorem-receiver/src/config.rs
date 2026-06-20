@@ -3,7 +3,7 @@
 //! The bearer token is NOT part of this file; it is read from the environment
 //! (`THEOREM_HARNESS_TOKEN`) at startup so no credential is ever stored on disk.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,10 @@ pub const DEFAULT_DISPATCH_LEASE_SECS: u64 = 600;
 pub const DEFAULT_DISPATCH_HEARTBEAT_SECS: u64 = 60;
 /// Default expired-lease reaper cadence.
 pub const DEFAULT_DISPATCH_REAP_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_OPENSANDBOX_EXECD_PORT: u16 = 44_772;
+pub const DEFAULT_OPENSANDBOX_TIMEOUT_SECS: u64 = 3_600;
+pub const DEFAULT_OPENSANDBOX_IMAGE: &str = "ubuntu:22.04";
+pub const DEFAULT_OPENSANDBOX_WORKTREE_ROOT: &str = "/workspace";
 
 fn default_tenant() -> String {
     "default".to_string()
@@ -50,6 +54,164 @@ fn default_dispatch_heartbeat_secs() -> u64 {
 
 fn default_dispatch_reap_interval_secs() -> u64 {
     DEFAULT_DISPATCH_REAP_INTERVAL_SECS
+}
+
+fn default_opensandbox_execd_port() -> u16 {
+    DEFAULT_OPENSANDBOX_EXECD_PORT
+}
+
+fn default_opensandbox_timeout_secs() -> u64 {
+    DEFAULT_OPENSANDBOX_TIMEOUT_SECS
+}
+
+fn default_opensandbox_image() -> String {
+    DEFAULT_OPENSANDBOX_IMAGE.to_string()
+}
+
+fn default_opensandbox_worktree_root() -> String {
+    DEFAULT_OPENSANDBOX_WORKTREE_ROOT.to_string()
+}
+
+fn default_openai_chat_path() -> String {
+    "/v1/chat/completions".to_string()
+}
+
+fn default_openai_responses_path() -> String {
+    "/v1/responses".to_string()
+}
+
+fn default_anthropic_messages_path() -> String {
+    "/v1/messages".to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProviderSeamConfig {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_openai_chat_path")]
+    pub chat_path: String,
+    #[serde(default = "default_openai_responses_path")]
+    pub responses_path: String,
+    #[serde(default = "default_anthropic_messages_path")]
+    pub messages_path: String,
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
+}
+
+impl Default for ProviderSeamConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            api_key_env: None,
+            chat_path: default_openai_chat_path(),
+            responses_path: default_openai_responses_path(),
+            messages_path: default_anthropic_messages_path(),
+            models: BTreeMap::new(),
+        }
+    }
+}
+
+impl ProviderSeamConfig {
+    pub fn endpoint_for_wire_mode(&self, wire_mode: ProviderWireMode) -> Option<String> {
+        let base_url = self.base_url.as_deref()?.trim().trim_end_matches('/');
+        if base_url.is_empty() {
+            return None;
+        }
+        let path = match wire_mode {
+            ProviderWireMode::ChatCompletions => &self.chat_path,
+            ProviderWireMode::Responses => &self.responses_path,
+            ProviderWireMode::Messages => &self.messages_path,
+        };
+        Some(format!(
+            "{base_url}/{}",
+            path.trim().trim_start_matches('/')
+        ))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelBackendKind {
+    Single,
+    Composed,
+}
+
+impl Default for ModelBackendKind {
+    fn default() -> Self {
+        Self::Single
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderWireMode {
+    ChatCompletions,
+    Responses,
+    Messages,
+}
+
+impl Default for ProviderWireMode {
+    fn default() -> Self {
+        Self::ChatCompletions
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelBackendConfig {
+    #[serde(default)]
+    pub kind: ModelBackendKind,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub credential_env: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub wire_mode: ProviderWireMode,
+    #[serde(default)]
+    pub composed_binding_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct HeadRuntimeRecipe {
+    pub runtime_binary: String,
+    pub model_backend: String,
+    #[serde(default)]
+    pub wire_mode: ProviderWireMode,
+    #[serde(default)]
+    pub sandbox: bool,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_opensandbox_image")]
+    pub image: String,
+    #[serde(default = "default_opensandbox_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_opensandbox_execd_port")]
+    pub execd_port: u16,
+    #[serde(default = "default_opensandbox_worktree_root")]
+    pub worktree_root: String,
+    #[serde(default)]
+    pub secure_runtime: Option<String>,
+    #[serde(default)]
+    pub egress_allowlist: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// The receiver's static configuration.
@@ -83,6 +245,21 @@ pub struct ReceiverConfig {
     /// Map of repo (`Travis-Gilbert/theorem`) to local worktree path. A job for
     /// an unmapped repo is never claimed (security fence).
     pub worktrees: BTreeMap<String, PathBuf>,
+    /// Optional LiteLLM/OpenAI-compatible provider seam used by sandboxed
+    /// coding runtimes and hosted composed-agent heads.
+    #[serde(default)]
+    pub provider_seam: ProviderSeamConfig,
+    /// Named model backends available to runtime recipes.
+    #[serde(default)]
+    pub model_backends: BTreeMap<String, ModelBackendConfig>,
+    /// Per-head coding runtime recipes. These are data-only until a job opts in
+    /// to sandbox execution.
+    #[serde(default)]
+    pub head_runtime_recipes: BTreeMap<String, HeadRuntimeRecipe>,
+    /// Optional OpenSandbox execution substrate. Local execution remains the
+    /// default unless this is present and a recipe/job opts in.
+    #[serde(default)]
+    pub sandbox: Option<SandboxConfig>,
 }
 
 impl ReceiverConfig {
@@ -131,6 +308,48 @@ impl ReceiverConfig {
             return Err(ReceiverError::Config(
                 "dispatch_heartbeat_secs must be shorter than dispatch_lease_secs".to_string(),
             ));
+        }
+        for (head, recipe) in &self.head_runtime_recipes {
+            if recipe.runtime_binary.trim().is_empty() {
+                return Err(ReceiverError::Config(format!(
+                    "head_runtime_recipes.{head}.runtime_binary is required"
+                )));
+            }
+            if !self.model_backends.contains_key(&recipe.model_backend) {
+                return Err(ReceiverError::Config(format!(
+                    "head_runtime_recipes.{head}.model_backend references unknown backend {}",
+                    recipe.model_backend
+                )));
+            }
+        }
+        if let Some(sandbox) = &self.sandbox {
+            if sandbox.enabled
+                && sandbox
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(ReceiverError::Config(
+                    "sandbox.base_url is required when sandbox.enabled = true".to_string(),
+                ));
+            }
+            if sandbox.timeout_secs == 0 {
+                return Err(ReceiverError::Config(
+                    "sandbox.timeout_secs must be positive".to_string(),
+                ));
+            }
+            if sandbox.execd_port == 0 {
+                return Err(ReceiverError::Config(
+                    "sandbox.execd_port must be positive".to_string(),
+                ));
+            }
+            if sandbox.worktree_root.trim().is_empty() {
+                return Err(ReceiverError::Config(
+                    "sandbox.worktree_root is required".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -218,6 +437,10 @@ harness_url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
             config.dispatch_reap_interval_secs,
             DEFAULT_DISPATCH_REAP_INTERVAL_SECS
         );
+        assert_eq!(config.provider_seam.chat_path, "/v1/chat/completions");
+        assert!(config.model_backends.is_empty());
+        assert!(config.head_runtime_recipes.is_empty());
+        assert!(config.sandbox.is_none());
         assert_eq!(config.repos(), vec!["Travis-Gilbert/theorem".to_string()]);
         assert_eq!(
             config.worktree_for("Travis-Gilbert/theorem"),
@@ -274,5 +497,83 @@ dispatch_heartbeat_secs = 10
 "#;
         let error = ReceiverConfig::from_toml(raw).unwrap_err().to_string();
         assert!(error.contains("heartbeat"));
+    }
+
+    #[test]
+    fn parses_sandbox_runtime_recipe_and_provider_seam() {
+        let raw = r#"
+harness_url = "https://example/mcp"
+
+[provider_seam]
+base_url = "http://litellm.internal:4000"
+api_key_env = "LITELLM_API_KEY"
+
+[provider_seam.models]
+deepseek = "deepseek-v4-flash"
+
+[model_backends.codex_single]
+kind = "single"
+provider = "openai"
+model = "gpt-4.1-mini"
+credential_env = "OPENAI_API_KEY"
+wire_mode = "responses"
+
+[head_runtime_recipes.codex]
+runtime_binary = "codex"
+model_backend = "codex_single"
+wire_mode = "responses"
+sandbox = true
+
+[head_runtime_recipes.codex.env]
+OPENAI_API_BASE = "http://litellm.internal:4000/v1"
+
+[sandbox]
+enabled = true
+base_url = "http://localhost:8080/v1"
+api_key_env = "OPEN_SANDBOX_API_KEY"
+image = "ghcr.io/example/theorem-codex:latest"
+worktree_root = "/workspace/theorem"
+egress_allowlist = ["litellm.internal", "github.com"]
+
+[worktrees]
+"acme/app" = "/repos/app"
+"#;
+        let config = ReceiverConfig::from_toml(raw).unwrap();
+
+        assert_eq!(
+            config
+                .provider_seam
+                .endpoint_for_wire_mode(ProviderWireMode::Responses)
+                .as_deref(),
+            Some("http://litellm.internal:4000/v1/responses")
+        );
+        assert_eq!(
+            config.model_backends["codex_single"].wire_mode,
+            ProviderWireMode::Responses
+        );
+        assert!(config.head_runtime_recipes["codex"].sandbox);
+        let sandbox = config.sandbox.unwrap();
+        assert!(sandbox.enabled);
+        assert_eq!(sandbox.execd_port, DEFAULT_OPENSANDBOX_EXECD_PORT);
+        assert_eq!(
+            sandbox.egress_allowlist,
+            vec!["litellm.internal".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_recipe_with_unknown_model_backend() {
+        let raw = r#"
+harness_url = "https://example/mcp"
+
+[head_runtime_recipes.codex]
+runtime_binary = "codex"
+model_backend = "missing"
+
+[worktrees]
+"acme/app" = "/repos/app"
+"#;
+        let error = ReceiverConfig::from_toml(raw).unwrap_err().to_string();
+        assert!(error.contains("unknown backend"));
     }
 }

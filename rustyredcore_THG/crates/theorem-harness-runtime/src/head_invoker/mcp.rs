@@ -13,6 +13,7 @@ pub fn invoke_mcp_head(
     http: &Client,
     endpoints: &EndpointMap,
     credentials: &CredentialResolver,
+    fallback_cost_units: f64,
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
     let endpoint = mcp_endpoint(endpoints, &request)?;
@@ -89,7 +90,7 @@ pub fn invoke_mcp_head(
             payload.get("text").and_then(Value::as_str).unwrap_or(""),
         ),
         payload,
-        0.0,
+        fallback_cost_units,
     ))
 }
 

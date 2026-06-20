@@ -27,6 +27,21 @@ Actions / runners / PATs / stored OAuth tokens.
 It does NOT run the RustyRed engine locally: no vector index, no PPR, no BM25, no
 embedders. Idle footprint is listener-scale.
 
+## OpenSandbox substrate
+
+The default backend is still local process execution. The sandbox backend is
+opt-in through `sandbox` plus a per-head `head_runtime_recipes.<head>.sandbox =
+true` recipe. It provisions an OpenSandbox sandbox, attaches a persistent volume
+at `worktree_root`, resolves the execd endpoint, and runs proof-shaped commands
+through execd. Receipts keep the local proof shape and use trust tier
+`substrate_rerun_sandbox`.
+
+The provisioned sandbox id is exported as `target_session_id`, and
+`target_worktree` is the configured volume path, so coordination mentions can
+target the live durable checkout. Use `provider_seam` and `model_backends` to
+point Codex at a Responses-capable LiteLLM endpoint and aider/other chat clients
+at chat completions.
+
 ## Run it (Option B: standalone binary)
 
 ```bash

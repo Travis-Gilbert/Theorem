@@ -6,6 +6,8 @@ Standalone crates and clients under `apps/`. Each depends on the `rustyredcore_T
 |-----|------------|
 | `browser` | `theorem-browser`: the Servo-embedded substrate-native browser. Standalone crate, not in the workspace. CI-only build. |
 | `browser-substrate` | `theorem-browser-substrate`: the Servo-free page-to-substrate seam. Ingests a `LoadedPage` into a `GraphStore`. Builds in seconds. |
+| `commonplace-api` | CommonPlace interoperability API seam. Serves the typed consumer GraphQL profile and MCP stdio tools over the `commonplace` object model, with optional durable RedCore plus disk backing. |
+| `copresence-editor` | Browser adapter for `theorem-copresence`: Velt/Yjs plus Tiptap collaboration with an OpenAI-compatible Gemma co-writer seam. |
 | `desktop` | Tauri plus React plus TypeScript desktop client (Vite). |
 | `ios` | `TheoremKit`: a Swift Package shared kit layer, distinct from `theorem-ios`. |
 | `jobintel` | Standalone job-intelligence CLI. A light HTTP consumer of a running RustyRed; no path-deps into the substrate. |

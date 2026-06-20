@@ -11,8 +11,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use theorem_harness_core::{
     HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
-    HeadInvoker, HeadTransport,
+    HeadInvoker, HeadKind, HeadTransport,
 };
+
+const DEFAULT_PROVIDER_HEAD_COST_UNITS: f64 = 1.0;
+const DEFAULT_LOCAL_OPENAI_CHAT_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
 
 #[derive(Clone, Debug, Default)]
 pub struct EndpointMap {
@@ -30,6 +33,13 @@ impl EndpointMap {
         if let Ok(endpoint) = std::env::var("DEEPSEEK_MCP_URL") {
             map.insert("deepseek", &HeadTransport::Mcp, endpoint);
         }
+        let local_endpoint = std::env::var("THEOREM_LOCAL_OPENAI_URL")
+            .unwrap_or_else(|_| DEFAULT_LOCAL_OPENAI_CHAT_URL.to_string());
+        map.insert("local", &HeadTransport::Local, local_endpoint.clone());
+        map.insert("gemma", &HeadTransport::Local, local_endpoint);
+        if let Some(hosted_endpoint) = hosted_openai_endpoint_from_env() {
+            map.insert("hosted", &HeadTransport::Hosted, hosted_endpoint);
+        }
         map
     }
 
@@ -44,9 +54,24 @@ impl EndpointMap {
     }
 
     pub fn get(&self, provider: &str, transport: &HeadTransport) -> Option<&str> {
-        self.endpoints
+        let endpoint = self
+            .endpoints
             .get(&endpoint_key(provider, transport))
-            .map(String::as_str)
+            .map(String::as_str);
+        if endpoint.is_some() {
+            return endpoint;
+        }
+        match transport {
+            HeadTransport::Local => self
+                .endpoints
+                .get(&endpoint_key("local", transport))
+                .map(String::as_str),
+            HeadTransport::Hosted => self
+                .endpoints
+                .get(&endpoint_key("hosted", transport))
+                .map(String::as_str),
+            HeadTransport::Api | HeadTransport::Mcp => None,
+        }
     }
 }
 
@@ -55,6 +80,7 @@ pub struct RealHeadInvoker {
     http: reqwest::blocking::Client,
     credentials: CredentialResolver,
     endpoints: EndpointMap,
+    fallback_cost_units: f64,
 }
 
 impl RealHeadInvoker {
@@ -70,6 +96,18 @@ impl RealHeadInvoker {
         endpoints: EndpointMap,
         credentials: CredentialResolver,
     ) -> Result<Self, HeadInvocationError> {
+        Self::with_credentials_and_cost_units(
+            endpoints,
+            credentials,
+            configured_provider_head_cost_units(),
+        )
+    }
+
+    pub fn with_credentials_and_cost_units(
+        endpoints: EndpointMap,
+        credentials: CredentialResolver,
+        fallback_cost_units: f64,
+    ) -> Result<Self, HeadInvocationError> {
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(90))
             .build()
@@ -83,6 +121,7 @@ impl RealHeadInvoker {
             http,
             credentials,
             endpoints,
+            fallback_cost_units,
         })
     }
 }
@@ -98,25 +137,34 @@ impl HeadInvoker for RealHeadInvoker {
                 kind: request.kind,
             });
         }
+        if request.head.kind == HeadKind::SkillPlugin {
+            return Err(HeadInvocationError::SkillPluginDenied {
+                head_id: request.head.head_id,
+            });
+        }
 
         match request.head.endpoint.transport {
-            HeadTransport::Api => {
-                api::invoke_api_head(&self.http, &self.endpoints, &self.credentials, request)
-            }
-            HeadTransport::Mcp => {
-                mcp::invoke_mcp_head(&self.http, &self.endpoints, &self.credentials, request)
-            }
-            HeadTransport::Local | HeadTransport::Hosted => {
-                Err(HeadInvocationError::ProviderError {
-                    head_id: request.head.head_id.clone(),
-                    provider: request.head.provider.clone(),
-                    status: 0,
-                    detail: format!(
-                        "unsupported provider transport: {} over {:?}",
-                        request.head.provider, request.head.endpoint.transport
-                    ),
-                })
-            }
+            HeadTransport::Api => api::invoke_api_head(
+                &self.http,
+                &self.endpoints,
+                &self.credentials,
+                self.fallback_cost_units,
+                request,
+            ),
+            HeadTransport::Mcp => mcp::invoke_mcp_head(
+                &self.http,
+                &self.endpoints,
+                &self.credentials,
+                self.fallback_cost_units,
+                request,
+            ),
+            HeadTransport::Local | HeadTransport::Hosted => invoke_openai_compatible_transport(
+                &self.http,
+                &self.endpoints,
+                &self.credentials,
+                self.fallback_cost_units,
+                request,
+            ),
         }
     }
 }
@@ -124,11 +172,7 @@ impl HeadInvoker for RealHeadInvoker {
 pub type ProviderHeadInvoker = RealHeadInvoker;
 
 pub(crate) fn prompt_for_request(request: &HeadInvocationRequest) -> String {
-    let mut prompt = format!(
-        "Task:\n{}\n\nInvocation kind: {}\n",
-        request.task,
-        request.kind.as_str()
-    );
+    let mut prompt = format!("Task:\n{}\n", request.task);
     if !request.prior_context.is_empty() {
         prompt.push_str("\nPrior revisions:\n");
         for context in &request.prior_context {
@@ -145,12 +189,29 @@ pub(crate) fn prompt_for_request(request: &HeadInvocationRequest) -> String {
         }
     }
     if !request.claims.is_empty() {
-        prompt.push_str("\nGrounding claims required:\n");
+        prompt.push_str("\nSeed grounding claims:\n");
         for claim in &request.claims {
             prompt.push_str(&format!("- {} [{}]\n", claim.text, claim.provenance));
         }
     }
+    prompt.push_str(
+        "\nReturn a concise answer. End with a line `Claims JSON:` followed by a JSON array of objects with `text` and `provenance` fields for the claims you assert.\n",
+    );
     prompt
+}
+
+pub(crate) fn system_instruction_for_kind(kind: HeadInvocationKind) -> &'static str {
+    match kind {
+        HeadInvocationKind::Proposal => {
+            "Produce a grounded answer to the task. List only the claims you assert."
+        }
+        HeadInvocationKind::Critique => {
+            "Review the prior proposal(s) in the user context. Name errors, gaps, and unsupported claims; do not restate, improve."
+        }
+        HeadInvocationKind::Synthesis => {
+            "Merge the proposal and critique into one final grounded answer."
+        }
+    }
 }
 
 pub(crate) fn provider_send_error(
@@ -172,9 +233,14 @@ pub(crate) fn provider_send_error(
     }
 }
 
-pub(crate) fn provider_summary(kind: HeadInvocationKind, text: &str) -> String {
-    let clipped = text.chars().take(96).collect::<String>();
-    format!("provider {}: {}", kind.as_str(), clipped)
+pub(crate) fn provider_summary(_kind: HeadInvocationKind, text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(280)
+        .collect()
 }
 
 pub(crate) fn object_payload(value: Value) -> serde_json::Map<String, Value> {
@@ -203,6 +269,92 @@ fn transport_slug(transport: &HeadTransport) -> &'static str {
         HeadTransport::Local => "local",
         HeadTransport::Hosted => "hosted",
     }
+}
+
+fn configured_provider_head_cost_units() -> f64 {
+    std::env::var("THEOREM_PROVIDER_HEAD_COST_UNITS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(DEFAULT_PROVIDER_HEAD_COST_UNITS)
+}
+
+fn hosted_openai_endpoint_from_env() -> Option<String> {
+    std::env::var("THEOREM_HOSTED_OPENAI_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("THEOREM_LITELLM_CHAT_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("THEOREM_LITELLM_BASE_URL")
+                .ok()
+                .map(|value| chat_completions_endpoint(&value))
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn chat_completions_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/chat/completions") {
+        base_url.to_string()
+    } else if base_url.ends_with("/v1") {
+        format!("{base_url}/chat/completions")
+    } else {
+        format!("{base_url}/v1/chat/completions")
+    }
+}
+
+fn invoke_openai_compatible_transport(
+    http: &reqwest::blocking::Client,
+    endpoints: &EndpointMap,
+    credentials: &CredentialResolver,
+    fallback_cost_units: f64,
+    request: HeadInvocationRequest,
+) -> Result<HeadInvocationReceipt, HeadInvocationError> {
+    let transport = request.head.endpoint.transport.clone();
+    let Some(endpoint) = endpoints.get(&request.head.provider, &transport) else {
+        return Err(HeadInvocationError::ProviderError {
+            head_id: request.head.head_id.clone(),
+            provider: request.head.provider.clone(),
+            status: 0,
+            detail: format!(
+                "missing endpoint for provider {} over {:?}",
+                request.head.provider, transport
+            ),
+        });
+    };
+    let api_key = match transport {
+        HeadTransport::Local => credentials
+            .resolve_optional_local(&request.head.credential_ref)
+            .map_err(|error| HeadInvocationError::ProviderError {
+                head_id: request.head.head_id.clone(),
+                provider: request.head.provider.clone(),
+                status: 0,
+                detail: error.detail(),
+            })?,
+        HeadTransport::Hosted => Some(credentials.resolve(&request.head.credential_ref).map_err(
+            |error| HeadInvocationError::ProviderError {
+                head_id: request.head.head_id.clone(),
+                provider: request.head.provider.clone(),
+                status: 0,
+                detail: error.detail(),
+            },
+        )?),
+        HeadTransport::Api | HeadTransport::Mcp => unreachable!("handled by caller"),
+    };
+    api::invoke_openai_chat_completions(
+        http,
+        endpoint,
+        api_key,
+        transport,
+        fallback_cost_units,
+        request,
+    )
 }
 
 #[cfg(test)]

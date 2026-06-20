@@ -464,6 +464,7 @@ fn lower_query(query: &Query) -> PgResult<LoweredQuery> {
             joins,
             projection: Vec::new(), // fetch all columns; we project in the frontend
             limit: None,            // ORDER BY/GROUP BY must see all rows first
+            ..QueryIr::default()
         },
         projection,
         group_by,
@@ -752,7 +753,10 @@ fn shape_result(
     plan: LoweredQuery,
     result: rustyred_thg_core::QueryResult,
 ) -> PgResult<PgQueryResult> {
-    let raw_rows = result.rows;
+    // The pg-wire frontend serves scalar/time/timeseries views (no rankers), so drop the optional
+    // per-row score and work over the flat column maps.
+    let raw_rows: Vec<BTreeMap<String, ScalarValue>> =
+        result.rows.into_iter().map(|row| row.values).collect();
 
     // Resolve the output column set.
     let output: Vec<OutputColumn> = if plan.select_star && plan.projection.is_empty() {

@@ -34,16 +34,17 @@ use ensemble::{
 };
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, compile_graphql_selection, compile_user_subgraph,
-    diff_graph_snapshots, epistemic_shadow_ppr, execute_query, graph_version_log,
-    merge_graph_snapshots, read_epistemic_shadow, run_epistemic_cron_pass, update_graph_ref_cas,
-    CodeKgManifest, Direction, EdgeRecord, EpistemicAnnotations, EpistemicCronInput,
-    EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicType,
-    GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
-    GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
-    HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
-    QueryIr, RedCoreGraphStore, RelationalStore, SessionDelta, StreamEvent, StreamLog,
-    StreamUrgency, UserSubgraph, VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL,
-    EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
+    diff_graph_snapshots, epistemic_shadow_ppr, execute_query_with_resolver, graph_version_log,
+    merge_graph_snapshots, read_epistemic_shadow, run_epistemic_cron_pass,
+    update_graph_ref_cas, CodeKgManifest, Direction, EdgeRecord, EpistemicAnnotations,
+    EpistemicCronInput, EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode,
+    EpistemicType, FusionPolicy, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats,
+    GraphStore, GraphStoreError, GraphStoreResult, GraphVersionRepository, GraphqlSelection,
+    HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, ModalityResolver, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, QueryIr, RankOutcome, RankedRow, RedCoreGraphStore,
+    RelationalStore, SessionDelta, StreamEvent, StreamLog, StreamUrgency, UserSubgraph,
+    VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
+    HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -51,9 +52,9 @@ use theorem_harness_core::{
     composition_hash, evaluate_publication, hash_agent_binding, next_for_head, spawn_verify_node,
     stable_value_hash, submit_verify_receipt, ActionTierPolicy, AgentBinding, AgentHead,
     BindingBudgetScope, BindingComposition, BindingIdentity, ClaimOutcome, FakeHeadInvoker,
-    GroundedClaim, HeadCostProfile, HeadFitness, HeadKind, HeadReliabilityProfile, HeadTransport,
-    JobSubmission, Millis, NodeStatus, Payload, Receipt, ScratchpadRevision, TaskNode, TraceTier,
-    TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
+    GroundedClaim, HeadCostProfile, HeadFitness, HeadInvoker, HeadKind, HeadReliabilityProfile,
+    HeadTransport, JobSubmission, Millis, NodeStatus, Payload, Receipt, ScratchpadRevision,
+    TaskNode, TraceTier, TransitionInput, TransitionResult, VerifyReceipt, WorkGraph,
 };
 #[cfg(test)]
 use theorem_harness_runtime::subscribe_coordination_room_events;
@@ -78,7 +79,7 @@ use theorem_harness_runtime::{
     CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
     CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
     HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
-    MemoryGraphStore, MemoryWriteInput, PresenceInput, RealHeadInvoker, RecallMemoryInput,
+    MemoryGraphStore, MemoryWriteInput, PresenceInput, ProviderHeadInvoker, RecallMemoryInput,
     RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput,
     SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput, UpsertNoteInput,
     WriteIntentInput, WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO,
@@ -2606,6 +2607,207 @@ fn query_payload(
     }))
 }
 
+/// Resolves multimodal planner predicates by node id against the live backend subsystems: TurboVec
+/// for `vector_knn`, the full-text index for `text_rank`/`text_contains`, and graph adjacency for
+/// `expand_*`. Spatial bbox candidates are not addressable from a bare `GeoWithin { column }` (the
+/// backend exposes no spatial-designation discovery), so `geo_overapprox` returns `None` and the
+/// planner falls back to a residual-only exact scan over the row coordinates.
+struct BackendModalityResolver<'a, B: McpGraphBackend> {
+    backend: &'a B,
+}
+
+impl<B: McpGraphBackend> BackendModalityResolver<'_, B> {
+    /// BFS hop distances from `from` along `edge_type` in `dir` over the live graph.
+    fn reachable(
+        &self,
+        from: &str,
+        edge_type: &str,
+        dir: Direction,
+    ) -> GraphStoreResult<std::collections::BTreeMap<String, usize>> {
+        let mut visited = std::collections::BTreeMap::new();
+        let mut seen = std::collections::BTreeSet::from([from.to_string()]);
+        let mut queue = std::collections::VecDeque::from([(from.to_string(), 0usize)]);
+        while let Some((node, distance)) = queue.pop_front() {
+            let hits = self.backend.neighbors(NeighborQuery {
+                node_id: node,
+                direction: dir.clone(),
+                edge_type: Some(edge_type.to_string()),
+                include_expired: false,
+            })?;
+            for hit in hits {
+                if seen.insert(hit.node_id.clone()) {
+                    visited.insert(hit.node_id.clone(), distance + 1);
+                    queue.push_back((hit.node_id, distance + 1));
+                }
+            }
+        }
+        Ok(visited)
+    }
+}
+
+impl<B: McpGraphBackend> ModalityResolver for BackendModalityResolver<'_, B> {
+    fn vector_knn(
+        &self,
+        _relation: &str,
+        column: &str,
+        query: &[f32],
+        candidates: Option<&std::collections::BTreeSet<String>>,
+        k: usize,
+    ) -> GraphStoreResult<RankOutcome> {
+        let Some(candidates) = candidates else {
+            let rows = self
+                .backend
+                .vector_search(None, column, query, k)?
+                .into_iter()
+                .map(|(row_id, score)| RankedRow { row_id, score })
+                .collect();
+            return Ok(RankOutcome {
+                rows,
+                strategy: Some("index_topk".to_string()),
+                overfetch_rounds: 0,
+            });
+        };
+        // Overfetch the approximate top-k, intersect with the candidate set, and widen until k
+        // survive (bounded). The live backend cannot score arbitrary ids exactly, so this is the
+        // honest strategy even for small candidate sets.
+        let mut factor = 8usize;
+        let mut rounds = 0usize;
+        let rows = loop {
+            rounds += 1;
+            let fetch = k.max(1) * factor;
+            let hits = self.backend.vector_search(None, column, query, fetch)?;
+            let returned = hits.len();
+            let kept = hits
+                .into_iter()
+                .filter(|(id, _)| candidates.contains(id))
+                .take(k)
+                .map(|(row_id, score)| RankedRow { row_id, score })
+                .collect::<Vec<_>>();
+            if kept.len() >= k || rounds >= 3 || returned < fetch {
+                break kept;
+            }
+            factor *= 2;
+        };
+        Ok(RankOutcome {
+            rows,
+            strategy: Some("filtered_overfetch".to_string()),
+            overfetch_rounds: rounds,
+        })
+    }
+
+    fn text_rank(
+        &self,
+        _relation: &str,
+        column: &str,
+        query: &str,
+        candidates: Option<&std::collections::BTreeSet<String>>,
+        k: usize,
+    ) -> GraphStoreResult<Vec<RankedRow>> {
+        let fetch = if candidates.is_some() {
+            (k.max(1) * 8).max(k)
+        } else {
+            k
+        };
+        let rows = self
+            .backend
+            .fulltext_search(None, column, query, fetch)?
+            .into_iter()
+            .filter(|(id, _)| candidates.map(|c| c.contains(id)).unwrap_or(true))
+            .take(k)
+            .map(|(row_id, score)| RankedRow { row_id, score })
+            .collect();
+        Ok(rows)
+    }
+
+    fn expand_proximity(
+        &self,
+        from: &str,
+        edge_type: &str,
+        dir: Direction,
+        candidates: Option<&std::collections::BTreeSet<String>>,
+        k: usize,
+    ) -> GraphStoreResult<Vec<RankedRow>> {
+        let mut rows = self
+            .reachable(from, edge_type, dir)?
+            .into_iter()
+            .filter(|(id, _)| candidates.map(|c| c.contains(id)).unwrap_or(true))
+            .map(|(row_id, distance)| RankedRow {
+                row_id,
+                score: 1.0 / (distance as f32 + 1.0),
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.row_id.cmp(&b.row_id))
+        });
+        rows.truncate(k);
+        Ok(rows)
+    }
+
+    fn text_contains(
+        &self,
+        _relation: &str,
+        column: &str,
+        query: &str,
+    ) -> GraphStoreResult<Vec<String>> {
+        Ok(self
+            .backend
+            .fulltext_search(None, column, query, 10_000)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    fn geo_overapprox(
+        &self,
+        _relation: &str,
+        _column: &str,
+        lat_property: Option<&str>,
+        lon_property: Option<&str>,
+        label: Option<&str>,
+        region: &rustyred_thg_core::RegionRef,
+    ) -> GraphStoreResult<Option<Vec<String>>> {
+        // The live spatial index is addressable only when GeoWithin carries the designated
+        // label/lat/lon mapping. Absent that, fall back to a residual-only exact scan.
+        let (Some(lat_property), Some(lon_property), Some(label)) =
+            (lat_property, lon_property, label)
+        else {
+            return Ok(None);
+        };
+        let rustyred_thg_core::RegionRef::Bbox {
+            min_lat,
+            min_lon,
+            max_lat,
+            max_lon,
+        } = region;
+        // Use the live spatial index when the backend supports it; if it does not, fall back to a
+        // residual-only scan rather than failing the whole query.
+        match self.backend.spatial_bbox_search(
+            label,
+            lat_property,
+            lon_property,
+            *min_lat,
+            *min_lon,
+            *max_lat,
+            *max_lon,
+        ) {
+            Ok(ids) => Ok(Some(ids)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn expand_reachable(
+        &self,
+        from: &str,
+        edge_type: &str,
+        dir: Direction,
+    ) -> GraphStoreResult<Vec<String>> {
+        Ok(self.reachable(from, edge_type, dir)?.into_keys().collect())
+    }
+}
+
 fn relational_query_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
@@ -2613,7 +2815,7 @@ fn relational_query_payload(
 ) -> Result<Value, McpError> {
     let snapshot = backend.graph_snapshot()?;
     let store = RelationalStore::from_graph_snapshot(&snapshot)?;
-    let query = if let Some(query_ir) = arguments
+    let mut query = if let Some(query_ir) = arguments
         .get("query_ir")
         .or_else(|| arguments.get("queryIr"))
     {
@@ -2632,7 +2834,17 @@ fn relational_query_payload(
             "rustyred_thg_relational_query requires query_ir or selection",
         ));
     };
-    let result = execute_query(&store, query)?;
+    // A top-level `fusion` argument overrides the policy embedded in query_ir, so callers can set
+    // the rank-fusion policy without hand-assembling the QueryIr.
+    if let Some(fusion) = arguments.get("fusion") {
+        query.fusion = serde_json::from_value::<FusionPolicy>(fusion.clone())
+            .map_err(|error| McpError::invalid_params(format!("invalid fusion: {error}")))?;
+    }
+    // Modality predicates resolve by node id against the live subsystems (TurboVec vectors,
+    // full-text, spatial, graph) behind the backend; only scalar/structured columns come from the
+    // snapshot-built relational store.
+    let resolver = BackendModalityResolver { backend };
+    let result = execute_query_with_resolver(&store, query, &resolver)?;
     Ok(json!({
         "tenant": tenant,
         "planner": "rustyred-native-relational",
@@ -9123,46 +9335,58 @@ fn composed_agent_run_to_store<S: GraphStore>(
     task: String,
     claims: Vec<GroundedClaim>,
 ) -> Result<Value, McpError> {
-    if composed_agent_real_invoker_enabled() {
-        let invoker = RealHeadInvoker::from_env().map_err(mcp_head_invocation_error)?;
-        let result = if claims.is_empty() {
-            theorem_harness_runtime::run_composed_agent(store, &binding_id, &task, &invoker)
-        } else {
-            theorem_harness_runtime::run_composed_agent_with_claims(
-                store,
-                &binding_id,
-                &task,
-                claims,
-                &invoker,
-            )
+    let result = match configured_composed_agent_invoker_mode()? {
+        ComposedAgentInvokerMode::Real => {
+            let invoker = ProviderHeadInvoker::from_env().map_err(mcp_head_invocation_error)?;
+            run_composed_agent_with_selected_invoker(store, &binding_id, &task, claims, &invoker)
         }
-        .map_err(mcp_composed_agent_error)?;
-        return composed_agent_result_value(result);
-    }
-
-    let invoker = FakeHeadInvoker::default();
-    let result = if claims.is_empty() {
-        theorem_harness_runtime::run_composed_agent(store, &binding_id, &task, &invoker)
-    } else {
-        theorem_harness_runtime::run_composed_agent_with_claims(
-            store,
-            &binding_id,
-            &task,
-            claims,
-            &invoker,
-        )
+        ComposedAgentInvokerMode::Fake => {
+            let invoker = FakeHeadInvoker::default();
+            run_composed_agent_with_selected_invoker(store, &binding_id, &task, claims, &invoker)
+        }
     }
     .map_err(mcp_composed_agent_error)?;
     composed_agent_result_value(result)
 }
 
-fn composed_agent_real_invoker_enabled() -> bool {
-    std::env::var("THEOREM_COMPOSED_AGENT_INVOKER")
-        .map(|value| value.trim().eq_ignore_ascii_case("real"))
-        .unwrap_or(false)
-        || std::env::var("THEOREM_COMPOSED_AGENT_REAL")
-            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
+fn run_composed_agent_with_selected_invoker<S: GraphStore, I: HeadInvoker>(
+    store: &mut S,
+    binding_id: &str,
+    task: &str,
+    claims: Vec<GroundedClaim>,
+    invoker: &I,
+) -> theorem_harness_runtime::ComposedAgentRuntimeResult<
+    theorem_harness_runtime::ComposedAgentRunResult,
+> {
+    if claims.is_empty() {
+        theorem_harness_runtime::run_composed_agent(store, binding_id, task, invoker)
+    } else {
+        theorem_harness_runtime::run_composed_agent_with_claims(
+            store, binding_id, task, claims, invoker,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposedAgentInvokerMode {
+    Real,
+    Fake,
+}
+
+fn configured_composed_agent_invoker_mode() -> Result<ComposedAgentInvokerMode, McpError> {
+    let default_mode = if cfg!(test) { "fake" } else { "real" };
+    match std::env::var("THEOREM_HEAD_INVOKER")
+        .unwrap_or_else(|_| default_mode.to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "real" | "provider" | "live" => Ok(ComposedAgentInvokerMode::Real),
+        "fake" | "test" => Ok(ComposedAgentInvokerMode::Fake),
+        value => Err(McpError::invalid_params(format!(
+            "unsupported THEOREM_HEAD_INVOKER={value}; expected real or fake"
+        ))),
+    }
 }
 
 fn composed_agent_result_value(
@@ -9878,18 +10102,22 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ),
         tool(
             "rustyred_thg_relational_query",
-            "Run a native relational planner query over the tenant graph snapshot. Accepts QueryIr or a GraphQL-style selection AST and returns planner trace receipts.",
+            "Run a native relational planner query over the tenant graph snapshot. Accepts QueryIr or a GraphQL-style selection AST and returns planner trace receipts, including multimodal rankers and fusion.",
             json!({
                 "type": "object",
                 "properties": {
                     "tenant": { "type": "string" },
                     "query_ir": {
                         "type": "object",
-                        "description": "Native QueryIr: relations, predicates, joins, projection, limit."
+                        "description": "Native QueryIr: relations, predicates, joins, projection, limit, fusion. Knn is always a ranker; TextMatch and Expand accept mode=filter|rank."
                     },
                     "selection": {
                         "type": "object",
                         "description": "GraphQL-style selection AST: relation, fields, joins, limit."
+                    },
+                    "fusion": {
+                        "type": "object",
+                        "description": "Optional rank-fusion policy: {kind:'rrf',k:60} or {kind:'weighted',weights:{method:weight}}. Overrides query_ir.fusion when set."
                     },
                     "budget": { "type": "object" }
                 }
@@ -12632,8 +12860,12 @@ fn remove_app_affordance_confirmation_controls(object: &mut Map<String, Value>) 
 mod tests {
     use std::cell::RefCell;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::{mpsc, Mutex, OnceLock};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rustyred_thg_affordances::registry::register_connector_with_target;
@@ -13106,6 +13338,166 @@ mod tests {
             panic!("tool call failed for {name}: {error}");
         }
         response["result"]["structuredContent"].clone()
+    }
+
+    #[derive(Debug)]
+    struct CapturedProviderRequest {
+        headers: String,
+        body: Value,
+    }
+
+    struct MockChatCompletions {
+        url: String,
+        received: mpsc::Receiver<CapturedProviderRequest>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl MockChatCompletions {
+        fn start(expected_requests: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://{}/v1/chat/completions",
+                listener.local_addr().unwrap()
+            );
+            let (tx, rx) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                for index in 0..expected_requests {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let captured = read_provider_request(&mut stream);
+                    tx.send(captured).unwrap();
+                    let content = format!(
+                        "provider reply {index}\n\nClaims JSON:\n[{{\"text\":\"claim {index}\",\"provenance\":\"mock:{index}\"}}]"
+                    );
+                    let body = json!({
+                        "model": "mock-model",
+                        "choices": [{
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1 }
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            });
+            Self {
+                url,
+                received: rx,
+                handle,
+            }
+        }
+
+        fn take_requests(self, count: usize) -> Vec<CapturedProviderRequest> {
+            let requests = (0..count)
+                .map(|_| {
+                    self.received
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("mock provider request")
+                })
+                .collect();
+            self.handle.join().unwrap();
+            requests
+        }
+    }
+
+    fn read_provider_request(stream: &mut TcpStream) -> CapturedProviderRequest {
+        let mut buffer = Vec::new();
+        let mut scratch = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut scratch).unwrap();
+            assert!(read > 0, "provider request closed before full body");
+            buffer.extend_from_slice(&scratch[..read]);
+            if let Some((header_end, content_length)) = http_request_shape(&buffer) {
+                let body_start = header_end + 4;
+                if buffer.len() >= body_start + content_length {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                    let body =
+                        serde_json::from_slice(&buffer[body_start..body_start + content_length])
+                            .unwrap();
+                    return CapturedProviderRequest { headers, body };
+                }
+            }
+        }
+    }
+
+    fn http_request_shape(buffer: &[u8]) -> Option<(usize, usize)> {
+        let header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n")?;
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .or_else(|| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length:"))
+            })?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((header_end, content_length))
+    }
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct ScopedEnv {
+        saved: Vec<(String, Option<String>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnv {
+        fn new(pairs: Vec<(&'static str, String)>) -> Self {
+            let guard = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut names = vec![
+                "THEOREM_AGENT_HEADS".to_string(),
+                "THEOREM_HEAD_INVOKER".to_string(),
+                "MISTRAL_CHAT_URL".to_string(),
+                "DEEPSEEK_CHAT_URL".to_string(),
+                "MISTRAL_API_KEY".to_string(),
+                "DEEPSEEK_API_KEY".to_string(),
+                "MISTRAL_MODEL".to_string(),
+                "DEEPSEEK_MODEL".to_string(),
+                "THEOREM_PROVIDER_HEAD_COST_UNITS".to_string(),
+            ];
+            names.extend(pairs.iter().map(|(name, _)| (*name).to_string()));
+            names.sort();
+            names.dedup();
+            let saved = names
+                .into_iter()
+                .map(|name| {
+                    let value = std::env::var(&name).ok();
+                    std::env::remove_var(&name);
+                    (name, value)
+                })
+                .collect::<Vec<_>>();
+            for (name, value) in pairs {
+                std::env::set_var(name, value);
+            }
+            Self {
+                saved,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 
     #[test]
@@ -14833,6 +15225,11 @@ mod tests {
 
     #[test]
     fn native_coordination_tools_round_trip_through_mcp() {
+        // `binding_active_head_set` is derived from the process-global `THEOREM_AGENT_HEADS`. Hold
+        // the shared env lock and pin it unset (default head set) so this test is deterministic and
+        // serialized against tests that mutate `THEOREM_AGENT_HEADS` (e.g. the provider-head
+        // composed-agent test), which otherwise race under parallel `cargo test`.
+        let _env = ScopedEnv::new(vec![]);
         let (provider, mut config) = fixture();
         config.read_only = false;
 
@@ -16972,7 +17369,19 @@ mod tests {
     }
 
     #[test]
-    fn composed_agent_run_round_trips_through_mcp_with_fake_heads() {
+    fn composed_agent_run_round_trips_through_mcp_with_provider_heads() {
+        let mock = MockChatCompletions::start(3);
+        let _env = ScopedEnv::new(vec![
+            ("THEOREM_HEAD_INVOKER", "real".to_string()),
+            ("THEOREM_AGENT_HEADS", "mistral,deepseek".to_string()),
+            ("MISTRAL_CHAT_URL", mock.url.clone()),
+            ("DEEPSEEK_CHAT_URL", mock.url.clone()),
+            ("MISTRAL_API_KEY", "mistral-test-secret".to_string()),
+            ("DEEPSEEK_API_KEY", "deepseek-test-secret".to_string()),
+            ("MISTRAL_MODEL", "mistral-large-latest".to_string()),
+            ("DEEPSEEK_MODEL", "deepseek-v4-flash".to_string()),
+            ("THEOREM_PROVIDER_HEAD_COST_UNITS", "1.0".to_string()),
+        ]);
         let provider = FixtureProvider(Rc::new(RefCell::new(InMemoryGraphStore::new())));
         let config = McpServerConfig {
             read_only: false,
@@ -17004,6 +17413,25 @@ mod tests {
                 .len(),
             2
         );
+        let receipts = result["result"]["invocation_receipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 3);
+        assert_eq!(receipts[0]["output_summary"], "provider reply 0");
+        assert_eq!(receipts[2]["claims"][0]["provenance"], "mock:2");
+
+        let requests = mock.take_requests(3);
+        assert!(requests.iter().any(|request| request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer mistral-test-secret")));
+        assert!(requests.iter().any(|request| request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer deepseek-test-secret")));
+        assert_eq!(requests[0].body["messages"][0]["role"], json!("system"));
+        assert!(requests[0].body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Produce a grounded answer"));
     }
 
     #[test]
@@ -17337,6 +17765,81 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().any(|row| row["k.to_id"] == "node:b"));
         assert!(rows.iter().any(|row| row["k.to_id"] == "node:c"));
+    }
+
+    #[test]
+    fn relational_query_geo_filter_resolves_through_backend_modality_resolver() {
+        // End-to-end live-path proof: a GeoWithin filter flows relational_query -> snapshot store ->
+        // BackendModalityResolver -> planner. InMemoryGraphStore has no live spatial index, so geo
+        // resolves via the residual exact scan over the node coordinates kept in the snapshot.
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(NodeRecord::new(
+                "place:inside",
+                ["Place"],
+                json!({"lat": 0.5, "lon": 0.5}),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "place:outside",
+                ["Place"],
+                json!({"lat": 1.0005, "lon": 0.5}),
+            ))
+            .unwrap();
+        let provider = FixtureProvider(Rc::new(RefCell::new(store)));
+        let config = McpServerConfig {
+            default_tenant: "smoke".to_string(),
+            ..McpServerConfig::default()
+        };
+
+        let query_ir = serde_json::to_value(rustyred_thg_core::QueryIr {
+            relations: vec![rustyred_thg_core::QueryRelation {
+                alias: "p".to_string(),
+                relation: "place".to_string(),
+                predicates: vec![rustyred_thg_core::Predicate::GeoWithin {
+                    column: "geo".to_string(),
+                    region: rustyred_thg_core::RegionRef::Bbox {
+                        min_lat: 0.0,
+                        min_lon: 0.0,
+                        max_lat: 1.0,
+                        max_lon: 1.0,
+                    },
+                    lat_property: Some("lat".to_string()),
+                    lon_property: Some("lon".to_string()),
+                    label: Some("Place".to_string()),
+                }],
+            }],
+            projection: vec![rustyred_thg_core::Projection {
+                alias: "p".to_string(),
+                column: "id".to_string(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let response = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "geo",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyred_thg_relational_query",
+                    "arguments": { "tenant": "smoke", "query_ir": query_ir }
+                }
+            }),
+        );
+
+        let content = &response["result"]["structuredContent"];
+        let rows = content["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["p.id"], "place:inside");
+        assert_eq!(
+            content["trace"]["access_paths"][0]["method"],
+            "geo_residual_scan"
+        );
     }
 
     #[test]

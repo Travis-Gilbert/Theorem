@@ -1,0 +1,15 @@
+# Minimal SearXNG config for local Theorem dev.
+# The key thing the RustyWeb SearXNG provider needs: JSON output enabled.
+use_default_settings: true
+
+server:
+  # Local-only dev secret. Replace if you expose this beyond localhost.
+  secret_key: "theorem-local-dev-change-me"
+  limiter: false
+  image_proxy: false
+
+search:
+  # The provider calls /search?format=json -- JSON must be in the list.
+  formats:
+    - html
+    - json

@@ -32,15 +32,25 @@ pub mod head;
 pub mod lanes;
 pub mod local_exec;
 pub mod receiver;
+pub mod sandbox_exec;
 pub mod spawn;
 pub mod wake;
 
 pub use client::HarnessClient;
-pub use config::ReceiverConfig;
-pub use head::{adapter_for, head_adapters, HeadAdapter};
+pub use config::{
+    HeadRuntimeRecipe, ModelBackendConfig, ModelBackendKind, ProviderSeamConfig, ProviderWireMode,
+    ReceiverConfig, SandboxConfig,
+};
+pub use head::{
+    adapter_for, head_adapters, runtime_plan_from_recipe, HeadAdapter, HeadRuntimePlan,
+};
 pub use lanes::detect_lanes;
 pub use local_exec::{run_proof, ProofPlan, ProofReceipt, TRUST_TIER_LOCAL};
 pub use receiver::{run_loop, run_loop_until, JobRunReport};
+pub use sandbox_exec::{
+    OpenSandboxRuntime, SandboxFile, SandboxHandle, SandboxProvisionRequest, SandboxRuntime,
+    TRUST_TIER_SANDBOX,
+};
 pub use spawn::{build_intent, build_spawn_plan, SpawnPlan};
 pub use wake::{
     build_wake_dry_run_report, build_wake_prompt, run_wake_report_with_spawner, spawn_wake_command,

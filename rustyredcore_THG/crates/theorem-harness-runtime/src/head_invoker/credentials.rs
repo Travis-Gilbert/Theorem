@@ -27,11 +27,15 @@ impl CredentialResolver {
                     "env credential reference requires a variable name".to_string(),
                 ));
             }
-            return std::env::var(env_name).map_err(|_| {
-                CredentialResolutionError::MissingCredential(format!(
-                    "missing environment credential {env_name}"
-                ))
-            });
+            return std::env::var(env_name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CredentialResolutionError::MissingCredential(format!(
+                        "missing environment credential {env_name}"
+                    ))
+                });
         }
 
         for prefix in ["secret:", "secret-store:"] {
@@ -53,6 +57,33 @@ impl CredentialResolver {
         Err(CredentialResolutionError::UnsupportedReference(format!(
             "unsupported credential reference {credential_ref}; expected env:NAME, secret:NAME, or secret-store:NAME"
         )))
+    }
+
+    pub fn resolve_optional_local(
+        &self,
+        credential_ref: &str,
+    ) -> Result<Option<String>, CredentialResolutionError> {
+        let credential_ref = credential_ref.trim();
+        if credential_ref.is_empty()
+            || matches!(
+                credential_ref.to_ascii_lowercase().as_str(),
+                "none" | "none:" | "disabled"
+            )
+        {
+            return Ok(None);
+        }
+        if let Some(token) = credential_ref
+            .strip_prefix("static:")
+            .or_else(|| credential_ref.strip_prefix("static-token:"))
+        {
+            let token = token.trim().to_string();
+            return if token.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(token))
+            };
+        }
+        self.resolve(credential_ref).map(Some)
     }
 }
 

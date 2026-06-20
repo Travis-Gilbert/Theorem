@@ -388,6 +388,7 @@ fn lower_select_to_query_ir(sql: &str) -> Result<(QueryIr, Vec<PgColumn>), Strin
             joins,
             projection,
             limit: parsed.limit,
+            ..QueryIr::default()
         },
         columns,
     ))

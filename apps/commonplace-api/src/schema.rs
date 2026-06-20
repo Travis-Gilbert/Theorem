@@ -11,16 +11,17 @@
 //! needs) by swapping the type alias, which is the named follow-up for the
 //! durable self-hosted binary.
 
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use async_graphql::{
     Context, EmptySubscription, Enum, Error, InputObject, Object, Result, Schema, SimpleObject,
 };
 use commonplace::{
-    Collection, Commonplace, InMemoryBlobStore, IngestInput, IngestPipeline, Item, ItemBody,
-    ItemKind, Residency, COLLECTION_LABEL,
+    BlobStore, Collection, Commonplace, EmbeddingGraphStore, InMemoryBlobStore, IngestInput,
+    IngestPipeline, Item, ItemBody, ItemKind, Residency, COLLECTION_LABEL,
 };
-use rustyred_thg_core::{InMemoryGraphStore, NodeQuery};
+use rustyred_thg_core::{DiskObjectStore, InMemoryGraphStore, NodeQuery, RedCoreGraphStore};
 
 use crate::auth::{ApiKeyRegistry, ApiKeyToken, Principal};
 use crate::briefing::{briefing as run_briefing, Briefing, BriefingConfig, ConnectedItem};
@@ -30,12 +31,26 @@ use crate::retrieve::{
     ask as run_ask, AnswerKind, AnswerModel, AskConfig, AskResult, NoModel, RetrievedItem,
 };
 
-/// The store backing one CommonPlace instance.
+/// The default in-memory store backing (tests + the no-data-dir binary path).
 pub type ApiStore = Commonplace<InMemoryGraphStore, InMemoryBlobStore>;
-/// A shared, lockable instance store (one per instance / URL).
-pub type SharedStore = Arc<Mutex<ApiStore>>;
-/// The consumer schema type.
-pub type ConsumerSchema = Schema<Query, Mutation, EmptySubscription>;
+/// A shared, lockable instance store, generic over the backing.
+pub type SharedStore<S, B> = Arc<Mutex<Commonplace<S, B>>>;
+/// The in-memory shared store.
+pub type InMemoryShared = SharedStore<InMemoryGraphStore, InMemoryBlobStore>;
+/// The durable shared store (RedCore + disk) for a self-hosted instance.
+pub type DurableShared = SharedStore<RedCoreGraphStore, DiskObjectStore>;
+/// The consumer schema over the in-memory backing (default / tests).
+pub type ConsumerSchema = Schema<
+    Query<InMemoryGraphStore, InMemoryBlobStore>,
+    Mutation<InMemoryGraphStore, InMemoryBlobStore>,
+    EmptySubscription,
+>;
+/// The consumer schema over the durable RedCore + disk backing.
+pub type DurableSchema = Schema<
+    Query<RedCoreGraphStore, DiskObjectStore>,
+    Mutation<RedCoreGraphStore, DiskObjectStore>,
+    EmptySubscription,
+>;
 
 /// An item, in the consumer API shape.
 #[derive(SimpleObject)]
@@ -282,8 +297,12 @@ fn principal(ctx: &Context<'_>) -> Result<Principal> {
         .ok_or_else(|| Error::new("invalid API key"))
 }
 
-fn shared(ctx: &Context<'_>) -> Result<SharedStore> {
-    ctx.data::<SharedStore>().cloned()
+fn shared<S, B>(ctx: &Context<'_>) -> Result<SharedStore<S, B>>
+where
+    S: Send + Sync + 'static,
+    B: Send + Sync + 'static,
+{
+    ctx.data::<SharedStore<S, B>>().cloned()
 }
 
 fn store_err(error: rustyred_thg_core::GraphStoreError) -> Error {
@@ -291,15 +310,18 @@ fn store_err(error: rustyred_thg_core::GraphStoreError) -> Error {
 }
 
 /// Consumer read API.
-#[derive(Default)]
-pub struct Query;
+pub struct Query<S, B>(PhantomData<fn() -> (S, B)>);
 
-#[Object]
-impl Query {
+#[Object(name = "Query")]
+impl<S, B> Query<S, B>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
     /// One item by id.
     async fn item(&self, ctx: &Context<'_>, id: String) -> Result<Option<ItemGql>> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -309,7 +331,7 @@ impl Query {
     /// All items, optionally filtered to a kind.
     async fn items(&self, ctx: &Context<'_>, kind: Option<String>) -> Result<Vec<ItemGql>> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -323,7 +345,7 @@ impl Query {
     /// One collection by id.
     async fn collection(&self, ctx: &Context<'_>, id: String) -> Result<Option<CollectionGql>> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -336,7 +358,7 @@ impl Query {
     /// All collections.
     async fn collections(&self, ctx: &Context<'_>) -> Result<Vec<CollectionGql>> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -358,7 +380,7 @@ impl Query {
     /// Items in a collection.
     async fn collection_items(&self, ctx: &Context<'_>, id: String) -> Result<Vec<ItemGql>> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -378,7 +400,7 @@ impl Query {
         k: Option<i32>,
     ) -> Result<Vec<SearchHitGql>> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -410,7 +432,7 @@ impl Query {
     ) -> Result<AskResultGql> {
         principal(ctx)?;
         let model = ctx.data::<Arc<dyn AnswerModel>>()?.clone();
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -432,7 +454,7 @@ impl Query {
         open_limit: Option<i32>,
     ) -> Result<BriefingGql> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -455,7 +477,7 @@ impl Query {
         max_results: Option<i32>,
     ) -> Result<Vec<CandidateLinkGql>> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -472,7 +494,7 @@ impl Query {
     /// markdown. The JSON output reimports via `importItems` without loss.
     async fn export(&self, ctx: &Context<'_>, format: Option<ExportFormat>) -> Result<String> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -485,15 +507,18 @@ impl Query {
 }
 
 /// Consumer write API.
-#[derive(Default)]
-pub struct Mutation;
+pub struct Mutation<S, B>(PhantomData<fn() -> (S, B)>);
 
-#[Object]
-impl Mutation {
+#[Object(name = "Mutation")]
+impl<S, B> Mutation<S, B>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
     /// Auto-structuring ingest: embed, classify, file, link, resolve entities.
     async fn ingest(&self, ctx: &Context<'_>, input: IngestInputGql) -> Result<ItemGql> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let mut cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -523,7 +548,7 @@ impl Mutation {
         tags: Option<Vec<String>>,
     ) -> Result<ItemGql> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let mut cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -544,7 +569,7 @@ impl Mutation {
         residency: Option<String>,
     ) -> Result<ItemGql> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let mut cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -567,7 +592,7 @@ impl Mutation {
     /// Create a manual collection.
     async fn create_collection(&self, ctx: &Context<'_>, name: String) -> Result<CollectionGql> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let mut cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -585,7 +610,7 @@ impl Mutation {
         collection_id: String,
     ) -> Result<bool> {
         principal(ctx)?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let mut cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -600,7 +625,7 @@ impl Mutation {
         principal(ctx)?;
         let document: ExportDocument = serde_json::from_str(&data)
             .map_err(|error| Error::new(format!("invalid export JSON: {error}")))?;
-        let store = shared(ctx)?;
+        let store = shared::<S, B>(ctx)?;
         let mut cp = store
             .lock()
             .map_err(|_| Error::new("store lock poisoned"))?;
@@ -614,18 +639,29 @@ impl Mutation {
 
 /// Build the consumer schema over an instance store and its key registry, with
 /// no generative answer model (ask uses the extractive fallback).
-pub fn build_schema(store: SharedStore, registry: Arc<ApiKeyRegistry>) -> ConsumerSchema {
+pub fn build_schema<S, B>(
+    store: SharedStore<S, B>,
+    registry: Arc<ApiKeyRegistry>,
+) -> Schema<Query<S, B>, Mutation<S, B>, EmptySubscription>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
     build_schema_with_model(store, registry, Arc::new(NoModel))
 }
 
 /// Build the schema with a specific answer model (e.g. a GL-Fusion client) for
 /// generative answers behind the same retrieval.
-pub fn build_schema_with_model(
-    store: SharedStore,
+pub fn build_schema_with_model<S, B>(
+    store: SharedStore<S, B>,
     registry: Arc<ApiKeyRegistry>,
     model: Arc<dyn AnswerModel>,
-) -> ConsumerSchema {
-    Schema::build(Query, Mutation, EmptySubscription)
+) -> Schema<Query<S, B>, Mutation<S, B>, EmptySubscription>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
+    Schema::build(Query(PhantomData), Mutation(PhantomData), EmptySubscription)
         .data(store)
         .data(registry)
         .data(model)

@@ -8,9 +8,10 @@ when its satellite isn't running.
 Edit `theorem-local.env`, then:
 
 ```bash
-# Terminal 1 (optional): Valkey daemon (Redis-wire compatible)
-brew install valkey && valkey-server --port 6379
-#   or: docker run --rm -p 6379:6379 valkey/valkey:latest
+# Terminal 1: all satellites at once (Valkey + SearXNG + embeddings + browser)
+docker compose -f scripts/dev/docker-compose.yml up -d
+#   first run pulls images + builds the sidecar; check health:
+docker compose -f scripts/dev/docker-compose.yml ps
 
 # Terminal 2 (optional): gRPC code search + Valkey cache
 ./scripts/dev/run-grpc.sh
@@ -18,6 +19,24 @@ brew install valkey && valkey-server --port 6379
 # Terminal 3: the harness MCP server
 ./scripts/dev/run-harness.sh
 ```
+
+Prefer not to use Docker for Valkey? `brew install valkey && valkey-server --port 6379`
+works too (Valkey speaks the Redis wire protocol).
+
+### What docker-compose brings up
+
+| Service | Port | Used by | Notes |
+|---|---|---|---|
+| `valkey` | 6379 | theorem-grpc (`VALKEY_URL`) | Redis-wire cache |
+| `searxng` | 8888 | harness (`SEARXNG_URL`) | JSON output enabled in `searxng/settings.yml` |
+| `embeddings` | 8081 | harness (`RUSTYWEB_QWEN4B_EMBED_URL`) | TEI, bge-small (384-dim); amd64 image (emulated on Apple Silicon) |
+| `browser-sidecar` | 9223 | harness (render + live action loop) | Playwright; see `browser-sidecar/` |
+
+Swap the embedding model to the real Qwen3-Embedding-4B in `docker-compose.yml`
+and set `RUSTYWEB_QWEN4B_DIMENSION=2560` in `theorem-local.env` for the
+production contract. On Apple Silicon, the TEI CPU image runs under emulation;
+for speed, stop that service and point `RUSTYWEB_QWEN4B_EMBED_URL` at a native
+OpenAI-compatible embedder (LM Studio / llama.cpp / Ollama).
 
 ## Where each dependency lives
 

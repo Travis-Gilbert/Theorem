@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::access_method::{
-    AccessMethodRegistry, ColumnId, RelationId, RowChange, RowChangeKind, RowId, ScalarValue,
+    AccessMethodRegistry, ColumnId, RankingRegistry, RelationId, RowChange, RowChangeKind, RowId,
+    ScalarValue,
 };
 use crate::graph_store::{GraphSnapshot, GraphStoreError, GraphStoreResult};
 
@@ -89,6 +90,7 @@ impl Relation {
 pub struct RelationalStore {
     relations: BTreeMap<RelationId, Relation>,
     access_methods: AccessMethodRegistry,
+    ranking_methods: RankingRegistry,
 }
 
 impl RelationalStore {
@@ -96,6 +98,7 @@ impl RelationalStore {
         Self {
             relations: BTreeMap::new(),
             access_methods: AccessMethodRegistry::with_native_defaults(),
+            ranking_methods: RankingRegistry::with_native_defaults(),
         }
     }
 
@@ -103,11 +106,16 @@ impl RelationalStore {
         Self {
             relations: BTreeMap::new(),
             access_methods,
+            ranking_methods: RankingRegistry::with_native_defaults(),
         }
     }
 
     pub fn access_methods(&self) -> &AccessMethodRegistry {
         &self.access_methods
+    }
+
+    pub fn ranking_methods(&self) -> &RankingRegistry {
+        &self.ranking_methods
     }
 
     pub fn create_relation(&mut self, schema: RelationSchema) {
@@ -131,6 +139,7 @@ impl RelationalStore {
             relation: relation_id.clone(),
             row_id: row.id.clone(),
             values: row.values.clone(),
+            properties: row.properties.clone(),
             kind: RowChangeKind::Upsert,
         })?;
         if let Some(relation) = self.relations.get_mut(&relation_id) {

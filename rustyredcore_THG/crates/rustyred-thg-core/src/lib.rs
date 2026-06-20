@@ -26,6 +26,7 @@ pub mod ordered;
 pub mod planner;
 pub mod plugin;
 pub mod ppr_cache;
+pub mod ranking;
 pub mod relational;
 pub mod spatial;
 #[cfg(feature = "s2")]
@@ -39,8 +40,9 @@ pub mod working_log;
 
 pub use access_method::{
     AccessMethod, AccessMethodRegistry, AccessMethodStats, AmResult, ColumnId, Cost,
-    OrderedAccessMethod, Predicate, RegionRef, RelationId, RowChange, RowChangeKind, RowId,
-    RowIdStream, ScalarBound, ScalarValue, TimeSeriesAccessMethod,
+    ModalityResolver, NoModalityResolver, OrderedAccessMethod, Predicate, PredicateMode,
+    RankOutcome, RankedRow, RankingAccessMethod, RankingRegistry, RegionRef, RelationId, RowChange,
+    RowChangeKind, RowId, RowIdStream, ScalarBound, ScalarValue, TimeSeriesAccessMethod,
 };
 pub use cold_fragments::{
     ColdFragment, ColdFragmentStore, CompressionFilter, FragmentColumn, FragmentRangeResult,
@@ -116,8 +118,9 @@ pub use ordered::{
     OrderedMode, OrderedScore,
 };
 pub use planner::{
-    compile_graphql_selection, execute_query, AccessPathTrace, GraphqlJoinSelection,
-    GraphqlSelection, JoinPredicate, PlanTrace, Projection, QueryIr, QueryRelation, QueryResult,
+    compile_graphql_selection, execute_query, execute_query_with_resolver, AccessPathTrace,
+    FusionPolicy, GraphqlJoinSelection, GraphqlSelection, JoinPredicate, PlanTrace, Projection,
+    QueryIr, QueryOutputRow, QueryRelation, QueryResult, RankerTrace,
 };
 pub use plugin::{
     normalize_plugin_command, PluginCapability, PluginCapabilityKind, PluginExecutionOutput,
@@ -128,6 +131,7 @@ pub use ppr_cache::{
     cached_personalized_pagerank, cached_single_seed_personalized_pagerank, clear_scoped_ppr_cache,
     merge_ppr_scores, scoped_ppr_cache_len,
 };
+pub use ranking::{ExpandRankingMethod, TextRankingMethod, VectorRankingMethod};
 pub use relational::{
     ColumnSchema, NativeAuthPrincipalRecord, NativeBillingAccountRecord, NativeCatalog,
     NativeProjectRecord, NativeTenantRecord, Relation, RelationSchema, RelationalRow,

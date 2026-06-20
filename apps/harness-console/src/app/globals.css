@@ -99,6 +99,28 @@
   color-scheme: dark;
 }
 
+/*
+ * The sidebar is always dark (a two-tone shell) in BOTH themes. This is a scoped
+ * palette override: the rail's semantic utilities (bg-surface, text-ink,
+ * text-muted-foreground, border-line, the oxblood active state) read these dark
+ * values, so the existing rail markup goes dark with strong contrast on the
+ * light content well, and stays dark in dark mode -- no separate dark markup.
+ */
+.rail-shell {
+  --bg: #131316;
+  --surface: #1b1b1f;
+  --surface-2: #26262c;
+  --ink: #f3f3f5;
+  --muted: #a6a6ae;
+  --faint: #8c8c95;
+  --line: rgba(237, 237, 240, 0.14);
+  --line-strong: rgba(237, 237, 240, 0.26);
+  --ox: #d2655a;
+  --ox-tint: rgba(210, 101, 90, 0.18);
+  --ox-ring: rgba(210, 101, 90, 0.55);
+  color-scheme: dark;
+}
+
 @theme inline {
   /* --- Our palette, exposed as utilities (bg-bg, text-ink, border-line, ...) --- */
   --color-bg: var(--bg);

@@ -16,6 +16,15 @@
 //!   Obsidian-sync read and upsert surface.
 //! - [`binding_store`], [`skill_pack`], [`work_graph_store`]: AgentBinding
 //!   scratchpad persistence, skill packs, and the multi-head work graph store.
+//! - [`head_invoker`]: live provider execution for composed-agent heads. Set
+//!   `THEOREM_AGENT_HEADS=deepseek,mistral,minimax` with
+//!   `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, and `MINIMAX_API_KEY` for the
+//!   API-backed binding. Current defaults avoid deprecated provider models:
+//!   `DEEPSEEK_MODEL=deepseek-v4-flash`,
+//!   `MISTRAL_MODEL=mistral-large-latest`, and `MINIMAX_MODEL=MiniMax-M3`
+//!   unless explicitly overridden. `THEOREM_HEAD_INVOKER=real` enables the live
+//!   MCP call site, while `HeadTransport::Local` and `HeadTransport::Hosted`
+//!   route OpenAI-compatible local llama-server and hosted/LiteLLM endpoints.
 //! - [`agent_runner`]: the in-process room runner that turns wake messages into
 //!   head invocations.
 //!
