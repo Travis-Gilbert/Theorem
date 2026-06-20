@@ -15824,7 +15824,10 @@ mod tests {
     // tenant argument anywhere.
     #[test]
     fn graphql_introspect_exposes_full_graph_domain() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        // The full typed SDL exceeds the default 16KB tool-result budget; fetch it
+        // whole rather than truncated into a fetch-handle envelope.
+        config.tool_result_budget_bytes = 0;
         let sdl = call_tool_json(
             &provider,
             &config,
@@ -16162,7 +16165,8 @@ mod tests {
     // still with no tenant argument.
     #[test]
     fn graphql_introspect_exposes_epistemic_domain() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.tool_result_budget_bytes = 0;
         let sdl = call_tool_json(
             &provider,
             &config,
@@ -16234,7 +16238,8 @@ mod tests {
     // mutations) as one typed surface, still with no tenant argument.
     #[test]
     fn graphql_introspect_exposes_code_domain() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.tool_result_budget_bytes = 0;
         let sdl = call_tool_json(
             &provider,
             &config,
@@ -16320,7 +16325,8 @@ mod tests {
     // A5-kg.2: SDL exposes the harness-KG domain, no tenant arg.
     #[test]
     fn graphql_introspect_exposes_harness_kg_domain() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.tool_result_budget_bytes = 0;
         let sdl = call_tool_json(
             &provider,
             &config,
@@ -16359,11 +16365,13 @@ mod tests {
         config.read_only = false;
         config.tool_result_budget_bytes = 0;
 
+        // skills: the typed `skillList` surfaces the same packs the flat
+        // `skill_list` returns (an empty fixture -> empty list either way).
         let gql_skills = graphql_tool_call(
             &provider,
             &config,
             "graphql_query",
-            "query{ skillList }",
+            "query{ skillList { packContentHash status title } }",
             Value::Null,
         );
         assert_no_graphql_errors(&gql_skills);
@@ -16373,16 +16381,26 @@ mod tests {
             "skill_list",
             json!({ "tenant": "smoke" }),
         );
+        let typed_pack_count = gql_skills["data"]["skillList"]
+            .as_array()
+            .map(|packs| packs.len())
+            .unwrap_or(0);
+        let flat_pack_count = flat_skills["packs"]
+            .as_array()
+            .map(|packs| packs.len())
+            .unwrap_or(0);
         assert_eq!(
-            gql_skills["data"]["skillList"], flat_skills,
-            "skillList must match flat skill_list"
+            typed_pack_count, flat_pack_count,
+            "typed skillList must surface the same pack count as flat skill_list: {gql_skills} / {flat_skills}"
         );
 
+        // harness-run: a missing run resolves to null, mirroring the flat tool's
+        // found:false.
         let gql_run = graphql_tool_call(
             &provider,
             &config,
             "graphql_query",
-            "query{ harnessRun(runId:\"missing\") }",
+            "query{ harnessRun(runId:\"missing\"){ runId status } }",
             Value::Null,
         );
         assert_no_graphql_errors(&gql_run);
@@ -16393,8 +16411,13 @@ mod tests {
             json!({ "tenant": "smoke", "run_id": "missing" }),
         );
         assert_eq!(
-            gql_run["data"]["harnessRun"], flat_run,
-            "harnessRun must match flat harness_run"
+            flat_run["found"],
+            json!(false),
+            "flat harness_run must report the missing run as not found"
+        );
+        assert!(
+            gql_run["data"]["harnessRun"].is_null(),
+            "typed harnessRun must be null when the flat tool reports found:false: {gql_run}"
         );
 
         // jobs: the dispatch board is RedCore-backed; the in-memory fixture does not
@@ -16405,7 +16428,7 @@ mod tests {
             &provider,
             &config,
             "graphql_query",
-            "query{ jobList }",
+            "query{ jobList { jobId } }",
             Value::Null,
         );
         assert!(
@@ -16437,11 +16460,11 @@ mod tests {
             &provider,
             &config,
             "graphql_mutate",
-            "mutation($i:JSON!){ ensembleRegister(input:$i) }",
+            "mutation($i:JSON!){ ensembleRegister(input:$i){ packContentHash } }",
             json!({ "i": { "pack": sample_capability_pack(), "source_content_hash": "hash-source", "artifact_hashes": ["hash-artifact"] } }),
         );
         assert_no_graphql_errors(&registered);
-        let pack_hash = registered["data"]["ensembleRegister"]["pack"]["pack_content_hash"]
+        let pack_hash = registered["data"]["ensembleRegister"]["packContentHash"]
             .as_str()
             .expect("registered pack hash")
             .to_string();
@@ -16454,21 +16477,22 @@ mod tests {
             &provider,
             &config,
             "graphql_query",
-            "query($i:JSON!){ ensembleSelect(input:$i) }",
+            "query($i:JSON!){ ensembleSelect(input:$i){ selected { packContentHash } } }",
             json!({ "i": { "task": "use rust graph store mcp code search", "kind": "skill_pack", "max_selected": 1 } }),
         );
         assert_no_graphql_errors(&selected);
         assert_eq!(
-            selected["data"]["ensembleSelect"]["decision"]["selected"][0]["pack_content_hash"],
+            selected["data"]["ensembleSelect"]["selected"][0]["packContentHash"],
             json!(pack_hash),
-            "ensembleSelect must select the registered pack: {selected}"
+            "ensembleSelect must select the registered pack via the typed field: {selected}"
         );
     }
 
     // A6.3: SDL exposes the cluster domains (reads + mutations), no tenant arg.
     #[test]
     fn graphql_introspect_exposes_cluster_domains() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.tool_result_budget_bytes = 0;
         let sdl = call_tool_json(
             &provider,
             &config,
