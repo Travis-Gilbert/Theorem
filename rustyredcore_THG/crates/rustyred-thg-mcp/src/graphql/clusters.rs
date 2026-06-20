@@ -79,6 +79,11 @@ fn arr<'a>(value: &'a Value, keys: &[&str]) -> Vec<&'a Value> {
         .unwrap_or_default()
 }
 
+/// The free-form JSON value at `key` (Null when absent), as the GraphQL scalar.
+fn json_at(value: &Value, key: &str) -> Json {
+    Json(value.get(key).cloned().unwrap_or(Value::Null))
+}
+
 /// Merge optional typed key/values into a fresh args object (only set ones).
 fn args_from(pairs: Vec<(&str, Option<Value>)>) -> Value {
     let mut args = json!({});
@@ -111,6 +116,16 @@ pub struct SkillPack {
     pub published_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// The full pack body/instructions, as advertised by the flat skill tool. A
+    /// GraphQL-only caller (flat tools hidden under graphql_default_surface) must
+    /// still be able to read the contract it selected.
+    pub pack: Json,
+    /// The pack's validator contract.
+    pub validators: Json,
+    /// Declared artifacts payload.
+    pub artifacts: Json,
+    /// Free-form pack metadata.
+    pub metadata: Json,
 }
 
 impl SkillPack {
@@ -128,6 +143,10 @@ impl SkillPack {
             published_by: s(value, &["published_by", "publishedBy"]),
             created_at: s_or(value, &["created_at", "createdAt"]),
             updated_at: s_or(value, &["updated_at", "updatedAt"]),
+            pack: json_at(value, "pack"),
+            validators: json_at(value, "validators"),
+            artifacts: json_at(value, "artifacts"),
+            metadata: json_at(value, "metadata"),
         }
     }
 }
@@ -386,6 +405,11 @@ pub struct HarnessEvent {
     pub event_type: String,
     pub created_at: String,
     pub state_hash_after: Option<String>,
+    /// The transition payload. Required to replay/audit a run through GraphQL
+    /// when the flat harness_run tool is hidden under graphql_default_surface.
+    pub payload: Json,
+    pub state_hash_before: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 impl HarnessEvent {
@@ -397,6 +421,9 @@ impl HarnessEvent {
             event_type: s_or(value, &["type", "event_type", "eventType"]),
             created_at: s_or(value, &["created_at", "createdAt"]),
             state_hash_after: s(value, &["state_hash_after", "stateHashAfter"]),
+            payload: json_at(value, "payload"),
+            state_hash_before: s(value, &["state_hash_before", "stateHashBefore"]),
+            idempotency_key: s(value, &["idempotency_key", "idempotencyKey"]),
         }
     }
 }
@@ -670,7 +697,11 @@ mod tests {
             "artifact_hashes": ["sha256:art"],
             "published_by": "claude-code",
             "created_at": "t0",
-            "updated_at": "t1"
+            "updated_at": "t1",
+            "pack": { "instructions": "use the graph store" },
+            "validators": [ { "kind": "native", "id": "v1" } ],
+            "artifacts": { "bundle": "sha256:bundle" },
+            "metadata": { "source": "fixture" }
         });
         let pack = SkillPack::from_value(&value);
         assert_eq!(pack.pack_content_hash, "sha256:abc");
@@ -680,6 +711,12 @@ mod tests {
         assert_eq!(pack.source_content_hash.as_deref(), Some("sha256:src"));
         assert_eq!(pack.artifact_hashes, vec!["sha256:art"]);
         assert_eq!(pack.published_by.as_deref(), Some("claude-code"));
+        // The pack contract must survive the typed projection (it is the only
+        // surface under graphql_default_surface).
+        assert_eq!(pack.pack.0["instructions"], json!("use the graph store"));
+        assert_eq!(pack.validators.0[0]["id"], json!("v1"));
+        assert_eq!(pack.artifacts.0["bundle"], json!("sha256:bundle"));
+        assert_eq!(pack.metadata.0["source"], json!("fixture"));
     }
 
     #[test]
@@ -765,7 +802,7 @@ mod tests {
             "found": true,
             "detail": {
                 "run": { "run_id": "run-1", "task": "ship", "actor": "claude-code", "status": "running", "last_event_seq": 2, "created_at": "t0", "updated_at": "t1" },
-                "events": [ { "event_id": "e1", "run_id": "run-1", "seq": 1, "type": "created", "created_at": "t0", "state_hash_after": "h1" } ]
+                "events": [ { "event_id": "e1", "run_id": "run-1", "seq": 1, "type": "created", "created_at": "t0", "state_hash_before": "h0", "state_hash_after": "h1", "idempotency_key": "idem-1", "payload": { "delta": 7 } } ]
             }
         });
         let run = HarnessRun::from_envelope(&present).expect("present run");
@@ -775,6 +812,10 @@ mod tests {
         assert_eq!(run.events.len(), 1);
         assert_eq!(run.events[0].event_type, "created");
         assert_eq!(run.events[0].seq, 1);
+        // Replay fields must survive: payload, both state hashes, idempotency key.
+        assert_eq!(run.events[0].payload.0["delta"], json!(7));
+        assert_eq!(run.events[0].state_hash_before.as_deref(), Some("h0"));
+        assert_eq!(run.events[0].idempotency_key.as_deref(), Some("idem-1"));
     }
 
     // ---- R3: round-trips through `execute_graphql` over a real in-process store ----
