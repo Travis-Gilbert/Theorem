@@ -432,14 +432,14 @@ pub fn rank_global_completion_candidates(
         }
 
         let seed_id = &graph.node_ids[seed_idx];
-        for target_idx in 0..num_nodes {
+        for (target_idx, target_hidden) in hidden.iter().enumerate().take(num_nodes) {
             if target_idx == seed_idx {
                 continue;
             }
             if direct_pairs.contains(&(seed_idx, target_idx)) {
                 continue;
             }
-            if l1_norm(&hidden[target_idx]) <= ACTIVATION_EPSILON {
+            if l1_norm(target_hidden) <= ACTIVATION_EPSILON {
                 continue;
             }
             let Some(support) =
@@ -448,7 +448,7 @@ pub fn rank_global_completion_candidates(
                 continue;
             };
             let activation = sigmoid(
-                config.score_bias + config.score_scale * dot(&hidden[target_idx], &readout).abs(),
+                config.score_bias + config.score_scale * dot(target_hidden, &readout).abs(),
             );
             let raw_confidence = (activation * support.confidence).clamp(0.0, 1.0);
             let confidence = raw_confidence.min(request.confidence_ceiling);

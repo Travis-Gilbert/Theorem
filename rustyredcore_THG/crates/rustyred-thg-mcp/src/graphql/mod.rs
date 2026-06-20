@@ -85,14 +85,18 @@ mod code;
 mod coordination;
 mod epistemic;
 mod graph;
+mod items;
 mod kg;
 mod memory;
+pub mod projection;
 mod scalars;
 
+use std::collections::BTreeMap;
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
 use async_graphql::{EmptyMutation, EmptySubscription, MergedObject, Request, Schema, Variables};
+use rustyred_thg_core::{NodeQuery, NodeRecord};
 use serde_json::{json, Value};
 
 use crate::{McpError, McpGraphBackend};
@@ -107,6 +111,7 @@ pub(crate) trait GraphqlInvoker {
     fn recall(&self, args: Value) -> Result<Value, McpError>;
     fn relate(&self, args: Value) -> Result<Value, McpError>;
     fn get_doc(&self, id: &str) -> Result<Option<Value>, McpError>;
+    fn item_projection_nodes(&self, limit: usize) -> Result<Vec<NodeRecord>, McpError>;
     fn archive_recall(&self, args: Value) -> Result<Value, McpError>;
     fn remember(&self, args: Value) -> Result<Value, McpError>;
     fn encode(&self, args: Value) -> Result<Value, McpError>;
@@ -224,6 +229,17 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
     fn get_doc(&self, id: &str) -> Result<Option<Value>, McpError> {
         let node = self.backend.borrow().get_node(id)?;
         Ok(node.map(|node| serde_json::to_value(node).unwrap_or(Value::Null)))
+    }
+    fn item_projection_nodes(&self, limit: usize) -> Result<Vec<NodeRecord>, McpError> {
+        let limit = limit.max(1);
+        let backend = self.backend.borrow();
+        let mut by_id = BTreeMap::new();
+        for label in projection::ITEM_SOURCE_LABELS {
+            for node in backend.query_nodes(NodeQuery::label(*label).with_limit(limit))? {
+                by_id.entry(node.id.clone()).or_insert(node);
+            }
+        }
+        Ok(by_id.into_values().take(limit).collect())
     }
     fn archive_recall(&self, args: Value) -> Result<Value, McpError> {
         crate::recall_archived_memory_payload(&self.tenant, &mut *self.backend.borrow_mut(), &args)
@@ -444,6 +460,7 @@ pub(crate) struct QueryRoot(
     code::CodeQuery,
     kg::HarnessKgQuery,
     clusters::ClustersQuery,
+    items::ItemQuery,
 );
 
 #[derive(MergedObject, Default)]
@@ -527,7 +544,7 @@ pub(crate) fn graphql_tool_definitions(include_mutations: bool) -> Vec<Value> {
     let mut tools = vec![
         crate::tool(
             "graphql_query",
-            "Run a GraphQL QUERY (read) over the typed Harness schema: Memory domain, Graph domain (graphAlgorithm, graphNode, neighbors, graphSchema, vectorSearch, vectorHybrid, fulltextSearch, spatialRadius, spatialBbox, and symbolic fields), and Coordination domain (coordinationRoom, coordinationStream, workGraph, nextTaskNode). Read-only: mutation operations are refused (use graphql_mutate). Tenant is the connection tenant, not a field argument.",
+            "Run a GraphQL QUERY (read) over the typed Harness schema: Items (items, itemsByKind, item), Memory domain, Graph domain (graphAlgorithm, graphNode, neighbors, graphSchema, vectorSearch, vectorHybrid, fulltextSearch, spatialRadius, spatialBbox, and symbolic fields), and Coordination domain (coordinationRoom, coordinationStream, workGraph, nextTaskNode). Read-only: mutation operations are refused (use graphql_mutate). Tenant is the connection tenant, not a field argument.",
             graphql_input_schema(),
         ),
         crate::tool(

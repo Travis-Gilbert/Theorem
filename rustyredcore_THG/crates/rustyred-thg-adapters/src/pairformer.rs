@@ -325,9 +325,9 @@ fn triangle_multiplicative_update_outgoing(pair: &mut PairGrid, config: &Pairfor
         for target_idx in 0..node_count {
             for dim_idx in 0..config.pair_dim {
                 let mut sum = 0.0;
-                for pivot_idx in 0..node_count {
-                    sum += original[source_idx][pivot_idx][dim_idx]
-                        * original[pivot_idx][target_idx][dim_idx];
+                for (pivot_idx, pivot_row) in original.iter().enumerate().take(node_count) {
+                    sum +=
+                        original[source_idx][pivot_idx][dim_idx] * pivot_row[target_idx][dim_idx];
                 }
                 pair[source_idx][target_idx][dim_idx] += config.triangle_update_scale * sum / norm;
             }
@@ -344,9 +344,9 @@ fn triangle_multiplicative_update_incoming(pair: &mut PairGrid, config: &Pairfor
         for target_idx in 0..node_count {
             for dim_idx in 0..config.pair_dim {
                 let mut sum = 0.0;
-                for pivot_idx in 0..node_count {
-                    sum += original[pivot_idx][source_idx][dim_idx]
-                        * original[target_idx][pivot_idx][dim_idx];
+                for (pivot_idx, pivot_row) in original.iter().enumerate().take(node_count) {
+                    sum +=
+                        pivot_row[source_idx][dim_idx] * original[target_idx][pivot_idx][dim_idx];
                 }
                 pair[source_idx][target_idx][dim_idx] += config.triangle_update_scale * sum / norm;
             }
@@ -363,17 +363,16 @@ fn triangle_attention_starting_node(pair: &mut PairGrid, config: &PairformerConf
         for target_idx in 0..node_count {
             let query = &original[source_idx][target_idx];
             let mut logits = Vec::with_capacity(node_count);
-            for pivot_idx in 0..node_count {
+            for (pivot_idx, source_pair) in original[source_idx].iter().enumerate().take(node_count)
+            {
                 let pair_bias = mean(&original[target_idx][pivot_idx]) * 0.25;
-                logits.push(dot(query, &original[source_idx][pivot_idx]) / norm + pair_bias);
+                logits.push(dot(query, source_pair) / norm + pair_bias);
             }
             let weights = softmax(&logits);
             let mut attended = vec![0.0; config.pair_dim];
-            for pivot_idx in 0..node_count {
-                for (slot, value) in attended
-                    .iter_mut()
-                    .zip(original[source_idx][pivot_idx].iter())
-                {
+            for (pivot_idx, source_pair) in original[source_idx].iter().enumerate().take(node_count)
+            {
+                for (slot, value) in attended.iter_mut().zip(source_pair.iter()) {
                     *slot += weights[pivot_idx] * value;
                 }
             }
@@ -393,17 +392,14 @@ fn triangle_attention_ending_node(pair: &mut PairGrid, config: &PairformerConfig
         for target_idx in 0..node_count {
             let query = &original[source_idx][target_idx];
             let mut logits = Vec::with_capacity(node_count);
-            for pivot_idx in 0..node_count {
-                let pair_bias = mean(&original[pivot_idx][source_idx]) * 0.25;
-                logits.push(dot(query, &original[pivot_idx][target_idx]) / norm + pair_bias);
+            for pivot_row in original.iter().take(node_count) {
+                let pair_bias = mean(&pivot_row[source_idx]) * 0.25;
+                logits.push(dot(query, &pivot_row[target_idx]) / norm + pair_bias);
             }
             let weights = softmax(&logits);
             let mut attended = vec![0.0; config.pair_dim];
-            for pivot_idx in 0..node_count {
-                for (slot, value) in attended
-                    .iter_mut()
-                    .zip(original[pivot_idx][target_idx].iter())
-                {
+            for (pivot_idx, pivot_row) in original.iter().enumerate().take(node_count) {
+                for (slot, value) in attended.iter_mut().zip(pivot_row[target_idx].iter()) {
                     *slot += weights[pivot_idx] * value;
                 }
             }
@@ -593,14 +589,14 @@ fn swiglu_transition(input: &[f32], output_dim: usize, hidden_dim: usize) -> Vec
     let hidden_dim = hidden_dim.max(output_dim).max(1);
     let norm = (hidden_dim as f32).sqrt().max(1.0);
     let mut hidden = vec![0.0; hidden_dim];
-    for hidden_idx in 0..hidden_dim {
+    for (hidden_idx, slot) in hidden.iter_mut().enumerate().take(hidden_dim) {
         let left = deterministic_projection(input, hidden_idx, 11);
         let gate = deterministic_projection(input, hidden_idx, 37);
-        hidden[hidden_idx] = silu(left) * gate;
+        *slot = silu(left) * gate;
     }
 
     let mut out = vec![0.0; output_dim];
-    for dim_idx in 0..output_dim {
+    for (dim_idx, slot) in out.iter_mut().enumerate().take(output_dim) {
         let mut sum = 0.0;
         for (hidden_idx, value) in hidden.iter().enumerate() {
             let sign = if (hidden_idx + dim_idx) % 2 == 0 {
@@ -611,7 +607,7 @@ fn swiglu_transition(input: &[f32], output_dim: usize, hidden_dim: usize) -> Vec
             let weight = sign * (0.5 + stable_noise("swiglu", hidden_idx + dim_idx).abs());
             sum += value * weight;
         }
-        out[dim_idx] = sum / norm;
+        *slot = sum / norm;
     }
     out
 }

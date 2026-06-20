@@ -64,11 +64,11 @@ function RailLink({ item, active }: { item: NavItem; active: boolean }) {
       className={cn(
         "relative flex items-center gap-2.5 rounded-md px-2.5 py-1.5 font-mono text-label transition-colors",
         active
-          ? "bg-[var(--ox-tint)] text-ink before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-ox before:content-['']"
-          : "text-muted-foreground hover:bg-surface-2 hover:text-ink",
+          ? "bg-[var(--rail-accent-tint)] text-[var(--rail-ink)] before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-[var(--rail-accent)] before:content-['']"
+          : "text-[var(--rail-muted)] hover:bg-[var(--rail-bg-2)] hover:text-[var(--rail-ink)]",
       )}
     >
-      <Icon size={15} className={active ? "text-ox" : ""} />
+      <Icon size={15} className={active ? "text-[var(--rail-accent)]" : ""} />
       {item.label}
     </Link>
   );
@@ -82,7 +82,7 @@ export function Rail({ horizontal = false }: { horizontal?: boolean }) {
     // Below 820px the rail collapses to a horizontal scrollable strip.
     const all = [...TOP, ...GROUPS.flatMap((g) => g.items)];
     return (
-      <nav className="flex w-full items-center gap-1 overflow-x-auto border-b border-line bg-surface px-2 py-2">
+      <nav className="rail-shell flex w-full items-center gap-1 overflow-x-auto border-b border-[var(--rail-line)] bg-[var(--rail-bg)] px-2 py-2">
         {all.map((item) => (
           <div key={item.href} className="shrink-0">
             <RailLink item={item} active={isActive(item.href)} />
@@ -94,20 +94,20 @@ export function Rail({ horizontal = false }: { horizontal?: boolean }) {
 
   return (
     <aside
-      className="z-20 hidden h-full shrink-0 flex-col border-r border-line bg-surface md:flex"
+      className="rail-shell z-20 hidden h-full shrink-0 flex-col border-r border-[var(--rail-line)] bg-[var(--rail-bg)] md:flex"
       style={{ width: "var(--rail-w)" }}
     >
       <div className="flex items-center gap-2 px-3 py-3">
         <div className="grid h-7 w-7 place-items-center rounded-md bg-ox font-mono text-[13px] font-bold text-white">
           H
         </div>
-        <span className="font-title text-subhead text-ink">Harness</span>
+        <span className="font-title text-subhead text-[var(--rail-ink)]">Harness</span>
       </div>
 
       {/* tenant selector */}
-      <button className="mx-3 mb-2 flex items-center justify-between rounded-md border border-line bg-bg px-2.5 py-1.5 font-mono text-label text-ink hover:bg-surface-2">
+      <button className="mx-3 mb-2 flex items-center justify-between rounded-md border border-[var(--rail-line)] bg-[var(--rail-bg-2)] px-2.5 py-1.5 font-mono text-label text-[var(--rail-ink)] hover:bg-[var(--rail-bg-3)]">
         <span className="truncate">{process.env.NEXT_PUBLIC_DEFAULT_TENANT ?? "default"}</span>
-        <ChevronDown size={13} className="text-muted-foreground" />
+        <ChevronDown size={13} className="text-[var(--rail-muted)]" />
       </button>
 
       <nav className="flex flex-1 flex-col gap-0.5 overflow-y-auto px-3 pb-2">

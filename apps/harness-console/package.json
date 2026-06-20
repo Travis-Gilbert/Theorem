@@ -8,7 +8,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint .",
+    "lint": "eslint . && npm run lint:design-math",
+    "lint:design-math": "node scripts/check-design-math.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -31,6 +32,7 @@
     "@radix-ui/react-tooltip": "^1.1.3",
     "@uiw/react-codemirror": "^4.23.6",
     "@xyflow/react": "^12.11.0",
+    "animejs": "^4.4.1",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "cmdk": "^1.0.4",

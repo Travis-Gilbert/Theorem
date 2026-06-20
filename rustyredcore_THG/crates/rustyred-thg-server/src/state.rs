@@ -12,15 +12,16 @@ use rustyred_thg_core::{
     make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
     EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
     GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
-    HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
-    SpatialDesignation, VectorDesignation, VerifyReport,
+    coalesce_per_id, GraphTransaction, GraphWriteResult, HookContext, HookDispatcher,
+    HookDispatcherConfig, HookHandler, HookOutcome, HookRegistration, HookStoreAccess,
+    HybridScoringConfig, InMemoryGraphStore, MutationEvent, MutationKind, MutationMatcher,
+    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions,
+    RedisGraphStore, SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
-    AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
-    McpServerConfig,
+    project_mutation_event, AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend,
+    McpGraphProvider, McpServerConfig, ITEM_SOURCE_LABELS,
 };
 use rustyred_web::{
     configured_search_providers_from_env, FetchCascade, FetchCascadeOptions, LiveFetchOptions,
@@ -37,6 +38,7 @@ use theorem_harness_runtime::{
     run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError, JobNoteInput,
     ProviderHeadInvoker,
 };
+use tokio::sync::broadcast;
 
 use crate::browser_pool::{BrowserLiveSessionRecord, LiveBrowserPool, RemoteBrowserPool};
 use crate::config::{Config, StorageMode};
@@ -80,6 +82,7 @@ pub struct AppState {
     live_browser_pool: Arc<RwLock<Option<Arc<dyn LiveBrowserPool>>>>,
     live_browser_sessions: Arc<Mutex<BTreeMap<String, BrowserLiveSessionRecord>>>,
     search_providers: Arc<RwLock<Vec<Arc<dyn SearchProvider>>>>,
+    item_change_tx: broadcast::Sender<Value>,
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
     fulltext_indexes: Arc<Mutex<FullTextIndexes>>,
@@ -114,6 +117,7 @@ impl AppState {
         .expect("default live fetch cascade options must build");
         let live_browser_pool =
             RemoteBrowserPool::from_env().map(|pool| Arc::new(pool) as Arc<dyn LiveBrowserPool>);
+        let (item_change_tx, _) = broadcast::channel(1024);
         Self {
             config: Arc::new(config),
             observability,
@@ -125,6 +129,7 @@ impl AppState {
             live_browser_pool: Arc::new(RwLock::new(live_browser_pool)),
             live_browser_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             search_providers: Arc::new(RwLock::new(search_providers)),
+            item_change_tx,
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -143,6 +148,10 @@ impl AppState {
         if let Ok(mut live_browser_pool) = self.live_browser_pool.write() {
             *live_browser_pool = pool;
         }
+    }
+
+    pub fn subscribe_item_changes(&self) -> broadcast::Receiver<Value> {
+        self.item_change_tx.subscribe()
     }
 
     pub fn live_browser_session(&self, run_id: &str) -> Option<BrowserLiveSessionRecord> {
@@ -730,13 +739,11 @@ impl AppState {
             RedCoreGraphStore::open(data_dir, options)?,
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if graph_hooks_enabled() {
-            if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
-                eprintln!(
-                    "[theorem] enable graph hooks failed for {tenant_id}: {}",
-                    err.message
-                );
-            }
+        if let Err(err) = store.enable_graph_hooks(self.graph_hook_registrations(), tenant_id) {
+            eprintln!(
+                "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                err.message
+            );
         }
         stores.insert(safe_tenant, store.clone());
         Ok(store)
@@ -759,13 +766,11 @@ impl AppState {
             RedCoreGraphStore::memory(),
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if graph_hooks_enabled() {
-            if let Err(err) = store.enable_graph_hooks(rustyred_web::crawl_hooks(), tenant_id) {
-                eprintln!(
-                    "[theorem] enable graph hooks failed for {tenant_id}: {}",
-                    err.message
-                );
-            }
+        if let Err(err) = store.enable_graph_hooks(self.graph_hook_registrations(), tenant_id) {
+            eprintln!(
+                "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                err.message
+            );
         }
         stores.insert(safe_tenant, store.clone());
         Ok(store)
@@ -796,6 +801,40 @@ impl AppState {
             .map(|(tenant, executor)| (tenant.clone(), executor.clone()))
             .collect())
     }
+
+    fn graph_hook_registrations(&self) -> Vec<HookRegistration> {
+        let mut registrations = vec![item_changefeed_hook(self.item_change_tx.clone())];
+        if graph_hooks_enabled() {
+            registrations.extend(rustyred_web::crawl_hooks());
+        }
+        registrations
+    }
+}
+
+fn item_changefeed_hook(sender: broadcast::Sender<Value>) -> HookRegistration {
+    let handler: HookHandler =
+        Arc::new(move |ctx: &mut HookContext, events: &[MutationEvent]| {
+            for event in events {
+                let node = if matches!(event.kind, MutationKind::NodeDeleted) {
+                    None
+                } else {
+                    ctx.store.get_node_record(&event.id)
+                };
+                if let Some(delta) = project_mutation_event(event, node.as_ref()) {
+                    let _ = sender.send(json!(delta));
+                }
+            }
+            Ok(HookOutcome::Done)
+        });
+
+    HookRegistration::new(
+        "theorem.item_changefeed",
+        MutationMatcher::any()
+            .with_kinds([MutationKind::NodeUpserted, MutationKind::NodeDeleted])
+            .with_labels(ITEM_SOURCE_LABELS.iter().copied()),
+        coalesce_per_id,
+        handler,
+    )
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -857,9 +896,9 @@ impl From<GraphStoreError> for StoreAccessError {
     }
 }
 
-/// Whether per-tenant stores auto-attach graph-level hooks. Default off so a
-/// deploy is a deliberate flag flip, not a silent behavior change. Truthy:
-/// `1`/`true`/`on`/`yes`.
+/// Whether per-tenant stores auto-attach optional web-crawl graph hooks. The
+/// Item changefeed hook is product-critical and always attaches; crawl hooks
+/// remain a deliberate flag flip. Truthy: `1`/`true`/`on`/`yes`.
 fn graph_hooks_enabled() -> bool {
     std::env::var("THEOREM_GRAPH_HOOKS")
         .map(|raw| {
