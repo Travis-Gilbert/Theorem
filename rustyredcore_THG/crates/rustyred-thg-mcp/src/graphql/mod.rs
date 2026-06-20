@@ -537,11 +537,16 @@ pub(crate) fn graphql_tool_definitions(include_mutations: bool) -> Vec<Value> {
         ),
     ];
     if include_mutations {
-        tools.push(crate::tool_write(
+        let mut mutate = crate::tool_write(
             "graphql_mutate",
             "Run a GraphQL MUTATION (write) over the typed Harness schema: rememberMemory / reviseMemory / forgetMemory / createHandoff, Graph designate/bulk writes, and Coordination writes (writeCoordinationIntent, writeCoordinationRecord, publishCoordinationEvent, advanceCoordinationStream, createTaskNode, claimTaskNode).",
             graphql_input_schema(),
-        ));
+        );
+        // graphql_mutate is the single door for destructive writes (forgetMemory,
+        // jobArchive, reviseMemory): flag it so MCP clients can gate it. The shared
+        // `tool_write` default is non-destructive, which is right for additive writes.
+        mutate["annotations"]["destructiveHint"] = json!(true);
+        tools.push(mutate);
     }
     tools
 }
@@ -556,4 +561,58 @@ fn graphql_input_schema() -> Value {
         "required": ["query"],
         "additionalProperties": false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} not in graphql definitions"))
+    }
+
+    // The GraphQL mutate entry point is the single door for destructive writes
+    // (forgetMemory, jobArchive, reviseMemory, ...), so it must hint that it can
+    // perform destructive updates -- a Connectors-Directory-style annotation.
+    #[test]
+    fn graphql_mutate_is_annotated_destructive() {
+        let tools = graphql_tool_definitions(true);
+        let mutate = tool_named(&tools, "graphql_mutate");
+        // A destructive hint is only meaningful on a non-read-only tool, so the
+        // mutate door must be both: not read-only, and destructive.
+        assert_eq!(
+            mutate["annotations"]["readOnlyHint"],
+            json!(false),
+            "graphql_mutate is a write door and must not be read-only"
+        );
+        assert_eq!(
+            mutate["annotations"]["destructiveHint"],
+            json!(true),
+            "graphql_mutate must hint that it can perform destructive updates"
+        );
+    }
+
+    // Guard: the two read entry points (query + the schema/introspect door) are
+    // annotated read-only, so a Connectors-Directory client can surface them
+    // without a write-gate.
+    #[test]
+    fn graphql_read_tools_are_annotated_read_only() {
+        let tools = graphql_tool_definitions(true);
+        for name in ["graphql_query", "graphql_introspect"] {
+            let tool = tool_named(&tools, name);
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"],
+                json!(true),
+                "{name} must be annotated read-only"
+            );
+            assert_eq!(
+                tool["annotations"]["destructiveHint"],
+                json!(false),
+                "{name} is a read door and must not be flagged destructive"
+            );
+        }
+    }
 }
