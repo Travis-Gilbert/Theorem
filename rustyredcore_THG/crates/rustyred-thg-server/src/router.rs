@@ -482,6 +482,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/tenants/:tenant_id/command", post(command))
         .route("/v1/tenants/:tenant_id/batch", post(batch))
         .route("/v1/tenants/:tenant_id/runs/:run_id", get(run_get))
+        .route(
+            "/v1/tenants/:tenant_id/items/events",
+            get(crate::items_changefeed::tenant_items_events),
+        )
         .route("/v1/tenants/:tenant_id/graph/query", post(graph_query))
         .route(
             "/v1/tenants/:tenant_id/graph/nodes",

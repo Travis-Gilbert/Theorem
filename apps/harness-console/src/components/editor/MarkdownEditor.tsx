@@ -19,7 +19,7 @@ export type EditorLanguage = "markdown" | "javascript" | "typescript" | "rust" |
 // Calm, light theme keyed to the console tokens. Muted syntax, hairline gutter.
 const calmTheme = EditorView.theme({
   "&": { backgroundColor: "transparent", color: "var(--ink)", fontSize: "13.5px" },
-  ".cm-content": { fontFamily: "var(--font-plex-mono), monospace", padding: "12px 0" },
+  ".cm-content": { fontFamily: "var(--font-plex-mono), monospace", padding: "var(--space-3) 0" },
   ".cm-gutters": { backgroundColor: "transparent", color: "var(--faint)", border: "none" },
   ".cm-activeLine": { backgroundColor: "var(--surface)" },
   ".cm-activeLineGutter": { backgroundColor: "transparent" },

@@ -95,10 +95,10 @@ use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
 use async_graphql::{EmptyMutation, EmptySubscription, MergedObject, Request, Schema, Variables};
+use rustyred_thg_core::{NodeQuery, NodeRecord};
 use serde_json::{json, Value};
 
 use crate::{McpError, McpGraphBackend};
-use rustyred_thg_core::{NodeQuery, NodeRecord};
 
 // ---------------------------------------------------------------------------
 // The scoped invoker: how resolvers reach the live backend.
@@ -603,7 +603,7 @@ pub(crate) fn graphql_tool_definitions(include_mutations: bool) -> Vec<Value> {
     let mut tools = vec![
         crate::tool(
             "graphql_query",
-            "Run a GraphQL QUERY (read) over the typed Harness schema: Memory domain, Graph domain (graphAlgorithm, graphNode, neighbors, graphSchema, vectorSearch, vectorHybrid, fulltextSearch, spatialRadius, spatialBbox, and symbolic fields), and Coordination domain (coordinationRoom, coordinationStream, workGraph, nextTaskNode). Read-only: mutation operations are refused (use graphql_mutate). Tenant is the connection tenant, not a field argument.",
+            "Run a GraphQL QUERY (read) over the typed Harness schema: Items (items, itemsByKind, item), Memory domain, Graph domain (graphAlgorithm, graphNode, neighbors, graphSchema, vectorSearch, vectorHybrid, fulltextSearch, spatialRadius, spatialBbox, and symbolic fields), and Coordination domain (coordinationRoom, coordinationStream, workGraph, nextTaskNode). Read-only: mutation operations are refused (use graphql_mutate). Tenant is the connection tenant, not a field argument.",
             graphql_input_schema(),
         ),
         crate::tool(

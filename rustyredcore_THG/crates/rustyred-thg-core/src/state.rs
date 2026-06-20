@@ -4,12 +4,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::stream::StreamStore;
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ThgState {
     pub seq: u64,
     pub runs: OrdMap<String, RunState>,
     pub contexts: OrdMap<String, ContextState>,
     pub patches: OrdMap<String, PatchState>,
+    /// Append-only coordination streams: the live awareness channel that
+    /// replaces turn-start room polling. Persisted and hashed with the rest of
+    /// the harness state so cursors survive restarts and every publish advances
+    /// the state hash.
+    #[serde(default)]
+    pub streams: StreamStore,
 }
 
 impl ThgState {

@@ -31,6 +31,11 @@ pub enum ThgCommand {
     AdaptersFitnessRecord,
     AdaptersList,
     AdaptersSupersede,
+    StreamPublish,
+    StreamRead,
+    StreamSubscribe,
+    StreamUnsubscribe,
+    StreamMentions,
 }
 
 impl ThgCommand {
@@ -62,6 +67,11 @@ impl ThgCommand {
             "RUSTYRED_THG.ADAPTERS.FITNESS.RECORD" => Ok(Self::AdaptersFitnessRecord),
             "RUSTYRED_THG.ADAPTERS.LIST" => Ok(Self::AdaptersList),
             "RUSTYRED_THG.ADAPTERS.SUPERSEDE" => Ok(Self::AdaptersSupersede),
+            "RUSTYRED_THG.STREAM.PUBLISH" => Ok(Self::StreamPublish),
+            "RUSTYRED_THG.STREAM.READ" => Ok(Self::StreamRead),
+            "RUSTYRED_THG.STREAM.SUBSCRIBE" => Ok(Self::StreamSubscribe),
+            "RUSTYRED_THG.STREAM.UNSUBSCRIBE" => Ok(Self::StreamUnsubscribe),
+            "RUSTYRED_THG.STREAM.MENTIONS" => Ok(Self::StreamMentions),
             _ => Err(ThgError::unsupported_command(name)),
         }
     }
@@ -92,6 +102,11 @@ impl ThgCommand {
             Self::AdaptersFitnessRecord => "RUSTYRED_THG.ADAPTERS.FITNESS.RECORD",
             Self::AdaptersList => "RUSTYRED_THG.ADAPTERS.LIST",
             Self::AdaptersSupersede => "RUSTYRED_THG.ADAPTERS.SUPERSEDE",
+            Self::StreamPublish => "RUSTYRED_THG.STREAM.PUBLISH",
+            Self::StreamRead => "RUSTYRED_THG.STREAM.READ",
+            Self::StreamSubscribe => "RUSTYRED_THG.STREAM.SUBSCRIBE",
+            Self::StreamUnsubscribe => "RUSTYRED_THG.STREAM.UNSUBSCRIBE",
+            Self::StreamMentions => "RUSTYRED_THG.STREAM.MENTIONS",
         }
     }
 }

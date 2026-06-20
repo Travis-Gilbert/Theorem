@@ -21,11 +21,11 @@ import { useIsClient } from "@/lib/hooks/useIsClient";
  */
 
 const HUMAN: Participant = { name: "You", color: "#1a1a1d" };
-const AGENT: Participant = { name: "Theorem agent", color: "#8a2e29" };
+const AGENT: Participant = { name: "Theorem agent", color: "#a8301e" };
 
 const cmTheme = EditorView.theme({
   "&": { backgroundColor: "transparent", color: "var(--ink)", fontSize: "13.5px" },
-  ".cm-content": { fontFamily: "var(--font-plex-mono), monospace", padding: "12px 0" },
+  ".cm-content": { fontFamily: "var(--font-plex-mono), monospace", padding: "var(--space-3) 0" },
   ".cm-gutters": { backgroundColor: "transparent", color: "var(--faint)", border: "none" },
   ".cm-activeLine": { backgroundColor: "var(--surface)" },
   "&.cm-focused": { outline: "none" },

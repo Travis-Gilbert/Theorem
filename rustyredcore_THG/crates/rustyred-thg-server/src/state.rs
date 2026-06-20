@@ -14,8 +14,8 @@ use rustyred_thg_core::{
     GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
     GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
     HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
-    SpatialDesignation, VectorDesignation, VerifyReport,
+    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions,
+    RedisGraphStore, SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
@@ -792,6 +792,7 @@ impl AppState {
             .map(|(tenant, executor)| (tenant.clone(), executor.clone()))
             .collect())
     }
+
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -853,9 +854,9 @@ impl From<GraphStoreError> for StoreAccessError {
     }
 }
 
-/// Whether per-tenant stores auto-attach graph-level hooks. Default off so a
-/// deploy is a deliberate flag flip, not a silent behavior change. Truthy:
-/// `1`/`true`/`on`/`yes`.
+/// Whether per-tenant stores auto-attach optional web-crawl graph hooks. The
+/// Item changefeed hook is product-critical and always attaches; crawl hooks
+/// remain a deliberate flag flip. Truthy: `1`/`true`/`on`/`yes`.
 fn graph_hooks_enabled() -> bool {
     std::env::var("THEOREM_GRAPH_HOOKS")
         .map(|raw| {

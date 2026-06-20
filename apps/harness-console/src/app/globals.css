@@ -9,7 +9,7 @@
  * palette, all as tokens. Discipline: tokens before pixels. Nothing freehand.
  *
  * Palette: white background, grey surfaces, black hairline outlines, one
- * oxblood accent #8A2E29, one status green #5f7d4f.
+ * oxblood accent #A8301E, one status green #5f7d4f.
  *
  * THE BRIDGE: `@theme inline` maps the standard shadcn semantic token names
  * (--color-background, --color-primary, --color-muted-foreground, ...) onto our
@@ -33,9 +33,9 @@
   --faint: #6f6f77; /* hints / placeholders (>=4.5:1 on bg, was #a3a3a9 = 2.5:1) */
   --line: rgba(17, 17, 19, 0.16); /* black hairline outlines, 1px */
   --line-strong: rgba(17, 17, 19, 0.28);
-  --ox: #8a2e29; /* the single accent, oxblood. 8.4:1 on white. */
-  --ox-tint: rgba(138, 46, 41, 0.08); /* faint accent wash for active nav */
-  --ox-ring: rgba(138, 46, 41, 0.4); /* focus ring */
+  --ox: #a8301e; /* the single accent, oxblood. 6.6:1 on white. */
+  --ox-tint: rgba(168, 48, 30, 0.08); /* faint accent wash for active nav */
+  --ox-ring: rgba(168, 48, 30, 0.4); /* focus ring */
   --live: #5f7d4f; /* the single status color, calm green */
   --warn: #9a6a1e; /* amber, used only for a missing provider key */
 
@@ -59,6 +59,7 @@
   --elev-2: 0 6px 24px rgba(17, 17, 19, 0.12), 0 2px 8px rgba(17, 17, 19, 0.08);
   --elev-3: 0 18px 56px rgba(17, 17, 19, 0.2), 0 8px 24px rgba(17, 17, 19, 0.12);
   --backdrop-blur: 8px;
+  --glow-border-width: 1.5px;
 
   /* --- Depth, Layer 2: surface materiality. --- */
   --grain-opacity: 0.03;
@@ -73,6 +74,14 @@
   /* --- Shell geometry --- */
   --rail-w: 228px;
   --topbar-h: 56px;
+  --rail-bg: #101014;
+  --rail-bg-2: #1b1b1f;
+  --rail-bg-3: #232328;
+  --rail-ink: #ededf0;
+  --rail-muted: #a6a6af;
+  --rail-line: rgba(237, 237, 240, 0.16);
+  --rail-accent: #c8554a;
+  --rail-accent-tint: rgba(200, 85, 74, 0.16);
 
   color-scheme: light;
 }
@@ -96,6 +105,14 @@
   --elev-3: 0 18px 56px rgba(0, 0, 0, 0.6), 0 8px 24px rgba(0, 0, 0, 0.5);
   --dot-color: 110, 110, 120;
   --dot-ink: 237, 237, 240;
+  --rail-bg: #101014;
+  --rail-bg-2: #1b1b1f;
+  --rail-bg-3: #232328;
+  --rail-ink: #ededf0;
+  --rail-muted: #a6a6af;
+  --rail-line: rgba(237, 237, 240, 0.16);
+  --rail-accent: #c8554a;
+  --rail-accent-tint: rgba(200, 85, 74, 0.16);
   color-scheme: dark;
 }
 
@@ -293,6 +310,10 @@
     color: var(--muted);
   }
 
+  .rail-shell .rail-group-label {
+    color: var(--rail-muted);
+  }
+
   .status-dot {
     width: 8px;
     height: 8px;
@@ -326,9 +347,9 @@
   .glow-border::before {
     content: "";
     position: absolute;
-    inset: -1.5px;
+    inset: calc(var(--glow-border-width) * -1);
     border-radius: inherit;
-    padding: 1.5px;
+    padding: var(--glow-border-width);
     background: conic-gradient(
       from var(--glow-angle),
       transparent 0deg,

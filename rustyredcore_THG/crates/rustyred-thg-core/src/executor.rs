@@ -11,6 +11,7 @@ use crate::state::{
     stable_hash, ContextState, PatchState, RunState, StepState, ThgEdge, ThgNode, ThgState,
 };
 use crate::store::ThgStore;
+use crate::stream::{StreamStore, StreamUrgency};
 
 pub trait ThgExecutor {
     fn execute(&mut self, command: ThgCommand, args: Value) -> ThgResult<ThgResponse>;
@@ -363,7 +364,7 @@ impl InMemoryThgExecutor {
                     command,
                     ThgError::new("invalid_graph_query", error.to_string()),
                     self.state_hash(),
-                )
+                );
             }
         };
         let operation = if query.label.is_some() || !query.properties.is_empty() {
@@ -399,7 +400,7 @@ impl InMemoryThgExecutor {
                     command,
                     ThgError::new("invalid_graph_query", error.to_string()),
                     self.state_hash(),
-                )
+                );
             }
         };
         let hits = self.graph_store.neighbors(query);
@@ -452,6 +453,253 @@ impl InMemoryThgExecutor {
                 self.state_hash(),
             ),
         }
+    }
+
+    fn stream_publish(&mut self, args: Value) -> ThgResponse {
+        let command = ThgCommand::StreamPublish.name();
+        let tenant = string_arg(&args, "tenant").unwrap_or_default();
+        let topic = string_arg(&args, "stream")
+            .or_else(|| string_arg(&args, "topic"))
+            .unwrap_or_default();
+        let actor = string_arg(&args, "actor").unwrap_or_default();
+        if actor.trim().is_empty() {
+            return ThgResponse::err(
+                command,
+                ThgError::new("missing_actor", "stream publish requires an actor"),
+                self.state_hash(),
+            );
+        }
+        let kind = string_arg(&args, "kind").unwrap_or_else(|| "message".to_string());
+        let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+        let urgency_raw = string_arg(&args, "urgency").unwrap_or_default();
+        let urgency = match StreamUrgency::parse(&urgency_raw) {
+            Some(urgency) => urgency,
+            None => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(
+                        "invalid_urgency",
+                        format!("unknown urgency: {urgency_raw}; expected info|ask|block"),
+                    ),
+                    self.state_hash(),
+                );
+            }
+        };
+        let target_actor = string_arg(&args, "target_actor");
+        // A ping (ask|block) must name a target to bridge to its wake path.
+        if urgency.is_ping()
+            && target_actor
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            return ThgResponse::err(
+                command,
+                ThgError::new(
+                    "missing_target_actor",
+                    "urgency ask|block requires a target_actor",
+                ),
+                self.state_hash(),
+            );
+        }
+        match self.state_mut().streams.publish(
+            &tenant,
+            &topic,
+            &actor,
+            &kind,
+            payload,
+            urgency,
+            target_actor,
+        ) {
+            Ok(event) => {
+                let event_value = serde_json::to_value(&event).unwrap_or_else(|_| json!({}));
+                let mut response = ThgResponse::ok(
+                    command,
+                    "ok",
+                    json!({
+                        "event_id": event.id,
+                        "ordering_token": event.ordering_token,
+                        "stream_key": event.stream_key,
+                        "urgency": event.urgency.as_str(),
+                        "pinged": event.urgency.is_ping() && event.target_actor.is_some(),
+                    }),
+                    self.state_hash(),
+                );
+                response.events.push(event_value);
+                response
+            }
+            Err(error) => ThgResponse::err(
+                command,
+                ThgError::new(error.code, error.message),
+                self.state_hash(),
+            ),
+        }
+    }
+
+    fn stream_read(&mut self, args: Value) -> ThgResponse {
+        let command = ThgCommand::StreamRead.name();
+        let actor = string_arg(&args, "actor").unwrap_or_default();
+        if actor.trim().is_empty() {
+            return ThgResponse::err(
+                command,
+                ThgError::new("missing_actor", "stream read requires an actor"),
+                self.state_hash(),
+            );
+        }
+        let tenant = string_arg(&args, "tenant").unwrap_or_default();
+        let advance = bool_arg(&args, "advance").unwrap_or(true);
+        let limit = int_arg(&args, "limit").unwrap_or(0).max(0) as usize;
+        // `streams[]` are topics resolved under `tenant`; omitting them reads the
+        // actor's subscription set (selective attention).
+        let topics = string_vec_arg(&args, "streams");
+        let mut resolved = Vec::with_capacity(topics.len());
+        for topic in &topics {
+            match StreamStore::resolve_stream_key(&tenant, topic) {
+                Ok(key) => resolved.push(key),
+                Err(error) => {
+                    return ThgResponse::err(
+                        command,
+                        ThgError::new(error.code, error.message),
+                        self.state_hash(),
+                    );
+                }
+            }
+        }
+        let (events, new_cursors) = match self
+            .state_mut()
+            .streams
+            .read(&tenant, &actor, &resolved, advance, limit)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(error.code, error.message),
+                    self.state_hash(),
+                );
+            }
+        };
+        let events_json: Vec<Value> = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap_or_else(|_| json!({})))
+            .collect();
+        let mut response = ThgResponse::ok(
+            command,
+            "ok",
+            json!({
+                "events": events_json,
+                "new_cursors": new_cursors,
+                "count": events_json.len(),
+                "advanced": advance,
+            }),
+            self.state_hash(),
+        );
+        response.events = events_json;
+        response
+    }
+
+    fn stream_set_subscription(&mut self, args: Value, subscribe: bool) -> ThgResponse {
+        let command = if subscribe {
+            ThgCommand::StreamSubscribe.name()
+        } else {
+            ThgCommand::StreamUnsubscribe.name()
+        };
+        let actor = string_arg(&args, "actor").unwrap_or_default();
+        if actor.trim().is_empty() {
+            return ThgResponse::err(
+                command,
+                ThgError::new("missing_actor", "stream subscription requires an actor"),
+                self.state_hash(),
+            );
+        }
+        let tenant = string_arg(&args, "tenant").unwrap_or_default();
+        let topic = string_arg(&args, "stream")
+            .or_else(|| string_arg(&args, "topic"))
+            .unwrap_or_default();
+        let stream_key = match StreamStore::resolve_stream_key(&tenant, &topic) {
+            Ok(key) => key,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(error.code, error.message),
+                    self.state_hash(),
+                );
+            }
+        };
+        let subscriptions = match if subscribe {
+            self.state_mut()
+                .streams
+                .subscribe(&tenant, &actor, &stream_key)
+        } else {
+            self.state_mut()
+                .streams
+                .unsubscribe(&tenant, &actor, &stream_key)
+        } {
+            Ok(subscriptions) => subscriptions,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(error.code, error.message),
+                    self.state_hash(),
+                );
+            }
+        };
+        ThgResponse::ok(
+            command,
+            "ok",
+            json!({
+                "actor": actor,
+                "stream_key": stream_key,
+                "subscribed": subscribe,
+                "subscriptions": subscriptions,
+            }),
+            self.state_hash(),
+        )
+    }
+
+    fn stream_mentions(&mut self, args: Value) -> ThgResponse {
+        let command = ThgCommand::StreamMentions.name();
+        let actor = string_arg(&args, "actor").unwrap_or_default();
+        if actor.trim().is_empty() {
+            return ThgResponse::err(
+                command,
+                ThgError::new("missing_actor", "stream mentions requires an actor"),
+                self.state_hash(),
+            );
+        }
+        let tenant = string_arg(&args, "tenant").unwrap_or_default();
+        let advance = bool_arg(&args, "advance").unwrap_or(true);
+        let mentions = match self
+            .state_mut()
+            .streams
+            .drain_mentions(&tenant, &actor, advance)
+        {
+            Ok(mentions) => mentions,
+            Err(error) => {
+                return ThgResponse::err(
+                    command,
+                    ThgError::new(error.code, error.message),
+                    self.state_hash(),
+                );
+            }
+        };
+        let mentions_json: Vec<Value> = mentions
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap_or_else(|_| json!({})))
+            .collect();
+        let mut response = ThgResponse::ok(
+            command,
+            "ok",
+            json!({
+                "mentions": mentions_json,
+                "count": mentions_json.len(),
+                "drained": advance,
+            }),
+            self.state_hash(),
+        );
+        response.events = mentions_json;
+        response
     }
 }
 
@@ -518,6 +766,11 @@ impl ThgExecutor for InMemoryThgExecutor {
             ThgCommand::GraphStats => self.graph_stats(),
             ThgCommand::GraphVerify => self.graph_verify(),
             ThgCommand::GraphRebuildIndexes => self.graph_rebuild_indexes(),
+            ThgCommand::StreamPublish => self.stream_publish(args),
+            ThgCommand::StreamRead => self.stream_read(args),
+            ThgCommand::StreamSubscribe => self.stream_set_subscription(args, true),
+            ThgCommand::StreamUnsubscribe => self.stream_set_subscription(args, false),
+            ThgCommand::StreamMentions => self.stream_mentions(args),
             ThgCommand::AdaptersUpsert
             | ThgCommand::AdaptersFind
             | ThgCommand::AdaptersGet
@@ -826,6 +1079,120 @@ mod tests {
         assert!(response.ok);
         let saved = executor.store().load();
         assert_eq!(saved.runs["run:persisted"].task, "durable THG");
+    }
+
+    #[test]
+    fn stream_commands_publish_read_subscribe_and_ping() {
+        use super::StoreBackedThgExecutor;
+        use crate::store::{InMemoryThgStore, ThgStore};
+
+        let store = InMemoryThgStore::new();
+        let mut executor = StoreBackedThgExecutor::new(store);
+
+        // Subscribe bob (before any publish: he attends from "now").
+        let sub = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamSubscribe.name(),
+            json!({ "actor": "bob", "tenant": "acme", "stream": "room" }),
+        ));
+        assert!(sub.ok);
+        let pre_hash = executor.state_hash();
+
+        // Publish an info event; the state hash advances like any mutation.
+        let publish = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "acme", "stream": "room", "actor": "alice", "kind": "msg", "payload": { "n": 1 } }),
+        ));
+        assert!(publish.ok);
+        assert_eq!(publish.payload["ordering_token"], 1);
+        assert_ne!(
+            pre_hash, publish.state_hash,
+            "publish advances the state hash"
+        );
+
+        // bob reads exactly one event via his subscription; cursor advances.
+        let read = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamRead.name(),
+            json!({ "actor": "bob", "tenant": "acme", "advance": true }),
+        ));
+        assert!(read.ok);
+        assert_eq!(read.payload["count"], 1);
+        assert_eq!(read.events.len(), 1);
+
+        // Re-read returns nothing (cursor consumed), and the cursor persisted.
+        let reread = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamRead.name(),
+            json!({ "actor": "bob", "tenant": "acme", "advance": true }),
+        ));
+        assert_eq!(reread.payload["count"], 0);
+        assert_ne!(
+            executor.store().load().streams,
+            crate::stream::StreamStore::default(),
+            "stream state is persisted through the store-backed executor"
+        );
+
+        // A ping (ask + target) lands in the target's mention drain.
+        let ping = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "acme", "stream": "room", "actor": "alice", "kind": "q", "urgency": "ask", "target_actor": "carol" }),
+        ));
+        assert!(ping.ok);
+        assert_eq!(ping.payload["pinged"], true);
+        let mentions = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamMentions.name(),
+            json!({ "actor": "carol", "tenant": "acme", "advance": true }),
+        ));
+        assert_eq!(mentions.payload["count"], 1);
+
+        let beta_ping = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "beta", "stream": "room", "actor": "alice", "kind": "q", "urgency": "ask", "target_actor": "carol" }),
+        ));
+        assert!(beta_ping.ok);
+        let wrong_tenant_mentions = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamMentions.name(),
+            json!({ "actor": "carol", "tenant": "acme", "advance": false }),
+        ));
+        assert_eq!(
+            wrong_tenant_mentions.payload["count"], 0,
+            "tenant-scoped mention drain must not leak beta pings into acme"
+        );
+        let beta_mentions = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamMentions.name(),
+            json!({ "actor": "carol", "tenant": "beta", "advance": true }),
+        ));
+        assert_eq!(beta_mentions.payload["count"], 1);
+
+        // An ask without a target is rejected.
+        let bad_ping = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "acme", "stream": "room", "actor": "alice", "urgency": "ask" }),
+        ));
+        assert!(!bad_ping.ok);
+        assert_eq!(
+            bad_ping.error.as_ref().map(|e| e.code.as_str()),
+            Some("missing_target_actor")
+        );
+
+        let missing_actor = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "acme", "stream": "room" }),
+        ));
+        assert!(!missing_actor.ok);
+        assert_eq!(
+            missing_actor.error.as_ref().map(|e| e.code.as_str()),
+            Some("missing_actor")
+        );
+
+        // Empty tenant is rejected, not routed to a default.
+        let empty = executor.execute_request(ThgRequest::new(
+            ThgCommand::StreamPublish.name(),
+            json!({ "tenant": "", "stream": "room", "actor": "alice" }),
+        ));
+        assert!(!empty.ok);
+        assert_eq!(
+            empty.error.as_ref().map(|e| e.code.as_str()),
+            Some("empty_tenant")
+        );
     }
 
     #[test]

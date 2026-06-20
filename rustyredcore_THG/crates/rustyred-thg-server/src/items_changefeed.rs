@@ -25,7 +25,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -155,6 +155,25 @@ fn change_event_name(change: ItemChange) -> &'static str {
     }
 }
 
+fn stream_for_tenant(tenant: String) -> axum::response::Response {
+    let stream = BroadcastStream::new(subscribe()).filter_map(move |event| {
+        let delta = event.ok()?;
+        if delta.tenant != tenant {
+            return None;
+        }
+        let kind = change_event_name(delta.change);
+        let sse_event = Event::default()
+            .event(kind)
+            .json_data(&delta)
+            .unwrap_or_else(|_| Event::default().event(kind).data("{}"));
+        Some(Ok::<Event, Infallible>(sse_event))
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 /// `GET /v1/items/stream?tenant=` -- SSE tail of Item deltas for one tenant. A
 /// `tenant` is required: the bus is process-global across tenants, so streaming
 /// without one would leak other tenants' Items.
@@ -180,22 +199,31 @@ pub async fn items_stream(
         }
     };
 
-    let stream = BroadcastStream::new(subscribe()).filter_map(move |event| {
-        let delta = event.ok()?;
-        if delta.tenant != tenant {
-            return None;
-        }
-        let kind = change_event_name(delta.change);
-        let sse_event = Event::default()
-            .event(kind)
-            .json_data(&delta)
-            .unwrap_or_else(|_| Event::default().event(kind).data("{}"));
-        Some(Ok::<Event, Infallible>(sse_event))
-    });
+    stream_for_tenant(tenant)
+}
 
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+/// Back-compat route for the main-line path shape:
+/// `GET /v1/tenants/:tenant_id/items/events`.
+pub async fn tenant_items_events(
+    Path(tenant_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(response) = guard(&state, &headers) {
+        return response;
+    }
+    let tenant = tenant_id.trim();
+    if tenant.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "missing_tenant",
+                "message": "the items changefeed requires a tenant"
+            })),
+        )
+            .into_response();
+    }
+    stream_for_tenant(tenant.to_string())
 }
 
 #[cfg(test)]
