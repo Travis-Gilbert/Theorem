@@ -3767,17 +3767,59 @@ fn coordinate_payload(
             created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
         },
     )?;
+    let (stream_event_id, stream_ordering_token) =
+        persist_coordination_message_stream_event(tenant, backend, &message)?;
     Ok(json!({
         "tenant": tenant,
         "ok": true,
         "room_id": room_id,
         "message_id": message.message_id,
+        "stream_event_id": stream_event_id,
+        "stream_ordering_token": stream_ordering_token,
         "mentions": message.mentions,
         "delivery": message.delivery,
         "unread_count": message.mentions.len(),
         "urgency": message.urgency,
         "created_at": message.created_at
     }))
+}
+
+fn persist_coordination_message_stream_event(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    message: &CoordinationMessageState,
+) -> Result<(String, u64), McpError> {
+    let topic = message.room_id.clone();
+    let stream_key = canonical_stream_key(tenant, &topic);
+    let _publish_guard = stream_publish_lock()
+        .lock()
+        .map_err(|_| McpError::internal("stream publish lock poisoned"))?;
+    let token = reserve_stream_token(backend, tenant, &topic, &stream_key, &message.created_at)?;
+    let event_id = format!(
+        "sevt:{}",
+        &stable_value_hash(&json!({ "k": stream_key, "t": token }))[..16]
+    );
+    let mut event = StreamEvent::new(
+        event_id,
+        stream_key,
+        message.actor_id.clone(),
+        "coordination_message",
+        json!({
+            "room_id": message.room_id,
+            "message_id": message.message_id,
+            "message": message.message,
+            "mentions": message.mentions,
+            "delivery": message.delivery,
+            "metadata": message.metadata,
+        }),
+        StreamUrgency::parse(&message.urgency)
+            .ok_or_else(|| McpError::internal("stored coordination message has invalid urgency"))?,
+        (message.mentions.len() == 1).then(|| message.mentions[0].clone()),
+        message.created_at.clone(),
+    );
+    event.ordering_token = token;
+    persist_stream_event(backend, tenant, &topic, &event)?;
+    Ok((event.id, token))
 }
 
 fn mentions_payload(
@@ -4656,7 +4698,14 @@ fn coordination_context_payload(
     let records =
         read_coordination_records(backend, tenant, &room_id, &record_types, record_limit)?;
     let pending_mentions = if let Some(actor_id) = actor_id.as_ref() {
-        read_coordination_mentions(backend, tenant, actor_id, false, mention_limit)?
+        read_coordination_mentions_in_room(
+            backend,
+            tenant,
+            &room_id,
+            actor_id,
+            false,
+            mention_limit,
+        )?
     } else {
         Vec::new()
     };
@@ -5831,7 +5880,7 @@ fn observe_payload(
     let pending_mentions = if actor_id.is_empty() {
         Vec::new()
     } else {
-        read_coordination_mentions(backend, tenant, &actor_id, false, 20)?
+        read_coordination_mentions_in_room(backend, tenant, &room_id, &actor_id, false, 20)?
     };
     let recall_results = if argument_text(arguments, &["query"]).is_some() {
         let mut store = McpMemoryStore { backend };
@@ -6770,6 +6819,35 @@ fn read_coordination_mentions(
     consume: bool,
     limit: usize,
 ) -> Result<Vec<CoordinationMessageState>, McpError> {
+    read_coordination_mentions_filtered(backend, tenant, None, actor_id, consume, limit)
+}
+
+fn read_coordination_mentions_in_room(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    room_id: &str,
+    actor_id: &str,
+    consume: bool,
+    limit: usize,
+) -> Result<Vec<CoordinationMessageState>, McpError> {
+    read_coordination_mentions_filtered(
+        backend,
+        tenant,
+        Some(room_id.to_string()),
+        actor_id,
+        consume,
+        limit,
+    )
+}
+
+fn read_coordination_mentions_filtered(
+    backend: &mut impl McpGraphBackend,
+    tenant: &str,
+    room_id: Option<String>,
+    actor_id: &str,
+    consume: bool,
+    limit: usize,
+) -> Result<Vec<CoordinationMessageState>, McpError> {
     let actor_id = require_actor_id(actor_id, "mentions requires actor")?;
     let mut messages = Vec::new();
     for tenant_alias in tenant_slug_aliases(tenant) {
@@ -6782,6 +6860,10 @@ fn read_coordination_mentions(
                 .mentions
                 .iter()
                 .any(|mention| normalize_actor_id(mention) == actor_id)
+                && room_id
+                    .as_ref()
+                    .map(|room_id| message.room_id == room_id.as_str())
+                    .unwrap_or(true)
                 && !message
                     .consumed_by
                     .iter()
@@ -15018,6 +15100,31 @@ mod tests {
         );
         assert_eq!(messages["messages"][0]["delivery"], "wake");
 
+        let stream_delta = call_tool_json(
+            &provider,
+            &config,
+            "stream_read",
+            json!({
+                "tenant": "smoke",
+                "actor": "claude-code",
+                "streams": ["harness-rust-port"],
+                "advance": false
+            }),
+        );
+        assert_eq!(stream_delta["count"], json!(1));
+        assert_eq!(
+            stream_delta["events"][0]["kind"],
+            json!("coordination_message")
+        );
+        assert_eq!(
+            stream_delta["events"][0]["payload"]["message_id"],
+            receipt["message_id"]
+        );
+        assert_eq!(
+            stream_delta["events"][0]["payload"]["message"],
+            json!("@claude-code. please test native MCP")
+        );
+
         let record = call_tool_json(
             &provider,
             &config,
@@ -15065,6 +15172,20 @@ mod tests {
         );
         assert_eq!(empty_records["count"], 0);
 
+        let other_room = call_tool_json(
+            &provider,
+            &config,
+            "coordinate",
+            json!({
+                "tenant": "smoke",
+                "actor": "deepseek",
+                "room_id": "other-room",
+                "message": "@codex stale cross-room mention",
+                "created_at": "2026-06-01T00:04:30Z"
+            }),
+        );
+        assert_eq!(other_room["ok"], true);
+
         let context = call_tool_json(
             &provider,
             &config,
@@ -15081,6 +15202,11 @@ mod tests {
         assert_eq!(context["counts"]["intents"], 1);
         assert_eq!(context["counts"]["messages"], 1);
         assert_eq!(context["counts"]["records"], 1);
+        assert_eq!(context["counts"]["pending_mentions"], 0);
+        assert!(
+            context["pending_mentions"].as_array().unwrap().is_empty(),
+            "coordination_context must not include mentions from other rooms: {context}"
+        );
         assert_eq!(context["intents"][0]["binding_id"], "agent:theorem");
         assert_eq!(
             context["intents"][0]["scratchpad_document_id"],
