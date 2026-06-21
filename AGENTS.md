@@ -37,6 +37,10 @@ Do not look for problems by reading. Stand up the oracles and fix what they flag
 
 Implement what the spec says, fully. Do not insert conservative defaults that contradict the spec, do not downgrade to an MVP that was not asked for, and do not frame in-scope work as deferred. A named choice in the spec is a requirement, not a suggestion. If something genuinely cannot be done, say so plainly and name the blocker, rather than quietly shrinking the work.
 
+## Local build/store hygiene
+
+When disk pressure or cleanup is needed, clear rebuildable caches outside the project before clearing repo-local stores. Internal stores often carry the state needed to complete and validate the current project, and reloading them slows the work down.
+
 ## Doc-update protocol (end of every session)
 
 Code outruns docs. If your session added, renamed, or removed a crate or app, before you end the session: update the crate or app table in `CLAUDE.md` and the matching row in `docs/site/reference/`, fix any `CLAUDE.md` section the change makes wrong, bump the README `Last sync` line if you re-synced with Theseus, then run `scripts/check-doc-drift.sh --refresh`. Encode the decision to the harness if it is load-bearing.
