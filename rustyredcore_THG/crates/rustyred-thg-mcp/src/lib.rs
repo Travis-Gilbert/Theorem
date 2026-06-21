@@ -4967,12 +4967,17 @@ fn append_harness_transition_payload(
     // scope.tenant_slug and otherwise falls back to the empty "default" tenant,
     // which resolves published packs to shadow. Inject the request tenant when the
     // caller omitted it so status resolves under the real tenant.
-    if let Some(scope) = transition
+    let scope_value = transition
         .payload
         .entry("scope".to_string())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-    {
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !scope_value.is_object() {
+        // A present-but-non-object scope would otherwise skip injection here and
+        // then be coerced to {} by stamp_run_created_status -- losing the tenant
+        // and falling back to "default". Normalize first (matches the runtime).
+        *scope_value = Value::Object(serde_json::Map::new());
+    }
+    if let Some(scope) = scope_value.as_object_mut() {
         let has_tenant = ["tenant_slug", "tenantSlug", "tenant", "tenant_id", "tenantId"]
             .iter()
             .any(|key| {
