@@ -24,6 +24,7 @@ pub mod reflexive;
 pub mod reflexive_executor;
 pub mod routing;
 pub mod situation_search;
+pub mod standing_pass;
 pub mod training_runner;
 pub mod training_substrate;
 pub mod types;
@@ -130,6 +131,20 @@ pub use situation_search::{
     SEARCH_ESCALATION_PLAN_LABEL, SIMILAR_SITUATION_SEARCH_LABEL, USER_MODEL_LABEL,
     USER_PREFERENCE_LABEL,
 };
+pub use standing_pass::{
+    admitted_edge_id, default_standing_generators, standing_pass_hook,
+    standing_pass_hook_with_engine, standing_pass_run_id, AdvisoryCandidate, AdvisoryPayload,
+    CandidateKind, CandidatePair, CandidateRef, DatalogStandingGenerator,
+    EgglogEquivalenceStandingGenerator, GeneratorInput, GeneratorQuery, GeneratorQueryKind,
+    HotTemporalStandingGenerator, PairformerStandingGenerator, SourceReliabilityStandingGenerator,
+    SpatialStandingGenerator, Spec1PropertyStandingGenerator, StandingGenerator,
+    StandingPassConfig, StandingPassEngine, StandingPassResult, DATALOG_STANDING_GENERATOR_ID,
+    DEFAULT_STANDING_PASS_CONFIDENCE_CEILING, DEFAULT_STANDING_PASS_CONFIDENCE_THRESHOLD,
+    DEFAULT_STANDING_PASS_MAX_CANDIDATES, DEFAULT_STANDING_PASS_MAX_DEPTH,
+    DEFAULT_STANDING_PASS_MAX_NODES, EGGLOG_EQUIVALENCE_STANDING_GENERATOR_ID,
+    SOURCE_RELIABILITY_STANDING_GENERATOR_ID, SPEC1_PROPERTY_STANDING_GENERATOR_ID,
+    STANDING_PASS_ADMITTED_BY,
+};
 pub use training_runner::{
     export_training_snapshot_files, import_gnn_export_dir, open_training_store,
     redcore_training_options, run_hot_temporal_training, run_local_training_smoke,
@@ -205,6 +220,10 @@ mod hot_test;
 #[cfg(test)]
 #[path = "tests/situation_search_test.rs"]
 mod situation_search_test;
+
+#[cfg(test)]
+#[path = "tests/standing_pass_test.rs"]
+mod standing_pass_test;
 
 #[cfg(test)]
 #[path = "tests/fitness_test.rs"]
