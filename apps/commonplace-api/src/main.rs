@@ -60,34 +60,13 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(50090);
-
-    match std::env::var("COMMONPLACE_DATA_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => {
-            let store = redcore_store(PathBuf::from(&dir)).expect("open durable store");
-            let schema = build_schema(store, Arc::clone(&registry));
-            println!("commonplace-api (durable: {dir}) listening on 0.0.0.0:{port}");
-            serve(AppState { schema, registry }, port).await;
-        }
-        _ => {
-            let schema = build_schema(in_memory_store(), Arc::clone(&registry));
-            println!("commonplace-api (in-memory) listening on 0.0.0.0:{port}");
-            serve(AppState { schema, registry }, port).await;
-        }
-    }
-}
-
-async fn serve<S, B>(state: AppState<S, B>, port: u16)
-where
-    S: EmbeddingGraphStore + Send + Sync + 'static,
-    B: BlobStore + Send + Sync + 'static,
-{
-    let app = Router::new()
-        .route("/graphql", get(graphiql).post(graphql_handler::<S, B>))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+    // Bind [::] (IPv6 dual-stack) not 0.0.0.0: on Linux this accepts both IPv6
+    // and IPv4, so a platform whose healthcheck / private network is IPv6-only
+    // (e.g. Railway) can reach the service. Locally it still serves IPv4.
+    let listener = tokio::net::TcpListener::bind(("::", port))
         .await
         .expect("bind commonplace-api port");
+    println!("commonplace-api listening on [::]:{port}");
     axum::serve(listener, app)
         .await
         .expect("serve commonplace-api");
