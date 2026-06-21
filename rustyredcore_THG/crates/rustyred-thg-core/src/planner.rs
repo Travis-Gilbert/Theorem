@@ -3,11 +3,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
+use serde_json::Value;
+
 use crate::access_method::{
     AccessMethod, ColumnId, Cost, ModalityResolver, NoModalityResolver, Predicate, PredicateMode,
     RankedRow, RegionRef, RelationId, RowId, ScalarValue,
 };
 use crate::graph_store::{GraphStoreError, GraphStoreResult};
+use crate::ranking::{apply_cascade, compute_term_match, QueryContext, RankCandidate, RankingRule};
 use crate::relational::{RelationalRow, RelationalStore};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -50,6 +53,10 @@ pub struct QueryIr {
 pub enum FusionPolicy {
     Rrf { k: usize },
     Weighted { weights: BTreeMap<String, f32> },
+    /// Ordered ranking-rule cascade (SPEC-RUSTYRED-RANKING-CASCADE): bucket-sort by each rule in
+    /// turn, later rules only breaking ties left by earlier ones. The epistemic rules are first
+    /// class and reorderable, so trust can rank ahead of relevance.
+    Cascade { rules: Vec<RankingRule> },
 }
 
 impl Default for FusionPolicy {
@@ -83,6 +90,12 @@ pub struct PlanTrace {
     pub fusion: String,
     pub knn_strategy: Option<String>,
     pub knn_overfetch_rounds: usize,
+    /// Cascade fusion only: the rule order actually applied, and per-ranked-row the bucket vector
+    /// (one ordinal per rule), so the trace answers "ranked here because rule R put it in bucket N".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cascade_rule_order: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cascade_buckets: BTreeMap<String, Vec<u32>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -537,7 +550,161 @@ fn score_rankers(
         });
         lists.push((method.name().to_string(), outcome.rows));
     }
-    Ok(Some(fuse_rankings(lists, fusion)))
+    let scores = match fusion {
+        FusionPolicy::Cascade { rules } => {
+            cascade_scores(store, relation_query, rules, rank_predicates, &lists, trace)?
+        }
+        _ => fuse_rankings(lists, fusion),
+    };
+    Ok(Some(scores))
+}
+
+/// Assemble a [`RankCandidate`] per ranked row from the per-ranker score lists plus the row's own
+/// epistemic columns, run [`apply_cascade`], and emit a synthetic descending score so the execute
+/// loop's existing sort-by-score reproduces the cascade order (and excluded rows drop out). The
+/// rule order and per-row bucket vectors are recorded into the trace.
+///
+/// Epistemic standing is read as scalar/structured columns on the ranked relation
+/// (`acceptance_status`, `epistemic_weight`, `source_reliability` or `justification_prior`,
+/// `valid_from_ms`, `superseded`); a multi-relation join that projects those columns onto the
+/// ranked rows is the caller's job, exactly as the spec's "supplies the signal through the existing
+/// join" intends. `term_match` is computed only when the ranked relation denormalizes the text
+/// column (the lexical rules are primarily the web path's; for the structured path the text lives
+/// in the resolver, not the row).
+fn cascade_scores(
+    store: &RelationalStore,
+    relation_query: &QueryRelation,
+    rules: &[RankingRule],
+    rank_predicates: &[&Predicate],
+    lists: &[(String, Vec<RankedRow>)],
+    trace: &mut PlanTrace,
+) -> GraphStoreResult<BTreeMap<RowId, f32>> {
+    let by_method = |name: &str| -> BTreeMap<&str, f32> {
+        lists
+            .iter()
+            .filter(|(method, _)| method == name)
+            .flat_map(|(_, rows)| rows.iter().map(|row| (row.row_id.as_str(), row.score)))
+            .collect()
+    };
+    let vector = by_method("vector");
+    let text = by_method("text_rank");
+    let expand = by_method("expand_ppr");
+
+    let mut candidate_ids = BTreeSet::new();
+    for (_, rows) in lists {
+        candidate_ids.extend(rows.iter().map(|row| row.row_id.clone()));
+    }
+
+    let query = cascade_query_context(rank_predicates);
+    let text_column = rank_predicates.iter().find_map(|predicate| match predicate {
+        Predicate::TextMatch {
+            column,
+            mode: PredicateMode::Rank,
+            ..
+        } => Some(column.as_str()),
+        _ => None,
+    });
+
+    let relation = store.relation(&relation_query.relation);
+    let candidates = candidate_ids
+        .into_iter()
+        .map(|id| {
+            let mut candidate = RankCandidate::new(id.clone());
+            candidate.vector_score = vector.get(id.as_str()).copied();
+            candidate.bm25_score = text.get(id.as_str()).copied();
+            candidate.graph_hops = expand.get(id.as_str()).map(|score| score_to_hops(*score));
+            if let Some(row) = relation.and_then(|relation| relation.get(&id)) {
+                candidate.acceptance_status =
+                    str_col(row, "acceptance_status").unwrap_or_default();
+                candidate.epistemic_weight =
+                    f64_col(row, "epistemic_weight").map(|v| v as f32).unwrap_or(1.0);
+                candidate.source_reliability = f64_col(row, "source_reliability")
+                    .or_else(|| f64_col(row, "justification_prior"))
+                    .map(|v| v as f32);
+                candidate.valid_from_ms = i64_col(row, "valid_from_ms");
+                candidate.superseded = bool_col(row, "superseded").unwrap_or(false);
+                if !query.terms.is_empty() {
+                    if let Some(body) = text_column.and_then(|column| str_col(row, column)) {
+                        candidate.term_match = Some(compute_term_match(&body, &query));
+                    }
+                }
+            }
+            candidate
+        })
+        .collect::<Vec<_>>();
+
+    let outcome = apply_cascade(candidates, rules, &query);
+    trace.cascade_rule_order = outcome.rule_order;
+    let n = outcome.ranked.len();
+    let mut scores = BTreeMap::new();
+    for (index, ranked) in outcome.ranked.into_iter().enumerate() {
+        scores.insert(ranked.row_id.clone(), (n - index) as f32);
+        trace.cascade_buckets.insert(ranked.row_id, ranked.buckets);
+    }
+    Ok(scores)
+}
+
+/// Build the cascade query context from the rank predicates: terms from the `TextMatch { Rank }`
+/// query, default typo tolerance and admission gate. The structured path carries no recency clock
+/// in `QueryIr`, so recency degrades to superseded-last; an absolute recency reference / `as_of`
+/// cutoff on this path is a named follow-up.
+fn cascade_query_context(rank_predicates: &[&Predicate]) -> QueryContext {
+    let terms = rank_predicates
+        .iter()
+        .find_map(|predicate| match predicate {
+            Predicate::TextMatch {
+                query,
+                mode: PredicateMode::Rank,
+                ..
+            } => Some(query.as_str()),
+            _ => None,
+        })
+        .map(QueryContext::from_query)
+        .unwrap_or_default();
+    terms
+}
+
+/// Convert an `expand_ppr` proximity score (`1 / (hops + 1)`) back to a hop count for the
+/// `GraphProximity` rule. Saturates for non-positive scores; the rule caps the band.
+fn score_to_hops(score: f32) -> u32 {
+    if score <= 0.0 {
+        return u32::MAX;
+    }
+    ((1.0 / score) - 1.0).round().max(0.0) as u32
+}
+
+fn str_col(row: &RelationalRow, key: &str) -> Option<String> {
+    row.values
+        .get(key)
+        .and_then(ScalarValue::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            row.properties
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn f64_col(row: &RelationalRow, key: &str) -> Option<f64> {
+    row.values
+        .get(key)
+        .and_then(ScalarValue::as_f64)
+        .or_else(|| row.properties.get(key).and_then(Value::as_f64))
+}
+
+fn i64_col(row: &RelationalRow, key: &str) -> Option<i64> {
+    row.values
+        .get(key)
+        .and_then(ScalarValue::as_i64)
+        .or_else(|| row.properties.get(key).and_then(Value::as_i64))
+}
+
+fn bool_col(row: &RelationalRow, key: &str) -> Option<bool> {
+    match row.values.get(key) {
+        Some(ScalarValue::Bool(value)) => Some(*value),
+        _ => row.properties.get(key).and_then(Value::as_bool),
+    }
 }
 
 fn rank_k_for_predicate(predicate: &Predicate, query_k: usize, candidate_count: usize) -> usize {
@@ -579,6 +746,15 @@ fn fuse_rankings(
                 }
             }
         }
+        // Cascade is diverted in `score_rankers` before fusion (it needs the rows + query context),
+        // so this arm is unreachable in practice; fall back to RRF rather than panic.
+        FusionPolicy::Cascade { .. } => {
+            for (_, rows) in lists {
+                for (index, row) in rows.into_iter().enumerate() {
+                    *scores.entry(row.row_id).or_insert(0.0) += 1.0 / (60.0 + index as f32 + 1.0);
+                }
+            }
+        }
     }
     scores
 }
@@ -587,6 +763,7 @@ fn fusion_name(fusion: &FusionPolicy) -> &'static str {
     match fusion {
         FusionPolicy::Rrf { .. } => "rrf",
         FusionPolicy::Weighted { .. } => "weighted",
+        FusionPolicy::Cascade { .. } => "cascade",
     }
 }
 

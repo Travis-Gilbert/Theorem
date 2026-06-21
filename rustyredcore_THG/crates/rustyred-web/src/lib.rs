@@ -150,8 +150,8 @@ pub use serp::{render_search_page, render_serp_html, serp_payload_json};
 // candidate set). Ported from Theseus retrieval.py. See epistemic_filter.rs.
 pub mod epistemic_filter;
 pub use epistemic_filter::{
-    apply_epistemic_filter, round_half_even, ConnectionScorer, EpistemicFilterConfig,
-    FusedCandidate, RrfFallbackScorer, ScoredResult,
+    apply_epistemic_cascade, apply_epistemic_filter, round_half_even, web_cascade_rules,
+    ConnectionScorer, EpistemicFilterConfig, FusedCandidate, RrfFallbackScorer, ScoredResult,
 };
 
 // Relevance extraction: turn a fetched page into the few passages that answer a

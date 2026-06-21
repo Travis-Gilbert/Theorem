@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rustyred_thg_core::{
     execute_query_with_resolver, AmResult, Direction, FusionPolicy, ModalityResolver, Predicate,
-    PredicateMode, Projection, QueryIr, QueryRelation, RankOutcome, RankedRow, RegionRef,
-    RelationalRow, RelationalStore, ScalarValue,
+    PredicateMode, Projection, QueryIr, QueryRelation, RankOutcome, RankedRow, RankingRule,
+    RegionRef, RelationalRow, RelationalStore, ScalarValue,
 };
 
 // --- in-memory live-subsystem stand-in --------------------------------------------------------
@@ -818,6 +818,98 @@ fn geo_explicit_lat_lon_properties_used_for_residual() {
 
     assert_eq!(id_order(&result, "p.id"), vec!["place:inside"]);
     assert_eq!(result.trace.access_paths[0].method, "geo_index");
+}
+
+/// D2 + the demonstration (SPEC-RUSTYRED-RANKING-CASCADE): the SAME query ranks a strong-but-
+/// undercut document first under RRF, but the supported document first under a `Cascade`. Proven
+/// both with the epistemic rules ahead of relevance (trust dominates) and behind them (banding ties
+/// Vector+Text, EpistemicStatus breaks the tie so the undercut doc still ranks below the grounded
+/// one that has a lower vector score). The trace names the rule that moved it.
+#[test]
+fn cascade_demotes_undercut_below_supported_against_rrf() {
+    let mut store = RelationalStore::new();
+    let mut modality = InMemoryModality::default();
+    // doc:a: strong relevance (top vector + equal text) but undercut. doc:b: supported (grounded),
+    // a lower vector score in the same band, same body. acceptance_status lives as a scalar column
+    // on the ranked relation (the join's epistemic standing projected onto the content row).
+    for (id, status, embedding) in [
+        ("doc:a", "undercuts", vec![1.0, 0.0]),
+        ("doc:b", "grounded", vec![0.9, 0.1]),
+    ] {
+        store
+            .upsert_row(scalar_row(
+                "docs",
+                id,
+                &[("acceptance_status", text(status))],
+            ))
+            .unwrap();
+        modality.vector("docs", "embedding", id, embedding);
+        modality.text("docs", "body", id, "alpha alpha");
+    }
+    let predicates = || {
+        vec![
+            Predicate::Knn {
+                column: "embedding".to_string(),
+                query: vec![1.0, 0.0],
+                k: 2,
+            },
+            Predicate::TextMatch {
+                column: "body".to_string(),
+                query: "alpha".to_string(),
+                mode: PredicateMode::Rank,
+            },
+        ]
+    };
+    let query = |fusion: FusionPolicy| QueryIr {
+        relations: vec![knn_relation(predicates())],
+        projection: doc_projection(),
+        fusion,
+        ..QueryIr::default()
+    };
+
+    // RRF: strong relevance wins; the undercut doc ranks first.
+    let rrf = run(&store, &modality, query(FusionPolicy::Rrf { k: 60 }));
+    assert_eq!(id_order(&rrf, "d.id"), vec!["doc:a", "doc:b"]);
+    assert_eq!(rrf.trace.fusion, "rrf");
+
+    // Cascade, epistemic ahead of relevance: trust dominates; the supported doc ranks first.
+    let trust_first = run(
+        &store,
+        &modality,
+        query(FusionPolicy::Cascade {
+            rules: vec![
+                RankingRule::EpistemicStatus,
+                RankingRule::Vector,
+                RankingRule::Text,
+            ],
+        }),
+    );
+    assert_eq!(id_order(&trust_first, "d.id"), vec!["doc:b", "doc:a"]);
+    assert_eq!(trust_first.trace.fusion, "cascade");
+    assert_eq!(
+        trust_first.trace.cascade_rule_order.first().map(String::as_str),
+        Some("epistemic_status")
+    );
+    // The trace explains it: doc:b's EpistemicStatus bucket beats doc:a's.
+    assert!(
+        trust_first.trace.cascade_buckets["doc:b"][0]
+            < trust_first.trace.cascade_buckets["doc:a"][0]
+    );
+
+    // Cascade, relevance ahead (the literal D2 sentence): Vector+Text bands tie, EpistemicStatus
+    // breaks the tie, so the undercut doc ranks below the grounded one despite its lower vector.
+    let relevance_first = run(
+        &store,
+        &modality,
+        query(FusionPolicy::Cascade {
+            rules: vec![
+                RankingRule::Vector,
+                RankingRule::Text,
+                RankingRule::EpistemicStatus,
+            ],
+        }),
+    );
+    assert_eq!(id_order(&relevance_first, "d.id"), vec!["doc:b", "doc:a"]);
 }
 
 // --- shared fixtures --------------------------------------------------------------------------
