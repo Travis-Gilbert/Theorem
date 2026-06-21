@@ -44,10 +44,13 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(50090);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+    // Bind [::] (IPv6 dual-stack) not 0.0.0.0: on Linux this accepts both IPv6
+    // and IPv4, so a platform whose healthcheck / private network is IPv6-only
+    // (e.g. Railway) can reach the service. Locally it still serves IPv4.
+    let listener = tokio::net::TcpListener::bind(("::", port))
         .await
         .expect("bind commonplace-api port");
-    println!("commonplace-api listening on 0.0.0.0:{port}");
+    println!("commonplace-api listening on [::]:{port}");
     axum::serve(listener, app)
         .await
         .expect("serve commonplace-api");

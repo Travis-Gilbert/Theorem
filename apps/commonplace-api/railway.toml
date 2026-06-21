@@ -1,0 +1,25 @@
+# Railway deploy config for commonplace-api (the CommonPlace consumer GraphQL server).
+#
+# Deploy as a NEW Railway service in the existing Theorem project. Leave the
+# service Root Directory at the repo root so the Docker build context is the
+# Theorem repo root (so the ../../rustyredcore_THG COPYs in the Dockerfile
+# resolve). Give it a PUBLIC domain: the website's Next proxy calls /graphql
+# server-side (THEOREM_GRAPHQL_URL -> this service, with x-api-key = THEOREM_API_KEY
+# matching this service's COMMONPLACE_API_KEY).
+#
+# Required env: COMMONPLACE_API_KEY (the instance key the proxy must send).
+# Exposes HTTP, so a real healthcheck is wired: GET /healthz returns "ok".
+#
+# NOTE: backing is the in-memory store for this slice, so data resets on every
+# deploy/restart. Durable RedCore+Disk backing behind the identical schema is the
+# named follow-up; until then the website populates it live via Capture/ingest.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "apps/commonplace-api/Dockerfile"
+
+[deploy]
+startCommand = "commonplace-api"
+healthcheckPath = "/healthz"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
