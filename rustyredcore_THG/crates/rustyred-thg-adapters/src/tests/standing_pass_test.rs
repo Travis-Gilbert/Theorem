@@ -9,9 +9,10 @@ use rustyred_thg_core::{
 use serde_json::json;
 
 use crate::{
-    admitted_edge_id, standing_pass_hook, AdvisoryCandidate, HotTemporalStandingGenerator,
-    InferredEdgeCandidate, PairformerConfig, PairformerStandingGenerator, StandingGenerator,
-    StandingPassConfig, StandingPassEngine, STANDING_PASS_ADMITTED_BY,
+    admitted_edge_id, standing_pass_hook, AdvisoryCandidate, DatalogStandingGenerator,
+    EgglogEquivalenceStandingGenerator, HotTemporalStandingGenerator, InferredEdgeCandidate,
+    PairformerConfig, PairformerStandingGenerator, SourceReliabilityStandingGenerator,
+    StandingGenerator, StandingPassConfig, StandingPassEngine, STANDING_PASS_ADMITTED_BY,
 };
 
 fn standing_config() -> StandingPassConfig {
@@ -67,6 +68,52 @@ fn seed_fixture<S: crate::types::AdapterGraphStore>(store: &mut S) {
         .upsert_edge(
             EdgeRecord::new("edge:a-d", "node:a", "OBSERVED_WITH", "node:d", json!({}))
                 .with_confidence(0.95),
+        )
+        .unwrap();
+}
+
+fn seed_symbolic_fixture<S: crate::types::AdapterGraphStore>(store: &mut S) {
+    store
+        .upsert_node(NodeRecord::new(
+            "claim:unsupported",
+            ["Claim"],
+            json!({
+                "claim_text": "The roof was repaired",
+                "status": "proposed",
+                "source_id": "source:field-team"
+            }),
+        ))
+        .unwrap();
+    store
+        .upsert_node(NodeRecord::new(
+            "object:alpha",
+            ["Object"],
+            json!({
+                "title": "Depot Parcel",
+                "source_id": "source:field-team"
+            }),
+        ))
+        .unwrap();
+    store
+        .upsert_node(NodeRecord::new(
+            "object:beta",
+            ["Object"],
+            json!({
+                "title": "Depot parcel!",
+                "source_id": "source:field-team"
+            }),
+        ))
+        .unwrap();
+    store
+        .upsert_edge(
+            EdgeRecord::new(
+                "edge:contradicts",
+                "object:alpha",
+                "CONTRADICTS",
+                "object:beta",
+                json!({ "source_id": "source:appeal" }),
+            )
+            .with_confidence(0.9),
         )
         .unwrap();
 }
@@ -143,6 +190,77 @@ fn standing_engine_runs_pairformer_and_temporal_generators_and_admits_union() {
         (applied.confidence.unwrap_or_default() - 0.72).abs() < 1e-6,
         "stored confidence should preserve the admission ceiling"
     );
+}
+
+#[test]
+fn symbolic_generators_emit_datalog_equivalence_and_reliability_candidates() {
+    let mut store = InMemoryGraphStore::new();
+    seed_symbolic_fixture(&mut store);
+    let engine = StandingPassEngine::new(
+        standing_config(),
+        vec![
+            Arc::new(DatalogStandingGenerator::with_rule_ids([
+                "unsupported_claim",
+                "likely_duplicate_entity",
+            ])),
+            Arc::new(EgglogEquivalenceStandingGenerator::default()),
+            Arc::new(SourceReliabilityStandingGenerator::default()),
+        ],
+    )
+    .unwrap();
+
+    let result = engine
+        .run(
+            &mut store,
+            vec![
+                "claim:unsupported".to_string(),
+                "object:alpha".to_string(),
+                "object:beta".to_string(),
+            ],
+        )
+        .unwrap();
+
+    assert!(result.applied_edge_ids.is_empty());
+    assert!(result.candidate_node_ids.is_empty());
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == crate::DATALOG_STANDING_GENERATOR_ID
+            && candidate.kind == crate::CandidateKind::DerivedFact
+            && matches!(
+                &candidate.payload,
+                crate::AdvisoryPayload::Json(payload)
+                    if payload["derived_fact"]["relation"] == json!("unsupported_claim")
+            )
+            && candidate.support.as_ref().is_some_and(|support| {
+                support
+                    .node_ids
+                    .iter()
+                    .any(|node_id| node_id == "claim:unsupported")
+            })
+    }));
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == crate::EGGLOG_EQUIVALENCE_STANDING_GENERATOR_ID
+            && candidate.kind == crate::CandidateKind::EquivalenceMerge
+            && matches!(
+                &candidate.payload,
+                crate::AdvisoryPayload::Json(payload)
+                    if payload["canonical_title"] == json!("depot parcel")
+                        && payload["member_node_ids"]
+                            .as_array()
+                            .unwrap()
+                            .len()
+                            == 2
+            )
+    }));
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == crate::SOURCE_RELIABILITY_STANDING_GENERATOR_ID
+            && candidate.kind == crate::CandidateKind::ReliabilityAnnotation
+            && matches!(
+                &candidate.payload,
+                crate::AdvisoryPayload::Json(payload)
+                    if payload["source_id"] == json!("source:appeal")
+                        && payload["contradicted"] == json!(1)
+            )
+    }));
 }
 
 #[test]
