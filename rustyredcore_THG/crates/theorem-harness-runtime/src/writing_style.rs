@@ -33,7 +33,7 @@ pub struct WritingStyleFitnessSummary {
 }
 
 pub fn prepare_run_transition<S: SkillPackGraphStore>(
-    store: &S,
+    store: &mut S,
     state: Option<&RunState>,
     mut transition: TransitionInput,
 ) -> TransitionInput {
@@ -94,7 +94,7 @@ pub fn metadata_with_style_receipt(
     metadata
 }
 
-fn stamp_run_created_status<S: SkillPackGraphStore>(store: &S, payload: &mut Payload) {
+fn stamp_run_created_status<S: SkillPackGraphStore>(store: &mut S, payload: &mut Payload) {
     let scope = payload
         .entry("scope".to_string())
         .or_insert_with(|| json!({}));
@@ -115,14 +115,31 @@ fn stamp_run_created_status<S: SkillPackGraphStore>(store: &S, payload: &mut Pay
         ],
     )
     .unwrap_or_else(|| "default".to_string());
-    match get_skill_pack(
+    // Resolve the published prose pack for this tenant. The engineering corpus is
+    // published advisory but nothing seeds it at server boot, so a fresh tenant
+    // first resolves nothing and enforcement silently degrades to shadow. Lazily
+    // publish the corpus (idempotent by content hash) for this tenant and retry
+    // before falling back -- this brings every tenant up on its first RUN.CREATED.
+    let mut resolved = get_skill_pack(
         store,
         SkillPackGetInput {
-            tenant_slug: tenant,
+            tenant_slug: tenant.clone(),
             pack_id: PACK_ID.to_string(),
             pack_content_hash: pack_hash(),
         },
-    ) {
+    );
+    if resolved.is_err() {
+        let _ = crate::engineering_packs::publish_engineering_packs(store, &tenant, "system");
+        resolved = get_skill_pack(
+            store,
+            SkillPackGetInput {
+                tenant_slug: tenant.clone(),
+                pack_id: PACK_ID.to_string(),
+                pack_content_hash: pack_hash(),
+            },
+        );
+    }
+    match resolved {
         Ok(pack) => {
             scope.insert(
                 WRITING_ENGINEERING_STATUS_FIELD.to_string(),
@@ -406,6 +423,7 @@ fn text_path(payload: &Payload, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyred_thg_core::InMemoryGraphStore;
     use serde_json::json;
 
     #[test]
@@ -416,6 +434,29 @@ mod tests {
 
         assert_eq!(coordinate.receipt.register, Register::Wire);
         assert_eq!(report.receipt.register, Register::Plain);
+    }
+
+    #[test]
+    fn run_created_lazily_brings_up_corpus_and_resolves_advisory() {
+        // A fresh tenant store has no published packs. RUN.CREATED must lazily
+        // publish the engineering corpus and resolve the prose pack to advisory
+        // from the registry, instead of falling back to shadow.
+        let mut store = InMemoryGraphStore::new();
+        let transition = TransitionInput::new(
+            "RUN.CREATED",
+            json!({ "scope": { "tenant_slug": "acme" } })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let prepared = prepare_run_transition(&mut store, None, transition);
+        let scope = prepared.payload["scope"].as_object().unwrap();
+        assert_eq!(
+            scope["writing_engineering_status"],
+            json!("advisory"),
+            "fresh tenant should resolve advisory after lazy bring-up"
+        );
+        assert_eq!(scope["writing_engineering_status_source"], json!("registry"));
     }
 
     #[test]

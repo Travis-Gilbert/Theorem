@@ -4961,7 +4961,36 @@ fn append_harness_transition_payload(
     backend: &mut impl McpGraphBackend,
     arguments: &Value,
 ) -> Result<Value, McpError> {
-    let transition = transition_from_arguments(arguments, "harness_append_transition")?;
+    let mut transition = transition_from_arguments(arguments, "harness_append_transition")?;
+    // Tenant must ride inside the transition scope. The runtime stamps
+    // registry-scoped run status (writing_engineering_status and peers) from
+    // scope.tenant_slug and otherwise falls back to the empty "default" tenant,
+    // which resolves published packs to shadow. Inject the request tenant when the
+    // caller omitted it so status resolves under the real tenant.
+    let scope_value = transition
+        .payload
+        .entry("scope".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !scope_value.is_object() {
+        // A present-but-non-object scope would otherwise skip injection here and
+        // then be coerced to {} by stamp_run_created_status -- losing the tenant
+        // and falling back to "default". Normalize first (matches the runtime).
+        *scope_value = Value::Object(serde_json::Map::new());
+    }
+    if let Some(scope) = scope_value.as_object_mut() {
+        let has_tenant = ["tenant_slug", "tenantSlug", "tenant", "tenant_id", "tenantId"]
+            .iter()
+            .any(|key| {
+                scope
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            });
+        if !has_tenant && !tenant.trim().is_empty() {
+            scope.insert("tenant_slug".to_string(), Value::String(tenant.to_string()));
+        }
+    }
     let result = backend.append_harness_transition(transition)?;
     Ok(json!({
         "tenant": tenant,
