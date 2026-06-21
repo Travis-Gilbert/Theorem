@@ -1,29 +1,53 @@
-//! The CommonPlace API HTTP server (plan unit F3).
+//! The CommonPlace API HTTP server (plan unit F3 + durable backing).
 //!
 //! Serves the consumer GraphQL profile over one instance. A client connects with
 //! this instance URL plus a key (the `x-api-key` header). `POST /graphql` runs
 //! operations, `GET /graphql` serves GraphiQL, `GET /healthz` is liveness.
 //!
 //! The seed API key comes from `COMMONPLACE_API_KEY` (default `dev-key` for
-//! local use); the bind port from `PORT` (default 50090). Backing is the
-//! in-memory store for this slice; a durable backing is the named follow-up.
+//! local use); the bind port from `PORT` (default 50090). Set
+//! `COMMONPLACE_DATA_DIR` to persist durably (RedCore + disk under that dir);
+//! unset = an ephemeral in-memory instance. The schema is generic over the
+//! backing, so the same handlers serve either.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_graphql::http::GraphiQLSource;
-use async_graphql::Request;
+use async_graphql::{EmptySubscription, Request, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
-use commonplace_api::{build_schema, in_memory_store, ApiKeyRegistry, ApiKeyToken, ConsumerSchema};
+use commonplace::{BlobStore, EmbeddingGraphStore};
+use commonplace_api::{
+    build_schema, in_memory_store, redcore_store, ApiKeyRegistry, ApiKeyToken, Mutation, Query,
+};
 
-#[derive(Clone)]
-struct AppState {
-    schema: ConsumerSchema,
+struct AppState<S, B>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
+    schema: Schema<Query<S, B>, Mutation<S, B>, EmptySubscription>,
     registry: Arc<ApiKeyRegistry>,
+}
+
+// Manual Clone so we do not require S: Clone / B: Clone (the Schema and Arc are
+// Clone regardless of the backing).
+impl<S, B> Clone for AppState<S, B>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            schema: self.schema.clone(),
+            registry: Arc::clone(&self.registry),
+        }
+    }
 }
 
 #[tokio::main]
@@ -32,14 +56,6 @@ async fn main() {
     let instance =
         std::env::var("COMMONPLACE_INSTANCE_ID").unwrap_or_else(|_| "default".to_string());
     let registry = Arc::new(ApiKeyRegistry::new().with_key(api_key, instance));
-    let schema = build_schema(in_memory_store(), Arc::clone(&registry));
-    let state = AppState { schema, registry };
-
-    let app = Router::new()
-        .route("/graphql", get(graphiql).post(graphql_handler))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
-
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -60,18 +76,21 @@ async fn graphiql() -> impl IntoResponse {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
-async fn graphql_handler(
-    State(state): State<AppState>,
+async fn graphql_handler<S, B>(
+    State(state): State<AppState<S, B>>,
     headers: HeaderMap,
     req: GraphQLRequest,
-) -> Result<GraphQLResponse, StatusCode> {
+) -> Result<GraphQLResponse, StatusCode>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
     let key = headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
         .filter(|key| state.registry.resolve(key).is_some())
         .ok_or(StatusCode::FORBIDDEN)?;
 
-    let mut request: Request = req.into_inner();
-    request = request.data(ApiKeyToken(key.to_string()));
+    let request: Request = req.into_inner().data(ApiKeyToken(key.to_string()));
     Ok(state.schema.execute(request).await.into())
 }

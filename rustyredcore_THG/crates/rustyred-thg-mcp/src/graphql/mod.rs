@@ -91,7 +91,6 @@ mod memory;
 pub mod projection;
 mod scalars;
 
-use std::collections::BTreeMap;
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
@@ -111,7 +110,6 @@ pub(crate) trait GraphqlInvoker {
     fn recall(&self, args: Value) -> Result<Value, McpError>;
     fn relate(&self, args: Value) -> Result<Value, McpError>;
     fn get_doc(&self, id: &str) -> Result<Option<Value>, McpError>;
-    fn item_projection_nodes(&self, limit: usize) -> Result<Vec<NodeRecord>, McpError>;
     fn archive_recall(&self, args: Value) -> Result<Value, McpError>;
     fn remember(&self, args: Value) -> Result<Value, McpError>;
     fn encode(&self, args: Value) -> Result<Value, McpError>;
@@ -162,6 +160,13 @@ pub(crate) trait GraphqlInvoker {
     fn skill(&self, operation: &str, args: Value) -> Result<Value, McpError>;
     fn ensemble(&self, operation: &str, args: Value) -> Result<Value, McpError>;
     fn job(&self, operation: &str, args: Value) -> Result<Value, McpError>;
+    // Item domain (SPEC-2): enumerate nodes by the projected labels, and fetch a
+    // single node by id, for the projection. Wraps query_nodes / get_node.
+    fn items_nodes(&self, labels: &[&str], limit: usize) -> Result<Vec<NodeRecord>, McpError>;
+    fn item_node(&self, id: &str) -> Result<Option<NodeRecord>, McpError>;
+    /// Item domain (SPEC-2 putItem): create-or-update a real Item node by id and
+    /// return the written record (for projection). Wraps get_node + upsert_node.
+    fn put_item(&self, args: Value) -> Result<NodeRecord, McpError>;
 }
 
 thread_local! {
@@ -229,17 +234,6 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
     fn get_doc(&self, id: &str) -> Result<Option<Value>, McpError> {
         let node = self.backend.borrow().get_node(id)?;
         Ok(node.map(|node| serde_json::to_value(node).unwrap_or(Value::Null)))
-    }
-    fn item_projection_nodes(&self, limit: usize) -> Result<Vec<NodeRecord>, McpError> {
-        let limit = limit.max(1);
-        let backend = self.backend.borrow();
-        let mut by_id = BTreeMap::new();
-        for label in projection::ITEM_SOURCE_LABELS {
-            for node in backend.query_nodes(NodeQuery::label(*label).with_limit(limit))? {
-                by_id.entry(node.id.clone()).or_insert(node);
-            }
-        }
-        Ok(by_id.into_values().take(limit).collect())
     }
     fn archive_recall(&self, args: Value) -> Result<Value, McpError> {
         crate::recall_archived_memory_payload(&self.tenant, &mut *self.backend.borrow_mut(), &args)
@@ -445,6 +439,70 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
             _ => Err(McpError::invalid_params("unknown job operation")),
         }
     }
+    fn items_nodes(&self, labels: &[&str], limit: usize) -> Result<Vec<NodeRecord>, McpError> {
+        let backend = self.backend.borrow();
+        let mut out = Vec::new();
+        for label in labels {
+            let mut nodes = backend.query_nodes(NodeQuery::label(*label).with_limit(limit))?;
+            out.append(&mut nodes);
+        }
+        Ok(out)
+    }
+    fn item_node(&self, id: &str) -> Result<Option<NodeRecord>, McpError> {
+        Ok(self.backend.borrow().get_node(id)?)
+    }
+    fn put_item(&self, args: Value) -> Result<NodeRecord, McpError> {
+        let mut backend = self.backend.borrow_mut();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let id = args
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("item:{now}"));
+        // Preserve the original created_at_ms across updates (the substrate upsert
+        // replaces the node, so a blind write would reset it).
+        let existing = backend.get_node(&id)?;
+        let created_at_ms = args
+            .get("created_at_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                existing.as_ref().and_then(|node| {
+                    node.properties
+                        .get("created_at_ms")
+                        .and_then(Value::as_i64)
+                })
+            })
+            .unwrap_or(now);
+        let updated_at_ms = args
+            .get("updated_at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(now);
+        let mut props = serde_json::Map::new();
+        props.insert(
+            "kind".to_string(),
+            args.get("kind").cloned().unwrap_or_else(|| json!("note")),
+        );
+        props.insert(
+            "title".to_string(),
+            args.get("title").cloned().unwrap_or_else(|| json!("")),
+        );
+        if let Some(source) = args.get("source") {
+            props.insert("source".to_string(), source.clone());
+        }
+        props.insert("created_at_ms".to_string(), json!(created_at_ms));
+        props.insert("updated_at_ms".to_string(), json!(updated_at_ms));
+        if let Some(extra) = args.get("extra") {
+            props.insert("extra".to_string(), extra.clone());
+        }
+        let record = NodeRecord::new(id, [projection::ITEM_LABEL], Value::Object(props));
+        backend.upsert_node(record.clone())?;
+        Ok(record)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +529,7 @@ pub(crate) struct MutationRoot(
     epistemic::EpistemicMutation,
     code::CodeMutation,
     clusters::ClustersMutation,
+    items::ItemMutation,
 );
 
 fn full_schema() -> Schema<QueryRoot, MutationRoot, EmptySubscription> {

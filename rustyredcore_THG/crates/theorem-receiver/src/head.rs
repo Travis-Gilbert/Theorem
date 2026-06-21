@@ -19,11 +19,15 @@
 //! registry (ensemble_register / ensemble_select), the harness plugin system; this
 //! adapter does not rebuild a parallel one.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
 use theorem_harness_core::{LANE_CLAUDE, LANE_CODEX};
 
+use crate::config::{
+    HeadRuntimeRecipe, ModelBackendConfig, ModelBackendKind, ProviderSeamConfig, ProviderWireMode,
+};
 use crate::lanes::which_in;
 use crate::spawn::{build_intent, SpawnPlan, ANTHROPIC_API_KEY};
 
@@ -89,6 +93,154 @@ pub trait HeadAdapter: Sync {
             strip_env: self.strip_env(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadRuntimePlan {
+    pub spawn: SpawnPlan,
+    pub env: BTreeMap<String, String>,
+    pub model_backend: String,
+    pub backend_kind: ModelBackendKind,
+    pub wire_mode: ProviderWireMode,
+    pub sandbox: bool,
+}
+
+pub fn runtime_plan_from_recipe(
+    recipe: &HeadRuntimeRecipe,
+    backend: &ModelBackendConfig,
+    provider_seam: &ProviderSeamConfig,
+    intent: &str,
+    worktree: &Path,
+) -> HeadRuntimePlan {
+    let wire_mode = recipe_wire_mode(recipe, backend);
+    let env = runtime_env(recipe, backend, provider_seam, wire_mode);
+    HeadRuntimePlan {
+        spawn: SpawnPlan {
+            program: recipe.runtime_binary.clone(),
+            args: runtime_args(recipe, intent),
+            cwd: worktree.to_path_buf(),
+            strip_env: Vec::new(),
+        },
+        env,
+        model_backend: recipe.model_backend.clone(),
+        backend_kind: backend.kind.clone(),
+        wire_mode,
+        sandbox: recipe.sandbox,
+    }
+}
+
+fn recipe_wire_mode(recipe: &HeadRuntimeRecipe, backend: &ModelBackendConfig) -> ProviderWireMode {
+    if recipe.wire_mode == ProviderWireMode::ChatCompletions
+        && backend.wire_mode != ProviderWireMode::ChatCompletions
+    {
+        backend.wire_mode
+    } else {
+        recipe.wire_mode
+    }
+}
+
+fn runtime_args(recipe: &HeadRuntimeRecipe, intent: &str) -> Vec<String> {
+    if !recipe.args.is_empty() {
+        return recipe
+            .args
+            .iter()
+            .map(|arg| arg.replace("{intent}", intent))
+            .collect();
+    }
+    match recipe.runtime_binary.trim() {
+        "claude" | "claude-code" => vec![
+            "-p".to_string(),
+            intent.to_string(),
+            "--permission-mode".to_string(),
+            "acceptEdits".to_string(),
+        ],
+        "codex" => vec!["exec".to_string(), intent.to_string()],
+        "aider" => vec!["--message".to_string(), intent.to_string()],
+        "openhands" => vec!["run".to_string(), intent.to_string()],
+        _ => vec![intent.to_string()],
+    }
+}
+
+fn runtime_env(
+    recipe: &HeadRuntimeRecipe,
+    backend: &ModelBackendConfig,
+    provider_seam: &ProviderSeamConfig,
+    wire_mode: ProviderWireMode,
+) -> BTreeMap<String, String> {
+    let mut env = recipe.env.clone();
+    env.insert(
+        "THEOREM_MODEL_BACKEND_KIND".to_string(),
+        match backend.kind {
+            ModelBackendKind::Single => "single",
+            ModelBackendKind::Composed => "composed",
+        }
+        .to_string(),
+    );
+    env.insert(
+        "THEOREM_PROVIDER_WIRE_MODE".to_string(),
+        match wire_mode {
+            ProviderWireMode::ChatCompletions => "chat_completions",
+            ProviderWireMode::Responses => "responses",
+            ProviderWireMode::Messages => "messages",
+        }
+        .to_string(),
+    );
+    if let Some(model) = backend
+        .model
+        .as_deref()
+        .or_else(|| {
+            backend
+                .provider
+                .as_deref()
+                .and_then(|provider| provider_seam.models.get(provider).map(String::as_str))
+        })
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        env.entry("OPENAI_MODEL".to_string())
+            .or_insert_with(|| model.to_string());
+    }
+    if let Some(base_url) = backend
+        .base_url
+        .as_deref()
+        .or(provider_seam.base_url.as_deref())
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+    {
+        env.entry("OPENAI_API_BASE".to_string())
+            .or_insert_with(|| base_url.trim_end_matches('/').to_string());
+    }
+    if let Some(endpoint) = backend
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+        .map(str::to_string)
+        .or_else(|| provider_seam.endpoint_for_wire_mode(wire_mode))
+    {
+        env.entry("THEOREM_PROVIDER_ENDPOINT".to_string())
+            .or_insert(endpoint);
+    }
+    if let Some(key_env) = backend
+        .credential_env
+        .as_deref()
+        .or(provider_seam.api_key_env.as_deref())
+        .map(str::trim)
+        .filter(|key_env| !key_env.is_empty())
+    {
+        env.entry("OPENAI_API_KEY_ENV".to_string())
+            .or_insert_with(|| key_env.to_string());
+    }
+    if let Some(binding_id) = backend
+        .composed_binding_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|binding_id| !binding_id.is_empty())
+    {
+        env.entry("THEOREM_COMPOSED_AGENT_BINDING_ID".to_string())
+            .or_insert_with(|| binding_id.to_string());
+    }
+    env
 }
 
 /// Claude Code head: `claude -p "<intent>" --permission-mode acceptEdits`.
@@ -260,5 +412,86 @@ mod tests {
         assert!(head.intent_template("spec", "job-x").contains("job-x"));
         assert_eq!(head.parse_receipt(Some(0), "ok")["lane"], json!("gemini"));
         assert!(head.capability_priors().is_empty());
+    }
+
+    #[test]
+    fn runtime_recipe_builds_sandbox_codex_plan_with_responses_seam() {
+        let recipe = HeadRuntimeRecipe {
+            runtime_binary: "codex".to_string(),
+            model_backend: "codex_single".to_string(),
+            wire_mode: ProviderWireMode::Responses,
+            sandbox: true,
+            env: BTreeMap::new(),
+            args: Vec::new(),
+        };
+        let backend = ModelBackendConfig {
+            kind: ModelBackendKind::Single,
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4.1-mini".to_string()),
+            credential_env: Some("OPENAI_API_KEY".to_string()),
+            base_url: None,
+            wire_mode: ProviderWireMode::Responses,
+            composed_binding_id: None,
+        };
+        let seam = ProviderSeamConfig {
+            base_url: Some("http://litellm.internal:4000".to_string()),
+            api_key_env: None,
+            ..ProviderSeamConfig::default()
+        };
+
+        let plan = runtime_plan_from_recipe(
+            &recipe,
+            &backend,
+            &seam,
+            "change the file",
+            Path::new("/workspace/repo"),
+        );
+
+        assert_eq!(plan.spawn.program, "codex");
+        assert_eq!(plan.spawn.args, vec!["exec", "change the file"]);
+        assert!(plan.sandbox);
+        assert_eq!(plan.wire_mode, ProviderWireMode::Responses);
+        assert_eq!(
+            plan.env["THEOREM_PROVIDER_ENDPOINT"],
+            "http://litellm.internal:4000/v1/responses"
+        );
+        assert_eq!(plan.env["OPENAI_MODEL"], "gpt-4.1-mini");
+        assert_eq!(plan.env["OPENAI_API_KEY_ENV"], "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn runtime_recipe_can_target_composed_backend() {
+        let recipe = HeadRuntimeRecipe {
+            runtime_binary: "aider".to_string(),
+            model_backend: "agent_consensus".to_string(),
+            wire_mode: ProviderWireMode::ChatCompletions,
+            sandbox: true,
+            env: BTreeMap::new(),
+            args: vec!["--message".to_string(), "{intent}".to_string()],
+        };
+        let backend = ModelBackendConfig {
+            kind: ModelBackendKind::Composed,
+            provider: None,
+            model: None,
+            credential_env: None,
+            base_url: Some("http://receiver.local/composed-agent".to_string()),
+            wire_mode: ProviderWireMode::ChatCompletions,
+            composed_binding_id: Some("agent:theorem".to_string()),
+        };
+
+        let plan = runtime_plan_from_recipe(
+            &recipe,
+            &backend,
+            &ProviderSeamConfig::default(),
+            "repair tests",
+            Path::new("/workspace/repo"),
+        );
+
+        assert_eq!(plan.backend_kind, ModelBackendKind::Composed);
+        assert_eq!(plan.spawn.args, vec!["--message", "repair tests"]);
+        assert_eq!(
+            plan.env["THEOREM_COMPOSED_AGENT_BINDING_ID"],
+            "agent:theorem"
+        );
     }
 }

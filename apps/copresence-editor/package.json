@@ -1,0 +1,30 @@
+{
+  "name": "copresence-editor",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Edit-with-Gemma over Velt: a Velt + Tiptap CRDT collaborative editor (browser adapter for the theorem-copresence substrate). Human co-editing + presence, plus a browser-driven Gemma co-writer over an OpenAI-compatible endpoint.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tiptap/core": "^3.0.0",
+    "@tiptap/starter-kit": "^3.0.0",
+    "@veltdev/react": "latest",
+    "@veltdev/tiptap-crdt": "latest",
+    "@veltdev/tiptap-crdt-react": "latest",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "yjs": "^13.6.20"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@veltdev/types": "latest",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

@@ -135,6 +135,15 @@ pub enum Predicate {
     GeoWithin {
         column: ColumnId,
         region: RegionRef,
+        /// Live spatial-index address: the designated lat/lon property names and node label. When
+        /// all three are present the planner resolves over-approximate candidates from the live
+        /// spatial index; otherwise it does a residual-only exact scan over the row coordinates.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lat_property: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lon_property: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     TimeRange {
         column: ColumnId,
@@ -144,11 +153,15 @@ pub enum Predicate {
     TextMatch {
         column: ColumnId,
         query: String,
+        #[serde(default)]
+        mode: PredicateMode,
     },
     Expand {
         from: RowId,
         edge_type: String,
         dir: Direction,
+        #[serde(default)]
+        mode: PredicateMode,
     },
 }
 
@@ -178,6 +191,14 @@ impl Predicate {
             Self::Expand { .. } => "expand",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredicateMode {
+    #[default]
+    Filter,
+    Rank,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -234,6 +255,8 @@ pub struct RowChange {
     pub relation: RelationId,
     pub row_id: RowId,
     pub values: BTreeMap<ColumnId, ScalarValue>,
+    #[serde(default)]
+    pub properties: Value,
     pub kind: RowChangeKind,
 }
 
@@ -245,6 +268,200 @@ pub trait AccessMethod: Send + Sync {
     fn cost(&self, relation: &str, predicate: &Predicate) -> Option<Cost>;
     fn scan(&self, relation: &str, predicate: &Predicate) -> AmResult<RowIdStream>;
     fn on_write(&self, change: &RowChange) -> AmResult<()>;
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RankedRow {
+    pub row_id: RowId,
+    pub score: f32,
+}
+
+/// Outcome of a rank-phase scoring pass. Carries the honest execution strategy and
+/// overfetch round count so the planner trace reports what actually ran rather than a
+/// fixed label. `strategy`/`overfetch_rounds` are only meaningful for vector kNN; text
+/// and expand rankers leave `strategy` `None` and `overfetch_rounds` `0`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RankOutcome {
+    pub rows: Vec<RankedRow>,
+    pub strategy: Option<String>,
+    pub overfetch_rounds: usize,
+}
+
+impl RankOutcome {
+    /// Wrap a plain scored list with no kNN strategy metadata (text/expand rankers).
+    pub fn scored(rows: Vec<RankedRow>) -> Self {
+        Self {
+            rows,
+            strategy: None,
+            overfetch_rounds: 0,
+        }
+    }
+}
+
+/// Handle to the live modality index subsystems (TurboVec vectors, full-text, spatial,
+/// graph adjacency/PPR). Rankers and modality filters resolve data *by node id* from these
+/// subsystems at query time; nothing is copied into the relational store. A query supplies
+/// the resolver to `execute_query_with_resolver`; scalar/time-only callers use
+/// [`NoModalityResolver`].
+pub trait ModalityResolver {
+    /// kNN over the live vector index, restricted to `candidates` (node ids) when present.
+    /// Returns the scored rows plus honest strategy/overfetch metadata for the trace.
+    fn vector_knn(
+        &self,
+        relation: &str,
+        column: &str,
+        query: &[f32],
+        candidates: Option<&BTreeSet<RowId>>,
+        k: usize,
+    ) -> AmResult<RankOutcome>;
+
+    /// Relevance (BM25) over the live full-text index, restricted to `candidates` when present.
+    fn text_rank(
+        &self,
+        relation: &str,
+        column: &str,
+        query: &str,
+        candidates: Option<&BTreeSet<RowId>>,
+        k: usize,
+    ) -> AmResult<Vec<RankedRow>>;
+
+    /// Proximity (hop distance / PPR) from `from` along `edge_type` in `dir` over the live
+    /// graph, restricted to `candidates` when present.
+    fn expand_proximity(
+        &self,
+        from: &str,
+        edge_type: &str,
+        dir: Direction,
+        candidates: Option<&BTreeSet<RowId>>,
+        k: usize,
+    ) -> AmResult<Vec<RankedRow>>;
+
+    /// Filter: candidate ids whose live full-text document contains `query` (over-approximate;
+    /// the planner residual-checks term presence on the row).
+    fn text_contains(&self, relation: &str, column: &str, query: &str) -> AmResult<Vec<RowId>>;
+
+    /// Filter: over-approximate candidate ids from the live spatial index for `region`, addressed by
+    /// the designated `label`/`lat_property`/`lon_property`. `Ok(None)` means no live spatial index
+    /// is addressable (e.g. the address is absent or the backend has no spatial support), so the
+    /// planner falls back to a residual-only exact scan over the existing candidate set.
+    fn geo_overapprox(
+        &self,
+        relation: &str,
+        column: &str,
+        lat_property: Option<&str>,
+        lon_property: Option<&str>,
+        label: Option<&str>,
+        region: &RegionRef,
+    ) -> AmResult<Option<Vec<RowId>>>;
+
+    /// Filter: the reachable id set from `from` along `edge_type` in `dir` over the live graph.
+    fn expand_reachable(&self, from: &str, edge_type: &str, dir: Direction)
+        -> AmResult<Vec<RowId>>;
+}
+
+/// No-op resolver for scalar/time-only queries: every modality op yields nothing. A `Knn`,
+/// `TextMatch { Rank }`, or `Expand { Rank }` predicate therefore returns no rows (honest: no
+/// index is bound), and modality filters impose no restriction (residual checks still apply).
+pub struct NoModalityResolver;
+
+impl ModalityResolver for NoModalityResolver {
+    fn vector_knn(
+        &self,
+        _relation: &str,
+        _column: &str,
+        _query: &[f32],
+        _candidates: Option<&BTreeSet<RowId>>,
+        _k: usize,
+    ) -> AmResult<RankOutcome> {
+        Ok(RankOutcome::default())
+    }
+
+    fn text_rank(
+        &self,
+        _relation: &str,
+        _column: &str,
+        _query: &str,
+        _candidates: Option<&BTreeSet<RowId>>,
+        _k: usize,
+    ) -> AmResult<Vec<RankedRow>> {
+        Ok(Vec::new())
+    }
+
+    fn expand_proximity(
+        &self,
+        _from: &str,
+        _edge_type: &str,
+        _dir: Direction,
+        _candidates: Option<&BTreeSet<RowId>>,
+        _k: usize,
+    ) -> AmResult<Vec<RankedRow>> {
+        Ok(Vec::new())
+    }
+
+    fn text_contains(&self, _relation: &str, _column: &str, _query: &str) -> AmResult<Vec<RowId>> {
+        Ok(Vec::new())
+    }
+
+    fn geo_overapprox(
+        &self,
+        _relation: &str,
+        _column: &str,
+        _lat_property: Option<&str>,
+        _lon_property: Option<&str>,
+        _label: Option<&str>,
+        _region: &RegionRef,
+    ) -> AmResult<Option<Vec<RowId>>> {
+        Ok(None)
+    }
+
+    fn expand_reachable(
+        &self,
+        _from: &str,
+        _edge_type: &str,
+        _dir: Direction,
+    ) -> AmResult<Vec<RowId>> {
+        Ok(Vec::new())
+    }
+}
+
+pub trait RankingAccessMethod: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn supports(&self, relation: &str, predicate: &Predicate) -> bool;
+    fn cost(
+        &self,
+        relation: &str,
+        predicate: &Predicate,
+        candidates: Option<usize>,
+    ) -> Option<Cost>;
+    /// Score `candidates` (node ids) via the live subsystem behind `resolver`. Candidates are
+    /// node ids, not ordinals, so there is no positional coupling with the relation's row order.
+    fn rank(
+        &self,
+        relation: &str,
+        predicate: &Predicate,
+        candidates: Option<&BTreeSet<RowId>>,
+        k: usize,
+        resolver: &dyn ModalityResolver,
+    ) -> AmResult<RankOutcome>;
+}
+
+#[derive(Default)]
+pub struct RankingRegistry {
+    methods: Vec<Box<dyn RankingAccessMethod>>,
+}
+
+impl RankingRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, method: impl RankingAccessMethod + 'static) {
+        self.methods.push(Box::new(method));
+    }
+
+    pub fn methods(&self) -> impl Iterator<Item = &dyn RankingAccessMethod> {
+        self.methods.iter().map(|method| method.as_ref())
+    }
 }
 
 #[derive(Default)]

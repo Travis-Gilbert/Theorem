@@ -1,0 +1,16 @@
+{
+  "name": "theorem-browser-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Playwright sidecar implementing the Theorem render endpoint + live browser action loop (sessions/checkout|snapshot|actuate).",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.48.0"
+  }
+}

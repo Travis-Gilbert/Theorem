@@ -12,16 +12,15 @@ use rustyred_thg_core::{
     make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
     EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
     GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
-    coalesce_per_id, GraphTransaction, GraphWriteResult, HookContext, HookDispatcher,
-    HookDispatcherConfig, HookHandler, HookOutcome, HookRegistration, HookStoreAccess,
-    HybridScoringConfig, InMemoryGraphStore, MutationEvent, MutationKind, MutationMatcher,
-    NeighborHit, NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions,
+    GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
+    HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
+    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions,
     RedisGraphStore, SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
-    project_mutation_event, AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend,
-    McpGraphProvider, McpServerConfig, ITEM_SOURCE_LABELS,
+    AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
+    McpServerConfig,
 };
 use rustyred_web::{
     configured_search_providers_from_env, FetchCascade, FetchCascadeOptions, LiveFetchOptions,
@@ -38,7 +37,6 @@ use theorem_harness_runtime::{
     run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError, JobNoteInput,
     ProviderHeadInvoker,
 };
-use tokio::sync::broadcast;
 
 use crate::browser_pool::{BrowserLiveSessionRecord, LiveBrowserPool, RemoteBrowserPool};
 use crate::config::{Config, StorageMode};
@@ -82,7 +80,6 @@ pub struct AppState {
     live_browser_pool: Arc<RwLock<Option<Arc<dyn LiveBrowserPool>>>>,
     live_browser_sessions: Arc<Mutex<BTreeMap<String, BrowserLiveSessionRecord>>>,
     search_providers: Arc<RwLock<Vec<Arc<dyn SearchProvider>>>>,
-    item_change_tx: broadcast::Sender<Value>,
     next_graph_txn_id: Arc<AtomicU64>,
     spatial_indexes: Arc<Mutex<SpatialIndexes>>,
     fulltext_indexes: Arc<Mutex<FullTextIndexes>>,
@@ -117,7 +114,6 @@ impl AppState {
         .expect("default live fetch cascade options must build");
         let live_browser_pool =
             RemoteBrowserPool::from_env().map(|pool| Arc::new(pool) as Arc<dyn LiveBrowserPool>);
-        let (item_change_tx, _) = broadcast::channel(1024);
         Self {
             config: Arc::new(config),
             observability,
@@ -129,7 +125,6 @@ impl AppState {
             live_browser_pool: Arc::new(RwLock::new(live_browser_pool)),
             live_browser_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             search_providers: Arc::new(RwLock::new(search_providers)),
-            item_change_tx,
             next_graph_txn_id: Arc::new(AtomicU64::new(1)),
             spatial_indexes: Arc::new(Mutex::new(BTreeMap::new())),
             fulltext_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -148,10 +143,6 @@ impl AppState {
         if let Ok(mut live_browser_pool) = self.live_browser_pool.write() {
             *live_browser_pool = pool;
         }
-    }
-
-    pub fn subscribe_item_changes(&self) -> broadcast::Receiver<Value> {
-        self.item_change_tx.subscribe()
     }
 
     pub fn live_browser_session(&self, run_id: &str) -> Option<BrowserLiveSessionRecord> {
@@ -739,7 +730,7 @@ impl AppState {
             RedCoreGraphStore::open(data_dir, options)?,
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(self.graph_hook_registrations(), tenant_id) {
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(), tenant_id) {
             eprintln!(
                 "[theorem] enable graph hooks failed for {tenant_id}: {}",
                 err.message
@@ -766,7 +757,7 @@ impl AppState {
             RedCoreGraphStore::memory(),
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(self.graph_hook_registrations(), tenant_id) {
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(), tenant_id) {
             eprintln!(
                 "[theorem] enable graph hooks failed for {tenant_id}: {}",
                 err.message
@@ -802,39 +793,6 @@ impl AppState {
             .collect())
     }
 
-    fn graph_hook_registrations(&self) -> Vec<HookRegistration> {
-        let mut registrations = vec![item_changefeed_hook(self.item_change_tx.clone())];
-        if graph_hooks_enabled() {
-            registrations.extend(rustyred_web::crawl_hooks());
-        }
-        registrations
-    }
-}
-
-fn item_changefeed_hook(sender: broadcast::Sender<Value>) -> HookRegistration {
-    let handler: HookHandler =
-        Arc::new(move |ctx: &mut HookContext, events: &[MutationEvent]| {
-            for event in events {
-                let node = if matches!(event.kind, MutationKind::NodeDeleted) {
-                    None
-                } else {
-                    ctx.store.get_node_record(&event.id)
-                };
-                if let Some(delta) = project_mutation_event(event, node.as_ref()) {
-                    let _ = sender.send(json!(delta));
-                }
-            }
-            Ok(HookOutcome::Done)
-        });
-
-    HookRegistration::new(
-        "theorem.item_changefeed",
-        MutationMatcher::any()
-            .with_kinds([MutationKind::NodeUpserted, MutationKind::NodeDeleted])
-            .with_labels(ITEM_SOURCE_LABELS.iter().copied()),
-        coalesce_per_id,
-        handler,
-    )
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -908,6 +866,22 @@ fn graph_hooks_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// The graph-level hook registrations to attach to a fresh per-tenant store.
+/// Crawl hooks ride `THEOREM_GRAPH_HOOKS`; the Item changefeed (SPEC-2) rides its
+/// own `THEOREM_ITEM_CHANGEFEED`, so the live changefeed can run without enabling
+/// the heavier reactive-compute hooks. Empty (the default) makes
+/// `enable_graph_hooks` a no-op.
+fn tenant_hook_registrations() -> Vec<HookRegistration> {
+    let mut registrations = Vec::new();
+    if graph_hooks_enabled() {
+        registrations.extend(rustyred_web::crawl_hooks());
+    }
+    if crate::items_changefeed::item_changefeed_enabled() {
+        registrations.push(crate::items_changefeed::changefeed_registration());
+    }
+    registrations
 }
 
 #[derive(Debug)]
@@ -1959,6 +1933,13 @@ fn mirror_job_to_dispatch_if_configured(job: &HarnessJob) -> Result<bool, McpErr
                 let queue = DispatchQueue::connect(&database_url)
                     .await
                     .map_err(|error| error.to_string())?;
+                // Idempotent (CREATE TABLE IF NOT EXISTS): a fresh dispatch database, or
+                // one where the harness server is the first writer, still receives the row
+                // instead of failing on a missing `dispatch_jobs` table.
+                queue
+                    .migrate()
+                    .await
+                    .map_err(|error| error.to_string())?;
                 queue
                     .submit(dispatch_job, priority)
                     .await
@@ -2139,9 +2120,23 @@ impl McpGraphBackend for ProductMcpBackend {
                 "job_submit payload could not mirror to dispatch: {error}"
             ))
         })?;
-        let mirrored = mirror_job_to_dispatch_if_configured(&job)?;
-        if let Value::Object(map) = &mut result {
-            map.insert("dispatch_mirrored".to_string(), json!(mirrored));
+        // The board write above (`job_submit_to_store`) is canonical and already
+        // committed. A dispatch-mirror failure (Postgres unreachable, schema missing,
+        // transient error) must NOT fail the submit -- otherwise the job lands on the
+        // board while `job_submit` reports an error, the exact reliability bug this
+        // addendum fixes. Record the mirror outcome on the payload and still return Ok.
+        match mirror_job_to_dispatch_if_configured(&job) {
+            Ok(mirrored) => {
+                if let Value::Object(map) = &mut result {
+                    map.insert("dispatch_mirrored".to_string(), json!(mirrored));
+                }
+            }
+            Err(error) => {
+                if let Value::Object(map) = &mut result {
+                    map.insert("dispatch_mirrored".to_string(), json!(false));
+                    map.insert("dispatch_mirror_error".to_string(), json!(error.message));
+                }
+            }
         }
         Ok(result)
     }
@@ -2664,6 +2659,53 @@ mod tests {
             executor.get_node("derived:1").unwrap().is_some(),
             "hook-derived node visible via the executor read snapshot"
         );
+    }
+
+    // SPEC-2 acceptance 2 + 5: a projected-node write delivers a projected Item
+    // delta on the changefeed bus (shaped by the same projection the query uses),
+    // and the publishing hook obeys the hook contract (no graph writes, fail-open
+    // send, runs off the writer's critical path through the dispatcher).
+    #[test]
+    fn item_changefeed_publishes_a_delta_for_a_projected_write() {
+        // Subscribe BEFORE the write: a broadcast receiver only sees later sends.
+        let mut rx = crate::items_changefeed::subscribe();
+        let executor =
+            Arc::new(RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap());
+        executor
+            .enable_graph_hooks(
+                vec![crate::items_changefeed::changefeed_registration()],
+                "tenant-cf",
+            )
+            .unwrap();
+
+        executor
+            .upsert_node(NodeRecord::new(
+                "run-cf::task-9",
+                ["TaskNode"],
+                json!({ "goal": "watch me appear", "created_at_ms": 1, "updated_at_ms": 1 }),
+            ))
+            .unwrap();
+        assert!(executor.quiesce_hooks(Duration::from_secs(10)));
+
+        // Drain the shared bus and find our delta (parallel tests may interleave).
+        let mut found = None;
+        loop {
+            match rx.try_recv() {
+                Ok(delta) => {
+                    if delta.id == "run-cf::task-9" {
+                        found = Some(delta);
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        let delta = found.expect("changefeed delivered a delta for the projected task write");
+        assert_eq!(delta.tenant, "tenant-cf");
+        let item = delta.item.expect("an upsert delta carries the projected item");
+        assert_eq!(item.kind, "task");
+        assert_eq!(item.title, "watch me appear");
     }
 
     #[test]
@@ -3370,6 +3412,88 @@ mod tests {
         assert_eq!(
             error.message,
             "no matching fulltext designation; call /fulltext/designate first"
+        );
+    }
+
+    // T9 (dispatch-mirror fix): a configured-but-unreachable Postgres dispatch mirror
+    // must not fail `job_submit`. The board write is canonical; the mirror is best-effort.
+    // Acceptance: submit completes cleanly (no error envelope, no panic), the job lands on
+    // the board, and the failed mirror is recorded as `dispatch_mirrored:false` + an error.
+    #[test]
+    fn job_submit_survives_a_failing_dispatch_mirror() {
+        let state = AppState::new(memory_config());
+        let mut config = state.mcp_config();
+        config.read_only = false;
+
+        // An invalid dispatch URL: `DispatchQueue::connect` fails fast (URL parse error),
+        // exercising the mirror-failure path without a live database. Capture results
+        // before asserting so an assert panic cannot leak the process-global env var.
+        std::env::set_var("THEOREM_DISPATCH_DATABASE_URL", "not-a-valid-postgres-url");
+        let submit = rustyred_thg_mcp::handle_mcp_request(
+            &state,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "submit",
+                "method": "tools/call",
+                "params": {
+                    "name": "job_submit",
+                    "arguments": {
+                        "tenant": "tenant-jobs",
+                        "title": "Mirror non-fatal job",
+                        "repo": "Travis-Gilbert/Theorem",
+                        "spec_inline": "make the dispatch mirror non-fatal",
+                        "actor": "claude-code"
+                    }
+                }
+            }),
+        );
+        let list = rustyred_thg_mcp::handle_mcp_request(
+            &state,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "list",
+                "method": "tools/call",
+                "params": {
+                    "name": "job_list",
+                    "arguments": { "tenant": "tenant-jobs" }
+                }
+            }),
+        );
+        std::env::remove_var("THEOREM_DISPATCH_DATABASE_URL");
+
+        // The submit completed cleanly: a success envelope, not the pre-fix error envelope.
+        assert!(
+            submit.get("error").is_none(),
+            "job_submit must not error when the dispatch mirror fails: {submit}"
+        );
+        let payload = &submit["result"]["structuredContent"]["result"];
+        assert_eq!(
+            payload["dispatch_mirrored"],
+            json!(false),
+            "mirror failure records dispatch_mirrored:false: {payload}"
+        );
+        assert!(
+            payload["dispatch_mirror_error"]
+                .as_str()
+                .map(|message| !message.is_empty())
+                .unwrap_or(false),
+            "a failed mirror records a non-empty error note: {payload}"
+        );
+        let job_id = payload["job"]["job_id"]
+            .as_str()
+            .expect("the job committed to the board");
+        assert!(!job_id.is_empty());
+
+        // The job is on the board despite the mirror failure.
+        assert!(
+            list.get("error").is_none(),
+            "job_list must succeed: {list}"
+        );
+        assert!(
+            list.to_string().contains(job_id),
+            "submitted job {job_id} must appear on the board: {list}"
         );
     }
 

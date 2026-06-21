@@ -15,4 +15,4 @@ An agent is a composition of heads bound to a shared working-memory scope over t
 
 ## Status
 
-Live build. Lane A is complete and committed. Lane B has the builtin reasoning-engine affordance registry, pure fake-endpoint AgentHead registry, deterministic fake-head intra-agent loop, fake-first invocation seam, and metadata-only `theorem_grpc` app affordance wrappers locally validated. The remaining active work is the runtime/provider head adapter, learned/router policy, charter-surface reintegration, and live `theorem_grpc` invocation adapter. Steps 10-11 are deferred by the spec.
+Live build. Lane A is complete and committed. Lane B has the builtin reasoning-engine affordance registry, pure fake-endpoint AgentHead registry, deterministic fake-head intra-agent loop, fake-first invocation seam, the runtime `ProviderHeadInvoker` for API-backed heads, production `composed_agent_run` wiring, and metadata-only `theorem_grpc` app affordance wrappers locally validated. The remaining active work is learned/router policy, charter-surface reintegration, and live `theorem_grpc` invocation adapter. Steps 10-11 are deferred by the spec.

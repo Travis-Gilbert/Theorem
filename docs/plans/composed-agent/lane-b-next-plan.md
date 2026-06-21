@@ -160,4 +160,4 @@ cd rustyredcore_THG && cargo clippy -p rustyred-thg-affordances --all-targets --
 
 ## First Implementation Slice
 
-Next implementation slice: add the runtime/provider adapter behind the `HeadInvoker` contract or move to LB-4 app affordance wrapping. Keep real provider calls explicit and outside `theorem-harness-core`; no credential values should enter GraphStore-backed binding state.
+Current implementation slice landed the runtime/provider adapter behind the `HeadInvoker` contract: `ProviderHeadInvoker` keeps real provider calls explicit and outside `theorem-harness-core`, resolves credential references only at call time, and keeps credential values out of GraphStore-backed binding state. Next slices are learned/router policy, charter-surface reintegration, or LB-4 app affordance wrapping.

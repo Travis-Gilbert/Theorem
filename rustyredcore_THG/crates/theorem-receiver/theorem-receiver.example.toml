@@ -28,3 +28,35 @@ capacity = 1
 # repo -> local worktree. A job for an unmapped repo is never launched.
 [worktrees]
 "Travis-Gilbert/theorem" = "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem"
+
+# Optional LiteLLM/OpenAI-compatible provider seam for sandboxed coding heads.
+# The named env var is resolved by the sandbox/runtime process, not stored here.
+# [provider_seam]
+# base_url = "http://litellm.internal:4000"
+# api_key_env = "LITELLM_API_KEY"
+#
+# [provider_seam.models]
+# deepseek = "deepseek-v4-flash"
+# mistral = "mistral-large-latest"
+# minimax = "MiniMax-M3"
+#
+# [model_backends.codex_single]
+# kind = "single"
+# provider = "openai"
+# model = "gpt-4.1-mini"
+# credential_env = "OPENAI_API_KEY"
+# wire_mode = "responses"
+#
+# [head_runtime_recipes.codex]
+# runtime_binary = "codex"
+# model_backend = "codex_single"
+# wire_mode = "responses"
+# sandbox = true
+#
+# [sandbox]
+# enabled = true
+# base_url = "http://localhost:8080/v1"
+# api_key_env = "OPEN_SANDBOX_API_KEY"
+# image = "ghcr.io/example/theorem-codex:latest"
+# worktree_root = "/workspace/theorem"
+# egress_allowlist = ["litellm.internal", "github.com"]

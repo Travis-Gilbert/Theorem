@@ -452,6 +452,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/agent-space/snapshot",
             get(crate::agent_space::agent_space_snapshot),
         )
+        .route(
+            "/v1/items/stream",
+            get(crate::items_changefeed::items_stream),
+        )
         .route("/metrics", get(crate::metrics::metrics))
         .route(
             "/v1/diagnostics/slow_queries",
@@ -478,7 +482,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/tenants/:tenant_id/command", post(command))
         .route("/v1/tenants/:tenant_id/batch", post(batch))
         .route("/v1/tenants/:tenant_id/runs/:run_id", get(run_get))
-        .route("/v1/tenants/:tenant_id/items/events", get(item_events))
+        .route(
+            "/v1/tenants/:tenant_id/items/events",
+            get(crate::items_changefeed::tenant_items_events),
+        )
         .route("/v1/tenants/:tenant_id/graph/query", post(graph_query))
         .route(
             "/v1/tenants/:tenant_id/graph/nodes",
@@ -933,37 +940,6 @@ async fn coordination_events(
                 Err(_) => None,
             },
         );
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-async fn item_events(
-    Path(tenant_id): Path<String>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if !mcp_origin_allowed(&headers, &state.config.allowed_origins) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    let tenant_filter = tenant_id.clone();
-    let stream = BroadcastStream::new(state.subscribe_item_changes()).filter_map(move |event| {
-        let tenant_filter = tenant_filter.as_str();
-        match event {
-            Ok(message)
-                if message.get("tenant").and_then(Value::as_str) == Some(tenant_filter) =>
-            {
-                let sse_event = Event::default()
-                    .event("item_delta")
-                    .json_data(message)
-                    .unwrap_or_else(|_| Event::default().event("item_delta").data("{}"));
-                Some(Ok::<Event, Infallible>(sse_event))
-            }
-            _ => None,
-        }
-    });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())

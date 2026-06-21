@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_graphql::Request;
 use commonplace::{DeterministicEmbedder, IngestInput, IngestPipeline};
 use commonplace_api::{
-    build_schema, in_memory_store, ApiKeyRegistry, ApiKeyToken, ConsumerSchema, SharedStore,
+    build_schema, in_memory_store, ApiKeyRegistry, ApiKeyToken, ConsumerSchema, InMemoryShared,
 };
 
 const KEY: &str = "key";
@@ -37,7 +37,7 @@ fn is_rust_pair(link: &serde_json::Value, a: &str, b: &str) -> bool {
 
 #[tokio::test]
 async fn discover_proposes_similar_but_unlinked_pairs_then_excludes_connected() {
-    let store: SharedStore = in_memory_store();
+    let store: InMemoryShared = in_memory_store();
 
     // Pre-populate with an artificially HIGH similarity threshold so the items
     // are embedded and indexed but the auto-linker writes NO SIMILAR_TO edges:

@@ -1,233 +1,386 @@
-//! Item projection for graph-native Harness and CommonPlace records.
+//! SPEC-2 deliverable 1: the one projection from a graph node (or a mutation
+//! event) to the Item shape.
 //!
-//! This module is intentionally independent from async-graphql. The GraphQL
-//! resolver and the async server changefeed both call the same projection
-//! functions so Item hydration and Item deltas do not drift.
+//! The invariant the projection enforces: a harness / Theseus / dispatch node
+//! read as an Item, and the same node delivered as an Item delta on the live
+//! changefeed, have IDENTICAL shape, because both go through [`project_node`]
+//! here. The read resolver ([`super::items`]) converts a [`ProjectedItem`] to the
+//! GraphQL `Item`; the async changefeed handler on `rustyred-thg-server`
+//! serializes an [`ItemDelta`] to SSE JSON. Neither reimplements the shape, so a
+//! shape change in one is a shape change in both (SPEC-2 acceptance 4).
+//!
+//! The projection NEVER mutates the node it reads. It presents native harness /
+//! Theseus / commonplace nodes as Items on read and as Item deltas on the feed;
+//! the single source of truth stays the native node.
+
+use serde::Serialize;
+use serde_json::{Map, Value};
 
 use rustyred_thg_core::{MutationEvent, MutationKind, NodeRecord};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
-pub const ITEM_LABEL: &str = "Item";
+/// Node labels the projection recognizes. These strings are the projection's
+/// match keys, bound to the writers by reading them in the codebase:
+///
+/// - `TaskNode`           <- `multihead_task_payload` (work-graph task node);
+///   `theorem-harness-runtime/src/work_graph_store.rs` `TASK_NODE_LABEL`.
+/// - `CoordinationRecord` <- `write_record_payload` (coordination record node);
+///   `rustyred-thg-mcp/src/lib.rs` `coordination_record_node`, the specific label
+///   of the `["HarnessCoordination", "CoordinationRecord"]` pair.
+/// - `MemoryDocument`     <- `remember` / `encode` (memory doc node);
+///   `theorem-harness-runtime/src/memory.rs`, the specific label of the
+///   `["HarnessMemory", "MemoryAtom", "MemoryDocument"]` triple.
+/// - `Job`                <- `job_submit` (dispatch job node; deliverable 5,
+///   reconciled: `job_submit` already writes a `Job` graph node, so jobs ride the
+///   graph changefeed for free); `theorem-harness-runtime/src/job_queue.rs`
+///   `JOB_LABEL`.
+/// - `Item`               <- the commonplace store (real user Items);
+///   `commonplace/src/store.rs` `ITEM_LABEL`.
 pub const TASK_NODE_LABEL: &str = "TaskNode";
 pub const COORDINATION_RECORD_LABEL: &str = "CoordinationRecord";
 pub const MEMORY_DOCUMENT_LABEL: &str = "MemoryDocument";
-pub const MEMORY_NODE_LABEL: &str = "MemoryNode";
 pub const JOB_LABEL: &str = "Job";
+pub const ITEM_LABEL: &str = "Item";
 
-pub const ITEM_SOURCE_LABELS: &[&str] = &[
+/// Every label the Item domain projects, for the changefeed hook matcher and the
+/// `items` enumeration. `Item` is first so real user Items lead the union.
+pub const PROJECTED_LABELS: [&str; 5] = [
     ITEM_LABEL,
     TASK_NODE_LABEL,
     COORDINATION_RECORD_LABEL,
     MEMORY_DOCUMENT_LABEL,
-    MEMORY_NODE_LABEL,
     JOB_LABEL,
 ];
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// The projected Item: the shared shape, deliberately free of any async-graphql
+/// dependency so the async server's changefeed handler can build it without
+/// pulling in the GraphQL types. [`super::items::Item`] is the thin GraphQL
+/// wrapper over this.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProjectedItem {
     pub id: String,
+    /// The item kind token. For a real `Item` node, its own stored `kind`
+    /// (`note` / `file` / ...); for a projected harness or dispatch node, the
+    /// fixed origin kind (`task` / `coordination` / `memory` / `job`).
     pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    pub labels: Vec<String>,
+    pub title: String,
+    /// The origin tag (e.g. `harness:task`, `dispatch:job`, `commonplace`).
+    pub source: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// The node's native properties, preserved verbatim under the Item's `extra`.
     pub extra: Value,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ProjectedItemDelta {
+/// The change a changefeed delta carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemChange {
+    Upserted,
+    Deleted,
+}
+
+/// One changefeed delta: an Item upsert (with the projected item) or a delete
+/// (id only, since the node is gone). Serializes to the SSE JSON payload the
+/// CommonPlace Auto-Organizer applies.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ItemDelta {
+    pub change: ItemChange,
+    pub id: String,
+    /// The tenant the mutation landed in, carried from the event so the
+    /// process-global changefeed bus can be filtered per tenant by the SSE
+    /// endpoint (the bus is shared across tenants; the delta is self-describing).
     pub tenant: String,
-    pub event: String,
-    pub committed_at_ms: u64,
-    pub changed_props: Vec<String>,
-    pub item: ProjectedItem,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<ProjectedItem>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProjectionClass {
-    Item,
-    Task,
-    Coordination,
-    Memory,
-    Job,
+/// Map a recognized harness/dispatch label set to `(kind, source)`. Returns
+/// `None` for an `Item` node (its kind comes from its own `kind` property) and
+/// for nodes the Item domain does not project.
+fn harness_origin(labels: &[String]) -> Option<(&'static str, &'static str)> {
+    // A node may carry several labels; match the specific projected one.
+    for label in labels {
+        match label.as_str() {
+            TASK_NODE_LABEL => return Some(("task", "harness:task")),
+            COORDINATION_RECORD_LABEL => {
+                return Some(("coordination", "harness:coordination"))
+            }
+            MEMORY_DOCUMENT_LABEL => return Some(("memory", "harness:memory")),
+            JOB_LABEL => return Some(("job", "dispatch:job")),
+            _ => {}
+        }
+    }
+    None
 }
 
-pub fn project_node_to_item(node: &NodeRecord) -> Option<ProjectedItem> {
-    let class = classify_labels(&node.labels)?;
-    let properties = node.properties.clone();
+fn is_item_node(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == ITEM_LABEL)
+}
+
+/// True if a node bearing these labels projects to an Item. Used by the
+/// changefeed to drop events for non-Item nodes and by tests.
+pub fn is_projectable(labels: &[String]) -> bool {
+    is_item_node(labels) || harness_origin(labels).is_some()
+}
+
+fn prop_str(props: &Map<String, Value>, key: &str) -> Option<String> {
+    props.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// First non-empty string among `keys`.
+fn first_str(props: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| prop_str(props, k).filter(|s| !s.trim().is_empty()))
+}
+
+/// First epoch-ms timestamp among `keys`. Accepts a numeric value (ms) or a
+/// numeric string; a non-numeric string (e.g. an ISO date) is skipped rather
+/// than mis-parsed, because every writer the projection binds stores ms.
+fn first_ms(props: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|k| match props.get(*k) {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+/// Title is `title`, falling back to a TaskNode's `goal`, then other common
+/// name carriers; finally the node id so an Item always has a non-empty title.
+const TITLE_KEYS: &[&str] = &["title", "goal", "name", "summary", "label"];
+const CREATED_KEYS: &[&str] = &["created_at_ms", "created_at", "createdAt"];
+const UPDATED_KEYS: &[&str] = &["updated_at_ms", "updated_at", "updatedAt", "committed_at_ms"];
+
+/// Project a graph node to a [`ProjectedItem`], or `None` if the node is not one
+/// the Item domain recognizes. The node is read, never mutated.
+pub fn project_node(node: &NodeRecord) -> Option<ProjectedItem> {
+    let empty = Map::new();
+    let props = node.properties.as_object().unwrap_or(&empty);
+
+    let (kind, source) = if let Some((kind, source)) = harness_origin(&node.labels) {
+        (kind.to_string(), source.to_string())
+    } else if is_item_node(&node.labels) {
+        // A real commonplace Item: its own stored kind, and its own source if it
+        // carries one, else the `commonplace` origin.
+        let kind = prop_str(props, "kind").unwrap_or_else(|| "note".to_string());
+        let source = prop_str(props, "source").unwrap_or_else(|| "commonplace".to_string());
+        (kind, source)
+    } else {
+        return None;
+    };
+
+    let title = first_str(props, TITLE_KEYS).unwrap_or_else(|| node.id.clone());
+    let created_at_ms = first_ms(props, CREATED_KEYS).unwrap_or(0);
+    let updated_at_ms = first_ms(props, UPDATED_KEYS).unwrap_or(created_at_ms);
+
     Some(ProjectedItem {
         id: node.id.clone(),
-        kind: item_kind(class, &properties),
-        title: item_title(class, &properties),
-        created_at: timestamp(&properties, &["created_at", "createdAt", "submitted_at"]),
-        updated_at: timestamp(
-            &properties,
-            &[
-                "updated_at",
-                "updatedAt",
-                "archived_at",
-                "started_at",
-                "submitted_at",
-                "created_at",
-                "createdAt",
-            ],
-        ),
-        source: string_field(
-            &properties,
-            &[
-                "source",
-                "origin",
-                "origin_surface",
-                "submitted_by",
-                "actor_id",
-                "created_by",
-            ],
-        ),
-        labels: node.labels.clone(),
-        extra: properties,
+        kind,
+        title,
+        source,
+        created_at_ms,
+        updated_at_ms,
+        extra: node.properties.clone(),
     })
 }
 
-pub fn project_mutation_event(
-    event: &MutationEvent,
-    node: Option<&NodeRecord>,
-) -> Option<ProjectedItemDelta> {
-    let item = match node {
-        Some(node) => project_node_to_item(node)?,
-        None => project_event_to_item(event)?,
-    };
-    Some(ProjectedItemDelta {
-        tenant: event.tenant.clone(),
-        event: event.kind.as_str().to_string(),
-        committed_at_ms: event.committed_at_ms,
-        changed_props: event.changed_props.clone(),
-        item,
-    })
-}
-
-pub fn is_projected_item_label(labels: &[String]) -> bool {
-    classify_labels(labels).is_some()
-}
-
-fn project_event_to_item(event: &MutationEvent) -> Option<ProjectedItem> {
-    let class = classify_labels(&event.labels)?;
-    Some(ProjectedItem {
-        id: event.id.clone(),
-        kind: item_kind(class, &Value::Null),
-        title: None,
-        created_at: None,
-        updated_at: None,
-        source: None,
-        labels: event.labels.clone(),
-        extra: json!({
-            "projection": "mutation_event",
-            "mutation_kind": event.kind.as_str(),
-            "changed_props": event.changed_props,
-            "deleted": matches!(event.kind, MutationKind::NodeDeleted),
+/// Project a mutation event to an Item delta for the changefeed. This is the
+/// spec's "second form" that maps a [`MutationEvent`] through the same
+/// projection: on an upsert the caller supplies the freshly re-read node (the
+/// changefeed hook re-reads it through its `&mut RedCoreGraphStore`) and the
+/// delta carries [`project_node`]'s output; on a delete the node is gone, so the
+/// delta is a tombstone (id only).
+///
+/// Returns `None` when the event is for a node the Item domain does not project
+/// or for an edge mutation, so the changefeed carries only Item-relevant deltas.
+pub fn project_event(event: &MutationEvent, node: Option<&NodeRecord>) -> Option<ItemDelta> {
+    if !is_projectable(&event.labels) {
+        return None;
+    }
+    match event.kind {
+        MutationKind::NodeDeleted => Some(ItemDelta {
+            change: ItemChange::Deleted,
+            id: event.id.clone(),
+            tenant: event.tenant.clone(),
+            item: None,
         }),
-    })
-}
-
-fn classify_labels(labels: &[String]) -> Option<ProjectionClass> {
-    if has_label(labels, ITEM_LABEL) {
-        return Some(ProjectionClass::Item);
+        MutationKind::NodeUpserted => Some(ItemDelta {
+            change: ItemChange::Upserted,
+            id: event.id.clone(),
+            tenant: event.tenant.clone(),
+            // If the node could not be re-read (raced deletion), the delta still
+            // carries the id and change so the consumer can reconcile.
+            item: node.and_then(project_node),
+        }),
+        // Edge mutations are not Item changes (the Item domain is node-shaped);
+        // unreachable in practice because edge events carry `[edge_type]` labels,
+        // which `is_projectable` already rejects above.
+        MutationKind::EdgeUpserted | MutationKind::EdgeDeleted => None,
     }
-    if has_label(labels, TASK_NODE_LABEL) {
-        return Some(ProjectionClass::Task);
-    }
-    if has_label(labels, COORDINATION_RECORD_LABEL) {
-        return Some(ProjectionClass::Coordination);
-    }
-    if has_label(labels, MEMORY_DOCUMENT_LABEL) || has_label(labels, MEMORY_NODE_LABEL) {
-        return Some(ProjectionClass::Memory);
-    }
-    if has_label(labels, JOB_LABEL) {
-        return Some(ProjectionClass::Job);
-    }
-    None
-}
-
-fn has_label(labels: &[String], wanted: &str) -> bool {
-    labels.iter().any(|label| label == wanted)
-}
-
-fn item_kind(class: ProjectionClass, properties: &Value) -> String {
-    match class {
-        ProjectionClass::Item => string_field(properties, &["kind", "item_kind", "itemKind", "type"])
-            .unwrap_or_else(|| "item".to_string()),
-        ProjectionClass::Task => "task".to_string(),
-        ProjectionClass::Coordination => "coordination".to_string(),
-        ProjectionClass::Memory => "memory".to_string(),
-        ProjectionClass::Job => "job".to_string(),
-    }
-}
-
-fn item_title(class: ProjectionClass, properties: &Value) -> Option<String> {
-    match class {
-        ProjectionClass::Task => string_field(properties, &["title", "goal"]),
-        ProjectionClass::Coordination => string_field(properties, &["title", "summary", "body"]),
-        ProjectionClass::Memory => string_field(properties, &["title", "summary", "content"]),
-        ProjectionClass::Job => string_field(properties, &["title"]),
-        ProjectionClass::Item => string_field(properties, &["title", "name", "goal", "summary"]),
-    }
-}
-
-fn timestamp(properties: &Value, keys: &[&str]) -> Option<String> {
-    string_field(properties, keys)
-}
-
-fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
-    let values = nested_values(value);
-    for key in keys {
-        for candidate in &values {
-            if let Some(raw) = candidate.get(*key).and_then(Value::as_str) {
-                let trimmed = raw.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn nested_values(value: &Value) -> Vec<&Value> {
-    let mut out = vec![value];
-    for key in ["properties", "document", "node", "item"] {
-        if let Some(inner) = value.get(key) {
-            out.push(inner);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn node(id: &str, labels: &[&str], props: Value) -> NodeRecord {
+        NodeRecord::new(id, labels.iter().map(|s| s.to_string()), props)
+    }
 
     #[test]
-    fn projects_harness_labels_without_mutating_native_props() {
-        let node = NodeRecord::new(
-            "work-graph:run-1:node:a",
-            ["TaskNode"],
-            json!({
-                "id": "a",
-                "run_id": "run-1",
-                "goal": "Implement item projection",
-                "created_by": "codex"
-            }),
+    fn projects_work_graph_task_node() {
+        let n = node(
+            "run-1::task-7",
+            &[TASK_NODE_LABEL],
+            json!({ "goal": "Ship SPEC-2", "created_at_ms": 1000, "updated_at_ms": 2000 }),
         );
+        let p = project_node(&n).expect("task node projects");
+        assert_eq!(p.kind, "task");
+        assert_eq!(p.source, "harness:task");
+        // Title falls back to `goal` for a task node.
+        assert_eq!(p.title, "Ship SPEC-2");
+        assert_eq!(p.created_at_ms, 1000);
+        assert_eq!(p.updated_at_ms, 2000);
+        // Native fields preserved under extra.
+        assert_eq!(p.extra["goal"], json!("Ship SPEC-2"));
+    }
 
-        let item = project_node_to_item(&node).expect("task node projects");
-        assert_eq!(item.kind, "task");
-        assert_eq!(item.title.as_deref(), Some("Implement item projection"));
-        assert_eq!(item.source.as_deref(), Some("codex"));
-        assert_eq!(item.extra["goal"], "Implement item projection");
+    #[test]
+    fn projects_coordination_record_node() {
+        let n = node(
+            "rec-1",
+            &["HarnessCoordination", COORDINATION_RECORD_LABEL],
+            json!({ "title": "Lane split", "created_at": 5 }),
+        );
+        let p = project_node(&n).expect("coordination record projects");
+        assert_eq!(p.kind, "coordination");
+        assert_eq!(p.source, "harness:coordination");
+        assert_eq!(p.title, "Lane split");
+        assert_eq!(p.created_at_ms, 5);
+    }
+
+    #[test]
+    fn projects_memory_document_node() {
+        let n = node(
+            "doc-1",
+            &["HarnessMemory", "MemoryAtom", MEMORY_DOCUMENT_LABEL],
+            json!({ "title": "A lesson", "created_at": 10, "updated_at": 20 }),
+        );
+        let p = project_node(&n).expect("memory doc projects");
+        assert_eq!(p.kind, "memory");
+        assert_eq!(p.source, "harness:memory");
+        assert_eq!(p.updated_at_ms, 20);
+    }
+
+    #[test]
+    fn projects_dispatch_job_node() {
+        let n = node(
+            "job-1",
+            &[JOB_LABEL],
+            json!({ "title": "Build it", "created_at_ms": 7 }),
+        );
+        let p = project_node(&n).expect("job node projects");
+        assert_eq!(p.kind, "job");
+        assert_eq!(p.source, "dispatch:job");
+    }
+
+    #[test]
+    fn projects_real_commonplace_item_with_its_own_kind() {
+        // A real Item written by the commonplace store: it carries its own kind
+        // and is indistinguishable in shape from a projected harness Item
+        // (SPEC-2 acceptance 3).
+        let n = node(
+            "item-1",
+            &[ITEM_LABEL],
+            json!({ "kind": "note", "title": "My note", "created_at_ms": 100, "updated_at_ms": 100 }),
+        );
+        let p = project_node(&n).expect("item projects");
+        assert_eq!(p.kind, "note");
+        assert_eq!(p.source, "commonplace");
+        assert_eq!(p.title, "My note");
+    }
+
+    #[test]
+    fn unrecognized_node_does_not_project() {
+        let n = node("x-1", &["CodeSymbol"], json!({ "signature": "fn f()" }));
+        assert!(project_node(&n).is_none());
+        assert!(!is_projectable(&n.labels));
+    }
+
+    #[test]
+    fn title_falls_back_to_id_when_absent() {
+        let n = node("naked-task", &[TASK_NODE_LABEL], json!({ "created_at_ms": 1 }));
+        let p = project_node(&n).unwrap();
+        assert_eq!(p.title, "naked-task");
+    }
+
+    #[test]
+    fn event_upsert_carries_same_shape_as_node_read() {
+        // Acceptance 4: the changefeed delta's item is exactly project_node's
+        // output, so the live shape and the queried shape cannot diverge.
+        let n = node(
+            "run-1::task-7",
+            &[TASK_NODE_LABEL],
+            json!({ "goal": "g", "created_at_ms": 1, "updated_at_ms": 2 }),
+        );
+        let event = MutationEvent::new(
+            MutationKind::NodeUpserted,
+            "tenant-a",
+            "run-1::task-7",
+            vec![TASK_NODE_LABEL.to_string()],
+            vec!["goal".to_string()],
+            2,
+            0,
+        );
+        let delta = project_event(&event, Some(&n)).expect("upsert projects");
+        assert_eq!(delta.change, ItemChange::Upserted);
+        assert_eq!(delta.id, "run-1::task-7");
+        assert_eq!(delta.tenant, "tenant-a");
+        assert_eq!(delta.item.as_ref(), project_node(&n).as_ref());
+    }
+
+    #[test]
+    fn event_delete_is_a_tombstone() {
+        let event = MutationEvent::new(
+            MutationKind::NodeDeleted,
+            "tenant-a",
+            "run-1::task-7",
+            vec![TASK_NODE_LABEL.to_string()],
+            vec![],
+            3,
+            0,
+        );
+        let delta = project_event(&event, None).expect("delete projects");
+        assert_eq!(delta.change, ItemChange::Deleted);
+        assert_eq!(delta.id, "run-1::task-7");
+        assert!(delta.item.is_none());
+    }
+
+    #[test]
+    fn event_for_unprojectable_node_is_dropped() {
+        let event = MutationEvent::new(
+            MutationKind::NodeUpserted,
+            "tenant-a",
+            "sym-1",
+            vec!["CodeSymbol".to_string()],
+            vec![],
+            1,
+            0,
+        );
+        assert!(project_event(&event, None).is_none());
+    }
+
+    #[test]
+    fn edge_event_is_dropped() {
+        let event = MutationEvent::new(
+            MutationKind::EdgeUpserted,
+            "tenant-a",
+            "e-1",
+            vec!["IN_COLLECTION".to_string()],
+            vec![],
+            1,
+            0,
+        );
+        assert!(project_event(&event, None).is_none());
     }
 }

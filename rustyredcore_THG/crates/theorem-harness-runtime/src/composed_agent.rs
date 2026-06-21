@@ -177,9 +177,9 @@ fn legacy_default_heads() -> (Vec<String>, Vec<AgentHead>) {
             head(
                 "deepseek",
                 "deepseek",
-                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-reasoner".to_string()),
+                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string()),
                 "env:DEEPSEEK_API_KEY",
-                HeadTransport::Mcp,
+                HeadTransport::Api,
             ),
         ],
     )
@@ -292,9 +292,9 @@ fn normalize_provider(value: &str) -> String {
 fn default_model_for_provider(provider: &str) -> String {
     match normalize_provider(provider).as_str() {
         "anthropic" | "claude" => "claude-3-5-sonnet-latest".to_string(),
-        "deepseek" => "deepseek-reasoner".to_string(),
+        "deepseek" => "deepseek-v4-flash".to_string(),
         "gemma" => "gemma3:latest".to_string(),
-        "minimax" => "MiniMax-Text-01".to_string(),
+        "minimax" => "MiniMax-M3".to_string(),
         "mistral" => "mistral-large-latest".to_string(),
         "openai" => "gpt-4.1-mini".to_string(),
         "zhipu" => "glm-4-plus".to_string(),
@@ -375,8 +375,8 @@ mod tests {
             (THEOREM_AGENT_HEADS_ENV, "mistral,openai,minimax,deepseek"),
             ("MISTRAL_MODEL", "mistral-small-latest"),
             ("OPENAI_MODEL", "gpt-4.1-mini"),
-            ("MINIMAX_MODEL", "MiniMax-Text-01"),
-            ("DEEPSEEK_MODEL", "deepseek-chat"),
+            ("MINIMAX_MODEL", "MiniMax-M3"),
+            ("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         ]);
 
         let binding = default_theorem_binding("agent:env").unwrap();
@@ -395,8 +395,10 @@ mod tests {
         assert_eq!(openai.credential_ref, "env:OPENAI_API_KEY");
         let minimax = binding.head("minimax").unwrap();
         assert_eq!(minimax.provider, "minimax");
+        assert_eq!(minimax.model, "MiniMax-M3");
         assert_eq!(minimax.credential_ref, "env:MINIMAX_API_KEY");
         let deepseek = binding.head("deepseek").unwrap();
+        assert_eq!(deepseek.model, "deepseek-v4-flash");
         assert_eq!(deepseek.transport, HeadTransport::Api);
     }
 
@@ -416,6 +418,45 @@ mod tests {
         assert_eq!(openapi.credential_ref, "env:OPENAI_API_KEY");
         let deepseek = binding.head("deepseek").unwrap();
         assert_eq!(deepseek.transport, HeadTransport::Mcp);
+    }
+
+    #[test]
+    #[ignore = "requires THEOREM_LIVE_PROVIDER_TEST=1 and real provider keys"]
+    fn live_provider_invoker_runs_three_head_binding_when_enabled() {
+        if std::env::var("THEOREM_LIVE_PROVIDER_TEST").ok().as_deref() != Some("1") {
+            eprintln!("set THEOREM_LIVE_PROVIDER_TEST=1 with live provider keys to run");
+            return;
+        }
+        let configured_heads = std::env::var(THEOREM_AGENT_HEADS_ENV)
+            .expect("set THEOREM_AGENT_HEADS=deepseek,mistral,minimax");
+        assert!(
+            configured_heads.contains("deepseek")
+                && configured_heads.contains("mistral")
+                && configured_heads.contains("minimax"),
+            "THEOREM_AGENT_HEADS must include deepseek,mistral,minimax"
+        );
+        let mut store = InMemoryGraphStore::new();
+        let invoker = crate::ProviderHeadInvoker::from_env().unwrap();
+
+        let result = run_composed_agent_with_claims(
+            &mut store,
+            "agent:live-provider-test",
+            "Return one grounded claim that this live provider test ran.",
+            vec![GroundedClaim::new("live provider smoke input", "test:live")],
+            &invoker,
+        )
+        .unwrap();
+
+        assert!(result.invocation_receipts.len() >= 3);
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event.event_type == "POLICY.CHECKED"));
+        if verdict_allowed(&result.alignment_verdict) {
+            assert!(!result.published_claims.is_empty());
+        } else {
+            assert!(result.published_claims.is_empty());
+        }
     }
 
     struct ScopedEnv {
