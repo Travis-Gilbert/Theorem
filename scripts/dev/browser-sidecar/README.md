@@ -12,6 +12,11 @@ It runs pilot-core's exact `GEOMETRY_SNAPSHOT_SCRIPT` in the page, so the
 locator/actionability layer resolves a locator to `{target_handle, kind}` and
 this sidecar acts on `[data-theorem-id="<handle>"]`.
 
+When the Rust server sends `include_screenshot: true`, checkout/snapshot/actuate
+responses also include `screenshot_base64` + `screenshot_media_type`. That feeds
+`THEOREM_VISUAL_PERCEIVER_URL` (`perception_visual` `POST /parse`) so no-DOM
+surfaces can still produce visual `PageState.interactive_elements`.
+
 ## Run
 
 Via docker compose (recommended):
@@ -32,7 +37,7 @@ PORT=9223 npm start
 
 `plan.kind.mechanism` -> Playwright:
 
-- `coordinate_synthesis` -> `locator.click()`
+- `coordinate_synthesis` -> click/hover/double-click the plan point; falls back to `locator.click()`
 - `keyboard` -> `locator.fill(kind.text)`
 - `scroll` -> `locator.scrollIntoViewIfNeeded()`
 - `embedder_control` / `semantic_activation` -> reported as

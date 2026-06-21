@@ -48,6 +48,7 @@ OpenAI-compatible embedder (LM Studio / llama.cpp / Ollama).
 | Search | harness | `RUSTYWEB_SEARCH_PROVIDERS` + per-provider key/URL | SearXNG (or cloud keys) |
 | Browser (rendered fetch) | harness | `THEOREM_SERVO_RENDER_ENDPOINT` | render sidecar |
 | Browser (live action loop) | harness | `THEOREM_LIVE_BROWSER_ENDPOINT` | action sidecar |
+| Visual perceiver | harness | `THEOREM_VISUAL_PERCEIVER_URL` | `uvicorn perception_visual.serve.app:app --port 8080` |
 
 Valkey belongs to **theorem-grpc**, not the harness server: the harness server
 never reads `VALKEY_URL`. So "use Valkey" = run the gRPC service against a Valkey
@@ -69,6 +70,13 @@ They are different subsystems with different jobs:
    (click, type, navigate) against an HTTP sidecar exposing
    `sessions/checkout`, `sessions/snapshot`, `sessions/actuate`. Unset -> those
    tools fall back to the cascade (no live actuation).
+
+3. **Visual fallback perceiver** (`THEOREM_VISUAL_PERCEIVER_URL`,
+   compatibility alias `THEOREM_OMNIPARSER_URL`): when the live action sidecar
+   returns a screenshot for a page with no DOM/a11y interactive elements, the
+   harness calls `perception_visual` `POST /parse` and turns the parser labels
+   into visual `PageState.interactive_elements`. Coordinate-synthesis clicks can
+   then target those visual handles.
 
 Both sidecars are Theorem-specific HTTP contracts (there's no off-the-shelf
 binary in this repo yet), so surface 1's basic path (plain fetch) and the

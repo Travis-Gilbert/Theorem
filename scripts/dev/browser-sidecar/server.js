@@ -5,11 +5,12 @@
 //       reply { html, http_status, content_type, final_url }
 //
 //   Surface 2 (live action loop): POST /sessions/checkout|snapshot|actuate
-//       checkout body  { tenant, run_id, session_id?, url?, max_bytes, actor_id }
-//                reply { session_id, page: PageState }
-//       snapshot body  { session_id }            reply { page: PageState }
-//       actuate  body  { session_id, plan: { target_handle, kind }, policy }
-//                reply { receipt: { mechanism, detail }, page: PageState }
+//       checkout body  { tenant, run_id, session_id?, url?, max_bytes, actor_id, include_screenshot? }
+//                reply { session_id, page: PageState, screenshot_base64?, screenshot_media_type? }
+//       snapshot body  { session_id, include_screenshot? }
+//                reply { page: PageState, screenshot_base64?, screenshot_media_type? }
+//       actuate  body  { session_id, plan: { target_handle, kind }, policy, include_screenshot? }
+//                reply { receipt: { mechanism, detail }, page: PageState, screenshot_base64?, screenshot_media_type? }
 //
 // PageState is produced by running pilot-core's exact GEOMETRY_SNAPSHOT_SCRIPT
 // in the page, so the Rust locator/actionability layer sees an identical shape.
@@ -148,6 +149,23 @@ async function buildPageState(page) {
   };
 }
 
+async function screenshotPayload(page, include) {
+  if (!include) return {};
+  const bytes = await page.screenshot({ type: "png" });
+  return {
+    screenshot_base64: bytes.toString("base64"),
+    screenshot_media_type: "image/png",
+  };
+}
+
+function finitePoint(kind) {
+  const point = kind && kind.point;
+  const x = Number(point && point.x);
+  const y = Number(point && point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+}
+
 const app = express();
 app.use(express.json({ limit: "8mb" }));
 
@@ -179,7 +197,7 @@ app.post("/render", async (req, res) => {
 
 // ---- Surface 2: live action loop -----------------------------------------
 app.post("/sessions/checkout", async (req, res) => {
-  const { run_id, session_id, url } = req.body || {};
+  const { run_id, session_id, url, include_screenshot } = req.body || {};
   const id = session_id || `${run_id || "run"}:${Date.now()}`;
   try {
     let entry = sessions.get(id);
@@ -192,25 +210,32 @@ app.post("/sessions/checkout", async (req, res) => {
     if (url) {
       await entry.page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     }
-    res.json({ session_id: id, page: await buildPageState(entry.page) });
+    res.json({
+      session_id: id,
+      page: await buildPageState(entry.page),
+      ...(await screenshotPayload(entry.page, !!include_screenshot)),
+    });
   } catch (err) {
     res.status(502).json({ error: String(err && err.message ? err.message : err) });
   }
 });
 
 app.post("/sessions/snapshot", async (req, res) => {
-  const { session_id } = req.body || {};
+  const { session_id, include_screenshot } = req.body || {};
   const entry = sessions.get(session_id);
   if (!entry) return res.status(404).json({ error: "unknown session_id" });
   try {
-    res.json({ page: await buildPageState(entry.page) });
+    res.json({
+      page: await buildPageState(entry.page),
+      ...(await screenshotPayload(entry.page, !!include_screenshot)),
+    });
   } catch (err) {
     res.status(502).json({ error: String(err && err.message ? err.message : err) });
   }
 });
 
 app.post("/sessions/actuate", async (req, res) => {
-  const { session_id, plan } = req.body || {};
+  const { session_id, plan, include_screenshot } = req.body || {};
   const entry = sessions.get(session_id);
   if (!entry) return res.status(404).json({ error: "unknown session_id" });
   const handle = plan && plan.target_handle;
@@ -221,11 +246,37 @@ app.post("/sessions/actuate", async (req, res) => {
   let mechanism = "sidecar.unsupported";
   try {
     if (mech === "coordinate_synthesis") {
-      await loc.click({ timeout: ACT_TIMEOUT_MS });
-      mechanism = "sidecar.click";
+      const point = finitePoint(kind);
+      const pointer = kind.pointer || "click";
+      if (point) {
+        if (pointer === "hover") {
+          await page.mouse.move(point.x, point.y);
+        } else if (pointer === "double_click") {
+          await page.mouse.dblclick(point.x, point.y);
+        } else {
+          await page.mouse.click(point.x, point.y);
+        }
+        mechanism = `sidecar.${pointer}`;
+      } else {
+        await loc.click({ timeout: ACT_TIMEOUT_MS });
+        mechanism = "sidecar.click";
+      }
     } else if (mech === "keyboard") {
-      await loc.fill(kind.text != null ? String(kind.text) : "", { timeout: ACT_TIMEOUT_MS });
-      mechanism = "sidecar.fill";
+      const point = finitePoint(kind);
+      if (point && (!handle || String(handle).startsWith("visual:"))) {
+        await page.mouse.click(point.x, point.y);
+        await page.keyboard.type(kind.text != null ? String(kind.text) : "");
+        mechanism = "sidecar.coordinate_keyboard";
+      } else if (loc) {
+        await loc.fill(kind.text != null ? String(kind.text) : "", { timeout: ACT_TIMEOUT_MS });
+        mechanism = "sidecar.fill";
+      } else if (point) {
+        await page.mouse.click(point.x, point.y);
+        await page.keyboard.type(kind.text != null ? String(kind.text) : "");
+        mechanism = "sidecar.coordinate_keyboard";
+      } else {
+        throw new Error("keyboard actuation requires a locator or point");
+      }
     } else if (mech === "scroll") {
       await loc.scrollIntoViewIfNeeded({ timeout: ACT_TIMEOUT_MS });
       mechanism = "sidecar.scroll";
@@ -235,6 +286,7 @@ app.post("/sessions/actuate", async (req, res) => {
       return res.json({
         receipt: { mechanism, detail: { target: handle || null, requested_mechanism: mech || null } },
         page: await buildPageState(page),
+        ...(await screenshotPayload(page, !!include_screenshot)),
       });
     }
     // Best-effort settle so the post-action snapshot reflects navigation.
@@ -242,6 +294,7 @@ app.post("/sessions/actuate", async (req, res) => {
     res.json({
       receipt: { mechanism, detail: { target: handle, requested_mechanism: mech } },
       page: await buildPageState(page),
+      ...(await screenshotPayload(page, !!include_screenshot)),
     });
   } catch (err) {
     res.status(502).json({ error: String(err && err.message ? err.message : err) });

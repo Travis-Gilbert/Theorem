@@ -115,8 +115,20 @@ Needs the model stack / GPU / network (not run here): real RF-DETR detection +
 fine-tune checkpoint, Florence-2 captions, EasyOCR text, Playwright dataset
 capture, and a real ScreenSpot accuracy number.
 
+## Runtime wiring
+
+Set `THEOREM_VISUAL_PERCEIVER_URL` to this service when running the THG server:
+
+```bash
+export THEOREM_VISUAL_PERCEIVER_URL="http://127.0.0.1:8080"
+```
+
+When a live browser sidecar returns a screenshot for a page with no DOM/a11y
+interactive elements, `rustyred-thg-server` calls `POST /parse`, converts the
+labels into visual `PageState.interactive_elements`, and the browser-use action
+path can target them by coordinate. `THEOREM_OMNIPARSER_URL` is accepted as a
+compatibility alias.
+
 ## Follow-ups
 
 - Iterate the RF-DETR detector to ScreenSpot parity on a larger labeled set.
-- Wire `theorem-browser-agent`'s perceiver to `POST /parse` so the model grounds
-  on labeled elements for no-DOM surfaces.

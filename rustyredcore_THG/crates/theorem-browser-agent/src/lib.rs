@@ -7,18 +7,13 @@ use serde_json::{json, Value};
 pub const OPEN_WEB_UNVERIFIED_LAYER: &str = "open_web_unverified";
 pub const DEFAULT_CONFIDENCE_CEILING: f32 = 0.35;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserSurface {
     BrowseWithMe,
+    #[default]
     BrowseForMe,
     WebConsume,
-}
-
-impl Default for BrowserSurface {
-    fn default() -> Self {
-        Self::BrowseForMe
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,9 +34,10 @@ pub enum RiskMode {
     Private,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputTarget {
+    #[default]
     Answer,
     Artifact,
     ActionPlan,
@@ -52,12 +48,6 @@ pub enum OutputTarget {
     GraphTrace,
     BrowserChrome,
     HarnessReceipt,
-}
-
-impl Default for OutputTarget {
-    fn default() -> Self {
-        Self::Answer
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -325,7 +315,7 @@ pub fn resolve_context_command(request: ContextCommandRequest) -> ContextCommand
         BrowserSurface::BrowseForMe | BrowserSurface::BrowseWithMe
     ));
 
-    let retrieval_mode = request.retrieval_mode.unwrap_or_else(|| {
+    let retrieval_mode = request.retrieval_mode.unwrap_or({
         if permission_policy.allow_external_web {
             RetrievalMode::WebAllowed
         } else {
@@ -427,10 +417,11 @@ fn is_default_browser_surface(surface: &BrowserSurface) -> bool {
     *surface == BrowserSurface::default()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerceptionMode {
     Ask,
+    #[default]
     Browse,
     Capture,
     Compare,
@@ -507,12 +498,6 @@ pub struct PerceptionInput {
     pub seed_urls: Vec<String>,
 }
 
-impl Default for PerceptionMode {
-    fn default() -> Self {
-        Self::Browse
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PageObservation {
     pub url: String,
@@ -522,6 +507,14 @@ pub struct PageObservation {
     pub active_tab_id: Option<String>,
     #[serde(default)]
     pub interactive_elements: Vec<ObservedElement>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ObservedElementBox {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -535,6 +528,117 @@ pub struct ObservedElement {
     pub visible: bool,
     #[serde(default)]
     pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<ObservedElementBox>,
+    #[serde(default = "empty_object")]
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VisualPerceiverImageSize {
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VisualPerceiverBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VisualPerceiverBoxPixels {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
+}
+
+impl VisualPerceiverBoxPixels {
+    pub fn to_observed_box(&self) -> ObservedElementBox {
+        ObservedElementBox {
+            x: self.x1,
+            y: self.y1,
+            width: (self.x2 - self.x1).max(0),
+            height: (self.y2 - self.y1).max(0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VisualPerceiverElement {
+    pub id: usize,
+    #[serde(default)]
+    pub interactable: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub score: f32,
+    #[serde(default)]
+    pub box_pixels: Option<VisualPerceiverBoxPixels>,
+    #[serde(default, rename = "box")]
+    pub normalized_box: VisualPerceiverBox,
+}
+
+impl VisualPerceiverElement {
+    pub fn element_id(&self) -> String {
+        format!("visual:{}", self.id)
+    }
+
+    pub fn role(&self) -> String {
+        if self.interactable {
+            "button".to_string()
+        } else {
+            "img".to_string()
+        }
+    }
+
+    pub fn label(&self) -> String {
+        let content = self.content.trim();
+        if content.is_empty() {
+            format!("Visual element {}", self.id)
+        } else {
+            content.to_string()
+        }
+    }
+
+    pub fn to_observed_element(&self) -> ObservedElement {
+        ObservedElement {
+            element_id: self.element_id(),
+            role: self.role(),
+            name: self.label(),
+            value: None,
+            visible: true,
+            degraded: false,
+            bbox: self
+                .box_pixels
+                .as_ref()
+                .map(VisualPerceiverBoxPixels::to_observed_box),
+            metadata: json!({
+                "source": "visual_perceiver",
+                "visual_source": self.source,
+                "score": self.score,
+                "normalized_box": self.normalized_box
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VisualPerceiverResponse {
+    pub image_size: VisualPerceiverImageSize,
+    #[serde(default)]
+    pub count: usize,
+    #[serde(default)]
+    pub elements: Vec<VisualPerceiverElement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotated_image_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotated_media_type: Option<String>,
 }
 
 pub fn perceive_with_graph<S: GraphStore>(
@@ -560,7 +664,7 @@ pub fn perceive_with_graph<S: GraphStore>(
             .properties
             .get("title")
             .and_then(Value::as_str)
-            .or_else(|| url.as_deref())
+            .or(url.as_deref())
             .unwrap_or(&node.id)
             .to_string();
         if seen.insert(node.id.clone()) {
@@ -598,7 +702,11 @@ pub fn perceive_with_graph<S: GraphStore>(
                 id: format!("element:{}", element.element_id),
                 kind: PerceptionCandidateKind::Action,
                 status: PerceptionCandidateStatus::FetchedUnadmitted,
-                label: element.name.clone(),
+                label: if element.name.is_empty() {
+                    element.element_id.clone()
+                } else {
+                    element.name.clone()
+                },
                 url: element
                     .value
                     .clone()
@@ -606,7 +714,10 @@ pub fn perceive_with_graph<S: GraphStore>(
                 confidence: 0.4,
                 metadata: json!({
                     "role": element.role,
-                    "visible": element.visible
+                    "visible": element.visible,
+                    "degraded": element.degraded,
+                    "bbox": element.bbox,
+                    "metadata": element.metadata
                 }),
             });
         }
@@ -1283,6 +1394,73 @@ mod tests {
             .actions
             .iter()
             .any(|action| action.execution_route == ExecutionRoute::WebApi));
+    }
+
+    #[test]
+    fn visual_perceiver_elements_enter_perception_with_geometry_metadata() {
+        let visual = VisualPerceiverElement {
+            id: 7,
+            interactable: true,
+            source: "icon".to_string(),
+            content: "Run search".to_string(),
+            score: 0.91,
+            box_pixels: Some(VisualPerceiverBoxPixels {
+                x1: 10,
+                y1: 20,
+                x2: 110,
+                y2: 50,
+            }),
+            normalized_box: VisualPerceiverBox {
+                x: 0.1,
+                y: 0.2,
+                w: 0.2,
+                h: 0.1,
+            },
+        };
+        let observed = visual.to_observed_element();
+        assert_eq!(observed.element_id, "visual:7");
+        assert_eq!(observed.role, "button");
+        assert_eq!(observed.name, "Run search");
+        assert_eq!(
+            observed.bbox,
+            Some(ObservedElementBox {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 30
+            })
+        );
+
+        let command = resolve_context_command(ContextCommandRequest {
+            raw_request: "click run search".to_string(),
+            ..ContextCommandRequest::default()
+        });
+        let perception = perceive_with_graph(
+            &InMemoryGraphStore::default(),
+            &command,
+            PerceptionInput {
+                mode: PerceptionMode::Act,
+                query: "click run search".to_string(),
+                page: Some(PageObservation {
+                    url: "app://canvas".to_string(),
+                    title: "Canvas".to_string(),
+                    distilled_text: String::new(),
+                    active_tab_id: None,
+                    interactive_elements: vec![observed],
+                }),
+                seed_urls: Vec::new(),
+            },
+        );
+
+        let candidate = perception
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == "element:visual:7")
+            .expect("visual candidate");
+        assert_eq!(candidate.label, "Run search");
+        assert_eq!(candidate.metadata["role"], "button");
+        assert_eq!(candidate.metadata["bbox"]["width"], 100);
+        assert_eq!(candidate.metadata["metadata"]["source"], "visual_perceiver");
     }
 
     #[test]

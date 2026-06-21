@@ -61,7 +61,7 @@ use serde_json::{json, Map, Value};
 use theorem_browser_agent::{
     browsing_run_receipt, build_action_rail, default_browser_playbooks, perceive_with_graph,
     resolve_context_command, BrowserSurface, ContextCommandRequest, ObservedElement,
-    PageObservation, PerceptionInput, PerceptionMode, RetrievalMode, RiskMode,
+    ObservedElementBox, PageObservation, PerceptionInput, PerceptionMode, RetrievalMode, RiskMode,
 };
 use theorem_harness_core::{GroundedClaim, TransitionInput};
 use theorem_harness_runtime::{
@@ -1318,6 +1318,7 @@ async fn execute_live_browser_use(
             url: Some(url.to_string()),
             max_bytes: job.max_bytes,
             actor_id: job.actor_id.clone(),
+            include_screenshot: false,
         })
         .await
         .map_err(browser_engine_payload)?;
@@ -1798,6 +1799,17 @@ fn page_observation_from_state(page: &PageState) -> PageObservation {
                 value: element.value.clone(),
                 visible: element.visible,
                 degraded: element.degraded,
+                bbox: element.bbox.as_ref().map(|bbox| ObservedElementBox {
+                    x: bbox.x,
+                    y: bbox.y,
+                    width: bbox.width,
+                    height: bbox.height,
+                }),
+                metadata: element
+                    .test_id
+                    .as_ref()
+                    .map(|test_id| json!({ "test_id": test_id }))
+                    .unwrap_or_else(|| json!({})),
             })
             .collect(),
     }

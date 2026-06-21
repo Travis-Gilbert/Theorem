@@ -1,22 +1,23 @@
 use async_trait::async_trait;
 use rustyred_web::{
     run_action, ActionOptions, ActuationPlan, ActuationReceipt, AutomationActionReceipt,
-    BrowserActionPolicy, BrowserDriver, BrowserEngineError, BrowserEngineResult, Locator,
-    LocatorAction, PageState,
+    BrowserActionPolicy, BrowserDriver, BrowserEngineError, BrowserEngineResult, ElementBox,
+    InteractiveElement, Locator, LocatorAction, PageState,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
+use theorem_browser_agent::{VisualPerceiverElement, VisualPerceiverResponse};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-#[cfg(test)]
-use rustyred_web::{ElementBox, InteractiveElement};
-#[cfg(test)]
-use serde_json::json;
 #[cfg(test)]
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
+use theorem_browser_agent::{
+    VisualPerceiverBox, VisualPerceiverBoxPixels, VisualPerceiverImageSize,
+};
 
 const LIVE_BROWSER_ENDPOINT_ENV: &str = "THEOREM_LIVE_BROWSER_ENDPOINT";
 /// Pool size bound (handoff-7 D1: "bounded by a pool size"). The pool vends at most
@@ -24,6 +25,8 @@ const LIVE_BROWSER_ENDPOINT_ENV: &str = "THEOREM_LIVE_BROWSER_ENDPOINT";
 /// drops (returns on completion). Override with `THEOREM_LIVE_BROWSER_POOL_SIZE`.
 const LIVE_BROWSER_POOL_SIZE_ENV: &str = "THEOREM_LIVE_BROWSER_POOL_SIZE";
 const DEFAULT_LIVE_BROWSER_POOL_SIZE: usize = 4;
+const VISUAL_PERCEIVER_ENDPOINT_ENV: &str = "THEOREM_VISUAL_PERCEIVER_URL";
+const VISUAL_PERCEIVER_ENDPOINT_ALIAS_ENV: &str = "THEOREM_OMNIPARSER_URL";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrowserCheckoutRequest {
@@ -35,6 +38,8 @@ pub struct BrowserCheckoutRequest {
     pub url: Option<String>,
     pub max_bytes: usize,
     pub actor_id: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_screenshot: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +97,7 @@ pub trait LiveBrowserSession: Send {
 pub struct RemoteBrowserPool {
     client: reqwest::Client,
     base_url: String,
+    visual_perceiver: Option<Arc<VisualPerceiverClient>>,
     // The pool-size bound (D1). Cloned with the pool; a checkout acquires an owned
     // permit that rides on the session and frees the slot on drop. The semaphore's
     // permit count IS the bound; the max comes from the env at construction.
@@ -113,6 +119,7 @@ impl RemoteBrowserPool {
         Some(Self {
             client: reqwest::Client::new(),
             base_url: endpoint,
+            visual_perceiver: VisualPerceiverClient::from_env().map(Arc::new),
             semaphore: Arc::new(Semaphore::new(capacity)),
         })
     }
@@ -120,22 +127,182 @@ impl RemoteBrowserPool {
     fn endpoint(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path.trim_start_matches('/'))
     }
+
+    async fn augment_page_with_visual_perception(
+        &self,
+        page: &mut PageState,
+        screenshot_base64: Option<&str>,
+        screenshot_media_type: Option<&str>,
+    ) {
+        if !page.interactive_elements.is_empty() {
+            return;
+        }
+        let Some(client) = &self.visual_perceiver else {
+            return;
+        };
+        let Some(image_base64) = screenshot_base64 else {
+            stamp_visual_perceiver_fetch(
+                page,
+                json!({
+                    "status": "missing_screenshot",
+                    "message": "visual perceiver configured, but the browser sidecar did not return a screenshot"
+                }),
+            );
+            return;
+        };
+        match client
+            .parse(image_base64, screenshot_media_type.unwrap_or("image/png"))
+            .await
+        {
+            Ok(response) => merge_visual_elements(page, &response),
+            Err(error) => stamp_visual_perceiver_fetch(
+                page,
+                json!({
+                    "status": "error",
+                    "message": error
+                }),
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct VisualPerceiverClient {
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl VisualPerceiverClient {
+    fn from_env() -> Option<Self> {
+        let endpoint = std::env::var(VISUAL_PERCEIVER_ENDPOINT_ENV)
+            .or_else(|_| std::env::var(VISUAL_PERCEIVER_ENDPOINT_ALIAS_ENV))
+            .ok()?;
+        let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+        if endpoint.is_empty() {
+            return None;
+        }
+        let endpoint = if endpoint.ends_with("/parse") {
+            endpoint
+        } else {
+            format!("{endpoint}/parse")
+        };
+        Some(Self {
+            client: reqwest::Client::new(),
+            endpoint,
+        })
+    }
+
+    async fn parse(
+        &self,
+        image_base64: &str,
+        media_type: &str,
+    ) -> Result<VisualPerceiverResponse, String> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .json(&json!({
+                "image_base64": image_base64,
+                "media_type": media_type,
+                "use_ocr": true,
+                "caption": false,
+                "include_annotated": false
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("visual perceiver request failed: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "visual perceiver returned {status}: {}",
+                body.chars().take(240).collect::<String>()
+            ));
+        }
+        response
+            .json::<VisualPerceiverResponse>()
+            .await
+            .map_err(|error| format!("visual perceiver response was not parseable: {error}"))
+    }
+}
+
+fn merge_visual_elements(page: &mut PageState, response: &VisualPerceiverResponse) {
+    let start_count = page.interactive_elements.len();
+    page.interactive_elements.extend(
+        response
+            .elements
+            .iter()
+            .map(visual_element_to_interactive_element),
+    );
+    stamp_visual_perceiver_fetch(
+        page,
+        json!({
+            "status": "parsed",
+            "count": response.count,
+            "added_elements": page.interactive_elements.len().saturating_sub(start_count),
+            "image_size": response.image_size
+        }),
+    );
+}
+
+fn visual_element_to_interactive_element(element: &VisualPerceiverElement) -> InteractiveElement {
+    InteractiveElement {
+        element_id: element.element_id(),
+        role: element.role(),
+        name: element.label(),
+        value: None,
+        test_id: Some("visual-perceiver".to_string()),
+        bbox: element.box_pixels.as_ref().map(|bbox| ElementBox {
+            x: bbox.x1,
+            y: bbox.y1,
+            width: (bbox.x2 - bbox.x1).max(0),
+            height: (bbox.y2 - bbox.y1).max(0),
+        }),
+        visible: true,
+        enabled: element.interactable,
+        editable: false,
+        degraded: false,
+    }
+}
+
+fn stamp_visual_perceiver_fetch(page: &mut PageState, value: Value) {
+    match &mut page.fetch {
+        Some(Value::Object(map)) => {
+            map.insert("visual_perceiver".to_string(), value);
+        }
+        _ => {
+            page.fetch = Some(json!({ "visual_perceiver": value }));
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Deserialize)]
 struct RemoteCheckoutResponse {
     session_id: String,
     page: PageState,
+    #[serde(default)]
+    screenshot_base64: Option<String>,
+    #[serde(default)]
+    screenshot_media_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct RemoteSnapshotRequest {
     session_id: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    include_screenshot: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct RemoteSnapshotResponse {
     page: PageState,
+    #[serde(default)]
+    screenshot_base64: Option<String>,
+    #[serde(default)]
+    screenshot_media_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +310,8 @@ struct RemoteActuateRequest {
     session_id: String,
     plan: ActuationPlan,
     policy: BrowserActionPolicy,
+    #[serde(default, skip_serializing_if = "is_false")]
+    include_screenshot: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,13 +319,17 @@ struct RemoteActuateResponse {
     receipt: ActuationReceipt,
     #[serde(default)]
     page: Option<PageState>,
+    #[serde(default)]
+    screenshot_base64: Option<String>,
+    #[serde(default)]
+    screenshot_media_type: Option<String>,
 }
 
 #[async_trait]
 impl LiveBrowserPool for RemoteBrowserPool {
     async fn checkout(
         &self,
-        request: BrowserCheckoutRequest,
+        mut request: BrowserCheckoutRequest,
     ) -> BrowserEngineResult<Box<dyn LiveBrowserSession>> {
         // Acquire a pool slot first (D1 bound). Awaits when the pool is saturated;
         // the permit rides on the session and frees the slot on drop.
@@ -165,6 +338,7 @@ impl LiveBrowserPool for RemoteBrowserPool {
                 message: "live browser pool is closed".to_string(),
             }
         })?;
+        request.include_screenshot = request.include_screenshot || self.visual_perceiver.is_some();
         let response = self
             .client
             .post(self.endpoint("sessions/checkout"))
@@ -182,10 +356,17 @@ impl LiveBrowserPool for RemoteBrowserPool {
             .json::<RemoteCheckoutResponse>()
             .await
             .map_err(remote_error)?;
+        let mut page = checkout.page;
+        self.augment_page_with_visual_perception(
+            &mut page,
+            checkout.screenshot_base64.as_deref(),
+            checkout.screenshot_media_type.as_deref(),
+        )
+        .await;
         Ok(Box::new(RemoteBrowserSession {
             pool: self.clone(),
             session_id: checkout.session_id,
-            current_page: checkout.page,
+            current_page: page,
             _permit: permit,
         }))
     }
@@ -211,6 +392,7 @@ impl RemoteBrowserSession {
             .post(self.pool.endpoint("sessions/snapshot"))
             .json(&RemoteSnapshotRequest {
                 session_id: self.session_id.clone(),
+                include_screenshot: self.pool.visual_perceiver.is_some(),
             })
             .send()
             .await
@@ -225,7 +407,15 @@ impl RemoteBrowserSession {
             .json::<RemoteSnapshotResponse>()
             .await
             .map_err(remote_error)?;
-        self.current_page = snapshot.page;
+        let mut page = snapshot.page;
+        self.pool
+            .augment_page_with_visual_perception(
+                &mut page,
+                snapshot.screenshot_base64.as_deref(),
+                snapshot.screenshot_media_type.as_deref(),
+            )
+            .await;
+        self.current_page = page;
         Ok(())
     }
 }
@@ -248,6 +438,7 @@ impl BrowserDriver for RemoteBrowserSession {
                 session_id: self.session_id.clone(),
                 plan,
                 policy: policy.clone(),
+                include_screenshot: self.pool.visual_perceiver.is_some(),
             })
             .send()
             .await
@@ -262,7 +453,14 @@ impl BrowserDriver for RemoteBrowserSession {
             .json::<RemoteActuateResponse>()
             .await
             .map_err(remote_error)?;
-        if let Some(page) = actuation.page.clone() {
+        if let Some(mut page) = actuation.page.clone() {
+            self.pool
+                .augment_page_with_visual_perception(
+                    &mut page,
+                    actuation.screenshot_base64.as_deref(),
+                    actuation.screenshot_media_type.as_deref(),
+                )
+                .await;
             self.current_page = page;
         } else {
             self.refresh_snapshot().await?;
@@ -501,6 +699,7 @@ impl RemoteBrowserPool {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            visual_perceiver: None,
             semaphore: Arc::new(Semaphore::new(capacity)),
         }
     }
@@ -514,6 +713,68 @@ mod pool_bound_tests {
     fn the_pool_starts_at_full_capacity() {
         let pool = RemoteBrowserPool::for_test("http://localhost:9", 3);
         assert_eq!(pool.semaphore.available_permits(), 3);
+    }
+
+    #[test]
+    fn visual_perceiver_response_adds_visual_interactive_elements() {
+        let mut page = PageState {
+            url: "app://canvas".to_string(),
+            title: "Canvas".to_string(),
+            distilled_text: String::new(),
+            interactive_elements: Vec::new(),
+            active_tab_id: None,
+            fetch: None,
+        };
+        merge_visual_elements(
+            &mut page,
+            &VisualPerceiverResponse {
+                image_size: VisualPerceiverImageSize {
+                    width: 320,
+                    height: 200,
+                },
+                count: 1,
+                elements: vec![VisualPerceiverElement {
+                    id: 3,
+                    interactable: true,
+                    source: "icon".to_string(),
+                    content: "Submit".to_string(),
+                    score: 0.88,
+                    box_pixels: Some(VisualPerceiverBoxPixels {
+                        x1: 12,
+                        y1: 24,
+                        x2: 132,
+                        y2: 64,
+                    }),
+                    normalized_box: VisualPerceiverBox {
+                        x: 0.04,
+                        y: 0.12,
+                        w: 0.38,
+                        h: 0.2,
+                    },
+                }],
+                annotated_image_base64: None,
+                annotated_media_type: None,
+            },
+        );
+
+        assert_eq!(page.interactive_elements.len(), 1);
+        let element = &page.interactive_elements[0];
+        assert_eq!(element.element_id, "visual:3");
+        assert_eq!(element.role, "button");
+        assert_eq!(element.name, "Submit");
+        assert_eq!(
+            element.bbox,
+            Some(ElementBox {
+                x: 12,
+                y: 24,
+                width: 120,
+                height: 40
+            })
+        );
+        assert_eq!(
+            page.fetch.as_ref().unwrap()["visual_perceiver"]["status"],
+            "parsed"
+        );
     }
 
     #[tokio::test]
