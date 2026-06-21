@@ -131,7 +131,11 @@ pub use ppr_cache::{
     cached_personalized_pagerank, cached_single_seed_personalized_pagerank, clear_scoped_ppr_cache,
     merge_ppr_scores, scoped_ppr_cache_len,
 };
-pub use ranking::{ExpandRankingMethod, TextRankingMethod, VectorRankingMethod};
+pub use ranking::{
+    apply_cascade, compute_term_match, CascadeOutcome, EpistemicGate, ExpandRankingMethod,
+    QueryContext, RankCandidate, RankedCandidate, RankingRule, TermMatch, TextRankingMethod,
+    TypoConfig, VectorRankingMethod,
+};
 pub use relational::{
     ColumnSchema, NativeAuthPrincipalRecord, NativeBillingAccountRecord, NativeCatalog,
     NativeProjectRecord, NativeTenantRecord, Relation, RelationSchema, RelationalRow,

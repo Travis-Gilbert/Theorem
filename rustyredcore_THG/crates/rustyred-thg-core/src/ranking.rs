@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::access_method::{
@@ -274,4 +275,517 @@ fn tokenize(text: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(|part| part.to_lowercase())
         .collect()
+}
+
+// === Ranking-rule cascade (SPEC-RUSTYRED-RANKING-CASCADE) =====================================
+//
+// A Meilisearch-style bucket-sort: ordered rules, each only breaking ties left by the prior rule.
+// Each rule maps a candidate to a bucket ordinal (lower is better) whose maximum is a query/config
+// constant, not a dataset rank, so a candidate's position is explainable independent of the index.
+// `None` from a rule excludes the candidate. The epistemic rules are the differentiator and are
+// reorderable: trust ahead of relevance demotes a contradicted-but-strong result below a supported
+// one. Both search paths fill `RankCandidate` from their own row types and share `apply_cascade`.
+
+// Banding constants. These are deliberate fixed grains, not dataset quantiles.
+const BANDS: u32 = 10; // similarity/relevance/reliability score bands (0 = best)
+const MAX_HOPS: u32 = 6; // graph-proximity hop cap
+const PROX_CAP: u32 = 8; // per-adjacent-pair proximity penalty cap (Meilisearch default)
+const ATTR_CAP: u32 = 64; // first-match position cap for the single-attribute model
+const RECENCY_WORST: u32 = BANDS + 1; // superseded lands strictly below every aged/unknown band
+// ponytail: weekly recency grain; tune AGE_BAND_MS, or pass a per-query value, if recency matters.
+const AGE_BAND_MS: i64 = 7 * 24 * 3_600 * 1_000;
+
+/// One ranking rule. Lexical UX rules (the forgiving instant-search feel), relevance rules
+/// (bucketized ranker scores), and epistemic rules (the graph/trust differentiator). Reorderable:
+/// the cascade takes the order as data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RankingRule {
+    Words,
+    Typo,
+    Proximity,
+    Attribute,
+    Exactness,
+    Vector,
+    Text,
+    GraphProximity,
+    SourceReliability,
+    Recency,
+    EpistemicStatus,
+}
+
+impl RankingRule {
+    /// Stable name for the trace ("ranked here because rule R put it in bucket N").
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Words => "words",
+            Self::Typo => "typo",
+            Self::Proximity => "proximity",
+            Self::Attribute => "attribute",
+            Self::Exactness => "exactness",
+            Self::Vector => "vector",
+            Self::Text => "text",
+            Self::GraphProximity => "graph_proximity",
+            Self::SourceReliability => "source_reliability",
+            Self::Recency => "recency",
+            Self::EpistemicStatus => "epistemic_status",
+        }
+    }
+
+    /// Bucket this candidate under this rule. `None` excludes it (retracted/acquaintance under
+    /// `EpistemicStatus`; a hard temporal cutoff under `Recency`). A rule whose signal is absent
+    /// places the candidate in its worst bucket rather than panicking, so a partial candidate
+    /// degrades instead of failing.
+    pub fn bucket(self, c: &RankCandidate, q: &QueryContext) -> Option<u32> {
+        let terms = q.terms.len() as u32;
+        Some(match self {
+            Self::Words => match &c.term_match {
+                Some(tm) => terms.saturating_sub(tm.matched_terms.min(terms)),
+                None => terms,
+            },
+            Self::Typo => match &c.term_match {
+                Some(tm) => tm.typos_per_term.iter().sum::<u32>().min(terms * 2),
+                None => terms * 2,
+            },
+            Self::Proximity => {
+                let worst = terms.saturating_sub(1) * PROX_CAP;
+                match &c.term_match {
+                    Some(tm) => proximity(&tm.positions).min(worst),
+                    None => worst,
+                }
+            }
+            Self::Attribute => match &c.term_match {
+                Some(tm) => tm.positions.iter().min().copied().unwrap_or(ATTR_CAP).min(ATTR_CAP),
+                None => ATTR_CAP,
+            },
+            Self::Exactness => match &c.term_match {
+                Some(tm) => terms.saturating_sub(tm.exact_terms.min(terms)),
+                None => terms,
+            },
+            Self::Vector => c.vector_score.map(|s| band(s, BANDS)).unwrap_or(BANDS),
+            // bm25 is unbounded >= 0; squash to [0,1) so the band is index-independent.
+            Self::Text => c.bm25_score.map(|s| band(s / (s + 1.0), BANDS)).unwrap_or(BANDS),
+            Self::GraphProximity => c.graph_hops.map(|h| h.min(MAX_HOPS)).unwrap_or(MAX_HOPS),
+            Self::SourceReliability => {
+                c.source_reliability.map(|s| band(s, BANDS)).unwrap_or(BANDS)
+            }
+            Self::Recency => return recency_bucket(c, q),
+            Self::EpistemicStatus => return epistemic_bucket(c, q),
+        })
+    }
+}
+
+/// Bi-temporal recency band: superseded to the worst band, then newer-is-better when a reference
+/// time is supplied. A hard `as_of` cutoff excludes a not-yet-valid candidate (`None`).
+fn recency_bucket(c: &RankCandidate, q: &QueryContext) -> Option<u32> {
+    if let (Some(as_of), Some(valid_from)) = (q.as_of_ms, c.valid_from_ms) {
+        if valid_from > as_of {
+            return None; // not yet valid at the cutoff
+        }
+    }
+    if c.superseded {
+        return Some(RECENCY_WORST);
+    }
+    match q.recency_reference_ms {
+        Some(reference) => Some(match c.valid_from_ms {
+            Some(valid_from) => {
+                let age = (reference - valid_from).max(0);
+                ((age / AGE_BAND_MS).min(BANDS as i64)) as u32
+            }
+            None => BANDS, // unknown valid-time: below any aged band, above superseded
+        }),
+        // No reference clock: order superseded-last, present-time over unknown-time.
+        None => Some(match c.valid_from_ms {
+            Some(_) => 0,
+            None => 1,
+        }),
+    }
+}
+
+/// Epistemic standing band: supported above undercut/contested, retracted and acquaintance
+/// excluded, provisional/contested gated by config (mirrors the web path's Stage 10). The
+/// acceptance status sets the primary tier; the epistemic weight (axiomatic 1.5x, explanatory 1.2x)
+/// is a sub-band within the tier, so a stronger-warranted result ranks ahead of a peer.
+fn epistemic_bucket(c: &RankCandidate, q: &QueryContext) -> Option<u32> {
+    if c.epistemic_weight <= 0.0 {
+        return None; // acquaintance: dropped, same as the web path
+    }
+    let status = c.acceptance_status.trim().to_lowercase();
+    match status.as_str() {
+        "retracted" => return None,
+        "contested" | "disputed" if !q.epistemic.allow_contested => return None,
+        "provisional" if !q.epistemic.allow_provisional => return None,
+        _ => {}
+    }
+    let status_tier = match status.as_str() {
+        "axiomatic" => 0,
+        "accepted" | "supported" | "grounded" | "explanatory" => 1,
+        "contested" | "disputed" | "undercut" | "undercuts" | "attacked" => 3,
+        // empty / neutral / provisional / unknown
+        _ => 2,
+    };
+    let weight_tier = if c.epistemic_weight >= 1.5 {
+        0
+    } else if c.epistemic_weight >= 1.2 {
+        1
+    } else if c.epistemic_weight >= 1.0 {
+        2
+    } else {
+        3
+    };
+    Some(status_tier * 4 + weight_tier)
+}
+
+/// Map a [0,1] score to a band (0 = best). Higher score, lower bucket. Out-of-range clamps.
+fn band(value01: f32, bands: u32) -> u32 {
+    let v = value01.clamp(0.0, 1.0);
+    (((1.0 - v) * bands as f32).floor() as u32).min(bands)
+}
+
+/// Sum of per-adjacent-pair gaps between matched term positions, each capped at `PROX_CAP`.
+/// Adjacent terms (gap of one) cost nothing; far-apart terms cost more. Fewer than two positions
+/// has no proximity penalty.
+fn proximity(positions: &[u32]) -> u32 {
+    if positions.len() < 2 {
+        return 0;
+    }
+    let mut sorted = positions.to_vec();
+    sorted.sort_unstable();
+    sorted
+        .windows(2)
+        .map(|w| (w[1] - w[0]).saturating_sub(1).min(PROX_CAP))
+        .sum()
+}
+
+/// Per-query knobs the rules read: the tokenized query terms (`Words`/`Typo`/`Proximity`/
+/// `Exactness`), typo tolerance, the recency reference clock and hard temporal cutoff, and the
+/// provisional/contested admission gate.
+#[derive(Clone, Debug, Default)]
+pub struct QueryContext {
+    pub terms: Vec<String>,
+    pub typo: TypoConfig,
+    pub recency_reference_ms: Option<i64>,
+    pub as_of_ms: Option<i64>,
+    pub epistemic: EpistemicGate,
+}
+
+impl QueryContext {
+    /// Build a context from a raw query string (tokenized + lowercased), default typo + gate.
+    pub fn from_query(query: &str) -> Self {
+        Self {
+            terms: tokenize(query),
+            ..Self::default()
+        }
+    }
+}
+
+/// Typo tolerance, Meilisearch defaults: one typo allowed at five or more characters, two at nine
+/// or more. Prefix matching and typo tolerance both apply to the last query term.
+#[derive(Clone, Copy, Debug)]
+pub struct TypoConfig {
+    pub enabled: bool,
+    pub one_typo_min_len: usize,
+    pub two_typo_min_len: usize,
+}
+
+impl Default for TypoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            one_typo_min_len: 5,
+            two_typo_min_len: 9,
+        }
+    }
+}
+
+/// Whether provisional / contested results are admitted (demoted) or dropped. Default drops both,
+/// matching the web path's Stage 10 unless the caller opts in.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EpistemicGate {
+    pub allow_provisional: bool,
+    pub allow_contested: bool,
+}
+
+/// Term-level match detail for the lexical UX rules, derived from the document text (D3). The two
+/// paths compute this from their own text column via [`compute_term_match`].
+#[derive(Clone, Debug, Default)]
+pub struct TermMatch {
+    pub matched_terms: u32,
+    pub typos_per_term: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub exact_terms: u32,
+}
+
+/// A candidate carrying every signal the rules read. Each path fills this from its own row type;
+/// rules never touch a path-specific struct. `epistemic_weight` defaults to non-acquaintance and
+/// `acceptance_status` to neutral, so a row that carries no epistemic columns is ranked, not
+/// dropped.
+#[derive(Clone, Debug)]
+pub struct RankCandidate {
+    pub row_id: RowId,
+    pub term_match: Option<TermMatch>,
+    pub vector_score: Option<f32>,
+    pub bm25_score: Option<f32>,
+    pub graph_hops: Option<u32>,
+    pub source_reliability: Option<f32>,
+    pub valid_from_ms: Option<i64>,
+    pub superseded: bool,
+    pub epistemic_weight: f32,
+    pub acceptance_status: String,
+}
+
+impl RankCandidate {
+    /// A bare candidate keyed by id with neutral epistemic standing and no relevance signals.
+    pub fn new(row_id: impl Into<RowId>) -> Self {
+        Self {
+            row_id: row_id.into(),
+            term_match: None,
+            vector_score: None,
+            bm25_score: None,
+            graph_hops: None,
+            source_reliability: None,
+            valid_from_ms: None,
+            superseded: false,
+            epistemic_weight: 1.0,
+            acceptance_status: String::new(),
+        }
+    }
+}
+
+/// A candidate in final order, carrying the bucket it landed in under each rule (rule order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankedCandidate {
+    pub row_id: RowId,
+    pub buckets: Vec<u32>,
+}
+
+/// The cascade result: candidates in final order plus the rule order actually applied (for the
+/// trace).
+#[derive(Clone, Debug, Default)]
+pub struct CascadeOutcome {
+    pub ranked: Vec<RankedCandidate>,
+    pub rule_order: Vec<String>,
+}
+
+/// Apply the cascade: compute each candidate's bucket vector, drop any candidate a rule excluded,
+/// and sort lexicographically by the bucket vector with `row_id` as the final, stable tiebreak.
+/// Reordering `rules` reorders the result; that is the property the spec proves.
+pub fn apply_cascade(
+    candidates: Vec<RankCandidate>,
+    rules: &[RankingRule],
+    query: &QueryContext,
+) -> CascadeOutcome {
+    let mut ranked = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let mut buckets = Vec::with_capacity(rules.len());
+            for rule in rules {
+                buckets.push(rule.bucket(&candidate, query)?); // None excludes the candidate
+            }
+            Some(RankedCandidate {
+                row_id: candidate.row_id,
+                buckets,
+            })
+        })
+        .collect::<Vec<_>>();
+    // Vec<u32> compares lexicographically: earlier rules dominate, later rules break ties.
+    ranked.sort_by(|a, b| a.buckets.cmp(&b.buckets).then_with(|| a.row_id.cmp(&b.row_id)));
+    CascadeOutcome {
+        ranked,
+        rule_order: rules.iter().map(|rule| rule.name().to_string()).collect(),
+    }
+}
+
+/// Derive [`TermMatch`] for a document body against the query terms (D3). Exact, prefix (last term
+/// only), and bounded-Levenshtein fuzzy matching with Meilisearch-default typo tolerance; positions
+/// feed `Proximity`/`Attribute`, exact count feeds `Exactness`. Query terms are assumed normalized
+/// (tokenized + lowercased), e.g. from [`QueryContext::from_query`].
+//
+// ponytail: in-crate bounded Levenshtein is the FTS arm today (matching the existing token-overlap
+// residual); swap to tantivy's FuzzyTermQuery/PrefixQuery when the full-text index goes native.
+pub fn compute_term_match(text: &str, query: &QueryContext) -> TermMatch {
+    let doc = tokenize(text);
+    let last = query.terms.len().saturating_sub(1);
+    let mut out = TermMatch::default();
+    for (i, term) in query.terms.iter().enumerate() {
+        let max_typos = allowed_typos(term, &query.typo);
+        if let Some((position, typos, exact)) = best_match(&doc, term, max_typos, i == last) {
+            out.matched_terms += 1;
+            out.typos_per_term.push(typos);
+            out.positions.push(position as u32);
+            if exact {
+                out.exact_terms += 1;
+            }
+        }
+    }
+    out
+}
+
+fn allowed_typos(term: &str, cfg: &TypoConfig) -> u32 {
+    if !cfg.enabled {
+        return 0;
+    }
+    let len = term.chars().count();
+    if len >= cfg.two_typo_min_len {
+        2
+    } else if len >= cfg.one_typo_min_len {
+        1
+    } else {
+        0
+    }
+}
+
+/// Best match of `term` over the doc tokens: returns (position, typos, is_exact). Exact equality
+/// wins; on the last term a prefix expansion matches with zero typos but is not "exact"; otherwise
+/// a bounded-Levenshtein match within `max_typos`. Lowest typo count wins, exact breaks ties.
+fn best_match(doc: &[String], term: &str, max_typos: u32, is_last: bool) -> Option<(usize, u32, bool)> {
+    let mut best: Option<(usize, u32, bool)> = None;
+    for (position, token) in doc.iter().enumerate() {
+        let found = if token == term {
+            Some((0, true))
+        } else if is_last && token.starts_with(term) {
+            Some((0, false)) // prefix expansion: zero edits, but not an exact term
+        } else {
+            levenshtein(term, token, max_typos).and_then(|d| (d > 0).then_some((d, false)))
+        };
+        if let Some((typos, exact)) = found {
+            let better = match &best {
+                None => true,
+                Some((_, best_typos, best_exact)) => {
+                    typos < *best_typos || (typos == *best_typos && exact && !*best_exact)
+                }
+            };
+            if better {
+                best = Some((position, typos, exact));
+            }
+        }
+    }
+    best
+}
+
+/// Levenshtein edit distance, bounded: returns `None` early once the distance must exceed `max`.
+fn levenshtein(a: &str, b: &str, max: u32) -> Option<u32> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if (a.len() as i64 - b.len() as i64).unsigned_abs() > max as u64 {
+        return None;
+    }
+    let mut prev: Vec<u32> = (0..=b.len() as u32).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i as u32 + 1];
+        let mut row_min = cur[0];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            let val = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+            cur.push(val);
+            row_min = row_min.min(val);
+        }
+        if row_min > max {
+            return None; // every cell in this row already exceeds the budget
+        }
+        prev = cur;
+    }
+    let distance = prev[b.len()];
+    (distance <= max).then_some(distance)
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+
+    fn order(outcome: &CascadeOutcome) -> Vec<String> {
+        outcome.ranked.iter().map(|c| c.row_id.clone()).collect()
+    }
+
+    fn cand(id: &str, bm25: f32, status: &str) -> RankCandidate {
+        RankCandidate {
+            bm25_score: Some(bm25),
+            acceptance_status: status.to_string(),
+            ..RankCandidate::new(id)
+        }
+    }
+
+    // D1 acceptance 1: [Text, EpistemicStatus] excludes a high-bm25 retracted candidate and ranks
+    // a lower-bm25 supported candidate first.
+    #[test]
+    fn retracted_excluded_and_supported_ranks_first() {
+        let q = QueryContext::default();
+        let strong_retracted = cand("a", 9.0, "retracted");
+        let weak_supported = cand("b", 1.0, "supported");
+        let out = apply_cascade(
+            vec![strong_retracted, weak_supported],
+            &[RankingRule::Text, RankingRule::EpistemicStatus],
+            &q,
+        );
+        assert_eq!(order(&out), vec!["b"]);
+    }
+
+    // D1 acceptance 2: reordering the SAME candidates changes the order from one field. Trust-first
+    // ranks the supported-but-weak doc above the strong-but-undercut one; text-first flips it.
+    #[test]
+    fn reordering_rules_changes_outcome() {
+        let q = QueryContext::default();
+        let supported_weak = cand("x", 1.0, "supported"); // trustworthy, weak text
+        let undercut_strong = cand("y", 9.0, "undercuts"); // strong text, attacked
+
+        let trust_first = apply_cascade(
+            vec![supported_weak.clone(), undercut_strong.clone()],
+            &[RankingRule::EpistemicStatus, RankingRule::Text],
+            &q,
+        );
+        assert_eq!(order(&trust_first), vec!["x", "y"]);
+
+        let text_first = apply_cascade(
+            vec![supported_weak, undercut_strong],
+            &[RankingRule::Text, RankingRule::EpistemicStatus],
+            &q,
+        );
+        assert_eq!(order(&text_first), vec!["y", "x"]);
+    }
+
+    // D3 acceptance: a one-typo query matches and ranks below an exact match under Typo; disabling
+    // typo tolerance excludes the fuzzy match; a prefix on the last term matches.
+    #[test]
+    fn typo_tolerance_and_prefix_term_match() {
+        let doc = "the database guide";
+
+        let typo = QueryContext {
+            terms: vec!["databse".to_string()],
+            ..QueryContext::default()
+        };
+        let tm = compute_term_match(doc, &typo);
+        assert_eq!(tm.matched_terms, 1);
+        assert_eq!(tm.typos_per_term, vec![1]);
+        assert_eq!(tm.exact_terms, 0);
+
+        let exact = QueryContext {
+            terms: vec!["database".to_string()],
+            ..QueryContext::default()
+        };
+        let tme = compute_term_match(doc, &exact);
+        assert_eq!(tme.typos_per_term, vec![0]);
+        assert_eq!(tme.exact_terms, 1);
+        // Typo rule ranks the exact match (bucket 0) above the one-typo match (bucket 1).
+        assert!(
+            RankingRule::Typo
+                .bucket(&RankCandidate { term_match: Some(tme), ..RankCandidate::new("e") }, &exact)
+                < RankingRule::Typo
+                    .bucket(&RankCandidate { term_match: Some(tm), ..RankCandidate::new("t") }, &typo)
+        );
+
+        let disabled = QueryContext {
+            terms: vec!["databse".to_string()],
+            typo: TypoConfig { enabled: false, ..TypoConfig::default() },
+            ..QueryContext::default()
+        };
+        assert_eq!(compute_term_match(doc, &disabled).matched_terms, 0);
+
+        let prefix = QueryContext {
+            terms: vec!["data".to_string()],
+            ..QueryContext::default()
+        };
+        let tmp = compute_term_match(doc, &prefix);
+        assert_eq!(tmp.matched_terms, 1);
+        assert_eq!(tmp.exact_terms, 0); // prefix expansion is not exact
+    }
 }

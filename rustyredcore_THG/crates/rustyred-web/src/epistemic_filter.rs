@@ -58,6 +58,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rustyred_thg_core::{apply_cascade, EpistemicGate, QueryContext, RankCandidate, RankingRule};
 use serde::{Deserialize, Serialize};
 
 /// Final result top-n (Python `top_n` default).
@@ -126,6 +127,14 @@ pub struct FusedCandidate {
     pub source_system: Option<String>,
     /// `Object.properties.code_entity_type` for the Stage 3b code gate.
     pub code_entity_type: Option<String>,
+    /// Bi-temporal valid-time start (ms), the temporal seam the `Recency` rule reads. `None` is
+    /// unknown valid-time.
+    #[serde(default)]
+    pub valid_from_ms: Option<i64>,
+    /// Whether a newer version supersedes this one (the supersession signal the temporal seam
+    /// reads); `Recency` sends superseded results to the worst band.
+    #[serde(default)]
+    pub superseded: bool,
     /// Per-pk signal scores (keyed by score-key, e.g. `code_boost`). The pure
     /// stages read only `code_boost`; the rest ride through for the scorer seam.
     #[serde(default)]
@@ -146,6 +155,8 @@ impl FusedCandidate {
             title: String::new(),
             source_system: None,
             code_entity_type: None,
+            valid_from_ms: None,
+            superseded: false,
             signals: HashMap::new(),
         }
     }
@@ -258,6 +269,132 @@ pub fn apply_epistemic_filter(
     run_pipeline(fused, query, config, scorer)
 }
 
+/// The web path's default cascade rule order (SPEC-RUSTYRED-RANKING-CASCADE, D4): trust ahead of
+/// relevance, the differentiator. Epistemic standing dominates, then materialized source
+/// reliability, then recency, then the learned relevance score. The order is data: callers pass any
+/// order to [`apply_epistemic_cascade`].
+//
+// ponytail: default order is the high-leverage knob held for Travis; reorder here (or per query)
+// to make relevance dominate and trust break ties instead.
+pub fn web_cascade_rules() -> Vec<RankingRule> {
+    vec![
+        RankingRule::EpistemicStatus,
+        RankingRule::SourceReliability,
+        RankingRule::Recency,
+        RankingRule::Text,
+    ]
+}
+
+/// The web path's epistemic signals expressed as a ranking-rule cascade (D4): the same fused,
+/// hydrated candidates ordered through [`apply_cascade`] instead of one blended `learned_score`.
+///
+/// `EpistemicStatus` subsumes Stage 10 (retracted excluded, contested/provisional gated by config)
+/// and the acquaintance drop (`epistemic_weight <= 0`); `Recency` is the temporal seam (superseded
+/// to the worst band); `SourceReliability` reads the materialized per-source value
+/// (`justification_prior` for now); the learned `ConnectionScorer` stays a relevance input that
+/// bucketizes into `Text` rather than a separate multiply (the title-overlap bonus folds into it).
+/// Structural stages survive: 3a truncation, 3b code gate, slug dedup, and the final `top_n` slice.
+pub fn apply_epistemic_cascade(
+    fused: Vec<FusedCandidate>,
+    query: &str,
+    config: &EpistemicFilterConfig,
+    scorer: &dyn ConnectionScorer,
+    rules: &[RankingRule],
+) -> Vec<ScoredResult> {
+    // Stage 3a: truncate to 2 * top_n before scoring.
+    let candidates: Vec<FusedCandidate> = fused
+        .into_iter()
+        .take(config.top_n.saturating_mul(2))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // Stage 3b: code-object exclusion gate.
+    let code_debug = config.is_code_debug();
+    let candidates: Vec<FusedCandidate> = if !config.include_code && !code_debug {
+        candidates
+            .into_iter()
+            .filter(|candidate| !candidate.is_code_object())
+            .collect()
+    } else {
+        candidates
+    };
+
+    // The cascade query context: terms from the query; the admission gate mirrors the Stage 10
+    // include flags. The acquaintance drop is the `epistemic_weight <= 0` exclusion inside the rule.
+    let context = QueryContext {
+        epistemic: EpistemicGate {
+            allow_provisional: config.include_provisional,
+            allow_contested: config.include_contested,
+        },
+        ..QueryContext::from_query(query)
+    };
+    let query_words: HashSet<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+
+    // Score each candidate (learned relevance + title nudge -> the Text band) and build both the
+    // result record and the rank candidate carrying the epistemic/temporal/reliability signals.
+    let mut results: Vec<ScoredResult> = Vec::with_capacity(candidates.len());
+    let mut rank_candidates: Vec<RankCandidate> = Vec::with_capacity(candidates.len());
+    let mut slug_by_pk: HashMap<String, String> = HashMap::new();
+    for candidate in candidates {
+        let (learned, method) = scorer.score(&candidate, query);
+        let mut learned = round_half_even(learned, 4);
+        let title_bonus = title_overlap_bonus(&query_words, &candidate.title);
+        if let Some(bonus) = title_bonus {
+            learned = round_half_even(learned + bonus, 4);
+        }
+        if let Some(slug) = candidate.slug.as_deref().filter(|slug| !slug.is_empty()) {
+            slug_by_pk.insert(candidate.object_pk.clone(), slug.to_string());
+        }
+
+        let mut rank = RankCandidate::new(candidate.object_pk.clone());
+        rank.bm25_score = Some(learned as f32);
+        rank.source_reliability = Some(candidate.justification_prior as f32);
+        rank.valid_from_ms = candidate.valid_from_ms;
+        rank.superseded = candidate.superseded;
+        rank.epistemic_weight = candidate.epistemic_weight as f32;
+        rank.acceptance_status = candidate.acceptance_status.clone();
+        rank_candidates.push(rank);
+
+        results.push(ScoredResult {
+            object_pk: candidate.object_pk,
+            rrf_score: round_half_even(candidate.rrf_score, 6),
+            learned_score: learned,
+            scoring_method: method,
+            epistemic_weight: candidate.epistemic_weight,
+            acceptance_status: candidate.acceptance_status,
+            justification_prior: candidate.justification_prior,
+            title_overlap_bonus: title_bonus,
+            signals: candidate.signals,
+        });
+    }
+
+    // The cascade orders and excludes (retracted / acquaintance / gated status).
+    let outcome = apply_cascade(rank_candidates, rules, &context);
+    let mut by_pk: HashMap<String, ScoredResult> =
+        results.into_iter().map(|r| (r.object_pk.clone(), r)).collect();
+    let mut ordered: Vec<ScoredResult> = outcome
+        .ranked
+        .into_iter()
+        .filter_map(|ranked| by_pk.remove(&ranked.row_id))
+        .collect();
+
+    // Stage 7: slug dedup -- in cascade order the first occurrence of a slug is the best-ranked.
+    let mut seen_slugs: HashSet<String> = HashSet::new();
+    ordered.retain(|result| match slug_by_pk.get(&result.object_pk) {
+        Some(slug) => seen_slugs.insert(slug.clone()),
+        None => true,
+    });
+
+    // Stage 11: final top_n slice.
+    ordered.truncate(config.top_n);
+    ordered
+}
+
 /// Stage 6: epistemic-weight boosting for one result, given its source weight and
 /// whether a code_boost signal is present under a code_debug query.
 fn boost_epistemic(result: &mut ScoredResult, is_code_debug: bool) {
@@ -276,17 +413,22 @@ fn apply_title_overlap_bonus(
     query_words: &HashSet<String>,
     title: &str,
 ) {
+    if let Some(bonus) = title_overlap_bonus(query_words, title) {
+        result.learned_score = round_half_even(result.learned_score + bonus, 4);
+        result.title_overlap_bonus = Some(bonus);
+    }
+}
+
+/// The Stage 8 title-overlap bonus as a pure value (capped), or `None` when no word overlaps.
+/// Shared by the blended pipeline and the cascade path, which folds it into the relevance input.
+fn title_overlap_bonus(query_words: &HashSet<String>, title: &str) -> Option<f64> {
     let title_words: HashSet<String> = title
         .to_lowercase()
         .split_whitespace()
         .map(str::to_string)
         .collect();
     let overlap = query_words.intersection(&title_words).count();
-    if overlap >= 1 {
-        let bonus = (overlap as f64 * TITLE_BONUS_PER_WORD).min(TITLE_BONUS_CAP);
-        result.learned_score = round_half_even(result.learned_score + bonus, 4);
-        result.title_overlap_bonus = Some(bonus);
-    }
+    (overlap >= 1).then(|| (overlap as f64 * TITLE_BONUS_PER_WORD).min(TITLE_BONUS_CAP))
 }
 
 /// The real implementation, carrying the slug/title metadata the public result
@@ -706,5 +848,95 @@ mod tests {
         config: &EpistemicFilterConfig,
     ) -> Vec<ScoredResult> {
         apply_epistemic_filter(fused, query, config, &RrfFallbackScorer)
+    }
+
+    fn cascade(fused: Vec<FusedCandidate>, query: &str, config: &EpistemicFilterConfig, rules: &[RankingRule]) -> Vec<String> {
+        apply_epistemic_cascade(fused, query, config, &RrfFallbackScorer, rules)
+            .into_iter()
+            .map(|r| r.object_pk)
+            .collect()
+    }
+
+    // D4 acceptance: the cascade ordering supersedes the old blended `learned_score` order. A
+    // better-warranted but weaker-relevance result ranks first under the cascade, where it ranked
+    // second under the blended `learned *= epistemic_weight`.
+    #[test]
+    fn cascade_ordering_supersedes_blended_learned_score() {
+        let mut trusted = candidate("trusted", 0.4);
+        trusted.epistemic_weight = 1.5; // axiomatic warrant, weak relevance
+        let weak_trust = candidate("weak_trust", 0.9); // strong relevance, ordinary warrant (1.0)
+
+        // Blended: relevance * weight, the strong-relevance doc wins (0.9 > 0.4 * 1.5 = 0.6).
+        let blended: Vec<String> = apply_epistemic_filter_for_test(
+            vec![trusted.clone(), weak_trust.clone()],
+            "q",
+            &EpistemicFilterConfig::default(),
+        )
+        .into_iter()
+        .map(|r| r.object_pk)
+        .collect();
+        assert_eq!(blended, vec!["weak_trust", "trusted"]);
+
+        // Cascade, trust ahead of relevance: the better-warranted doc ranks first.
+        assert_eq!(
+            cascade(
+                vec![trusted, weak_trust],
+                "q",
+                &EpistemicFilterConfig::default(),
+                &web_cascade_rules(),
+            ),
+            vec!["trusted", "weak_trust"]
+        );
+    }
+
+    // D4 acceptance: retracted always drops and provisional/contested stay gated, now through the
+    // EpistemicStatus rule rather than Stage 10.
+    #[test]
+    fn cascade_epistemic_status_drops_retracted_and_gates_provisional_contested() {
+        let accepted = candidate("ok", 0.5);
+        let mut retracted = candidate("retracted", 0.9);
+        retracted.acceptance_status = "retracted".to_string();
+        let mut provisional = candidate("prov", 0.8);
+        provisional.acceptance_status = "provisional".to_string();
+        let mut contested = candidate("cont", 0.7);
+        contested.acceptance_status = "contested".to_string();
+        let all = || vec![accepted.clone(), retracted.clone(), provisional.clone(), contested.clone()];
+
+        // Default: only accepted survives.
+        assert_eq!(
+            cascade(all(), "q", &EpistemicFilterConfig::default(), &web_cascade_rules()),
+            vec!["ok"]
+        );
+
+        // Opt-in keeps provisional + contested; retracted is always dropped.
+        let permissive = EpistemicFilterConfig {
+            include_provisional: true,
+            include_contested: true,
+            ..EpistemicFilterConfig::default()
+        };
+        let mut pks = cascade(all(), "q", &permissive, &web_cascade_rules());
+        pks.sort();
+        assert_eq!(pks, vec!["cont", "ok", "prov"]);
+    }
+
+    // D4 acceptance: of two candidates, the one carrying a superseding newer valid-time sinks the
+    // superseded one to last under the Recency rule, even with stronger relevance.
+    #[test]
+    fn cascade_recency_sinks_superseded_below_current() {
+        let mut newer = candidate("newer", 0.3); // weaker relevance, current
+        newer.valid_from_ms = Some(2_000);
+        let mut superseded = candidate("superseded", 0.9); // stronger relevance, but superseded
+        superseded.valid_from_ms = Some(1_000);
+        superseded.superseded = true;
+
+        assert_eq!(
+            cascade(
+                vec![superseded, newer],
+                "q",
+                &EpistemicFilterConfig::default(),
+                &[RankingRule::Recency, RankingRule::Text],
+            ),
+            vec!["newer", "superseded"]
+        );
     }
 }

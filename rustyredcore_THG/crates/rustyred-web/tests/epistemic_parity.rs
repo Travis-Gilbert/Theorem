@@ -113,6 +113,8 @@ impl From<FixtureCandidate> for FusedCandidate {
             title: fc.title,
             source_system: fc.source_system,
             code_entity_type: fc.code_entity_type,
+            valid_from_ms: None,
+            superseded: false,
             signals: fc.signals,
         }
     }
