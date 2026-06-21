@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use rustyred_thg_adapters::{
-    export_training_snapshot_files, import_gnn_export_dir, run_local_training_smoke,
-    seed_training_fixture, writeback_model_artifact_file, GnnExportImportOptions,
+    export_training_snapshot_files, import_gnn_export_dir, run_hot_temporal_training,
+    run_local_training_smoke, seed_hot_temporal_fixture, seed_training_fixture,
+    writeback_model_artifact_file, GnnExportImportOptions, HotConfig, HotTemporalSplitConfig,
+    HotTrainingConfig, HotTrainingRunOptions, HOT_MODEL_ARTIFACT_FILE, HOT_MODEL_FILE,
 };
 
 fn main() {
@@ -96,6 +98,69 @@ fn run() -> Result<(), String> {
                 "counts": export.manifest.counts
             }))
         }
+        "hot-train" => {
+            let data_dir = required_path(&opts, "data-dir")?;
+            let output_dir = required_path(&opts, "output-dir")?;
+            let tenant = option_or(&opts, "tenant", "theorem");
+            let export_id = option_or(&opts, "export-id", "hot-training-export");
+            let actor = opts.get("actor").map(String::as_str);
+            let result = run_hot_temporal_training(
+                data_dir,
+                output_dir,
+                tenant,
+                export_id,
+                hot_options_from(&opts),
+                actor,
+            )
+            .map_err(format_thg)?;
+            print_json(json!({
+                "ok": true,
+                "command": "hot-train",
+                "manifest_path": result.export.manifest_path,
+                "graph_snapshot_path": result.export.graph_snapshot_path,
+                "runpod_input_path": result.export.runpod_input_path,
+                "model_path": result.model_path,
+                "model_artifact_input_path": result.model_artifact_input_path,
+                "model_node_id": result.writeback.model_node_id,
+                "evaluation_node_id": result.writeback.evaluation_node_id,
+                "snapshot_hash": result.export.manifest.snapshot_hash,
+                "graph_version": result.writeback.transaction.graph_version,
+                "metrics": result.metrics
+            }))
+        }
+        "hot-smoke" => {
+            let data_dir = required_path(&opts, "data-dir")?;
+            let output_dir = required_path(&opts, "output-dir")?;
+            let tenant = option_or(&opts, "tenant", "theorem");
+            let export_id = option_or(&opts, "export-id", "hot-training-smoke");
+            let actor = opts.get("actor").map(String::as_str);
+            let fixture =
+                seed_hot_temporal_fixture(&data_dir, tenant, actor).map_err(format_thg)?;
+            let result = run_hot_temporal_training(
+                data_dir,
+                output_dir,
+                tenant,
+                export_id,
+                hot_options_from(&opts),
+                actor,
+            )
+            .map_err(format_thg)?;
+            print_json(json!({
+                "ok": true,
+                "command": "hot-smoke",
+                "fixture": fixture,
+                "manifest_path": result.export.manifest_path,
+                "graph_snapshot_path": result.export.graph_snapshot_path,
+                "runpod_input_path": result.export.runpod_input_path,
+                "model_path": result.model_path,
+                "model_artifact_input_path": result.model_artifact_input_path,
+                "model_node_id": result.writeback.model_node_id,
+                "evaluation_node_id": result.writeback.evaluation_node_id,
+                "snapshot_hash": result.export.manifest.snapshot_hash,
+                "graph_version": result.writeback.transaction.graph_version,
+                "metrics": result.metrics
+            }))
+        }
         "writeback" => {
             let data_dir = required_path(&opts, "data-dir")?;
             let input = required_path(&opts, "input")?;
@@ -178,6 +243,41 @@ fn option_usize(opts: &BTreeMap<String, String>, key: &str) -> Option<usize> {
         .and_then(|value| value.parse::<usize>().ok())
 }
 
+fn option_f32(opts: &BTreeMap<String, String>, key: &str) -> Option<f32> {
+    opts.get(key)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| value.parse::<f32>().ok())
+}
+
+fn hot_options_from(opts: &BTreeMap<String, String>) -> HotTrainingRunOptions {
+    let mut training = HotTrainingConfig::default();
+    training.epochs = option_usize(opts, "epochs").unwrap_or(training.epochs);
+    training.batch_size = option_usize(opts, "batch-size").unwrap_or(training.batch_size);
+    training.learning_rate = option_f32(opts, "learning-rate").unwrap_or(training.learning_rate);
+    training.l2_weight_decay = option_f32(opts, "l2-weight-decay").unwrap_or(training.l2_weight_decay);
+    training.model = HotConfig {
+        max_nodes: option_usize(opts, "max-nodes").unwrap_or(HotConfig::default().max_nodes),
+        max_temporal_edges: option_usize(opts, "max-temporal-edges")
+            .unwrap_or(HotConfig::default().max_temporal_edges),
+        decoder_hidden_dim: option_usize(opts, "decoder-hidden-dim")
+            .unwrap_or(HotConfig::default().decoder_hidden_dim),
+        ..HotConfig::default()
+    };
+    HotTrainingRunOptions {
+        model_id: option_or(opts, "model-id", "hot-temporal-link-native-v1").to_string(),
+        promotion_decision: option_or(opts, "promotion-decision", "shadow").to_string(),
+        s3_uri: opts.get("s3-uri").cloned(),
+        training,
+        split: HotTemporalSplitConfig {
+            holdout_fraction: option_f32(opts, "holdout-fraction").unwrap_or(0.2),
+            negatives_per_positive: option_usize(opts, "negatives-per-positive").unwrap_or(1),
+            max_positive_edges: option_usize(opts, "max-positive-edges").unwrap_or(512),
+        },
+        max_baseline_candidates: option_usize(opts, "max-baseline-candidates").unwrap_or(64),
+    }
+}
+
 fn print_json(value: serde_json::Value) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
     println!("{raw}");
@@ -199,6 +299,14 @@ Commands:
             [--max-entities N] [--max-triples N]
             [--max-temporal-triples N] [--actor NAME]
   export    --data-dir DIR --output-dir DIR [--tenant theorem] [--export-id ID]
+  hot-train --data-dir DIR --output-dir DIR [--tenant theorem]
+            [--export-id ID] [--model-id ID] [--epochs N]
+            [--learning-rate F] [--holdout-fraction F]
+            [--negatives-per-positive N] [--promotion-decision shadow]
+            [--s3-uri URI] [--actor NAME]
+  hot-smoke --data-dir DIR --output-dir DIR [same options as hot-train]
+            Seeds a timestamped temporal graph fixture before training.
+            Writes {HOT_MODEL_FILE} and {HOT_MODEL_ARTIFACT_FILE}.
   writeback --data-dir DIR --input model_artifact.json [--actor NAME]
   smoke     --data-dir DIR --output-dir DIR [--tenant theorem] [--export-id ID]
             [--model-id ID] [--model-type paraphramer] [--s3-uri s3://...]
