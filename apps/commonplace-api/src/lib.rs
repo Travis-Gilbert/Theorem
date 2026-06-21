@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod portability;
 pub mod retrieve;
 pub mod schema;
+pub mod serve;
 
 pub use auth::{ApiKeyRegistry, ApiKeyToken, Principal};
 pub use briefing::{briefing, Briefing, BriefingConfig, ConnectedItem};
@@ -28,10 +29,11 @@ pub use portability::{
 pub use retrieve::{ask, AnswerKind, AnswerModel, AskConfig, AskResult, NoModel, RetrievedItem};
 pub use schema::{
     build_schema, build_schema_with_model, AnswerKindGql, ApiStore, AskResultGql, BriefingGql,
-    CandidateLinkGql, CollectionGql, ConnectedItemGql, ConsumerSchema, DurableSchema, DurableShared,
-    ExportFormat, ImportResultGql, IngestInputGql, InMemoryShared, ItemGql, Mutation, ProvenanceGql,
-    Query, SearchHitGql, SharedStore,
+    CandidateLinkGql, CollectionGql, ConnectedItemGql, ConsumerSchema, DurableSchema,
+    DurableShared, ExportFormat, ImportResultGql, InMemoryShared, IngestInputGql, ItemGql,
+    Mutation, ProvenanceGql, Query, SearchHitGql, SharedStore,
 };
+pub use serve::{run_from_env, serve_loopback};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

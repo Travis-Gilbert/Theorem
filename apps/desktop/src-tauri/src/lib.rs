@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 
 const HOSTED_ENDPOINT: &str = "https://rustyredcore-theorem-production.up.railway.app/mcp";
 const LOCAL_NODE_PORT: u16 = 17888;
+const COMMONPLACE_NODE_PORT: u16 = 17890;
 const KEYCHAIN_SERVICE: &str = "com.theorem.desktop";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +68,15 @@ struct LocalNodeStatus {
     store_path: String,
     active_target: String,
     tools_match_hosted: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommonplaceStatus {
+    node_up: bool,
+    endpoint: String,
+    port: u16,
+    store_path: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -295,6 +305,12 @@ struct LocalNodeRuntime {
     shutdown: Option<oneshot::Sender<()>>,
 }
 
+struct CommonplaceRuntime {
+    endpoint: String,
+    store_path: String,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
 #[derive(Default)]
 struct ReceiverThreadStatus {
     state: String,
@@ -313,6 +329,7 @@ struct DesktopBackendState {
     harness: HarnessSettings,
     receiver: ReceiverSettings,
     local_node: Option<LocalNodeRuntime>,
+    commonplace_node: Option<CommonplaceRuntime>,
     receiver_runtime: Option<ReceiverRuntime>,
     tabs: HashMap<String, TabRuntime>,
     active_tab: Option<String>,
@@ -331,7 +348,7 @@ impl Default for DesktopBackendState {
             harness: HarnessSettings {
                 endpoint: HOSTED_ENDPOINT.to_string(),
                 local_endpoint: format!("http://127.0.0.1:{LOCAL_NODE_PORT}/mcp"),
-                active_target: "hosted".to_string(),
+                active_target: "local".to_string(),
                 tenant: "default".to_string(),
                 bearer_present: secret_get("harness_bearer").is_ok(),
             },
@@ -341,6 +358,7 @@ impl Default for DesktopBackendState {
                 worktrees,
             },
             local_node: None,
+            commonplace_node: None,
             receiver_runtime: None,
             tabs: HashMap::new(),
             active_tab: None,
@@ -1096,6 +1114,8 @@ fn start_local_node(
     config.allowed_origins = vec![
         "http://localhost:1420".to_string(),
         "http://127.0.0.1:1420".to_string(),
+        "http://localhost:3000".to_string(),
+        "http://127.0.0.1:3000".to_string(),
         "tauri://localhost".to_string(),
     ];
 
@@ -1117,9 +1137,72 @@ fn start_local_node(
     Ok(())
 }
 
+fn start_commonplace_api(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<(), String> {
+    let store_path = app_store_path(app)?.join("commonplace-api");
+    std::fs::create_dir_all(&store_path).map_err(|error| error.to_string())?;
+
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], COMMONPLACE_NODE_PORT).into();
+    let endpoint = format!("http://127.0.0.1:{COMMONPLACE_NODE_PORT}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let spawn_store_path = store_path.clone();
+    tauri::async_runtime::spawn(async move {
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+        };
+        if let Err(error) =
+            commonplace_api::serve_loopback(addr, spawn_store_path, "dev-key", "default", shutdown)
+                .await
+        {
+            eprintln!("[theorem-desktop] commonplace-api stopped: {error}");
+        }
+    });
+
+    let mut backend = state.lock().map_err(|error| error.to_string())?;
+    backend.commonplace_node = Some(CommonplaceRuntime {
+        endpoint,
+        store_path: store_path.display().to_string(),
+        shutdown: Some(shutdown_tx),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn commonplace_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<CommonplaceStatus, String> {
+    let backend = state.lock().map_err(|error| error.to_string())?;
+    let fallback_store = app_store_path(&app)?.join("commonplace-api");
+    let endpoint = backend
+        .commonplace_node
+        .as_ref()
+        .map(|node| node.endpoint.clone())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{COMMONPLACE_NODE_PORT}"));
+    let store_path = backend
+        .commonplace_node
+        .as_ref()
+        .map(|node| node.store_path.clone())
+        .unwrap_or_else(|| fallback_store.display().to_string());
+
+    Ok(CommonplaceStatus {
+        node_up: backend.commonplace_node.is_some(),
+        endpoint,
+        port: COMMONPLACE_NODE_PORT,
+        store_path,
+    })
+}
+
 fn stop_local_node(state: &tauri::State<'_, Mutex<DesktopBackendState>>) {
     if let Ok(mut backend) = state.lock() {
         if let Some(mut node) = backend.local_node.take() {
+            if let Some(shutdown) = node.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+        if let Some(mut node) = backend.commonplace_node.take() {
             if let Some(shutdown) = node.shutdown.take() {
                 let _ = shutdown.send(());
             }
@@ -1150,7 +1233,16 @@ fn start_receiver_locked(backend: &mut DesktopBackendState) -> Result<(), String
         receiver_id: Some("theorem-desktop-receiver".to_string()),
         claim_interval_secs: backend.receiver.claim_interval_secs,
         capacity: 1,
+        dispatch_database_url_env: theorem_receiver::config::DEFAULT_DISPATCH_DATABASE_URL_ENV
+            .to_string(),
+        dispatch_lease_secs: theorem_receiver::config::DEFAULT_DISPATCH_LEASE_SECS,
+        dispatch_heartbeat_secs: theorem_receiver::config::DEFAULT_DISPATCH_HEARTBEAT_SECS,
+        dispatch_reap_interval_secs: theorem_receiver::config::DEFAULT_DISPATCH_REAP_INTERVAL_SECS,
         worktrees,
+        provider_seam: theorem_receiver::ProviderSeamConfig::default(),
+        model_backends: BTreeMap::new(),
+        head_runtime_recipes: BTreeMap::new(),
+        sandbox: None,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(ReceiverThreadStatus {
@@ -1649,6 +1741,7 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<Mutex<DesktopBackendState>>();
             start_local_node(app.handle(), &state)?;
+            start_commonplace_api(app.handle(), &state)?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1663,6 +1756,7 @@ pub fn run() {
             harness_bearer_set,
             harness_bearer_clear,
             local_node_status,
+            commonplace_status,
             receiver_settings_get,
             receiver_settings_set,
             receiver_status,

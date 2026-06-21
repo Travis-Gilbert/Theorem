@@ -6,9 +6,9 @@ Standalone crates and clients under `apps/`. Each depends on the `rustyredcore_T
 |-----|------------|
 | `browser` | `theorem-browser`: the Servo-embedded substrate-native browser. Standalone crate, not in the workspace. CI-only build. |
 | `browser-substrate` | `theorem-browser-substrate`: the Servo-free page-to-substrate seam. Ingests a `LoadedPage` into a `GraphStore`. Builds in seconds. |
-| `commonplace-api` | CommonPlace interoperability API seam. Serves the typed consumer GraphQL profile and MCP stdio tools over the `commonplace` object model, with optional durable RedCore plus disk backing. |
+| `commonplace-api` | CommonPlace interoperability API seam. Serves the typed consumer GraphQL profile and MCP stdio tools over the `commonplace` object model, with optional durable RedCore plus disk backing; also exposes an embeddable loopback server for the desktop shell. |
 | `copresence-editor` | Browser adapter for `theorem-copresence`: Velt/Yjs plus Tiptap collaboration with an OpenAI-compatible Gemma co-writer seam. |
-| `desktop` | Tauri plus React plus TypeScript desktop client (Vite). |
+| `desktop` | Tauri desktop shell. Owns the local harness node, the CommonPlace API loopback server, keychain, receiver, browser tabs, and native command bridge; SPEC-9 repoints the main window to the CommonPlace Next.js frontend export. |
 | `harness-console` | Standalone Next.js 16 / React 19 control surface for Theorems Harness at `harness.theoremsweb.com`. Greenfield app with Agent, Memory, Skills, Rooms, Runs, API Keys, Providers, Usage, Connections/MCP Hub, Settings, collaborative CodeMirror/Yjs editor, cosmos.gl memory graph, Dynamic Island omnibar, and tokenized 4px design-math lint. |
 | `ios` | `TheoremKit`: a Swift Package shared kit layer, distinct from `theorem-ios`. |
 | `jobintel` | Standalone job-intelligence CLI. A light HTTP consumer of a running RustyRed; no path-deps into the substrate. |

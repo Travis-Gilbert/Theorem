@@ -124,7 +124,8 @@ fn ingest_survives_restart_blocked_on_redcore() {
     stop(server);
 
     // DIAGNOSTIC: what is on disk after the SIGKILL, before respawn?
-    let aof = std::fs::read_to_string(dir.join("graph").join("graph.aof.current")).unwrap_or_default();
+    let aof =
+        std::fs::read_to_string(dir.join("graph").join("graph.aof.current")).unwrap_or_default();
     eprintln!("POST-SIGKILL AOF lines = {}", aof.lines().count());
     eprintln!(
         "POST-SIGKILL manifest = {}",
