@@ -170,6 +170,14 @@ pub struct SkillPackState {
     pub artifact_hashes: Vec<String>,
     pub source_content_hash: String,
     pub pack: Value,
+    /// The `CapabilityPackSpec` contract, so a published skill pack deserializes as an
+    /// `ensemble::CapabilityPack` (which requires a `spec`) and is therefore visible to
+    /// `ensemble_select` as a candidate and a live-fitness source. Defaults to the pack's
+    /// own `spec` field, falling back to the full pack payload. This is what makes "the
+    /// skill corpus the same machine as the tool corpus": one dual-labeled node serves both
+    /// the skill-pack loop and the ensemble registry.
+    #[serde(default)]
+    pub spec: Value,
     pub metadata: Map<String, Value>,
     pub published_by: String,
     pub created_at: String,
@@ -253,6 +261,13 @@ pub fn publish_skill_pack<S: SkillPackGraphStore>(
     let now = timestamp_or_now(&input.created_at);
     let source_content_hash = resolve_source_content_hash(&metadata, &input.source_content_hash);
     let artifact_hashes = resolve_artifact_hashes(&pack, &metadata, input.artifact_hashes);
+    // The pack's own `spec`, or the full pack payload as the spec contract, so the stored
+    // node deserializes as an `ensemble::CapabilityPack` and joins the ensemble registry.
+    let spec = pack
+        .get("spec")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| pack.clone());
     let state = SkillPackState {
         tenant_slug: tenant.clone(),
         origin_tenant_slug: tenant.clone(),
@@ -277,6 +292,7 @@ pub fn publish_skill_pack<S: SkillPackGraphStore>(
         artifact_hashes,
         source_content_hash,
         pack,
+        spec,
         metadata,
         published_by: input.actor_id.trim().to_string(),
         created_at: now.clone(),

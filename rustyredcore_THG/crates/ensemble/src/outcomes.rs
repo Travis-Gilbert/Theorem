@@ -286,7 +286,7 @@ pub fn effective_pack_fitness_from_node(node: &NodeRecord) -> f32 {
         .get("fitness")
         .and_then(Value::as_f64)
         .map(|value| value as f32)
-        .unwrap_or(DEFAULT_BASE_FITNESS)
+        .unwrap_or_else(|| compound_standing_fitness(node))
         .clamp(0.0, 1.0);
     let Some(updated_at_ms) = node
         .properties
@@ -306,6 +306,39 @@ pub fn effective_pack_fitness_from_node(node: &NodeRecord) -> f32 {
     let half_life_ms = half_life_days * 86_400_000.0;
     let decay = 0.5_f32.powf(age_ms / half_life_ms);
     (DEFAULT_FITNESS_EPSILON + (stored - DEFAULT_FITNESS_EPSILON) * decay)
+        .clamp(DEFAULT_FITNESS_EPSILON, 1.0)
+}
+
+/// Live-fitness fallback for skill-pack nodes that carry compound standing instead of a
+/// top-level scalar `fitness`. The harness Compound spine writes
+/// `metadata.fitness.compound.{run_count, positive_count}` onto the dual-labeled
+/// `["CapabilityPack", "SkillPack"]` node when a skill is applied and its run closes. We read
+/// it as a Laplace-smoothed success rate with the base fitness as the prior: a never-used
+/// pack reads exactly `DEFAULT_BASE_FITNESS`, each positive compound run raises it, and a
+/// repeatedly-unhelpful pack sinks below the prior. This is no new ranking -- it only
+/// projects the existing compound standing into the fitness contract the selector already
+/// reads, so a skill use compounds into ensemble selection like a tool use does.
+fn compound_standing_fitness(node: &NodeRecord) -> f32 {
+    let Some(compound) = node
+        .properties
+        .get("metadata")
+        .and_then(|metadata| metadata.get("fitness"))
+        .and_then(|fitness| fitness.get("compound"))
+    else {
+        return DEFAULT_BASE_FITNESS;
+    };
+    let run_count = compound
+        .get("run_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if run_count == 0 {
+        return DEFAULT_BASE_FITNESS;
+    }
+    let positive_count = compound
+        .get("positive_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    ((positive_count as f32 + DEFAULT_BASE_FITNESS) / (run_count as f32 + 1.0))
         .clamp(DEFAULT_FITNESS_EPSILON, 1.0)
 }
 

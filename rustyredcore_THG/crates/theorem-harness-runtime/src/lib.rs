@@ -37,6 +37,7 @@ pub mod composed_agent;
 pub mod compound_engineering;
 pub mod coordination;
 pub mod coordination_push;
+pub mod engineering_packs;
 pub mod event_log;
 pub mod head_invoker;
 pub mod job_queue;
