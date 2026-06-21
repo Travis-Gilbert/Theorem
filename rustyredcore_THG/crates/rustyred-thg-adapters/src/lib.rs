@@ -112,11 +112,12 @@ pub use standing_pass::{
     CandidateKind, CandidatePair, CandidateRef, DatalogStandingGenerator,
     EgglogEquivalenceStandingGenerator, GeneratorInput, GeneratorQuery, GeneratorQueryKind,
     HotTemporalStandingGenerator, PairformerStandingGenerator, SourceReliabilityStandingGenerator,
-    SpatialStandingGenerator, StandingGenerator, StandingPassConfig, StandingPassEngine,
-    StandingPassResult, DATALOG_STANDING_GENERATOR_ID, DEFAULT_STANDING_PASS_CONFIDENCE_CEILING,
-    DEFAULT_STANDING_PASS_CONFIDENCE_THRESHOLD, DEFAULT_STANDING_PASS_MAX_CANDIDATES,
-    DEFAULT_STANDING_PASS_MAX_DEPTH, DEFAULT_STANDING_PASS_MAX_NODES,
-    EGGLOG_EQUIVALENCE_STANDING_GENERATOR_ID, SOURCE_RELIABILITY_STANDING_GENERATOR_ID,
+    SpatialStandingGenerator, Spec1PropertyStandingGenerator, StandingGenerator,
+    StandingPassConfig, StandingPassEngine, StandingPassResult, DATALOG_STANDING_GENERATOR_ID,
+    DEFAULT_STANDING_PASS_CONFIDENCE_CEILING, DEFAULT_STANDING_PASS_CONFIDENCE_THRESHOLD,
+    DEFAULT_STANDING_PASS_MAX_CANDIDATES, DEFAULT_STANDING_PASS_MAX_DEPTH,
+    DEFAULT_STANDING_PASS_MAX_NODES, EGGLOG_EQUIVALENCE_STANDING_GENERATOR_ID,
+    SOURCE_RELIABILITY_STANDING_GENERATOR_ID, SPEC1_PROPERTY_STANDING_GENERATOR_ID,
     STANDING_PASS_ADMITTED_BY,
 };
 pub use training_runner::{

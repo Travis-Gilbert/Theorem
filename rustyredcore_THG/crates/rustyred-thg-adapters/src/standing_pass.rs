@@ -19,10 +19,12 @@ use serde_json::{json, Value};
 
 use crate::pairformer::{PairformerConfig, PairformerSupportPath};
 use crate::reflexive::{
-    quarantine_densification_candidates, rank_pairformer_densification_candidates,
-    rank_spatial_candidates, rank_temporal_candidates, DensificationRequest, DensificationResult,
-    InferredEdgeCandidate, REFLEXIVE_CANDIDATE_OF, REFLEXIVE_CANDIDATE_SOURCE,
-    REFLEXIVE_CANDIDATE_TARGET, REFLEXIVE_DENSIFICATION_RUN_LABEL, REFLEXIVE_EDGE_CANDIDATE_LABEL,
+    quarantine_densification_candidates, quarantine_property_candidates_with_options,
+    rank_pairformer_densification_candidates, rank_property_candidates, rank_spatial_candidates,
+    rank_temporal_candidates, DensificationRequest, DensificationResult, InferredEdgeCandidate,
+    InferredPropertyCandidate, PropertyCandidateQuarantineOptions, PropertyCandidateResult,
+    REFLEXIVE_CANDIDATE_OF, REFLEXIVE_CANDIDATE_SOURCE, REFLEXIVE_CANDIDATE_TARGET,
+    REFLEXIVE_DENSIFICATION_RUN_LABEL, REFLEXIVE_EDGE_CANDIDATE_LABEL,
     REFLEXIVE_PROPERTY_CANDIDATE_LABEL,
 };
 use crate::types::{thg_error_from_store, THG_ADAPTER_SOURCE};
@@ -37,6 +39,7 @@ pub const DATALOG_STANDING_GENERATOR_ID: &str = "symbolic-datalog/core-rules-v0"
 pub const EGGLOG_EQUIVALENCE_STANDING_GENERATOR_ID: &str = "symbolic-egglog/equivalence-v0";
 pub const SOURCE_RELIABILITY_STANDING_GENERATOR_ID: &str =
     "symbolic-beta-bernoulli/source-reliability-v0";
+pub const SPEC1_PROPERTY_STANDING_GENERATOR_ID: &str = "rule-property/missing-scalar-v0";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GeneratorInput {
@@ -96,6 +99,7 @@ pub struct CandidatePair {
 #[serde(rename_all = "snake_case")]
 pub enum CandidateKind {
     ProposedEdge,
+    PropertyProposal,
     EquivalenceMerge,
     DerivedFact,
     ReliabilityAnnotation,
@@ -116,6 +120,11 @@ pub enum CandidateRef {
     Edge {
         edge_id: String,
     },
+    PropertyProposal {
+        target_node_id: String,
+        property_key: String,
+        value_hash: String,
+    },
     Fact {
         fact_id: String,
     },
@@ -125,6 +134,7 @@ pub enum CandidateRef {
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum AdvisoryPayload {
     Edge(InferredEdgeCandidate),
+    Property(InferredPropertyCandidate),
     Json(Value),
 }
 
@@ -161,10 +171,42 @@ impl AdvisoryCandidate {
         }
     }
 
+    pub fn from_property(
+        generator_id: impl Into<String>,
+        candidate: InferredPropertyCandidate,
+    ) -> Self {
+        let generator_id = generator_id.into();
+        let support = Some(PairformerSupportPath {
+            edge_ids: candidate.support_edge_ids.clone(),
+            node_ids: candidate.support_node_ids.clone(),
+            relation_hint: candidate.property_key.clone(),
+            confidence: candidate.confidence,
+        });
+        Self {
+            kind: CandidateKind::PropertyProposal,
+            subject: CandidateRef::PropertyProposal {
+                target_node_id: candidate.target_node_id.clone(),
+                property_key: candidate.property_key.clone(),
+                value_hash: stable_hash(&candidate.proposed_value),
+            },
+            score: candidate.confidence,
+            support,
+            generator_id,
+            payload: AdvisoryPayload::Property(candidate),
+        }
+    }
+
     pub fn edge_candidate(&self) -> Option<&InferredEdgeCandidate> {
         match &self.payload {
             AdvisoryPayload::Edge(candidate) => Some(candidate),
-            AdvisoryPayload::Json(_) => None,
+            AdvisoryPayload::Property(_) | AdvisoryPayload::Json(_) => None,
+        }
+    }
+
+    pub fn property_candidate(&self) -> Option<&InferredPropertyCandidate> {
+        match &self.payload {
+            AdvisoryPayload::Property(candidate) => Some(candidate),
+            AdvisoryPayload::Edge(_) | AdvisoryPayload::Json(_) => None,
         }
     }
 
@@ -272,7 +314,9 @@ pub struct StandingPassResult {
     pub generator_ids: Vec<String>,
     pub candidates: Vec<AdvisoryCandidate>,
     pub candidate_node_ids: Vec<String>,
+    pub property_candidate_node_ids: Vec<String>,
     pub applied_edge_ids: Vec<String>,
+    pub applied_property_node_ids: Vec<String>,
     pub writes: usize,
 }
 
@@ -352,6 +396,10 @@ impl StandingPassEngine {
             .iter()
             .filter_map(|candidate| candidate.edge_candidate().cloned())
             .collect::<Vec<_>>();
+        let property_candidates = candidates
+            .iter()
+            .filter_map(|candidate| candidate.property_candidate().cloned())
+            .collect::<Vec<_>>();
         let quarantine = if edge_candidates.is_empty() {
             None
         } else {
@@ -363,13 +411,38 @@ impl StandingPassEngine {
                 Some(STANDING_PASS_ADMITTED_BY),
             )?)
         };
+        let property_quarantine = if property_candidates.is_empty() {
+            None
+        } else {
+            Some(quarantine_property_candidates_with_options(
+                store,
+                &self.config.tenant_id,
+                &run_id,
+                &property_candidates,
+                Some(STANDING_PASS_ADMITTED_BY),
+                PropertyCandidateQuarantineOptions {
+                    dry_run: !self.config.auto_apply_at_confidence_ceiling,
+                },
+            )?)
+        };
 
         let applied_edge_ids = admit_edge_candidates(store, &self.config, &candidates)?;
         let candidate_node_ids = quarantine
             .as_ref()
             .map(|result| result.candidate_node_ids.clone())
             .unwrap_or_default();
-        let writes = candidate_node_ids.len() + applied_edge_ids.len();
+        let property_candidate_node_ids = property_quarantine
+            .as_ref()
+            .map(|result| result.candidate_node_ids.clone())
+            .unwrap_or_default();
+        let applied_property_node_ids = property_quarantine
+            .as_ref()
+            .map(|result| result.applied_target_node_ids.clone())
+            .unwrap_or_default();
+        let writes = candidate_node_ids.len()
+            + property_candidate_node_ids.len()
+            + applied_edge_ids.len()
+            + applied_property_node_ids.len();
 
         Ok(StandingPassResult {
             tenant_id: self.config.tenant_id.clone(),
@@ -379,7 +452,9 @@ impl StandingPassEngine {
             generator_ids,
             candidates,
             candidate_node_ids,
+            property_candidate_node_ids,
             applied_edge_ids,
+            applied_property_node_ids,
             writes,
         })
     }
@@ -490,6 +565,33 @@ impl StandingGenerator for HotTemporalStandingGenerator {
             input.query.densification_request(self.id()),
         )?;
         Ok(edge_result_to_advisories(self.id(), result))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Spec1PropertyStandingGenerator {
+    id: String,
+}
+
+impl Default for Spec1PropertyStandingGenerator {
+    fn default() -> Self {
+        Self {
+            id: SPEC1_PROPERTY_STANDING_GENERATOR_ID.to_string(),
+        }
+    }
+}
+
+impl StandingGenerator for Spec1PropertyStandingGenerator {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn generate(&self, input: &GeneratorInput) -> ThgResult<Vec<AdvisoryCandidate>> {
+        let result = rank_property_candidates(
+            &snapshot_from_input(input),
+            input.query.densification_request(self.id()),
+        )?;
+        Ok(property_result_to_advisories(self.id(), result))
     }
 }
 
@@ -729,6 +831,7 @@ pub fn default_standing_generators(config: &StandingPassConfig) -> Vec<Arc<dyn S
         )),
         Arc::new(SpatialStandingGenerator::default()),
         Arc::new(HotTemporalStandingGenerator::default()),
+        Arc::new(Spec1PropertyStandingGenerator::default()),
         Arc::new(DatalogStandingGenerator::default()),
         Arc::new(EgglogEquivalenceStandingGenerator::default()),
         Arc::new(SourceReliabilityStandingGenerator::default()),
@@ -764,6 +867,17 @@ fn edge_result_to_advisories(
         .candidates
         .into_iter()
         .map(|candidate| AdvisoryCandidate::from_edge(generator_id, candidate))
+        .collect()
+}
+
+fn property_result_to_advisories(
+    generator_id: &str,
+    result: PropertyCandidateResult,
+) -> Vec<AdvisoryCandidate> {
+    result
+        .candidates
+        .into_iter()
+        .map(|candidate| AdvisoryCandidate::from_property(generator_id, candidate))
         .collect()
 }
 

@@ -49,3 +49,8 @@ The north star named three levers: geo and time into features and generators, re
 - The spatial index query API in `spatial.rs` and `spatial_s2.rs` and the bi-temporal field names on the record types are confirmed on the working branch before binding. The generators read geography and time the same way the spatial index and the versioned graph already do, not from reinvented fields.
 - Geo lives as designated node properties and time as bi-temporal validity on records, both already written by the substrate. This slice reads them; it does not change how they are written.
 - The model id on the new candidates follows the existing reflexive-composition convention, and the admission tier defaults to the advisory inferred tier already used by densification.
+
+## Implementation Notes
+
+- The reflexive layer implements the SPEC-1 feature and ranker surface in `rustyred-thg-adapters/src/reflexive.rs`: spatial, temporal, geo/time features, property candidates, quarantine, dry-run, and above-ceiling property application.
+- The standing-pass organizer wraps the property surface as `Spec1PropertyStandingGenerator`, alongside the spatial and temporal rule generators, so the default background pass now covers the full SPEC-1 rule generator set.

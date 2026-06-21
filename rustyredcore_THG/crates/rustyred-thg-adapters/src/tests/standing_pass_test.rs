@@ -9,10 +9,12 @@ use rustyred_thg_core::{
 use serde_json::json;
 
 use crate::{
-    admitted_edge_id, standing_pass_hook, AdvisoryCandidate, DatalogStandingGenerator,
-    EgglogEquivalenceStandingGenerator, HotTemporalStandingGenerator, InferredEdgeCandidate,
-    PairformerConfig, PairformerStandingGenerator, SourceReliabilityStandingGenerator,
-    StandingGenerator, StandingPassConfig, StandingPassEngine, STANDING_PASS_ADMITTED_BY,
+    admitted_edge_id, standing_pass_hook, AdvisoryCandidate, AdvisoryPayload, CandidateKind,
+    CandidateRef, DatalogStandingGenerator, EgglogEquivalenceStandingGenerator,
+    HotTemporalStandingGenerator, InferredEdgeCandidate, PairformerConfig,
+    PairformerStandingGenerator, SourceReliabilityStandingGenerator,
+    Spec1PropertyStandingGenerator, StandingGenerator, StandingPassConfig, StandingPassEngine,
+    STANDING_PASS_ADMITTED_BY,
 };
 
 fn standing_config() -> StandingPassConfig {
@@ -112,6 +114,31 @@ fn seed_symbolic_fixture<S: crate::types::AdapterGraphStore>(store: &mut S) {
                 "CONTRADICTS",
                 "object:beta",
                 json!({ "source_id": "source:appeal" }),
+            )
+            .with_confidence(0.9),
+        )
+        .unwrap();
+}
+
+fn seed_property_fixture<S: crate::types::AdapterGraphStore>(store: &mut S) {
+    store
+        .upsert_node(NodeRecord::new("node:target", ["Object"], json!({})))
+        .unwrap();
+    store
+        .upsert_node(NodeRecord::new(
+            "node:support",
+            ["Object"],
+            json!({ "status": "active" }),
+        ))
+        .unwrap();
+    store
+        .upsert_edge(
+            EdgeRecord::new(
+                "edge:target-support",
+                "node:target",
+                "SIMILAR_TO",
+                "node:support",
+                json!({}),
             )
             .with_confidence(0.9),
         )
@@ -261,6 +288,88 @@ fn symbolic_generators_emit_datalog_equivalence_and_reliability_candidates() {
                         && payload["contradicted"] == json!(1)
             )
     }));
+}
+
+#[test]
+fn spec1_property_generator_quarantines_and_applies_scalar_candidates() {
+    let mut quarantine_store = InMemoryGraphStore::new();
+    seed_property_fixture(&mut quarantine_store);
+    let mut quarantine_config = standing_config();
+    quarantine_config.confidence_ceiling = 0.99;
+    let quarantine_engine = StandingPassEngine::new(
+        quarantine_config,
+        vec![Arc::new(Spec1PropertyStandingGenerator::default())],
+    )
+    .unwrap();
+
+    let quarantine_result = quarantine_engine
+        .run(&mut quarantine_store, vec!["node:target".to_string()])
+        .unwrap();
+
+    let (advisory, property_candidate) = quarantine_result
+        .candidates
+        .iter()
+        .find_map(|candidate| match &candidate.payload {
+            AdvisoryPayload::Property(property) => Some((candidate, property)),
+            AdvisoryPayload::Edge(_) | AdvisoryPayload::Json(_) => None,
+        })
+        .expect("SPEC-1 property generator emitted a scalar property proposal");
+    assert_eq!(advisory.kind, CandidateKind::PropertyProposal);
+    assert!(matches!(
+        &advisory.subject,
+        CandidateRef::PropertyProposal {
+            target_node_id,
+            property_key,
+            ..
+        } if target_node_id == "node:target" && property_key == "status"
+    ));
+    assert_eq!(
+        advisory.generator_id,
+        crate::SPEC1_PROPERTY_STANDING_GENERATOR_ID
+    );
+    assert_eq!(property_candidate.target_node_id, "node:target");
+    assert_eq!(property_candidate.property_key, "status");
+    assert_eq!(property_candidate.proposed_value, json!("active"));
+    assert_eq!(property_candidate.confidence, 0.95);
+    assert_eq!(property_candidate.confidence_ceiling, 0.99);
+    assert_eq!(quarantine_result.property_candidate_node_ids.len(), 1);
+    assert!(quarantine_result.applied_property_node_ids.is_empty());
+    let quarantined_node = quarantine_store
+        .get_node(&quarantine_result.property_candidate_node_ids[0])
+        .unwrap();
+    assert!(quarantined_node
+        .labels
+        .contains(&crate::REFLEXIVE_PROPERTY_CANDIDATE_LABEL.to_string()));
+    assert_eq!(quarantined_node.properties["applied"], json!(false));
+    assert!(quarantine_store
+        .get_node("node:target")
+        .unwrap()
+        .properties
+        .get("status")
+        .is_none());
+
+    let mut apply_store = InMemoryGraphStore::new();
+    seed_property_fixture(&mut apply_store);
+    let apply_engine = StandingPassEngine::new(
+        standing_config(),
+        vec![Arc::new(Spec1PropertyStandingGenerator::default())],
+    )
+    .unwrap();
+
+    let apply_result = apply_engine
+        .run(&mut apply_store, vec!["node:target".to_string()])
+        .unwrap();
+
+    assert_eq!(apply_result.property_candidate_node_ids.len(), 1);
+    assert_eq!(
+        apply_result.applied_property_node_ids,
+        vec!["node:target".to_string()]
+    );
+    assert!(apply_result.applied_edge_ids.is_empty());
+    assert_eq!(
+        apply_store.get_node("node:target").unwrap().properties["status"],
+        json!("active")
+    );
 }
 
 #[test]

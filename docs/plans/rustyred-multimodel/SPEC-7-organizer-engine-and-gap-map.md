@@ -48,7 +48,7 @@ pub struct GeneratorInput {
 }
 
 pub struct AdvisoryCandidate {
-    pub kind: CandidateKind,            // ProposedEdge, EquivalenceMerge, DerivedFact, ReliabilityAnnotation, SalienceUpdate
+    pub kind: CandidateKind,            // ProposedEdge, PropertyProposal, EquivalenceMerge, DerivedFact, ReliabilityAnnotation, SalienceUpdate
     pub subject: CandidateRef,
     pub score: f32,
     pub support: Option<SupportPath>,   // the same shape as PairformerSupportPath
@@ -65,7 +65,7 @@ pub trait StandingGenerator {
 
 ### The generator set
 
-- Rule based: the SPEC-1 geo and time generators.
+- Rule based: the SPEC-1 geo, time, and scalar-property generators.
 - Structural learned: the Pairformer, already built, an atemporal triangle reasoner over a bounded snapshot.
 - Temporal learned: HOT, SPEC-8, the higher-order temporal scorer over the history of updates. Complementary to the Pairformer because the Pairformer has no time encoding.
 - Symbolic: datalog derivation, egglog equivalence and duplicate collapse, Beta-Bernoulli source reliability. These live in `rustyred-thg-core/src/symbolic` and the harness symbolic surface; this gap is wiring them as generators, not writing them.
@@ -114,7 +114,8 @@ Section B first, because it resolves the latency problem, generalizes a pattern 
 
 - Implemented Section B in `rustyred-thg-adapters/src/standing_pass.rs`, not `rustyred-thg-core`, because the first concrete generator set depends on adapter-layer Pairformer and reflexive candidate functions while reusing core hooks and graph mutations.
 - Added the shared `StandingGenerator` contract, bounded `GeneratorInput`, `AdvisoryCandidate` output, `StandingPassEngine`, and `standing_pass_hook`.
-- Default registered generators are Pairformer structural, spatial proximity rule, `hot-temporal/heuristic-v0`, Datalog receipt derivation, egglog-style equivalence merge candidates, and Beta-Bernoulli source reliability. The temporal slot is deliberately named heuristic-v0 because the trained SPEC-8 HOT scorer is not present on `main` yet.
-- Admission reuses the existing quarantine candidate path for traceability, then auto-applies proposed edges through normal graph mutations only when the candidate reaches the confidence ceiling.
+- Default registered generators are Pairformer structural, spatial proximity rule, `hot-temporal/heuristic-v0`, SPEC-1 scalar property proposal, Datalog receipt derivation, egglog-style equivalence merge candidates, and Beta-Bernoulli source reliability. The temporal slot is deliberately named heuristic-v0 because the trained SPEC-8 HOT scorer is not present on `main` yet.
+- Admission reuses the existing quarantine candidate path for traceability, then auto-applies proposed edges and scalar property upserts through normal graph mutations only when the candidate reaches the confidence ceiling.
 - Acceptance is covered by `standing_pass_test`: generator union, hook-triggered off-hot-path materialization, and read-time use of precomputed structure without re-entering a generator.
 - Symbolic generator slice: `DatalogStandingGenerator` wraps the existing `rustyred-thg-core::derive_datalog_receipt`; `EgglogEquivalenceStandingGenerator` emits proposal-only equivalence classes using the normalized-title rewrite domain and records the upstream `egraphs-good/egglog` API seam (`EGraph::parse_and_run_program`) without adding a new dependency yet; `SourceReliabilityStandingGenerator` wraps the existing Beta-Bernoulli source reliability receipt. Non-edge symbolic candidates remain advisory-only until a concrete writeback node/edge shape is specced.
+- SPEC-1 remainder slice: `Spec1PropertyStandingGenerator` wraps the existing `rank_property_candidates` path so missing scalar/classification proposals emit typed `PropertyProposal` advisories, quarantine as `ReflexivePropertyCandidate` nodes, and apply only through the existing above-ceiling property upsert path. This completes the SPEC-1 rule-based standing-pass generator surface: spatial, temporal, and scalar property.
