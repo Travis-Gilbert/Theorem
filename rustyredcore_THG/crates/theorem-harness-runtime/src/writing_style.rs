@@ -1,5 +1,8 @@
 use crate::skill_pack::{get_skill_pack, SkillPackGetInput, SkillPackGraphStore};
-use prose_check::{check, pack_hash, Register, StyleReceipt, PACK_ID};
+use design_check::{pack_hash as design_pack_hash, PACK_ID as DESIGN_PACK_ID};
+use prose_check::{
+    check, pack_hash as writing_pack_hash, Register, StyleReceipt, PACK_ID as WRITING_PACK_ID,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{BindingTransitionInput, Payload, RunState, TransitionInput};
@@ -7,6 +10,7 @@ use theorem_harness_core::{BindingTransitionInput, Payload, RunState, Transition
 pub const STYLE_RECEIPTS_FIELD: &str = "style_receipts";
 pub const STYLE_FITNESS_FIELD: &str = "writing_engineering_fitness";
 pub const WRITING_ENGINEERING_STATUS_FIELD: &str = "writing_engineering_status";
+pub const DESIGN_ENGINEERING_STATUS_FIELD: &str = "design_engineering_status";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoundaryStyleReceipt {
@@ -115,50 +119,76 @@ fn stamp_run_created_status<S: SkillPackGraphStore>(store: &mut S, payload: &mut
         ],
     )
     .unwrap_or_else(|| "default".to_string());
-    // Resolve the published prose pack for this tenant. The engineering corpus is
-    // published advisory but nothing seeds it at server boot, so a fresh tenant
-    // first resolves nothing and enforcement silently degrades to shadow. Lazily
-    // publish the corpus (idempotent by content hash) for this tenant and retry
-    // before falling back -- this brings every tenant up on its first RUN.CREATED.
+    stamp_registry_pack_status(
+        store,
+        scope,
+        &tenant,
+        "writing_engineering",
+        WRITING_ENGINEERING_STATUS_FIELD,
+        WRITING_PACK_ID,
+        &writing_pack_hash(),
+    );
+    stamp_registry_pack_status(
+        store,
+        scope,
+        &tenant,
+        "design_engineering",
+        DESIGN_ENGINEERING_STATUS_FIELD,
+        DESIGN_PACK_ID,
+        &design_pack_hash(),
+    );
+}
+
+fn stamp_registry_pack_status<S: SkillPackGraphStore>(
+    store: &mut S,
+    scope: &mut Map<String, Value>,
+    tenant: &str,
+    prefix: &str,
+    status_field: &str,
+    pack_id: &str,
+    pack_content_hash: &str,
+) {
+    // Resolve the published engineering pack for this tenant. The engineering
+    // corpus is published advisory but is not guaranteed to be seeded before the
+    // first run, so a fresh tenant can otherwise resolve nothing and silently
+    // degrade to shadow. Lazily publish the corpus (idempotent by content hash)
+    // and retry before falling back.
     let mut resolved = get_skill_pack(
         store,
         SkillPackGetInput {
-            tenant_slug: tenant.clone(),
-            pack_id: PACK_ID.to_string(),
-            pack_content_hash: pack_hash(),
+            tenant_slug: tenant.to_string(),
+            pack_id: pack_id.to_string(),
+            pack_content_hash: pack_content_hash.to_string(),
         },
     );
     if resolved.is_err() {
-        let _ = crate::engineering_packs::publish_engineering_packs(store, &tenant, "system");
+        let _ =
+            crate::engineering_packs::publish_missing_engineering_packs(store, tenant, "system");
         resolved = get_skill_pack(
             store,
             SkillPackGetInput {
-                tenant_slug: tenant.clone(),
-                pack_id: PACK_ID.to_string(),
-                pack_content_hash: pack_hash(),
+                tenant_slug: tenant.to_string(),
+                pack_id: pack_id.to_string(),
+                pack_content_hash: pack_content_hash.to_string(),
             },
         );
     }
+    let status_source_field = format!("{prefix}_status_source");
+    let pack_id_field = format!("{prefix}_pack_id");
+    let pack_hash_field = format!("{prefix}_pack_hash");
+    let origin_tenant_field = format!("{prefix}_origin_tenant");
+    let status_error_field = format!("{prefix}_status_error");
     match resolved {
         Ok(pack) => {
             scope.insert(
-                WRITING_ENGINEERING_STATUS_FIELD.to_string(),
+                status_field.to_string(),
                 Value::String(normalize_pack_status(&pack.status)),
             );
+            scope.insert(status_source_field, Value::String("registry".to_string()));
+            scope.insert(pack_id_field, Value::String(pack.pack_id));
+            scope.insert(pack_hash_field, Value::String(pack.pack_content_hash));
             scope.insert(
-                "writing_engineering_status_source".to_string(),
-                Value::String("registry".to_string()),
-            );
-            scope.insert(
-                "writing_engineering_pack_id".to_string(),
-                Value::String(pack.pack_id),
-            );
-            scope.insert(
-                "writing_engineering_pack_hash".to_string(),
-                Value::String(pack.pack_content_hash),
-            );
-            scope.insert(
-                "writing_engineering_origin_tenant".to_string(),
+                origin_tenant_field,
                 Value::String(if pack.origin_tenant_slug.trim().is_empty() {
                     pack.tenant_slug
                 } else {
@@ -168,25 +198,16 @@ fn stamp_run_created_status<S: SkillPackGraphStore>(store: &mut S, payload: &mut
         }
         Err(error) => {
             scope.insert(
-                WRITING_ENGINEERING_STATUS_FIELD.to_string(),
+                status_field.to_string(),
                 Value::String("shadow".to_string()),
             );
+            scope.insert(status_source_field, Value::String("fallback".to_string()));
+            scope.insert(pack_id_field, Value::String(pack_id.to_string()));
             scope.insert(
-                "writing_engineering_status_source".to_string(),
-                Value::String("fallback".to_string()),
+                pack_hash_field,
+                Value::String(pack_content_hash.to_string()),
             );
-            scope.insert(
-                "writing_engineering_pack_id".to_string(),
-                Value::String(PACK_ID.to_string()),
-            );
-            scope.insert(
-                "writing_engineering_pack_hash".to_string(),
-                Value::String(pack_hash()),
-            );
-            scope.insert(
-                "writing_engineering_status_error".to_string(),
-                Value::String(error.to_string()),
-            );
+            scope.insert(status_error_field, Value::String(error.to_string()));
         }
     }
 }
@@ -202,6 +223,12 @@ fn carry_status_from_run_scope(state: Option<&RunState>, payload: &mut Payload) 
         "writing_engineering_pack_hash",
         "writing_engineering_origin_tenant",
         "writing_engineering_status_error",
+        DESIGN_ENGINEERING_STATUS_FIELD,
+        "design_engineering_status_source",
+        "design_engineering_pack_id",
+        "design_engineering_pack_hash",
+        "design_engineering_origin_tenant",
+        "design_engineering_status_error",
     ] {
         if payload.contains_key(key) {
             continue;
@@ -222,7 +249,7 @@ pub fn check_boundary_text(
     let hard_axis_failed = !receipt.fidelity.preserved || receipt.em_dash_count > 0;
     BoundaryStyleReceipt {
         boundary: boundary.to_string(),
-        pack_id: PACK_ID.to_string(),
+        pack_id: WRITING_PACK_ID.to_string(),
         pack_status: normalize_pack_status(pack_status),
         action: style_action(pack_status, hard_axis_failed).to_string(),
         hard_axis_failed,
@@ -352,8 +379,8 @@ fn style_action(status: &str, hard_axis_failed: bool) -> &'static str {
 
 pub fn summarize_style_receipts_for_fitness(receipts: &[Value]) -> WritingStyleFitnessSummary {
     let mut summary = WritingStyleFitnessSummary {
-        pack_id: PACK_ID.to_string(),
-        pack_hash: pack_hash(),
+        pack_id: WRITING_PACK_ID.to_string(),
+        pack_hash: writing_pack_hash(),
         style_receipt_count: receipts.len() as u64,
         ..WritingStyleFitnessSummary::default()
     };
@@ -439,8 +466,8 @@ mod tests {
     #[test]
     fn run_created_lazily_brings_up_corpus_and_resolves_advisory() {
         // A fresh tenant store has no published packs. RUN.CREATED must lazily
-        // publish the engineering corpus and resolve the prose pack to advisory
-        // from the registry, instead of falling back to shadow.
+        // publish the engineering corpus and resolve checker-backed packs to
+        // advisory from the registry, instead of falling back to shadow.
         let mut store = InMemoryGraphStore::new();
         let transition = TransitionInput::new(
             "RUN.CREATED",
@@ -456,7 +483,16 @@ mod tests {
             json!("advisory"),
             "fresh tenant should resolve advisory after lazy bring-up"
         );
-        assert_eq!(scope["writing_engineering_status_source"], json!("registry"));
+        assert_eq!(
+            scope["writing_engineering_status_source"],
+            json!("registry")
+        );
+        assert_eq!(
+            scope["design_engineering_status"],
+            json!("advisory"),
+            "design hook must have a registry status to read from run scope"
+        );
+        assert_eq!(scope["design_engineering_status_source"], json!("registry"));
     }
 
     #[test]
