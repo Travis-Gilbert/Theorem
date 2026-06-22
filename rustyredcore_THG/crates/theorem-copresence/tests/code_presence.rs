@@ -134,3 +134,54 @@ fn code_file_footprint_structure_converges_content_does_not() {
         "the source peer never opened a text region for code either"
     );
 }
+
+// W5 acceptance #3: presence ordering is deterministic. Sequential announces
+// (the working log serializes appends under its mutex) get strictly increasing
+// cursors and are observed in that order, so the newest position wins.
+#[test]
+fn code_presence_ordering_is_deterministic_latest_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = Arc::new(Mutex::new(WorkingLog::new()));
+    let scope = "repo:demo";
+    let actor_a = ActorId::from_label("codex");
+    let actor_b = ActorId::from_label("claude-code");
+    let mut a = peer(actor_a, scope, log.clone(), tmp.path().join("oa"), 5);
+    let mut b = peer(actor_b, scope, log.clone(), tmp.path().join("ob"), 6);
+
+    let mut adapter = CodeSurfaceAdapter::new("src/main.rs");
+    // Peer A moves its cursor down the file: line 10, then line 20.
+    for line in [10u32, 20u32] {
+        let presence =
+            Presence::at_code(actor_a, scope, "Codex", "src/main.rs", line, 0, PresenceKind::Agent);
+        adapter
+            .to_peer(&mut a, SurfaceIntent::Presence { presence })
+            .expect("announce");
+    }
+
+    let events: Vec<(u64, CursorPos)> = b
+        .observe(0)
+        .expect("observe")
+        .into_iter()
+        .filter_map(|event| match event {
+            PeerEvent::Presence { cursor, presence } => presence.cursor.map(|c| (cursor, c)),
+            PeerEvent::WorkingLog { .. } => None,
+        })
+        .collect();
+
+    assert!(events.len() >= 2, "both announces observed: {events:?}");
+    for window in events.windows(2) {
+        assert!(
+            window[0].0 < window[1].0,
+            "cursors strictly increase (deterministic order): {events:?}"
+        );
+    }
+    assert_eq!(
+        events.last().unwrap().1,
+        CursorPos::FilePosition {
+            path: "src/main.rs".to_string(),
+            line: 20,
+            col: 0,
+        },
+        "the latest announced position wins"
+    );
+}
