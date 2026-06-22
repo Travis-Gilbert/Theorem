@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
     },
     thread::JoinHandle,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection};
@@ -17,8 +17,13 @@ use tauri::{path::BaseDirectory, Manager, WebviewUrl};
 use tokio::sync::oneshot;
 
 const HOSTED_ENDPOINT: &str = "https://rustyredcore-theorem-production.up.railway.app/mcp";
+const DEFAULT_TENANT: &str = "Travis-Gilbert";
 const LOCAL_NODE_PORT: u16 = 17888;
 const COMMONPLACE_NODE_PORT: u16 = 17890;
+const COMMONPLACE_API_KEY: &str = "dev-key";
+const HOSTED_MEMORY_IMPORT_LIMIT: usize = 250;
+const DEFAULT_LOCAL_MODEL_ENDPOINT: &str = "http://127.0.0.1:8080";
+const DEFAULT_LOCAL_MODEL_NAME: &str = "gemma-4-12b-it-q4";
 const KEYCHAIN_SERVICE: &str = "com.theorem.desktop";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,6 +82,27 @@ struct CommonplaceStatus {
     endpoint: String,
     port: u16,
     store_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostedConnectionStatus {
+    endpoint: String,
+    tenant: String,
+    bearer_present: bool,
+    reachable: bool,
+    document_count: Option<u64>,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStatus {
+    enabled: bool,
+    endpoint: String,
+    model: String,
+    reachable: bool,
+    message: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,6 +185,66 @@ struct SyncReceipt {
     merged_nodes: Option<u64>,
     merged_edges: Option<u64>,
     conflicts: Option<u64>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostedMemoryDocsResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    max_updated_at: String,
+    #[serde(default)]
+    docs: Vec<HostedMemoryDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostedMemoryDoc {
+    #[serde(default)]
+    doc_id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    links: Vec<String>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommonplaceImportResponse {
+    data: Option<CommonplaceImportData>,
+    errors: Option<Vec<CommonplaceGraphqlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommonplaceImportData {
+    import_items: CommonplaceImportResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommonplaceImportResult {
+    imported: u64,
+    collections: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommonplaceGraphqlError {
     message: String,
 }
 
@@ -349,7 +435,7 @@ impl Default for DesktopBackendState {
                 endpoint: HOSTED_ENDPOINT.to_string(),
                 local_endpoint: format!("http://127.0.0.1:{LOCAL_NODE_PORT}/mcp"),
                 active_target: "local".to_string(),
-                tenant: "default".to_string(),
+                tenant: DEFAULT_TENANT.to_string(),
                 bearer_present: secret_get("harness_bearer").is_ok(),
             },
             receiver: ReceiverSettings {
@@ -382,9 +468,22 @@ fn harness_settings_get(
 
 #[tauri::command]
 fn harness_settings_set(
-    settings: HarnessSettings,
+    mut settings: HarnessSettings,
     state: tauri::State<'_, Mutex<DesktopBackendState>>,
 ) -> Result<(), String> {
+    if settings.tenant.trim().is_empty() {
+        settings.tenant = DEFAULT_TENANT.to_string();
+    }
+    if settings.endpoint.trim().is_empty() {
+        settings.endpoint = HOSTED_ENDPOINT.to_string();
+    }
+    if settings.local_endpoint.trim().is_empty() {
+        settings.local_endpoint = format!("http://127.0.0.1:{LOCAL_NODE_PORT}/mcp");
+    }
+    if settings.active_target != "hosted" {
+        settings.active_target = "local".to_string();
+    }
+    settings.bearer_present = secret_get("harness_bearer").is_ok();
     state.lock().map_err(|error| error.to_string())?.harness = settings;
     Ok(())
 }
@@ -833,10 +932,11 @@ fn sync_run(state: tauri::State<'_, Mutex<DesktopBackendState>>) -> Result<SyncR
         "rustyred_thg_graph_version_compile",
         json!({ "ref": "desktop-local" }),
     );
-    let hosted = bearer_token().ok().and_then(|token| {
+    let token = bearer_token().ok();
+    let hosted = token.as_ref().and_then(|token| {
         call_tool_url(
             &settings.endpoint,
-            Some(&token),
+            Some(token.as_str()),
             &settings.tenant,
             "rustyred_thg_graph_version_compile",
             json!({ "ref": "desktop-hosted" }),
@@ -844,16 +944,38 @@ fn sync_run(state: tauri::State<'_, Mutex<DesktopBackendState>>) -> Result<SyncR
         .ok()
     });
 
-    let (status, message): (String, String) = match (&local, &hosted) {
-        (Ok(_), Some(_)) => (
+    let import = token
+        .as_ref()
+        .map(|token| sync_hosted_memory_docs_to_commonplace(&settings, token));
+
+    let (status, message, merged_nodes): (String, String, u64) = match (&local, &hosted, &import) {
+        (Ok(_), Some(_), Some(Ok(imported))) => (
             "ok".to_string(),
-            "Sync round exchanged version packs.".to_string(),
+            format!(
+                "Imported {imported} hosted memory document(s) from tenant {} into local CommonPlace. Graph edges remain on the hosted substrate.",
+                settings.tenant
+            ),
+            *imported,
         ),
-        (Ok(_), None) => (
+        (Ok(_), None, Some(Ok(imported))) => (
+            "ok".to_string(),
+            format!(
+                "Imported {imported} hosted memory document(s) from tenant {} into local CommonPlace. Hosted version-pack probe was unavailable.",
+                settings.tenant
+            ),
+            *imported,
+        ),
+        (Ok(_), _, None) => (
             "error".to_string(),
-            "Local pack compiled; hosted pack unavailable without bearer or network.".to_string(),
+            "Local pack compiled; hosted import needs a bearer token.".to_string(),
+            0,
         ),
-        (Err(error), _) => ("error".to_string(), error.clone()),
+        (Ok(_), _, Some(Err(error))) => (
+            "error".to_string(),
+            format!("Local pack compiled; hosted import failed: {error}"),
+            0,
+        ),
+        (Err(error), _, _) => ("error".to_string(), error.clone(), 0),
     };
 
     Ok(SyncReceipt {
@@ -875,7 +997,7 @@ fn sync_run(state: tauri::State<'_, Mutex<DesktopBackendState>>) -> Result<SyncR
                 .and_then(Value::as_str)
                 .map(str::to_string)
         }),
-        merged_nodes: Some(0),
+        merged_nodes: Some(merged_nodes),
         merged_edges: Some(0),
         conflicts: Some(0),
         message,
@@ -1110,7 +1232,7 @@ fn start_local_node(
     config.require_auth = false;
     config.mcp_read_only = false;
     config.mcp_allow_admin = true;
-    config.mcp_default_tenant = "default".to_string();
+    config.mcp_default_tenant = DEFAULT_TENANT.to_string();
     config.allowed_origins = vec![
         "http://localhost:1420".to_string(),
         "http://127.0.0.1:1420".to_string(),
@@ -1152,9 +1274,14 @@ fn start_commonplace_api(
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
-        if let Err(error) =
-            commonplace_api::serve_loopback(addr, spawn_store_path, "dev-key", "default", shutdown)
-                .await
+        if let Err(error) = commonplace_api::serve_loopback(
+            addr,
+            spawn_store_path,
+            COMMONPLACE_API_KEY,
+            DEFAULT_TENANT,
+            shutdown,
+        )
+        .await
         {
             eprintln!("[theorem-desktop] commonplace-api stopped: {error}");
         }
@@ -1195,6 +1322,50 @@ fn commonplace_status(
     })
 }
 
+#[tauri::command]
+fn hosted_connection_status(
+    state: tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<HostedConnectionStatus, String> {
+    let settings = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .harness
+        .clone();
+    let token = bearer_token().ok();
+    let bearer_present = token.is_some();
+    let mut status = HostedConnectionStatus {
+        endpoint: settings.endpoint.clone(),
+        tenant: settings.tenant.clone(),
+        bearer_present,
+        reachable: false,
+        document_count: None,
+        message: "Bearer token is not set; hosted tenant is not connected.".to_string(),
+    };
+
+    if let Some(token) = token {
+        match fetch_hosted_memory_docs(&settings, &token, None) {
+            Ok(response) => {
+                status.reachable = true;
+                status.document_count = Some(response.count);
+                status.message = format!(
+                    "Connected to hosted tenant {} with {} memory document(s) visible.",
+                    settings.tenant, response.count
+                );
+            }
+            Err(error) => {
+                status.message = format!("Hosted tenant probe failed: {error}");
+            }
+        }
+    }
+
+    Ok(status)
+}
+
+#[tauri::command]
+fn model_status() -> ModelStatus {
+    local_model_status()
+}
+
 fn stop_local_node(state: &tauri::State<'_, Mutex<DesktopBackendState>>) {
     if let Ok(mut backend) = state.lock() {
         if let Some(mut node) = backend.local_node.take() {
@@ -1229,7 +1400,7 @@ fn start_receiver_locked(backend: &mut DesktopBackendState) -> Result<(), String
         .collect::<BTreeMap<_, _>>();
     let config = theorem_receiver::ReceiverConfig {
         harness_url: backend.harness.endpoint.clone(),
-        tenant_slug: "default".to_string(),
+        tenant_slug: backend.harness.tenant.clone(),
         receiver_id: Some("theorem-desktop-receiver".to_string()),
         claim_interval_secs: backend.receiver.claim_interval_secs,
         capacity: 1,
@@ -1377,6 +1548,302 @@ fn secret_delete(account: &str) -> Result<(), String> {
 fn bearer_token() -> Result<String, String> {
     secret_get("harness_bearer")
         .or_else(|_| std::env::var("THEOREM_HARNESS_TOKEN").map_err(|error| error.to_string()))
+}
+
+fn sync_hosted_memory_docs_to_commonplace(
+    settings: &HarnessSettings,
+    token: &str,
+) -> Result<u64, String> {
+    let response = fetch_hosted_memory_docs(settings, token, Some(HOSTED_MEMORY_IMPORT_LIMIT))?;
+    if !response.ok {
+        return Err("hosted memory-doc endpoint returned ok=false".to_string());
+    }
+    if response.docs.is_empty() {
+        return Ok(0);
+    }
+    let export = hosted_docs_commonplace_export(settings, &response.docs, &response.max_updated_at);
+    import_commonplace_export(&export)
+}
+
+fn fetch_hosted_memory_docs(
+    settings: &HarnessSettings,
+    token: &str,
+    limit: Option<usize>,
+) -> Result<HostedMemoryDocsResponse, String> {
+    let mut url = format!(
+        "{}/v1/tenants/{}/memory/docs",
+        harness_base_url(&settings.endpoint),
+        encode_path_segment(&settings.tenant)
+    );
+    if let Some(limit) = limit {
+        url.push_str(&format!("?limit={limit}"));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| error.to_string())?;
+    client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?
+        .json::<HostedMemoryDocsResponse>()
+        .map_err(|error| error.to_string())
+}
+
+fn hosted_docs_commonplace_export(
+    settings: &HarnessSettings,
+    docs: &[HostedMemoryDoc],
+    max_updated_at: &str,
+) -> Value {
+    let collection_id = "coll:hosted-rustyred-memory";
+    let items = docs
+        .iter()
+        .enumerate()
+        .map(|(index, doc)| hosted_doc_commonplace_item(settings, collection_id, doc, index))
+        .collect::<Vec<_>>();
+    json!({
+        "version": 1,
+        "items": items,
+        "collections": [{
+            "id": collection_id,
+            "name": "Hosted RustyRed",
+            "kind": "manual",
+            "created_at_ms": parse_unix_ms(max_updated_at),
+        }],
+        "blobs": {},
+    })
+}
+
+fn hosted_doc_commonplace_item(
+    settings: &HarnessSettings,
+    collection_id: &str,
+    doc: &HostedMemoryDoc,
+    index: usize,
+) -> Value {
+    let doc_id = if doc.doc_id.trim().is_empty() {
+        format!("untitled-{index}")
+    } else {
+        doc.doc_id.clone()
+    };
+    let mut tags = doc.tags.clone();
+    tags.push("hosted".to_string());
+    tags.push("rustyred".to_string());
+    tags.push("memory".to_string());
+    if !doc.kind.trim().is_empty() {
+        tags.push(format!("kind:{}", doc.kind));
+    }
+    tags.sort();
+    tags.dedup();
+
+    let text = if doc.content.trim().is_empty() {
+        doc.summary.clone()
+    } else {
+        doc.content.clone()
+    };
+    let title = if doc.title.trim().is_empty() {
+        doc_id.clone()
+    } else {
+        doc.title.clone()
+    };
+
+    json!({
+        "id": format!("item:hosted-memory:{}", safe_id_fragment(&doc_id)),
+        "kind": "note",
+        "title": title,
+        "body": {
+            "body_kind": "inline",
+            "text": text,
+        },
+        "source": format!("theorem-harness://{}/{}", settings.tenant, doc_id),
+        "residency": "synced",
+        "tags": tags,
+        "collections": [collection_id],
+        "classification": "HostedMemory",
+        "created_at_ms": parse_unix_ms(&doc.created_at),
+        "updated_at_ms": parse_unix_ms(&doc.updated_at),
+        "extra": {
+            "hosted_doc_id": doc_id,
+            "hosted_kind": doc.kind,
+            "hosted_status": doc.status,
+            "hosted_links": doc.links,
+            "tenant": settings.tenant,
+        },
+    })
+}
+
+fn import_commonplace_export(export: &Value) -> Result<u64, String> {
+    let body = json!({
+        "query": "mutation($data:String!){ importItems(data:$data){ imported collections } }",
+        "variables": { "data": export.to_string() },
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(format!("http://127.0.0.1:{COMMONPLACE_NODE_PORT}/graphql"))
+        .header("content-type", "application/json")
+        .header("x-api-key", COMMONPLACE_API_KEY)
+        .json(&body)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?
+        .json::<CommonplaceImportResponse>()
+        .map_err(|error| error.to_string())?;
+    if let Some(errors) = response.errors {
+        let message = errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(message);
+    }
+    let result = response
+        .data
+        .map(|data| data.import_items)
+        .ok_or_else(|| "commonplace import returned no data".to_string())?;
+    let _collections = result.collections;
+    Ok(result.imported)
+}
+
+fn local_model_status() -> ModelStatus {
+    let endpoint = first_env(&["COMMONPLACE_ASK_MODEL_URL", "THEOREM_LOCAL_OPENAI_URL"])
+        .unwrap_or_else(|| DEFAULT_LOCAL_MODEL_ENDPOINT.to_string());
+    let model = first_env(&[
+        "COMMONPLACE_ASK_MODEL",
+        "COMMONPLACE_GEMMA_MODEL",
+        "THEOREM_LOCAL_OPENAI_MODEL",
+    ])
+    .unwrap_or_else(|| DEFAULT_LOCAL_MODEL_NAME.to_string());
+    let enabled = env_flag("COMMONPLACE_ASK_MODEL_ENABLED", true);
+    if !enabled {
+        return ModelStatus {
+            enabled,
+            endpoint,
+            model,
+            reachable: false,
+            message: "Local ask model is disabled by COMMONPLACE_ASK_MODEL_ENABLED=0.".to_string(),
+        };
+    }
+
+    let probe_url = model_probe_url(&endpoint);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return ModelStatus {
+                enabled,
+                endpoint,
+                model,
+                reachable: false,
+                message: error.to_string(),
+            }
+        }
+    };
+    match client.get(probe_url).send() {
+        Ok(response) if response.status().is_success() => ModelStatus {
+            enabled,
+            endpoint,
+            model,
+            reachable: true,
+            message: "Local OpenAI-compatible model endpoint is reachable.".to_string(),
+        },
+        Ok(response) => ModelStatus {
+            enabled,
+            endpoint,
+            model,
+            reachable: false,
+            message: format!("Model endpoint responded with HTTP {}.", response.status()),
+        },
+        Err(error) => ModelStatus {
+            enabled,
+            endpoint,
+            model,
+            reachable: false,
+            message: format!("Model endpoint is offline: {error}"),
+        },
+    }
+}
+
+fn first_env(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+fn env_flag(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(default)
+}
+
+fn model_probe_url(endpoint: &str) -> String {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    if let Some(base) = endpoint.strip_suffix("/v1/chat/completions") {
+        format!("{base}/v1/models")
+    } else if endpoint.ends_with("/v1") {
+        format!("{endpoint}/models")
+    } else {
+        format!("{endpoint}/v1/models")
+    }
+}
+
+fn harness_base_url(endpoint: &str) -> String {
+    endpoint
+        .trim()
+        .trim_end_matches('/')
+        .strip_suffix("/mcp")
+        .unwrap_or_else(|| endpoint.trim().trim_end_matches('/'))
+        .to_string()
+}
+
+fn parse_unix_ms(value: &str) -> i64 {
+    value
+        .strip_prefix("unix_ms:")
+        .unwrap_or(value)
+        .parse::<i64>()
+        .unwrap_or(0)
+}
+
+fn safe_id_fragment(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if safe.is_empty() {
+        format!("doc-{}", now_millis())
+    } else {
+        safe
+    }
+}
+
+fn encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn call_selected_tool(
@@ -1757,6 +2224,8 @@ pub fn run() {
             harness_bearer_clear,
             local_node_status,
             commonplace_status,
+            hosted_connection_status,
+            model_status,
             receiver_settings_get,
             receiver_settings_set,
             receiver_status,
