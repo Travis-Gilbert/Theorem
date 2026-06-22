@@ -21,8 +21,8 @@ use commonplace::{BlobStore, EmbeddingGraphStore};
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    build_schema, in_memory_store, redcore_store, ApiKeyRegistry, ApiKeyToken, Mutation, Query,
-    SharedStore,
+    answer_model_from_env, build_schema, build_schema_with_model, in_memory_store, redcore_store,
+    AnswerModel, ApiKeyRegistry, ApiKeyToken, Mutation, Query, SharedStore,
 };
 
 struct AppState<S, B>
@@ -53,6 +53,30 @@ where
     B: BlobStore + Send + Sync + 'static,
 {
     let schema = build_schema(store, Arc::clone(&registry));
+    build_router_from_schema(schema, registry)
+}
+
+pub fn build_router_with_model<S, B>(
+    store: SharedStore<S, B>,
+    registry: Arc<ApiKeyRegistry>,
+    model: Arc<dyn AnswerModel>,
+) -> Router
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
+    let schema = build_schema_with_model(store, Arc::clone(&registry), model);
+    build_router_from_schema(schema, registry)
+}
+
+fn build_router_from_schema<S, B>(
+    schema: Schema<Query<S, B>, Mutation<S, B>, EmptySubscription>,
+    registry: Arc<ApiKeyRegistry>,
+) -> Router
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
     let state = AppState { schema, registry };
     Router::new()
         .route("/healthz", get(healthz))
@@ -97,15 +121,16 @@ pub async fn run_from_env() -> Result<(), String> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(50090);
+    let model = answer_model_from_env();
 
     let app = match std::env::var("COMMONPLACE_DATA_DIR") {
         Ok(dir) if !dir.trim().is_empty() => {
             let store = redcore_store(&dir).map_err(|error| {
                 format!("commonplace-api open durable store at {dir}: {error:?}")
             })?;
-            build_router(store, registry)
+            build_router_with_model(store, registry, Arc::clone(&model))
         }
-        _ => build_router(in_memory_store(), registry),
+        _ => build_router_with_model(in_memory_store(), registry, model),
     };
 
     let listener = tokio::net::TcpListener::bind(("::", port))
@@ -132,7 +157,7 @@ pub async fn serve_loopback(
         )
     })?;
     let registry = Arc::new(ApiKeyRegistry::new().with_key(api_key.into(), instance.into()));
-    let app = build_router(store, registry);
+    let app = build_router_with_model(store, registry, answer_model_from_env());
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|error| format!("commonplace-api bind {addr}: {error}"))?;

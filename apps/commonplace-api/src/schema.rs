@@ -28,7 +28,8 @@ use crate::briefing::{briefing as run_briefing, Briefing, BriefingConfig, Connec
 use crate::discover::{discover as run_discover, CandidateLink, DiscoverConfig};
 use crate::portability::{self, ExportDocument};
 use crate::retrieve::{
-    ask as run_ask, AnswerKind, AnswerModel, AskConfig, AskResult, NoModel, RetrievedItem,
+    answer_from_provenance, retrieve_grounding, AnswerKind, AnswerModel, AskConfig, AskResult,
+    NoModel, RetrievedItem,
 };
 
 /// The default in-memory store backing (tests + the no-data-dir binary path).
@@ -433,14 +434,17 @@ where
         principal(ctx)?;
         let model = ctx.data::<Arc<dyn AnswerModel>>()?.clone();
         let store = shared::<S, B>(ctx)?;
-        let cp = store
-            .lock()
-            .map_err(|_| Error::new("store lock poisoned"))?;
         let config = AskConfig {
             k: k.unwrap_or(5).max(1) as usize,
             ..AskConfig::default()
         };
-        let result = run_ask(&*cp, model.as_ref(), &question, &config).map_err(store_err)?;
+        let provenance = {
+            let cp = store
+                .lock()
+                .map_err(|_| Error::new("store lock poisoned"))?;
+            retrieve_grounding(&*cp, &question, &config).map_err(store_err)?
+        };
+        let result = answer_from_provenance(model.as_ref(), &question, provenance);
         Ok(AskResultGql::from(result))
     }
 
@@ -650,8 +654,9 @@ where
     build_schema_with_model(store, registry, Arc::new(NoModel))
 }
 
-/// Build the schema with a specific answer model (e.g. a GL-Fusion client) for
-/// generative answers behind the same retrieval.
+/// Build the schema with a specific answer model (for example local Gemma via
+/// an OpenAI-compatible endpoint) for generative answers behind the same
+/// retrieval.
 pub fn build_schema_with_model<S, B>(
     store: SharedStore<S, B>,
     registry: Arc<ApiKeyRegistry>,

@@ -1677,6 +1677,7 @@ dependencies = [
  "async-graphql-axum",
  "axum 0.8.9",
  "commonplace",
+ "reqwest 0.12.28",
  "rustyred-thg-core",
  "serde",
  "serde_json",
