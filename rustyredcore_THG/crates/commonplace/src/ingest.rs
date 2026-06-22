@@ -273,6 +273,36 @@ pub struct ResolvedEntity {
     pub score: f32,
 }
 
+/// One ranked candidate collection for an item, by cosine to the collection's
+/// label embedding (the same signal `best_collection` gates on).
+#[derive(Clone, Debug)]
+pub struct ClassificationRank {
+    pub collection_id: String,
+    pub collection_name: String,
+    pub score: f32, // cosine 0..1
+}
+
+/// Engine-sourced classification of an item: every collection ranked by cosine
+/// to its label embedding, best first. The caller applies its own threshold.
+#[derive(Clone, Debug, Default)]
+pub struct Classification {
+    /// Ranked candidate collections, best first. Empty if the item has no
+    /// embedding or there are no collections with label embeddings.
+    pub ranked: Vec<ClassificationRank>,
+}
+
+impl Classification {
+    /// The best candidate, if any.
+    pub fn best(&self) -> Option<&ClassificationRank> {
+        self.ranked.first()
+    }
+
+    /// The best candidate's score, or 0.0 when there is no candidate.
+    pub fn confidence(&self) -> f32 {
+        self.ranked.first().map(|rank| rank.score).unwrap_or(0.0)
+    }
+}
+
 /// The observable F2 receipt.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct IngestReceipt {
@@ -491,6 +521,63 @@ where
             }
         }
         Ok(best.map(|(collection, _)| collection))
+    }
+
+    /// Classify an already-stored item against the live collections: read the
+    /// item's stored embedding and rank every collection's label embedding by
+    /// cosine, best first. Unlike [`best_collection`](Self::best_collection),
+    /// this is NOT gated by `collection_threshold` (the caller applies its own
+    /// ceiling); returns an empty [`Classification`] when the item carries no
+    /// embedding or no collection has a label embedding.
+    pub fn classify_item<S, B>(
+        &self,
+        commonplace: &Commonplace<S, B>,
+        item: &Item,
+    ) -> GraphStoreResult<Classification>
+    where
+        S: EmbeddingGraphStore,
+        B: BlobStore,
+    {
+        let Some(embedding) = item
+            .extra
+            .get(ITEM_EMBEDDING_PROPERTY)
+            .and_then(value_to_f32_vec)
+        else {
+            return Ok(Classification::default());
+        };
+
+        let mut ranked: Vec<ClassificationRank> = Vec::new();
+        for node in commonplace
+            .store()
+            .query_nodes(NodeQuery::label(COLLECTION_LABEL).with_limit(usize::MAX))
+        {
+            let Some(candidate) = float_array(&node.properties, COLLECTION_EMBEDDING_PROPERTY)
+            else {
+                continue;
+            };
+            if candidate.len() != embedding.len() {
+                continue;
+            }
+            let score = cosine(&embedding, &candidate);
+            let collection_name = commonplace
+                .get_collection(&node.id)?
+                .map(|collection| collection.name)
+                .unwrap_or_default();
+            ranked.push(ClassificationRank {
+                collection_id: node.id.clone(),
+                collection_name,
+                score,
+            });
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.collection_id.cmp(&right.collection_id))
+        });
+
+        Ok(Classification { ranked })
     }
 
     fn write_similarity_edges<S, B>(

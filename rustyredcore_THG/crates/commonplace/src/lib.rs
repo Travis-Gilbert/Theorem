@@ -32,9 +32,9 @@ pub mod tag;
 pub use blob::{content_hash, BlobStore, InMemoryBlobStore};
 pub use collection::{Collection, CollectionKind};
 pub use ingest::{
-    DeterministicEmbedder, Embedder, EmbeddingGraphStore, IngestBody, IngestInput, IngestPipeline,
-    IngestReceipt, ResolvedEntity, SimilarityLink, ENTITY_LABEL, ITEM_EMBEDDING_PROPERTY,
-    MENTIONS_ENTITY_EDGE,
+    Classification, ClassificationRank, DeterministicEmbedder, Embedder, EmbeddingGraphStore,
+    IngestBody, IngestInput, IngestPipeline, IngestReceipt, ResolvedEntity, SimilarityLink,
+    COLLECTION_EMBEDDING_PROPERTY, ENTITY_LABEL, ITEM_EMBEDDING_PROPERTY, MENTIONS_ENTITY_EDGE,
 };
 pub use item::{Item, ItemBody, ItemKind, Residency};
 pub use store::{

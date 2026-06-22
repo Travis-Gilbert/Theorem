@@ -15,6 +15,7 @@ pub mod auth;
 pub mod briefing;
 pub mod discover;
 pub mod mcp;
+pub mod organize;
 pub mod portability;
 pub mod retrieve;
 pub mod schema;
@@ -23,6 +24,10 @@ pub mod serve;
 pub use auth::{ApiKeyRegistry, ApiKeyToken, Principal};
 pub use briefing::{briefing, Briefing, BriefingConfig, ConnectedItem};
 pub use discover::{discover, CandidateLink, DiscoverConfig};
+pub use organize::{
+    organize, DailyProgress, OrganizeConfig, OrganizeFiled, OrganizeGroup, OrganizeItem,
+    OrganizeSnapshot, OrganizedToday, Subtask, Timeframe,
+};
 pub use portability::{
     export, export_json, export_markdown, import, ExportDocument, ImportSummary, EXPORT_VERSION,
 };
