@@ -7539,6 +7539,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-intake"
+version = "0.1.0"
+dependencies = [
+ "commonplace",
+ "rustyred-thg-affordances",
+ "rustyred-thg-connectors",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "ureq 3.3.0",
+]
+
+[[package]]
 name = "rustyred-thg-mcp"
 version = "0.5.0"
 dependencies = [
