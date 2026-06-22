@@ -72,6 +72,22 @@ enforces the epistemic floor and `agent_binding.rs::ActionTierPolicy` has 3 tier
 - **Acceptance:** ordered ladder (global law from `alignment.rs` invariants + `ActionTierPolicy` + charter -> project law `.theorem/constitution.json` -> request -> live evidence); enforced for **every head every turn**; epistemic floor unconditional; **drift test** the order can't be reordered; each turn carries a `policy_decision`.
 - **Reuse:** `alignment.rs::evaluate_publication`, `agent_binding.rs::ActionTierPolicy`.
 
+**Progress 2026-06-22 (Codex):** First green slice landed in core: typed
+`PolicyDecision`/`PolicyLayer`/`PolicyCheck`, `GuardViolation.policy_layer`,
+`TransitionResult.policy_decision`, a pure `constitution.rs` authority ladder
+with drift coverage, per-head-turn policy decisions attached to
+`HeadInvocationRequest`, and `POLICY.CHECKED` now carries the policy decision
+beside the existing hard publication guard. Still open for M2 completion:
+materialize/load `.theorem/constitution.json` project law and wire any richer
+per-turn denial semantics beyond the existing publication floor.
+
+**Progress 2026-06-22 (Codex):** After Claude's live DeepSeek proof found that
+the console entrypoint inherited the pure fake-loop `6.0` budget, runtime
+`run_composed_agent` now allocates a real-provider-sized budget by default
+(`5000`) and supports `THEOREM_COMPOSED_AGENT_BUDGET_UNITS` for operators.
+This removes the production `binding_budget_overspent` blocker without changing
+the fake core fixture.
+
 ### M3: Passive memory layer
 - **Files:** `rustyred-thg-memory/src/passive.rs`; call site in the turn loop's context assembly.
 - **Acceptance:** relevant memories auto-injected with **no tool call**; relevance gate on `RankedMemory.score`; turn-context seeding via `recall_seeds`; ambient `consolidate()` on a cadence; epistemic floor via `read_epistemic_shadow`.

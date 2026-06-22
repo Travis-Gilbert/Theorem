@@ -14,6 +14,8 @@ use theorem_harness_core::{
 
 pub const DEFAULT_BINDING_ID: &str = "agent:theorem";
 pub const THEOREM_AGENT_HEADS_ENV: &str = "THEOREM_AGENT_HEADS";
+pub const THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV: &str = "THEOREM_COMPOSED_AGENT_BUDGET_UNITS";
+pub const DEFAULT_COMPOSED_AGENT_BUDGET_UNITS: f64 = 5_000.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComposedAgentRunResult {
@@ -100,7 +102,8 @@ pub fn run_composed_agent_with_claims<S: GraphStore>(
         Some(binding) => binding,
         None => default_theorem_binding(&binding_id)?,
     };
-    let input = FakeIntraAgentLoopInput::new(task, claims);
+    let mut input = FakeIntraAgentLoopInput::new(task, claims);
+    input.budget_units = composed_agent_budget_units()?;
     let result = run_intra_agent_loop_with_invoker(binding, input, invoker)?;
     persist_binding_run_result(store, &result.binding, &result.events)?;
     let policy_event = result
@@ -322,6 +325,27 @@ fn normalize_binding_id(binding_id: &str) -> String {
     }
 }
 
+fn composed_agent_budget_units() -> ComposedAgentRuntimeResult<f64> {
+    let Ok(raw) = std::env::var(THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV) else {
+        return Ok(DEFAULT_COMPOSED_AGENT_BUDGET_UNITS);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_COMPOSED_AGENT_BUDGET_UNITS);
+    }
+    let budget = trimmed.parse::<f64>().map_err(|_| {
+        ComposedAgentRuntimeError::InvalidInput(format!(
+            "{THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV} must be a positive number"
+        ))
+    })?;
+    if !budget.is_finite() || budget <= 0.0 {
+        return Err(ComposedAgentRuntimeError::InvalidInput(format!(
+            "{THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV} must be a positive number"
+        )));
+    }
+    Ok(budget)
+}
+
 fn verdict_allowed(verdict: &Value) -> bool {
     verdict
         .get("allowed")
@@ -367,6 +391,57 @@ mod tests {
                 .len(),
             result.events.len()
         );
+    }
+
+    #[test]
+    fn composed_agent_run_uses_real_provider_sized_default_budget() {
+        let _env = ScopedEnv::new([]);
+        let mut store = InMemoryGraphStore::new();
+        let result = run_composed_agent_with_claims(
+            &mut store,
+            "agent:budget-default",
+            "publish",
+            vec![GroundedClaim::new("grounded", "source:1")],
+            &FakeHeadInvoker::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            allocated_budget_units(&result),
+            DEFAULT_COMPOSED_AGENT_BUDGET_UNITS
+        );
+    }
+
+    #[test]
+    fn composed_agent_run_budget_can_be_overridden_by_env() {
+        let _env = ScopedEnv::new([(THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV, "7500")]);
+        let mut store = InMemoryGraphStore::new();
+        let result = run_composed_agent_with_claims(
+            &mut store,
+            "agent:budget-env",
+            "publish",
+            vec![GroundedClaim::new("grounded", "source:1")],
+            &FakeHeadInvoker::default(),
+        )
+        .unwrap();
+
+        assert_eq!(allocated_budget_units(&result), 7_500.0);
+    }
+
+    #[test]
+    fn composed_agent_run_rejects_invalid_budget_env() {
+        let _env = ScopedEnv::new([(THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV, "nope")]);
+        let mut store = InMemoryGraphStore::new();
+        let error = run_composed_agent_with_claims(
+            &mut store,
+            "agent:budget-invalid",
+            "publish",
+            vec![GroundedClaim::new("grounded", "source:1")],
+            &FakeHeadInvoker::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ComposedAgentRuntimeError::InvalidInput(_)));
     }
 
     #[test]
@@ -471,6 +546,7 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut names = vec![
                 THEOREM_AGENT_HEADS_ENV.to_string(),
+                THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV.to_string(),
                 "MISTRAL_MODEL".to_string(),
                 "OPENAI_MODEL".to_string(),
                 "MINIMAX_MODEL".to_string(),
@@ -499,6 +575,16 @@ mod tests {
                 _guard: guard,
             }
         }
+    }
+
+    fn allocated_budget_units(result: &ComposedAgentRunResult) -> f64 {
+        result
+            .events
+            .iter()
+            .find(|event| event.event_type == "BUDGET.ALLOCATED")
+            .and_then(|event| event.payload.get("budget_units"))
+            .and_then(Value::as_f64)
+            .expect("BUDGET.ALLOCATED carries budget_units")
     }
 
     impl Drop for ScopedEnv {

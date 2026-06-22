@@ -237,6 +237,8 @@ pub struct GuardViolation {
     pub code: String,
     pub message: String,
     #[serde(default)]
+    pub policy_layer: String,
+    #[serde(default)]
     pub required_state: String,
     #[serde(default)]
     pub received_state: String,
@@ -247,11 +249,43 @@ pub struct GuardViolation {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyLayer {
+    pub layer_id: String,
+    pub source: String,
+    pub summary: String,
+    pub authority: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyCheck {
+    pub check_id: String,
+    pub layer_id: String,
+    pub status: String,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDecision {
+    pub decision_id: String,
+    pub allowed: bool,
+    #[serde(default)]
+    pub authority_order: Vec<String>,
+    #[serde(default)]
+    pub layers: Vec<PolicyLayer>,
+    #[serde(default)]
+    pub checks: Vec<PolicyCheck>,
+    #[serde(default)]
+    pub receipt_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TransitionResult {
     pub run: RunState,
     pub event: EventState,
     #[serde(default)]
     pub effects: Vec<Value>,
+    #[serde(default)]
+    pub policy_decision: Option<PolicyDecision>,
     pub state_hash_before: String,
     pub state_hash_after: String,
 }

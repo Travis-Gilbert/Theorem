@@ -114,6 +114,7 @@ fn guard(code: &str, message: &str, details: Value) -> BindingError {
     BindingError::Guard(Box::new(GuardViolation {
         code: code.to_string(),
         message: message.to_string(),
+        policy_layer: crate::constitution::GLOBAL_LAW_LAYER.to_string(),
         required_state: String::new(),
         received_state: String::new(),
         missing_fields: Vec::new(),

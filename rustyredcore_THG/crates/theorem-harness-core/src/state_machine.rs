@@ -88,6 +88,7 @@ pub fn apply_transition(
         run: next_run,
         event,
         effects: Vec::new(),
+        policy_decision: None,
         state_hash_before: before_hash,
         state_hash_after: after_hash,
     })
@@ -846,6 +847,7 @@ fn guard_violation(
     HarnessError::Guard(Box::new(GuardViolation {
         code: code.into(),
         message: message.into(),
+        policy_layer: String::new(),
         required_state: required_state.into(),
         received_state: received_state.into(),
         missing_fields,
