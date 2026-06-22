@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
     },
     thread::JoinHandle,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection};
@@ -1137,6 +1137,28 @@ fn start_local_node(
     Ok(())
 }
 
+fn commonplace_is_healthy(endpoint: &str) -> bool {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+        .ok()
+        .and_then(|client| client.get(format!("{endpoint}/healthz")).send().ok())
+        .and_then(|response| response.error_for_status().ok())
+        .is_some()
+}
+
+fn wait_for_commonplace_health(endpoint: &str) -> Result<(), String> {
+    for _ in 0..20 {
+        if commonplace_is_healthy(endpoint) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "commonplace-api health check failed at {endpoint}/healthz"
+    ))
+}
+
 fn start_commonplace_api(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, Mutex<DesktopBackendState>>,
@@ -1147,18 +1169,39 @@ fn start_commonplace_api(
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], COMMONPLACE_NODE_PORT).into();
     let endpoint = format!("http://127.0.0.1:{COMMONPLACE_NODE_PORT}");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let spawn_store_path = store_path.clone();
     tauri::async_runtime::spawn(async move {
         let shutdown = async move {
             let _ = shutdown_rx.await;
         };
-        if let Err(error) =
-            commonplace_api::serve_loopback(addr, spawn_store_path, "dev-key", "default", shutdown)
-                .await
+        if let Err(error) = commonplace_api::serve_loopback_with_ready(
+            addr,
+            spawn_store_path,
+            "dev-key",
+            "default",
+            ready_tx,
+            shutdown,
+        )
+        .await
         {
             eprintln!("[theorem-desktop] commonplace-api stopped: {error}");
         }
     });
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(error) => {
+            return Err(format!(
+                "commonplace-api startup ended before readiness signal: {error}"
+            ))
+        }
+    }
+    if let Err(error) = wait_for_commonplace_health(&endpoint) {
+        let _ = shutdown_tx.send(());
+        return Err(error);
+    }
 
     let mut backend = state.lock().map_err(|error| error.to_string())?;
     backend.commonplace_node = Some(CommonplaceRuntime {
@@ -1186,9 +1229,14 @@ fn commonplace_status(
         .as_ref()
         .map(|node| node.store_path.clone())
         .unwrap_or_else(|| fallback_store.display().to_string());
+    let node_up = backend
+        .commonplace_node
+        .as_ref()
+        .map(|_| commonplace_is_healthy(&endpoint))
+        .unwrap_or(false);
 
     Ok(CommonplaceStatus {
-        node_up: backend.commonplace_node.is_some(),
+        node_up,
         endpoint,
         port: COMMONPLACE_NODE_PORT,
         store_path,

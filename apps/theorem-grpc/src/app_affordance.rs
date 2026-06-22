@@ -638,6 +638,7 @@ fn code_ingest_handler(
             .or_else(|| request_u64(request, "max_repo_bytes"))
             .or_else(|| request_u64(request, "maxRepoBytes"))
             .unwrap_or_default(),
+        materialize_symbol_name_index: false,
         actor: actor.to_string(),
     };
     // D1: submit and return immediately. The heavy path runs on the

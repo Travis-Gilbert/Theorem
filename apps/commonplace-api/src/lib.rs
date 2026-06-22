@@ -41,7 +41,7 @@ pub use schema::{
     DurableShared, ExportFormat, ImportResultGql, InMemoryShared, IngestInputGql, ItemGql,
     Mutation, ProvenanceGql, Query, SearchHitGql, SharedStore,
 };
-pub use serve::{build_router_with_model, run_from_env, serve_loopback};
+pub use serve::{build_router_with_model, run_from_env, serve_loopback, serve_loopback_with_ready};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
