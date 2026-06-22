@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -33,7 +33,10 @@ mod ingest_jobs;
 mod map_projection;
 mod repo_fetch;
 
-pub use code_embed_hook::{incremental_embed_hook, EMBEDDING_DIM, EMBEDDING_PROPERTY};
+pub use code_embed_hook::{
+    incremental_embed_hook, incremental_embed_hook_with_embedder, EMBEDDING_DIM,
+    EMBEDDING_PROPERTY,
+};
 pub use code_epistemic_hook::{
     code_epistemic_hook, run_code_epistemic_pass_for_repo, CodeDriftFinding, CodeEpistemicReadout,
     CODE_EPISTEMIC_ENGINE, DEFAULT_CODE_EPISTEMIC_TOP_K,
@@ -65,6 +68,7 @@ pub use repo_fetch::{
 pub const CODE_REPO_LABEL: &str = "CodeRepository";
 pub const CODE_FILE_LABEL: &str = "CodeFile";
 pub const CODE_SYMBOL_LABEL: &str = "CodeSymbol";
+pub const CODE_SYMBOL_NAME_LABEL: &str = "CodeSymbolName";
 pub const CODE_RECEIPT_LABEL: &str = "CodeInvocationReceipt";
 /// Content-addressed side record holding a file's full text, keyed by the
 /// file's `content_hash`. Kept OFF the `CodeFile` node so symbol/file node
@@ -74,6 +78,7 @@ pub const CODE_FILE_TEXT_LABEL: &str = "CodeFileText";
 pub const SOURCE: &str = "rustyred_thg_code";
 pub const CONTAINS_FILE: &str = "CONTAINS_FILE";
 pub const DECLARES_SYMBOL: &str = "DECLARES_SYMBOL";
+pub const SYMBOL_NAME_TARGET: &str = "SYMBOL_NAME_TARGET";
 pub const CALLS_SYMBOL: &str = "CALLS_SYMBOL";
 pub const DEPENDS_ON_SYMBOL: &str = "DEPENDS_ON_SYMBOL";
 const DEFAULT_TRUST_TIER: &str = "advisory";
@@ -188,6 +193,7 @@ impl CodeParsingPlugin {
                 CODE_REPO_LABEL,
                 CODE_FILE_LABEL,
                 CODE_SYMBOL_LABEL,
+                CODE_SYMBOL_NAME_LABEL,
                 CODE_RECEIPT_LABEL,
                 EPISTEMIC_SHADOW_LABEL,
             ],
@@ -864,14 +870,18 @@ fn run_codebase_ingest_in_store(
 /// point the input at the quarantined checkout; the returned `FetchedRepo`
 /// handle must stay alive until parsing has read all file text, after which
 /// dropping it removes the clone.
-pub(crate) fn stage_repo_for_ingest(
+pub fn stage_repo_for_ingest(
     input: IngestCodebaseInput,
     url: Option<(&str, &RepoFetchCaps)>,
 ) -> Result<(IngestCodebaseInput, u64, Option<FetchedRepo>), CodeIndexError> {
     stage_repo_for_ingest_with_credential(input, url, None)
 }
 
-pub(crate) fn stage_repo_for_ingest_with_credential(
+/// Stage a repository for ingest or workspace import. With a URL, this
+/// shallow-clones through the existing credential-aware fetch path and rewrites
+/// `input.repo_path` to the temporary checkout; with `None`, it returns the
+/// local input unchanged.
+pub fn stage_repo_for_ingest_with_credential(
     mut input: IngestCodebaseInput,
     url: Option<(&str, &RepoFetchCaps)>,
     credential: Option<&GitCredential>,
@@ -1203,6 +1213,11 @@ fn handle_ingest_code_operation(
                 "maxRepoBytes",
             ],
         ),
+        materialize_symbol_name_index: arguments
+            .get("materialize_symbol_name_index")
+            .or_else(|| arguments.get("materializeSymbolNameIndex"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         actor: code_plugin_arg_string(&arguments, &["actor", "actor_id", "actorId"]),
     };
     let output = if !repo_url.trim().is_empty() {
@@ -1506,6 +1521,10 @@ pub struct IngestCodebaseInput {
     pub max_files: u64,
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
+    /// W1 opt-in: materialize `CodeSymbolName` inverse-index bucket nodes for
+    /// touched-name lookup. Kept off by default so existing full-ingest paths do
+    /// not pay a per-unique-name write cost until the on-write lane enables it.
+    pub materialize_symbol_name_index: bool,
     pub actor: String,
 }
 
@@ -1532,6 +1551,37 @@ pub struct IngestCodebaseOutput {
     pub stage_timings: IngestStageTimings,
     pub language_stats: BTreeMap<String, LanguageIngestStats>,
     pub skip_stats: IngestSkipStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceFileWriteIndexInput {
+    pub tenant_id: String,
+    pub repo_id: String,
+    pub repo_root_display: String,
+    pub file_path: String,
+    pub content: Vec<u8>,
+    pub actor: String,
+    /// Optional explicit generation. `0` means "use now".
+    pub generation: u64,
+    pub materialize_symbol_name_index: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceFileWriteIndexOutput {
+    pub tenant_id: String,
+    pub repo_id: String,
+    pub file_path: String,
+    pub file_id: String,
+    pub content_hash: String,
+    pub generation: u64,
+    pub graph_version: u64,
+    pub symbols_indexed: u64,
+    pub files_carried: u64,
+    pub edges_indexed: u64,
+    pub edges_retired: u64,
+    pub bucket_lookups: u64,
+    pub symbol_names: Vec<String>,
+    pub bucket_names: Vec<String>,
 }
 
 impl IngestCodebaseOutput {
@@ -2188,6 +2238,7 @@ pub struct IngestConfig {
     pub exclude_dirs: BTreeSet<String>,
     pub max_files: usize,
     pub max_file_bytes: u64,
+    pub materialize_symbol_name_index: bool,
     pub actor: String,
     pub generation: u64,
     /// AM6 provenance: the URL this repo was ingested from (empty for a purely
@@ -2275,6 +2326,32 @@ pub(crate) fn build_node_mutations(
     );
 
     let mut mutations = vec![GraphMutation::NodeUpsert(repo_node)];
+    let symbol_name_targets = if config.materialize_symbol_name_index {
+        let mut targets_by_name: BTreeMap<String, Vec<SymbolNameTarget>> = BTreeMap::new();
+        for symbol in files.iter().flat_map(|file| file.symbols.iter()) {
+            targets_by_name
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(SymbolNameTarget {
+                    symbol_id: symbol.symbol_id.clone(),
+                    file_path: symbol.file_path.clone(),
+                    line: symbol.line,
+                });
+        }
+        for targets in targets_by_name.values_mut() {
+            targets.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then_with(|| a.line.cmp(&b.line))
+                    .then_with(|| a.symbol_id.cmp(&b.symbol_id))
+            });
+            targets.dedup_by(|a, b| a.symbol_id == b.symbol_id);
+        }
+        targets_by_name
+    } else {
+        BTreeMap::new()
+    };
+    let mut emitted_symbol_names = BTreeSet::new();
     for file in files {
         // D3: the CodeFile node carries metadata only; the full text lives in
         // a content-addressed CodeFileText side record so search/explore node
@@ -2321,6 +2398,39 @@ pub(crate) fn build_node_mutations(
             }),
         )));
         for symbol in &file.symbols {
+            if config.materialize_symbol_name_index
+                && emitted_symbol_names.insert(symbol.name.clone())
+            {
+                let name_id = symbol_name_node_id(&config.repo_id, config.generation, &symbol.name);
+                let targets = symbol_name_targets
+                    .get(&symbol.name)
+                    .map(|targets| {
+                        targets
+                            .iter()
+                            .map(|target| {
+                                json!({
+                                    "symbol_id": target.symbol_id,
+                                    "file_path": target.file_path,
+                                    "line": target.line,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
+                    &name_id,
+                    [CODE_SYMBOL_NAME_LABEL],
+                    json!({
+                        "tenant_id": config.tenant_id,
+                        "repo_id": config.repo_id,
+                        "name": symbol.name,
+                        "generation": config.generation,
+                        "target_count": targets.len(),
+                        "targets": targets,
+                        "source": SOURCE,
+                    }),
+                )));
+            }
             mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(
                 &symbol.symbol_id,
                 [CODE_SYMBOL_LABEL],
@@ -3397,6 +3507,215 @@ pub fn collect_code_files(
     Ok(())
 }
 
+/// W1.1/W1.3 source-file write seam: parse and commit exactly one source file
+/// into the code graph without walking or reindexing the repository.
+///
+/// The caller supplies the file bytes that were just written into the workspace
+/// store. This reuses the same per-file encoder and node mutation builder as
+/// full ingest, so CodeFile/CodeSymbol graph shape stays identical. When the
+/// persistent name-bucket index is enabled, it also rewrites outgoing
+/// CALLS/DEPENDS edges for the changed file's symbols by looking up only the
+/// names observed in the changed file.
+pub fn index_source_file_write_in_store(
+    store: &mut RedCoreGraphStore,
+    input: SourceFileWriteIndexInput,
+) -> Result<SourceFileWriteIndexOutput, CodeIndexError> {
+    let tenant_id = normalize_tenant(&input.tenant_id);
+    let repo_id = input.repo_id.trim().to_string();
+    if repo_id.is_empty() {
+        return Err(CodeIndexError::invalid(
+            "repo_id is required for source-file write indexing",
+        ));
+    }
+    let rel_path = safe_source_file_path(&input.file_path)?;
+    let extension = extension_for(Path::new(&rel_path));
+    if !default_extensions().contains(&extension) {
+        return Err(CodeIndexError::invalid(format!(
+            "unsupported source extension for {rel_path:?}"
+        )));
+    }
+    if input.content.len() as u64 > ABSOLUTE_MAX_FILE_BYTES {
+        return Err(CodeIndexError::invalid(format!(
+            "source file {rel_path:?} exceeds max file bytes"
+        )));
+    }
+    if input.content.contains(&0) {
+        return Err(CodeIndexError::invalid(format!(
+            "source file {rel_path:?} appears to be binary"
+        )));
+    }
+    let text = String::from_utf8(input.content).map_err(|error| {
+        CodeIndexError::invalid(format!("source file {rel_path:?} is not utf-8: {error}"))
+    })?;
+    let prior = load_prior_generation_snapshot(store, &tenant_id, &repo_id)?;
+    let mut generation = if input.generation == 0 {
+        now_ms().max(1) as u64
+    } else {
+        input.generation
+    };
+    if let Some(prior) = &prior {
+        if generation <= prior.generation {
+            generation = prior.generation + 1;
+        }
+    }
+    let repo_root_display = if input.repo_root_display.trim().is_empty() {
+        repo_id.clone()
+    } else {
+        input.repo_root_display.trim().to_string()
+    };
+    let config = IngestConfig {
+        tenant_id: tenant_id.clone(),
+        repo_root: PathBuf::from(&repo_root_display),
+        repo_root_display,
+        repo_id: repo_id.clone(),
+        include_extensions: default_extensions(),
+        exclude_dirs: default_exclude_dirs(),
+        max_files: 1,
+        max_file_bytes: ABSOLUTE_MAX_FILE_BYTES,
+        // Source-file writes materialize touched buckets below. Keeping the
+        // generic node builder off avoids emitting an incomplete per-file
+        // bucket when another current file defines the same symbol name.
+        materialize_symbol_name_index: false,
+        actor: input.actor.trim().to_string(),
+        generation,
+        repo_url: String::new(),
+        head_sha: String::new(),
+    };
+    let content_hash = stable_hash(json!({
+        "repo_id": repo_id,
+        "path": rel_path,
+        "content": text,
+    }));
+    let language = language_for_extension(&extension).to_string();
+    let mut loaded = LoadedCandidate {
+        candidate: CodeFileCandidate {
+            path: PathBuf::from(&rel_path),
+            rel_path: rel_path.clone(),
+            extension,
+            language,
+        },
+        text,
+        content_hash: content_hash.clone(),
+    };
+    let indexed = indexed_file_from_loaded(&config, &mut loaded);
+    let symbol_names = indexed
+        .symbols
+        .iter()
+        .map(|symbol| symbol.name.clone())
+        .collect::<Vec<_>>();
+    let file_id = indexed.file_id.clone();
+    let symbols_indexed = indexed.symbols.len() as u64;
+    let carried_entries = prior
+        .as_ref()
+        .map(|prior| {
+            prior
+                .files
+                .iter()
+                .filter_map(|(path, entry)| (path != &rel_path).then_some(entry))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let touched_names = touched_names_for_file(&indexed);
+    let changed_definition_names = indexed
+        .symbols
+        .iter()
+        .map(|symbol| symbol.name.clone())
+        .collect::<BTreeSet<_>>();
+    let bucket_names = if input.materialize_symbol_name_index {
+        touched_names.iter().cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let targets_by_name = if input.materialize_symbol_name_index {
+        collect_touched_symbol_name_targets(
+            store,
+            &config,
+            prior.as_ref(),
+            &indexed,
+            &touched_names,
+        )?
+    } else {
+        BTreeMap::new()
+    };
+    let mut mutations = build_node_mutations(&config, std::slice::from_ref(&indexed));
+    mutations.extend(carried_forward_mutations(
+        &carried_entries,
+        config.generation,
+    ));
+    if input.materialize_symbol_name_index {
+        mutations.extend(symbol_name_bucket_mutations(&config, &targets_by_name));
+    }
+    let retired_edges = tombstone_existing_outgoing_symbol_edges(store, &indexed.symbols)?;
+    let edges_retired = retired_edges.len() as u64;
+    mutations.extend(retired_edges);
+    let carried_sources_for_incoming = if input.materialize_symbol_name_index
+        && !changed_definition_names.is_empty()
+        && !carried_entries.is_empty()
+    {
+        let carried_text = load_carried_text(
+            &carried_entries,
+            &config,
+            Some(&|hashes| load_file_texts(store, &config.tenant_id, hashes)),
+        );
+        carried_entries
+            .iter()
+            .map(|entry| reconstruct_carried_file(entry, &carried_text))
+            .flat_map(|file| {
+                file.symbols
+                    .into_iter()
+                    .filter(|symbol| symbol_references_any(symbol, &changed_definition_names))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let incoming_retired_edges = tombstone_existing_outgoing_symbol_edges_to_names(
+        store,
+        &carried_sources_for_incoming,
+        &changed_definition_names,
+    )?;
+    let edges_retired = edges_retired.saturating_add(incoming_retired_edges.len() as u64);
+    mutations.extend(incoming_retired_edges);
+    let outgoing_edges = if input.materialize_symbol_name_index {
+        infer_touched_outgoing_edges(&indexed.symbols, &targets_by_name, &config)
+    } else {
+        Vec::new()
+    };
+    let incoming_edges = if input.materialize_symbol_name_index {
+        infer_incoming_edges_for_names(
+            &carried_sources_for_incoming,
+            &targets_by_name,
+            &changed_definition_names,
+            &config,
+        )
+    } else {
+        Vec::new()
+    };
+    let edges_indexed = (outgoing_edges.len() + incoming_edges.len()) as u64;
+    mutations.extend(outgoing_edges.into_iter().map(GraphMutation::EdgeUpsert));
+    mutations.extend(incoming_edges.into_iter().map(GraphMutation::EdgeUpsert));
+    let transaction = store
+        .commit_batch(GraphMutationBatch::new(mutations))
+        .map_err(CodeIndexError::from_store)?;
+    Ok(SourceFileWriteIndexOutput {
+        tenant_id,
+        repo_id,
+        file_path: rel_path,
+        file_id,
+        content_hash,
+        generation,
+        graph_version: transaction.graph_version,
+        symbols_indexed,
+        files_carried: carried_entries.len() as u64,
+        edges_indexed,
+        edges_retired,
+        bucket_lookups: touched_names.len() as u64,
+        symbol_names,
+        bucket_names,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct CodeFileCandidate {
     path: PathBuf,
@@ -3736,6 +4055,7 @@ pub fn resolve_ingest_config(input: IngestCodebaseInput) -> Result<IngestConfig,
         exclude_dirs,
         max_files,
         max_file_bytes,
+        materialize_symbol_name_index: input.materialize_symbol_name_index,
         actor: input.actor.trim().to_string(),
         generation: now_ms().max(1) as u64,
         repo_url: String::new(),
@@ -3817,6 +4137,13 @@ struct EdgeTargetRef<'a> {
     symbol_id: &'a str,
     name: &'a str,
     file_path: &'a str,
+    line: u64,
+}
+
+#[derive(Clone)]
+struct SymbolNameTarget {
+    symbol_id: String,
+    file_path: String,
     line: u64,
 }
 
@@ -3963,6 +4290,413 @@ fn push_symbol_edges(
                 "repo_id": config.repo_id,
                 "generation": config.generation,
                 "evidence": format!("{evidence_kind}: {} references {}", symbol.name, target.name),
+                "source": SOURCE,
+            }),
+        ));
+        emitted += 1;
+    }
+}
+
+fn touched_names_for_file(file: &IndexedFile) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for symbol in &file.symbols {
+        names.insert(symbol.name.clone());
+        names.extend(observed_names_for_symbol(symbol));
+    }
+    names
+}
+
+fn observed_names_for_symbol(symbol: &IndexedSymbol) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if symbol.parser_backed {
+        names.extend(symbol.call_names.iter().cloned());
+        names.extend(symbol.dependency_names.iter().cloned());
+    } else {
+        names.extend(
+            identifier_tokens(&symbol.body)
+                .into_iter()
+                .filter(|token| *token != symbol.name)
+                .map(str::to_string),
+        );
+    }
+    names
+}
+
+fn symbol_references_any(symbol: &IndexedSymbol, names: &BTreeSet<String>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    observed_names_for_symbol(symbol)
+        .into_iter()
+        .any(|name| names.contains(&name))
+}
+
+fn collect_touched_symbol_name_targets(
+    store: &RedCoreGraphStore,
+    config: &IngestConfig,
+    prior: Option<&PriorGenerationSnapshot>,
+    changed_file: &IndexedFile,
+    touched_names: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<SymbolNameTarget>>, CodeIndexError> {
+    let mut targets_by_name = BTreeMap::new();
+    let prior_generation = prior.map(|prior| prior.generation);
+    for name in touched_names {
+        let mut targets = changed_file
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == *name)
+            .map(target_from_indexed_symbol)
+            .collect::<Vec<_>>();
+        if let Some(generation) = prior_generation {
+            let nodes = store
+                .query_nodes(
+                    NodeQuery::label(CODE_SYMBOL_LABEL)
+                        .with_property("tenant_id", json!(config.tenant_id))
+                        .with_property("repo_id", json!(config.repo_id))
+                        .with_property("name", json!(name))
+                        .with_limit(100_000),
+                )
+                .map_err(CodeIndexError::from_store)?;
+            for node in nodes {
+                if property_u64(&node.properties, "generation") != Some(generation) {
+                    continue;
+                }
+                if property_string(&node.properties, "file_path").as_deref()
+                    == Some(changed_file.rel_path.as_str())
+                {
+                    continue;
+                }
+                if let Some(target) = target_from_symbol_node(&node) {
+                    targets.push(target);
+                }
+            }
+        }
+        sort_symbol_name_targets(&mut targets);
+        targets_by_name.insert(name.clone(), targets);
+    }
+    Ok(targets_by_name)
+}
+
+fn target_from_indexed_symbol(symbol: &IndexedSymbol) -> SymbolNameTarget {
+    SymbolNameTarget {
+        symbol_id: symbol.symbol_id.clone(),
+        file_path: symbol.file_path.clone(),
+        line: symbol.line,
+    }
+}
+
+fn target_from_symbol_node(node: &NodeRecord) -> Option<SymbolNameTarget> {
+    Some(SymbolNameTarget {
+        symbol_id: property_string(&node.properties, "symbol_id")
+            .unwrap_or_else(|| node.id.clone()),
+        file_path: property_string(&node.properties, "file_path")?,
+        line: property_u64(&node.properties, "line").unwrap_or(0),
+    })
+}
+
+fn sort_symbol_name_targets(targets: &mut Vec<SymbolNameTarget>) {
+    targets.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.symbol_id.cmp(&b.symbol_id))
+    });
+    targets.dedup_by(|a, b| a.symbol_id == b.symbol_id);
+}
+
+fn symbol_name_bucket_mutations(
+    config: &IngestConfig,
+    targets_by_name: &BTreeMap<String, Vec<SymbolNameTarget>>,
+) -> Vec<GraphMutation> {
+    targets_by_name
+        .iter()
+        .map(|(name, targets)| {
+            let target_values = targets
+                .iter()
+                .map(|target| {
+                    json!({
+                        "symbol_id": target.symbol_id,
+                        "file_path": target.file_path,
+                        "line": target.line,
+                    })
+                })
+                .collect::<Vec<_>>();
+            GraphMutation::NodeUpsert(NodeRecord::new(
+                symbol_name_node_id(&config.repo_id, config.generation, name),
+                [CODE_SYMBOL_NAME_LABEL],
+                json!({
+                    "tenant_id": config.tenant_id,
+                    "repo_id": config.repo_id,
+                    "name": name,
+                    "generation": config.generation,
+                    "target_count": target_values.len(),
+                    "targets": target_values,
+                    "source": SOURCE,
+                }),
+            ))
+        })
+        .collect()
+}
+
+fn tombstone_existing_outgoing_symbol_edges(
+    store: &RedCoreGraphStore,
+    symbols: &[IndexedSymbol],
+) -> Result<Vec<GraphMutation>, CodeIndexError> {
+    let mut mutations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for symbol in symbols {
+        for edge_type in [CALLS_SYMBOL, DEPENDS_ON_SYMBOL] {
+            let neighbors = store
+                .neighbors(NeighborQuery {
+                    node_id: symbol.symbol_id.clone(),
+                    direction: Direction::Out,
+                    edge_type: Some(edge_type.to_string()),
+                    include_expired: false,
+                })
+                .map_err(CodeIndexError::from_store)?;
+            for neighbor in neighbors {
+                if !seen.insert(neighbor.edge_id.clone()) {
+                    continue;
+                }
+                let Some(mut edge) = store
+                    .get_edge(&neighbor.edge_id)
+                    .map_err(CodeIndexError::from_store)?
+                else {
+                    continue;
+                };
+                if edge.tombstone {
+                    continue;
+                }
+                edge.tombstone = true;
+                mutations.push(GraphMutation::EdgeUpsert(edge));
+            }
+        }
+    }
+    Ok(mutations)
+}
+
+fn tombstone_existing_outgoing_symbol_edges_to_names(
+    store: &RedCoreGraphStore,
+    symbols: &[IndexedSymbol],
+    target_names: &BTreeSet<String>,
+) -> Result<Vec<GraphMutation>, CodeIndexError> {
+    if target_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut mutations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for symbol in symbols {
+        for edge_type in [CALLS_SYMBOL, DEPENDS_ON_SYMBOL] {
+            let neighbors = store
+                .neighbors(NeighborQuery {
+                    node_id: symbol.symbol_id.clone(),
+                    direction: Direction::Out,
+                    edge_type: Some(edge_type.to_string()),
+                    include_expired: false,
+                })
+                .map_err(CodeIndexError::from_store)?;
+            for neighbor in neighbors {
+                if !seen.insert(neighbor.edge_id.clone()) {
+                    continue;
+                }
+                let Some(mut edge) = store
+                    .get_edge(&neighbor.edge_id)
+                    .map_err(CodeIndexError::from_store)?
+                else {
+                    continue;
+                };
+                if edge.tombstone {
+                    continue;
+                }
+                let Some(target) = store
+                    .get_node(&edge.to_id)
+                    .map_err(CodeIndexError::from_store)?
+                else {
+                    continue;
+                };
+                let Some(target_name) = property_string(&target.properties, "name") else {
+                    continue;
+                };
+                if !target_names.contains(&target_name) {
+                    continue;
+                }
+                edge.tombstone = true;
+                mutations.push(GraphMutation::EdgeUpsert(edge));
+            }
+        }
+    }
+    Ok(mutations)
+}
+
+fn infer_touched_outgoing_edges(
+    symbols: &[IndexedSymbol],
+    targets_by_name: &BTreeMap<String, Vec<SymbolNameTarget>>,
+    config: &IngestConfig,
+) -> Vec<EdgeRecord> {
+    let mut edges = Vec::new();
+    let mut seen = BTreeSet::new();
+    for symbol in symbols {
+        if symbol.parser_backed {
+            for name in &symbol.call_names {
+                push_touched_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    targets_by_name,
+                    symbol,
+                    name,
+                    CALLS_SYMBOL,
+                    "code:edge:symbol_call",
+                    "rust_ast_call",
+                    config,
+                );
+            }
+            for name in &symbol.dependency_names {
+                push_touched_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    targets_by_name,
+                    symbol,
+                    name,
+                    DEPENDS_ON_SYMBOL,
+                    "code:edge:symbol_dependency",
+                    "rust_ast_dependency",
+                    config,
+                );
+            }
+        } else {
+            for token in identifier_tokens(&symbol.body) {
+                if token == symbol.name || !targets_by_name.contains_key(token) {
+                    continue;
+                }
+                push_touched_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    targets_by_name,
+                    symbol,
+                    token,
+                    CALLS_SYMBOL,
+                    "code:edge:symbol_call",
+                    "text_body_reference",
+                    config,
+                );
+            }
+        }
+    }
+    edges
+}
+
+fn infer_incoming_edges_for_names(
+    symbols: &[IndexedSymbol],
+    targets_by_name: &BTreeMap<String, Vec<SymbolNameTarget>>,
+    target_names: &BTreeSet<String>,
+    config: &IngestConfig,
+) -> Vec<EdgeRecord> {
+    if target_names.is_empty() {
+        return Vec::new();
+    }
+    let mut edges = Vec::new();
+    let mut seen = BTreeSet::new();
+    for symbol in symbols {
+        if symbol.parser_backed {
+            for name in symbol
+                .call_names
+                .iter()
+                .filter(|name| target_names.contains(*name))
+            {
+                push_touched_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    targets_by_name,
+                    symbol,
+                    name,
+                    CALLS_SYMBOL,
+                    "code:edge:symbol_call",
+                    "rust_ast_call",
+                    config,
+                );
+            }
+            for name in symbol
+                .dependency_names
+                .iter()
+                .filter(|name| target_names.contains(*name))
+            {
+                push_touched_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    targets_by_name,
+                    symbol,
+                    name,
+                    DEPENDS_ON_SYMBOL,
+                    "code:edge:symbol_dependency",
+                    "rust_ast_dependency",
+                    config,
+                );
+            }
+        } else {
+            for token in identifier_tokens(&symbol.body) {
+                if !target_names.contains(token) {
+                    continue;
+                }
+                push_touched_symbol_edges(
+                    &mut edges,
+                    &mut seen,
+                    targets_by_name,
+                    symbol,
+                    token,
+                    CALLS_SYMBOL,
+                    "code:edge:symbol_call",
+                    "text_body_reference",
+                    config,
+                );
+            }
+        }
+    }
+    edges
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_touched_symbol_edges(
+    edges: &mut Vec<EdgeRecord>,
+    seen: &mut BTreeSet<String>,
+    targets_by_name: &BTreeMap<String, Vec<SymbolNameTarget>>,
+    symbol: &IndexedSymbol,
+    name: &str,
+    edge_type: &str,
+    edge_prefix: &str,
+    evidence_kind: &str,
+    config: &IngestConfig,
+) {
+    if name == symbol.name {
+        return;
+    }
+    let Some(targets) = targets_by_name.get(name) else {
+        return;
+    };
+    if targets.len() > EDGE_NAME_BUCKET_CAP {
+        return;
+    }
+    let mut emitted = 0usize;
+    for target in targets {
+        if emitted >= EDGE_TARGETS_PER_NAME_CAP {
+            break;
+        }
+        if target.symbol_id == symbol.symbol_id {
+            continue;
+        }
+        let symbol_edge_id = edge_id(edge_prefix, &symbol.symbol_id, &target.symbol_id);
+        if !seen.insert(symbol_edge_id.clone()) {
+            continue;
+        }
+        edges.push(EdgeRecord::new(
+            symbol_edge_id,
+            &symbol.symbol_id,
+            edge_type,
+            &target.symbol_id,
+            json!({
+                "tenant_id": config.tenant_id,
+                "repo_id": config.repo_id,
+                "generation": config.generation,
+                "evidence": format!("{evidence_kind}: {} references {name}", symbol.name),
                 "source": SOURCE,
             }),
         ));
@@ -4920,6 +5654,34 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, CodeIndexError> {
         .join("/"))
 }
 
+fn safe_source_file_path(path: &str) -> Result<String, CodeIndexError> {
+    let raw = Path::new(path.trim());
+    if raw.as_os_str().is_empty() {
+        return Err(CodeIndexError::invalid("source file path is required"));
+    }
+    let mut parts = Vec::new();
+    for component in raw.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value.to_str().ok_or_else(|| {
+                    CodeIndexError::invalid(format!("non-utf8 source path {path:?}"))
+                })?;
+                parts.push(value.to_string());
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(CodeIndexError::invalid(format!(
+                    "unsafe source file path {path:?}"
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(CodeIndexError::invalid("source file path is required"));
+    }
+    Ok(parts.join("/"))
+}
+
 fn repo_node_id(repo_root: &str) -> String {
     format!(
         "code:repo:{}",
@@ -4994,6 +5756,17 @@ fn symbol_node_id(repo_id: &str, path: &str, kind: &str, name: &str, line: u64) 
             "kind": kind,
             "name": name,
             "line": line,
+        }))
+    )
+}
+
+fn symbol_name_node_id(repo_id: &str, generation: u64, name: &str) -> String {
+    format!(
+        "code:symbol_name:{}",
+        stable_hash(json!({
+            "repo_id": repo_id,
+            "generation": generation,
+            "name": name,
         }))
     )
 }
@@ -5095,7 +5868,9 @@ impl IfEmptyThen for String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use rustyred_code_embedding::{cosine_similarity, CodeEmbedder, CodeEmbeddingError};
 
     use super::*;
 
@@ -5242,7 +6017,9 @@ mod tests {
 
     #[test]
     fn repo_fetch_caps_cover_large_public_repos_without_unbounded_fetches() {
-        assert!(repo_fetch::DEFAULT_MAX_TOTAL_BYTES >= 771_959_844);
+        const {
+            assert!(repo_fetch::DEFAULT_MAX_TOTAL_BYTES >= 771_959_844);
+        }
 
         let servo_sized = RepoFetchCaps::from_requested(771_959_844);
         assert_eq!(servo_sized.max_total_bytes, 771_959_844);
@@ -5557,6 +6334,110 @@ mod tests {
         fs::remove_dir_all(repo_dir).ok();
     }
 
+    #[test]
+    fn ingest_materializes_symbol_name_bucket_index() {
+        let (repo_dir, _store_dir) = write_fixture_repo();
+        let mut store = RedCoreGraphStore::memory();
+        let input = IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo_dir.display().to_string(),
+            repo_id: "repo:name-bucket-fixture".to_string(),
+            materialize_symbol_name_index: true,
+            ..Default::default()
+        };
+        let ingest = ingest_codebase_in_store(&mut store, input).unwrap();
+
+        let buckets = store
+            .query_nodes(
+                NodeQuery::label(CODE_SYMBOL_NAME_LABEL)
+                    .with_property("repo_id", json!(ingest.repo_id.clone()))
+                    .with_property("name", json!("helper_len"))
+                    .with_property("generation", json!(ingest.generation))
+                    .with_limit(10),
+            )
+            .unwrap();
+        assert_eq!(buckets.len(), 1, "{buckets:?}");
+        let bucket = &buckets[0];
+        assert_eq!(bucket.properties["target_count"], json!(1));
+
+        let targets = bucket.properties["targets"]
+            .as_array()
+            .expect("bucket targets");
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        let target_ref = &targets[0];
+        let target = store
+            .get_node(target_ref["symbol_id"].as_str().unwrap())
+            .unwrap()
+            .expect("bucket target symbol");
+        assert_eq!(target_ref["file_path"], json!("src/lib.rs"));
+        assert_eq!(target_ref["line"], target.properties["line"]);
+        assert_eq!(target.properties["name"], json!("helper_len"));
+        assert_eq!(target.properties["repo_id"], json!(ingest.repo_id));
+        assert_eq!(target.properties["generation"], json!(ingest.generation));
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn source_file_write_indexes_one_file_without_repo_walk() {
+        let mut store = RedCoreGraphStore::memory();
+        let output = index_source_file_write_in_store(
+            &mut store,
+            SourceFileWriteIndexInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: "repo:on-write-fixture".to_string(),
+                repo_root_display: "embedded://repo/on-write-fixture".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                content: br#"
+pub fn helper_len(value: &str) -> usize { value.len() }
+pub fn caller() -> usize { helper_len("abc") }
+"#
+                .to_vec(),
+                actor: "w1-test".to_string(),
+                generation: 7,
+                materialize_symbol_name_index: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output.file_path, "src/lib.rs");
+        assert_eq!(output.generation, 7);
+        assert_eq!(output.symbol_names, vec!["helper_len", "caller"]);
+        assert_eq!(output.bucket_names, vec!["caller", "helper_len", "len"]);
+        let file = store
+            .get_node(&output.file_id)
+            .unwrap()
+            .expect("CodeFile node");
+        assert_eq!(file.properties["path"], json!("src/lib.rs"));
+        assert_eq!(file.properties["generation"], json!(7));
+
+        let symbols = store
+            .query_nodes(
+                NodeQuery::label(CODE_SYMBOL_LABEL)
+                    .with_property("repo_id", json!("repo:on-write-fixture"))
+                    .with_property("file_path", json!("src/lib.rs"))
+                    .with_property("generation", json!(7))
+                    .with_limit(10),
+            )
+            .unwrap();
+        assert_eq!(symbols.len(), 2, "{symbols:?}");
+        assert!(symbols
+            .iter()
+            .any(|node| node.properties["name"] == json!("helper_len")));
+
+        let helper_bucket = store
+            .query_nodes(
+                NodeQuery::label(CODE_SYMBOL_NAME_LABEL)
+                    .with_property("repo_id", json!("repo:on-write-fixture"))
+                    .with_property("name", json!("helper_len"))
+                    .with_property("generation", json!(7))
+                    .with_limit(10),
+            )
+            .unwrap();
+        assert_eq!(helper_bucket.len(), 1, "{helper_bucket:?}");
+        assert_eq!(helper_bucket[0].properties["target_count"], json!(1));
+    }
+
     /// Collect every CALLS/DEPENDS edge currently visible for a repo as
     /// (from_name, edge_type, to_name) at the latest generation, the same way
     /// traversal sees them (stale-generation neighbors filtered out).
@@ -5590,6 +6471,416 @@ mod tests {
             }
         }
         edges
+    }
+
+    fn symbol_embedding(store: &Arc<Mutex<RedCoreGraphStore>>, symbol_id: &str) -> Vec<f32> {
+        let guard = store.lock().unwrap();
+        let node = guard
+            .get_node(symbol_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("symbol {symbol_id} present"));
+        let vector =
+            crate::code_embed_hook::extract_float_vec(&node.properties, EMBEDDING_PROPERTY)
+                .unwrap_or_else(|| panic!("embedding present on {symbol_id}"));
+        vector
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixtureSemanticCodeEmbedder;
+
+    impl CodeEmbedder for FixtureSemanticCodeEmbedder {
+        fn embed_code(&self, text: &str) -> Result<Vec<f32>, CodeEmbeddingError> {
+            let text = text.to_ascii_lowercase();
+            if text.contains("parse") || text.contains("decode") || text.contains("json") {
+                Ok(vec![1.0, 0.0, 0.0])
+            } else if text.contains("render") || text.contains("button") || text.contains("view") {
+                Ok(vec![0.0, 1.0, 0.0])
+            } else {
+                Ok(vec![0.0, 0.0, 1.0])
+            }
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn name(&self) -> &str {
+            "fixture-semantic-code"
+        }
+    }
+
+    #[test]
+    fn configured_code_embedder_controls_symbol_dimension_and_similarity() {
+        let query = FixtureSemanticCodeEmbedder
+            .embed_code("fn parse_request(json: &str) -> Request")
+            .unwrap();
+        let similar = FixtureSemanticCodeEmbedder
+            .embed_code("fn decode_json(input: &str) -> Value")
+            .unwrap();
+        let dissimilar = FixtureSemanticCodeEmbedder
+            .embed_code("fn render_button(view: &mut Ui)")
+            .unwrap();
+        assert!(
+            cosine_similarity(&query, &similar) > cosine_similarity(&query, &dissimilar),
+            "configured encoder must rank semantically similar code closer"
+        );
+
+        let store = Arc::new(Mutex::new(RedCoreGraphStore::memory()));
+        let dispatcher = HookDispatcher::start(
+            Arc::clone(&store),
+            vec![incremental_embed_hook_with_embedder(Arc::new(
+                FixtureSemanticCodeEmbedder,
+            ))],
+            HookDispatcherConfig::default(),
+        );
+        store
+            .lock()
+            .unwrap()
+            .attach_hook_emitter(dispatcher.emitter());
+        let repo_id = "repo:w4-configured-embedding";
+        let symbol_id = symbol_node_id(repo_id, "src/lib.rs", "function", "parse_request", 1);
+
+        {
+            let mut guard = store.lock().unwrap();
+            index_source_file_write_in_store(
+                &mut guard,
+                SourceFileWriteIndexInput {
+                    tenant_id: "theorem".to_string(),
+                    repo_id: repo_id.to_string(),
+                    repo_root_display: "embedded://repo/w4-configured-embedding".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    content: b"pub fn parse_request(json: &str) -> usize { json.len() }\n"
+                        .to_vec(),
+                    actor: "w4-test".to_string(),
+                    generation: 1,
+                    materialize_symbol_name_index: true,
+                },
+            )
+            .unwrap();
+        }
+        assert!(
+            dispatcher.quiesce(Duration::from_secs(10)),
+            "configured embedding hook drained"
+        );
+        let vector = symbol_embedding(&store, &symbol_id);
+        assert_eq!(vector, vec![1.0, 0.0, 0.0]);
+        let designations = store.lock().unwrap().vector_designations();
+        assert!(
+            designations.iter().any(|designation| {
+                designation.label == CODE_SYMBOL_LABEL
+                    && designation.property == EMBEDDING_PROPERTY
+                    && designation.dimension == 3
+            }),
+            "CodeSymbol/embedding designation must follow configured encoder dimension: {designations:?}"
+        );
+    }
+
+    #[test]
+    fn source_file_write_refreshes_embedding_via_hook() {
+        let store = Arc::new(Mutex::new(RedCoreGraphStore::memory()));
+        let dispatcher = start_code_kg_dispatcher(Arc::clone(&store));
+        let repo_id = "repo:on-write-embedding";
+        let symbol_id = symbol_node_id(repo_id, "src/lib.rs", "function", "alpha", 1);
+
+        let write_source = |content: &str, generation: u64| {
+            let mut guard = store.lock().unwrap();
+            index_source_file_write_in_store(
+                &mut guard,
+                SourceFileWriteIndexInput {
+                    tenant_id: "theorem".to_string(),
+                    repo_id: repo_id.to_string(),
+                    repo_root_display: "embedded://repo/on-write-embedding".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    content: content.as_bytes().to_vec(),
+                    actor: "w1-test".to_string(),
+                    generation,
+                    materialize_symbol_name_index: true,
+                },
+            )
+            .unwrap()
+        };
+
+        write_source("pub fn alpha() -> usize { 1 }\n", 11);
+        assert!(
+            dispatcher.quiesce(Duration::from_secs(10)),
+            "embedding hook drained after initial source write"
+        );
+        let first = symbol_embedding(&store, &symbol_id);
+        assert_eq!(first.len(), EMBEDDING_DIM);
+
+        write_source("pub   fn   alpha()    ->    usize   {   1   }\n", 12);
+        assert!(
+            dispatcher.quiesce(Duration::from_secs(10)),
+            "embedding hook drained after token-equivalent edit"
+        );
+        let whitespace_only = symbol_embedding(&store, &symbol_id);
+        assert_eq!(
+            first, whitespace_only,
+            "token-equivalent whitespace edit keeps the embedding idempotent"
+        );
+
+        write_source("pub fn alpha() -> usize { 2 }\n", 13);
+        assert!(
+            dispatcher.quiesce(Duration::from_secs(10)),
+            "embedding hook drained after token-changing edit"
+        );
+        let changed = symbol_embedding(&store, &symbol_id);
+        assert_ne!(
+            whitespace_only, changed,
+            "token-changing source-file edit refreshes the embedding"
+        );
+    }
+
+    #[test]
+    fn source_file_write_rewrites_touched_outgoing_edges() {
+        let repo_dir = unique_dir("on-write-edge-rewrite");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(repo_dir.join("helper.py"), "def helper():\n    return 1\n").unwrap();
+        fs::write(repo_dir.join("caller.py"), "def caller():\n    return 1\n").unwrap();
+        fs::write(
+            repo_dir.join("unrelated.py"),
+            "def unrelated():\n    return helper()\n",
+        )
+        .unwrap();
+        let input = |repo: &PathBuf| IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            repo_id: "repo:on-write-edges".to_string(),
+            materialize_symbol_name_index: true,
+            ..Default::default()
+        };
+
+        let mut incremental = RedCoreGraphStore::memory();
+        let initial = ingest_codebase_in_store(&mut incremental, input(&repo_dir)).unwrap();
+        let before = collect_visible_edges(&incremental, "repo:on-write-edges");
+        assert!(before.contains(&(
+            "unrelated".to_string(),
+            CALLS_SYMBOL.to_string(),
+            "helper".to_string()
+        )));
+        assert!(!before.contains(&(
+            "caller".to_string(),
+            CALLS_SYMBOL.to_string(),
+            "helper".to_string()
+        )));
+
+        let edited = "def caller():\n    return helper()\n";
+        let output = index_source_file_write_in_store(
+            &mut incremental,
+            SourceFileWriteIndexInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: "repo:on-write-edges".to_string(),
+                repo_root_display: repo_dir.display().to_string(),
+                file_path: "caller.py".to_string(),
+                content: edited.as_bytes().to_vec(),
+                actor: "w1-test".to_string(),
+                generation: initial.generation + 1,
+                materialize_symbol_name_index: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(output.files_carried, 2);
+        assert_eq!(output.edges_indexed, 1);
+        assert!(output.bucket_lookups < 10, "{output:?}");
+
+        let incremental_edges = collect_visible_edges(&incremental, "repo:on-write-edges");
+        assert!(incremental_edges.contains(&(
+            "caller".to_string(),
+            CALLS_SYMBOL.to_string(),
+            "helper".to_string()
+        )));
+        assert!(incremental_edges.contains(&(
+            "unrelated".to_string(),
+            CALLS_SYMBOL.to_string(),
+            "helper".to_string()
+        )));
+
+        fs::write(repo_dir.join("caller.py"), edited).unwrap();
+        let mut full = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut full, input(&repo_dir)).unwrap();
+        assert_eq!(
+            incremental_edges,
+            collect_visible_edges(&full, "repo:on-write-edges"),
+            "single-file write edge set matches a full ingest after adding a call"
+        );
+
+        let removed = "def caller():\n    return 2\n";
+        let removed_output = index_source_file_write_in_store(
+            &mut incremental,
+            SourceFileWriteIndexInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: "repo:on-write-edges".to_string(),
+                repo_root_display: repo_dir.display().to_string(),
+                file_path: "caller.py".to_string(),
+                content: removed.as_bytes().to_vec(),
+                actor: "w1-test".to_string(),
+                generation: output.generation + 1,
+                materialize_symbol_name_index: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            removed_output.edges_retired >= 1,
+            "removed call tombstones the prior outgoing edge: {removed_output:?}"
+        );
+        let removed_edges = collect_visible_edges(&incremental, "repo:on-write-edges");
+        assert!(!removed_edges.contains(&(
+            "caller".to_string(),
+            CALLS_SYMBOL.to_string(),
+            "helper".to_string()
+        )));
+        assert!(removed_edges.contains(&(
+            "unrelated".to_string(),
+            CALLS_SYMBOL.to_string(),
+            "helper".to_string()
+        )));
+
+        fs::write(repo_dir.join("caller.py"), removed).unwrap();
+        let mut full_removed = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut full_removed, input(&repo_dir)).unwrap();
+        assert_eq!(
+            removed_edges,
+            collect_visible_edges(&full_removed, "repo:on-write-edges"),
+            "single-file write edge set matches a full ingest after removing a call"
+        );
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn source_file_write_recomputes_incoming_edges_for_new_definition() {
+        let repo_dir = unique_dir("on-write-incoming-edge");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(
+            repo_dir.join("caller.py"),
+            "def caller():\n    return mystery()\n",
+        )
+        .unwrap();
+        let input = |repo: &PathBuf| IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            repo_id: "repo:on-write-incoming".to_string(),
+            materialize_symbol_name_index: true,
+            ..Default::default()
+        };
+
+        let mut incremental = RedCoreGraphStore::memory();
+        let initial = ingest_codebase_in_store(&mut incremental, input(&repo_dir)).unwrap();
+        assert!(
+            !collect_visible_edges(&incremental, "repo:on-write-incoming").contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "mystery".to_string()
+            )),
+            "no edge before mystery is defined"
+        );
+
+        let mystery = "def mystery():\n    return 7\n";
+        let output = index_source_file_write_in_store(
+            &mut incremental,
+            SourceFileWriteIndexInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: "repo:on-write-incoming".to_string(),
+                repo_root_display: repo_dir.display().to_string(),
+                file_path: "mystery.py".to_string(),
+                content: mystery.as_bytes().to_vec(),
+                actor: "w1-test".to_string(),
+                generation: initial.generation + 1,
+                materialize_symbol_name_index: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(output.files_carried, 1);
+        assert_eq!(output.edges_indexed, 1);
+        assert!(output.bucket_lookups < 10, "{output:?}");
+
+        let incremental_edges = collect_visible_edges(&incremental, "repo:on-write-incoming");
+        assert!(
+            incremental_edges.contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "mystery".to_string()
+            )),
+            "carried caller links to newly defined mystery: {incremental_edges:?}"
+        );
+
+        fs::write(repo_dir.join("mystery.py"), mystery).unwrap();
+        let mut full = RedCoreGraphStore::memory();
+        ingest_codebase_in_store(&mut full, input(&repo_dir)).unwrap();
+        assert_eq!(
+            incremental_edges,
+            collect_visible_edges(&full, "repo:on-write-incoming"),
+            "single-file write incoming edge set matches a full ingest"
+        );
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn source_file_write_touches_only_changed_name_buckets_in_large_repo() {
+        let repo_dir = unique_dir("on-write-large-bucket-bound");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let symbol_count = 250usize;
+        for index in 0..symbol_count {
+            fs::write(
+                repo_dir.join(format!("helper_{index}.py")),
+                format!("def helper_{index}():\n    return {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(repo_dir.join("caller.py"), "def caller():\n    return 1\n").unwrap();
+        let input = |repo: &PathBuf| IngestCodebaseInput {
+            tenant_id: "theorem".to_string(),
+            repo_path: repo.display().to_string(),
+            repo_id: "repo:on-write-large-bucket-bound".to_string(),
+            materialize_symbol_name_index: true,
+            max_files: (symbol_count as u64) + 10,
+            ..Default::default()
+        };
+
+        let mut store = RedCoreGraphStore::memory();
+        let initial = ingest_codebase_in_store(&mut store, input(&repo_dir)).unwrap();
+        assert!(
+            initial.symbols_indexed > 200,
+            "fixture should be multi-hundred symbols: {initial:?}"
+        );
+
+        let edited = "def caller():\n    return helper_42()\n";
+        let output = index_source_file_write_in_store(
+            &mut store,
+            SourceFileWriteIndexInput {
+                tenant_id: "theorem".to_string(),
+                repo_id: "repo:on-write-large-bucket-bound".to_string(),
+                repo_root_display: repo_dir.display().to_string(),
+                file_path: "caller.py".to_string(),
+                content: edited.as_bytes().to_vec(),
+                actor: "w1-test".to_string(),
+                generation: initial.generation + 1,
+                materialize_symbol_name_index: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output.symbols_indexed, 1);
+        assert!(
+            output.bucket_lookups <= 4,
+            "bucket work should be bounded by names in changed file, not repo size: {output:?}"
+        );
+        assert!(
+            output.bucket_lookups < initial.symbols_indexed / 50,
+            "bucket work must stay far below all repo symbols: {output:?}"
+        );
+        let edges = collect_visible_edges(&store, "repo:on-write-large-bucket-bound");
+        assert!(
+            edges.contains(&(
+                "caller".to_string(),
+                CALLS_SYMBOL.to_string(),
+                "helper_42".to_string()
+            )),
+            "changed caller links to one target in the large repo: {edges:?}"
+        );
+
+        fs::remove_dir_all(repo_dir).ok();
     }
 
     #[test]
@@ -6406,6 +7697,7 @@ mod tests {
         let manifest = CodeParsingPlugin.manifest();
         assert_eq!(manifest.name, "rustyred.thg.code");
         assert!(manifest.labels.contains(&CODE_SYMBOL_LABEL));
+        assert!(manifest.labels.contains(&CODE_SYMBOL_NAME_LABEL));
         assert!(manifest.edge_types.contains(&CALLS_SYMBOL));
         assert!(manifest.operations.iter().any(|operation| operation.command
             == "RUSTYRED_THG.CODE.INGEST"

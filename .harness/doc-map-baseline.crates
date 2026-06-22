@@ -4,6 +4,7 @@ ensemble
 pilot-core
 prose-check
 reconstruction-engine
+rustyred-code-embedding
 rustyred-hipporag
 rustyred-membrane
 rustyred-rerank

@@ -1,0 +1,23 @@
+[package]
+name = "rustyred-workspace"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "RustyRed code-workspace import seam: bring a git checkout into the embedded DocTree workspace with source/artifact filtering and batch persistence."
+
+[workspace]
+
+[dependencies]
+fuser = { version = "0.17.0", optional = true, features = ["macos-no-mount"] }
+ignore = "0.4"
+rustyred-embedded = { path = "../rustyred-embedded" }
+rustyred-thg-code = { path = "../../rustyredcore_THG/crates/rustyred-thg-code" }
+theorem-receiver = { path = "../../rustyredcore_THG/crates/theorem-receiver" }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[features]
+default = []
+fuse-host = ["dep:fuser"]

@@ -1,0 +1,39 @@
+# rustyred-fuse: North Star "RustyRed as Code Workspace", unit W6 (FUSE endgame).
+#
+# Mount the DocTree as a real POSIX filesystem so the toolchain reads and writes
+# RustyRed's files directly: one copy, no materialize/sync (W0/W3's copy goes
+# away). This first slice is a READ-ONLY mount over a `FileSource` (path -> bytes,
+# exactly the DocTree's shape); read-write and the live Engine adapter are next.
+#
+# macFUSE is OPTIONAL. The DocTree -> filesystem translation (file/dir
+# distinction, immediate-children extraction, inode mapping) is pure and always
+# builds + tests with NO system dependency. The actual kernel mount (the `fuser`
+# FFI, which needs macFUSE/libfuse to link) lives behind the `mount` feature, so
+# the crate ships and is verifiable on any machine; only running a real mount
+# needs macFUSE installed + its kext loaded.
+#
+#   cargo test --manifest-path apps/rustyred-fuse/Cargo.toml                 # pure logic, no macFUSE
+#   cargo test --manifest-path apps/rustyred-fuse/Cargo.toml --features mount # + the mount glue (needs macFUSE)
+#   cargo test ... --features mount -- --ignored                             # live mount (needs the kext loaded)
+#
+# Standalone Cargo root, mirrors apps/rustyred-embedded.
+# Plan: docs/plans/rustyred-code-workspace/W6-fuse-endgame.md
+
+[package]
+name = "rustyred-fuse"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "RustyRed code workspace W6: mount the DocTree as a real FUSE filesystem (read-only; macFUSE optional behind the `mount` feature)."
+
+[features]
+default = []
+# Enable the real kernel mount (pulls fuser + libc; needs macFUSE/libfuse).
+mount = ["dep:fuser", "dep:libc"]
+
+[dependencies]
+fuser = { version = "0.14", optional = true }
+libc = { version = "0.2", optional = true }
+
+[workspace]
