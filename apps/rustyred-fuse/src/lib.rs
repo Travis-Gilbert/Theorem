@@ -14,10 +14,15 @@
 //! Plan: docs/plans/rustyred-code-workspace/W6-fuse-endgame.md
 
 use std::collections::{BTreeMap, HashMap};
+
+#[cfg(feature = "mount")]
 use std::ffi::OsStr;
+#[cfg(feature = "mount")]
 use std::path::Path;
+#[cfg(feature = "mount")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "mount")]
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
@@ -162,8 +167,10 @@ impl Inodes {
     }
 }
 
+#[cfg(feature = "mount")]
 const TTL: Duration = Duration::from_secs(1);
 
+#[cfg(feature = "mount")]
 fn attr_for(ino: u64, kind: NodeKind, size: u64) -> FileAttr {
     let now: SystemTime = UNIX_EPOCH;
     let (ftype, perm, nlink) = match kind {
@@ -191,13 +198,15 @@ fn attr_for(ino: u64, kind: NodeKind, size: u64) -> FileAttr {
 
 /// A read-only FUSE filesystem over a [`FileSource`]. Source paths are snapshotted
 /// into a [`DirView`] at construction (read-only slice; a read-write slice would
-/// rebuild on write).
+/// rebuild on write). Behind the `mount` feature (it needs macFUSE to link).
+#[cfg(feature = "mount")]
 pub struct DocTreeFs<S: FileSource> {
     source: S,
     view: DirView,
     inodes: Inodes,
 }
 
+#[cfg(feature = "mount")]
 impl<S: FileSource> DocTreeFs<S> {
     pub fn new(source: S) -> Self {
         let view = DirView::new(source.paths());
@@ -216,6 +225,7 @@ impl<S: FileSource> DocTreeFs<S> {
     }
 }
 
+#[cfg(feature = "mount")]
 impl<S: FileSource> Filesystem for DocTreeFs<S> {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(parent_path) = self.inodes.path(parent).map(str::to_string) else {
@@ -321,7 +331,8 @@ impl<S: FileSource> Filesystem for DocTreeFs<S> {
 }
 
 /// Mount `source` read-only at `mountpoint` (blocking until unmounted). Needs the
-/// macFUSE kext loaded.
+/// macFUSE kext loaded. Behind the `mount` feature.
+#[cfg(feature = "mount")]
 pub fn mount_readonly<S: FileSource>(source: S, mountpoint: &Path) -> std::io::Result<()> {
     let options = vec![
         MountOption::RO,
@@ -409,10 +420,12 @@ mod tests {
     }
 
     // Live mount: proves the kernel actually serves DocTree files through the
-    // mount. Needs the macFUSE kext loaded (System Settings -> Privacy & Security
-    // approval, then reboot). Run with: cargo test -- --ignored
+    // mount. Behind the `mount` feature; needs the macFUSE kext loaded (System
+    // Settings -> Privacy & Security approval, then reboot).
+    // Run with: cargo test --features mount -- --ignored
+    #[cfg(feature = "mount")]
     #[test]
-    #[ignore = "needs macFUSE kext loaded (approve + reboot); run with --ignored"]
+    #[ignore = "needs macFUSE kext loaded (approve + reboot); run with --features mount -- --ignored"]
     fn live_mount_reads_files_through_the_kernel() {
         struct Mem(Vec<(String, Vec<u8>)>);
         impl FileSource for Mem {
