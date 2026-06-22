@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.theorem.desktop",
   "build": {
-    "beforeDevCommand": "pnpm --dir ../../../travisgilbert.me dev",
-    "devUrl": "http://localhost:3000",
-    "beforeBuildCommand": "npm --prefix ../../../travisgilbert.me run build:desktop",
-    "frontendDist": "../../../../travisgilbert.me/out"
+    "beforeDevCommand": "npm --prefix .. run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm --prefix .. run build",
+    "frontendDist": "../dist"
   },
   "app": {
     "windows": [
