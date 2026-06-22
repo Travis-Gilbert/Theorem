@@ -78,9 +78,10 @@ impl SourceRef {
     }
 
     /// The single-string key written alongside the ref so a node-property filter
-    /// is one exact match: `"{source}:{external_id}"`.
+    /// is one exact match. Length-prefixed (`"<len(source)>:<source>:<external_id>"`)
+    /// so it cannot collide when either component contains a `:`.
     pub fn key(&self) -> String {
-        format!("{}:{}", self.source, self.external_id)
+        format!("{}:{}:{}", self.source.len(), self.source, self.external_id)
     }
 }
 

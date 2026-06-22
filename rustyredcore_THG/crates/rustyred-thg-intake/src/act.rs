@@ -67,11 +67,13 @@ where
     S: GraphStore,
     B: BlobStore,
 {
-    let result = seam.act(suggestion)?;
+    // Validate the target item BEFORE firing the affordance, so a bad item id
+    // does not trigger an external side effect that then fails on writeback.
     let mut item = commonplace
         .get_item(item_id)
         .map_err(store_err)?
         .ok_or_else(|| SourceError::Mapping(format!("item {item_id} not found")))?;
+    let result = seam.act(suggestion)?;
     item.extra
         .insert("agent_action".into(), json!(suggestion.action.as_str()));
     item.extra.insert("agent_result".into(), result);

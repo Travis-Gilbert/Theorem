@@ -194,7 +194,8 @@ where
         source: &str,
         external_id: &str,
     ) -> GraphStoreResult<Option<Item>> {
-        let key = format!("{source}:{external_id}");
+        // Reuse SourceRef::key so the lookup key matches what put_item wrote.
+        let key = crate::item::SourceRef::new(source, external_id).key();
         let nodes = self.store.query_nodes(
             NodeQuery::label(ITEM_LABEL)
                 .with_property(SOURCE_REF_KEY_PROPERTY, json!(key))

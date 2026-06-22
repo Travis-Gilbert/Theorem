@@ -227,6 +227,11 @@ impl IngestInput {
     }
 
     fn item_kind(&self) -> ItemKind {
+        // Task scalars force `Task` kind for any body shape (e.g. a link-bodied
+        // capture turned into a task), so it appears in task queries.
+        if self.task.is_some() {
+            return ItemKind::Task;
+        }
         match &self.body {
             IngestBody::Text { kind, .. } | IngestBody::Binary { kind, .. } => kind.clone(),
             IngestBody::Link { .. } => ItemKind::Link,
@@ -494,20 +499,33 @@ where
     {
         let embedding = self.embed_input(&input)?;
         let searchable_text = input.searchable_text();
-        let collection = match forced {
-            Some(collection) => collection,
-            None => self.choose_or_create_collection(commonplace, &input, &embedding)?,
-        };
-        let folder_path = folder_path_for(&collection.name, &input.title);
 
         // A3 idempotency: a re-fetched source record updates the same item in
         // place (reusing its id upserts every outgoing edge), never a duplicate.
-        let existing_id = match &input.source_ref {
-            Some(source_ref) => commonplace
-                .item_by_source_ref(&source_ref.source, &source_ref.external_id)?
-                .map(|existing| existing.id),
+        let existing_item = match &input.source_ref {
+            Some(source_ref) => {
+                commonplace.item_by_source_ref(&source_ref.source, &source_ref.external_id)?
+            }
             None => None,
         };
+
+        let collection = match (forced, &existing_item) {
+            (Some(collection), _) => collection,
+            // Sticky on update: keep the item's current collection. No durable
+            // edge-delete is available, so re-classifying to a different
+            // collection would leave the item a member of both; staying put
+            // keeps membership single and correct. (A genuine re-file is an
+            // explicit `ingest_routed`/move, not a side effect of re-sync.)
+            (None, Some(existing)) => match existing.collections.first() {
+                Some(collection_id) => match commonplace.get_collection(collection_id)? {
+                    Some(collection) => collection,
+                    None => self.choose_or_create_collection(commonplace, &input, &embedding)?,
+                },
+                None => self.choose_or_create_collection(commonplace, &input, &embedding)?,
+            },
+            (None, None) => self.choose_or_create_collection(commonplace, &input, &embedding)?,
+        };
+        let folder_path = folder_path_for(&collection.name, &input.title);
 
         let mut item = Item::new(input.item_kind(), input.title.clone())
             .with_residency(input.residency)
@@ -519,8 +537,12 @@ where
             .with_extra("folder_path", json!(folder_path.clone()))
             .with_extra("auto_structured", json!(true));
 
-        if let Some(id) = existing_id {
-            item = item.with_id(id);
+        if let Some(existing) = &existing_item {
+            // Reuse the id and preserve the original creation time (put_item only
+            // sets created_at_ms when it is 0, so carrying it forward stops a
+            // re-fetch from resetting it).
+            item = item.with_id(existing.id.clone());
+            item.created_at_ms = existing.created_at_ms;
         }
         if let Some(source) = input.source.clone() {
             item = item.with_source(source);

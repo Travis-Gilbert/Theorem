@@ -56,7 +56,12 @@ pub type HttpFetch = dyn Fn(&HttpRequest) -> SourceResult<String>;
 /// The real network client (the only OS/network-touching code). Maps Google/
 /// Microsoft/Notion/Linear auth + rate-limit statuses onto [`SourceError`].
 pub fn ureq_fetch(req: &HttpRequest) -> SourceResult<String> {
-    let agent = ureq::agent();
+    // A global deadline so a stalled upstream cannot block sync_source forever.
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build(),
+    );
     let mut response = if req.method == "POST" {
         let mut builder = agent.post(&req.url);
         for (key, value) in &req.headers {
@@ -179,6 +184,35 @@ fn parse_iso_date_to_ms(value: &str) -> Option<i64> {
     Some(days_from_civil(year, month, day) * 86_400 * 1000)
 }
 
+/// Parse a leading `YYYY-MM-DD[THH:MM:SS...]` (RFC 3339, fractional seconds and
+/// offset tolerated by truncation; treated as UTC) to epoch ms. Used to stamp a
+/// record's source instant so the driver can advance the high-water cursor.
+fn parse_rfc3339_to_ms(value: &str) -> Option<i64> {
+    let date_ms = parse_iso_date_to_ms(value)?;
+    let bytes = value.as_bytes();
+    if value.len() >= 19 && (bytes[10] == b'T' || bytes[10] == b' ') {
+        let hour: i64 = value.get(11..13)?.parse().ok()?;
+        let minute: i64 = value.get(14..16)?.parse().ok()?;
+        let second: i64 = value.get(17..19)?.parse().ok()?;
+        return Some(date_ms + (hour * 3600 + minute * 60 + second) * 1000);
+    }
+    Some(date_ms)
+}
+
+/// The effective `since` bound for a fetch: the caller's `scope.since_ms`, or the
+/// cursor's high-water mark when starting a fresh sync (empty page token). Within
+/// pagination the token carries position, so the cursor high-water is not
+/// re-applied as a filter.
+fn effective_since(scope: &SourceScope, cursor: &SourceCursor) -> Option<i64> {
+    scope.since_ms.or({
+        if cursor.token.is_empty() && cursor.updated_at_ms > 0 {
+            Some(cursor.updated_at_ms)
+        } else {
+            None
+        }
+    })
+}
+
 fn page_size_or(scope: &SourceScope, default: u32, cap: u32) -> u32 {
     scope.max_records.map(|m| m.clamp(1, cap)).unwrap_or(default)
 }
@@ -223,7 +257,7 @@ fn gsuite_params(scope: &SourceScope, cursor: &SourceCursor) -> Vec<(String, Str
             .join(" or ");
         clauses.push(format!("({parents})"));
     }
-    if let Some(since) = scope.since_ms {
+    if let Some(since) = effective_since(scope, cursor) {
         clauses.push(format!("modifiedTime > '{}'", epoch_ms_to_rfc3339(since)));
     }
     for filter in &scope.filters {
@@ -252,7 +286,10 @@ impl RecordTransport for GSuiteDriveTransport {
         let mut records = Vec::new();
         for file in json_array(&value, &["files"]) {
             let id = require_id(&file, "drive file")?;
-            records.push(SourceRecord::new(id, file, 0));
+            let fetched = str_at(&file, &["modifiedTime"])
+                .and_then(|t| parse_rfc3339_to_ms(&t))
+                .unwrap_or(0);
+            records.push(SourceRecord::new(id, file, fetched));
         }
         Ok(page(records, next, cursor))
     }
@@ -293,7 +330,7 @@ impl RecordTransport for GmailHttpTransport {
     fn fetch(&self, scope: &SourceScope, cursor: &SourceCursor) -> SourceResult<SourcePage> {
         let mut params = vec![("maxResults".to_string(), page_size_or(scope, 100, 500).to_string())];
         let mut q = scope.filters.join(" ");
-        if let Some(since) = scope.since_ms {
+        if let Some(since) = effective_since(scope, cursor) {
             q = format!("{q} after:{}", since.div_euclid(1000)).trim().to_string();
         }
         if !q.trim().is_empty() {
@@ -327,6 +364,10 @@ impl RecordTransport for GmailHttpTransport {
                 .unwrap_or_else(|| "(no subject)".into());
             let snippet = str_at(&msg, &["snippet"]).unwrap_or_default();
             let label_ids = msg.get("labelIds").cloned().unwrap_or_else(|| json!([]));
+            // Gmail `internalDate` is epoch ms as a string.
+            let fetched = str_at(&msg, &["internalDate"])
+                .and_then(|d| d.parse::<i64>().ok())
+                .unwrap_or(0);
             let raw = json!({
                 "id": id,
                 "subject": subject,
@@ -334,7 +375,7 @@ impl RecordTransport for GmailHttpTransport {
                 "body": snippet,
                 "labelIds": label_ids,
             });
-            records.push(SourceRecord::new(id, raw, 0));
+            records.push(SourceRecord::new(id, raw, fetched));
         }
         Ok(page(records, next, cursor))
     }
@@ -380,14 +421,14 @@ impl RecordTransport for OutlookHttpTransport {
                 None => format!("{}/me/messages", self.base_url),
             };
             let mut filters = Vec::new();
-            if let Some(since) = scope.since_ms {
+            if let Some(since) = effective_since(scope, cursor) {
                 filters.push(format!("receivedDateTime ge {}", epoch_ms_to_rfc3339(since)));
             }
             filters.extend(scope.filters.iter().cloned());
             let mut params = vec![
                 (
                     "$select".to_string(),
-                    "id,subject,bodyPreview,parentFolderId".to_string(),
+                    "id,subject,bodyPreview,parentFolderId,receivedDateTime".to_string(),
                 ),
                 ("$top".to_string(), page_size_or(scope, 50, 1000).to_string()),
             ];
@@ -401,7 +442,10 @@ impl RecordTransport for OutlookHttpTransport {
         let mut records = Vec::new();
         for message in json_array(&value, &["value"]) {
             let id = require_id(&message, "outlook message")?;
-            records.push(SourceRecord::new(id, message, 0));
+            let fetched = str_at(&message, &["receivedDateTime"])
+                .and_then(|t| parse_rfc3339_to_ms(&t))
+                .unwrap_or(0);
+            records.push(SourceRecord::new(id, message, fetched));
         }
         Ok(page(records, next, cursor))
     }
@@ -454,7 +498,7 @@ impl RecordTransport for NotionHttpTransport {
         if !cursor.token.is_empty() {
             body.insert("start_cursor".to_string(), json!(cursor.token));
         }
-        if let Some(since) = scope.since_ms {
+        if let Some(since) = effective_since(scope, cursor) {
             body.insert(
                 "filter".to_string(),
                 json!({
@@ -480,8 +524,11 @@ impl RecordTransport for NotionHttpTransport {
         for page_obj in json_array(&value, &["results"]) {
             let id = require_id(&page_obj, "notion page")?;
             let title = notion_title(&page_obj).unwrap_or_else(|| "(untitled)".into());
+            let fetched = str_at(&page_obj, &["last_edited_time"])
+                .and_then(|t| parse_rfc3339_to_ms(&t))
+                .unwrap_or(0);
             let raw = json!({ "id": id, "title": title, "text": "", "database_id": database });
-            records.push(SourceRecord::new(id, raw, 0));
+            records.push(SourceRecord::new(id, raw, fetched));
         }
         // Notion paginates by `has_more`, not an empty cursor.
         Ok(SourcePage {
@@ -549,7 +596,7 @@ impl RecordTransport for LinearHttpTransport {
         if !scope.containers.is_empty() {
             filter.insert("team".to_string(), json!({ "id": { "in": scope.containers } }));
         }
-        if let Some(since) = scope.since_ms {
+        if let Some(since) = effective_since(scope, cursor) {
             filter.insert("updatedAt".to_string(), json!({ "gte": epoch_ms_to_rfc3339(since) }));
         }
         let variables = json!({
@@ -581,6 +628,9 @@ impl RecordTransport for LinearHttpTransport {
         for node in json_array(&issues, &["nodes"]) {
             let id = require_id(&node, "linear issue")?;
             let due_at_ms = str_at(&node, &["dueDate"]).and_then(|d| parse_iso_date_to_ms(&d));
+            let fetched = str_at(&node, &["updatedAt"])
+                .and_then(|t| parse_rfc3339_to_ms(&t))
+                .unwrap_or(0);
             let raw = json!({
                 "id": id,
                 "title": node.get("title").cloned().unwrap_or(Value::Null),
@@ -590,7 +640,7 @@ impl RecordTransport for LinearHttpTransport {
                 "dueAtMs": due_at_ms,
                 "teamId": str_at(&node, &["team", "id"]),
             });
-            records.push(SourceRecord::new(id, raw, 0));
+            records.push(SourceRecord::new(id, raw, fetched));
         }
         Ok(SourcePage {
             records,
@@ -655,6 +705,23 @@ mod tests {
         let ms = parse_iso_date_to_ms("2023-11-14").unwrap();
         assert_eq!(epoch_ms_to_rfc3339(ms), "2023-11-14T00:00:00Z");
         assert!(parse_iso_date_to_ms("not-a-date").is_none());
+        // RFC3339 datetime round-trips through the time component too.
+        let dt = parse_rfc3339_to_ms("2024-06-01T12:00:00Z").unwrap();
+        assert_eq!(epoch_ms_to_rfc3339(dt), "2024-06-01T12:00:00Z");
+    }
+
+    #[test]
+    fn effective_since_uses_cursor_high_water_only_on_a_fresh_start() {
+        let scope = SourceScope::default();
+        // Fresh start (empty token) consumes the cursor high-water.
+        let fresh = SourceCursor { token: String::new(), updated_at_ms: 123 };
+        assert_eq!(effective_since(&scope, &fresh), Some(123));
+        // Mid-pagination (non-empty token) does not re-apply it.
+        let paging = SourceCursor { token: "p2".into(), updated_at_ms: 123 };
+        assert_eq!(effective_since(&scope, &paging), None);
+        // An explicit scope.since_ms always wins.
+        let scoped = SourceScope::default().since(999);
+        assert_eq!(effective_since(&scoped, &paging), Some(999));
     }
 
     #[test]

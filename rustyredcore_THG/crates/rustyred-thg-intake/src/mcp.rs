@@ -73,7 +73,12 @@ impl McpRecordTransport {
                     .cloned()
                     .unwrap_or_default();
                 let next = map.get("next").and_then(Value::as_str).unwrap_or("").to_string();
-                let exhausted = map.get("exhausted").and_then(Value::as_bool).unwrap_or(true);
+                // Absent `exhausted` defaults from the token: a non-empty
+                // continuation token means there is more to read.
+                let exhausted = map
+                    .get("exhausted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(next.is_empty());
                 (records, next, exhausted)
             }
             _ => {

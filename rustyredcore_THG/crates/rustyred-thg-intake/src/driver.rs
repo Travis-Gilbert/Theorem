@@ -48,13 +48,27 @@ where
         receipts: Vec::new(),
     };
 
+    // The advancing incremental high-water mark (newest record instant seen),
+    // seeded from the incoming cursor so it never goes backward.
+    let mut high_water = cursor.updated_at_ms;
+    // `max_records` is a TOTAL cap across pages: the live transports apply it only
+    // as a per-request page size, so without this a paginated firehose would not
+    // stop at the documented bound.
+    let mut remaining = scope.max_records.map(|m| m as usize);
     let mut current = cursor;
     loop {
         let page = spoke.fetch(scope, &current)?;
-        report.fetched += page.records.len();
+        let mut records = page.records;
+        if let Some(rem) = remaining {
+            if records.len() > rem {
+                records.truncate(rem);
+            }
+        }
+        report.fetched += records.len();
 
-        let mut inputs = Vec::with_capacity(page.records.len());
-        for record in &page.records {
+        let mut inputs = Vec::with_capacity(records.len());
+        for record in &records {
+            high_water = high_water.max(record.fetched_at_ms);
             let mut input = match spoke.to_ingest_input(record) {
                 Ok(input) => input,
                 Err(SourceError::Mapping(_)) => {
@@ -81,14 +95,26 @@ where
 
         let receipts = pipeline.ingest_batch(commonplace, inputs).map_err(store_err)?;
         report.receipts.extend(receipts);
-
         report.next_cursor = page.next.clone();
+
+        if let Some(rem) = remaining.as_mut() {
+            *rem = rem.saturating_sub(records.len());
+            if *rem == 0 {
+                break;
+            }
+        }
         if page.exhausted {
+            break;
+        }
+        // Stop rather than loop forever if a transport reports more work but does
+        // not advance its cursor.
+        if page.next.token == current.token && page.next.updated_at_ms == current.updated_at_ms {
             break;
         }
         current = page.next;
     }
 
+    report.next_cursor.updated_at_ms = high_water;
     Ok(report)
 }
 

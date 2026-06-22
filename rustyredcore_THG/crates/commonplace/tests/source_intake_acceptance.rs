@@ -82,11 +82,12 @@ fn a3_item_by_source_ref_finds_and_reuses_in_place() {
     let again = cp.item_by_source_ref("gmail", "msg-123").unwrap().unwrap();
     assert_eq!(again.id, stored.id, "same node, updated in place");
 
+    let want_key = SourceRef::new("gmail", "msg-123").key();
     let all: Vec<_> = cp
         .all_items()
         .unwrap()
         .into_iter()
-        .filter(|i| i.source_ref_key().as_deref() == Some("gmail:msg-123"))
+        .filter(|i| i.source_ref_key().as_deref() == Some(want_key.as_str()))
         .collect();
     assert_eq!(all.len(), 1, "exactly one item for the source record");
 
@@ -254,7 +255,13 @@ fn b1_soft_source_prior_breaks_ties_but_content_still_wins() {
     let rank_of = |c: &Classification, id: &str| {
         c.ranked.iter().position(|r| r.collection_id == id).unwrap()
     };
-    assert!(rank_of(&pure, &a) != rank_of(&pure, &b));
+    let score_of = |c: &Classification, id: &str| {
+        c.ranked.iter().find(|r| r.collection_id == id).unwrap().score
+    };
+    assert!(
+        (score_of(&pure, &a) - score_of(&pure, &b)).abs() < 1e-6,
+        "pure classification keeps equal-content collections tied (no source prior)"
+    );
 
     // With the prior, the shared-source collection (B) ranks above the equal A.
     let primed = pipeline

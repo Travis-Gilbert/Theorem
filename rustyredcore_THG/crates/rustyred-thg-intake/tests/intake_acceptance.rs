@@ -438,6 +438,71 @@ fn a6_gsuite_drive_http_transport_files_records() {
 }
 
 #[test]
+fn a6_max_records_caps_total_across_paginated_pages() {
+    use rustyred_thg_intake::GSuiteDriveTransport;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let pipeline = IngestPipeline::default();
+    let mut cp = fresh();
+    // A source that always returns a full page plus a next token, ignoring
+    // max_records (the realistic case: max is the per-request page size). Without
+    // the driver's total cap this would paginate forever.
+    let calls = Rc::new(RefCell::new(0usize));
+    let counter = calls.clone();
+    let transport = GSuiteDriveTransport::with_http("tok", "https://drive.test", move |_req| {
+        let mut n = counter.borrow_mut();
+        let base = *n * 4;
+        *n += 1;
+        let files: Vec<Value> = (0..4)
+            .map(|i| json!({"id": format!("f{}", base + i), "name":"x","mimeType":"text/plain","parents":["folder-A"]}))
+            .collect();
+        Ok(json!({"files": files, "nextPageToken": format!("p{n}")}).to_string())
+    });
+    let spoke = GSuiteSpoke::new(Box::new(transport));
+    let scope = SourceScope::containers(["folder-A"]).max_records(5);
+    let report = sync_source(&mut cp, &spoke, &scope, SourceCursor::default(), &pipeline).unwrap();
+    assert_eq!(report.fetched, 5, "total cap stops the sync, not just the page size");
+    assert!(*calls.borrow() <= 2, "did not run away paginating");
+    assert_eq!(cp.all_items().unwrap().len(), 5);
+}
+
+#[test]
+fn a6_high_water_cursor_advances_and_is_consumed_next_sync() {
+    use rustyred_thg_intake::GSuiteDriveTransport;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let pipeline = IngestPipeline::default();
+    let mut cp = fresh();
+    let response = json!({
+        "files":[{"id":"f1","name":"Doc","mimeType":"text/plain","modifiedTime":"2024-06-01T12:00:00Z","parents":["folder-A"]}]
+    })
+    .to_string();
+
+    let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let captured = seen.clone();
+    let transport = GSuiteDriveTransport::with_http("tok", "https://drive.test", move |req| {
+        captured.borrow_mut().push(req.url.clone());
+        Ok(response.clone())
+    });
+    let spoke = GSuiteSpoke::new(Box::new(transport));
+    let scope = SourceScope::containers(["folder-A"]);
+
+    // First sync: no since filter; the high-water advances to the record instant.
+    let first = sync_source(&mut cp, &spoke, &scope, SourceCursor::default(), &pipeline).unwrap();
+    assert!(first.next_cursor.updated_at_ms > 0, "high-water advances past the record");
+
+    // Second sync passing that cursor back: the query now carries a modifiedTime
+    // filter derived from the high-water (so it does not re-pull everything).
+    sync_source(&mut cp, &spoke, &scope, first.next_cursor.clone(), &pipeline).unwrap();
+    let urls = seen.borrow();
+    assert_eq!(urls.len(), 2);
+    assert!(!urls[0].contains("modifiedTime%20%3E"), "first sync: no since filter");
+    assert!(urls[1].contains("modifiedTime%20%3E"), "second sync: filters since the high-water");
+}
+
+#[test]
 fn a6_gmail_http_transport_lists_then_gets_messages() {
     use rustyred_thg_intake::GmailHttpTransport;
 
