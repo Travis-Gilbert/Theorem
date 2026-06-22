@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::adapters::code::CodeFileSnapshot;
 use crate::adapters::note::{NoteIntent, NoteSnapshot};
 use crate::peer::{StructuredOp, SubstratePeer};
 use crate::presence::Presence;
@@ -34,6 +35,7 @@ pub enum SurfaceIntent {
 pub enum SurfaceSnapshot {
     Generic { scope: String, graph: Value },
     Note { snapshot: NoteSnapshot },
+    Code { snapshot: CodeFileSnapshot },
 }
 
 pub trait SurfaceAdapter {
