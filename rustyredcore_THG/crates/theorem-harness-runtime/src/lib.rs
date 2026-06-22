@@ -37,6 +37,7 @@ pub mod composed_agent;
 pub mod compound_engineering;
 pub mod coordination;
 pub mod coordination_push;
+pub mod coordination_v2;
 pub mod engineering_packs;
 pub mod event_log;
 pub mod head_invoker;
@@ -105,6 +106,16 @@ pub use coordination::{
     CoordinationIntentState, CoordinationMessageState, CoordinationPresenceState,
     CoordinationRecordState, CoordinationResult, CoordinationRoomMember, CoordinationRoomState,
     JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
+};
+pub use coordination_v2::{
+    attach_related_event, consume_ping, coordination_manifest_path, create_ping,
+    ping_targets_checkout, read_claims_for_task, read_coordination_manifest, read_open_contradictions,
+    read_open_pings_for_actor, read_pending_pings_for_task, read_related_events, record_claim,
+    register_task_ref, resolve_canonical_room, resolve_task_ref, room_digest, route_message_to_task,
+    turn_start_discovery, write_coordination_manifest, ActorActivity, ActorPing, AttachRelatedInput,
+    Claim, ClaimInput, Contradiction, CoordinationManifest, CoordinationStore, DigestInput,
+    DiscoveryInput, ManifestActor, PingInput, RelatedEvent, RoomAlias, RoomDigest, TaskRef,
+    TaskRefConfidence, TaskRefInput, TurnStartDiscovery, PING_CONSUMED, PING_PENDING, PING_SEEN,
 };
 pub use coordination_push::{
     agent_space_event_kind, agent_space_event_matches, agent_space_high_water_seq,
