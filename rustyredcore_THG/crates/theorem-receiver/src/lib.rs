@@ -48,8 +48,8 @@ pub use lanes::detect_lanes;
 pub use local_exec::{run_proof, ProofPlan, ProofReceipt, TRUST_TIER_LOCAL};
 pub use receiver::{run_loop, run_loop_until, JobRunReport};
 pub use sandbox_exec::{
-    OpenSandboxRuntime, SandboxFile, SandboxHandle, SandboxProvisionRequest, SandboxRuntime,
-    TRUST_TIER_SANDBOX,
+    LocalProcessSandbox, OpenSandboxRuntime, SandboxCancelToken, SandboxFile, SandboxHandle,
+    SandboxProvisionRequest, SandboxRuntime, SandboxStreamEvent, TRUST_TIER_SANDBOX,
 };
 pub use spawn::{build_intent, build_spawn_plan, SpawnPlan};
 pub use wake::{

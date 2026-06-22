@@ -832,6 +832,7 @@ fn request_to_json(request: &IngestJobRequest) -> Value {
             "max_files": input.max_files,
             "max_file_bytes": input.max_file_bytes,
             "max_total_bytes": input.max_total_bytes,
+            "materialize_symbol_name_index": input.materialize_symbol_name_index,
             "actor": input.actor,
         },
         "operation": request.operation,
@@ -877,6 +878,10 @@ fn request_from_json(value: &Value) -> Option<IngestJobRequest> {
         max_files: u64_at(input_value, "max_files"),
         max_file_bytes: u64_at(input_value, "max_file_bytes"),
         max_total_bytes: u64_at(input_value, "max_total_bytes"),
+        materialize_symbol_name_index: input_value
+            .get("materialize_symbol_name_index")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         actor: str_at(input_value, "actor"),
     };
     let caps_value = value.get("caps").cloned().unwrap_or_else(|| json!({}));

@@ -305,7 +305,7 @@ fn run_git_clone(
             "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
         )
         .args(&args)
-        .arg(&dir)
+        .arg(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));

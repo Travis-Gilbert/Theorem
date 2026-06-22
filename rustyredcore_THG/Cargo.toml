@@ -23,6 +23,7 @@ members = [
     "crates/rustyred-rerank",
     "crates/rustyred-hipporag",
     "crates/rustyred-web",
+    "crates/rustyred-code-embedding",
     "crates/rustyred-thg-code",
     "crates/rustyred-thg-memory",
     "crates/rustyred-thg-catalog",

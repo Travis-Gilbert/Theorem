@@ -10,6 +10,9 @@ notebook
 obsidian-sync
 orchestrate
 rustyred-embedded
+rustyred-fuse
+rustyred-git
+rustyred-workspace
 theorem-agentd
 theorem-gateway
 theorem-grpc
