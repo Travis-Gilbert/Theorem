@@ -61,7 +61,7 @@ const DEFAULT_SETTINGS: Settings = {
     model: "llama3.2",
   },
   defaultModel: "deepseek",
-  providerKeyPresent: { anthropic: false, openai: false, deepseek: false, ollama: false },
+  providerKeyPresent: { anthropic: false, openai: false, deepseek: false, ollama: false, local: false },
 };
 
 const initialState: AppState = {

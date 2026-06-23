@@ -81,6 +81,27 @@ struct CommonplaceStatus {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct HostedConnectionStatus {
+    endpoint: String,
+    tenant: String,
+    bearer_present: bool,
+    reachable: bool,
+    document_count: Option<u64>,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStatus {
+    enabled: bool,
+    endpoint: String,
+    model: String,
+    reachable: bool,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ReceiverStatus {
     enabled: bool,
     state: String,
@@ -123,6 +144,9 @@ struct ModelChatInput {
     messages: Vec<ModelMessage>,
     ollama_endpoint: Option<String>,
     ollama_model: Option<String>,
+    local_endpoint: Option<String>,
+    local_model: Option<String>,
+    local_protocol: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -783,15 +807,29 @@ fn model_chat(
         .collect::<Vec<_>>()
         .join("\n");
     let tokens_in = estimate_tokens(&prompt);
-    if input.model == "ollama" {
-        let content =
-            call_ollama(&input).unwrap_or_else(|error| format!("Ollama is not available: {error}"));
+    let model_id = input.model.trim().to_ascii_lowercase();
+    if model_id == "ollama" {
+        let content = call_ollama(&input)?;
         let tokens_out = estimate_tokens(&content);
         return Ok(ModelChatResult {
             content,
             usage: TurnUsage {
                 provider: "ollama".to_string(),
-                model: "ollama".to_string(),
+                model: local_model_name(&input, "llama3.2"),
+                tokens_in,
+                tokens_out,
+                estimated_usd: 0.0,
+            },
+        });
+    }
+    if model_id == "local" {
+        let content = call_local_chat(&input)?;
+        let tokens_out = estimate_tokens(&content);
+        return Ok(ModelChatResult {
+            content,
+            usage: TurnUsage {
+                provider: "local".to_string(),
+                model: local_model_name(&input, "gemma3:latest"),
                 tokens_in,
                 tokens_out,
                 estimated_usd: 0.0,
@@ -799,10 +837,7 @@ fn model_chat(
         });
     }
 
-    let answer = format!(
-        "The desktop model lane is configured for {} against {}. Provider API streaming is next; local memory and provenance are active.",
-        input.model, settings.active_target
-    );
+    let answer = call_composed_agent_chat(&settings, &prompt)?;
     let tokens_out = estimate_tokens(&answer);
     let estimated_usd = estimate_cost_usd(&input.model, tokens_in, tokens_out);
     Ok(ModelChatResult {
@@ -1243,6 +1278,80 @@ fn commonplace_status(
     })
 }
 
+#[tauri::command]
+fn hosted_connection_status(
+    state: tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<HostedConnectionStatus, String> {
+    let settings = state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .harness
+        .clone();
+    let bearer = bearer_token().ok();
+    let bearer_present = bearer.is_some();
+    if !bearer_present {
+        return Ok(HostedConnectionStatus {
+            endpoint: settings.endpoint,
+            tenant: settings.tenant,
+            bearer_present,
+            reachable: false,
+            document_count: None,
+            message: "No hosted bearer token stored.".to_string(),
+        });
+    }
+    match tools_list(&settings.endpoint, bearer.as_deref()) {
+        Ok(tools) => Ok(HostedConnectionStatus {
+            endpoint: settings.endpoint,
+            tenant: settings.tenant,
+            bearer_present,
+            reachable: true,
+            document_count: None,
+            message: format!("Hosted harness reachable ({} tools).", tools.len()),
+        }),
+        Err(error) => Ok(HostedConnectionStatus {
+            endpoint: settings.endpoint,
+            tenant: settings.tenant,
+            bearer_present,
+            reachable: false,
+            document_count: None,
+            message: error,
+        }),
+    }
+}
+
+#[tauri::command]
+fn model_status() -> Result<ModelStatus, String> {
+    let protocol = std::env::var("THEOREM_LOCAL_AGENT_PROTOCOL")
+        .unwrap_or_else(|_| "openai".to_string())
+        .to_ascii_lowercase();
+    let endpoint = if protocol == "ollama" {
+        std::env::var("THEOREM_OLLAMA_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string())
+    } else {
+        std::env::var("THEOREM_LOCAL_OPENAI_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080/v1/chat/completions".to_string())
+    };
+    let model = std::env::var("THEOREM_LOCAL_MODEL")
+        .or_else(|_| std::env::var("OLLAMA_MODEL"))
+        .unwrap_or_else(|_| "gemma3:latest".to_string());
+    let reachable = if protocol == "ollama" {
+        ollama_is_reachable(&endpoint)
+    } else {
+        openai_compatible_is_reachable(&endpoint)
+    };
+    Ok(ModelStatus {
+        enabled: true,
+        endpoint,
+        model,
+        reachable,
+        message: if reachable {
+            format!("{protocol} local agent reachable")
+        } else {
+            format!("{protocol} local agent not reachable")
+        },
+    })
+}
+
 fn stop_local_node(state: &tauri::State<'_, Mutex<DesktopBackendState>>) {
     if let Ok(mut backend) = state.lock() {
         if let Some(mut node) = backend.local_node.take() {
@@ -1678,13 +1787,84 @@ fn queue_jobs_from_payload(payload: &Value) -> Vec<QueueJob> {
         .collect()
 }
 
+fn call_composed_agent_chat(settings: &HarnessSettings, task: &str) -> Result<String, String> {
+    let payload = call_selected_tool(
+        settings,
+        "composed_agent_run",
+        json!({
+            "bindingId": "agent:theorem",
+            "task": task,
+        }),
+    )?;
+    Ok(composed_agent_text(&payload).unwrap_or_else(|| payload.to_string()))
+}
+
+fn composed_agent_text(payload: &Value) -> Option<String> {
+    let result = payload.get("result").unwrap_or(payload);
+    result
+        .get("invocation_receipts")
+        .and_then(Value::as_array)
+        .and_then(|receipts| {
+            receipts.iter().rev().find_map(|receipt| {
+                receipt
+                    .pointer("/payload/text")
+                    .or_else(|| receipt.pointer("/payload/content"))
+                    .and_then(Value::as_str)
+                    .or_else(|| receipt.get("output_summary").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+        })
+        .or_else(|| {
+            let claims = result.get("published_claims")?.as_array()?;
+            let text = claims
+                .iter()
+                .filter_map(|claim| claim.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        })
+}
+
+fn call_local_chat(input: &ModelChatInput) -> Result<String, String> {
+    match local_protocol(input).as_str() {
+        "ollama" => call_ollama(input),
+        _ => call_openai_compatible(input),
+    }
+}
+
+fn local_protocol(input: &ModelChatInput) -> String {
+    input
+        .local_protocol
+        .clone()
+        .or_else(|| input.ollama_endpoint.as_ref().map(|_| "ollama".to_string()))
+        .or_else(|| std::env::var("THEOREM_LOCAL_AGENT_PROTOCOL").ok())
+        .unwrap_or_else(|| "openai".to_string())
+        .to_ascii_lowercase()
+}
+
+fn local_model_name(input: &ModelChatInput, fallback: &str) -> String {
+    input
+        .local_model
+        .clone()
+        .or_else(|| input.ollama_model.clone())
+        .or_else(|| std::env::var("THEOREM_LOCAL_MODEL").ok())
+        .or_else(|| std::env::var("OLLAMA_MODEL").ok())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn call_ollama(input: &ModelChatInput) -> Result<String, String> {
     let endpoint = input
         .ollama_endpoint
-        .as_deref()
-        .unwrap_or("http://127.0.0.1:11434")
-        .trim_end_matches('/');
-    let model = input.ollama_model.as_deref().unwrap_or("llama3.2");
+        .clone()
+        .or_else(|| input.local_endpoint.clone())
+        .or_else(|| std::env::var("THEOREM_OLLAMA_ENDPOINT").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+    let endpoint = endpoint.trim_end_matches('/');
+    let model = local_model_name(input, "llama3.2");
     let messages = input
         .messages
         .iter()
@@ -1703,6 +1883,71 @@ fn call_ollama(input: &ModelChatInput) -> Result<String, String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string())
+}
+
+fn call_openai_compatible(input: &ModelChatInput) -> Result<String, String> {
+    let endpoint = input
+        .local_endpoint
+        .clone()
+        .or_else(|| std::env::var("THEOREM_LOCAL_OPENAI_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080/v1/chat/completions".to_string());
+    let url = normalize_openai_chat_url(&endpoint);
+    let model = local_model_name(input, "gemma3:latest");
+    let messages = input
+        .messages
+        .iter()
+        .map(|message| json!({ "role": message.role, "content": message.content }))
+        .collect::<Vec<_>>();
+    let response: Value = reqwest::blocking::Client::new()
+        .post(url)
+        .json(&json!({ "model": model, "messages": messages, "stream": false }))
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?
+        .json()
+        .map_err(|error| error.to_string())?;
+    response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "local OpenAI-compatible endpoint returned no message content".to_string())
+}
+
+fn normalize_openai_chat_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/chat/completions")
+    } else {
+        format!("{trimmed}/v1/chat/completions")
+    }
+}
+
+fn openai_compatible_is_reachable(endpoint: &str) -> bool {
+    let url = normalize_openai_chat_url(endpoint)
+        .trim_end_matches("/chat/completions")
+        .to_string()
+        + "/models";
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+        .ok()
+        .and_then(|client| client.get(url).send().ok())
+        .and_then(|response| response.error_for_status().ok())
+        .is_some()
+}
+
+fn ollama_is_reachable(endpoint: &str) -> bool {
+    let endpoint = endpoint.trim_end_matches('/');
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+        .ok()
+        .and_then(|client| client.get(format!("{endpoint}/api/tags")).send().ok())
+        .and_then(|response| response.error_for_status().ok())
+        .is_some()
 }
 
 fn fetch_text(url: &str) -> Result<String, String> {
@@ -1805,6 +2050,8 @@ pub fn run() {
             harness_bearer_clear,
             local_node_status,
             commonplace_status,
+            hosted_connection_status,
+            model_status,
             receiver_settings_get,
             receiver_settings_set,
             receiver_status,

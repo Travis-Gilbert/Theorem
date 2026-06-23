@@ -93,12 +93,13 @@ export interface RecallHit {
   createdAt?: number;
 }
 
-export type ProviderId = "anthropic" | "openai" | "deepseek" | "ollama";
+export type ProviderId = "anthropic" | "openai" | "deepseek" | "ollama" | "local";
 export type HarnessTarget = "hosted" | "local";
 
 /** Provider roster. DeepSeek is the keyless default per the standing decision. */
 export const PROVIDERS: { id: ProviderId; label: string; keyless: boolean }[] = [
   { id: "deepseek", label: "DeepSeek", keyless: true },
+  { id: "local", label: "Local", keyless: true },
   { id: "ollama", label: "Ollama", keyless: true },
   { id: "anthropic", label: "Anthropic", keyless: false },
   { id: "openai", label: "OpenAI", keyless: false },

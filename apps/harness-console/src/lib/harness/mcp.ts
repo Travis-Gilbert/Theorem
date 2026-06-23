@@ -62,7 +62,7 @@ export const liveClient: HarnessClient = {
   async runAgent(prompt, scope) {
     const result = await callTool("composed_agent_run", {
       bindingId: "agent:theorem",
-      prompt,
+      task: prompt,
       scope,
     });
     const text = typeof result === "string" ? result : JSON.stringify(result);

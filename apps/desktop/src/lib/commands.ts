@@ -276,6 +276,9 @@ export interface ModelChatInput {
   messages: ModelMessage[];
   ollamaEndpoint?: string;
   ollamaModel?: string;
+  localEndpoint?: string;
+  localModel?: string;
+  localProtocol?: "openai" | "ollama";
 }
 
 export interface ModelChatResult {
