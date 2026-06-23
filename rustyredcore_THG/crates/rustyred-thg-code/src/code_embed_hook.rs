@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use rustyred_code_embedding::{CodeEmbedder, CodeEmbeddingConfig, CodeEmbeddingError};
 use rustyred_thg_core::{
     HookContext, HookError, HookHandler, HookOutcome, HookRegistration, MutationEvent,
     MutationKind, MutationMatcher, NodeRecord, RedCoreGraphStore,
@@ -20,6 +21,8 @@ use crate::{property_string, CODE_SYMBOL_LABEL};
 
 /// Property holding the symbol embedding (a float array) + its designation.
 pub const EMBEDDING_PROPERTY: &str = "embedding";
+/// Legacy no-config symbol embedding dimension. Configured W4 embedders may use
+/// a different dimension; the designation follows the selected embedder.
 pub const EMBEDDING_DIM: usize = 64;
 
 /// Text property keys whose change should refresh the embedding. The spec names
@@ -32,7 +35,13 @@ const EMBED_TRIGGER_PROPS: [&str; 5] = ["signature", "snippet", "search_text", "
 const EMBED_EPSILON: f32 = 1e-6;
 
 pub fn incremental_embed_hook() -> HookRegistration {
-    let handler: HookHandler = Arc::new(embed_handler);
+    incremental_embed_hook_with_embedder(default_symbol_embedder())
+}
+
+pub fn incremental_embed_hook_with_embedder(embedder: Arc<dyn CodeEmbedder>) -> HookRegistration {
+    let handler_embedder = Arc::clone(&embedder);
+    let handler: HookHandler =
+        Arc::new(move |ctx, events| embed_handler(ctx, events, handler_embedder.as_ref()));
     HookRegistration::new(
         "code.incremental_embed",
         MutationMatcher::any()
@@ -44,6 +53,12 @@ pub fn incremental_embed_hook() -> HookRegistration {
     )
 }
 
+pub(crate) fn default_symbol_embedder() -> Arc<dyn CodeEmbedder> {
+    CodeEmbeddingConfig::from_env_or_hash(EMBEDDING_DIM)
+        .and_then(|config| config.build())
+        .unwrap_or_else(|error| Arc::new(FailingCodeEmbedder::new(error)))
+}
+
 fn coalesce_code_embed(_event: &MutationEvent) -> Option<String> {
     Some("code-kg-embed".to_string())
 }
@@ -51,8 +66,9 @@ fn coalesce_code_embed(_event: &MutationEvent) -> Option<String> {
 fn embed_handler(
     ctx: &mut HookContext,
     events: &[MutationEvent],
+    embedder: &dyn CodeEmbedder,
 ) -> Result<HookOutcome, HookError> {
-    ensure_embedding_designation(ctx.store)?;
+    ensure_embedding_designation_with_dim(ctx.store, embedder.dimension())?;
 
     let mut writes = 0usize;
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -73,7 +89,9 @@ fn embed_handler(
         if text.trim().is_empty() {
             continue;
         }
-        let vector = embed_text(&text, EMBEDDING_DIM);
+        let vector = embedder
+            .embed_code(&text)
+            .map_err(|error| HookError::new(format!("code embedding failed: {error}")))?;
 
         // Idempotent: skip the write if the same embedding is already present.
         if let Some(existing) = extract_float_vec(&node.properties, EMBEDDING_PROPERTY) {
@@ -91,12 +109,19 @@ fn embed_handler(
 /// Designate `(CodeSymbol, embedding)` as a vector field once. Re-designating is
 /// avoided because it re-indexes every matching node.
 pub(crate) fn ensure_embedding_designation(store: &mut RedCoreGraphStore) -> Result<(), HookError> {
+    ensure_embedding_designation_with_dim(store, EMBEDDING_DIM)
+}
+
+pub(crate) fn ensure_embedding_designation_with_dim(
+    store: &mut RedCoreGraphStore,
+    dimension: usize,
+) -> Result<(), HookError> {
     let already = store.vector_designations().into_iter().any(|designation| {
         designation.label == CODE_SYMBOL_LABEL && designation.property == EMBEDDING_PROPERTY
     });
     if !already {
         store
-            .designate_vector_property(CODE_SYMBOL_LABEL, EMBEDDING_PROPERTY, EMBEDDING_DIM)
+            .designate_vector_property(CODE_SYMBOL_LABEL, EMBEDDING_PROPERTY, dimension)
             .map_err(HookError::from)?;
     }
     Ok(())
@@ -113,37 +138,6 @@ pub(crate) fn symbol_embedding_text(properties: &Value) -> String {
         }
     }
     parts.join(" ")
-}
-
-/// Deterministic offline embedding: hashed bag-of-tokens with signed buckets,
-/// L2-normalized. Stable across runs (idempotent) and dependency-free.
-pub(crate) fn embed_text(text: &str, dim: usize) -> Vec<f32> {
-    let mut vector = vec![0f32; dim];
-    for token in text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-    {
-        let hash = fnv1a(token.to_ascii_lowercase().as_bytes());
-        let index = (hash % dim as u64) as usize;
-        let sign = if (hash >> 1) & 1 == 0 { 1.0 } else { -1.0 };
-        vector[index] += sign;
-    }
-    let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for value in &mut vector {
-            *value /= norm;
-        }
-    }
-    vector
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 pub(crate) fn extract_float_vec(properties: &Value, key: &str) -> Option<Vec<f32>> {
@@ -168,5 +162,32 @@ pub(crate) fn set_embedding(node: &mut NodeRecord, vector: &[f32]) {
         None => {
             node.properties = json!({ EMBEDDING_PROPERTY: array });
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailingCodeEmbedder {
+    message: String,
+}
+
+impl FailingCodeEmbedder {
+    fn new(error: CodeEmbeddingError) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl CodeEmbedder for FailingCodeEmbedder {
+    fn embed_code(&self, _text: &str) -> Result<Vec<f32>, CodeEmbeddingError> {
+        Err(CodeEmbeddingError::Config(self.message.clone()))
+    }
+
+    fn dimension(&self) -> usize {
+        EMBEDDING_DIM
+    }
+
+    fn name(&self) -> &str {
+        "unconfigured"
     }
 }

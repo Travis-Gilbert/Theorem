@@ -11,6 +11,7 @@ use crate::agent_binding::{
     BindingTransitionInput, BindingTransitionResult, HeadKind, ScratchpadRevision,
 };
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
+use crate::constitution::Constitution;
 use crate::head_invocation::{
     FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
     HeadInvocationRequest, HeadInvoker, RevisionContext,
@@ -254,6 +255,8 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
     )?
     .binding;
 
+    let constitution = Constitution::for_binding(&binding, &input.task, &input.claims);
+
     let proposal_receipt = invoke_head(
         invoker,
         primary.clone(),
@@ -261,6 +264,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &binding,
         &input,
         &revisions,
+        &constitution,
     )?;
     let proposal = append_invocation_revision(&mut binding, &proposal_receipt)?;
     binding = contribute_from_receipt(binding, &proposal_receipt, &input.started_at, &mut events)?;
@@ -274,6 +278,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &binding,
         &input,
         &revisions,
+        &constitution,
     )?;
     let critique = append_invocation_revision(&mut binding, &critique_receipt)?;
     binding = contribute_from_receipt(binding, &critique_receipt, &input.started_at, &mut events)?;
@@ -287,6 +292,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &binding,
         &input,
         &revisions,
+        &constitution,
     )?;
     let synthesis_revision = append_invocation_revision(&mut binding, &synthesis_receipt)?;
     binding = contribute_from_receipt(binding, &synthesis_receipt, &input.started_at, &mut events)?;
@@ -317,12 +323,14 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
     )?
     .binding;
 
+    let policy_decision = constitution.publication_decision(&binding);
     binding = apply_step(
         binding,
         "POLICY.CHECKED",
         object_payload(json!({
-            "policy_receipt_id": "policy:fake-loop",
-            "allowed": true,
+            "policy_receipt_id": policy_decision.decision_id,
+            "allowed": policy_decision.allowed,
+            "policy_decision": policy_decision,
             "claims": input.claims
         })),
         &input.started_at,
@@ -393,12 +401,14 @@ fn invoke_head<I: HeadInvoker>(
     binding: &AgentBinding,
     input: &FakeIntraAgentLoopInput,
     revisions: &[ScratchpadRevision],
+    constitution: &Constitution,
 ) -> Result<HeadInvocationReceipt, IntraAgentLoopError> {
     let prior_revision_ids = revisions
         .iter()
         .map(|revision| revision.revision_id.clone())
         .collect();
     let prior_context = revisions.iter().filter_map(revision_context).collect();
+    let policy_decision = constitution.head_turn_decision(binding, &head.head_id, kind);
     let request = HeadInvocationRequest::new_with_context(
         head,
         kind,
@@ -408,7 +418,8 @@ fn invoke_head<I: HeadInvoker>(
         prior_context,
         input.claims.clone(),
         input.started_at.clone(),
-    );
+    )
+    .with_policy_decision(policy_decision);
     invoker
         .invoke(request)
         .map_err(IntraAgentLoopError::Invocation)

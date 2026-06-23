@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::adapters::code::{CodeIntent, CodeSnapshot};
 use crate::adapters::note::{NoteIntent, NoteSnapshot};
 use crate::peer::{StructuredOp, SubstratePeer};
 use crate::presence::Presence;
@@ -24,6 +25,9 @@ pub enum SurfaceIntent {
     Presence {
         presence: Presence,
     },
+    Code {
+        intent: CodeIntent,
+    },
     Note {
         intent: NoteIntent,
     },
@@ -33,6 +37,7 @@ pub enum SurfaceIntent {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum SurfaceSnapshot {
     Generic { scope: String, graph: Value },
+    Code { snapshot: CodeSnapshot },
     Note { snapshot: NoteSnapshot },
 }
 

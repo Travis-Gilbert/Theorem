@@ -1122,6 +1122,7 @@ fn guard_violation(
     BindingError::Guard(Box::new(GuardViolation {
         code: code.into(),
         message: message.into(),
+        policy_layer: String::new(),
         required_state: required_state.into(),
         received_state: received_state.into(),
         missing_fields,

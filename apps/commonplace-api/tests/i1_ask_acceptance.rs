@@ -11,11 +11,27 @@
 use std::sync::Arc;
 
 use async_graphql::Request;
-use commonplace_api::{build_schema, in_memory_store, ApiKeyRegistry, ApiKeyToken, ConsumerSchema};
+use commonplace_api::{
+    build_schema, build_schema_with_model, in_memory_store, AnswerModel, ApiKeyRegistry,
+    ApiKeyToken, ConsumerSchema, RetrievedItem,
+};
 
 fn instance(key: &str) -> ConsumerSchema {
     let registry = Arc::new(ApiKeyRegistry::new().with_key(key, "instance"));
     build_schema(in_memory_store(), registry)
+}
+
+fn instance_with_model(key: &str, model: Arc<dyn AnswerModel>) -> ConsumerSchema {
+    let registry = Arc::new(ApiKeyRegistry::new().with_key(key, "instance"));
+    build_schema_with_model(in_memory_store(), registry, model)
+}
+
+struct StaticAnswerModel;
+
+impl AnswerModel for StaticAnswerModel {
+    fn synthesize(&self, question: &str, context: &[RetrievedItem]) -> Option<String> {
+        (!context.is_empty()).then(|| format!("model answer for {question}"))
+    }
 }
 
 async fn ingest(schema: &ConsumerSchema, key: &str, title: &str, text: &str) {
@@ -30,6 +46,41 @@ async fn ingest(schema: &ConsumerSchema, key: &str, title: &str, text: &str) {
         "ingest errors: {:?}",
         response.errors
     );
+}
+
+#[tokio::test]
+async fn ask_uses_configured_model_when_available() {
+    let key = "key";
+    let schema = instance_with_model(key, Arc::new(StaticAnswerModel));
+    ingest(
+        &schema,
+        key,
+        "Local Gemma",
+        "Gemma synthesizes answers over grounded CommonPlace notes.",
+    )
+    .await;
+
+    let query = r#"query {
+        ask(question: "does the model answer", k: 1) {
+            answer
+            answerKind
+            provenance { item { title } }
+        }
+    }"#;
+    let response = schema
+        .execute(Request::new(query).data(ApiKeyToken(key.to_string())))
+        .await;
+    assert!(
+        response.errors.is_empty(),
+        "ask errors: {:?}",
+        response.errors
+    );
+    let data = response.data.into_json().unwrap();
+    let ask = &data["ask"];
+
+    assert_eq!(ask["answer"], "model answer for does the model answer");
+    assert_eq!(ask["answerKind"], "MODEL");
+    assert_eq!(ask["provenance"][0]["item"]["title"], "Local Gemma");
 }
 
 #[tokio::test]

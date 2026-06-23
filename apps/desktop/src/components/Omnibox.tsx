@@ -68,12 +68,13 @@ export function Omnibox() {
           <ReloadIcon />
         </button>
       </div>
+      <div className="omnibox__scope">Intake</div>
       <input
         ref={inputRef}
         className="omnibox__input"
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        placeholder="Search, enter a URL, or ask anything"
+        placeholder="Capture a source, search CommonPlace, enter a URL, or ask"
         spellCheck={false}
         autoComplete="off"
         autoCorrect="off"

@@ -246,7 +246,7 @@ impl SubstratePeer {
         Ok(())
     }
 
-    pub fn observe(&mut self, since_cursor: u64) -> CoResult<Vec<PeerEvent>> {
+    pub fn observe(&self, since_cursor: u64) -> CoResult<Vec<PeerEvent>> {
         let events = self
             .working_log
             .lock()

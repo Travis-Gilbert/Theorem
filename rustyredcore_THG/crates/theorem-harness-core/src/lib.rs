@@ -26,6 +26,7 @@ pub mod agent_binding;
 pub mod agent_head_registry;
 pub mod alignment;
 pub mod budget;
+pub mod constitution;
 pub mod context_manager;
 pub mod context_web;
 pub mod federated_signals;
@@ -64,6 +65,10 @@ pub use agent_head_registry::{
 };
 pub use alignment::{evaluate_publication, MIN_CONSENSUS_HEADS};
 pub use budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
+pub use constitution::{
+    default_authority_order, Constitution, GLOBAL_LAW_LAYER, LIVE_EVIDENCE_LAYER,
+    PROJECT_LAW_LAYER, REQUEST_LAYER,
+};
 pub use context_manager::{
     autocompact_with_summary, microcompact, ContextCheckResult, ContextGuard, ContextManager,
     ContextManagerConfig, ContextManagerStats, ContextMessage, ContextReduction, MicrocompactStats,
@@ -118,8 +123,8 @@ pub use toolgraph::{
     CompiledToolkit, ToolContract, ToolSelectionState, DEFAULT_PERMISSIONS,
 };
 pub use types::{
-    AgentRunState, AgentStepState, EventState, GuardViolation, Payload, RunState, TransitionInput,
-    TransitionResult,
+    AgentRunState, AgentStepState, EventState, GuardViolation, Payload, PolicyCheck,
+    PolicyDecision, PolicyLayer, RunState, TransitionInput, TransitionResult,
 };
 pub use work_graph::{
     claim_task_node, heartbeat_task_node, ClaimLease, ClaimOutcome, Millis, NodeStatus, Receipt,

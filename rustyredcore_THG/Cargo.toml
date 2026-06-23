@@ -23,6 +23,7 @@ members = [
     "crates/rustyred-rerank",
     "crates/rustyred-hipporag",
     "crates/rustyred-web",
+    "crates/rustyred-code-embedding",
     "crates/rustyred-thg-code",
     "crates/rustyred-thg-memory",
     "crates/rustyred-thg-catalog",
@@ -42,6 +43,7 @@ members = [
     "crates/design-check",
     "crates/pilot-core",
     "crates/commonplace",
+    "crates/rustyred-thg-intake",
     "crates/theorem-copresence",
 ]
 resolver = "2"

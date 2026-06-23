@@ -32,4 +32,9 @@ and allows no bearer token for llama-server/Gemma. `HeadTransport::Hosted` uses
 `THEOREM_HOSTED_OPENAI_URL`, `THEOREM_LITELLM_CHAT_URL`, or
 `THEOREM_LITELLM_BASE_URL` and requires the configured credential reference.
 
+Production `run_composed_agent` allocates
+`THEOREM_COMPOSED_AGENT_BUDGET_UNITS` when set, or `5000` units by default. The
+default is sized for real provider token costs; the lower fake-loop budget remains
+only inside the pure core test fixture.
+
 Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.

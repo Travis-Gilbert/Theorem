@@ -1,20 +1,20 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "desktop",
+  "productName": "CommonPlace",
   "version": "0.1.0",
   "identifier": "com.theorem.desktop",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "npm --prefix .. run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "npm --prefix .. run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "desktop",
-        "width": 800,
-        "height": 600
+        "title": "CommonPlace",
+        "width": 1280,
+        "height": 820
       }
     ],
     "security": {

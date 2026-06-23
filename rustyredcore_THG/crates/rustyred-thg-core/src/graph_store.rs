@@ -1436,10 +1436,15 @@ impl InMemoryGraphStore {
             ));
         }
         let key = (label.to_string(), property_name.to_string());
-        self.vector_designations.insert(key.clone(), dimension);
-        self.vector_indexes
-            .entry(key)
-            .or_insert_with(|| VectorIndex::new(dimension));
+        let previous_dimension = self.vector_designations.insert(key.clone(), dimension);
+        if previous_dimension != Some(dimension) {
+            self.vector_indexes
+                .insert(key.clone(), VectorIndex::new(dimension));
+        } else {
+            self.vector_indexes
+                .entry(key.clone())
+                .or_insert_with(|| VectorIndex::new(dimension));
+        }
         for node in self.nodes.values() {
             if node.tombstone {
                 continue;
@@ -2607,6 +2612,51 @@ impl RedCoreGraphStore {
             .into_iter()
             .next()
             .ok_or_else(|| GraphStoreError::new("redcore_missing_write", "node write vanished"))
+    }
+
+    /// Durably remove a live node from RedCore storage. This is a logical
+    /// delete, not a working-set residency change: it journals a
+    /// `RedCoreMutation::NodeDelete` before publishing the staged removal, so
+    /// the deletion survives AOF replay and snapshot recovery. Returns `false`
+    /// when the node is already absent.
+    pub fn delete_node(&mut self, id: &str) -> GraphStoreResult<bool> {
+        if id.trim().is_empty() {
+            return Err(GraphStoreError::empty_field("node.id"));
+        }
+        let Some(existing) = self
+            .store
+            .get_node_including_expired(id)
+            .filter(|node| !node.tombstone)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+
+        let mut staged = self.store.clone();
+        staged.apply_recovered_delete(id)?;
+        let txn_id = self.last_txn_id + 1;
+        let graph_version = staged.stats().version;
+        let prepublished_snapshot_txn_id = self.persist_before_publish(
+            txn_id,
+            graph_version,
+            &staged,
+            RedCoreMutation::NodeDelete(id.to_string()),
+        )?;
+
+        self.store = staged;
+        self.last_txn_id = txn_id;
+        if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
+            self.snapshot_txn_id = snapshot_txn_id;
+        }
+
+        self.emit_hook_event(
+            MutationKind::NodeDeleted,
+            id.to_string(),
+            existing.labels,
+            Vec::new(),
+            now_ms().max(0) as u64,
+        );
+        Ok(true)
     }
 
     /// Insert `node` only when no live record with the same id exists.
@@ -6278,6 +6328,52 @@ mod tests {
     }
 
     #[test]
+    fn redcore_delete_node_survives_aof_replay() {
+        let data_dir = unique_test_dir("redcore-delete-node-aof-replay");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "file:src/lib.rs",
+                    ["File"],
+                    json!({ "doc_tree_path": "src/lib.rs" }),
+                ))
+                .unwrap();
+
+            assert!(store.delete_node("file:src/lib.rs").unwrap());
+            assert!(
+                !store.delete_node("file:src/lib.rs").unwrap(),
+                "missing delete is a no-op"
+            );
+            assert!(store.get_node("file:src/lib.rs").unwrap().is_none());
+            assert_eq!(
+                store.status().last_txn_id,
+                2,
+                "upsert + one real delete frame; no-op delete writes nothing"
+            );
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(
+            store.get_node("file:src/lib.rs").unwrap().is_none(),
+            "deleted node must stay gone after AOF replay"
+        );
+        assert_eq!(
+            store.status().recovered_frames,
+            2,
+            "AOF replay should see the upsert and durable NodeDelete"
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn redcore_purge_no_op_writes_no_aof_frame() {
         let data_dir = unique_test_dir("redcore-ttl-purge-no-op");
         let options = RedCoreOptions {
@@ -6910,6 +7006,53 @@ mod tests {
         assert!(
             msg.contains("dimension"),
             "error should mention dimension: {msg}"
+        );
+    }
+
+    #[test]
+    fn vector_redesignate_rebuilds_index_for_new_dimension() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property("Doc", "embedding", 3)
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:old",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0, 0.0] }),
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 1)
+                .unwrap()[0]
+                .0,
+            "doc:old"
+        );
+
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+        assert!(
+            store
+                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 1)
+                .unwrap()
+                .is_empty(),
+            "old 3-d vector must not survive the 2-d designation rebuild"
+        );
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:new",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0] }),
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 1)
+                .unwrap()[0]
+                .0,
+            "doc:new"
         );
     }
 

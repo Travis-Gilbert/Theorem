@@ -4,6 +4,7 @@ ensemble
 pilot-core
 prose-check
 reconstruction-engine
+rustyred-code-embedding
 rustyred-hipporag
 rustyred-membrane
 rustyred-rerank
@@ -16,6 +17,7 @@ rustyred-thg-connectors
 rustyred-thg-core
 rustyred-thg-fractal
 rustyred-thg-geotemporal
+rustyred-thg-intake
 rustyred-thg-mcp
 rustyred-thg-memory
 rustyred-thg-pg-server

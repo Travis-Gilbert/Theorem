@@ -17,12 +17,12 @@ use rustyred_thg_core::{
 use serde_json::{json, Value};
 
 use crate::code_embed_hook::{
-    embed_text, ensure_embedding_designation, extract_float_vec, set_embedding,
+    default_symbol_embedder, ensure_embedding_designation, extract_float_vec, set_embedding,
     symbol_embedding_text,
 };
 use crate::{
     latest_repo_generations, normalize_tenant, property_string, property_u64, CALLS_SYMBOL,
-    CODE_SYMBOL_LABEL, DECLARES_SYMBOL, DEPENDS_ON_SYMBOL, EMBEDDING_DIM, EMBEDDING_PROPERTY,
+    CODE_SYMBOL_LABEL, DECLARES_SYMBOL, DEPENDS_ON_SYMBOL, EMBEDDING_PROPERTY,
 };
 
 pub const CODE_EPISTEMIC_ENGINE: &str = "rustyred-thg-code.instant_structural_epistemic";
@@ -222,12 +222,16 @@ fn warm_missing_embeddings(
     store: &mut RedCoreGraphStore,
     symbols: &mut [NodeRecord],
 ) -> Result<(), crate::CodeIndexError> {
+    let embedder = default_symbol_embedder();
     for node in symbols {
         let text = symbol_embedding_text(&node.properties);
         if text.trim().is_empty() {
             continue;
         }
-        let vector = embed_text(&text, EMBEDDING_DIM);
+        let vector = embedder.embed_code(&text).map_err(|error| crate::CodeIndexError {
+            code: "code_embedding_error".to_string(),
+            message: error.to_string(),
+        })?;
         let up_to_date = extract_float_vec(&node.properties, EMBEDDING_PROPERTY)
             .map(|existing| vectors_close(&existing, &vector))
             .unwrap_or(false);

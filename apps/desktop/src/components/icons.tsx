@@ -91,3 +91,81 @@ export const GlobeIcon = ({ size, className }: IconProps) =>
     size,
     className,
   );
+
+export const AgentIcon = ({ size, className }: IconProps) =>
+  svg(
+    <>
+      <path d="M12 3v3" />
+      <path d="M6 11a6 6 0 0 1 12 0v5a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3Z" />
+      <path d="M9 13h.01 M15 13h.01" />
+      <path d="M10 17h4" />
+    </>,
+    size,
+    className,
+  );
+
+export const QueueIcon = ({ size, className }: IconProps) =>
+  svg(
+    <>
+      <path d="M6 7h12" />
+      <path d="M6 12h12" />
+      <path d="M6 17h7" />
+      <path d="M4 7h.01 M4 12h.01 M4 17h.01" />
+    </>,
+    size,
+    className,
+  );
+
+export const SourceIcon = ({ size, className }: IconProps) =>
+  svg(
+    <>
+      <path d="M4 7h16" />
+      <path d="M4 12h16" />
+      <path d="M4 17h16" />
+      <path d="M7 4v16" />
+    </>,
+    size,
+    className,
+  );
+
+export const RouteIcon = ({ size, className }: IconProps) =>
+  svg(
+    <>
+      <circle cx="5" cy="6" r="2" />
+      <circle cx="19" cy="18" r="2" />
+      <circle cx="19" cy="6" r="2" />
+      <path d="M7 6h5a3 3 0 0 1 3 3v6a3 3 0 0 0 3 3" />
+      <path d="M17 6h-2" />
+    </>,
+    size,
+    className,
+  );
+
+export const ReviewIcon = ({ size, className }: IconProps) =>
+  svg(
+    <>
+      <path d="M5 4h14v16H5Z" />
+      <path d="M8 8h8" />
+      <path d="M8 12h5" />
+      <path d="m8 16 2 2 5-5" />
+    </>,
+    size,
+    className,
+  );
+
+export const TaskIcon = ({ size, className }: IconProps) =>
+  svg(
+    <>
+      <path d="M9 6h11" />
+      <path d="M9 12h11" />
+      <path d="M9 18h11" />
+      <path d="m4 6 1 1 2-3" />
+      <path d="m4 12 1 1 2-3" />
+      <path d="m4 18 1 1 2-3" />
+    </>,
+    size,
+    className,
+  );
+
+export const CheckIcon = ({ size, className }: IconProps) =>
+  svg(<path d="m5 13 4 4L19 7" />, size, className);

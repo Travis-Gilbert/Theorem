@@ -1,0 +1,38 @@
+# rustyred-git: North Star "RustyRed as Code Workspace", unit W2 (git-as-truth).
+#
+# A real git VCS for code, so a working tree (W0's DocTree, materialized by W3)
+# has a git history GitHub will accept. graph-version versions the knowledge
+# graph (layer 4); this versions the code (layers 2-3). Two VCS, two kinds of
+# state.
+#
+# Backend note: `WorkspaceRepo` drives the installed `git` CLI for the full
+# local VCS slice, while `GixWorkspaceRepo` is the pure-Rust backend slice for
+# init/open/head/read/clone/commit/stage/status/branch/checkout/merge/diff/
+# isolation/verified-packfile-receive-pack-prep/local-bare-push/local-receive-pack/
+# smart-http-push. The GitHub PR-open path is direct REST with an injected bearer
+# token, so GitHub App token minting can stay outside this crate.
+#
+# Standalone Cargo root (bare `[workspace]`), mirrors apps/rustyred-embedded.
+# Build: cargo test --manifest-path apps/rustyred-git/Cargo.toml
+# Plan: docs/plans/rustyred-code-workspace/W2-git-as-truth.md
+
+[package]
+name = "rustyred-git"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "RustyRed code workspace W2: a real git VCS for the working tree plus GitHub PR-open seam."
+
+[dependencies]
+base64 = "0.22"
+gix = { version = "0.84.0", features = ["blocking-network-client", "merge", "worktree-mutation"] }
+gix-pack = "0.71.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+serde_json = "1"
+
+[workspace]

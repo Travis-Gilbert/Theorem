@@ -17,7 +17,7 @@ fn peer_observes_presence_from_working_log() {
             .with_data_dir(tmp.path().join("codex")),
     )
     .unwrap();
-    let mut claude = SubstratePeer::try_new(
+    let claude = SubstratePeer::try_new(
         InMemoryThgExecutor::new(),
         PeerConfig::new(actor_b, "note:presence")
             .with_text_client_id(2)
