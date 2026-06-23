@@ -7584,9 +7584,16 @@ name = "rustyred-thg-ml"
 version = "0.5.0"
 dependencies = [
  "burn",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "cubecl",
+ "hf-hub",
+ "image",
  "rustyred-thg-core",
  "serde",
+ "serde_json",
+ "tokenizers",
 ]
 
 [[package]]

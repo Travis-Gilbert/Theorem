@@ -315,6 +315,10 @@ Current implementation slice, 2026-06-23:
   spine: exact MaxSim oracle, sign-bit binary projection, binary Hamming MaxSim
   scorer, ranking helpers, binary-vs-exact recall reporting, bounded exact
   rerank hydration, and cold/exact-vector manifest byte accounting.
+- `rustyred-thg-ml` now has a producer seam: deterministic text/image fixtures
+  for tests, `project_multivector_tiers` for manifest plus hot binary
+  projection bundles, and an opt-in CPU `colpali-candle` path that loads
+  Candle's ColPali model and emits exact `MultiVectorEmbeddingSet`s.
 
 ## Multi-Vector Retrieval
 
@@ -337,7 +341,9 @@ Planned tiering:
 2. **Candle inference path.** Add a Rust-native ColPali encoder behind an
    optional feature in `rustyred-thg-ml` or a narrow sibling module. Use the
    Candle example as the first reference implementation, but measure local CPU,
-   Metal, and CUDA behavior before making it the default.
+   Metal, and CUDA behavior before making it the default. The first CPU-only
+   producer now exists behind `colpali-candle`; GPU feature wiring waits for
+   the benchmark gate.
 3. **Cold exact vectors.** Store exact page/token/patch vectors in the cold
    object or array tier, referenced by a `MultiVectorEmbeddingSet` graph node or
    manifest edge. Use content hash, model id, model version, page/chunk id, and
@@ -360,8 +366,8 @@ Acceptance for the study gate:
 - Measure memory bytes per page for exact float, fp16/bf16 if used, and binary
   projection.
 - Prove the default GraphQL query does not hydrate cold exact vectors.
-- Record a local benchmark with Candle ColPali inference before committing to a
-  production ingestion path.
+- Compile the Candle ColPali inference path behind an opt-in feature, then
+  record a local benchmark before committing to a production ingestion path.
 
 ## Implementation Phases
 
@@ -451,12 +457,14 @@ Acceptance:
 - Implement exact float MaxSim and binary Hamming MaxSim reference paths.
 - Define `MultiVectorEmbeddingSet` manifests and cold exact-vector references.
 - Prototype Candle ColPali ingestion on a tiny fixture.
+- Keep producer output tiered through manifest plus binary projection helpers.
 
 Acceptance:
 
 - Binary candidate generation has measured recall versus exact MaxSim.
 - Memory per page/chunk is reported for exact and binary tiers.
 - Exact rerank hydrates cold vectors only for bounded top N.
+- Candle ColPali stays opt-in and compiles behind its feature.
 
 ## Open Questions
 

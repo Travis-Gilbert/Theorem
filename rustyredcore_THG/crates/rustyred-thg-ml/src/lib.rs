@@ -5,6 +5,7 @@
 //! the consuming crates.
 
 pub mod multivector;
+pub mod producer;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,14 @@ pub use multivector::{
     MaxSimAggregation, MaxSimScorer, MultiVectorEmbeddingSet, MultiVectorManifest,
     MultiVectorRecallReport, MultiVectorScore, MultiVectorStorageCost,
 };
+pub use producer::{
+    project_multivector_tiers, HashingMultiVectorProducer, MultiVectorEncodeRequest,
+    MultiVectorInputSegment, MultiVectorProducer, MultiVectorProjectionBundle,
+    DEFAULT_COLPALI_DUMMY_IMAGE_PROMPT, DEFAULT_COLPALI_EMBEDDING_DIM, DEFAULT_COLPALI_MODEL_ID,
+    DEFAULT_COLPALI_REVISION, DEFAULT_COLPALI_TOKENIZER_MODEL_ID,
+};
+#[cfg(feature = "colpali-candle")]
+pub use producer::{CandleColPaliConfig, CandleColPaliProducer};
 
 pub const DEFAULT_SCATTER_BURN_NATIVE_MAX_ELEMENTS: usize = 262_144;
 pub const DEFAULT_FIXED_POINT_SCALE: i64 = 1_000_000;

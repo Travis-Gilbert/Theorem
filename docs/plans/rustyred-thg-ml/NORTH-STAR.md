@@ -1,7 +1,8 @@
 # RustyRed THG ML Runtime And Morphological Graph North Star
 
 Status: implementation started. Shared message-passing and multi-vector
-retrieval primitives are landing in `rustyred-thg-ml`.
+retrieval primitives are landing in `rustyred-thg-ml`, including the first
+feature-gated Candle/ColPali producer.
 
 Source inputs:
 
@@ -136,15 +137,22 @@ Implemented first:
   candidate budget, then reranks with exact MaxSim.
 - `storage_costs`: reports exact `f32`, exact `f16`, and binary projection byte
   costs for capacity planning.
+- `MultiVectorProducer` plus `HashingMultiVectorProducer`: a stable producer
+  seam and deterministic fixture path for text/image segments.
+- `CandleColPaliProducer`: optional `colpali-candle` CPU inference path that
+  loads `vidore/colpali-v1.2-merged` through Candle and emits exact
+  `MultiVectorEmbeddingSet`s.
+- `project_multivector_tiers`: turns exact producer output into the manifest
+  plus hot binary projection bundle.
 
 Current boundary:
 
 - Exact float vectors are treated as cold payloads or bounded test fixtures, not
   node properties.
 - Binary projections are the hot candidate-generation shape.
-- Candle/ColPali inference remains a later feature-gated producer of
-  `MultiVectorEmbeddingSet`, after the exact and binary scorers have stable
-  fixtures.
+- Candle/ColPali inference is present as an opt-in CPU producer. It should stay
+  non-default until local CPU, Metal, and CUDA benchmarks establish the runtime
+  and memory envelope.
 
 Acceptance:
 
@@ -155,6 +163,9 @@ Acceptance:
 - Recall reports quantify binary candidate overlap against exact top-k.
 - Bounded rerank proves exact vector hydration is limited to the requested
   candidate budget.
+- The producer seam proves generated exact vectors can immediately be projected
+  into cold exact refs plus hot binary refs.
+- The `colpali-candle` feature compiles without affecting default builds.
 - Dimension mismatches fail with structured THG errors.
 
 ## Extraction Path From Existing Code
