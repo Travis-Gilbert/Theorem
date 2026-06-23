@@ -18,6 +18,7 @@ interface IntakeTask {
 }
 
 interface Writeback {
+  id: string;
   actor: string;
   status: string;
   at: string;
@@ -75,7 +76,7 @@ const INITIAL_ITEMS: IntakeItem[] = [
       { title: "Answer pricing language", state: "open", due: "Fri" },
     ],
     writebacks: [
-      { actor: "Routing agent", status: "Filed for review", at: "9:43" },
+      { id: "wb-gmail-brand-review-routing", actor: "Routing agent", status: "Filed for review", at: "9:43" },
     ],
   },
   {
@@ -104,8 +105,8 @@ const INITIAL_ITEMS: IntakeItem[] = [
       { title: "Draft account-source mapping", state: "open", due: "Mon" },
     ],
     writebacks: [
-      { actor: "Routing agent", status: "Auto-filed", at: "10:09" },
-      { actor: "Task agent", status: "Created task edge", at: "10:09" },
+      { id: "wb-linear-onboarding-routing", actor: "Routing agent", status: "Auto-filed", at: "10:09" },
+      { id: "wb-linear-onboarding-task", actor: "Task agent", status: "Created task edge", at: "10:09" },
     ],
   },
   {
@@ -132,7 +133,7 @@ const INITIAL_ITEMS: IntakeItem[] = [
     graph: ["Evaluation Protocols", "Graph Intake", "Field Session"],
     tasks: [],
     writebacks: [
-      { actor: "Routing agent", status: "Queued reviewer check", at: "11:28" },
+      { id: "wb-drive-model-notes-routing", actor: "Routing agent", status: "Queued reviewer check", at: "11:28" },
     ],
   },
   {
@@ -161,7 +162,7 @@ const INITIAL_ITEMS: IntakeItem[] = [
       { title: "Approve Outlook field-map override", state: "open", due: "Today" },
     ],
     writebacks: [
-      { actor: "Catalog agent", status: "Drafted rule change", at: "12:16" },
+      { id: "wb-notion-source-contract-catalog", actor: "Catalog agent", status: "Drafted rule change", at: "12:16" },
     ],
   },
 ];
@@ -191,6 +192,13 @@ function priorityLabel(priority: IntakeItem["priority"]): string {
   return "Normal";
 }
 
+function makeWriteback(actor: string, status: string): Writeback {
+  const id =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return { id: `wb-${id}`, actor, status, at: "now" };
+}
+
 export function IntakeReview() {
   const [items, setItems] = useState<IntakeItem[]>(INITIAL_ITEMS);
   const [selectedId, setSelectedId] = useState(INITIAL_ITEMS[0]?.id ?? "");
@@ -217,6 +225,17 @@ export function IntakeReview() {
   );
 
   const selected = visibleItems.find((item) => item.id === selectedId) ?? visibleItems[0];
+
+  const medianConfidence = useMemo(() => {
+    if (items.length === 0) return "0%";
+    const values = items.map((item) => item.confidence).sort((a, b) => a - b);
+    const middle = Math.floor(values.length / 2);
+    const median =
+      values.length % 2 === 1
+        ? values[middle]
+        : (values[middle - 1] + values[middle]) / 2;
+    return percent(median);
+  }, [items]);
 
   useEffect(() => {
     if (visibleItems.length === 0) return;
@@ -247,7 +266,7 @@ export function IntakeReview() {
       confidence: Math.max(selected.confidence, 0.86),
       reason: "Approved route",
       writebacks: [
-        { actor: "You", status: "Approved collection", at: "now" },
+        makeWriteback("You", "Approved collection"),
         ...selected.writebacks,
       ],
     });
@@ -259,7 +278,7 @@ export function IntakeReview() {
       state: "review",
       reason: "Held for source review",
       writebacks: [
-        { actor: "You", status: "Moved to review", at: "now" },
+        makeWriteback("You", "Moved to review"),
         ...selected.writebacks,
       ],
     });
@@ -276,7 +295,7 @@ export function IntakeReview() {
             ...selected.tasks,
           ],
       writebacks: [
-        { actor: "Task agent", status: "Added follow-up task", at: "now" },
+        makeWriteback("Task agent", "Added follow-up task"),
         ...selected.writebacks,
       ],
     });
@@ -349,7 +368,7 @@ export function IntakeReview() {
           </div>
           <div>
             <span>Median confidence</span>
-            <strong>69%</strong>
+            <strong>{medianConfidence}</strong>
           </div>
         </div>
       </div>
@@ -505,7 +524,7 @@ export function IntakeReview() {
             <div className="side-section">
               <div className="panel-title panel-title--small">Writebacks</div>
               {selected.writebacks.map((writeback) => (
-                <div className="writeback-row" key={`${writeback.actor}-${writeback.status}-${writeback.at}`}>
+                <div className="writeback-row" key={writeback.id}>
                   <span>{writeback.status}</span>
                   <code>{writeback.actor} / {writeback.at}</code>
                 </div>

@@ -83,22 +83,22 @@ export function Sidebar() {
           <button type="button" className="side-nav__item side-nav__item--active">
             <ReviewIcon size={14} />
             <span>Review Queue</span>
-            <code>2</code>
+            <code aria-label="Metric pending">-</code>
           </button>
           <button type="button" className="side-nav__item">
             <SourceIcon size={14} />
             <span>Sources</span>
-            <code>5</code>
+            <code aria-label="Metric pending">-</code>
           </button>
           <button type="button" className="side-nav__item">
             <RouteIcon size={14} />
             <span>Routed</span>
-            <code>1</code>
+            <code aria-label="Metric pending">-</code>
           </button>
           <button type="button" className="side-nav__item">
             <TaskIcon size={14} />
             <span>Tasks</span>
-            <code>4</code>
+            <code aria-label="Metric pending">-</code>
           </button>
         </div>
 
