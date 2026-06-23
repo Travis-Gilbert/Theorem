@@ -5416,7 +5416,8 @@ fn memory_contract_from_recall(results: &[theorem_harness_runtime::MemoryRecallI
 fn memory_recall_item_summary(item: &theorem_harness_runtime::MemoryRecallItem) -> Option<String> {
     let value = serde_json::to_value(item).ok()?;
     let title = first_string_at(&value, &["title", "id"])?;
-    let preview = first_string_at(&value, &["summary", "content"]).unwrap_or_default();
+    let preview =
+        first_string_at(&value, &["summary", "content_preview", "content"]).unwrap_or_default();
     if preview.is_empty() {
         Some(title)
     } else {
@@ -5426,7 +5427,7 @@ fn memory_recall_item_summary(item: &theorem_harness_runtime::MemoryRecallItem) 
 
 fn memory_recall_item_risk(item: &theorem_harness_runtime::MemoryRecallItem) -> Option<String> {
     let value = serde_json::to_value(item).ok()?;
-    let text = first_string_at(&value, &["summary", "content", "title"])?;
+    let text = first_string_at(&value, &["summary", "content_preview", "content", "title"])?;
     let lower = text.to_ascii_lowercase();
     if lower.contains("risk")
         || lower.contains("do not")
@@ -5442,7 +5443,7 @@ fn memory_recall_item_risk(item: &theorem_harness_runtime::MemoryRecallItem) -> 
 
 fn memory_recall_item_do_not(item: &theorem_harness_runtime::MemoryRecallItem) -> Option<String> {
     let value = serde_json::to_value(item).ok()?;
-    let text = first_string_at(&value, &["summary", "content", "title"])?;
+    let text = first_string_at(&value, &["summary", "content_preview", "content", "title"])?;
     let lower = text.to_ascii_lowercase();
     if lower.contains("do not") || lower.contains("don't") || lower.contains("never") {
         Some(text)
@@ -5862,6 +5863,19 @@ fn recall_memory_payload(
             &["recency_half_life_seconds", "recencyHalfLifeSeconds"],
         )
         .unwrap_or(0.0),
+        hydrate: arguments
+            .get("hydrate")
+            .or_else(|| arguments.get("include_content"))
+            .or_else(|| arguments.get("includeContent"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        hydrate_top_k: argument_u64(arguments, &["hydrate_top_k", "hydrateTopK"]).unwrap_or(0)
+            as usize,
+        content_preview_chars: argument_u64(
+            arguments,
+            &["content_preview_chars", "contentPreviewChars"],
+        )
+        .unwrap_or(0) as usize,
     };
     let results = recall_memory(&mut store, input).map_err(mcp_memory_error)?;
     Ok(json!({
@@ -5979,6 +5993,19 @@ fn recall_archived_memory_payload(
         query: argument_text(arguments, &["query"]).unwrap_or_default(),
         actor: argument_text(arguments, &["actor", "actor_id", "actorId"]).unwrap_or_default(),
         limit: argument_u64(arguments, &["limit"]).unwrap_or(10) as usize,
+        hydrate: arguments
+            .get("hydrate")
+            .or_else(|| arguments.get("include_content"))
+            .or_else(|| arguments.get("includeContent"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        hydrate_top_k: argument_u64(arguments, &["hydrate_top_k", "hydrateTopK"]).unwrap_or(0)
+            as usize,
+        content_preview_chars: argument_u64(
+            arguments,
+            &["content_preview_chars", "contentPreviewChars"],
+        )
+        .unwrap_or(0) as usize,
         ..RecallMemoryInput::default()
     };
     let mut store = McpMemoryStore { backend };
@@ -6151,6 +6178,19 @@ fn observe_payload(
                     .or_else(|| arguments.get("includeConsolidationSources"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                hydrate: arguments
+                    .get("hydrate")
+                    .or_else(|| arguments.get("include_content"))
+                    .or_else(|| arguments.get("includeContent"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                hydrate_top_k: argument_u64(arguments, &["hydrate_top_k", "hydrateTopK"])
+                    .unwrap_or(0) as usize,
+                content_preview_chars: argument_u64(
+                    arguments,
+                    &["content_preview_chars", "contentPreviewChars"],
+                )
+                .unwrap_or(0) as usize,
                 ..RecallMemoryInput::default()
             },
         )
@@ -11008,7 +11048,14 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "ppr_max_pushes": { "type": "integer", "default": 100000 },
                     "pprMaxPushes": { "type": "integer" },
                     "recency_half_life_seconds": { "type": "number", "default": 0 },
-                    "recencyHalfLifeSeconds": { "type": "number" }
+                    "recencyHalfLifeSeconds": { "type": "number" },
+                    "hydrate": { "type": "boolean", "default": false, "description": "Return full content plus nested document/node records. Default recall returns slim summaries and previews only." },
+                    "include_content": { "type": "boolean", "default": false },
+                    "includeContent": { "type": "boolean", "default": false },
+                    "hydrate_top_k": { "type": "integer", "default": 0, "description": "Hydrate full content only for the first N ranked results." },
+                    "hydrateTopK": { "type": "integer" },
+                    "content_preview_chars": { "type": "integer", "default": 700 },
+                    "contentPreviewChars": { "type": "integer" }
                 }
             }),
         ),
@@ -11104,7 +11151,14 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "query": { "type": "string" },
                     "actor": { "type": "string" },
                     "actor_id": { "type": "string" },
-                    "limit": { "type": "integer", "default": 10 }
+                    "limit": { "type": "integer", "default": 10 },
+                    "hydrate": { "type": "boolean", "default": false },
+                    "include_content": { "type": "boolean", "default": false },
+                    "includeContent": { "type": "boolean", "default": false },
+                    "hydrate_top_k": { "type": "integer", "default": 0 },
+                    "hydrateTopK": { "type": "integer" },
+                    "content_preview_chars": { "type": "integer", "default": 700 },
+                    "contentPreviewChars": { "type": "integer" }
                 }
             }),
         ),
@@ -11122,7 +11176,10 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "query": { "type": "string" },
                     "limit": { "type": "integer", "default": 10 },
                     "include_low_fitness": { "type": "boolean", "default": false },
-                    "include_consolidation_sources": { "type": "boolean", "default": false }
+                    "include_consolidation_sources": { "type": "boolean", "default": false },
+                    "hydrate": { "type": "boolean", "default": false },
+                    "hydrate_top_k": { "type": "integer", "default": 0 },
+                    "content_preview_chars": { "type": "integer", "default": 700 }
                 }
             }),
         ),
@@ -15760,6 +15817,38 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item["item_type"] == "node"));
+        for item in recall["results"].as_array().unwrap() {
+            assert!(item.get("content").is_none());
+            assert!(item.get("document").is_none());
+            assert!(item.get("node").is_none());
+            assert!(
+                item.get("content_preview")
+                    .and_then(Value::as_str)
+                    .map(|preview| !preview.is_empty())
+                    .unwrap_or(false),
+                "default recall includes a bounded preview"
+            );
+        }
+
+        let hydrated = call_tool_json(
+            &provider,
+            &config,
+            "recall",
+            json!({
+                "tenant": "smoke",
+                "query": "memory",
+                "limit": 10,
+                "hydrate_top_k": 1
+            }),
+        );
+        assert!(hydrated["results"][0]["content"].as_str().is_some());
+        assert!(
+            hydrated["results"][0].get("document").is_some()
+                || hydrated["results"][0].get("node").is_some()
+        );
+        assert!(hydrated["results"][1].get("content").is_none());
+        assert!(hydrated["results"][1].get("document").is_none());
+        assert!(hydrated["results"][1].get("node").is_none());
 
         let related = call_tool_json(
             &provider,

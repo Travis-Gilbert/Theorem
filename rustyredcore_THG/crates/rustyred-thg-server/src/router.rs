@@ -2028,6 +2028,11 @@ async fn hippo_retrieve_payload(
         .or_else(|| arguments.get("includeHubs"))
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let auto_index_memory = arguments
+        .get("auto_index_memory")
+        .or_else(|| arguments.get("autoIndexMemory"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let hippo_query_vector = hippo_query_vector_from_env(&query).await?;
 
     let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
@@ -2037,13 +2042,21 @@ async fn hippo_retrieve_payload(
             "message": error.message
         })
     })?;
-    let gate_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+    let mut gate_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
         json!({
             "error": "hippo_retrieve_store_unavailable",
             "code": error.code,
             "message": error.message
         })
     })?;
+    let indexing = if auto_index_memory {
+        warm_hippo_memory_index(&mut gate_store, &tenant, arguments)?
+    } else {
+        json!({
+            "ran": false,
+            "reason": "disabled_by_request"
+        })
+    };
     let hippo_query = HippoQuery {
         text: &query,
         top_k,
@@ -2058,6 +2071,10 @@ async fn hippo_retrieve_payload(
     let stats = json!({
         "candidates": candidates.len(),
         "seeds": trace.seeds.len(),
+        "memory_index_pages_upserted": indexing
+            .get("pages_upserted")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         "warm_centrality_reads": trace.warm_centrality_reads,
         "ran_query_ppr": trace.ran_query_ppr,
         "ran_global_ppr": trace.ran_global_ppr
@@ -2068,8 +2085,176 @@ async fn hippo_retrieve_payload(
         "query": query,
         "candidates": candidates,
         "trace": trace,
+        "indexing": indexing,
         "stats": stats
     }))
+}
+
+fn warm_hippo_memory_index(
+    store: &mut TenantMirrorGraphStore<'_>,
+    tenant: &str,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let index_limit = argument_u64_any(arguments, &["index_limit", "indexLimit"])
+        .unwrap_or(200)
+        .clamp(1, 5_000) as usize;
+    let existing_phrases = store
+        .query_nodes(NodeQuery::label(rustyred_hipporag::schema::LABEL_PHRASE).with_limit(1))
+        .len();
+    let existing_hubs = store
+        .query_nodes(NodeQuery::label(rustyred_hipporag::schema::LABEL_HUB).with_limit(1))
+        .len();
+    let mut memory_sources_seen = 0usize;
+    let mut pages_upserted = 0usize;
+    let mut passages_indexed = 0usize;
+    let mut phrases_upserted = 0usize;
+    let mut contains_edges = 0usize;
+    let mut source_page_ids = Vec::new();
+    let tenant_aliases = hippo_tenant_slug_aliases(tenant);
+    let mut source_ids_seen = BTreeSet::new();
+
+    for label in ["MemoryDocument", "MemoryNode"] {
+        for alias in &tenant_aliases {
+            for node in store
+                .query_nodes(
+                    NodeQuery::label(label)
+                        .with_property("tenant_slug", Value::String(alias.clone()))
+                        .with_limit(index_limit),
+                )
+                .into_iter()
+                .filter(hippo_memory_status_indexable)
+            {
+                if memory_sources_seen >= index_limit {
+                    break;
+                }
+                if !source_ids_seen.insert(node.id.clone()) {
+                    continue;
+                }
+                let text = hippo_memory_page_text(&node);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                memory_sources_seen += 1;
+                let page_id = format!("hippo:page:memory:{}", stable_hash(&node.id));
+                source_page_ids.push(page_id.clone());
+                let should_index = existing_phrases == 0 || store.get_node(&page_id).is_none();
+                if !should_index {
+                    continue;
+                }
+
+                let page = NodeRecord::new(
+                    &page_id,
+                    [rustyred_hipporag::schema::LABEL_PAGE],
+                    json!({
+                        "tenant_slug": tenant,
+                        "source_graph_id": node.id.clone(),
+                        "source_label": label,
+                        "source_doc_id": node.properties.get("doc_id").or_else(|| node.properties.get("node_id")).and_then(Value::as_str).unwrap_or_default(),
+                        "title": node.properties.get("title").and_then(Value::as_str).unwrap_or_default(),
+                        "summary": node.properties.get("summary").and_then(Value::as_str).unwrap_or_default(),
+                        "text": text,
+                    }),
+                );
+                store.upsert_node(page).map_err(hippo_index_store_error)?;
+                pages_upserted += 1;
+                let stats = rustyred_hipporag::index_passage(store, &page_id)
+                    .map_err(|error| hippo_index_error("hippo_index_passage_failed", error))?;
+                passages_indexed += 1;
+                phrases_upserted += stats.phrases_upserted;
+                contains_edges += stats.contains_edges;
+            }
+        }
+    }
+
+    let should_build_hubs =
+        pages_upserted > 0 || (existing_hubs == 0 && !source_page_ids.is_empty());
+    let hub_stats = if !should_build_hubs {
+        json!({
+            "hubs_upserted": 0,
+            "summarize_edges": 0,
+            "hub_parent_edges": 0
+        })
+    } else {
+        let stats = rustyred_hipporag::build_summary_tree_for_region(
+            store,
+            rustyred_hipporag::RaptorPolicy {
+                region_node_threshold: 1,
+                min_members: 2,
+                max_level: 2,
+            },
+            &source_page_ids,
+        )
+        .map_err(|error| hippo_index_error("hippo_build_hubs_failed", error))?;
+        json!({
+            "hubs_upserted": stats.hubs_upserted,
+            "summarize_edges": stats.summarize_edges,
+            "hub_parent_edges": stats.hub_parent_edges
+        })
+    };
+
+    Ok(json!({
+        "ran": pages_upserted > 0,
+        "reason": if pages_upserted > 0 { "memory_sources_indexed" } else { "already_warm_or_no_memory_sources" },
+        "index_limit": index_limit,
+        "existing_phrase_nodes": existing_phrases,
+        "existing_hub_nodes": existing_hubs,
+        "memory_sources_seen": memory_sources_seen,
+        "pages_upserted": pages_upserted,
+        "passages_indexed": passages_indexed,
+        "phrases_upserted": phrases_upserted,
+        "contains_edges": contains_edges,
+        "hubs": hub_stats
+    }))
+}
+
+fn hippo_tenant_slug_aliases(tenant: &str) -> Vec<String> {
+    let normalized = normalize_tenant_slug(tenant);
+    let trimmed = tenant.trim();
+    let candidates = [
+        normalized.clone(),
+        trimmed.to_string(),
+        normalized.to_ascii_lowercase(),
+        trimmed.to_ascii_lowercase(),
+    ];
+    let mut aliases = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_empty() && !aliases.contains(&candidate) {
+            aliases.push(candidate);
+        }
+    }
+    aliases
+}
+
+fn hippo_memory_status_indexable(node: &NodeRecord) -> bool {
+    node.properties
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|status| status == "active")
+        .unwrap_or(true)
+}
+
+fn hippo_memory_page_text(node: &NodeRecord) -> String {
+    ["title", "summary", "content", "search_text"]
+        .iter()
+        .filter_map(|key| node.properties.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn hippo_index_store_error(error: GraphStoreError) -> Value {
+    json!({
+        "error": "hippo_memory_index_store_error",
+        "code": error.code,
+        "message": error.message
+    })
+}
+
+fn hippo_index_error(code: &str, error: rustyred_hipporag::HippoError) -> Value {
+    json!({
+        "error": code,
+        "message": error.to_string()
+    })
 }
 
 async fn hippo_query_vector_from_env(query: &str) -> Result<Option<Vec<f32>>, Value> {
@@ -2577,6 +2762,16 @@ fn hippo_retrieve_tool_definition() -> Value {
                 "include_hubs": {
                     "type": "boolean",
                     "description": "Whether Hub nodes can appear as candidates. Default true."
+                },
+                "auto_index_memory": {
+                    "type": "boolean",
+                    "description": "When true, warm a missing HippoRAG index from active MemoryDocument/MemoryNode records before retrieval. Default true."
+                },
+                "index_limit": {
+                    "type": "integer",
+                    "description": "Maximum memory records to warm-index on this call. Default 200.",
+                    "minimum": 1,
+                    "maximum": 5000
                 }
             },
             "required": ["query"]
@@ -8913,6 +9108,59 @@ mod tests {
         assert_eq!(payload["trace"]["ran_query_ppr"], true);
         assert_eq!(payload["trace"]["ran_global_ppr"], false);
         assert!(payload["stats"]["warm_centrality_reads"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_hippo_retrieve_warms_index_from_memory_documents() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("Travis-Gilbert").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:doc:hippo",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "travis-gilbert",
+                        "doc_id": "doc-hippo",
+                        "kind": "decision",
+                        "title": "Commonplace wedge",
+                        "summary": "Commonplace wedge memory should seed HippoRAG retrieval.",
+                        "content": "The Commonplace wedge connects associative recall, memory summaries, and HippoRAG phrase indexing.",
+                        "status": "active",
+                        "tags": ["commonplace", "hipporag"]
+                    }),
+                ))
+                .unwrap();
+        }
+        let config = state.mcp_config();
+        let response = maybe_handle_hippo_retrieve_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "hippo-retrieve-memory",
+                "method": "tools/call",
+                "params": {
+                    "name": "hippo_retrieve",
+                    "arguments": {
+                        "tenant": "Travis-Gilbert",
+                        "query": "Commonplace wedge associative recall",
+                        "top_k": 4
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("hippo_retrieve MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["tenant"], "Travis-Gilbert");
+        assert_eq!(payload["indexing"]["ran"], true);
+        assert_eq!(payload["indexing"]["pages_upserted"], 1);
+        assert!(payload["indexing"]["phrases_upserted"].as_u64().unwrap() > 0);
+        assert!(payload["candidates"].as_array().unwrap().len() >= 1);
+        assert_eq!(payload["trace"]["ran_query_ppr"], true);
+        assert!(payload["stats"]["seeds"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

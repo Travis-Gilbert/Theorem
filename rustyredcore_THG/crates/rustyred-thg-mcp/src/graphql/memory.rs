@@ -18,6 +18,7 @@ pub struct MemoryDoc {
     pub kind: String,
     pub title: Option<String>,
     pub summary: Option<String>,
+    pub content_preview: Option<String>,
     pub content: String,
     pub tags: Vec<String>,
     pub status: String,
@@ -85,6 +86,7 @@ impl MemoryDoc {
                 .unwrap_or_else(|| "memory".to_string()),
             title: str_field(value, &["title"]),
             summary: str_field(value, &["summary"]),
+            content_preview: str_field(value, &["content_preview", "contentPreview"]),
             content: str_field(value, &["content"]).unwrap_or_default(),
             tags: arr_strings(value, &["tags"]),
             status: str_field(value, &["status"]).unwrap_or_else(|| "active".to_string()),
@@ -185,6 +187,9 @@ impl MemoryQuery {
         ppr_epsilon: Option<f64>,
         seed_limit: Option<i32>,
         query_time: Option<String>,
+        #[graphql(default = false)] hydrate: bool,
+        hydrate_top_k: Option<i32>,
+        content_preview_chars: Option<i32>,
     ) -> GqlResult<Vec<MemoryDoc>> {
         let mut args = json!({ "limit": limit, "include_low_fitness": include_low_fitness });
         let obj = args.as_object_mut().expect("json object");
@@ -211,6 +216,18 @@ impl MemoryQuery {
         }
         if let Some(query_time) = query_time {
             obj.insert("query_time".to_string(), json!(query_time));
+        }
+        if hydrate {
+            obj.insert("hydrate".to_string(), json!(hydrate));
+        }
+        if let Some(hydrate_top_k) = hydrate_top_k {
+            obj.insert("hydrate_top_k".to_string(), json!(hydrate_top_k));
+        }
+        if let Some(content_preview_chars) = content_preview_chars {
+            obj.insert(
+                "content_preview_chars".to_string(),
+                json!(content_preview_chars),
+            );
         }
         with_invoker(|inv| {
             let value = inv.recall(args.clone()).map_err(map_err)?;

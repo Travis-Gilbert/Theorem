@@ -211,6 +211,12 @@ pub struct RecallMemoryInput {
     pub ppr_max_pushes: usize,
     #[serde(default)]
     pub recency_half_life_seconds: f64,
+    #[serde(default)]
+    pub hydrate: bool,
+    #[serde(default)]
+    pub hydrate_top_k: usize,
+    #[serde(default)]
+    pub content_preview_chars: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -483,6 +489,11 @@ pub struct MemoryRecallItem {
     pub item_type: String,
     pub kind: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_preview: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     #[serde(default)]
     pub summary: String,
@@ -779,6 +790,8 @@ pub fn recall_memory<S: MemoryGraphStore>(
         }
     }
 
+    apply_recall_payload_policy(&mut results, &input);
+
     Ok(results)
 }
 
@@ -1055,6 +1068,7 @@ pub fn recall_archived_memory<S: MemoryGraphStore>(
     }
     results.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     results.truncate(limit);
+    apply_recall_payload_policy(&mut results, &input);
     Ok(results)
 }
 
@@ -1866,6 +1880,8 @@ fn recall_item_for_document(document: MemoryDocumentState) -> MemoryRecallItem {
         item_type: "document".to_string(),
         kind: document.kind.clone(),
         title: document.title.clone(),
+        tags: document.tags.clone(),
+        content_preview: preview_text(&document.content, default_recall_preview_chars()),
         content: document.content.clone(),
         summary: document.summary.clone(),
         status: document.status.clone(),
@@ -1898,6 +1914,8 @@ fn recall_item_for_node(node: MemoryNodeState) -> MemoryRecallItem {
         item_type: "node".to_string(),
         kind: node.kind.clone(),
         title: node.title.clone(),
+        tags: node.tags.clone(),
+        content_preview: preview_text(&node.content, default_recall_preview_chars()),
         content: node.content.clone(),
         summary: String::new(),
         status: node.status.clone(),
@@ -2534,6 +2552,47 @@ fn compare_recall_items(left: &MemoryRecallItem, right: &MemoryRecallItem) -> st
         .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| right.updated_at.cmp(&left.updated_at))
         .then_with(|| left.id.cmp(&right.id))
+}
+
+fn apply_recall_payload_policy(results: &mut [MemoryRecallItem], input: &RecallMemoryInput) {
+    let preview_chars = effective_recall_preview_chars(input.content_preview_chars);
+    let hydrate_top_k = if input.hydrate {
+        usize::MAX
+    } else {
+        input.hydrate_top_k
+    };
+
+    for (index, item) in results.iter_mut().enumerate() {
+        if item.content_preview.is_empty() && !item.content.is_empty() {
+            item.content_preview = preview_text(&item.content, preview_chars);
+        } else if !item.content_preview.is_empty() {
+            item.content_preview = preview_text(&item.content_preview, preview_chars);
+        }
+
+        if index < hydrate_top_k {
+            continue;
+        }
+
+        item.content.clear();
+        item.document = None;
+        item.node = None;
+    }
+}
+
+fn default_recall_preview_chars() -> usize {
+    700
+}
+
+fn effective_recall_preview_chars(value: usize) -> usize {
+    if value == 0 {
+        default_recall_preview_chars()
+    } else {
+        value.min(4_000)
+    }
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 fn recall_item_graph_id(tenant_slug: &str, item: &MemoryRecallItem) -> String {
@@ -3720,6 +3779,7 @@ mod tests {
                 query: "tenant casing".to_string(),
                 query_time: T2.to_string(),
                 limit: 10,
+                hydrate: true,
                 ..RecallMemoryInput::default()
             },
         )
@@ -3729,6 +3789,104 @@ mod tests {
             .find_map(|item| item.document.as_ref())
             .unwrap();
         assert_eq!(recalled.tenant_slug, "Travis-Gilbert");
+    }
+
+    #[test]
+    fn recall_defaults_to_slim_payload_without_duplicate_full_content() {
+        let mut store = InMemoryGraphStore::new();
+        let long_content = format!("{} {}", "needle".repeat(20), "x".repeat(2_000));
+        let document = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Payload shape".to_string(),
+                content: long_content.clone(),
+                summary: "Short payload summary".to_string(),
+                tags: vec!["memory".to_string(), "payload".to_string()],
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "needle payload".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        let item = results
+            .iter()
+            .find(|item| item.id == document.doc_id)
+            .expect("document recalled");
+        assert_eq!(item.summary, "Short payload summary");
+        assert_eq!(item.tags, vec!["memory".to_string(), "payload".to_string()]);
+        assert!(!item.content_preview.is_empty());
+        assert!(item.content_preview.len() < long_content.len());
+        assert!(item.content.is_empty(), "default recall omits full content");
+        assert!(
+            item.document.is_none(),
+            "default recall omits nested document"
+        );
+    }
+
+    #[test]
+    fn recall_hydrate_top_k_only_hydrates_leading_results() {
+        let mut store = InMemoryGraphStore::new();
+        let first = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Alpha payload".to_string(),
+                content: "alpha payload full content".to_string(),
+                created_at: T2.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let second = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Beta payload".to_string(),
+                content: "beta payload full content".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "payload".to_string(),
+                query_time: T3.to_string(),
+                limit: 10,
+                hydrate_top_k: 1,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results[0].id, first.doc_id);
+        assert!(!results[0].content.is_empty());
+        assert!(results[0].document.is_some());
+        let second_item = results
+            .iter()
+            .find(|item| item.id == second.doc_id)
+            .expect("second document recalled");
+        assert!(second_item.content.is_empty());
+        assert!(second_item.document.is_none());
     }
 
     #[test]
