@@ -2,10 +2,11 @@ use std::cell::RefCell;
 
 use serde_json::json;
 use theorem_harness_core::{
-    run_fake_intra_agent_loop, AgentBinding, AgentHead, BindingBudgetScope, BindingComposition,
-    BindingError, BindingIdentity, FakeIntraAgentLoopInput, GroundedClaim, HeadCostProfile,
-    HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
-    HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError, TraceTier,
+    default_authority_order, run_fake_intra_agent_loop, AgentBinding, AgentHead,
+    BindingBudgetScope, BindingComposition, BindingError, BindingIdentity, FakeIntraAgentLoopInput,
+    GroundedClaim, HeadCostProfile, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
+    HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport,
+    IntraAgentLoopError, TraceTier,
 };
 
 #[test]
@@ -41,7 +42,17 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
     assert_eq!(result.events[9].event_type, "HEADS.CONTRIBUTE");
     assert_eq!(result.events[10].event_type, "HEADS.CONTRIBUTE");
     assert_eq!(result.events[11].event_type, "DRAFTS.SYNTHESIZED");
+    assert_eq!(result.events[13].event_type, "POLICY.CHECKED");
     assert_eq!(result.events[16].event_type, "RUN.CLOSED");
+    let policy_decision = result.events[13]
+        .payload
+        .get("policy_decision")
+        .and_then(serde_json::Value::as_object)
+        .expect("POLICY.CHECKED carries a policy decision");
+    assert_eq!(
+        policy_decision.get("authority_order").unwrap(),
+        &json!(default_authority_order())
+    );
     assert_eq!(result.scratchpad_revisions.len(), 4);
     assert_eq!(
         result
@@ -116,6 +127,16 @@ fn synthesis_receives_proposal_and_critique_context() {
         .get("task")
         .and_then(serde_json::Value::as_str)
         .is_some());
+    assert!(requests
+        .iter()
+        .all(|request| request.policy_decision.is_some()));
+    assert!(requests.iter().all(|request| {
+        request
+            .policy_decision
+            .as_ref()
+            .map(|decision| decision.authority_order == default_authority_order())
+            .unwrap_or(false)
+    }));
 }
 
 #[test]

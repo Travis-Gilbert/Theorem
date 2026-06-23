@@ -8,7 +8,7 @@
 use crate::agent_binding::HeadKind;
 use crate::agent_head_registry::ResolvedAgentHead;
 use crate::state_hash::stable_value_hash;
-use crate::types::Payload;
+use crate::types::{Payload, PolicyDecision};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::error::Error;
@@ -77,6 +77,8 @@ pub struct HeadInvocationRequest {
     pub prior_context: Vec<RevisionContext>,
     #[serde(default)]
     pub claims: Vec<GroundedClaim>,
+    #[serde(default)]
+    pub policy_decision: Option<PolicyDecision>,
     pub created_at: String,
 }
 
@@ -122,10 +124,17 @@ impl HeadInvocationRequest {
             prior_revision_ids,
             prior_context,
             claims,
+            policy_decision: None,
             created_at: created_at.into(),
         };
         request.invocation_id = request.computed_invocation_id();
         request
+    }
+
+    pub fn with_policy_decision(mut self, policy_decision: PolicyDecision) -> Self {
+        self.policy_decision = Some(policy_decision);
+        self.invocation_id = self.computed_invocation_id();
+        self
     }
 
     pub fn computed_invocation_id(&self) -> String {
@@ -139,6 +148,7 @@ impl HeadInvocationRequest {
                 "prior_revision_ids": self.prior_revision_ids,
                 "prior_context": self.prior_context,
                 "claims": self.claims,
+                "policy_decision": self.policy_decision,
                 "created_at": self.created_at,
             }))
         )
