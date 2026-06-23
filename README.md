@@ -1,6 +1,6 @@
 # Theorem
 
-Theorem is the ** Graph based the programmable Rust projection** that mirrors Theseus The Epistemic Engine workspace. It carries the RustyRed/THG substrate engine, the  bridge and parity surfaces that exercise it, the Graph native browser crawler/search engine, the RustyWeb, and, Theseus' symbolic-engine.
+Theorem is the **Graph based the programmable Rust projection** that mirrors Theseus The Epistemic Engine workspace. It carries the RustyRed/THG substrate engine, the  bridge and parity surfaces that exercise it, the Graph native browser crawler/search engine, the RustyWeb, and, Theseus' symbolic-engine.
 
 This file is the navigation truth for the repo. Read it first. Order of truth: this map, then the actual code, then the plan docs (plans lag code). If a session changes architecture (new crate, renamed module, removed subsystem, new entrypoint), update this file before ending the session.
 
