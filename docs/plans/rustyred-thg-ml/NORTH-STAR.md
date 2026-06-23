@@ -130,6 +130,12 @@ Implemented first:
   generation.
 - `binary_hamming_maxsim_score` / `rank_binary_hamming_maxsim`: Vespa-inspired
   binary/Hamming MaxSim candidate scoring.
+- `recall_against_exact_top_k`: measures binary candidate overlap against the
+  exact float oracle.
+- `rerank_exact_maxsim_bounded`: hydrates exact vectors only for a bounded
+  candidate budget, then reranks with exact MaxSim.
+- `storage_costs`: reports exact `f32`, exact `f16`, and binary projection byte
+  costs for capacity planning.
 
 Current boundary:
 
@@ -146,6 +152,9 @@ Acceptance:
 - Binary Hamming MaxSim matches the exact top-1 on a sign-stable fixture.
 - Manifest byte accounting shows the binary projection is materially smaller
   than exact `f32` storage.
+- Recall reports quantify binary candidate overlap against exact top-k.
+- Bounded rerank proves exact vector hydration is limited to the requested
+  candidate budget.
 - Dimension mismatches fail with structured THG errors.
 
 ## Extraction Path From Existing Code

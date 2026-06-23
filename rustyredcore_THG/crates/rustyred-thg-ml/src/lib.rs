@@ -11,10 +11,11 @@ use serde::{Deserialize, Serialize};
 use rustyred_thg_core::{ThgError, ThgResult};
 
 pub use multivector::{
-    binary_hamming_maxsim_score, binary_projection_bytes, exact_f32_bytes, exact_maxsim_score,
-    quantize_sign_bits, rank_binary_hamming_maxsim, rank_exact_maxsim, BinaryMultiVectorSet,
+    binary_hamming_maxsim_score, binary_projection_bytes, exact_f16_bytes, exact_f32_bytes,
+    exact_maxsim_score, quantize_sign_bits, rank_binary_hamming_maxsim, rank_exact_maxsim,
+    recall_against_exact_top_k, rerank_exact_maxsim_bounded, storage_costs, BinaryMultiVectorSet,
     MaxSimAggregation, MaxSimScorer, MultiVectorEmbeddingSet, MultiVectorManifest,
-    MultiVectorScore,
+    MultiVectorRecallReport, MultiVectorScore, MultiVectorStorageCost,
 };
 
 pub const DEFAULT_SCATTER_BURN_NATIVE_MAX_ELEMENTS: usize = 262_144;

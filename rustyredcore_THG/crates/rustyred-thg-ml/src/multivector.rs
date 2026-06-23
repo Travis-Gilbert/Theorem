@@ -292,6 +292,94 @@ pub fn rank_binary_hamming_maxsim(
     Ok(scores)
 }
 
+pub fn recall_against_exact_top_k(
+    exact_ranked: &[MultiVectorScore],
+    candidate_ranked: &[MultiVectorScore],
+    exact_top_k: usize,
+    candidate_top_k: usize,
+) -> MultiVectorRecallReport {
+    let exact_count = exact_ranked.len().min(exact_top_k);
+    let candidate_count = candidate_ranked.len().min(candidate_top_k);
+    let candidate_ids = candidate_ranked
+        .iter()
+        .take(candidate_count)
+        .map(|score| score.content_id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    let mut overlap_count = 0;
+    let mut missing_content_ids = Vec::new();
+    for score in exact_ranked.iter().take(exact_count) {
+        if candidate_ids.contains(score.content_id.as_str()) {
+            overlap_count += 1;
+        } else {
+            missing_content_ids.push(score.content_id.clone());
+        }
+    }
+
+    MultiVectorRecallReport {
+        exact_top_k,
+        candidate_top_k,
+        exact_count,
+        candidate_count,
+        overlap_count,
+        recall: if exact_count == 0 {
+            0.0
+        } else {
+            overlap_count as f32 / exact_count as f32
+        },
+        missing_content_ids,
+    }
+}
+
+pub fn rerank_exact_maxsim_bounded<F>(
+    query_vectors: &[Vec<f32>],
+    candidates: &[MultiVectorScore],
+    hydrate_limit: usize,
+    output_limit: usize,
+    aggregation: MaxSimAggregation,
+    mut hydrate_exact: F,
+) -> ThgResult<Vec<MultiVectorScore>>
+where
+    F: FnMut(&MultiVectorScore) -> ThgResult<MultiVectorEmbeddingSet>,
+{
+    if hydrate_limit == 0 || output_limit == 0 {
+        return Ok(Vec::new());
+    }
+    validate_vector_matrix("query_vectors", query_vectors)?;
+
+    let mut reranked = Vec::with_capacity(candidates.len().min(hydrate_limit));
+    for candidate in candidates.iter().take(hydrate_limit) {
+        let exact = hydrate_exact(candidate)?;
+        if exact.embedding_set_id != candidate.embedding_set_id
+            || exact.content_id != candidate.content_id
+        {
+            return Err(ThgError::new(
+                "multivector_hydration_mismatch",
+                format!(
+                    "hydrated set {} for {} does not match candidate {} for {}",
+                    exact.embedding_set_id,
+                    exact.content_id,
+                    candidate.embedding_set_id,
+                    candidate.content_id
+                ),
+            ));
+        }
+
+        let score = exact_maxsim_score(query_vectors, &exact.vectors, aggregation)?;
+        let vector_count = exact.vector_count();
+        reranked.push(MultiVectorScore {
+            content_id: exact.content_id,
+            embedding_set_id: exact.embedding_set_id,
+            score,
+            scorer: MaxSimScorer::ExactFloat,
+            vector_count,
+        });
+    }
+
+    sort_and_truncate(&mut reranked, output_limit);
+    Ok(reranked)
+}
+
 fn validate_vector_matrix(name: &str, vectors: &[Vec<f32>]) -> ThgResult<usize> {
     if vectors.is_empty() {
         return Err(ThgError::new(
@@ -402,6 +490,13 @@ fn apply_aggregation(total: f32, query_count: usize, aggregation: MaxSimAggregat
     }
 }
 
+fn byte_ratio(numerator: usize, denominator: usize) -> f32 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    numerator as f32 / denominator as f32
+}
+
 fn sort_and_truncate(scores: &mut Vec<MultiVectorScore>, limit: usize) {
     scores.sort_by(|left, right| {
         right
@@ -486,6 +581,102 @@ mod tests {
     }
 
     #[test]
+    fn recall_report_measures_binary_overlap_against_exact_top_k() {
+        let exact = vec![
+            MultiVectorScore {
+                content_id: "doc:a".to_string(),
+                embedding_set_id: "mv:a".to_string(),
+                score: 3.0,
+                scorer: MaxSimScorer::ExactFloat,
+                vector_count: 2,
+            },
+            MultiVectorScore {
+                content_id: "doc:b".to_string(),
+                embedding_set_id: "mv:b".to_string(),
+                score: 2.0,
+                scorer: MaxSimScorer::ExactFloat,
+                vector_count: 2,
+            },
+        ];
+        let binary = vec![
+            MultiVectorScore {
+                content_id: "doc:b".to_string(),
+                embedding_set_id: "mv:b".to_string(),
+                score: 0.9,
+                scorer: MaxSimScorer::BinaryHamming,
+                vector_count: 2,
+            },
+            MultiVectorScore {
+                content_id: "doc:c".to_string(),
+                embedding_set_id: "mv:c".to_string(),
+                score: 0.8,
+                scorer: MaxSimScorer::BinaryHamming,
+                vector_count: 2,
+            },
+        ];
+
+        let report = recall_against_exact_top_k(&exact, &binary, 2, 2);
+
+        assert_eq!(report.overlap_count, 1);
+        assert_eq!(report.recall, 0.5);
+        assert_eq!(report.missing_content_ids, vec!["doc:a"]);
+    }
+
+    #[test]
+    fn bounded_exact_rerank_hydrates_only_the_candidate_budget() {
+        let query = vec![vec![1.0, 0.0]];
+        let candidate_a = MultiVectorScore {
+            content_id: "doc:a".to_string(),
+            embedding_set_id: "mv:a".to_string(),
+            score: 0.9,
+            scorer: MaxSimScorer::BinaryHamming,
+            vector_count: 1,
+        };
+        let candidate_b = MultiVectorScore {
+            content_id: "doc:b".to_string(),
+            embedding_set_id: "mv:b".to_string(),
+            score: 0.8,
+            scorer: MaxSimScorer::BinaryHamming,
+            vector_count: 1,
+        };
+        let candidate_c = MultiVectorScore {
+            content_id: "doc:c".to_string(),
+            embedding_set_id: "mv:c".to_string(),
+            score: 0.7,
+            scorer: MaxSimScorer::BinaryHamming,
+            vector_count: 1,
+        };
+        let mut hydrated = Vec::new();
+
+        let reranked = rerank_exact_maxsim_bounded(
+            &query,
+            &[candidate_a, candidate_b, candidate_c],
+            2,
+            1,
+            MaxSimAggregation::Mean,
+            |candidate| {
+                hydrated.push(candidate.content_id.clone());
+                let vector = if candidate.content_id == "doc:b" {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                };
+                Ok(set(
+                    &candidate.embedding_set_id,
+                    &candidate.content_id,
+                    vec![vector],
+                ))
+            },
+        )
+        .expect("bounded rerank");
+
+        assert_eq!(hydrated, vec!["doc:a", "doc:b"]);
+        assert_eq!(reranked.len(), 1);
+        assert_eq!(reranked[0].content_id, "doc:b");
+        assert_eq!(reranked[0].scorer, MaxSimScorer::ExactFloat);
+    }
+
+    #[test]
     fn manifest_records_exact_and_binary_storage_costs() {
         let vectors = vec![vec![1.0; 128]; 32];
         let embedding_set = set("mv:page:1", "page:1", vectors);
@@ -502,6 +693,16 @@ mod tests {
         assert_eq!(manifest.exact_bytes, 32 * 128 * 4);
         assert_eq!(manifest.binary_projection_bytes, 32 * 16);
         assert!(manifest.exact_to_binary_byte_ratio() >= 32.0);
+
+        let costs = storage_costs(32, 128);
+        assert_eq!(costs.exact_f32_bytes, manifest.exact_bytes);
+        assert_eq!(costs.exact_f16_bytes, 32 * 128 * 2);
+        assert_eq!(
+            costs.binary_projection_bytes,
+            manifest.binary_projection_bytes
+        );
+        assert!(costs.exact_f32_to_binary_ratio() >= 32.0);
+        assert!(costs.exact_f16_to_binary_ratio() >= 16.0);
     }
 
     #[test]

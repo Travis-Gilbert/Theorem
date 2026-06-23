@@ -313,7 +313,8 @@ Current implementation slice, 2026-06-23:
   `epistemic_shadow_dirty` for projection refresh.
 - `rustyred-thg-ml::multivector` has the first dependency-light retrieval
   spine: exact MaxSim oracle, sign-bit binary projection, binary Hamming MaxSim
-  scorer, ranking helpers, and cold/exact-vector manifest byte accounting.
+  scorer, ranking helpers, binary-vs-exact recall reporting, bounded exact
+  rerank hydration, and cold/exact-vector manifest byte accounting.
 
 ## Multi-Vector Retrieval
 
