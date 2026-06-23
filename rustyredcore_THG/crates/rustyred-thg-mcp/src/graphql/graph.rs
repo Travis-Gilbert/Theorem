@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 use super::scalars::Json;
 use super::{map_err, with_invoker};
 
+const DEFAULT_EPISTEMIC_TYPES: &[&str] =
+    &["supports", "contradicts", "tension", "derives", "cites"];
+const HAS_EPISTEMIC_SHADOW_EDGE: &str = "HasEpistemicShadow";
+
 /// Which graph algorithm to run. The eight flat tools become this enum x `inline`.
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum AlgorithmKind {
@@ -52,6 +56,188 @@ pub struct BulkResult {
     pub inserted: i32,
     pub failed: i32,
     pub errors: Json,
+    pub epistemic_dirty_nodes_marked: i32,
+}
+
+pub struct ContentNode {
+    id: String,
+    raw: Json,
+}
+
+#[Object]
+impl ContentNode {
+    async fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn raw(&self) -> Json {
+        self.raw.clone()
+    }
+
+    async fn epistemic(&self) -> EpistemicFacet {
+        EpistemicFacet {
+            node_id: self.id.clone(),
+        }
+    }
+}
+
+pub struct EpistemicFacet {
+    node_id: String,
+}
+
+#[Object]
+impl EpistemicFacet {
+    async fn standing(&self, top_k: Option<i32>) -> GqlResult<Json> {
+        let mut seeds = serde_json::Map::new();
+        seeds.insert(self.node_id.clone(), json!(1.0));
+        let args = json!({
+            "seeds": Value::Object(seeds),
+            "top_k": top_k.unwrap_or(8).max(1),
+        });
+        let shadow = with_invoker(|inv| inv.epistemic_shadow_ppr(args.clone()).map_err(map_err))?;
+        let relationship_args = epistemic_neighbor_args(&self.node_id, None, None, Some(1));
+        let relationships = with_invoker(|inv| {
+            inv.epistemic_neighbors(relationship_args.clone())
+                .map_err(map_err)
+        })?;
+        let direct = relationships
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (support_in_degree, attack_in_degree) = epistemic_degree_counts(&direct);
+        let scores = shadow.get("scores").cloned().unwrap_or_else(|| json!([]));
+        let has_scores = scores
+            .as_array()
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+
+        Ok(Json(json!({
+            "source": if has_scores { "shadow_ppr" } else { "degree_fallback" },
+            "scores": scores,
+            "support_in_degree": support_in_degree,
+            "attack_in_degree": attack_in_degree,
+            "stale": !has_scores,
+        })))
+    }
+
+    async fn relationships(
+        &self,
+        epistemic_types: Option<Vec<String>>,
+        min_confidence: Option<f64>,
+        max_depth: Option<i32>,
+    ) -> GqlResult<Json> {
+        let fallback_types = epistemic_types.clone();
+        let explicit_empty_filter = epistemic_types
+            .as_ref()
+            .map(|values| values.is_empty())
+            .unwrap_or(false);
+        let args =
+            epistemic_neighbor_args(&self.node_id, epistemic_types, min_confidence, max_depth);
+        let payload = with_invoker(|inv| inv.epistemic_neighbors(args.clone()).map_err(map_err))?;
+        let mut results = payload
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if results.is_empty() && !explicit_empty_filter {
+            results = legacy_shadow_relationships(
+                &self.node_id,
+                fallback_types,
+                min_confidence,
+                max_depth,
+            )?;
+        }
+        Ok(Json(Value::Array(results)))
+    }
+}
+
+fn epistemic_neighbor_args(
+    node_id: &str,
+    epistemic_types: Option<Vec<String>>,
+    min_confidence: Option<f64>,
+    max_depth: Option<i32>,
+) -> Value {
+    let mut args = json!({ "node_id": node_id });
+    let obj = args.as_object_mut().expect("json object");
+    let epistemic_types = epistemic_types.unwrap_or_else(|| {
+        DEFAULT_EPISTEMIC_TYPES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect()
+    });
+    obj.insert("epistemic_types".to_string(), json!(epistemic_types));
+    if let Some(min_confidence) = min_confidence {
+        obj.insert("min_confidence".to_string(), json!(min_confidence));
+    }
+    if let Some(max_depth) = max_depth {
+        obj.insert("max_depth".to_string(), json!(max_depth.max(1)));
+    }
+    args
+}
+
+fn legacy_shadow_relationships(
+    node_id: &str,
+    epistemic_types: Option<Vec<String>>,
+    min_confidence: Option<f64>,
+    max_depth: Option<i32>,
+) -> GqlResult<Vec<Value>> {
+    let bridge_args = json!({ "node_id": node_id, "max_depth": 1 });
+    let bridge_payload = with_invoker(|inv| {
+        inv.epistemic_neighbors(bridge_args.clone())
+            .map_err(map_err)
+    })?;
+    let shadow_ids = bridge_payload
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|hits| {
+            hits.iter()
+                .filter(|hit| {
+                    hit.get("edge")
+                        .and_then(|edge| edge.get("type"))
+                        .and_then(Value::as_str)
+                        == Some(HAS_EPISTEMIC_SHADOW_EDGE)
+                })
+                .filter_map(|hit| {
+                    hit.get("node")
+                        .and_then(|node| node.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut results = Vec::new();
+    for shadow_id in shadow_ids {
+        let args = epistemic_neighbor_args(
+            &shadow_id,
+            epistemic_types.clone(),
+            min_confidence,
+            max_depth,
+        );
+        let payload = with_invoker(|inv| inv.epistemic_neighbors(args.clone()).map_err(map_err))?;
+        if let Some(hits) = payload.get("results").and_then(Value::as_array) {
+            results.extend(hits.iter().cloned());
+        }
+    }
+    Ok(results)
+}
+
+fn epistemic_degree_counts(results: &[Value]) -> (usize, usize) {
+    let mut support = 0usize;
+    let mut attack = 0usize;
+    for hit in results {
+        match hit
+            .get("edge")
+            .and_then(|edge| edge.get("epistemic_type"))
+            .and_then(Value::as_str)
+        {
+            Some("supports" | "derives" | "cites") => support += 1,
+            Some("contradicts" | "tension") => attack += 1,
+            _ => {}
+        }
+    }
+    (support, attack)
 }
 
 /// Parse the `results: [{node_id, score}]` shape the search payloads return.
@@ -97,6 +283,10 @@ fn bulk_result(value: &Value) -> BulkResult {
         inserted: value.get("inserted").and_then(Value::as_i64).unwrap_or(0) as i32,
         failed: value.get("failed").and_then(Value::as_i64).unwrap_or(0) as i32,
         errors: Json(value.get("errors").cloned().unwrap_or(Value::Null)),
+        epistemic_dirty_nodes_marked: value
+            .get("epistemic_dirty_nodes_marked")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as i32,
     }
 }
 
@@ -150,6 +340,18 @@ impl GraphQuery {
     async fn graph_node(&self, id: ID) -> GqlResult<Option<Json>> {
         let id = id.to_string();
         with_invoker(|inv| Ok(inv.get_doc(&id).map_err(map_err)?.map(Json)))
+    }
+
+    /// Fetch a content node plus the epistemic facet. This wraps existing graph
+    /// and epistemic payloads; the facet is the caller-facing seam.
+    async fn content_node(&self, id: ID) -> GqlResult<Option<ContentNode>> {
+        let id = id.to_string();
+        with_invoker(|inv| {
+            Ok(inv.get_doc(&id).map_err(map_err)?.map(|raw| ContentNode {
+                id: id.clone(),
+                raw: Json(raw),
+            }))
+        })
     }
 
     /// One-hop neighbors of a node (wraps `graph_neighbors`). `direction` is

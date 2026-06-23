@@ -8,6 +8,9 @@ rooms can all reference the same artifact from inside the checkout.
 
 - `NORTH-STAR-RUSTYRED-MULTIMODEL.md`: the unit graph and acceptance map.
 - `SPEC-GRAPHQL-MCP.md`: GraphQL MCP surface, including A2 coordination.
+- `SPEC-EPISTEMIC-FACET-AND-MULTIVECTOR.md`: epistemics as a content-node facet,
+  SQL/shadow as read-only projections, cold bodies, and ColPali-style
+  multi-vector tiering.
 - `SPEC-RUSTYRED-STREAM-COORDINATION.md`: append-only stream coordination.
 - `E0-embedded-mode.md`: embedded-mode execution handoff.
 
@@ -46,6 +49,7 @@ Before asking Claude to implement a slice:
 Present in this folder:
 
 - `SPEC-GRAPHQL-MCP.md`
+- `SPEC-EPISTEMIC-FACET-AND-MULTIVECTOR.md`
 - `SPEC-RUSTYRED-STREAM-COORDINATION.md`
 - `E0-embedded-mode.md`
 

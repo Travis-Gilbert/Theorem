@@ -2349,10 +2349,17 @@ fn bulk_edges_payload(
         .ok_or_else(|| McpError::invalid_params("rustyred_thg_bulk_edges requires edges array"))?;
     let mut inserted = 0usize;
     let mut errors = Vec::new();
+    let mut epistemic_dirty_node_ids = BTreeSet::new();
     for (idx, raw) in records.iter().enumerate() {
         match parse_edge_record(raw) {
             Ok(edge) => match backend.upsert_edge(edge.clone()) {
-                Ok(()) => inserted += 1,
+                Ok(()) => {
+                    inserted += 1;
+                    if edge.epistemic_type.is_some() {
+                        epistemic_dirty_node_ids.insert(edge.from_id);
+                        epistemic_dirty_node_ids.insert(edge.to_id);
+                    }
+                }
                 Err(error) => errors.push(json!({
                     "line": idx + 1,
                     "code": error.code,
@@ -2367,13 +2374,40 @@ fn bulk_edges_payload(
             })),
         }
     }
+    let epistemic_dirty_nodes_marked =
+        mark_epistemic_dirty_nodes(backend, epistemic_dirty_node_ids)?;
     Ok(json!({
         "tenant": tenant,
         "ok": errors.is_empty(),
         "inserted": inserted,
         "failed": errors.len(),
         "errors": errors,
+        "epistemic_dirty_nodes_marked": epistemic_dirty_nodes_marked,
     }))
+}
+
+fn mark_epistemic_dirty_nodes(
+    backend: &mut impl McpGraphBackend,
+    node_ids: BTreeSet<String>,
+) -> Result<usize, McpError> {
+    let mut marked = 0usize;
+    for node_id in node_ids {
+        let Some(mut node) = backend.get_node(&node_id)? else {
+            continue;
+        };
+        if is_epistemic_shadow_node(&node) {
+            continue;
+        }
+        if !node.properties.is_object() {
+            node.properties = json!({});
+        }
+        let properties = node.properties.as_object_mut().expect("node properties object");
+        properties.insert("epistemic_shadow_dirty".to_string(), json!(true));
+        properties.insert("epistemic_dirty_at_ms".to_string(), json!(now_unix_ms()));
+        backend.upsert_node(node)?;
+        marked += 1;
+    }
+    Ok(marked)
 }
 
 fn vector_search_payload(
@@ -8542,6 +8576,17 @@ fn parse_edge_record(raw: &Value) -> Result<EdgeRecord, McpError> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     edge.confidence = raw.get("confidence").and_then(Value::as_f64);
+    if let Some(epistemic_type) = raw
+        .get("epistemic_type")
+        .or_else(|| raw.get("epistemicType"))
+        .and_then(Value::as_str)
+    {
+        edge.epistemic_type = Some(
+            epistemic_type
+                .parse::<EpistemicType>()
+                .map_err(McpError::from)?,
+        );
+    }
     Ok(edge)
 }
 
@@ -16518,6 +16563,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn graphql_content_node_epistemic_facet_reads_canonical_edges() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let nodes = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($n:JSON!){ bulkNodes(nodes:$n){ ok inserted failed } }",
+            json!({ "n": [
+                { "id": "claim:a", "labels": ["Claim"], "properties": { "title": "A" } },
+                { "id": "claim:b", "labels": ["Claim"], "properties": { "title": "B" } },
+                { "id": "doc:plain", "labels": ["Doc"], "properties": { "title": "plain" } }
+            ]}),
+        );
+        assert_no_graphql_errors(&nodes);
+        assert_eq!(
+            nodes["data"]["bulkNodes"]["inserted"], 3,
+            "bulkNodes: {nodes}"
+        );
+
+        let edges = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            "mutation($e:JSON!){ bulkEdges(edges:$e){ ok inserted failed epistemicDirtyNodesMarked } }",
+            json!({ "e": [
+                { "id": "claim:a-supports-claim:b", "from_id": "claim:a", "to_id": "claim:b", "type": "Supports", "epistemic_type": "supports", "confidence": 0.7 },
+                { "id": "claim:a-links-doc:plain", "from_id": "claim:a", "to_id": "doc:plain", "type": "LINKS" }
+            ]}),
+        );
+        assert_no_graphql_errors(&edges);
+        assert_eq!(
+            edges["data"]["bulkEdges"]["inserted"], 2,
+            "bulkEdges: {edges}"
+        );
+        assert_eq!(
+            edges["data"]["bulkEdges"]["epistemicDirtyNodesMarked"], 2,
+            "one canonical epistemic edge should dirty its content endpoints only: {edges}"
+        );
+
+        let facet = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ contentNode(id:\"claim:a\"){ raw epistemic{ relationships(maxDepth:1) standing(topK:3) } } }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&facet);
+        assert_eq!(
+            facet["data"]["contentNode"]["raw"]["properties"]["epistemic_shadow_dirty"],
+            json!(true),
+            "canonical epistemic edge writes should mark the content node dirty: {facet}"
+        );
+        let relationships = facet["data"]["contentNode"]["epistemic"]["relationships"]
+            .as_array()
+            .expect("relationships should be an array");
+        assert_eq!(
+            relationships.len(),
+            1,
+            "relationships should default to epistemic edges only: {facet}"
+        );
+        assert_eq!(
+            relationships[0]["edge"]["id"],
+            json!("claim:a-supports-claim:b")
+        );
+        assert_eq!(
+            relationships[0]["edge"]["epistemic_type"],
+            json!("supports")
+        );
+        assert_eq!(relationships[0]["node"]["id"], json!("claim:b"));
+
+        let standing = &facet["data"]["contentNode"]["epistemic"]["standing"];
+        assert_eq!(standing["source"], json!("degree_fallback"));
+        assert_eq!(standing["support_in_degree"], json!(1));
+        assert_eq!(standing["attack_in_degree"], json!(0));
+        assert_eq!(standing["stale"], json!(true));
+        assert_eq!(
+            standing["scores"].as_array().map(Vec::len),
+            Some(0),
+            "direct canonical edge should be visible even before shadow scores exist: {facet}"
+        );
+    }
+
     // A3.2: graphSchema lowers to the same schema_payload the flat tool uses, so the
     // two are byte-identical (faithful wrap, no reimplementation).
     #[test]
@@ -17056,6 +17187,34 @@ mod tests {
         assert_eq!(
             neighbors["data"]["epistemicNeighbors"]["results"], flat_neighbors["results"],
             "epistemicNeighbors must return the shadow nodes the flat tool returns: gql={neighbors} flat={flat_neighbors}"
+        );
+
+        let facet = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query{ contentNode(id:\"node:a\"){ id raw epistemic{ relationships(maxDepth:2) standing(topK:4) } } }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&facet);
+        assert_eq!(facet["data"]["contentNode"]["id"], "node:a");
+        assert_eq!(
+            facet["data"]["contentNode"]["raw"]["properties"]["name"],
+            "Ada"
+        );
+        assert!(
+            !facet["data"]["contentNode"]["epistemic"]["relationships"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "contentNode.epistemic.relationships should reuse the epistemic traversal: {facet}"
+        );
+        assert!(
+            !facet["data"]["contentNode"]["epistemic"]["standing"]["scores"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "contentNode.epistemic.standing should expose shadow PPR readout: {facet}"
         );
 
         // shadowPpr parity over the populated shadow layer.
