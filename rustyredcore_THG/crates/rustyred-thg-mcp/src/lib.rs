@@ -4043,6 +4043,186 @@ fn persist_coordination_message_stream_event(
     Ok((event.id, token))
 }
 
+// ---------------------------------------------------------------------------
+// Coordination v2 (Task-Reference Rooms): one dispatch over the runtime engine
+// via a narrow-store adapter, surfaced through the typed GraphQL transport so it
+// adds zero new flat tools.
+// ---------------------------------------------------------------------------
+
+/// Adapts an [`McpGraphBackend`] to the runtime's `CoordinationStore` seam, so
+/// the single coordination v2 engine runs over the MCP backend with no second
+/// persistence implementation. Mirrors the `McpMemoryStore` adapter pattern.
+struct McpCoordinationStore<'a, B: McpGraphBackend> {
+    backend: &'a mut B,
+}
+
+impl<B: McpGraphBackend> theorem_harness_runtime::CoordinationStore
+    for McpCoordinationStore<'_, B>
+{
+    fn coord_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.backend.get_node(id)
+    }
+    fn coord_get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.backend.get_edge(id)
+    }
+    fn coord_query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.backend.query_nodes(query)
+    }
+    fn coord_upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        self.backend.upsert_node(node)
+    }
+    fn coord_upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.backend.upsert_edge(edge)
+    }
+}
+
+fn coordination_v2_error(err: theorem_harness_runtime::CoordinationError) -> McpError {
+    use theorem_harness_runtime::CoordinationError as E;
+    let message = err.to_string();
+    match err {
+        E::InvalidInput { .. } => McpError::invalid_params(message),
+        _ => McpError::internal(message),
+    }
+}
+
+fn coordination_v2_parse<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, McpError> {
+    serde_json::from_value(args.clone()).map_err(|error| McpError::invalid_params(error.to_string()))
+}
+
+fn coordination_v2_value<T: serde::Serialize>(value: T) -> Result<Value, McpError> {
+    serde_json::to_value(value).map_err(|error| McpError::internal(error.to_string()))
+}
+
+/// One dispatch for every coordination v2 verb, parameterized by operation (the
+/// A5/A6 pattern). Tenant is connection-scoped: the caller-supplied tenant is
+/// always overridden, never trusted from the document.
+pub(crate) fn coordination_v2_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    operation: &str,
+    args: &Value,
+) -> Result<Value, McpError> {
+    use theorem_harness_runtime as thr;
+    let tenant = tenant.to_string();
+    let arg_str = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let arg_limit = || args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+
+    match operation {
+        "resolve_task_ref" => {
+            let mut input: thr::TaskRefInput = coordination_v2_parse(args)?;
+            input.tenant_slug = tenant;
+            coordination_v2_value(thr::resolve_task_ref(&input))
+        }
+        "register_task_ref" => {
+            let mut input: thr::TaskRefInput = coordination_v2_parse(args)?;
+            input.tenant_slug = tenant;
+            let task_ref = thr::resolve_task_ref(&input);
+            let created_at = arg_str("created_at");
+            let mut store = McpCoordinationStore { backend };
+            thr::register_task_ref(&mut store, &task_ref, &created_at)
+                .map_err(coordination_v2_error)?;
+            coordination_v2_value(task_ref)
+        }
+        "route_message" => {
+            let mut task: thr::TaskRefInput = coordination_v2_parse(
+                args.get("task").unwrap_or(&Value::Null),
+            )?;
+            task.tenant_slug = tenant.clone();
+            let message = thr::CoordinationMessageState {
+                tenant_slug: tenant,
+                room_id: arg_str("room_id"),
+                message_id: arg_str("message_id"),
+                actor_id: arg_str("actor"),
+                urgency: {
+                    let urgency = arg_str("urgency");
+                    if urgency.is_empty() { "info".to_string() } else { urgency }
+                },
+                delivery: "passive".to_string(),
+                message: arg_str("message"),
+                mentions: Vec::new(),
+                metadata: serde_json::Map::new(),
+                consumed_by: Vec::new(),
+                created_at: arg_str("created_at"),
+            };
+            let mut store = McpCoordinationStore { backend };
+            let routed = thr::route_message_to_task(&mut store, &message, &task)
+                .map_err(coordination_v2_error)?;
+            coordination_v2_value(routed)
+        }
+        "turn_start_discovery" => {
+            let mut input: thr::DiscoveryInput = coordination_v2_parse(args)?;
+            input.task.tenant_slug = tenant;
+            let mut store = McpCoordinationStore { backend };
+            let discovery =
+                thr::turn_start_discovery(&mut store, &input).map_err(coordination_v2_error)?;
+            coordination_v2_value(discovery)
+        }
+        "room_digest" => {
+            let mut input: thr::DigestInput = coordination_v2_parse(args)?;
+            input.task.tenant_slug = tenant;
+            let store = McpCoordinationStore { backend };
+            let digest = thr::room_digest(&store, &input).map_err(coordination_v2_error)?;
+            coordination_v2_value(digest)
+        }
+        "open_pings" => {
+            let actor = arg_str("actor");
+            let branch = args.get("branch").and_then(Value::as_str);
+            let worktree = args.get("worktree").and_then(Value::as_str);
+            let checkout = match (branch, worktree) {
+                (None, None) => None,
+                (branch, worktree) => Some((branch.unwrap_or_default(), worktree.unwrap_or_default())),
+            };
+            let limit = arg_limit();
+            let mut store = McpCoordinationStore { backend };
+            let pings = thr::read_open_pings_for_actor(
+                &mut store, &tenant, &actor, checkout, false, limit,
+            )
+            .map_err(coordination_v2_error)?;
+            coordination_v2_value(pings)
+        }
+        "open_contradictions" => {
+            let task_ref_id = arg_str("task_ref_id");
+            let store = McpCoordinationStore { backend };
+            let contradictions = thr::read_open_contradictions(&store, &tenant, &task_ref_id)
+                .map_err(coordination_v2_error)?;
+            coordination_v2_value(contradictions)
+        }
+        "related_events" => {
+            let canonical_room = arg_str("canonical_room");
+            let limit = arg_limit();
+            let store = McpCoordinationStore { backend };
+            let events = thr::read_related_events(&store, &tenant, &canonical_room, limit)
+                .map_err(coordination_v2_error)?;
+            coordination_v2_value(events)
+        }
+        "create_ping" => {
+            let mut input: thr::PingInput = coordination_v2_parse(args)?;
+            input.tenant_slug = tenant;
+            let mut store = McpCoordinationStore { backend };
+            let ping = thr::create_ping(&mut store, input).map_err(coordination_v2_error)?;
+            coordination_v2_value(ping)
+        }
+        "consume_ping" => {
+            let ping_id = arg_str("ping_id");
+            let mut store = McpCoordinationStore { backend };
+            let ping = thr::consume_ping(&mut store, &tenant, &ping_id)
+                .map_err(coordination_v2_error)?;
+            coordination_v2_value(ping)
+        }
+        "record_claim" => {
+            let mut input: thr::ClaimInput = coordination_v2_parse(args)?;
+            input.tenant_slug = tenant;
+            let mut store = McpCoordinationStore { backend };
+            let (claim, contradictions) =
+                thr::record_claim(&mut store, input).map_err(coordination_v2_error)?;
+            Ok(json!({ "claim": claim, "contradictions": contradictions }))
+        }
+        other => Err(McpError::invalid_params(format!(
+            "unknown coordination_v2 operation: {other}"
+        ))),
+    }
+}
+
 fn mentions_payload(
     tenant: &str,
     backend: &mut impl McpGraphBackend,
@@ -16664,6 +16844,114 @@ mod tests {
             empty["data"]["advanceCoordinationStream"]["count"],
             json!(0),
             "advanced cursor should prevent duplicate delivery: {empty}"
+        );
+    }
+
+    // Coordination v2 (Task-Reference Rooms) rides the typed GraphQL transport:
+    // every verb works through graphql_query / graphql_mutate, so it adds ZERO
+    // new flat tools. One round trip exercises task addressing, off-canonical
+    // routing, turn-start discovery (inbox + pings), and the contradiction pass.
+    #[test]
+    fn graphql_coordination_v2_round_trips_via_graphql_surface() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.tool_result_budget_bytes = 0;
+
+        let task = "{ repo: \"Travis-Gilbert/Theorem\", workstream: \"SPEC-9 CommonPlace Desktop\", specRefs: [\"docs/plans/x/SPEC-9-commonplace-desktop-tauri.md\"], branch: \"Travis-Gilbert/spec-9-commonplace-desktop-tauri\" }";
+
+        // TRR-001: resolve the stable task address.
+        let resolved = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            &format!("query{{ taskRef(task: {task}) }}"),
+            Value::Null,
+        );
+        assert_no_graphql_errors(&resolved);
+        let task_ref = &resolved["data"]["taskRef"];
+        let task_ref_id = task_ref["task_ref_id"].as_str().unwrap().to_string();
+        let canonical = task_ref["canonical_room_id"].as_str().unwrap().to_string();
+        assert_eq!(canonical, "task:spec-9-commonplace-desktop-tauri", "{resolved}");
+
+        // TRR-002: Claude's handoff lands in ungrouped, routes to canonical.
+        let routed = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            &format!(
+                "mutation{{ routeMessageToTask(task: {task}, roomId: \"room:ungrouped\", actor: \"claude-code\", messageId: \"m1\", message: \"backend wiring for SPEC-9 done, frontend next\") }}"
+            ),
+            Value::Null,
+        );
+        assert_no_graphql_errors(&routed);
+
+        // TRR-003: a ping for codex (no subscription anywhere).
+        let pinged = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            &format!(
+                "mutation{{ createPing(targetActor: \"codex\", urgency: \"ask\", taskRefId: \"{task_ref_id}\", roomId: \"{canonical}\", message: \"see the handoff\") }}"
+            ),
+            Value::Null,
+        );
+        assert_no_graphql_errors(&pinged);
+        assert_eq!(pinged["data"]["createPing"]["status"], json!("pending"), "{pinged}");
+
+        // TRR-004/010: codex's turn-start discovery surfaces both before edits.
+        let discovery = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            &format!("query{{ turnStartDiscovery(task: {task}, actor: \"codex\") }}"),
+            Value::Null,
+        );
+        assert_no_graphql_errors(&discovery);
+        let view = &discovery["data"]["turnStartDiscovery"];
+        assert_eq!(view["task_ref_id"], json!(task_ref_id), "{discovery}");
+        assert_eq!(
+            view["related_inbox"].as_array().unwrap().len(),
+            1,
+            "discovery should surface the routed handoff: {discovery}"
+        );
+        assert!(view["related_inbox"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("backend wiring"));
+        assert_eq!(
+            view["open_pings"].as_array().unwrap().len(),
+            1,
+            "discovery should surface the open ping: {discovery}"
+        );
+
+        // TRR-007: two heads claim different ports -> a contradiction.
+        for (actor, port) in [("codex", "1420"), ("claude-code", "3000")] {
+            let claimed = graphql_tool_call(
+                &provider,
+                &config,
+                "graphql_mutate",
+                &format!(
+                    "mutation{{ recordClaim(taskRefId: \"{task_ref_id}\", roomId: \"{canonical}\", actor: \"{actor}\", subject: \"tauri dev port\", predicate: \"value\", object: \"{port}\") }}"
+                ),
+                Value::Null,
+            );
+            assert_no_graphql_errors(&claimed);
+        }
+        let contradictions = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            &format!("query{{ openContradictions(taskRefId: \"{task_ref_id}\") }}"),
+            Value::Null,
+        );
+        assert_no_graphql_errors(&contradictions);
+        assert_eq!(
+            contradictions["data"]["openContradictions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{contradictions}"
         );
     }
 

@@ -83,6 +83,7 @@
 mod clusters;
 mod code;
 mod coordination;
+mod coordination_v2;
 mod epistemic;
 mod graph;
 mod items;
@@ -143,6 +144,9 @@ pub(crate) trait GraphqlInvoker {
     fn task_node(&self, args: Value) -> Result<Value, McpError>;
     fn claim_task_node(&self, args: Value) -> Result<Value, McpError>;
     fn next_task_node(&self, args: Value) -> Result<Value, McpError>;
+    // Coordination v2 (Task-Reference Rooms): one dispatch over the runtime
+    // engine via the McpCoordinationStore adapter, parameterized by operation.
+    fn coordination_v2(&self, operation: &str, args: Value) -> Result<Value, McpError>;
     // Epistemic domain (A4): wraps the shadow-graph payloads.
     fn epistemic_neighbors(&self, args: Value) -> Result<Value, McpError>;
     fn epistemic_dirty_frontier(&self, args: Value) -> Result<Value, McpError>;
@@ -376,6 +380,14 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
     fn next_task_node(&self, args: Value) -> Result<Value, McpError> {
         crate::multihead_next_payload(&self.tenant, &*self.backend.borrow(), &args)
     }
+    fn coordination_v2(&self, operation: &str, args: Value) -> Result<Value, McpError> {
+        crate::coordination_v2_payload(
+            &self.tenant,
+            &mut *self.backend.borrow_mut(),
+            operation,
+            &args,
+        )
+    }
     fn epistemic_neighbors(&self, args: Value) -> Result<Value, McpError> {
         crate::epistemic_neighbors_payload(&self.tenant, &*self.backend.borrow(), &args)
     }
@@ -514,6 +526,7 @@ pub(crate) struct QueryRoot(
     memory::MemoryQuery,
     graph::GraphQuery,
     coordination::CoordinationQuery,
+    coordination_v2::CoordinationV2Query,
     epistemic::EpistemicQuery,
     code::CodeQuery,
     kg::HarnessKgQuery,
@@ -526,6 +539,7 @@ pub(crate) struct MutationRoot(
     memory::MemoryMutation,
     graph::GraphMutation,
     coordination::CoordinationMutation,
+    coordination_v2::CoordinationV2Mutation,
     epistemic::EpistemicMutation,
     code::CodeMutation,
     clusters::ClustersMutation,

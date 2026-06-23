@@ -2,85 +2,86 @@
   "schema_version": 1,
   "plan": "docs/plans/harness-coordination-v2/TASK-REFERENCE-ROOMS.md",
   "task": "Task-Reference Rooms for Theorems Harness Coordination",
+  "notes": "Engine in rustyredcore_THG/crates/theorem-harness-runtime/src/coordination_v2.rs over a narrow CoordinationStore seam (blanket-impl'd for GraphStore). All 10 acceptance criteria proven by 11 unit/integration tests (cargo test -p theorem-harness-runtime coordination_v2). MCP EXPOSURE DONE via the typed GraphQL surface with ZERO new flat tools: a CoordinationV2 GraphQL domain (graphql/coordination_v2.rs) whose fields ride the existing graphql_query / graphql_mutate transport, lowering to one coordination_v2 invoker op that runs the SAME engine over an McpCoordinationStore adapter (no second persistence implementation; mirrors the MemoryGraphStore/McpMemoryStore pattern). Performance: resolvers run synchronously on the dispatch thread over the same backend, identical cost to a flat tool. Proven by graphql_coordination_v2_round_trips_via_graphql_surface (task addressing, off-canonical routing, turn-start discovery, pings, contradiction pass through GraphQL). 121 mcp lib tests green; the no-tenant SDL guard still passes (no field carries an instance scope). Connection-scoped: the caller tenant is always overridden. The .harness/coordination.json manifest (TRR-005) stays a runtime + device-side file affordance, not an MCP verb (it is a worktree file, not a graph op). Changed files clippy-clean; cargo check --workspace clean. Pre-existing unrelated failure on this branch: tests/skill_corpus_acceptance.rs (4 vs 3), confirmed failing identically on base main -- not from this work.",
   "items": [
     {
       "id": "TRR-001",
       "title": "Add TaskRef resolver",
-      "status": "open",
+      "status": "done",
       "acceptance": "Given tenant, repo, spec, and branch metadata, both Codex and Claude resolve the same task_ref_id and canonical_room_id.",
-      "verification": null,
+      "verification": "resolve_task_ref (pure, content hash over normalized metadata; spec paths collapse to a basename token so the in-repo path and the Downloads path agree). Test: coordination_v2::tests::trr_001_resolver_is_deterministic_across_heads.",
       "deferral_reason": null
     },
     {
       "id": "TRR-002",
       "title": "Add room refs, aliases, and merges",
-      "status": "open",
+      "status": "done",
       "acceptance": "A message written to room:ungrouped with SPEC-9 metadata appears in the SPEC-9 canonical room as a related event with provenance.",
-      "verification": null,
+      "verification": "register_task_ref/resolve_canonical_room (CoordinationRoomAlias nodes + COORDINATION_ROOM_ALIAS_OF edges) and route_message_to_task/attach_related_event (CoordinationRelatedEvent with origin room/message/actor/confidence/reason provenance). Test: trr_002_ungrouped_message_routes_to_canonical_with_provenance. RoomRef/RoomMerge from the design narrative are subsumed by the alias graph + canonical resolution; the load-bearing acceptance (provenance-carrying related event) is proven.",
       "deferral_reason": null
     },
     {
       "id": "TRR-003",
       "title": "Restore explicit pings",
-      "status": "open",
+      "status": "done",
       "acceptance": "urgency=ask or urgency=block creates a target actor ping with pending, seen, and consumed status, even if the actor is not subscribed to the stream.",
-      "verification": null,
+      "verification": "create_ping (CoordinationActorPing node, ask/block only) + read_open_pings_for_actor (pending->seen) + consume_ping (->consumed). Pings are actor-targeted nodes independent of any stream subscription. Test: trr_003_ask_creates_ping_reachable_without_subscription.",
       "deferral_reason": null
     },
     {
       "id": "TRR-004",
       "title": "Add turn-start discovery",
-      "status": "open",
+      "status": "done",
       "acceptance": "At turn start, a head sees canonical room, related inbox messages, open pings, active intents, stale intents, and contradictions for its task.",
-      "verification": null,
+      "verification": "turn_start_discovery returns canonical room + related_inbox + open_pings (checkout-filtered; a pure read, no delivery-state change) + active/stale intent split + open contradictions. Engine test: trr_004_turn_start_discovery_surfaces_every_bucket. Exposed over MCP as the turnStartDiscovery GraphQL query (zero new flat tools); proven through the transport by graphql_coordination_v2_round_trips_via_graphql_surface.",
       "deferral_reason": null
     },
     {
       "id": "TRR-005",
       "title": "Write and read coordination manifest",
-      "status": "open",
+      "status": "done",
       "acceptance": "Starting a task writes a manifest; a later head in the worktree can find the canonical room without guessing.",
-      "verification": null,
+      "verification": "write_coordination_manifest/read_coordination_manifest at <worktree>/.harness/coordination.json; merge-aware update preserves prior actors/open_questions for the same task. Test: trr_005_manifest_roundtrips_and_merges_without_clobber.",
       "deferral_reason": null
     },
     {
       "id": "TRR-006",
       "title": "Target checkout identity",
-      "status": "open",
+      "status": "done",
       "acceptance": "A ping can target actor plus branch plus worktree; a different checkout sees that it is not the intended target.",
-      "verification": null,
+      "verification": "ActorPing carries target_branch/target_worktree; ping_targets_checkout + read_open_pings_for_actor filter by checkout (empty branch/worktree = any checkout). Test: trr_006_ping_targets_specific_checkout.",
       "deferral_reason": null
     },
     {
       "id": "TRR-007",
       "title": "Add contradiction claim model",
-      "status": "open",
+      "status": "done",
       "acceptance": "Structured claim conflicts write CONTRADICTS edges and a room-visible contradiction event.",
-      "verification": null,
+      "verification": "record_claim persists CoordinationClaim nodes, runs the conservative same-subject+same-predicate+different-object pass, writes a COORDINATION_CONTRADICTS edge between claims and a CoordinationContradiction event edged to the room; same-actor restatement supersedes and resolves (no re-alert). Test: trr_007_contradiction_writes_edge_and_event_and_resolves_on_supersede. v1 implements the scalar-object rule; the other three rule shapes in the design (checklist done/blocked, file claimed twice, evidence-vs-prose) are a named extension.",
       "deferral_reason": null
     },
     {
       "id": "TRR-008",
       "title": "Add room dashboard digest",
-      "status": "open",
+      "status": "done",
       "acceptance": "Digest displays canonical room, aliases, active actors, stale actors, pending pings, related ungrouped messages, and contradictions.",
-      "verification": null,
+      "verification": "room_digest composes registered aliases, active/stale actor split (presence + intents), pending pings, related messages, and open contradictions into one RoomDigest. Engine test: trr_008_digest_displays_all_sections. Exposed over MCP as the roomDigest GraphQL query (zero new flat tools). Harness-console rendering is a downstream consumer of that digest field (separate Next.js app); the digest data contract it renders is produced and proven here.",
       "deferral_reason": null
     },
     {
       "id": "TRR-009",
       "title": "Backfill compatibility",
-      "status": "open",
+      "status": "done",
       "acceptance": "Existing room users keep working; old room ids become aliases or standalone rooms with no data loss.",
-      "verification": null,
+      "verification": "register_task_ref records the legacy inferred room (repo:branch) as an alias; resolve_canonical_room maps it to canonical while messages written to the old room remain readable there (read_messages_for_room unchanged); an unaliased room resolves to itself. All existing coordination.rs read/write paths are untouched (additive). Test: trr_009_old_room_ids_alias_in_without_data_loss.",
       "deferral_reason": null
     },
     {
       "id": "TRR-010",
       "title": "Acceptance replay",
-      "status": "open",
+      "status": "done",
       "acceptance": "A replay of the SPEC-9 failure mode shows Claude's ungrouped handoff discovered by Codex before edits begin.",
-      "verification": null,
+      "verification": "End-to-end over a durable RedCoreGraphStore: Claude resolves the SPEC-9 task and (the bug) writes a handoff to room:ungrouped; permissive routing attaches it to the canonical room; Codex's turn_start_discovery (task resolved from the repo path) surfaces Claude's handoff in related_inbox before editing. Test: trr_010_spec9_replay_codex_discovers_claude_handoff_before_editing (+ trr_durable_aliases_and_related_survive_reopen proves cross-restart durability).",
       "deferral_reason": null
     }
   ]

@@ -23,7 +23,7 @@ use theorem_harness_core::{
 
 pub type CoordinationResult<T> = Result<T, CoordinationError>;
 
-const DEFAULT_ROOM: &str = "room:ungrouped";
+pub(crate) const DEFAULT_ROOM: &str = "room:ungrouped";
 const DEFAULT_MODE: &str = "collaborating";
 const DEFAULT_PRESENCE_TTL_SECONDS: u64 = 60;
 const INTENT_STATUSES: &[&str] = &["working", "paused", "done"];
@@ -1689,7 +1689,7 @@ fn record_room_edge(state: &CoordinationRecordState) -> CoordinationResult<EdgeR
     ))
 }
 
-fn empty_room_state(tenant_slug: &str, room_id: &str, now: &str) -> CoordinationRoomState {
+pub(crate) fn empty_room_state(tenant_slug: &str, room_id: &str, now: &str) -> CoordinationRoomState {
     CoordinationRoomState {
         tenant_slug: normalize_tenant_slug(tenant_slug),
         room_id: normalize_room_id(room_id),
@@ -1861,7 +1861,7 @@ fn resolve_room_id(
     infer_coordination_room_id(repo, branch, task, session_id)
 }
 
-fn normalize_room_id(room_id: &str) -> String {
+pub(crate) fn normalize_room_id(room_id: &str) -> String {
     let room_id = room_id.trim();
     if room_id.is_empty() {
         DEFAULT_ROOM.to_string()
@@ -1882,7 +1882,7 @@ fn require_text(field: &str, value: &str) -> CoordinationResult<String> {
     }
 }
 
-fn require_actor_id(field: &str, value: &str) -> CoordinationResult<String> {
+pub(crate) fn require_actor_id(field: &str, value: &str) -> CoordinationResult<String> {
     let value = normalize_actor_id(value);
     if value.is_empty() {
         Err(CoordinationError::InvalidInput {
@@ -1894,7 +1894,7 @@ fn require_actor_id(field: &str, value: &str) -> CoordinationResult<String> {
     }
 }
 
-fn require_tenant_slug(value: &str) -> CoordinationResult<String> {
+pub(crate) fn require_tenant_slug(value: &str) -> CoordinationResult<String> {
     if value.trim().is_empty() {
         Err(CoordinationError::InvalidInput {
             field: "tenant_slug".to_string(),
@@ -2028,7 +2028,7 @@ pub fn stable_coordination_message_id(
     stable_message_id(tenant_slug, room_id, actor_id, message, created_at)
 }
 
-fn slugify_room_part(value: &str) -> String {
+pub(crate) fn slugify_room_part(value: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
     for character in value.trim().to_lowercase().chars() {
@@ -2046,7 +2046,7 @@ fn slugify_room_part(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-fn timestamp_or_now(value: &str) -> String {
+pub(crate) fn timestamp_or_now(value: &str) -> String {
     let value = value.trim();
     if !value.is_empty() {
         return value.to_string();
@@ -2062,7 +2062,10 @@ fn default_presence_ttl() -> u64 {
     DEFAULT_PRESENCE_TTL_SECONDS
 }
 
-fn upsert_node_if_changed<S: GraphStore>(store: &mut S, node: NodeRecord) -> GraphStoreResult<()> {
+pub(crate) fn upsert_node_if_changed<S: GraphStore>(
+    store: &mut S,
+    node: NodeRecord,
+) -> GraphStoreResult<()> {
     let unchanged = store
         .get_node(&node.id)
         .map(|existing| {
@@ -2077,7 +2080,10 @@ fn upsert_node_if_changed<S: GraphStore>(store: &mut S, node: NodeRecord) -> Gra
     Ok(())
 }
 
-fn upsert_edge_if_changed<S: GraphStore>(store: &mut S, edge: EdgeRecord) -> GraphStoreResult<()> {
+pub(crate) fn upsert_edge_if_changed<S: GraphStore>(
+    store: &mut S,
+    edge: EdgeRecord,
+) -> GraphStoreResult<()> {
     let unchanged = store
         .get_edge(&edge.id)
         .map(|existing| {
