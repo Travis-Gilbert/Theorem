@@ -1,0 +1,500 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use rustyred_thg_core::{
+    EdgeRecord, HookDispatcher, HookDispatcherConfig, InMemoryGraphStore, NodeRecord,
+    RedCoreGraphStore,
+};
+use serde_json::json;
+
+use crate::{
+    admitted_edge_id, standing_pass_hook, AdvisoryCandidate, AdvisoryPayload, CandidateKind,
+    CandidateRef, DatalogStandingGenerator, EgglogEquivalenceStandingGenerator,
+    HotTemporalStandingGenerator, InferredEdgeCandidate, PairformerConfig,
+    PairformerStandingGenerator, SourceReliabilityStandingGenerator,
+    Spec1PropertyStandingGenerator, StandingGenerator, StandingPassConfig, StandingPassEngine,
+    STANDING_PASS_ADMITTED_BY,
+};
+
+fn standing_config() -> StandingPassConfig {
+    StandingPassConfig {
+        tenant_id: "theorem".to_string(),
+        max_nodes: 16,
+        max_depth: 2,
+        min_path_confidence: 0.0,
+        confidence_threshold: 0.0,
+        confidence_ceiling: 0.72,
+        max_candidates: 16,
+        admission_tier: "advisory_inferred".to_string(),
+        allowed_edge_types: Vec::new(),
+        pairformer_config: PairformerConfig {
+            pair_dim: 8,
+            single_dim: 8,
+            blocks: 2,
+            transition_hidden_dim: 16,
+            max_nodes: 16,
+            ..PairformerConfig::default()
+        },
+        auto_apply_at_confidence_ceiling: true,
+    }
+}
+
+fn seed_fixture<S: crate::types::AdapterGraphStore>(store: &mut S) {
+    for (node_id, properties) in [
+        (
+            "node:a",
+            json!({ "embedding": [1.0, 0.0], "t_valid": 1_000, "t_invalid": 2_000 }),
+        ),
+        ("node:b", json!({ "embedding": [0.5, 0.5] })),
+        ("node:c", json!({ "embedding": [0.0, 1.0] })),
+        ("node:d", json!({ "t_valid": 2_100, "t_invalid": 3_000 })),
+    ] {
+        store
+            .upsert_node(NodeRecord::new(node_id, ["Object"], properties))
+            .unwrap();
+    }
+    store
+        .upsert_edge(
+            EdgeRecord::new("edge:a-b", "node:a", "RELATES_TO", "node:b", json!({}))
+                .with_confidence(0.95),
+        )
+        .unwrap();
+    store
+        .upsert_edge(
+            EdgeRecord::new("edge:b-c", "node:b", "RELATES_TO", "node:c", json!({}))
+                .with_confidence(0.95),
+        )
+        .unwrap();
+    store
+        .upsert_edge(
+            EdgeRecord::new("edge:a-d", "node:a", "OBSERVED_WITH", "node:d", json!({}))
+                .with_confidence(0.95),
+        )
+        .unwrap();
+}
+
+fn seed_symbolic_fixture<S: crate::types::AdapterGraphStore>(store: &mut S) {
+    store
+        .upsert_node(NodeRecord::new(
+            "claim:unsupported",
+            ["Claim"],
+            json!({
+                "claim_text": "The roof was repaired",
+                "status": "proposed",
+                "source_id": "source:field-team"
+            }),
+        ))
+        .unwrap();
+    store
+        .upsert_node(NodeRecord::new(
+            "object:alpha",
+            ["Object"],
+            json!({
+                "title": "Depot Parcel",
+                "source_id": "source:field-team"
+            }),
+        ))
+        .unwrap();
+    store
+        .upsert_node(NodeRecord::new(
+            "object:beta",
+            ["Object"],
+            json!({
+                "title": "Depot parcel!",
+                "source_id": "source:field-team"
+            }),
+        ))
+        .unwrap();
+    store
+        .upsert_edge(
+            EdgeRecord::new(
+                "edge:contradicts",
+                "object:alpha",
+                "CONTRADICTS",
+                "object:beta",
+                json!({ "source_id": "source:appeal" }),
+            )
+            .with_confidence(0.9),
+        )
+        .unwrap();
+}
+
+fn seed_property_fixture<S: crate::types::AdapterGraphStore>(store: &mut S) {
+    store
+        .upsert_node(NodeRecord::new("node:target", ["Object"], json!({})))
+        .unwrap();
+    store
+        .upsert_node(NodeRecord::new(
+            "node:support",
+            ["Object"],
+            json!({ "status": "active" }),
+        ))
+        .unwrap();
+    store
+        .upsert_edge(
+            EdgeRecord::new(
+                "edge:target-support",
+                "node:target",
+                "SIMILAR_TO",
+                "node:support",
+                json!({}),
+            )
+            .with_confidence(0.9),
+        )
+        .unwrap();
+}
+
+#[test]
+fn standing_engine_runs_pairformer_and_temporal_generators_and_admits_union() {
+    let mut store = InMemoryGraphStore::new();
+    seed_fixture(&mut store);
+    let config = standing_config();
+    let engine = StandingPassEngine::new(
+        config.clone(),
+        vec![
+            Arc::new(PairformerStandingGenerator::new(
+                config.pairformer_config.clone(),
+            )),
+            Arc::new(HotTemporalStandingGenerator::default()),
+        ],
+    )
+    .unwrap();
+
+    let result = engine.run(&mut store, vec!["node:a".to_string()]).unwrap();
+
+    assert_eq!(
+        result.generator_ids,
+        vec![
+            "pairformer-structural/default".to_string(),
+            "hot-temporal/heuristic-v0".to_string()
+        ]
+    );
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == "pairformer-structural/default"
+            && matches!(
+                &candidate.subject,
+                crate::CandidateRef::EdgeProposal {
+                    source_id,
+                    target_id,
+                    edge_type
+                } if source_id == "node:a"
+                    && target_id == "node:c"
+                    && edge_type == "INFERRED_RELATES_TO"
+            )
+            && candidate.support.is_some()
+    }));
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == "hot-temporal/heuristic-v0"
+            && matches!(
+                &candidate.subject,
+                crate::CandidateRef::EdgeProposal {
+                    source_id,
+                    target_id,
+                    edge_type
+                } if source_id == "node:a" && target_id == "node:d" && edge_type == "PRECEDES"
+            )
+            && candidate.support.is_some()
+    }));
+    assert!(!result.candidate_node_ids.is_empty());
+    assert!(result
+        .applied_edge_ids
+        .iter()
+        .any(|edge_id| { edge_id == "edge:node:a:INFERRED_RELATES_TO:node:c" }));
+    assert!(result
+        .applied_edge_ids
+        .iter()
+        .any(|edge_id| edge_id == "edge:node:a:PRECEDES:node:d"));
+
+    let applied = store
+        .get_edge("edge:node:a:INFERRED_RELATES_TO:node:c")
+        .expect("standing pass applied precomputed structural edge");
+    assert_eq!(
+        applied.properties["admitted_by"],
+        json!(STANDING_PASS_ADMITTED_BY)
+    );
+    assert!(
+        (applied.confidence.unwrap_or_default() - 0.72).abs() < 1e-6,
+        "stored confidence should preserve the admission ceiling"
+    );
+}
+
+#[test]
+fn symbolic_generators_emit_datalog_equivalence_and_reliability_candidates() {
+    let mut store = InMemoryGraphStore::new();
+    seed_symbolic_fixture(&mut store);
+    let engine = StandingPassEngine::new(
+        standing_config(),
+        vec![
+            Arc::new(DatalogStandingGenerator::with_rule_ids([
+                "unsupported_claim",
+                "likely_duplicate_entity",
+            ])),
+            Arc::new(EgglogEquivalenceStandingGenerator::default()),
+            Arc::new(SourceReliabilityStandingGenerator::default()),
+        ],
+    )
+    .unwrap();
+
+    let result = engine
+        .run(
+            &mut store,
+            vec![
+                "claim:unsupported".to_string(),
+                "object:alpha".to_string(),
+                "object:beta".to_string(),
+            ],
+        )
+        .unwrap();
+
+    assert!(result.applied_edge_ids.is_empty());
+    assert!(result.candidate_node_ids.is_empty());
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == crate::DATALOG_STANDING_GENERATOR_ID
+            && candidate.kind == crate::CandidateKind::DerivedFact
+            && matches!(
+                &candidate.payload,
+                crate::AdvisoryPayload::Json(payload)
+                    if payload["derived_fact"]["relation"] == json!("unsupported_claim")
+            )
+            && candidate.support.as_ref().is_some_and(|support| {
+                support
+                    .node_ids
+                    .iter()
+                    .any(|node_id| node_id == "claim:unsupported")
+            })
+    }));
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == crate::EGGLOG_EQUIVALENCE_STANDING_GENERATOR_ID
+            && candidate.kind == crate::CandidateKind::EquivalenceMerge
+            && matches!(
+                &candidate.payload,
+                crate::AdvisoryPayload::Json(payload)
+                    if payload["canonical_title"] == json!("depot parcel")
+                        && payload["member_node_ids"]
+                            .as_array()
+                            .unwrap()
+                            .len()
+                            == 2
+            )
+    }));
+    assert!(result.candidates.iter().any(|candidate| {
+        candidate.generator_id == crate::SOURCE_RELIABILITY_STANDING_GENERATOR_ID
+            && candidate.kind == crate::CandidateKind::ReliabilityAnnotation
+            && matches!(
+                &candidate.payload,
+                crate::AdvisoryPayload::Json(payload)
+                    if payload["source_id"] == json!("source:appeal")
+                        && payload["contradicted"] == json!(1)
+            )
+    }));
+}
+
+#[test]
+fn spec1_property_generator_quarantines_and_applies_scalar_candidates() {
+    let mut quarantine_store = InMemoryGraphStore::new();
+    seed_property_fixture(&mut quarantine_store);
+    let mut quarantine_config = standing_config();
+    quarantine_config.confidence_ceiling = 0.99;
+    let quarantine_engine = StandingPassEngine::new(
+        quarantine_config,
+        vec![Arc::new(Spec1PropertyStandingGenerator::default())],
+    )
+    .unwrap();
+
+    let quarantine_result = quarantine_engine
+        .run(&mut quarantine_store, vec!["node:target".to_string()])
+        .unwrap();
+
+    let (advisory, property_candidate) = quarantine_result
+        .candidates
+        .iter()
+        .find_map(|candidate| match &candidate.payload {
+            AdvisoryPayload::Property(property) => Some((candidate, property)),
+            AdvisoryPayload::Edge(_) | AdvisoryPayload::Json(_) => None,
+        })
+        .expect("SPEC-1 property generator emitted a scalar property proposal");
+    assert_eq!(advisory.kind, CandidateKind::PropertyProposal);
+    assert!(matches!(
+        &advisory.subject,
+        CandidateRef::PropertyProposal {
+            target_node_id,
+            property_key,
+            ..
+        } if target_node_id == "node:target" && property_key == "status"
+    ));
+    assert_eq!(
+        advisory.generator_id,
+        crate::SPEC1_PROPERTY_STANDING_GENERATOR_ID
+    );
+    assert_eq!(property_candidate.target_node_id, "node:target");
+    assert_eq!(property_candidate.property_key, "status");
+    assert_eq!(property_candidate.proposed_value, json!("active"));
+    assert_eq!(property_candidate.confidence, 0.95);
+    assert_eq!(property_candidate.confidence_ceiling, 0.99);
+    assert_eq!(quarantine_result.property_candidate_node_ids.len(), 1);
+    assert!(quarantine_result.applied_property_node_ids.is_empty());
+    let quarantined_node = quarantine_store
+        .get_node(&quarantine_result.property_candidate_node_ids[0])
+        .unwrap();
+    assert!(quarantined_node
+        .labels
+        .contains(&crate::REFLEXIVE_PROPERTY_CANDIDATE_LABEL.to_string()));
+    assert_eq!(quarantined_node.properties["applied"], json!(false));
+    assert!(quarantine_store
+        .get_node("node:target")
+        .unwrap()
+        .properties
+        .get("status")
+        .is_none());
+
+    let mut apply_store = InMemoryGraphStore::new();
+    seed_property_fixture(&mut apply_store);
+    let apply_engine = StandingPassEngine::new(
+        standing_config(),
+        vec![Arc::new(Spec1PropertyStandingGenerator::default())],
+    )
+    .unwrap();
+
+    let apply_result = apply_engine
+        .run(&mut apply_store, vec!["node:target".to_string()])
+        .unwrap();
+
+    assert_eq!(apply_result.property_candidate_node_ids.len(), 1);
+    assert_eq!(
+        apply_result.applied_property_node_ids,
+        vec!["node:target".to_string()]
+    );
+    assert!(apply_result.applied_edge_ids.is_empty());
+    assert_eq!(
+        apply_store.get_node("node:target").unwrap().properties["status"],
+        json!("active")
+    );
+}
+
+#[test]
+fn standing_pass_hook_materializes_candidates_after_foreground_write() {
+    let store = Arc::new(Mutex::new(RedCoreGraphStore::memory()));
+    {
+        let mut guard = store.lock().unwrap();
+        seed_fixture(&mut *guard);
+    }
+
+    let dispatcher = HookDispatcher::start(
+        Arc::clone(&store),
+        vec![standing_pass_hook(standing_config()).unwrap()],
+        HookDispatcherConfig {
+            debounce: Duration::from_millis(20),
+            idle_poll: Duration::from_millis(5),
+            max_depth: 3,
+            ..Default::default()
+        },
+    );
+    {
+        let mut guard = store.lock().unwrap();
+        guard.attach_hook_emitter(dispatcher.emitter());
+        guard.set_hook_tenant("theorem");
+        guard
+            .upsert_node(NodeRecord::new(
+                "node:a",
+                ["Object"],
+                json!({
+                    "embedding": [1.0, 0.0],
+                    "t_valid": 1_000,
+                    "t_invalid": 2_000,
+                    "standing_pass_touch": true
+                }),
+            ))
+            .unwrap();
+    }
+
+    assert!(dispatcher.quiesce(Duration::from_secs(5)));
+    let guard = store.lock().unwrap();
+    let edge = guard
+        .get_edge("edge:node:a:INFERRED_RELATES_TO:node:c")
+        .unwrap()
+        .expect("hook materialized standing-pass edge");
+    assert_eq!(
+        edge.properties["admitted_by"],
+        json!(STANDING_PASS_ADMITTED_BY)
+    );
+    let candidate_nodes = guard
+        .graph_snapshot()
+        .nodes
+        .into_iter()
+        .filter(|node| {
+            node.labels
+                .iter()
+                .any(|label| label == crate::REFLEXIVE_EDGE_CANDIDATE_LABEL)
+        })
+        .count();
+    assert!(candidate_nodes >= 2, "structural plus temporal candidates");
+}
+
+#[derive(Debug)]
+struct CountingGenerator {
+    calls: Arc<AtomicUsize>,
+}
+
+impl StandingGenerator for CountingGenerator {
+    fn id(&self) -> &str {
+        "counting-generator/test"
+    }
+
+    fn generate(
+        &self,
+        input: &crate::GeneratorInput,
+    ) -> rustyred_thg_core::ThgResult<Vec<AdvisoryCandidate>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let edge = InferredEdgeCandidate {
+            candidate_id: "counting-edge".to_string(),
+            tenant_id: input.query.tenant_id.clone(),
+            source_id: "node:a".to_string(),
+            target_id: "node:b".to_string(),
+            proposed_edge_type: "COUNTED_WITH".to_string(),
+            confidence: input.query.confidence_ceiling,
+            confidence_ceiling: input.query.confidence_ceiling,
+            admission_tier: input.query.admission_tier.clone(),
+            model_id: self.id().to_string(),
+            support_path_edge_ids: Vec::new(),
+            support_path_node_ids: vec!["node:a".to_string(), "node:b".to_string()],
+        };
+        Ok(vec![AdvisoryCandidate::from_edge(self.id(), edge)])
+    }
+}
+
+#[test]
+fn reads_use_precomputed_structure_without_calling_generators() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut store = InMemoryGraphStore::new();
+    store
+        .upsert_node(NodeRecord::new("node:a", ["Object"], json!({})))
+        .unwrap();
+    store
+        .upsert_node(NodeRecord::new("node:b", ["Object"], json!({})))
+        .unwrap();
+    let engine = StandingPassEngine::new(
+        standing_config(),
+        vec![Arc::new(CountingGenerator {
+            calls: Arc::clone(&calls),
+        })],
+    )
+    .unwrap();
+
+    let result = engine.run(&mut store, vec!["node:a".to_string()]).unwrap();
+    let edge_id = admitted_edge_id(
+        result.candidates[0]
+            .edge_candidate()
+            .expect("edge advisory payload"),
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    for _ in 0..5 {
+        assert!(store.get_edge(&edge_id).is_some());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "reads did not re-enter generator"
+    );
+}

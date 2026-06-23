@@ -12,6 +12,11 @@ pub mod commands;
 pub mod edge_mpnn;
 pub mod fitness;
 pub mod grounded_skill;
+pub mod hot;
+#[cfg(feature = "pairformer-burn-cubecl")]
+pub mod hot_burn;
+#[cfg(feature = "pairformer-burn-cubecl")]
+pub mod hot_cubecl;
 pub mod pairformer;
 #[cfg(feature = "pairformer-burn-cubecl")]
 pub mod pairformer_cubecl;
@@ -19,6 +24,7 @@ pub mod reflexive;
 pub mod reflexive_executor;
 pub mod routing;
 pub mod situation_search;
+pub mod standing_pass;
 pub mod training_runner;
 pub mod training_substrate;
 pub mod types;
@@ -48,6 +54,25 @@ pub use grounded_skill::{
     GroundedSkillProvenance, GroundedSkillScript, GroundedSkillScriptLanguage,
     GroundedSkillSourceRef, AGENT_SKILL_STANDARD, DEFAULT_GROUNDED_SKILL_EMBEDDER_MODEL,
 };
+pub use hot::{
+    build_hot_feature_matrices, evaluate_hot_predictions, extract_higher_order_temporal_neighbors,
+    hot_input_from_snapshot, hot_temporal_edge_timestamp_for_record,
+    hot_temporal_link_dataset_from_snapshot, hot_training_examples_from_input,
+    hot_training_examples_from_timed_labels, patch_align_and_concatenate, run_hot,
+    score_hot_timed_labels, tgat_time_encoding, train_hot_link_model, HotConfig,
+    HotFeatureMatrices, HotInput, HotLearnedModel, HotLinkScore, HotLinkTrainingExample,
+    HotNegativeSamplingScheme, HotNode, HotNodeRepresentation, HotOutput, HotPairLabel,
+    HotPairPrediction, HotPairRepresentation, HotPairSequence, HotTemporalEdge,
+    HotTemporalLinkDataset, HotTemporalSplitConfig, HotTimeEncoder, HotTimedPairLabel,
+    HotTrainingConfig, HotTrainingReport,
+    DEFAULT_HOT_ALIGNED_DIM, DEFAULT_HOT_BLOCK_SIZE, DEFAULT_HOT_BRT_CELLS,
+    DEFAULT_HOT_COOCCURRENCE_DIM, DEFAULT_HOT_DECODER_HIDDEN_DIM, DEFAULT_HOT_HEADS,
+    DEFAULT_HOT_HORIZONTAL_CELL_INDEX, DEFAULT_HOT_MAX_NODES, DEFAULT_HOT_MAX_TEMPORAL_EDGES,
+    DEFAULT_HOT_OUTPUT_DIM, DEFAULT_HOT_PATCH_SIZE, DEFAULT_HOT_S1, DEFAULT_HOT_S2,
+    DEFAULT_HOT_SEGMENT_SIZE, DEFAULT_HOT_STATE_VECTORS, DEFAULT_HOT_TIME_ENCODING_DIM,
+};
+#[cfg(feature = "pairformer-burn-cubecl")]
+pub use hot_burn::{featurize_hot_training_examples, BurnHot, BurnHotConfig};
 pub use pairformer::{
     run_pairformer, PairformerConfig, PairformerEdgeInput, PairformerInput, PairformerLinkScore,
     PairformerNodeInput, PairformerOutput, PairformerPairRepresentation, PairformerSupportPath,
@@ -60,7 +85,8 @@ pub use reflexive::{
     property_candidate_run_node_id, quarantine_densification_candidates,
     quarantine_property_candidates, quarantine_property_candidates_with_options,
     rank_classification_property_candidates, rank_densification_candidates,
-    rank_missing_property_candidates, rank_pairformer_densification_candidates,
+    rank_hot_temporal_densification_candidates, rank_missing_property_candidates,
+    rank_pairformer_densification_candidates,
     rank_property_candidates, rank_reflexive_organizing_candidates, rank_spatial_candidates,
     rank_temporal_candidates, representation_sidecar_node_id, upsert_representation_sidecar,
     DensificationQuarantineResult, DensificationRequest, DensificationResult,
@@ -105,12 +131,28 @@ pub use situation_search::{
     SEARCH_ESCALATION_PLAN_LABEL, SIMILAR_SITUATION_SEARCH_LABEL, USER_MODEL_LABEL,
     USER_PREFERENCE_LABEL,
 };
+pub use standing_pass::{
+    admitted_edge_id, default_standing_generators, standing_pass_hook,
+    standing_pass_hook_with_engine, standing_pass_run_id, AdvisoryCandidate, AdvisoryPayload,
+    CandidateKind, CandidatePair, CandidateRef, DatalogStandingGenerator,
+    EgglogEquivalenceStandingGenerator, GeneratorInput, GeneratorQuery, GeneratorQueryKind,
+    HotTemporalStandingGenerator, PairformerStandingGenerator, SourceReliabilityStandingGenerator,
+    SpatialStandingGenerator, Spec1PropertyStandingGenerator, StandingGenerator,
+    StandingPassConfig, StandingPassEngine, StandingPassResult, DATALOG_STANDING_GENERATOR_ID,
+    DEFAULT_STANDING_PASS_CONFIDENCE_CEILING, DEFAULT_STANDING_PASS_CONFIDENCE_THRESHOLD,
+    DEFAULT_STANDING_PASS_MAX_CANDIDATES, DEFAULT_STANDING_PASS_MAX_DEPTH,
+    DEFAULT_STANDING_PASS_MAX_NODES, EGGLOG_EQUIVALENCE_STANDING_GENERATOR_ID,
+    SOURCE_RELIABILITY_STANDING_GENERATOR_ID, SPEC1_PROPERTY_STANDING_GENERATOR_ID,
+    STANDING_PASS_ADMITTED_BY,
+};
 pub use training_runner::{
     export_training_snapshot_files, import_gnn_export_dir, open_training_store,
-    redcore_training_options, run_local_training_smoke, runpod_input_for_manifest,
-    seed_training_fixture, writeback_model_artifact_file, RunPodTrainingInput, TrainingExportFiles,
-    TrainingSmokeResult, TrainingSnapshotBundle, TrainingSnapshotLocalFiles, GRAPH_SNAPSHOT_FILE,
-    MANIFEST_FILE, RUNPOD_INPUT_FILE,
+    redcore_training_options, run_hot_temporal_training, run_local_training_smoke,
+    runpod_input_for_manifest, seed_hot_temporal_fixture, seed_training_fixture,
+    writeback_model_artifact_file, HotBaselineReport, HotTemporalFixtureResult,
+    HotTrainingRunMetrics, HotTrainingRunOptions, HotTrainingRunResult, RunPodTrainingInput,
+    TrainingExportFiles, TrainingSmokeResult, TrainingSnapshotBundle, TrainingSnapshotLocalFiles,
+    GRAPH_SNAPSHOT_FILE, HOT_MODEL_ARTIFACT_FILE, HOT_MODEL_FILE, MANIFEST_FILE, RUNPOD_INPUT_FILE,
 };
 pub use training_substrate::{
     artifact_node_id, evaluation_receipt_node_id, export_training_snapshot, gnn_export_node_id,
@@ -172,8 +214,16 @@ mod burn_pairformer_test;
 mod pairformer_test;
 
 #[cfg(test)]
+#[path = "tests/hot_test.rs"]
+mod hot_test;
+
+#[cfg(test)]
 #[path = "tests/situation_search_test.rs"]
 mod situation_search_test;
+
+#[cfg(test)]
+#[path = "tests/standing_pass_test.rs"]
+mod standing_pass_test;
 
 #[cfg(test)]
 #[path = "tests/fitness_test.rs"]

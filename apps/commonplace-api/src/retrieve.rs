@@ -10,8 +10,9 @@
 //!
 //! The answer itself comes from an [`AnswerModel`] seam; with no model configured
 //! ([`NoModel`]) the result is an honest extractive answer drawn from the top
-//! items (still grounded and fully traceable). A generative model (GL-Fusion on
-//! RunPod) drops in behind the same seam.
+//! items (still grounded and fully traceable). A local OpenAI-compatible model
+//! (Gemma via RustyRed's resident llama-server path) drops in behind the same
+//! seam.
 //!
 //! Scope notes (surfaced): the lexical arm is an in-crate scorer, not the core
 //! `FullTextIndex`/tantivy backend (the native-FTS upgrade path); the graph arm
@@ -19,11 +20,20 @@
 //! path). Both are named follow-ups; the seam and fusion are real.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
 use commonplace::{
     BlobStore, Commonplace, EmbeddingGraphStore, IngestPipeline, Item, ItemBody, SIMILAR_TO_EDGE,
 };
 use rustyred_thg_core::{GraphStoreResult, NeighborQuery};
+use serde_json::{json, Value};
+
+const DEFAULT_LOCAL_OPENAI_CHAT_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
+const DEFAULT_GEMMA_MODEL: &str = "gemma-4-12b-it-q4";
+const DEFAULT_MODEL_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_MODEL_MAX_TOKENS: u32 = 700;
+const DEFAULT_MODEL_TEMPERATURE: f32 = 0.2;
 
 /// One retrieved item with its fused score and the arms that surfaced it.
 #[derive(Clone, Debug)]
@@ -64,6 +74,127 @@ impl AnswerModel for NoModel {
     }
 }
 
+/// OpenAI-compatible answer model for the local RustyRed/Gemma runtime.
+///
+/// The model is intentionally optional: request errors return `None`, preserving
+/// the extractive answer path when the resident model is not running.
+pub struct LocalOpenAiAnswerModel {
+    chat_url: String,
+    model: String,
+    api_key: Option<String>,
+    temperature: f32,
+    max_tokens: u32,
+    timeout: Duration,
+}
+
+impl LocalOpenAiAnswerModel {
+    pub fn new(
+        endpoint: impl AsRef<str>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        temperature: f32,
+        max_tokens: u32,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            chat_url: chat_completions_url(endpoint.as_ref()),
+            model: model.into(),
+            api_key,
+            temperature,
+            max_tokens,
+            timeout,
+        })
+    }
+
+    pub fn from_env() -> Option<Self> {
+        if !env_flag("COMMONPLACE_ASK_MODEL_ENABLED", true) {
+            return None;
+        }
+
+        let endpoint = first_env(&["COMMONPLACE_ASK_MODEL_URL", "THEOREM_LOCAL_OPENAI_URL"])
+            .or_else(|| {
+                env_flag("COMMONPLACE_ASK_MODEL_AUTO", true)
+                    .then(|| DEFAULT_LOCAL_OPENAI_CHAT_URL.to_string())
+            })?;
+        let model = first_env(&[
+            "COMMONPLACE_ASK_MODEL",
+            "COMMONPLACE_GEMMA_MODEL",
+            "THEOREM_LOCAL_OPENAI_MODEL",
+            "AGENTD_SMOKE_MODEL",
+        ])
+        .unwrap_or_else(|| DEFAULT_GEMMA_MODEL.to_string());
+        let api_key = first_env(&["COMMONPLACE_ASK_MODEL_API_KEY", "THEOREM_MODEL_API_KEY"]);
+        let timeout = Duration::from_secs(env_u64(
+            "COMMONPLACE_ASK_MODEL_TIMEOUT_SECS",
+            DEFAULT_MODEL_TIMEOUT_SECS,
+        ));
+        let max_tokens = env_u32("COMMONPLACE_ASK_MODEL_MAX_TOKENS", DEFAULT_MODEL_MAX_TOKENS);
+        let temperature = env_f32(
+            "COMMONPLACE_ASK_MODEL_TEMPERATURE",
+            DEFAULT_MODEL_TEMPERATURE,
+        );
+
+        Self::new(endpoint, model, api_key, temperature, max_tokens, timeout).ok()
+    }
+}
+
+impl AnswerModel for LocalOpenAiAnswerModel {
+    fn synthesize(&self, question: &str, context: &[RetrievedItem]) -> Option<String> {
+        if context.is_empty() {
+            return None;
+        }
+
+        let body = json!({
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You answer questions for CommonPlace using only the provided grounding items. Be concise, faithful to the sources, and say what is missing when the grounding is thin."
+                },
+                {
+                    "role": "user",
+                    "content": grounded_prompt(question, context)
+                }
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": false
+        });
+
+        let chat_url = self.chat_url.clone();
+        let api_key = self.api_key.clone();
+        let timeout = self.timeout;
+        std::thread::spawn(move || {
+            let http = reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(timeout)
+                .build()
+                .ok()?;
+            let mut request = http.post(chat_url).json(&body);
+            if let Some(api_key) = api_key {
+                request = request.bearer_auth(api_key);
+            }
+            let value: Value = request.send().ok()?.error_for_status().ok()?.json().ok()?;
+            parse_chat_content(&value)
+        })
+        .join()
+        .ok()
+        .flatten()
+    }
+}
+
+/// Build the configured answer model for HTTP serving.
+///
+/// By default this tries RustyRed's local OpenAI-compatible Gemma endpoint at
+/// `127.0.0.1:8080`; set `COMMONPLACE_ASK_MODEL_ENABLED=0` or
+/// `COMMONPLACE_ASK_MODEL_AUTO=0` to keep the API extractive-only unless an
+/// explicit model URL is provided.
+pub fn answer_model_from_env() -> Arc<dyn AnswerModel> {
+    LocalOpenAiAnswerModel::from_env()
+        .map(|model| Arc::new(model) as Arc<dyn AnswerModel>)
+        .unwrap_or_else(|| Arc::new(NoModel))
+}
+
 /// Tuning for unified retrieval.
 #[derive(Clone, Debug)]
 pub struct AskConfig {
@@ -95,6 +226,20 @@ pub fn ask<S, B>(
     question: &str,
     config: &AskConfig,
 ) -> GraphStoreResult<AskResult>
+where
+    S: EmbeddingGraphStore,
+    B: BlobStore,
+{
+    let provenance = retrieve_grounding(cp, question, config)?;
+    Ok(answer_from_provenance(model, question, provenance))
+}
+
+/// Retrieve the grounding set for a question without running answer synthesis.
+pub fn retrieve_grounding<S, B>(
+    cp: &Commonplace<S, B>,
+    question: &str,
+    config: &AskConfig,
+) -> GraphStoreResult<Vec<RetrievedItem>>
 where
     S: EmbeddingGraphStore,
     B: BlobStore,
@@ -149,6 +294,15 @@ where
         }
     }
 
+    Ok(provenance)
+}
+
+/// Synthesize an ask result from already-retrieved provenance.
+pub fn answer_from_provenance(
+    model: &dyn AnswerModel,
+    question: &str,
+    provenance: Vec<RetrievedItem>,
+) -> AskResult {
     let (answer, answer_kind) = match model.synthesize(question, &provenance) {
         Some(answer) => (answer, AnswerKind::Model),
         None if provenance.is_empty() => (
@@ -158,11 +312,11 @@ where
         None => (extractive_answer(&provenance), AnswerKind::Extractive),
     };
 
-    Ok(AskResult {
+    AskResult {
         answer,
         answer_kind,
         provenance,
-    })
+    }
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -288,5 +442,227 @@ fn first_sentence(text: &str) -> String {
     match trimmed.find(['.', '!', '?']) {
         Some(idx) => trimmed[..=idx].trim().to_string(),
         None => trimmed.chars().take(200).collect(),
+    }
+}
+
+fn grounded_prompt(question: &str, context: &[RetrievedItem]) -> String {
+    let mut prompt = format!(
+        "Question:\n{question}\n\nGrounding items:\n{}\n\nAnswer in 2-6 sentences. Include item titles when they help the user trace the answer.",
+        context
+            .iter()
+            .enumerate()
+            .map(|(idx, hit)| grounding_item(idx + 1, hit))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    if prompt.chars().count() > 24_000 {
+        prompt = prompt.chars().take(24_000).collect();
+        prompt.push_str("\n\n[grounding truncated]");
+    }
+    prompt
+}
+
+fn grounding_item(index: usize, hit: &RetrievedItem) -> String {
+    let item = &hit.item;
+    let mut lines = vec![
+        format!("[{index}] title: {}", item.title),
+        format!("id: {}", item.id),
+        format!("kind: {}", item.kind.as_str()),
+    ];
+    if let Some(source) = &item.source {
+        lines.push(format!("source: {source}"));
+    }
+    if !item.tags.is_empty() {
+        lines.push(format!("tags: {}", item.tags.join(", ")));
+    }
+    if let Some(classification) = &item.classification {
+        lines.push(format!("classification: {classification}"));
+    }
+    let body = match &item.body {
+        ItemBody::Inline { text } => truncate_chars(text.trim(), 1800),
+        ItemBody::Blob { mime, .. } => mime
+            .as_deref()
+            .map(|mime| format!("[blob item; mime: {mime}]"))
+            .unwrap_or_else(|| "[blob item]".to_string()),
+        ItemBody::Empty => "[empty item]".to_string(),
+    };
+    lines.push(format!("text: {body}"));
+    lines.push(format!(
+        "retrieval: score {:.4}, arms {}",
+        hit.score,
+        hit.arms.join(", ")
+    ));
+    lines.join("\n")
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let mut output: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        output.push_str("...");
+    }
+    output
+}
+
+fn parse_chat_content(value: &Value) -> Option<String> {
+    if value.get("error").is_some() {
+        return None;
+    }
+    let content = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)?
+        .trim();
+    (!content.is_empty()).then(|| content.to_string())
+}
+
+fn chat_completions_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/chat/completions")
+    } else {
+        format!("{trimmed}/v1/chat/completions")
+    }
+}
+
+fn first_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn chat_url_accepts_base_v1_or_full_endpoint() {
+        assert_eq!(
+            chat_completions_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("http://127.0.0.1:8080/v1/chat/completions"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn local_openai_model_posts_grounded_prompt_and_reads_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap();
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let payload =
+                r#"{"choices":[{"message":{"content":"Gemma answered from grounded notes."}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8(body).unwrap()
+        });
+
+        let model = LocalOpenAiAnswerModel::new(
+            format!("http://{addr}/v1"),
+            "test-gemma",
+            None,
+            0.1,
+            64,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let context = vec![RetrievedItem {
+            item: Item::note(
+                "Gemma note",
+                "The local Gemma model should synthesize grounded answers.",
+            ),
+            score: 1.0,
+            arms: vec!["lexical".to_string()],
+        }];
+
+        let answer = model.synthesize("what should answer?", &context).unwrap();
+        let body = handle.join().unwrap();
+
+        assert_eq!(answer, "Gemma answered from grounded notes.");
+        assert!(
+            body.contains("test-gemma"),
+            "body should include model: {body}"
+        );
+        assert!(
+            body.contains("Gemma note"),
+            "body should include grounding title: {body}"
+        );
+        assert!(
+            body.contains("what should answer?"),
+            "body should include the question: {body}"
+        );
     }
 }

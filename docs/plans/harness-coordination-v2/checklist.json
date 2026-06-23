@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "plan": "docs/plans/harness-coordination-v2/TASK-REFERENCE-ROOMS.md",
+  "task": "Task-Reference Rooms for Theorems Harness Coordination",
+  "items": [
+    {
+      "id": "TRR-001",
+      "title": "Add TaskRef resolver",
+      "status": "open",
+      "acceptance": "Given tenant, repo, spec, and branch metadata, both Codex and Claude resolve the same task_ref_id and canonical_room_id.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-002",
+      "title": "Add room refs, aliases, and merges",
+      "status": "open",
+      "acceptance": "A message written to room:ungrouped with SPEC-9 metadata appears in the SPEC-9 canonical room as a related event with provenance.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-003",
+      "title": "Restore explicit pings",
+      "status": "open",
+      "acceptance": "urgency=ask or urgency=block creates a target actor ping with pending, seen, and consumed status, even if the actor is not subscribed to the stream.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-004",
+      "title": "Add turn-start discovery",
+      "status": "open",
+      "acceptance": "At turn start, a head sees canonical room, related inbox messages, open pings, active intents, stale intents, and contradictions for its task.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-005",
+      "title": "Write and read coordination manifest",
+      "status": "open",
+      "acceptance": "Starting a task writes a manifest; a later head in the worktree can find the canonical room without guessing.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-006",
+      "title": "Target checkout identity",
+      "status": "open",
+      "acceptance": "A ping can target actor plus branch plus worktree; a different checkout sees that it is not the intended target.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-007",
+      "title": "Add contradiction claim model",
+      "status": "open",
+      "acceptance": "Structured claim conflicts write CONTRADICTS edges and a room-visible contradiction event.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-008",
+      "title": "Add room dashboard digest",
+      "status": "open",
+      "acceptance": "Digest displays canonical room, aliases, active actors, stale actors, pending pings, related ungrouped messages, and contradictions.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-009",
+      "title": "Backfill compatibility",
+      "status": "open",
+      "acceptance": "Existing room users keep working; old room ids become aliases or standalone rooms with no data loss.",
+      "verification": null,
+      "deferral_reason": null
+    },
+    {
+      "id": "TRR-010",
+      "title": "Acceptance replay",
+      "status": "open",
+      "acceptance": "A replay of the SPEC-9 failure mode shows Claude's ungrouped handoff discovered by Codex before edits begin.",
+      "verification": null,
+      "deferral_reason": null
+    }
+  ]
+}

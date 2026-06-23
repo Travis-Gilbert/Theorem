@@ -136,6 +136,9 @@ impl SurfaceAdapter for NoteAdapter {
                 peer.text_region(&region_id)?.push(&text).map(|_| ())
             }
             SurfaceIntent::Presence { presence } => peer.announce(presence),
+            SurfaceIntent::Code { .. } => Err(CoError::Invalid(
+                "note adapter does not accept code intents".to_string(),
+            )),
         }
     }
 

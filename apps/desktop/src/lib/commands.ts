@@ -194,6 +194,13 @@ export interface LocalNodeStatus {
   toolsMatchHosted: boolean;
 }
 
+export interface CommonplaceStatus {
+  nodeUp: boolean;
+  endpoint: string;
+  port: number;
+  storePath: string;
+}
+
 export interface ReceiverStatus {
   enabled: boolean;
   state: "off" | "configured" | "running" | "error";
@@ -210,8 +217,19 @@ export async function localNodeStatus(): Promise<LocalNodeStatus> {
     endpoint: "http://127.0.0.1:17888/mcp",
     port: 17888,
     storePath: "~/Library/Application Support/Theorem/store",
-    activeTarget: "hosted",
+    activeTarget: "local",
     toolsMatchHosted: false,
+  };
+}
+
+/** Rust: `commonplace_status() -> CommonplaceStatus`. */
+export async function commonplaceStatus(): Promise<CommonplaceStatus> {
+  if (isTauri()) return invoke<CommonplaceStatus>("commonplace_status");
+  return {
+    nodeUp: false,
+    endpoint: "http://127.0.0.1:17890",
+    port: 17890,
+    storePath: "~/Library/Application Support/Theorem/store/commonplace-api",
   };
 }
 

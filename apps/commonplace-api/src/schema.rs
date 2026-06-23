@@ -26,9 +26,14 @@ use rustyred_thg_core::{DiskObjectStore, InMemoryGraphStore, NodeQuery, RedCoreG
 use crate::auth::{ApiKeyRegistry, ApiKeyToken, Principal};
 use crate::briefing::{briefing as run_briefing, Briefing, BriefingConfig, ConnectedItem};
 use crate::discover::{discover as run_discover, CandidateLink, DiscoverConfig};
+use crate::organize::{
+    organize as run_organize, DailyProgress, OrganizeConfig, OrganizeFiled, OrganizeGroup,
+    OrganizeItem, OrganizeSnapshot, OrganizedToday, Subtask, Timeframe,
+};
 use crate::portability::{self, ExportDocument};
 use crate::retrieve::{
-    ask as run_ask, AnswerKind, AnswerModel, AskConfig, AskResult, NoModel, RetrievedItem,
+    answer_from_provenance, retrieve_grounding, AnswerKind, AnswerModel, AskConfig, AskResult,
+    NoModel, RetrievedItem,
 };
 
 /// The default in-memory store backing (tests + the no-data-dir binary path).
@@ -286,6 +291,184 @@ pub struct ImportResultGql {
     pub collections: i32,
 }
 
+/// A next-best candidate collection for an item.
+#[derive(SimpleObject)]
+pub struct OrganizeAlternativeGql {
+    pub collection_id: String,
+    pub label: String,
+}
+
+/// The engine's classification verdict for an organize item.
+#[derive(SimpleObject)]
+pub struct OrganizeClassificationGql {
+    pub target_collection_id: Option<String>,
+    pub target_collection_label: Option<String>,
+    pub confidence: f64,
+    pub alternatives: Vec<OrganizeAlternativeGql>,
+}
+
+/// A checkbox subtask parsed from a task item's body.
+#[derive(SimpleObject)]
+pub struct SubtaskGql {
+    pub text: String,
+    pub done: bool,
+}
+
+impl From<Subtask> for SubtaskGql {
+    fn from(subtask: Subtask) -> Self {
+        Self {
+            text: subtask.text,
+            done: subtask.done,
+        }
+    }
+}
+
+/// An item in the organize surface, with its classification attached.
+#[derive(SimpleObject)]
+pub struct OrganizeItemGql {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub preview: String,
+    pub source: String,
+    /// ISO-8601 UTC of the item's updated_at_ms.
+    pub arrived_at: String,
+    pub classification: OrganizeClassificationGql,
+    pub time_sensitive: bool,
+    pub expected_action: Option<String>,
+    /// Checkbox subtasks parsed from the body (empty unless the item is a task).
+    pub subtasks: Vec<SubtaskGql>,
+    /// The item's tags (note cards surface these).
+    pub tags: Vec<String>,
+}
+
+impl From<OrganizeItem> for OrganizeItemGql {
+    fn from(item: OrganizeItem) -> Self {
+        let arrived_at = crate::organize::iso_from_ms(item.item.updated_at_ms);
+        let alternatives = item
+            .alternatives
+            .into_iter()
+            .map(|(collection_id, label)| OrganizeAlternativeGql {
+                collection_id,
+                label,
+            })
+            .collect();
+        let subtasks = item.subtasks.into_iter().map(SubtaskGql::from).collect();
+        Self {
+            id: item.item.id,
+            kind: item.kind,
+            title: item.item.title,
+            preview: item.preview,
+            source: item.source,
+            arrived_at,
+            classification: OrganizeClassificationGql {
+                target_collection_id: item.target_collection_id,
+                target_collection_label: item.target_collection_label,
+                confidence: item.confidence as f64,
+                alternatives,
+            },
+            time_sensitive: item.time_sensitive,
+            expected_action: item.expected_action,
+            subtasks,
+            tags: item.tags,
+        }
+    }
+}
+
+/// An item the engine filed, plus when it filed it.
+#[derive(SimpleObject)]
+pub struct OrganizeFiledGql {
+    pub item: OrganizeItemGql,
+    pub filed_at: String,
+}
+
+impl From<OrganizeFiled> for OrganizeFiledGql {
+    fn from(filed: OrganizeFiled) -> Self {
+        Self {
+            item: OrganizeItemGql::from(filed.item),
+            filed_at: filed.filed_at,
+        }
+    }
+}
+
+/// A filed-into collection with its member count for the timeframe.
+#[derive(SimpleObject)]
+pub struct OrganizeGroupGql {
+    pub collection_id: String,
+    pub label: String,
+    pub count: i32,
+}
+
+impl From<OrganizeGroup> for OrganizeGroupGql {
+    fn from(group: OrganizeGroup) -> Self {
+        Self {
+            collection_id: group.collection_id,
+            label: group.label,
+            count: group.count as i32,
+        }
+    }
+}
+
+/// What the engine organized in the timeframe, without a human.
+#[derive(SimpleObject)]
+pub struct OrganizedTodayGql {
+    pub most_recent: Option<OrganizeFiledGql>,
+    pub groups: Vec<OrganizeGroupGql>,
+    pub total_count: i32,
+}
+
+impl From<OrganizedToday> for OrganizedTodayGql {
+    fn from(today: OrganizedToday) -> Self {
+        Self {
+            most_recent: today.most_recent.map(OrganizeFiledGql::from),
+            groups: today.groups.into_iter().map(OrganizeGroupGql::from).collect(),
+            total_count: today.total_count as i32,
+        }
+    }
+}
+
+/// How much of the timeframe's intake is done vs. total.
+#[derive(SimpleObject)]
+pub struct DailyProgressGql {
+    pub timeframe: String,
+    pub done: i32,
+    pub total: i32,
+}
+
+impl From<DailyProgress> for DailyProgressGql {
+    fn from(progress: DailyProgress) -> Self {
+        Self {
+            timeframe: progress.timeframe,
+            done: progress.done as i32,
+            total: progress.total as i32,
+        }
+    }
+}
+
+/// The full organize snapshot: what needs you, what was organized, and progress.
+#[derive(SimpleObject)]
+pub struct OrganizeSnapshotGql {
+    pub needs_you: Vec<OrganizeItemGql>,
+    pub organized_today: OrganizedTodayGql,
+    pub daily_progress: DailyProgressGql,
+    pub needs_you_ceiling: f64,
+}
+
+impl From<OrganizeSnapshot> for OrganizeSnapshotGql {
+    fn from(snapshot: OrganizeSnapshot) -> Self {
+        Self {
+            needs_you: snapshot
+                .needs_you
+                .into_iter()
+                .map(OrganizeItemGql::from)
+                .collect(),
+            organized_today: OrganizedTodayGql::from(snapshot.organized_today),
+            daily_progress: DailyProgressGql::from(snapshot.daily_progress),
+            needs_you_ceiling: snapshot.needs_you_ceiling as f64,
+        }
+    }
+}
+
 fn principal(ctx: &Context<'_>) -> Result<Principal> {
     let token = ctx
         .data_opt::<ApiKeyToken>()
@@ -433,14 +616,17 @@ where
         principal(ctx)?;
         let model = ctx.data::<Arc<dyn AnswerModel>>()?.clone();
         let store = shared::<S, B>(ctx)?;
-        let cp = store
-            .lock()
-            .map_err(|_| Error::new("store lock poisoned"))?;
         let config = AskConfig {
             k: k.unwrap_or(5).max(1) as usize,
             ..AskConfig::default()
         };
-        let result = run_ask(&*cp, model.as_ref(), &question, &config).map_err(store_err)?;
+        let provenance = {
+            let cp = store
+                .lock()
+                .map_err(|_| Error::new("store lock poisoned"))?;
+            retrieve_grounding(&*cp, &question, &config).map_err(store_err)?
+        };
+        let result = answer_from_provenance(model.as_ref(), &question, provenance);
         Ok(AskResultGql::from(result))
     }
 
@@ -488,6 +674,32 @@ where
         };
         let links = run_discover(&*cp, &config).map_err(store_err)?;
         Ok(links.into_iter().map(CandidateLinkGql::from).collect())
+    }
+
+    /// Organize: the daily triage surface. Partitions the items that arrived in
+    /// the timeframe into what the engine filed confidently (`organizedToday`)
+    /// and what still needs a human (`needsYou`, low-confidence or
+    /// time-sensitive), using the engine's classification signal for both, and
+    /// reports `dailyProgress` over the intake.
+    async fn organize(
+        &self,
+        ctx: &Context<'_>,
+        needs_you_ceiling: Option<f64>,
+        timeframe: Option<String>,
+    ) -> Result<OrganizeSnapshotGql> {
+        principal(ctx)?;
+        let store = shared::<S, B>(ctx)?;
+        let cp = store
+            .lock()
+            .map_err(|_| Error::new("store lock poisoned"))?;
+        let config = OrganizeConfig {
+            needs_you_ceiling: needs_you_ceiling.unwrap_or(0.58) as f32,
+            timeframe: Timeframe::from(timeframe.as_deref().unwrap_or("day")),
+            ..OrganizeConfig::default()
+        };
+        let pipeline = IngestPipeline::default();
+        let snapshot = run_organize(&*cp, &pipeline, &config).map_err(store_err)?;
+        Ok(OrganizeSnapshotGql::from(snapshot))
     }
 
     /// Export the whole store: lossless JSON (default) or human-readable
@@ -650,8 +862,9 @@ where
     build_schema_with_model(store, registry, Arc::new(NoModel))
 }
 
-/// Build the schema with a specific answer model (e.g. a GL-Fusion client) for
-/// generative answers behind the same retrieval.
+/// Build the schema with a specific answer model (for example local Gemma via
+/// an OpenAI-compatible endpoint) for generative answers behind the same
+/// retrieval.
 pub fn build_schema_with_model<S, B>(
     store: SharedStore<S, B>,
     registry: Arc<ApiKeyRegistry>,

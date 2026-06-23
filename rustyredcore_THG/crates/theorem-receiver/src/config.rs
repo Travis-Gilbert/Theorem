@@ -131,31 +131,21 @@ impl ProviderSeamConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelBackendKind {
+    #[default]
     Single,
     Composed,
 }
 
-impl Default for ModelBackendKind {
-    fn default() -> Self {
-        Self::Single
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderWireMode {
+    #[default]
     ChatCompletions,
     Responses,
     Messages,
-}
-
-impl Default for ProviderWireMode {
-    fn default() -> Self {
-        Self::ChatCompletions
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

@@ -15,6 +15,7 @@ use rustyred_thg_core::{
     SpatialDesignation, ThgError, ThgResult,
 };
 
+use crate::hot::{hot_input_from_snapshot, run_hot, HotConfig, HotLinkScore};
 use crate::pairformer::{
     run_pairformer, PairformerConfig, PairformerEdgeInput, PairformerInput, PairformerLinkScore,
 };
@@ -535,6 +536,103 @@ pub fn rank_pairformer_densification_candidates(
     })
 }
 
+pub fn rank_hot_temporal_densification_candidates(
+    snapshot: &GraphSnapshot,
+    request: DensificationRequest,
+    config: HotConfig,
+) -> ThgResult<DensificationResult> {
+    let request = request.normalized();
+    if request.seed_node_ids.is_empty() {
+        return Ok(DensificationResult {
+            tenant_id: request.tenant_id,
+            considered_node_ids: Vec::new(),
+            bounded: false,
+            candidates: Vec::new(),
+        });
+    }
+
+    let nodes_by_id = snapshot
+        .nodes
+        .iter()
+        .filter(|node| !node.tombstone)
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let allowed_edge_types = request
+        .allowed_edge_types
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let edge_refs = snapshot
+        .edges
+        .iter()
+        .filter(|edge| {
+            !edge.tombstone
+                && edge.effective_confidence() as f32 >= request.min_path_confidence
+                && (allowed_edge_types.is_empty() || allowed_edge_types.contains(&edge.edge_type))
+                && nodes_by_id.contains_key(&edge.from_id)
+                && nodes_by_id.contains_key(&edge.to_id)
+        })
+        .collect::<Vec<_>>();
+
+    let (mut considered, mut bounded) = bounded_neighborhood(&request, &edge_refs);
+    let config = config.normalized();
+    if considered.len() > config.max_nodes {
+        bounded = true;
+        considered = considered.into_iter().take(config.max_nodes).collect();
+    }
+    if considered.is_empty() {
+        return Ok(DensificationResult {
+            tenant_id: request.tenant_id,
+            considered_node_ids: Vec::new(),
+            bounded,
+            candidates: Vec::new(),
+        });
+    }
+
+    let existing_direct_pairs = edge_refs
+        .iter()
+        .map(|edge| (edge.from_id.clone(), edge.to_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let query_pairs = hot_candidate_pairs(
+        &considered,
+        &nodes_by_id,
+        &edge_refs,
+        &existing_direct_pairs,
+        request.max_candidates.saturating_mul(4).max(request.max_candidates),
+    );
+    if query_pairs.is_empty() {
+        return Ok(DensificationResult {
+            tenant_id: request.tenant_id,
+            considered_node_ids: considered.into_iter().collect(),
+            bounded,
+            candidates: Vec::new(),
+        });
+    }
+    let as_of = edge_refs
+        .iter()
+        .filter_map(|edge| temporal_edge_timestamp_for_hot(edge))
+        .max()
+        .unwrap_or_else(now_ms)
+        .saturating_add(1);
+    let hot_input = hot_input_from_snapshot(snapshot, query_pairs, as_of, config.clone())?;
+    let output = run_hot(&hot_input, config)?;
+
+    let mut candidates = output
+        .link_scores
+        .iter()
+        .filter_map(|score| hot_score_to_candidate(&request, score, &existing_direct_pairs))
+        .collect::<Vec<_>>();
+    sort_edge_candidates(&mut candidates);
+    candidates.truncate(request.max_candidates);
+
+    Ok(DensificationResult {
+        tenant_id: request.tenant_id,
+        considered_node_ids: considered.into_iter().collect(),
+        bounded,
+        candidates,
+    })
+}
+
 pub fn rank_spatial_candidates(
     snapshot: &GraphSnapshot,
     request: DensificationRequest,
@@ -760,13 +858,15 @@ pub fn rank_reflexive_organizing_candidates(
     let graph = rank_densification_candidates(snapshot, request.clone())?;
     let pairformer =
         rank_pairformer_densification_candidates(snapshot, request.clone(), pairformer_config)?;
+    let hot =
+        rank_hot_temporal_densification_candidates(snapshot, request.clone(), HotConfig::default())?;
     let spatial = rank_spatial_candidates(snapshot, request.clone())?;
     let temporal = rank_temporal_candidates(snapshot, request.clone())?;
 
     let mut considered = BTreeSet::new();
     let mut bounded = false;
     let mut by_key: BTreeMap<(String, String, String), InferredEdgeCandidate> = BTreeMap::new();
-    for result in [graph, pairformer, spatial, temporal] {
+    for result in [graph, pairformer, hot, spatial, temporal] {
         bounded |= result.bounded;
         considered.extend(result.considered_node_ids);
         for candidate in result.candidates {
@@ -1354,6 +1454,164 @@ pub(crate) fn pairformer_score_to_candidate(
     })
 }
 
+fn hot_candidate_pairs(
+    considered: &BTreeSet<String>,
+    nodes_by_id: &BTreeMap<String, &NodeRecord>,
+    edges: &[&EdgeRecord],
+    existing_direct_pairs: &BTreeSet<(String, String)>,
+    limit: usize,
+) -> Vec<(String, String)> {
+    let mut by_pair = BTreeMap::<(String, String), f32>::new();
+    let mut by_source = BTreeMap::<String, Vec<&EdgeRecord>>::new();
+    for edge in edges {
+        if !considered.contains(&edge.from_id) || !considered.contains(&edge.to_id) {
+            continue;
+        }
+        by_source.entry(edge.from_id.clone()).or_default().push(edge);
+    }
+
+    for first in edges {
+        if !considered.contains(&first.from_id) || !considered.contains(&first.to_id) {
+            continue;
+        }
+        let Some(seconds) = by_source.get(&first.to_id) else {
+            continue;
+        };
+        for second in seconds {
+            if first.from_id == second.to_id {
+                continue;
+            }
+            add_hot_pair_score(
+                &mut by_pair,
+                existing_direct_pairs,
+                first.from_id.clone(),
+                second.to_id.clone(),
+                0.8 * (first.effective_confidence() * second.effective_confidence()).sqrt()
+                    as f32,
+            );
+        }
+    }
+
+    let mut embeddings = considered
+        .iter()
+        .filter_map(|node_id| {
+            nodes_by_id.get(node_id).map(|node| {
+                let mut features = numeric_array_property(&node.properties, "embedding");
+                features.extend(numeric_array_property(&node.properties, "features"));
+                (node_id.clone(), features)
+            })
+        })
+        .filter(|(_, features)| !features.is_empty())
+        .collect::<Vec<_>>();
+    embeddings.sort_by(|left, right| left.0.cmp(&right.0));
+    for left_idx in 0..embeddings.len() {
+        for right_idx in 0..embeddings.len() {
+            if left_idx == right_idx {
+                continue;
+            }
+            let similarity = cosine_similarity(&embeddings[left_idx].1, &embeddings[right_idx].1);
+            if similarity > 0.25 {
+                add_hot_pair_score(
+                    &mut by_pair,
+                    existing_direct_pairs,
+                    embeddings[left_idx].0.clone(),
+                    embeddings[right_idx].0.clone(),
+                    0.25 + similarity.max(0.0) * 0.35,
+                );
+            }
+        }
+    }
+
+    let mut recent_edges = edges
+        .iter()
+        .filter(|edge| considered.contains(&edge.from_id) && considered.contains(&edge.to_id))
+        .filter_map(|edge| temporal_edge_timestamp_for_hot(edge).map(|timestamp| (*edge, timestamp)))
+        .collect::<Vec<_>>();
+    recent_edges.sort_by(|left, right| right.1.cmp(&left.1));
+    recent_edges.truncate(limit.max(1));
+    for (left_idx, (left, _)) in recent_edges.iter().enumerate() {
+        for (right, _) in recent_edges.iter().skip(left_idx + 1) {
+            for (source_id, target_id) in [
+                (left.from_id.clone(), right.from_id.clone()),
+                (left.from_id.clone(), right.to_id.clone()),
+                (left.to_id.clone(), right.to_id.clone()),
+            ] {
+                add_hot_pair_score(
+                    &mut by_pair,
+                    existing_direct_pairs,
+                    source_id,
+                    target_id,
+                    0.2,
+                );
+            }
+        }
+    }
+
+    let mut rows = by_pair.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    rows.truncate(limit);
+    rows.into_iter().map(|(pair, _)| pair).collect()
+}
+
+fn add_hot_pair_score(
+    by_pair: &mut BTreeMap<(String, String), f32>,
+    existing_direct_pairs: &BTreeSet<(String, String)>,
+    source_id: String,
+    target_id: String,
+    score: f32,
+) {
+    if source_id == target_id || existing_direct_pairs.contains(&(source_id.clone(), target_id.clone())) {
+        return;
+    }
+    let slot = by_pair.entry((source_id, target_id)).or_insert(0.0);
+    *slot = (*slot).max(score);
+}
+
+fn hot_score_to_candidate(
+    request: &DensificationRequest,
+    score: &HotLinkScore,
+    existing_direct_pairs: &BTreeSet<(String, String)>,
+) -> Option<InferredEdgeCandidate> {
+    if existing_direct_pairs.contains(&(score.source_id.clone(), score.target_id.clone())) {
+        return None;
+    }
+    let support = score.support.as_ref()?;
+    let raw_confidence = (score.score * support.confidence).clamp(0.0, 1.0);
+    let confidence = raw_confidence.min(request.confidence_ceiling);
+    if confidence < request.confidence_threshold {
+        return None;
+    }
+    let proposed_edge_type = support.relation_hint.clone();
+    let candidate_id = stable_hash(json!({
+        "tenant_id": request.tenant_id,
+        "source_id": score.source_id,
+        "target_id": score.target_id,
+        "proposed_edge_type": proposed_edge_type,
+        "support_path_edge_ids": support.edge_ids,
+        "model_id": request.model_id,
+        "hot_score": score.score,
+    }));
+    Some(InferredEdgeCandidate {
+        candidate_id,
+        tenant_id: request.tenant_id.clone(),
+        source_id: score.source_id.clone(),
+        target_id: score.target_id.clone(),
+        proposed_edge_type,
+        confidence,
+        confidence_ceiling: request.confidence_ceiling,
+        admission_tier: request.admission_tier.clone(),
+        model_id: request.model_id.clone(),
+        support_path_edge_ids: support.edge_ids.clone(),
+        support_path_node_ids: support.node_ids.clone(),
+    })
+}
+
 fn rank_property_candidates_for_keys(
     snapshot: &GraphSnapshot,
     request: DensificationRequest,
@@ -1881,6 +2139,29 @@ fn temporal_overlap_confidence(left: &TemporalInterval, right: &TemporalInterval
     (overlap as f32 / left_duration.min(right_duration) as f32).clamp(0.0, 1.0)
 }
 
+fn temporal_edge_timestamp_for_hot(edge: &EdgeRecord) -> Option<i64> {
+    numeric_i64_property_any(
+        &edge.properties,
+        &[
+            "timestamp_ms",
+            "ts_ms",
+            "t_valid",
+            "valid_from_ms",
+            "t_created",
+            "created_at_ms",
+            "created_ms",
+            "timestamp",
+        ],
+    )
+    .or_else(|| {
+        edge.provenance
+            .as_ref()
+            .and_then(|provenance| provenance.timestamp.as_ref())
+            .and_then(|raw| raw.parse::<i64>().ok())
+    })
+    .or(Some(edge.version as i64))
+}
+
 fn numeric_property(properties: &Value, key: &str) -> Option<f64> {
     properties.get(key).and_then(|value| {
         value
@@ -1980,6 +2261,26 @@ fn numeric_array_property(properties: &Value, key: &str) -> Vec<f32> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let width = left.len().min(right.len());
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for idx in 0..width {
+        dot += left[idx] * right[idx];
+        left_norm += left[idx] * left[idx];
+        right_norm += right[idx] * right[idx];
+    }
+    if left_norm <= f32::EPSILON || right_norm <= f32::EPSILON {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
 }
 
 fn normalized_inferred_edge_type(left: &str, right: &str) -> String {

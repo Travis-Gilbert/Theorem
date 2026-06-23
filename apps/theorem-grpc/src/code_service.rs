@@ -261,6 +261,7 @@ fn input_from_ingest(req: pb::IngestCodebaseRequest) -> IngestCodebaseInput {
         max_files: req.max_files,
         max_file_bytes: req.max_file_bytes,
         max_total_bytes: req.max_total_bytes,
+        materialize_symbol_name_index: false,
         actor: req.actor,
     }
 }
@@ -275,6 +276,7 @@ fn input_from_reindex(req: pb::ReindexCodebaseRequest) -> IngestCodebaseInput {
         max_files: req.max_files,
         max_file_bytes: req.max_file_bytes,
         max_total_bytes: req.max_total_bytes,
+        materialize_symbol_name_index: false,
         actor: req.actor,
     }
 }

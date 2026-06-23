@@ -730,7 +730,7 @@ impl AppState {
             RedCoreGraphStore::open(data_dir, options)?,
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(), tenant_id) {
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id) {
             eprintln!(
                 "[theorem] enable graph hooks failed for {tenant_id}: {}",
                 err.message
@@ -757,7 +757,7 @@ impl AppState {
             RedCoreGraphStore::memory(),
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(), tenant_id) {
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id) {
             eprintln!(
                 "[theorem] enable graph hooks failed for {tenant_id}: {}",
                 err.message
@@ -868,12 +868,29 @@ fn graph_hooks_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether per-tenant stores auto-attach the SPEC-7 standing-pass organizer
+/// engine as a post-commit hook. The engine is advisory background compute
+/// (generators propose, admission disposes), so it stays a deliberate flag flip
+/// like the crawl hooks. Truthy: `1`/`true`/`on`/`yes`.
+fn standing_pass_enabled() -> bool {
+    std::env::var("THEOREM_STANDING_PASS")
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// The graph-level hook registrations to attach to a fresh per-tenant store.
 /// Crawl hooks ride `THEOREM_GRAPH_HOOKS`; the Item changefeed (SPEC-2) rides its
-/// own `THEOREM_ITEM_CHANGEFEED`, so the live changefeed can run without enabling
-/// the heavier reactive-compute hooks. Empty (the default) makes
-/// `enable_graph_hooks` a no-op.
-fn tenant_hook_registrations() -> Vec<HookRegistration> {
+/// own `THEOREM_ITEM_CHANGEFEED`; the SPEC-7 standing-pass organizer engine rides
+/// `THEOREM_STANDING_PASS`, so reactive structure-making can run without enabling
+/// the heavier crawl hooks. Empty (the default) makes `enable_graph_hooks` a
+/// no-op. Scoped per tenant: the standing pass writes its advisory structure
+/// under `tenant_id`.
+fn tenant_hook_registrations(tenant_id: &str) -> Vec<HookRegistration> {
     let mut registrations = Vec::new();
     if graph_hooks_enabled() {
         registrations.extend(rustyred_web::crawl_hooks());
@@ -881,7 +898,50 @@ fn tenant_hook_registrations() -> Vec<HookRegistration> {
     if crate::items_changefeed::item_changefeed_enabled() {
         registrations.push(crate::items_changefeed::changefeed_registration());
     }
+    if standing_pass_enabled() {
+        match rustyred_thg_adapters::standing_pass_hook(rustyred_thg_adapters::StandingPassConfig {
+            tenant_id: tenant_id.to_string(),
+            ..Default::default()
+        }) {
+            Ok(registration) => registrations.push(registration),
+            Err(err) => eprintln!(
+                "[theorem] standing-pass hook init failed for {tenant_id}: {}",
+                err.message
+            ),
+        }
+    }
     registrations
+}
+
+#[cfg(test)]
+mod standing_pass_activation_tests {
+    use super::tenant_hook_registrations;
+
+    /// SPEC-7 runtime activation: the standing-pass organizer engine attaches as
+    /// a per-tenant graph hook only behind `THEOREM_STANDING_PASS`. Asserted by
+    /// the registration name so it is independent of the other hook flags.
+    /// `THEOREM_STANDING_PASS` is read by no other code path, so toggling it here
+    /// cannot race another test reading the same var.
+    #[test]
+    fn standing_pass_hook_rides_its_env_flag() {
+        std::env::set_var("THEOREM_STANDING_PASS", "1");
+        let enabled = tenant_hook_registrations("theorem");
+        std::env::remove_var("THEOREM_STANDING_PASS");
+        let disabled = tenant_hook_registrations("theorem");
+
+        assert!(
+            enabled
+                .iter()
+                .any(|registration| registration.name == "reflexive.standing_pass"),
+            "standing-pass hook registers when THEOREM_STANDING_PASS is truthy"
+        );
+        assert!(
+            !disabled
+                .iter()
+                .any(|registration| registration.name == "reflexive.standing_pass"),
+            "standing-pass hook is absent when the flag is unset"
+        );
+    }
 }
 
 #[derive(Debug)]

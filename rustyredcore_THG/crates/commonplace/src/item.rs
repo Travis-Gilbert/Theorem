@@ -19,6 +19,10 @@ pub enum ItemKind {
     Link,
     Image,
     Doc,
+    /// A unit of work (Layer C). First-class because tasks carry their own edges
+    /// (`SUBTASK_OF`/`DEPENDS_ON`/`ABOUT`/`WORKED_BY`) and indexed scalars
+    /// (`status`/`priority`/`due_at_ms`) rather than living as `Other("task")`.
+    Task,
     Other(String),
 }
 
@@ -31,6 +35,7 @@ impl ItemKind {
             ItemKind::Link => "link",
             ItemKind::Image => "image",
             ItemKind::Doc => "doc",
+            ItemKind::Task => "task",
             ItemKind::Other(other) => other.as_str(),
         }
     }
@@ -50,8 +55,33 @@ impl From<String> for ItemKind {
             "link" => ItemKind::Link,
             "image" => ItemKind::Image,
             "doc" => ItemKind::Doc,
+            "task" => ItemKind::Task,
             _ => ItemKind::Other(value),
         }
+    }
+}
+
+/// A stable reference back to the source record an item came from (A3). Identity
+/// is `(source, external_id)`, so a re-fetched record updates the same item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRef {
+    pub source: String,
+    pub external_id: String,
+}
+
+impl SourceRef {
+    pub fn new(source: impl Into<String>, external_id: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            external_id: external_id.into(),
+        }
+    }
+
+    /// The single-string key written alongside the ref so a node-property filter
+    /// is one exact match. Length-prefixed (`"<len(source)>:<source>:<external_id>"`)
+    /// so it cannot collide when either component contains a `:`.
+    pub fn key(&self) -> String {
+        format!("{}:{}:{}", self.source.len(), self.source, self.external_id)
     }
 }
 
@@ -130,6 +160,10 @@ pub struct Item {
     pub body: ItemBody,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The source record this item came from (A3). Persisted as a node property;
+    /// the store also writes a derived `source_ref_key` for exact-match lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<SourceRef>,
     #[serde(default)]
     pub residency: Residency,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -145,6 +179,17 @@ pub struct Item {
     pub embedding: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
+    /// Task state (Layer C), a top-level scalar so a relational filter answers
+    /// "what is open" without loading bodies. Only meaningful for `Task` items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Task priority (Layer C), indexed scalar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// Task due instant in epoch ms (Layer C), indexed scalar so "due today" is a
+    /// range query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at_ms: Option<i64>,
     #[serde(default)]
     pub created_at_ms: i64,
     #[serde(default)]
@@ -163,16 +208,25 @@ impl Item {
             title: title.into(),
             body: ItemBody::Empty,
             source: None,
+            source_ref: None,
             residency: Residency::Local,
             tags: Vec::new(),
             collections: Vec::new(),
             embedding_ref: None,
             embedding: None,
             classification: None,
+            status: None,
+            priority: None,
+            due_at_ms: None,
             created_at_ms: 0,
             updated_at_ms: 0,
             extra: Map::new(),
         }
+    }
+
+    /// Convenience: a `Task` item with inline description text.
+    pub fn task(title: impl Into<String>, description: impl Into<String>) -> Self {
+        Self::new(ItemKind::Task, title).with_text(description)
     }
 
     /// Convenience: a `Note` item with inline text.
@@ -198,6 +252,34 @@ impl Item {
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
         self
+    }
+
+    /// Stamp the source record this item came from (A3). Also sets `source` to
+    /// the ref's source, since a source record always implies its source.
+    pub fn with_source_ref(mut self, source_ref: SourceRef) -> Self {
+        self.source = Some(source_ref.source.clone());
+        self.source_ref = Some(source_ref);
+        self
+    }
+
+    pub fn with_status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    pub fn with_priority(mut self, priority: impl Into<String>) -> Self {
+        self.priority = Some(priority.into());
+        self
+    }
+
+    pub fn with_due_at(mut self, due_at_ms: i64) -> Self {
+        self.due_at_ms = Some(due_at_ms);
+        self
+    }
+
+    /// The single-string source-record key, if this item came from a source (A3).
+    pub fn source_ref_key(&self) -> Option<String> {
+        self.source_ref.as_ref().map(SourceRef::key)
     }
 
     pub fn with_residency(mut self, residency: Residency) -> Self {

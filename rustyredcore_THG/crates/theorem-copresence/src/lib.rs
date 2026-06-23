@@ -12,6 +12,10 @@ pub mod text_region;
 pub use adapter::{
     InSubstrateAdapter, InstrumentAdapter, SurfaceAdapter, SurfaceIntent, SurfaceSnapshot,
 };
+pub use adapters::code::{
+    CodeContentStrategy, CodeEditFootprint, CodeIntent, CodePresenceSnapshot, CodeSnapshot,
+    CodeSurfaceAdapter, FileRange,
+};
 pub use adapters::note::{NoteAdapter, NoteIntent, NoteSectionSnapshot, NoteSnapshot};
 pub use peer::{PeerConfig, PeerEvent, SharedWorkingLog, StructuredOp, SubstratePeer};
 pub use presence::{CursorPos, Presence, PresenceKind};

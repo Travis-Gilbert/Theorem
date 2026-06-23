@@ -15,23 +15,33 @@ pub mod auth;
 pub mod briefing;
 pub mod discover;
 pub mod mcp;
+pub mod organize;
 pub mod portability;
 pub mod retrieve;
 pub mod schema;
+pub mod serve;
 
 pub use auth::{ApiKeyRegistry, ApiKeyToken, Principal};
 pub use briefing::{briefing, Briefing, BriefingConfig, ConnectedItem};
 pub use discover::{discover, CandidateLink, DiscoverConfig};
+pub use organize::{
+    organize, DailyProgress, OrganizeConfig, OrganizeFiled, OrganizeGroup, OrganizeItem,
+    OrganizeSnapshot, OrganizedToday, Subtask, Timeframe,
+};
 pub use portability::{
     export, export_json, export_markdown, import, ExportDocument, ImportSummary, EXPORT_VERSION,
 };
-pub use retrieve::{ask, AnswerKind, AnswerModel, AskConfig, AskResult, NoModel, RetrievedItem};
+pub use retrieve::{
+    answer_model_from_env, ask, AnswerKind, AnswerModel, AskConfig, AskResult,
+    LocalOpenAiAnswerModel, NoModel, RetrievedItem,
+};
 pub use schema::{
     build_schema, build_schema_with_model, AnswerKindGql, ApiStore, AskResultGql, BriefingGql,
-    CandidateLinkGql, CollectionGql, ConnectedItemGql, ConsumerSchema, DurableSchema, DurableShared,
-    ExportFormat, ImportResultGql, IngestInputGql, InMemoryShared, ItemGql, Mutation, ProvenanceGql,
-    Query, SearchHitGql, SharedStore,
+    CandidateLinkGql, CollectionGql, ConnectedItemGql, ConsumerSchema, DurableSchema,
+    DurableShared, ExportFormat, ImportResultGql, InMemoryShared, IngestInputGql, ItemGql,
+    Mutation, ProvenanceGql, Query, SearchHitGql, SharedStore,
 };
+pub use serve::{build_router_with_model, run_from_env, serve_loopback, serve_loopback_with_ready};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
