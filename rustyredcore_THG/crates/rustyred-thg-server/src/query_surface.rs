@@ -2566,6 +2566,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         });
         let mut store = state.tenant_graph_store("tenant-a").unwrap();

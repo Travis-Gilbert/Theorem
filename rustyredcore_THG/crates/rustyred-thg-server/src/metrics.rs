@@ -5,6 +5,8 @@ use axum::{
     Json,
 };
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+use std::fs;
 
 use crate::auth::require_scope;
 use crate::config::StorageMode;
@@ -169,4 +171,116 @@ pub async fn diagnostics_config(
             "sweep_duration_p99_ms": state.ttl_sweep.sweep_duration_p99_ms(),
         },
     })))
+}
+
+/// `GET /v1/diagnostics/memory` — operator snapshot for process and tenant
+/// graph memory. The tenant sections only include already materialized tenants;
+/// reading this route does not lazily open on-disk graphs.
+pub async fn diagnostics_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "admin:read",
+        state.config.require_auth,
+    )?;
+
+    let redcore_tenants = state
+        .iter_redcore_tenants()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut tenant_versions = BTreeMap::new();
+    let tenant_reports = redcore_tenants
+        .iter()
+        .map(|(tenant, executor)| match executor.stats() {
+            Ok(stats) => {
+                tenant_versions.insert(tenant.clone(), stats.version);
+                json!({
+                    "tenant": tenant,
+                    "stats": stats,
+                    "cached_edges": executor.cached_edges_diagnostics(),
+                })
+            }
+            Err(error) => json!({
+                "tenant": tenant,
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                },
+                "cached_edges": executor.cached_edges_diagnostics(),
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    let graph_caches = state
+        .iter_graph_caches()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cache_reports = graph_caches
+        .iter()
+        .map(|(tenant, cache)| {
+            let graph_version = tenant_versions.get(tenant).copied().unwrap_or(0);
+            match cache.stats(graph_version) {
+                Ok(stats) => json!({
+                    "tenant": tenant,
+                    "graph_version_source": if tenant_versions.contains_key(tenant) {
+                        "materialized_redcore_tenant"
+                    } else {
+                        "default_zero"
+                    },
+                    "cache": stats,
+                }),
+                Err(error) => json!({
+                    "tenant": tenant,
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                    },
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({
+        "service": state.config.service_name.as_str(),
+        "status": "ok",
+        "storage_mode": state.config.storage_mode.as_str(),
+        "process": process_memory_snapshot(),
+        "ppr_cache": {
+            "scoped_entries": rustyred_thg_core::scoped_ppr_cache_len(),
+        },
+        "redcore_tenant_count": tenant_reports.len(),
+        "redcore_tenants": tenant_reports,
+        "graph_cache_tenant_count": cache_reports.len(),
+        "graph_caches": cache_reports,
+    })))
+}
+
+fn process_memory_snapshot() -> Value {
+    match fs::read_to_string("/proc/self/status") {
+        Ok(status) => json!({
+            "source": "/proc/self/status",
+            "available": true,
+            "vm_rss_bytes": status_kib(&status, "VmRSS").map(kib_to_bytes),
+            "vm_hwm_bytes": status_kib(&status, "VmHWM").map(kib_to_bytes),
+            "vm_size_bytes": status_kib(&status, "VmSize").map(kib_to_bytes),
+            "vm_data_bytes": status_kib(&status, "VmData").map(kib_to_bytes),
+        }),
+        Err(error) => json!({
+            "source": "/proc/self/status",
+            "available": false,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn status_kib(status: &str, key: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix(key)?.trim_start_matches(':').trim();
+        value.split_whitespace().next()?.parse::<u64>().ok()
+    })
+}
+
+fn kib_to_bytes(kib: u64) -> u64 {
+    kib.saturating_mul(1024)
 }

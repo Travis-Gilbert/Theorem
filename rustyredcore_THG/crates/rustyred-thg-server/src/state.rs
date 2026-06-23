@@ -14,8 +14,8 @@ use rustyred_thg_core::{
     GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
     GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
     HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions,
-    RedisGraphStore, SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
+    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
+    SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
@@ -659,7 +659,7 @@ impl AppState {
             default_tenant: self.config.mcp_default_tenant.clone(),
             read_only: self.config.mcp_read_only,
             allow_admin: self.config.mcp_allow_admin,
-            graphql_default_surface: false,
+            graphql_default_surface: self.config.mcp_graphql_default_surface,
             tool_result_budget_bytes: rustyred_thg_mcp::DEFAULT_TOOL_RESULT_BUDGET_BYTES,
             tool_result_family_budgets: Default::default(),
         }
@@ -730,7 +730,8 @@ impl AppState {
             RedCoreGraphStore::open(data_dir, options)?,
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id) {
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id)
+        {
             eprintln!(
                 "[theorem] enable graph hooks failed for {tenant_id}: {}",
                 err.message
@@ -757,7 +758,8 @@ impl AppState {
             RedCoreGraphStore::memory(),
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id) {
+        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id)
+        {
             eprintln!(
                 "[theorem] enable graph hooks failed for {tenant_id}: {}",
                 err.message
@@ -793,6 +795,18 @@ impl AppState {
             .collect())
     }
 
+    pub fn iter_graph_caches(
+        &self,
+    ) -> Result<Vec<(String, Arc<GraphCacheTenant>)>, StoreAccessError> {
+        let caches = self
+            .graph_caches
+            .lock()
+            .map_err(|_| StoreAccessError::internal("graph cache tenant map lock poisoned"))?;
+        Ok(caches
+            .iter()
+            .map(|(tenant, cache)| (tenant.clone(), cache.clone()))
+            .collect())
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1128,6 +1142,31 @@ impl RedCoreTenantExecutor {
             stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
             stats
         })
+    }
+
+    pub fn cached_edges_diagnostics(&self) -> Value {
+        match self.cached_edges.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some((version, edges)) => json!({
+                    "present": true,
+                    "graph_version": version,
+                    "edges": edges.len(),
+                    "arc_strong_count": Arc::strong_count(edges),
+                    "estimated_record_struct_bytes": edges
+                        .len()
+                        .saturating_mul(std::mem::size_of::<EdgeRecord>()),
+                }),
+                None => json!({
+                    "present": false,
+                    "edges": 0,
+                    "estimated_record_struct_bytes": 0,
+                }),
+            },
+            Err(_) => json!({
+                "present": false,
+                "error": "redcore edge cache lock poisoned",
+            }),
+        }
     }
 
     pub fn verify(&self) -> GraphStoreResult<VerifyReport> {
@@ -1986,7 +2025,7 @@ fn mirror_job_to_dispatch_if_configured(job: &HarnessJob) -> Result<bool, McpErr
         .name(format!("dispatch-mirror-{job_id}"))
         .spawn(move || -> Result<(), String> {
             let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
             runtime.block_on(async move {
@@ -1996,10 +2035,7 @@ fn mirror_job_to_dispatch_if_configured(job: &HarnessJob) -> Result<bool, McpErr
                 // Idempotent (CREATE TABLE IF NOT EXISTS): a fresh dispatch database, or
                 // one where the harness server is the first writer, still receives the row
                 // instead of failing on a missing `dispatch_jobs` table.
-                queue
-                    .migrate()
-                    .await
-                    .map_err(|error| error.to_string())?;
+                queue.migrate().await.map_err(|error| error.to_string())?;
                 queue
                     .submit(dispatch_job, priority)
                     .await
@@ -2763,7 +2799,9 @@ mod tests {
         }
         let delta = found.expect("changefeed delivered a delta for the projected task write");
         assert_eq!(delta.tenant, "tenant-cf");
-        let item = delta.item.expect("an upsert delta carries the projected item");
+        let item = delta
+            .item
+            .expect("an upsert delta carries the projected item");
         assert_eq!(item.kind, "task");
         assert_eq!(item.title, "watch me appear");
     }
@@ -2864,6 +2902,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         });
 
@@ -2944,6 +2983,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         };
         {
@@ -3003,6 +3043,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         });
 
@@ -3046,6 +3087,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         });
 
@@ -3315,6 +3357,15 @@ mod tests {
     }
 
     #[test]
+    fn mcp_config_carries_graphql_default_surface_flag() {
+        let mut config = memory_config();
+        config.mcp_graphql_default_surface = true;
+        let state = AppState::new(config);
+
+        assert!(state.mcp_config().graphql_default_surface);
+    }
+
+    #[test]
     fn product_mcp_backend_reaches_fulltext_spatial_and_bulk_tools() {
         let state = AppState::new(memory_config());
         let mut config = state.mcp_config();
@@ -3547,10 +3598,7 @@ mod tests {
         assert!(!job_id.is_empty());
 
         // The job is on the board despite the mirror failure.
-        assert!(
-            list.get("error").is_none(),
-            "job_list must succeed: {list}"
-        );
+        assert!(list.get("error").is_none(), "job_list must succeed: {list}");
         assert!(
             list.to_string().contains(job_id),
             "submitted job {job_id} must appear on the board: {list}"
@@ -3590,6 +3638,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         }
     }
@@ -3637,6 +3686,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         })
     }

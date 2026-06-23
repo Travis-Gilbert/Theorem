@@ -306,6 +306,44 @@ pub async fn openapi(State(state): State<AppState>) -> Json<Value> {
                     }
                 }
             },
+            "/v1/diagnostics/memory": {
+                "get": {
+                    "tags": ["operations"],
+                    "summary": "Process and tenant memory diagnostics",
+                    "description": "Admin-scoped memory snapshot for the running process, materialized RedCore tenants, graph cache tenants, and cached edge-list allocations. Calling this route does not open tenants that are not already materialized.",
+                    "responses": {
+                        "200": {
+                            "description": "Memory diagnostics snapshot.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "service": { "type": "string" },
+                                            "status": { "type": "string" },
+                                            "storage_mode": { "type": "string" },
+                                            "process": { "type": "object", "additionalProperties": true },
+                                            "ppr_cache": { "type": "object", "additionalProperties": true },
+                                            "redcore_tenant_count": { "type": "integer" },
+                                            "redcore_tenants": {
+                                                "type": "array",
+                                                "items": { "type": "object", "additionalProperties": true }
+                                            },
+                                            "graph_cache_tenant_count": { "type": "integer" },
+                                            "graph_caches": {
+                                                "type": "array",
+                                                "items": { "type": "object", "additionalProperties": true }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "403": { "$ref": "#/components/responses/Forbidden" }
+                    }
+                }
+            },
             "/v1/command": {
                 "post": {
                     "tags": ["runs"],
@@ -3373,6 +3411,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         });
 
@@ -3391,6 +3430,7 @@ mod tests {
             ("/search/answer", "post"),
             ("/v1/diagnostics/slow_queries", "get"),
             ("/v1/diagnostics/config", "get"),
+            ("/v1/diagnostics/memory", "get"),
             ("/v1/query", "post"),
             ("/v1/cypher", "post"),
             ("/v1/cypher/explain", "post"),

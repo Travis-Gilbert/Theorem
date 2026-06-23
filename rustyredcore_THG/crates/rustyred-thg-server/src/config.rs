@@ -62,6 +62,7 @@ pub struct Config {
     pub mcp_read_only: bool,
     pub mcp_allow_admin: bool,
     pub mcp_default_tenant: String,
+    pub mcp_graphql_default_surface: bool,
     /// TTL background sweep interval in milliseconds. Default 1000ms.
     /// Env: `RUSTYRED_THG_TTL_SWEEP_MS`. Lower = tighter expiration
     /// precision but more CPU; higher = cheaper but expired nodes
@@ -244,6 +245,13 @@ impl Config {
             "RUSTYRED_THG_MCP_DEFAULT_TENANT",
         ])
         .unwrap_or_else(|_| "default".to_string());
+        let mcp_graphql_default_surface = env_bool(
+            &[
+                "RUSTY_RED_MCP_GRAPHQL_DEFAULT_SURFACE",
+                "RUSTYRED_THG_MCP_GRAPHQL_DEFAULT_SURFACE",
+            ],
+            false,
+        );
 
         // TTL-04: background sweep interval. Default 1000ms balances
         // expiration precision against per-tick CPU.
@@ -284,6 +292,7 @@ impl Config {
             mcp_read_only,
             mcp_allow_admin,
             mcp_default_tenant,
+            mcp_graphql_default_surface,
             ttl_sweep_ms,
         }
     }
@@ -327,6 +336,7 @@ impl Config {
             mcp_read_only: false,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 50,
         }
     }
@@ -560,6 +570,7 @@ mod tests {
             mcp_read_only: false,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         }
     }

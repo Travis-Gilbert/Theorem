@@ -91,28 +91,26 @@ pub fn item_changefeed_enabled() -> bool {
 /// is ignored), and it makes NO graph writes, so the loop guard never engages.
 pub fn changefeed_registration() -> HookRegistration {
     let sender = sender();
-    let handler = Arc::new(
-        move |ctx: &mut HookContext, events: &[MutationEvent]| {
-            for event in events {
-                let node = match event.kind {
-                    // A delete has no node to re-read; the delta is a tombstone.
-                    MutationKind::NodeDeleted => None,
-                    // Re-read the just-committed node for its properties. A read
-                    // error skips THIS event without aborting the batch.
-                    _ => match ctx.store.get_node(&event.id) {
-                        Ok(node) => node,
-                        Err(_) => continue,
-                    },
-                };
-                if let Some(delta) = project_event(event, node.as_ref()) {
-                    // Non-blocking; `Err` only means no live subscribers, which is
-                    // fine (a fresh subscriber re-hydrates through the items query).
-                    let _ = sender.send(delta);
-                }
+    let handler = Arc::new(move |ctx: &mut HookContext, events: &[MutationEvent]| {
+        for event in events {
+            let node = match event.kind {
+                // A delete has no node to re-read; the delta is a tombstone.
+                MutationKind::NodeDeleted => None,
+                // Re-read the just-committed node for its properties. A read
+                // error skips THIS event without aborting the batch.
+                _ => match ctx.store.get_node(&event.id) {
+                    Ok(node) => node,
+                    Err(_) => continue,
+                },
+            };
+            if let Some(delta) = project_event(event, node.as_ref()) {
+                // Non-blocking; `Err` only means no live subscribers, which is
+                // fine (a fresh subscriber re-hydrates through the items query).
+                let _ = sender.send(delta);
             }
-            Ok(HookOutcome::Done)
-        },
-    );
+        }
+        Ok(HookOutcome::Done)
+    });
     HookRegistration::new(
         "item-changefeed",
         MutationMatcher::any()

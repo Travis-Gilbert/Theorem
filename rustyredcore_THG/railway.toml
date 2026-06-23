@@ -7,6 +7,11 @@ healthcheckPath = "/ready"
 healthcheckTimeout = 300
 restartPolicyMaxRetries = 3
 
+# Horizontal scale for the Railway RustyRed core service. Replicas spread traffic,
+# but each process still keeps the plan's per-replica memory limit.
+[deploy.multiRegionConfig."us-east4-eqdc4a"]
+numReplicas = 2
+
 # RustyRed base deployments should be one application image running embedded
 # RedCore with a mounted Railway volume. Add Redis only when intentionally
 # running the compatibility path with RUSTY_RED_MODE=redis.

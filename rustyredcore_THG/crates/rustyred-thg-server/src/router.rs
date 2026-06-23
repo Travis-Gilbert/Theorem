@@ -465,6 +465,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/diagnostics/config",
             get(crate::metrics::diagnostics_config),
         )
+        .route(
+            "/v1/diagnostics/memory",
+            get(crate::metrics::diagnostics_memory),
+        )
         .route("/v1/command", post(root_command))
         .route("/v1/batch", post(root_batch))
         .route("/v1/query", post(public_query))
@@ -8297,7 +8301,7 @@ mod tests {
     use crate::{
         auth::ApiToken,
         config::{Config, StorageMode, TenantConfigOverride},
-        metrics::diagnostics_config,
+        metrics::{diagnostics_config, diagnostics_memory},
         state::AppState,
     };
     use rustyred_thg_affordances::registry::register_connector_with_target;
@@ -8396,6 +8400,7 @@ mod tests {
                 mcp_read_only: read_only,
                 mcp_allow_admin: false,
                 mcp_default_tenant: "default".to_string(),
+                mcp_graphql_default_surface: false,
                 ttl_sweep_ms: 1000,
             },
             search_providers,
@@ -9622,6 +9627,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         });
 
@@ -10147,6 +10153,7 @@ mod tests {
             mcp_read_only: true,
             mcp_allow_admin: false,
             mcp_default_tenant: "default".to_string(),
+            mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
         });
 
@@ -10190,6 +10197,60 @@ mod tests {
                 ["edge_type_weights"]["CONTRADICTS"],
             -2.0
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_memory_reports_materialized_tenants_and_caches() {
+        let state = memory_product_state();
+        let tenant_id = "tenant-memory";
+        let mut store = state.tenant_graph_store(tenant_id).unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:memory",
+                vec!["MemoryProbe".to_string()],
+                json!({}),
+            ))
+            .unwrap();
+        let graph_version = store.stats().unwrap().version;
+        let cache = state.tenant_graph_cache(tenant_id).unwrap();
+        cache
+            .put(
+                crate::graph_cache::GraphCachePutBody {
+                    tenant_id: Some(tenant_id.to_string()),
+                    kind: "query_result".to_string(),
+                    key: json!({"query": "memory probe"}),
+                    value: json!({"ok": true}),
+                    metadata: json!({}),
+                    index_manifest_hash: None,
+                    auth_scope_hash: None,
+                    retrieval_policy_hash: None,
+                    model_version: None,
+                    source_hashes: Vec::new(),
+                },
+                graph_version,
+            )
+            .unwrap();
+
+        let response = diagnostics_memory(axum::extract::State(state), HeaderMap::new())
+            .await
+            .unwrap()
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["redcore_tenant_count"], 1);
+        assert_eq!(payload["redcore_tenants"][0]["tenant"], "pct_tenant-memory");
+        assert_eq!(payload["redcore_tenants"][0]["stats"]["nodes_total"], 1);
+        assert_eq!(
+            payload["redcore_tenants"][0]["cached_edges"]["present"],
+            false
+        );
+        assert_eq!(payload["graph_cache_tenant_count"], 1);
+        assert_eq!(payload["graph_caches"][0]["tenant"], "pct_tenant-memory");
+        assert_eq!(payload["graph_caches"][0]["cache"]["entries_total"], 1);
+        assert!(payload["ppr_cache"]["scoped_entries"].is_u64());
+        assert!(payload["process"]["available"].is_boolean());
     }
 
     #[tokio::test]
