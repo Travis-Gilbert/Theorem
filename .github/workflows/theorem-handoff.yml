@@ -1,0 +1,99 @@
+name: Theorem Handoff
+
+# Session-spawning: run Claude Code on GitHub's runner from a handoff intent.
+#
+# Two entry points, both landing on the same repository_dispatch -> action path,
+# because anthropics/claude-code-action@v1 only accepts a fixed set of events
+# (agent mode: workflow_dispatch, repository_dispatch, schedule, workflow_run).
+# A raw `push` event is rejected by the action ("Unsupported event type: push"),
+# so the push entry point RELAYS into a repository_dispatch rather than calling
+# the action directly.
+#
+#   A. repository_dispatch (type: theorem-handoff), client_payload { intent, branch }
+#      Fired by a spawn tool (e.g. spawn_handoff_session on github-mcp) or by the
+#      relay job below. This is the path the action actually runs on.
+#
+#   B. push touching .handoff/** (the claude.ai bootstrap path)
+#      A surface that can write files but cannot send a repository_dispatch
+#      (claude.ai's curated github-mcp subset) commits .handoff/intent.md. The
+#      `relay` job reads that file and fires the repository_dispatch in path A.
+#
+# Secrets (one-time):
+#   1. CLAUDE_CODE_OAUTH_TOKEN  - `claude setup-token` output, added as a repo
+#      Actions secret. The runner authenticates to Claude with this. Without it
+#      the action fails. (This is NOT the github-mcp commit token; different thing.)
+#      Also run `/install-github-app` once from Claude Code.
+#   2. HANDOFF_DISPATCH_PAT  - a token used ONLY by the relay job to fire the
+#      repository_dispatch. A separate token is required because the default
+#      GITHUB_TOKEN cannot re-trigger a workflow (recursion prevention), so a
+#      GITHUB_TOKEN-fired dispatch would no-op. A classic PAT with the `repo`
+#      scope works reliably; a fine-grained PAT needs Contents: read+write but is
+#      flakier for dispatches. Paste the token value with NO trailing newline
+#      (a stray newline makes gh fail with "invalid header field value for
+#      Authorization"). Only needed for entry point B; a spawn tool does not use it.
+#
+# IMPORTANT precedence note: do NOT also set ANTHROPIC_API_KEY as a secret/env here.
+# Claude Code prefers the API key over the OAuth token, so if both are present the
+# runs silently bill API rates instead of the subscription. Use exactly one.
+#
+# Multi-user boundary: the OAuth token is for the owner's individual use only.
+# When Theorem executes another user's task, that run must use that user's own
+# API key (BYO key), never this personal subscription token.
+
+on:
+  repository_dispatch:
+    types: [theorem-handoff]
+  push:
+    paths:
+      - '.handoff/**'
+
+jobs:
+  relay:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Relay .handoff/intent.md into a repository_dispatch
+        env:
+          GH_TOKEN: ${{ secrets.HANDOFF_DISPATCH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HANDOFF_DISPATCH_PAT is not set. Add a token (classic PAT with repo scope is most reliable) so the push can relay into a repository_dispatch." >&2
+            exit 1
+          fi
+          if [ ! -f .handoff/intent.md ]; then
+            echo "push touched .handoff/** but .handoff/intent.md is missing" >&2
+            exit 1
+          fi
+          jq -nc --rawfile intent .handoff/intent.md \
+            '{event_type:"theorem-handoff", client_payload:{intent:$intent}}' \
+            | gh api -X POST "repos/${GITHUB_REPOSITORY}/dispatches" --input -
+          echo "Relayed .handoff/intent.md into repository_dispatch (theorem-handoff)."
+
+  run:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    # id-token: write is REQUIRED by claude-code-action@v1: it mints its GitHub
+    # token via OIDC, and without this permission the runner never sets
+    # ACTIONS_ID_TOKEN_REQUEST_URL, so auth fails with
+    # "Could not fetch an OIDC token. Did you remember to add `id-token: write`...".
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.branch || github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Run Claude Code on the handoff intent
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ github.event.client_payload.intent }}

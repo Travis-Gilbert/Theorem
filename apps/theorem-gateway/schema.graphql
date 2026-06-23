@@ -1,0 +1,227 @@
+type AgentAnswer {
+	answer: String!
+	"""
+	The graph context that fed the model — the visible proof that this is a
+	graph-aware answer and not a generic chatbot.
+	"""
+	contextNodes: [GraphNode!]!
+	sources: [SearchHit!]!
+	model: String!
+}
+
+"""
+The scope of an `askAgent` call: exactly one of `repoId` (code-KG) or `seed`
+(instant-KG over the substrate) must be set.
+"""
+input AgentScope {
+	"""
+	Code-KG scope: ground the answer in this repo's code graph.
+	"""
+	repoId: String
+	"""
+	Instant-KG scope: ground the answer in a PPR gap-walk from this seed.
+	"""
+	seed: String
+}
+
+type CodeContextBlock {
+	path: String!
+	snippet: String!
+	symbols: [CodeSymbol!]!
+}
+
+type CodeSymbol {
+	id: String!
+	name: String!
+	kind: String!
+	path: String!
+	trustTier: String!
+	"""
+	Supporting evidence: a snippet/signature for a search or context hit;
+	the summary plus rendered graph edges for an explain hit.
+	"""
+	evidence: [String!]!
+}
+
+type GraphEdge {
+	src: String!
+	dst: String!
+	kind: String!
+	weight: Float!
+}
+
+type GraphNode {
+	id: String!
+	label: String!
+	kind: String!
+	score: Float!
+}
+
+type GraphStats {
+	nodeCount: Int!
+	edgeCount: Int!
+	"""
+	Gap-walk / explore rounds executed, when the source reports it (0 else).
+	"""
+	roundsExecuted: Int!
+}
+
+type IngestReceipt {
+	repoId: String!
+	nodeCount: Int!
+	edgeCount: Int!
+	"""
+	Content-addressed receipt hash from the code service.
+	"""
+	receipt: String!
+	"""
+	Async job id (ingest runs on a server-side worker). Poll-free for the
+	caller when the gateway waited for completion; otherwise use it to poll.
+	"""
+	jobId: String!
+	"""
+	"submitted" | "running" | "ok" | "budget_exceeded" | "failed".
+	"""
+	status: String!
+	message: String!
+	"""
+	JSON-encoded EpistemicRAG instant structural readout from CodeCrawler.
+	"""
+	epistemicReadoutJson: String!
+}
+
+type KnowledgeGraph {
+	nodes: [GraphNode!]!
+	edges: [GraphEdge!]!
+	stats: GraphStats!
+}
+
+type Mutation {
+	"""
+	Ingest a remote repository into a code graph. Only repo URLs matching
+	`PUBLIC_INGEST_ALLOWLIST` are accepted; anything else is refused with no
+	gRPC call. -> CodeCrawlerService.IngestCodebase (+ poll to completion)
+	"""
+	ingestCodebase(repoUrl: String!): IngestReceipt!
+	"""
+	Reindex an already-ingested repo (incremental: unchanged files are
+	carried forward). -> CodeCrawlerService.ReindexCodebase (+ poll)
+	"""
+	reindexCodebase(repoId: String!): IngestReceipt!
+}
+
+"""
+The omni-bar screen coordinate the explosion spawns from (Deliverable C
+reads it from the package provenance). Optional; defaults to viewport center.
+"""
+input OriginInput {
+	x: Float!
+	y: Float!
+}
+
+type Query {
+	"""
+	Theseus search over the live substrate. Returns admitted hits
+	(prior knowledge + new evidence) or an honest-empty list — never
+	fabricated. -> SearchService.Search
+	"""
+	search(query: String!, mode: SearchMode): [SearchHit!]!
+	"""
+	Single-round PPR gap-walk from a seed, returned as a knowledge graph
+	(nodes are admitted evidence; edges are empty — gap-walk surfaces ranked
+	evidence, not topology). -> SearchService.GapWalk
+	"""
+	gapWalk(seed: String!): KnowledgeGraph!
+	"""
+	Provenance for a graph node: the root node of its evidence-and-gap-closure
+	history, or null if none. -> SearchService.Provenance
+	"""
+	provenance(nodeId: String!): GraphNode
+	"""
+	Search indexed code symbols in a repo. -> CodeCrawlerService.SearchCode
+	"""
+	searchCode(query: String!, repoId: String!): [CodeSymbol!]!
+	"""
+	Expand a code symbol into its AST call/dependency subgraph.
+	-> CodeCrawlerService.ExploreCode
+	"""
+	exploreCode(symbolId: String!): KnowledgeGraph!
+	"""
+	Expand a file or symbol hit into surrounding source.
+	`target` is treated as a file path when it contains a path separator,
+	otherwise as a symbol node id. -> CodeCrawlerService.CodeContext
+	"""
+	codeContext(repoId: String!, target: String!): CodeContextBlock!
+	"""
+	Compact symbol summary with trust tier and graph evidence.
+	-> CodeCrawlerService.ExplainCode
+	"""
+	explainCode(symbolId: String!): CodeSymbol!
+	"""
+	The showpiece: answer a question grounded in a graph the visitor just
+	built or selected, returning the graph context that fed the model.
+	Rate-limited per IP. -> assembles graph context, then POSTs GL-Fusion.
+	"""
+	askAgent(question: String!, scope: AgentScope!): AgentAnswer!
+	"""
+	SceneOS add-on: build the KG for the input, get the model's explanation,
+	compile a force-graph `ScenePackageV2`, store it, and return a `SceneRef`
+	the browser embeds via `GET /scene/{sceneId}`. Rate-limited per IP.
+	"""
+	sceneForInput(input: String!, scope: AgentScope!, origin: OriginInput): SceneRef!
+}
+
+"""
+A handle to a compiled scene: an id plus the URL the browser embeds.
+"""
+type SceneRef {
+	sceneId: String!
+	url: String!
+}
+
+type SearchHit {
+	id: String!
+	title: String!
+	snippet: String!
+	score: Float!
+	"""
+	Where the evidence came from: the canonical URL when present, else the
+	source marker ("graph", "web", "source_pair", "fusion").
+	"""
+	provenance: String!
+}
+
+"""
+Browser-facing search mode, mapped to `theseus_search.v1.SearchMode`.
+"""
+enum SearchMode {
+	"""
+	Real-time UX. Single round, cheap rerank only.
+	"""
+	ASK
+	"""
+	Deep research. Up to 3 gap-walk rounds, full rerank.
+	"""
+	DEEP
+	"""
+	Encode-time bulk retrieval.
+	"""
+	ENCODE
+	"""
+	Civic-atlas: deep + source-paired.
+	"""
+	CIVIC_ATLAS
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: Query
+	mutation: Mutation
+}

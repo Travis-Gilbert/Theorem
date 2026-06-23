@@ -1,0 +1,35 @@
+[package]
+name = "rustyred-thg-core"
+version = "0.5.0"
+edition = "2021"
+description = "Theorem HotGraph core command executor and state machine."
+license = "MIT"
+rust-version = "1.85"
+
+[features]
+default = []
+redis-store = ["dep:redis"]
+# Optional vector-index acceleration. Default builds keep the exact in-memory
+# vector search and avoid TurboVec's BLAS-linked dependency graph.
+vector-accelerated = ["dep:turbovec"]
+# §P5-A pa5.1+pa5.2: tantivy as alternative full-text backend behind
+# RUSTY_RED_FULLTEXT_BACKEND=tantivy. Default builds keep the hand-rolled BM25.
+tantivy = ["dep:tantivy"]
+# §P8-A pa8.1+pa8.2: S2 cells as alternative spatial backend behind
+# RUSTY_RED_SPATIAL_BACKEND=s2. Default builds keep H3.
+s2 = ["dep:s2"]
+
+[dependencies]
+egg = "0.10"
+fs2 = "0.4"
+h3o = "0.7"
+imbl = { version = "7.0.0", features = ["serde"] }
+redis = { version = "0.27", optional = true }
+roaring = "0.10"
+s2 = { version = "0.0.12", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tantivy = { version = "0.22", optional = true }
+turbovec = { version = "0.8.0", optional = true }
+zstd = "0.13"

@@ -1,0 +1,737 @@
+/**
+ * Vanilla 2D-canvas renderer for a SceneOS scene package.
+ *
+ * Lane B slice 1: NOT the React `AtomSubstrate` (cosmos.gl force engine). This
+ * is a self-contained canvas renderer that takes the scene package Lane A
+ * produced, runs the projection to place the atoms, and draws them: one file
+ * Servo serves, no SPA, no WebGL.
+ *
+ * It draws the substrate's established vocabulary (relations as lines, atoms as
+ * kind-glyphs with labels; see `palette.ts`) so the page is continuous with
+ * the substrate's `genericTerminalState` and the browser's SERP chrome. Camera
+ * fits the whole scene to the viewport; hover hit-tests real atom positions
+ * (no theater).
+ *
+ * Canvas discipline (project rule): guard against zero dimensions and cap to
+ * 8192px; scale the backing store by devicePixelRatio and draw in CSS pixels.
+ *
+ * Security: atom labels / kinds may originate from crawled pages or agent
+ * output and are untrusted. Every piece of DOM text is written via
+ * `textContent` / `createElement` (never `innerHTML`), mirroring the SERP page.
+ */
+
+import { curveBumpY, link } from 'd3-shape';
+
+import type { Atom } from '../atoms/types';
+import type { ScenePackageV2 } from '../v2-package';
+import {
+  ACCENT,
+  INK,
+  INK_SOFT,
+  MONO,
+  PAPER,
+  atomFill,
+  relationStroke,
+  shapeForGlyph,
+  type ShapeKind,
+} from './palette';
+import {
+  fitTransform,
+  layoutScene,
+  type FitTransform,
+  type SceneLayout,
+  type Viewport,
+} from './sceneGeometry';
+import { AnnotationLayer, type AnnotationCallout } from './annotationLayer';
+
+/** Atom kind for model-explanation atoms: rendered as callouts pinned to their
+ *  anchor node, never as graph glyphs, and excluded from the force layout. */
+const ANNOTATION_KIND = 'annotation';
+/** Enter-choreography duration (ms): atoms spawn from the omni-bar origin and
+ *  settle into the force layout. */
+const ENTER_DURATION_MS = 900;
+
+const MAX_CANVAS_PX = 8192;
+const FIT_PADDING_PX = 64;
+const MIN_ATOM_RADIUS = 5;
+const MAX_ATOM_RADIUS = 18;
+const LABEL_FONT_PX = 11;
+/** Above this atom count, labels render only for the hovered atom to avoid
+ *  an unreadable wall of text. */
+const LABEL_ALL_THRESHOLD = 48;
+
+interface PlacedAtom {
+  atom: Atom;
+  sx: number;
+  sy: number;
+  r: number;
+  fill: string;
+  shape: ShapeKind;
+}
+
+/** A relation's two screen-space endpoints, the datum the d3-shape link
+ *  generator reads. */
+interface LinkEndpoints {
+  source: { x: number; y: number };
+  target: { x: number; y: number };
+}
+
+/**
+ * Smooth-curve relation generator (d3-shape). `curveBumpY` draws a vertical
+ * bezier between the two endpoints, so relations read as gentle arcs instead of
+ * hard straight segments. Built once at module load (it is a pure path
+ * generator with no DOM / no canvas binding) and reused per relation: each call
+ * with a `LinkEndpoints` datum returns an SVG path string the canvas strokes
+ * via `Path2D`. No randomness, no time: same endpoints produce the same path.
+ */
+const RELATION_LINK = link<LinkEndpoints, { x: number; y: number }>(curveBumpY)
+  .x((point) => point.x)
+  .y((point) => point.y);
+
+export interface SceneRendererCallbacks {
+  /** Called when the user clicks an atom (real selection, wired by the host
+   *  shell: e.g. open evidence / ask follow-up). */
+  onSelectAtom?(atom: Atom): void;
+}
+
+export class SceneRenderer {
+  private readonly canvas: HTMLCanvasElement;
+  private readonly ctx: CanvasRenderingContext2D;
+  private readonly tooltip: HTMLElement | null;
+  private readonly callbacks: SceneRendererCallbacks;
+  private readonly pkg: ScenePackageV2;
+
+  private layout: SceneLayout | null = null;
+  private transform: FitTransform | null = null;
+  private placed: PlacedAtom[] = [];
+  private hoveredId: string | null = null;
+  private selectedId: string | null = null;
+  private viewport: Viewport = { width: 0, height: 0 };
+  private readonly annotations: AnnotationLayer | null;
+
+  // SceneOS explosion/annotate choreography (Deliverable C).
+  /** Graph atoms only (annotation atoms are filtered out of the force layout). */
+  private readonly graphPkg: ScenePackageV2;
+  /** Model-explanation atoms, rendered as callouts pinned to anchor nodes. */
+  private readonly annotationAtoms: Atom[];
+  private readonly reducedMotion: boolean;
+  /** 0 = spawned at origin, 1 = settled. Drives the enter tween. */
+  private enterProgress: number;
+  /** True once the enter animation (or reduced-motion reveal) has completed. */
+  private entered: boolean;
+  /** Omni-bar spawn origin in screen coords; null until first resize. */
+  private origin: { x: number; y: number } | null = null;
+  private enterRaf = 0;
+
+  constructor(
+    canvas: HTMLCanvasElement,
+    pkg: ScenePackageV2,
+    options: {
+      tooltip?: HTMLElement | null;
+      overlay?: SVGSVGElement | null;
+      callbacks?: SceneRendererCallbacks;
+    } = {},
+  ) {
+    this.canvas = canvas;
+    const ctx = canvas.getContext('2d');
+    if (ctx === null) {
+      throw new Error('SceneRenderer: 2D canvas context unavailable');
+    }
+    this.ctx = ctx;
+    this.tooltip = options.tooltip ?? null;
+    this.callbacks = options.callbacks ?? {};
+    this.pkg = pkg;
+    // Partition annotation atoms out of the graph: they render as callouts
+    // pinned to their anchor node, never as force-laid-out glyphs.
+    this.annotationAtoms = pkg.atoms.filter((a) => a.kind === ANNOTATION_KIND);
+    this.graphPkg = {
+      ...pkg,
+      atoms: pkg.atoms.filter((a) => a.kind !== ANNOTATION_KIND),
+    };
+    // Respect prefers-reduced-motion: skip the spawn/settle animation and
+    // reveal the settled, annotated layout directly.
+    this.reducedMotion =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    this.enterProgress = this.reducedMotion ? 1 : 0;
+    this.entered = this.reducedMotion;
+    // The annotation overlay is optional: when no <svg> is supplied the renderer
+    // simply draws no callouts (the canvas + tooltip path is unchanged).
+    this.annotations =
+      options.overlay != null
+        ? new AnnotationLayer(options.overlay, () => this.viewport)
+        : null;
+
+    this.onPointerMove = this.onPointerMove.bind(this);
+    this.onPointerLeave = this.onPointerLeave.bind(this);
+    this.onClick = this.onClick.bind(this);
+    canvas.addEventListener('pointermove', this.onPointerMove);
+    canvas.addEventListener('pointerleave', this.onPointerLeave);
+    canvas.addEventListener('click', this.onClick);
+  }
+
+  /** The resolved layout (for the host shell to read projection id / fallback
+   *  state and render an honest header / note). Null until first `resize`. */
+  getLayout(): SceneLayout | null {
+    return this.layout;
+  }
+
+  /**
+   * Measure the canvas's CSS box, re-fit the scene, and paint. Call on mount
+   * and whenever the container resizes. Re-runs the (pure) projection because
+   * viewport-aware adapters depend on the available space.
+   */
+  resize(): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const cssW = Math.floor(rect.width);
+    const cssH = Math.floor(rect.height);
+    // Guard zero dimensions (browsers show a broken-image icon) and cap to the
+    // canvas size limit.
+    if (cssW < 1 || cssH < 1) return;
+    const w = Math.min(cssW, MAX_CANVAS_PX);
+    const h = Math.min(cssH, MAX_CANVAS_PX);
+
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    this.viewport = { width: w, height: h };
+    // Lay out only the graph atoms (annotation atoms are callouts, not nodes).
+    this.layout = layoutScene(this.graphPkg, this.viewport);
+    this.transform = fitTransform(this.layout.bounds, this.viewport, FIT_PADDING_PX);
+    this.origin = this.resolveOrigin();
+    this.computePlaced();
+    this.paint();
+    // Re-anchor any open selection callout to the atom's new screen position
+    // (the re-fit moved every glyph).
+    this.refreshAnnotation();
+    // Re-pin the model-explanation callouts after a re-fit, but only once the
+    // enter reveal has happened (so they do not flash before the animation).
+    if (this.entered) {
+      this.renderModelAnnotations();
+    }
+  }
+
+  destroy(): void {
+    if (this.enterRaf) {
+      cancelAnimationFrame(this.enterRaf);
+      this.enterRaf = 0;
+    }
+    this.canvas.removeEventListener('pointermove', this.onPointerMove);
+    this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
+    this.canvas.removeEventListener('click', this.onClick);
+    if (this.tooltip) this.tooltip.style.display = 'none';
+    if (this.annotations) this.annotations.clearAll();
+  }
+
+  /**
+   * Phase 1+2+3: spawn the atoms from the omni-bar origin, settle them into the
+   * force layout, then reveal the model-explanation callouts. The reduced-motion
+   * path skips phases 1-2 and reveals the settled, annotated layout directly.
+   */
+  playEnter(): void {
+    if (this.layout === null) return;
+    if (this.reducedMotion) {
+      this.enterProgress = 1;
+      this.entered = true;
+      this.paint();
+      this.renderModelAnnotations();
+      return;
+    }
+    if (this.enterRaf) cancelAnimationFrame(this.enterRaf);
+    this.enterProgress = 0;
+    this.entered = false;
+    let start: number | null = null;
+    const step = (timestamp: number): void => {
+      if (start === null) start = timestamp;
+      const elapsed = timestamp - start;
+      this.enterProgress = Math.min(1, elapsed / ENTER_DURATION_MS);
+      this.paint();
+      if (this.enterProgress < 1) {
+        this.enterRaf = requestAnimationFrame(step);
+      } else {
+        this.enterRaf = 0;
+        this.entered = true;
+        this.renderModelAnnotations();
+      }
+    };
+    this.enterRaf = requestAnimationFrame(step);
+  }
+
+  /** Eased enter factor (easeOutCubic): smooth spawn -> settle. */
+  private enterFactor(): number {
+    if (this.enterProgress >= 1) return 1;
+    return 1 - Math.pow(1 - this.enterProgress, 3);
+  }
+
+  /** A placed atom's current draw X: lerped from the origin during the enter
+   *  tween, settled position once entered. */
+  private drawX(p: PlacedAtom): number {
+    const f = this.enterFactor();
+    if (this.origin === null || f >= 1) return p.sx;
+    return this.origin.x + (p.sx - this.origin.x) * f;
+  }
+
+  private drawY(p: PlacedAtom): number {
+    const f = this.enterFactor();
+    if (this.origin === null || f >= 1) return p.sy;
+    return this.origin.y + (p.sy - this.origin.y) * f;
+  }
+
+  /** Read the omni-bar spawn origin from the package provenance, falling back to
+   *  the viewport center. Origin is in screen (CSS-pixel) coordinates. */
+  private resolveOrigin(): { x: number; y: number } {
+    const center = { x: this.viewport.width / 2, y: this.viewport.height / 2 };
+    const provenance = this.pkg.provenance as Record<string, unknown> | undefined;
+    const origin = provenance?.origin as { x?: unknown; y?: unknown } | undefined;
+    if (
+      origin &&
+      typeof origin.x === 'number' &&
+      Number.isFinite(origin.x) &&
+      typeof origin.y === 'number' &&
+      Number.isFinite(origin.y)
+    ) {
+      return { x: origin.x, y: origin.y };
+    }
+    return center;
+  }
+
+  /** Phase 3: pin a callout to each annotation atom's anchor node (or the top
+   *  center for a global annotation), revealing the model's explanation. */
+  private renderModelAnnotations(): void {
+    const layer = this.annotations;
+    if (layer === null || this.annotationAtoms.length === 0) return;
+    const byId = new Map(this.placed.map((p) => [p.atom.id, p]));
+    const items: AnnotationCallout[] = [];
+    for (const annotation of this.annotationAtoms) {
+      const body = annotation.label ?? '';
+      if (body.length === 0) continue;
+      const anchorId =
+        typeof annotation.metadata?.anchorId === 'string'
+          ? (annotation.metadata.anchorId as string)
+          : null;
+      const anchor = anchorId !== null ? byId.get(anchorId) : undefined;
+      const x = anchor !== undefined ? anchor.sx : this.viewport.width / 2;
+      const y = anchor !== undefined ? anchor.sy : this.viewport.height * 0.18;
+      items.push({ title: 'Explanation', body, x, y });
+    }
+    layer.showAnnotations(items);
+  }
+
+  /** Redraw the callout for the currently-selected atom at its current screen
+   *  position, or clear it if nothing is selected / the atom is gone. */
+  private refreshAnnotation(): void {
+    const layer = this.annotations;
+    if (layer === null) return;
+    if (this.selectedId === null) {
+      layer.clear();
+      return;
+    }
+    const placed = this.placed.find((p) => p.atom.id === this.selectedId);
+    if (placed === undefined) {
+      layer.clear();
+      return;
+    }
+    layer.showCallout(placed.atom, placed.sx, placed.sy);
+  }
+
+  // ------------------------------------------------------------------------
+  // Placement
+  // ------------------------------------------------------------------------
+
+  private computePlaced(): void {
+    const layout = this.layout;
+    const transform = this.transform;
+    this.placed = [];
+    if (layout === null || transform === null) return;
+
+    // Radius scales with atom weight/scale, clamped to a legible band.
+    const weights = layout.atoms.map((a) => atomMagnitude(a));
+    const maxWeight = weights.reduce((m, v) => Math.max(m, v), 0) || 1;
+
+    for (const atom of layout.atoms) {
+      const world = layout.positions.get(atom.id);
+      if (world === undefined) continue;
+      const sx = transform.toScreenX(world.x);
+      const sy = transform.toScreenY(world.y);
+      const norm = atomMagnitude(atom) / maxWeight;
+      const r = MIN_ATOM_RADIUS + norm * (MAX_ATOM_RADIUS - MIN_ATOM_RADIUS);
+      this.placed.push({
+        atom,
+        sx,
+        sy,
+        r,
+        fill: atomFill(atom.kind, atom.color),
+        shape: shapeForGlyph(atom.glyph),
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // Paint
+  // ------------------------------------------------------------------------
+
+  /**
+   * Paint the current scene at full opacity. Synchronous and idempotent: no
+   * rAF, no time-based fade. A scene MUST be visible the instant it mounts,
+   * and rAF is throttled in headless / background tabs: gating visibility on
+   * it would leave the canvas blank. Lifecycle-driven per-atom opacity
+   * (entering / leaving) still applies because it is data-driven, not
+   * time-driven. Choreographed enter/morph transitions are a later enrichment
+   * (the substrate's real choreographer), not a slice-1 concern.
+   */
+  private paint(): void {
+    const { ctx } = this;
+    const { width, height } = this.viewport;
+    const layout = this.layout;
+    if (layout === null) return;
+
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, width, height);
+
+    // Fade the whole scene in as it spawns from the origin (phase 1 -> 2).
+    ctx.globalAlpha = this.enterFactor();
+    this.paintRelations(layout);
+    this.paintAtoms(layout);
+    ctx.globalAlpha = 1;
+  }
+
+  /** Repaint immediately (used by hover to refresh the highlight). */
+  private repaint(): void {
+    this.paint();
+  }
+
+  private paintRelations(layout: SceneLayout): void {
+    const transform = this.transform;
+    if (transform === null) return;
+    const { ctx } = this;
+    const fade = ctx.globalAlpha;
+    const byId = new Map(this.placed.map((p) => [p.atom.id, p]));
+
+    ctx.lineWidth = 1.25;
+    for (const rel of layout.relations) {
+      const a = byId.get(rel.sourceId);
+      const b = byId.get(rel.targetId);
+      if (a === undefined || b === undefined) continue;
+      const highlight =
+        this.hoveredId !== null &&
+        (rel.sourceId === this.hoveredId || rel.targetId === this.hoveredId);
+      const stroke = relationStroke(rel.color);
+      ctx.strokeStyle = highlight ? ACCENT : stroke;
+      ctx.globalAlpha = (highlight ? 0.95 : 0.5) * fade;
+      const ax = this.drawX(a);
+      const ay = this.drawY(a);
+      const bx = this.drawX(b);
+      const by = this.drawY(b);
+      // Smooth curve (d3-shape) between the two glyph centers. The generator
+      // returns an SVG path string; Path2D lets the canvas stroke it directly.
+      const pathStr = RELATION_LINK({
+        source: { x: ax, y: ay },
+        target: { x: bx, y: by },
+      });
+      if (pathStr !== null) {
+        ctx.stroke(new Path2D(pathStr));
+      }
+      // Arrowheads only once settled (they read wrong mid-fly-in).
+      if (this.enterProgress >= 1) {
+        drawArrowhead(ctx, a, b, highlight ? ACCENT : stroke);
+      }
+    }
+    ctx.globalAlpha = fade;
+  }
+
+  private paintAtoms(layout: SceneLayout): void {
+    const { ctx } = this;
+    const fade = ctx.globalAlpha;
+    const labelAll = layout.atoms.length <= LABEL_ALL_THRESHOLD;
+
+    const settled = this.enterProgress >= 1;
+    for (const p of this.placed) {
+      const hovered = p.atom.id === this.hoveredId;
+      const radius = hovered ? p.r * 1.18 : p.r;
+      ctx.globalAlpha = lifecycleAlpha(p.atom) * fade;
+
+      const px = this.drawX(p);
+      const py = this.drawY(p);
+      drawGlyph(ctx, p.shape, px, py, radius, p.fill);
+      ctx.lineWidth = hovered ? 2 : 1;
+      ctx.strokeStyle = hovered ? ACCENT : INK;
+      strokeGlyph(ctx, p.shape, px, py, radius);
+
+      // Labels only once settled (no label churn during the fly-in).
+      if (settled && (labelAll || hovered)) {
+        drawLabel(ctx, p, hovered);
+      }
+    }
+    ctx.globalAlpha = fade;
+  }
+
+  // ------------------------------------------------------------------------
+  // Interaction
+  // ------------------------------------------------------------------------
+
+  private hitTest(cssX: number, cssY: number): PlacedAtom | null {
+    let best: PlacedAtom | null = null;
+    let bestDist = Infinity;
+    for (const p of this.placed) {
+      const dx = cssX - p.sx;
+      const dy = cssY - p.sy;
+      const dist = dx * dx + dy * dy;
+      const hitR = p.r + 5;
+      if (dist <= hitR * hitR && dist < bestDist) {
+        best = p;
+        bestDist = dist;
+      }
+    }
+    return best;
+  }
+
+  private onPointerMove(event: PointerEvent): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const cssX = event.clientX - rect.left;
+    const cssY = event.clientY - rect.top;
+    const hit = this.hitTest(cssX, cssY);
+    const nextId = hit?.atom.id ?? null;
+    this.canvas.style.cursor = hit ? 'pointer' : 'default';
+
+    if (nextId !== this.hoveredId) {
+      this.hoveredId = nextId;
+      this.repaint();
+    }
+    this.showTooltip(hit, cssX, cssY);
+  }
+
+  private onPointerLeave(): void {
+    if (this.hoveredId !== null) {
+      this.hoveredId = null;
+      this.repaint();
+    }
+    if (this.tooltip) this.tooltip.style.display = 'none';
+    this.canvas.style.cursor = 'default';
+  }
+
+  private onClick(event: PointerEvent): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const hit = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
+    // Selecting an atom opens its callout at the atom's screen position;
+    // clicking empty space clears the selection and the callout. Selection is
+    // real state (also surfaced to the host via onSelectAtom), not theater.
+    if (hit) {
+      this.selectedId = hit.atom.id;
+      if (this.annotations) {
+        this.annotations.showCallout(hit.atom, hit.sx, hit.sy);
+      }
+      if (this.callbacks.onSelectAtom) {
+        this.callbacks.onSelectAtom(hit.atom);
+      }
+    } else if (this.selectedId !== null) {
+      this.selectedId = null;
+      if (this.annotations) this.annotations.clear();
+    }
+  }
+
+  private showTooltip(hit: PlacedAtom | null, cssX: number, cssY: number): void {
+    const tip = this.tooltip;
+    if (tip === null) return;
+    if (hit === null) {
+      tip.style.display = 'none';
+      return;
+    }
+    const atom = hit.atom;
+    const refs = atom.sourceRefs?.length ?? 0;
+    // Clear + rebuild with safe DOM nodes only (labels are untrusted; never
+    // innerHTML). replaceChildren() empties the node without parsing HTML.
+    tip.replaceChildren();
+    const title = document.createElement('div');
+    title.className = 'tip-title';
+    title.textContent = atom.label ?? atom.id;
+    tip.appendChild(title);
+    const kind = document.createElement('div');
+    kind.className = 'tip-kind';
+    kind.textContent = atom.kind;
+    tip.appendChild(kind);
+    if (refs > 0) {
+      const src = document.createElement('div');
+      src.className = 'tip-src';
+      src.textContent = `${refs} source${refs === 1 ? '' : 's'}`;
+      tip.appendChild(src);
+    }
+    tip.style.display = 'block';
+    // Keep the tooltip inside the viewport.
+    const offset = 14;
+    const tipW = tip.offsetWidth;
+    const tipH = tip.offsetHeight;
+    let left = cssX + offset;
+    let top = cssY + offset;
+    if (left + tipW > this.viewport.width) left = cssX - tipW - offset;
+    if (top + tipH > this.viewport.height) top = cssY - tipH - offset;
+    tip.style.left = `${Math.max(0, left)}px`;
+    tip.style.top = `${Math.max(0, top)}px`;
+  }
+}
+
+// --------------------------------------------------------------------------
+// Glyph drawing
+// --------------------------------------------------------------------------
+
+function drawGlyph(
+  ctx: CanvasRenderingContext2D,
+  shape: ShapeKind,
+  x: number,
+  y: number,
+  r: number,
+  fill: string,
+): void {
+  ctx.fillStyle = fill;
+  glyphPath(ctx, shape, x, y, r);
+  ctx.fill();
+}
+
+function strokeGlyph(
+  ctx: CanvasRenderingContext2D,
+  shape: ShapeKind,
+  x: number,
+  y: number,
+  r: number,
+): void {
+  glyphPath(ctx, shape, x, y, r);
+  ctx.stroke();
+}
+
+/** Build the path for a glyph shape centered at (x, y) with radius r. Shapes
+ *  echo `defaultGlyphForKind`: a source reads as a page, evidence as a pin,
+ *  a cluster as a hex, etc. Unknown -> circle (the substrate baseline mark). */
+function glyphPath(
+  ctx: CanvasRenderingContext2D,
+  shape: ShapeKind,
+  x: number,
+  y: number,
+  r: number,
+): void {
+  ctx.beginPath();
+  switch (shape) {
+    case 'page': {
+      const w = r * 1.5;
+      const h = r * 1.9;
+      ctx.rect(x - w / 2, y - h / 2, w, h);
+      break;
+    }
+    case 'square': {
+      const s = r * 1.7;
+      ctx.rect(x - s / 2, y - s / 2, s, s);
+      break;
+    }
+    case 'frame': {
+      const w = r * 2.1;
+      const h = r * 1.5;
+      ctx.rect(x - w / 2, y - h / 2, w, h);
+      break;
+    }
+    case 'building': {
+      const w = r * 1.7;
+      const h = r * 2.1;
+      ctx.rect(x - w / 2, y - h / 2, w, h);
+      break;
+    }
+    case 'pin': {
+      // Teardrop: a circle with a point at the bottom.
+      ctx.moveTo(x, y + r * 1.4);
+      ctx.quadraticCurveTo(x - r, y + r * 0.2, x - r, y - r * 0.2);
+      ctx.arc(x, y - r * 0.2, r, Math.PI, 0, false);
+      ctx.quadraticCurveTo(x + r, y + r * 0.2, x, y + r * 1.4);
+      break;
+    }
+    case 'person': {
+      ctx.arc(x, y - r * 0.4, r * 0.6, 0, Math.PI * 2);
+      ctx.moveTo(x + r * 0.9, y + r * 1.1);
+      ctx.arc(x, y + r * 0.5, r * 0.9, 0, Math.PI, false);
+      break;
+    }
+    case 'hex': {
+      for (let i = 0; i < 6; i += 1) {
+        const angle = (Math.PI / 3) * i - Math.PI / 6;
+        const px = x + r * Math.cos(angle);
+        const py = y + r * Math.sin(angle);
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      break;
+    }
+    case 'circle':
+    default:
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      break;
+  }
+}
+
+function drawArrowhead(
+  ctx: CanvasRenderingContext2D,
+  from: PlacedAtom,
+  to: PlacedAtom,
+  color: string,
+): void {
+  const dx = to.sx - from.sx;
+  const dy = to.sy - from.sy;
+  const len = Math.hypot(dx, dy);
+  if (len < to.r + 6) return; // too short to bother
+  const ux = dx / len;
+  const uy = dy / len;
+  // Land the arrow just outside the target glyph.
+  const tipX = to.sx - ux * (to.r + 2);
+  const tipY = to.sy - uy * (to.r + 2);
+  const size = 5;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(tipX - ux * size - uy * size * 0.6, tipY - uy * size + ux * size * 0.6);
+  ctx.lineTo(tipX - ux * size + uy * size * 0.6, tipY - uy * size - ux * size * 0.6);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawLabel(ctx: CanvasRenderingContext2D, p: PlacedAtom, hovered: boolean): void {
+  const text = truncate(p.atom.label ?? p.atom.id, hovered ? 48 : 22);
+  ctx.font = `${LABEL_FONT_PX}px ${MONO}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const y = p.sy + p.r + 4;
+  // Soft paper halo so labels stay legible over relation lines.
+  const w = ctx.measureText(text).width;
+  ctx.fillStyle = 'rgba(244, 241, 234, 0.82)';
+  ctx.fillRect(p.sx - w / 2 - 2, y - 1, w + 4, LABEL_FONT_PX + 3);
+  ctx.fillStyle = hovered ? INK : INK_SOFT;
+  ctx.fillText(text, p.sx, y);
+}
+
+// --------------------------------------------------------------------------
+// Small helpers
+// --------------------------------------------------------------------------
+
+function atomMagnitude(atom: Atom): number {
+  if (typeof atom.weight === 'number' && Number.isFinite(atom.weight) && atom.weight > 0) {
+    return atom.weight;
+  }
+  if (typeof atom.scale === 'number' && Number.isFinite(atom.scale) && atom.scale > 0) {
+    return atom.scale;
+  }
+  return 1;
+}
+
+function lifecycleAlpha(atom: Atom): number {
+  switch (atom.lifecycle) {
+    case 'leaving':
+      return 0.35;
+    case 'entering':
+      return 0.85;
+    default:
+      return 1;
+  }
+}
+
+function truncate(value: string, max: number): string {
+  const s = String(value);
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}

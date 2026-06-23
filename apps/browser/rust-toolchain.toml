@@ -1,0 +1,9 @@
+# Mirrors Servo's pinned toolchain at the rev pinned in Cargo.toml
+# (b891f04d0819272b27e80ac975e2e57d3cb9e66b, captured 2026-05-29). libservo is
+# part of this crate's build graph (Cargo git dependency), and Cargo builds the
+# whole graph with ONE toolchain, so the embedder must use Servo's toolchain +
+# components or libservo fails to compile. Keep in sync when bumping the servo rev
+# (source: servo/rust-toolchain.toml).
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "llvm-tools", "rustc-dev", "rustfmt", "rust-src"]

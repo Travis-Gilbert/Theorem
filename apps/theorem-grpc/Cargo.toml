@@ -1,0 +1,66 @@
+# Theorem's first gRPC server.
+#
+# theseus_search.v1.SearchService implemented in pure Rust over the RustyRed
+# substrate (rustyred-web + rustyred-thg-core). It is the URL-swap target for
+# the civic-atlas-server SearchServiceClient: same proto package + message
+# shapes, so the civic backend dials it by setting THEOREM_SEARCH_URL with no
+# code change.
+#
+# Workspace placement: this crate is its OWN Cargo root (bare `[workspace]`
+# table at the bottom) and is NOT a member of rustyredcore_THG. It path-deps
+# INTO the THG core crates but builds/tests directly here via
+# `cargo build -p theorem-grpc-server`. Mirrors apps/browser (standalone,
+# path-deps THG core) and rustyredcore_THG/crates/reconstruction-engine
+# (bare `[workspace]` table to stay out of the parent members). Deploys as
+# its own Railway service per the binding project decision.
+
+[package]
+name = "theorem-grpc"
+version = "0.0.0"
+edition = "2021"
+build = "build.rs"
+publish = false
+description = "Theorem's first gRPC server: theseus_search.v1.SearchService over the RustyRed substrate (pure Rust, no PyO3, no Django)."
+license = "MIT"
+
+[dependencies]
+# tonic/prost PINNED at 0.12/0.13 to match BOTH rustyred-thg-server AND the
+# civic-atlas-server SearchServiceClient (our-civic-atlas-backend root
+# workspace: tonic 0.12 / prost 0.13). A drift to 0.13/0.14 would break wire
+# + codegen compatibility with the existing client. The bare [workspace]
+# table isolates this crate's lockfile so a stray workspace-wide bump cannot
+# silently move it.
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio-stream = "0.1"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+redis = "0.27"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# The pure-Rust search engine. rustyred-web::search_substrate is the real search
+# kernel; rustyred-thg-core::{InMemoryGraphStore, personalized_pagerank} are
+# the substrate + PPR primitive. Neither crate has any Python/PyO3 dep
+# (verified against their Cargo.toml). This binary NEVER touches the PyO3
+# #[pyfunction] wrappers in rustyredcore_THG/src/*.rs.
+rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+rustyred-thg-code = { path = "../../rustyredcore_THG/crates/rustyred-thg-code" }
+# AppAffordanceService uses RedCoreGraphStore for durable invocation receipts
+# and rustyred-thg-affordances for registry, selection, and learning writes.
+rustyred-thg-affordances = { path = "../../rustyredcore_THG/crates/rustyred-thg-affordances" }
+theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "theorem-grpc-server"
+path = "src/main.rs"
+
+# Standalone workspace root: keeps this crate OUT of any ancestor workspace
+# and gives it its own Cargo.lock. Same trick reconstruction-engine uses.
+[workspace]

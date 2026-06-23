@@ -1,0 +1,19 @@
+[package]
+name = "rustyred-thg-pg-server"
+version = "0.5.0"
+edition = "2021"
+description = "Postgres wire protocol server for RustyRedCore-THG native views."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+postgres-types = "0.2"
+rustyred-thg-core = { path = "../rustyred-thg-core", features = ["redis-store"] }
+serde_json = "1.0"
+sqlparser = "0.62"
+
+[dev-dependencies]
+# tokio-postgres is the real Postgres client used by the wire acceptance suite to
+# prove psql-class drivers connect; tokio drives its async runtime in-test only.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-postgres = "0.7"

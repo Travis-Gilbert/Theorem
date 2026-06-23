@@ -1,0 +1,52 @@
+[package]
+name = "rustyred-thg-server"
+version = "0.5.0"
+edition = "2021"
+description = "Product HTTP/gRPC/MCP surface over RustyRedCore-THG: tenant graph routes, query/Cypher APIs, harness coordination, browser actions, fractal expansion, and TTL sweeping."
+build = "build.rs"
+
+[dependencies]
+ed25519-dalek = "2"
+hex = "0.4"
+reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+axum = "0.7"
+http = "1"
+pest = "2.7"
+pest_derive = "2.7"
+prost = "0.13"
+redis = "0.27"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustyred-thg-core = { path = "../rustyred-thg-core", features = ["redis-store"] }
+theorem-harness-core = { path = "../theorem-harness-core" }
+theorem-harness-runtime = { path = "../theorem-harness-runtime" }
+theorem-dispatch = { path = "../theorem-dispatch" }
+theorem-browser-agent = { path = "../theorem-browser-agent" }
+rustyred-thg-adapters = { path = "../rustyred-thg-adapters", features = ["pairformer-burn-cubecl"] }
+rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
+rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
+rustyred-thg-mcp = { path = "../rustyred-thg-mcp", features = ["redis-store"] }
+rustyred-thg-fractal = { path = "../rustyred-thg-fractal" }
+rustyred-web = { path = "../rustyred-web" }
+rustyred-hipporag = { path = "../rustyred-hipporag" }
+rustyred-membrane = { path = "../rustyred-membrane", features = ["graph-store"] }
+rustyred-rerank = { path = "../rustyred-rerank" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = "0.12"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "rustyred-thg-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "rustyred-thg-upgrade-format"
+path = "src/bin/upgrade_format.rs"

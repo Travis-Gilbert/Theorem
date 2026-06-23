@@ -1,0 +1,78 @@
+// JS smoke test for the theorem-harness Node binding.
+//
+// Proves the round-trip JS -> Rust SDK -> GraphStore -> back to JS against the
+// built .node addon. Build first:
+//   cargo build --manifest-path apps/theorem-harness-node/Cargo.toml
+//   cp apps/theorem-harness-node/target/debug/libtheorem_harness_node.dylib \
+//      apps/theorem-harness-node/theorem_harness_node.node
+//   node apps/theorem-harness-node/smoke.mjs
+
+import { createRequire } from "module";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+import { mkdtempSync } from "fs";
+import { tmpdir } from "os";
+import { streamRun } from "./stream.mjs";
+
+const require = createRequire(import.meta.url);
+const here = dirname(fileURLToPath(import.meta.url));
+const { Harness } = require(join(here, "theorem_harness_node.node"));
+
+const dataDir = process.argv[2] || mkdtempSync(join(tmpdir(), "theorem-harness-"));
+console.log("data dir:", dataDir);
+const harness = new Harness(dataDir);
+
+const runId = harness.startRun("demo from node", "node-smoke", "k-create");
+console.log("started run:", runId);
+console.log("RUNID=" + runId);
+
+let events = JSON.parse(harness.eventsJson(runId));
+console.log("after start:", events.length, events.map((e) => e.kind));
+
+harness.cancel(runId, "stopping from node", "k-cancel");
+events = JSON.parse(harness.eventsJson(runId));
+console.log("after cancel:", events.length, events.map((e) => e.kind));
+
+const text = harness.pollText(runId, 0);
+console.log("text view:", JSON.stringify(text));
+
+// Consume the async-iterator stream: it yields the two events, then stops once
+// the run reaches a terminal status (cancelled).
+const streamed = [];
+for await (const event of streamRun(harness, runId)) {
+  streamed.push(event.kind);
+}
+console.log("streamed kinds:", streamed);
+
+// Memory round-trip through the binding (Session.remember -> recall).
+const receipt = JSON.parse(
+  harness.remember(
+    "node-smoke",
+    "belief",
+    "binding is durable",
+    "The Node binding persists to RedCore.",
+  ),
+);
+console.log("remember saved:", receipt.saved_type);
+const recalled = JSON.parse(harness.recall("node-smoke", "binding", 10));
+console.log("recalled:", recalled.length);
+const memOk = recalled.some(
+  (m) => (m.content || "").includes("binding") || (m.title || "").includes("binding"),
+);
+
+const ok =
+  events.length === 2 &&
+  events[0].kind === "Created" &&
+  events[1].kind === "Cancelled" &&
+  text.includes("stopping from node") &&
+  streamed.length === 2 &&
+  streamed[0] === "Created" &&
+  streamed[1] === "Cancelled" &&
+  memOk;
+
+if (ok) {
+  console.log("SMOKE PASS");
+} else {
+  console.error("SMOKE FAIL");
+  process.exit(1);
+}

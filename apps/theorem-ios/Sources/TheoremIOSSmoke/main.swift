@@ -1,0 +1,144 @@
+import Foundation
+import TheoremIOSCore
+
+let availability = TheoremProjectionEngine.availableProjections(for: SampleScene.package)
+precondition(availability.count == 4, "expected four iOS v1 projections")
+precondition(availability.allSatisfy(\.available), "sample scene should support all projections")
+
+let cyclic = ScenePackageV2(
+    id: "cyclic-scene",
+    manifestRef: "cyclic-manifest",
+    atoms: [
+        atom("a", ring: 0, score: 0.9),
+        atom("b", ring: 1, score: 0.4),
+        atom("c", ring: 1, score: 0.3),
+    ],
+    relations: [
+        relation("a", "b"),
+        relation("b", "c"),
+        relation("c", "a"),
+    ],
+    projection: ProjectionBinding(id: ProjectionID.forceGraph.rawValue, params: [:]),
+    chrome: ChromeBinding(id: "dynamic_island_shell", params: [:])
+)
+
+let tree = TheoremProjectionEngine.availableProjections(for: cyclic)
+    .first { $0.id == .treeLayout }
+precondition(tree?.available == false, "tree projection must reject cycles")
+
+let centerScene = ScenePackageV2(
+    id: "center-scene",
+    manifestRef: "center-manifest",
+    atoms: [
+        atom("dense", ring: 1, score: 0.2),
+        atom("center", ring: 0, score: 0.95),
+        atom("leaf", ring: 1, score: 0.1),
+    ],
+    relations: [
+        relation("dense", "leaf"),
+        relation("center", "leaf"),
+    ],
+    projection: ProjectionBinding(id: ProjectionID.forceGraph.rawValue, params: [:]),
+    chrome: ChromeBinding(id: "dynamic_island_shell", params: [:])
+)
+
+precondition(
+    TheoremProjectionEngine.centerNodeID(in: centerScene, mode: .pprMass) == "center",
+    "PPR mass should control center node selection"
+)
+
+let commonplaceRoute = CommonplaceRouter().plan(
+    query: "Can RustyWeb crawl a paper, OCR it, and let the room synthesize implementation options?",
+    registry: SampleCommonplaceRegistry.registry
+)
+let commonplaceToolPreview = CommonplaceToolUseBudget.preview(
+    for: commonplaceRoute.query,
+    features: commonplaceRoute.features
+)
+let commonplaceCreditEstimate = CommonplaceCreditEstimator().estimate(
+    routePlan: commonplaceRoute,
+    registry: SampleCommonplaceRegistry.registry,
+    toolBudget: commonplaceToolPreview
+)
+precondition(commonplaceCreditEstimate.estimatedCredits > 0, "credit preview should be nonzero")
+precondition(
+    commonplaceCreditEstimate.worstCaseCredits >= commonplaceCreditEstimate.estimatedCredits,
+    "worst-case credits should not undercut the immediate estimate"
+)
+precondition(
+    !commonplaceCreditEstimate.estimatedModelLineItems.isEmpty,
+    "credit preview should expose model-token line items"
+)
+precondition(
+    commonplaceToolPreview.ocrPages > 0 && commonplaceToolPreview.webFetches > 0 && commonplaceToolPreview.substrateSearches > 0,
+    "credit preview should infer document, web, and substrate tool budgets"
+)
+
+let fullToolCreditEstimate = CommonplaceCreditEstimator().estimate(
+    routePlan: commonplaceRoute,
+    registry: SampleCommonplaceRegistry.registry,
+    toolBudget: CommonplaceToolUseBudget(
+        ocrPages: 6,
+        speechMinutes: 1.5,
+        ttsCharacters: 1_200,
+        webFetches: 4,
+        substrateSearches: 1
+    )
+)
+precondition(
+    fullToolCreditEstimate.toolLineItems.count == 5,
+    "explicit tool budget should account for OCR, speech, TTS, web fetch, and substrate search"
+)
+
+// Omission safety: the Rust serde layer omits empty maps/arrays/None options
+// (skip_serializing_if). Decoding a real wire payload must NOT throw
+// keyNotFound on the omitted metadata/sourceRefs/params/actions/provenance —
+// the bug the custom decoders fix. The sample scene is built in Swift, so this
+// is the only place the omitted-field wire shape is exercised.
+do {
+    let wireJSON = """
+    {
+      "version": "scene-package-v2",
+      "id": "pkg-omit",
+      "manifestRef": "m",
+      "atoms": [{"id":"a","kind":"evidence","lifecycle":"present"}],
+      "relations": [{"id":"a->a","sourceId":"a","targetId":"a","kind":"links_to","lifecycle":"present"}],
+      "projection": {"id":"force_graph"},
+      "chrome": {"id":"document_rail"}
+    }
+    """.data(using: .utf8)!
+    let decoded = try JSONDecoder().decode(ScenePackageV2.self, from: wireJSON)
+    precondition(decoded.atoms.first?.metadata.isEmpty == true, "omitted metadata -> empty")
+    precondition(decoded.atoms.first?.sourceRefs.isEmpty == true, "omitted sourceRefs -> empty")
+    precondition(decoded.projection.params.isEmpty, "omitted params -> empty")
+    precondition(decoded.actions.isEmpty, "omitted actions -> empty")
+    precondition(decoded.provenance.isEmpty, "omitted provenance -> empty")
+    precondition(decoded.transitions == nil && decoded.terminalState == nil, "omitted optionals -> nil")
+} catch {
+    fatalError("omission-safe decode threw on the real wire shape: \(error)")
+}
+
+print("TheoremIOSSmoke passed")
+
+private func atom(_ id: String, ring: Int, score: Double) -> SceneAtom {
+    SceneAtom(
+        id: id,
+        kind: "concept",
+        label: id,
+        weight: score,
+        metadata: [
+            "ring": .double(Double(ring)),
+            "matchScore": .double(score),
+        ]
+    )
+}
+
+private func relation(_ source: String, _ target: String) -> SceneRelation {
+    SceneRelation(
+        id: "\(source)->\(target):links_to",
+        sourceId: source,
+        targetId: target,
+        kind: "links_to",
+        weight: 1.0
+    )
+}

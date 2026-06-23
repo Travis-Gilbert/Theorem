@@ -1,0 +1,39 @@
+// Copyright 2026 Travis Gilbert. MIT licensed.
+//
+// App affordance execution boundary for metadata-registered Theseus app tools.
+// The first implementation validates registered affordance ids and returns
+// content-addressed receipts. Concrete app-family handlers can be added behind
+// the same RPC without changing the registry surface.
+
+syntax = "proto3";
+
+package theorem_grpc;
+
+service AppAffordanceService {
+  rpc InvokeAffordance(InvokeAffordanceRequest) returns (InvokeAffordanceResponse);
+}
+
+message InvokeAffordanceRequest {
+  string tenant_id = 1;
+  string affordance_id = 2;
+  string actor = 3;
+  string request_json = 4;
+  bool dry_run = 5;
+  bool confirmed = 6;
+  uint64 timeout_ms = 7;
+}
+
+message InvokeAffordanceResponse {
+  string tenant_id = 1;
+  string affordance_id = 2;
+  string server_id = 3;
+  string tool_name = 4;
+  string status = 5;
+  bool executed = 6;
+  string receipt_hash = 7;
+  string receipt_json = 8;
+  string output_json = 9;
+  string error_code = 10;
+  string message = 11;
+  uint64 elapsed_ms = 12;
+}

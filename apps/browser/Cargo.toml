@@ -1,0 +1,43 @@
+[package]
+name = "theorem-browser"
+version = "0.0.0"
+edition = "2021"
+description = "Substrate-native browser: Servo embedder that renders the open web and SceneOS scenes in-process with the RustyRed substrate. v2b step 1: build-validation (engine construction only)."
+license = "MIT"
+publish = false
+
+# Servo is consumed as a git dependency pinned to a known-good revision, and it
+# requires the Servo build toolchain (./mach bootstrap system deps) to compile.
+# The pinned rev below is the exact commit our CI build validated green
+# (.github/workflows/servo-browser.yml, 2026-05-29). Bump deliberately and on
+# evidence; the embedding API (WebViewBuilder / ServoDelegate / spin_event_loop)
+# moves between revisions.
+[dependencies]
+accesskit = "0.24"
+servo = { git = "https://github.com/servo/servo", rev = "b891f04d0819272b27e80ac975e2e57d3cb9e66b" }
+# Servo exports the WebView hook, but the concrete interception response type
+# lives in the embedder-traits crate at the same pinned rev.
+embedder_traits = { package = "servo-embedder-traits", git = "https://github.com/servo/servo", rev = "b891f04d0819272b27e80ac975e2e57d3cb9e66b" }
+# The Servo-free page->substrate seam (LoadedPage -> rustyred-web -> substrate).
+# The WebViewDelegate::load_web_resource hook (step 2) calls into this crate.
+theorem-browser-substrate = { path = "../browser-substrate" }
+rustyred-web = { path = "../../rustyredcore_THG/crates/rustyred-web", features = ["accesskit"] }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+scene-os-core = { path = "../../rustyredcore_THG/crates/scene-os-core" }
+scene-os-web = { path = "../../rustyredcore_THG/crates/scene-os-web" }
+# For step 2's windowed/headless runtime (WebView surface, URL, Scale/PhysicalSize).
+winit = "0.30"
+url = "2"
+euclid = "0.22"
+dpi = "0.1"
+http = "1.4"
+serde_json = "1.0"
+# Servo's network stack can reach Rustls before a downstream crate has selected
+# a process-wide crypto provider. The browser process installs the ring provider
+# explicitly at startup so headless CI and desktop runs behave the same.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+# Once the engine integration needs modifications the embedder API cannot express
+# (DOM-at-parse-time into the substrate, compositor-level scene fusion), repoint
+# the `servo` dependency at a Travis-Gilbert/servo fork pinned to a maintained
+# delta against upstream. Embed first; fork on evidence (README "Fork vs embed").

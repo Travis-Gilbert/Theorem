@@ -1,0 +1,51 @@
+# Created by `theorem init`.
+# Safe first-run config: no bearer token, model API key, or data-dir env var.
+
+default_room_id = "repo:theorem:branch:main"
+actor = "theorem-agentd"
+operator_memory_tenant = "Travis-Gilbert"
+
+[model]
+provider = "rule"
+temperature = 0.2
+max_tokens = 1200
+request_timeout_secs = 120
+grammar_constrained = true
+
+# To use a resident OpenAI-compatible model:
+#
+# provider = "openai-compatible"
+# base_url = "http://127.0.0.1:8080"
+# model = "gemma-4-12b-it-q4"
+# api_key_env = "THEOREM_MODEL_API_KEY"
+#
+# Put real secrets in environment variables, never in this file.
+
+[harness]
+name = "harness"
+url = "http://127.0.0.1:8380/mcp"
+tenant_slug = "Travis-Gilbert"
+
+# Hosted sync is opt-in. For the hosted Theorem MCP, change url to:
+# url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
+
+[receiver]
+enabled = false
+config_path = "theorem-receiver.toml"
+
+[loop_config]
+max_iterations = 8
+tick_interval_secs = 60
+storm_guard_window_secs = 600
+
+[ledger]
+path = ".theorem/agentd-token-ledger.jsonl"
+mirror_to_graph = true
+
+[capture]
+enabled = false
+repo = "Travis-Gilbert/theorem"
+dispatched_subtask_title = "dispatched"
+
+[relay]
+enabled = false

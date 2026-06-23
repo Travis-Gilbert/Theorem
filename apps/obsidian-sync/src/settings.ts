@@ -1,0 +1,423 @@
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { HarnessClient } from "./harness";
+import { formatKindList, parseKindList } from "./kinds";
+import type TheoremHarnessSyncPlugin from "./main";
+
+export type ConflictMode = "conflict-copy" | "graph-wins" | "local-wins";
+
+/**
+ * The commons ("default") tenant is the shared graph; hand-written notes must
+ * never land there by accident. Empty is treated as commons too, since the
+ * client falls back to "default" when no tenant is set.
+ */
+export function isCommonsTenant(tenant: string): boolean {
+  const slug = tenant.trim().toLowerCase();
+  return slug === "" || slug === "default";
+}
+
+export interface HarnessSyncSettings {
+  /** Harness base URL, e.g. https://rustyredcore-theorem-production.up.railway.app */
+  baseUrl: string;
+  /** Bearer token scoped to this user's tenant. */
+  token: string;
+  /** Tenant slug whose partition this vault mirrors. */
+  tenant: string;
+  /** Vault folder the mirror writes notes into. */
+  syncFolder: string;
+  /**
+   * Folder whose new notes write back to the graph. Empty means "use syncFolder".
+   * Combined with the capture flag: a new note writes back if it is in this folder
+   * OR carries the capture flag in frontmatter.
+   */
+  captureFolder: string;
+  /** Frontmatter key that opts an individual note into write-back, e.g. `graph: true`. */
+  captureFlag: string;
+  /** Master switch for Phase 2 write-back. Off by default until the user opts in. */
+  enableWriteBack: boolean;
+  /**
+   * Allow write-back when the tenant is the commons ("default"). Off by default:
+   * hand-written notes are blocked from the shared graph unless explicitly opted in.
+   */
+  allowCommonsWriteback: boolean;
+  /** Periodic pull interval in minutes. 0 disables the timer (manual sync only). */
+  syncIntervalMinutes: number;
+  /** Pull superseded and archived documents too, not just active ones. */
+  includeInactive: boolean;
+  /**
+   * Pull allowlist of kinds. Empty means "all kinds". When non-empty, only docs
+   * whose kind is listed are mirrored. Case-insensitive.
+   */
+  includeKinds: string[];
+  /**
+   * Pull denylist of kinds skipped on sync. Defaults to the graph-internal kinds
+   * (`community_summary` stubs and `orchestrate` coordination exhaust) that bury
+   * real memory. A kind here is dropped even if it is also in `includeKinds`.
+   */
+  excludeKinds: string[];
+  /**
+   * Place each note in a per-kind subfolder (`<syncFolder>/<KindFolder>/`) instead
+   * of one flat folder. Makes the emitted vault navigable.
+   */
+  folderByKind: boolean;
+  /**
+   * Generate Map-of-Content index notes each sync: one per kind folder plus a root
+   * map. Plugin-owned files; they carry `theorem_generated: index` and never write
+   * back.
+   */
+  generateIndexes: boolean;
+  /** Basename of the root Map-of-Content note (no extension). */
+  indexFileName: string;
+  /** How to resolve a doc that changed on both sides since the last sync. */
+  conflictMode: ConflictMode;
+  /** Default kind for hand-written new notes with no `kind` in frontmatter. */
+  defaultKind: string;
+}
+
+export const DEFAULT_SETTINGS: HarnessSyncSettings = {
+  baseUrl: "",
+  token: "",
+  tenant: "default",
+  syncFolder: "Theorem",
+  captureFolder: "",
+  captureFlag: "graph",
+  enableWriteBack: false,
+  allowCommonsWriteback: false,
+  syncIntervalMinutes: 15,
+  includeInactive: false,
+  includeKinds: [],
+  excludeKinds: ["community_summary", "orchestrate"],
+  folderByKind: true,
+  generateIndexes: true,
+  indexFileName: "📍 Memory Map",
+  conflictMode: "conflict-copy",
+  defaultKind: "note",
+};
+
+export class HarnessSyncSettingTab extends PluginSettingTab {
+  plugin: TheoremHarnessSyncPlugin;
+
+  constructor(app: App, plugin: TheoremHarnessSyncPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    containerEl.createEl("h2", { text: "Connection" });
+
+    new Setting(containerEl)
+      .setName("Harness base URL")
+      .setDesc("Root URL of your harness server (no trailing slash).")
+      .addText((text) =>
+        text
+          .setPlaceholder("https://your-harness.up.railway.app")
+          .setValue(this.plugin.settings.baseUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.baseUrl = value.trim().replace(/\/+$/, "");
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Bearer token")
+      .setDesc("Token scoped to your tenant. Stored locally in this vault.")
+      .addText((text) => {
+        text
+          .setPlaceholder("token")
+          .setValue(this.plugin.settings.token)
+          .onChange(async (value) => {
+            this.plugin.settings.token = value.trim();
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.type = "password";
+      });
+
+    new Setting(containerEl)
+      .setName("Tenant")
+      .setDesc("The tenant slug whose memory this vault mirrors.")
+      .addText((text) =>
+        text
+          .setPlaceholder("default")
+          .setValue(this.plugin.settings.tenant)
+          .onChange(async (value) => {
+            this.plugin.settings.tenant = value.trim() || "default";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Test connection")
+      .setDesc("Probe /health and the memory list endpoint, then report the doc count.")
+      .addButton((button) =>
+        button.setButtonText("Test").onClick(async () => {
+          button.setDisabled(true);
+          const notice = new Notice("Theorem: testing connection...", 0);
+          try {
+            const client = new HarnessClient(this.plugin.settings);
+            const result = await client.testConnection();
+            const sample = result.sampleTitle ? `, e.g. "${result.sampleTitle}"` : "";
+            notice.setMessage(
+              `Theorem: OK (health ${result.health}). Tenant ` +
+                `"${this.plugin.settings.tenant || "default"}" has ` +
+                `${result.count} doc(s)${sample}.`
+            );
+            window.setTimeout(() => notice.hide(), 6000);
+          } catch (error) {
+            notice.hide();
+            new Notice(
+              `Theorem: connection failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          } finally {
+            button.setDisabled(false);
+          }
+        })
+      );
+
+    containerEl.createEl("h2", { text: "Vault layout" });
+
+    new Setting(containerEl)
+      .setName("Sync folder")
+      .setDesc("Folder the mirror writes notes into.")
+      .addText((text) =>
+        text
+          .setPlaceholder("Theorem")
+          .setValue(this.plugin.settings.syncFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.syncFolder = normalizeFolder(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Include superseded / archived")
+      .setDesc("Also mirror non-active documents (off keeps the vault to current notes).")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.includeInactive)
+          .onChange(async (value) => {
+            this.plugin.settings.includeInactive = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Auto-sync interval (minutes)")
+      .setDesc("How often to pull. 0 disables the timer; sync stays manual.")
+      .addText((text) =>
+        text
+          .setPlaceholder("15")
+          .setValue(String(this.plugin.settings.syncIntervalMinutes))
+          .onChange(async (value) => {
+            const parsed = Number.parseInt(value, 10);
+            this.plugin.settings.syncIntervalMinutes = Number.isFinite(parsed)
+              ? Math.max(0, parsed)
+              : 0;
+            await this.plugin.saveSettings();
+            this.plugin.restartTimer();
+          })
+      );
+
+    containerEl.createEl("h2", { text: "Pull filter" });
+
+    new Setting(containerEl)
+      .setName("Exclude kinds")
+      .setDesc(
+        "Comma-separated kinds to skip on pull. Defaults to the graph-internal " +
+          "kinds (`community_summary` stubs, `orchestrate` coordination exhaust) " +
+          "so they do not bury real memory notes. Clear it to mirror every kind."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("orchestrate")
+          .setValue(formatKindList(this.plugin.settings.excludeKinds))
+          .onChange(async (value) => {
+            this.plugin.settings.excludeKinds = parseKindList(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Only these kinds (allowlist)")
+      .setDesc(
+        "Comma-separated. If set, only these kinds are pulled and all others " +
+          "are skipped. Leave empty to pull every kind except the excluded ones. " +
+          "Exclude wins over the allowlist."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("(all kinds)")
+          .setValue(formatKindList(this.plugin.settings.includeKinds))
+          .onChange(async (value) => {
+            this.plugin.settings.includeKinds = parseKindList(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    const filterNote = containerEl.createEl("p", {
+      text:
+        "Filtering changes which docs are mirrored on the next pull; it does not " +
+        "delete notes already synced for an excluded kind. For a clean slate, " +
+        "delete the sync folder and run Full resync.",
+    });
+    filterNote.style.fontSize = "var(--font-ui-smaller)";
+    filterNote.style.color = "var(--text-muted)";
+
+    containerEl.createEl("h2", { text: "Vault structure" });
+
+    new Setting(containerEl)
+      .setName("Folder by kind")
+      .setDesc(
+        "Place each note in a per-kind subfolder (Solutions, Decisions, " +
+          "Postmortems, ...) instead of one flat folder. Filenames become the " +
+          "note titles; identity stays in the frontmatter doc_id, so a title or " +
+          "kind change renames or moves the note instead of duplicating it."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.folderByKind)
+          .onChange(async (value) => {
+            this.plugin.settings.folderByKind = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Generate index notes")
+      .setDesc(
+        "Write a root Map-of-Content note plus one annotated index per kind " +
+          "folder each sync. These are plugin-owned (they never write back). The " +
+          "per-kind indexes render without any extra plugin; the root map gains " +
+          "live tables if you have Dataview."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.generateIndexes)
+          .onChange(async (value) => {
+            this.plugin.settings.generateIndexes = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Memory map name")
+      .setDesc("Basename of the root Map-of-Content note (no extension).")
+      .addText((text) =>
+        text
+          .setPlaceholder("📍 Memory Map")
+          .setValue(this.plugin.settings.indexFileName)
+          .onChange(async (value) => {
+            this.plugin.settings.indexFileName = value.trim() || "📍 Memory Map";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    containerEl.createEl("h2", { text: "Write-back (Phase 2)" });
+
+    if (
+      this.plugin.settings.enableWriteBack &&
+      isCommonsTenant(this.plugin.settings.tenant) &&
+      !this.plugin.settings.allowCommonsWriteback
+    ) {
+      const warning = containerEl.createEl("p", {
+        text:
+          'Write-back is on but the tenant is the commons ("default"). ' +
+          "Hand-written notes will NOT be pushed. Set a personal tenant above, " +
+          'or enable "Allow commons write-back" below to override.',
+      });
+      warning.style.color = "var(--text-error)";
+      warning.style.fontWeight = "600";
+    }
+
+    new Setting(containerEl)
+      .setName("Enable write-back")
+      .setDesc("Push note edits and new linked notes into the graph. Note-linking is graph construction.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.enableWriteBack)
+          .onChange(async (value) => {
+            this.plugin.settings.enableWriteBack = value;
+            await this.plugin.saveSettings();
+            this.display();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Allow commons write-back")
+      .setDesc(
+        'Permit pushing into the commons ("default") tenant. Off by default so ' +
+          "hand-written notes never land in the shared graph by accident."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.allowCommonsWriteback)
+          .onChange(async (value) => {
+            this.plugin.settings.allowCommonsWriteback = value;
+            await this.plugin.saveSettings();
+            this.display();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Capture folder")
+      .setDesc("New notes in this folder write back. Empty uses the sync folder.")
+      .addText((text) =>
+        text
+          .setPlaceholder("(sync folder)")
+          .setValue(this.plugin.settings.captureFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.captureFolder = normalizeFolder(value);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Capture flag")
+      .setDesc("Frontmatter key that opts any note into write-back regardless of folder.")
+      .addText((text) =>
+        text
+          .setPlaceholder("graph")
+          .setValue(this.plugin.settings.captureFlag)
+          .onChange(async (value) => {
+            this.plugin.settings.captureFlag = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Default kind")
+      .setDesc("Kind given to a hand-written note that sets no `kind` in frontmatter.")
+      .addText((text) =>
+        text
+          .setPlaceholder("note")
+          .setValue(this.plugin.settings.defaultKind)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultKind = value.trim() || "note";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Conflict resolution")
+      .setDesc("What to do when a note and its graph doc both changed since the last sync.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("conflict-copy", "Write a conflict copy (safe)")
+          .addOption("graph-wins", "Graph wins (overwrite local)")
+          .addOption("local-wins", "Local wins (skip incoming)")
+          .setValue(this.plugin.settings.conflictMode)
+          .onChange(async (value) => {
+            this.plugin.settings.conflictMode = value as ConflictMode;
+            await this.plugin.saveSettings();
+          })
+      );
+  }
+}
+
+/** Normalize a folder path: trim, drop leading/trailing slashes, collapse blanks. */
+export function normalizeFolder(value: string): string {
+  return value.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+}

@@ -1,0 +1,10871 @@
+use axum::{
+    body::Body,
+    extract::{Path, Query, Request, State},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
+    middleware::{self, Next},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse,
+    },
+    routing::{get, post},
+    Json, Router,
+};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rustyred_hipporag::HippoQuery;
+use rustyred_rerank::{
+    CrossEncoder, HttpCrossEncoder, HttpListwiseReranker, LexicalCrossEncoder, ListwiseReranker,
+    RerankScorer, GTE_RERANKER_MODERNBERT_BASE, JINA_RERANKER_V3,
+};
+use rustyred_thg_adapters::execute_adapter_command;
+use rustyred_thg_affordances::CONNECTOR_LABEL;
+use rustyred_thg_connectors::{connect_target, ConnectionTarget};
+use rustyred_thg_core::commands::{ThgCommand, ThgRequest, ThgResponse};
+use rustyred_thg_core::errors::ThgError;
+use rustyred_thg_core::executor::{StoreBackedThgExecutor, ThgExecutor};
+use rustyred_thg_core::{
+    checkout_graph_version, compile_graph_pack, diff_graph_snapshots, graph_version_log,
+    merge_graph_snapshots, stable_hash, update_graph_ref_cas, CodeKgManifest, Direction,
+    EdgeRecord, EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphMergeStrategy,
+    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
+    GraphVersionRepository, GraphWriteResult, HarnessInstantKg, InMemoryGraphStore, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, SessionDelta, VerifyReport,
+};
+use rustyred_thg_fractal::{
+    run_fractal_expansion, run_fractal_expansion_with_search_providers, FractalExpansionRequest,
+};
+use rustyred_thg_mcp::{
+    agent_manifest, execute_graphql, handle_mcp_request_with_context, introspect_sdl, mcp_manifest,
+    McpError, McpGraphBackend, McpGraphProvider, McpRequestContext, OpKind,
+};
+use rustyred_web::{
+    apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
+    configured_qwen3_embedding_4b_client_from_env, fanout_search_providers, gate_search_graph,
+    gate_search_graph_with_hippo_query_vector, render_serp_html, run_live_crawl, search_substrate,
+    warm_pages_task, web_consume_to_graph, ActionOptions, AutomationActionReceipt,
+    BrowserActionPolicy, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope, Locator,
+    LocatorAction, PageRecord, PageState, RustyWebError, SearchOptions, SearchOpts, TextEmbedder,
+    WebCommonsFragment, WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt,
+    WebConsumeReceipt, WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
+    LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION,
+    SEMANTIC_VECTOR_PROPERTY,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use theorem_browser_agent::{
+    browsing_run_receipt, build_action_rail, default_browser_playbooks, perceive_with_graph,
+    resolve_context_command, BrowserSurface, ContextCommandRequest, ObservedElement,
+    PageObservation, PerceptionInput, PerceptionMode, RetrievalMode, RiskMode,
+};
+use theorem_harness_core::{GroundedClaim, TransitionInput};
+use theorem_harness_runtime::{
+    append_transition_from_store, memory_content_hash, normalize_tenant_slug, publish_skill_pack,
+    subscribe_coordination_room_events, MemoryDocumentState, SkillPackPublishInput,
+};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::auth::{authenticate, require_scope, require_scope_for_tenant, AuthContext};
+use crate::browser_pool::{BrowserActionCommand, BrowserCheckoutRequest, BrowserLiveSessionRecord};
+use crate::graph_cache::{
+    GraphCacheInvalidateBody, GraphCacheLookupBody, GraphCachePutBody, GraphCacheStatsBody,
+};
+use crate::observability::{
+    KIND_ALGO_COMMUNITIES, KIND_ALGO_COMPONENTS, KIND_ALGO_PAGERANK, KIND_ALGO_PPR, KIND_CYPHER,
+    KIND_FULLTEXT_SEARCH, KIND_VECTOR_SEARCH,
+};
+use crate::query_surface::{
+    execute_cypher_query_with_steering, execute_public_query, explain_cypher_query,
+    parse_tx_cypher_mutations, resolve_tenant_id, PublicCypherBody, QuerySurfaceError,
+};
+use crate::state::{AppState, StoreAccessError, TenantGraphStore};
+
+#[derive(Debug, Deserialize)]
+pub struct CommandBody {
+    pub command: String,
+    #[serde(default, alias = "payload")]
+    pub args: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchBody {
+    #[serde(default)]
+    pub commands: Vec<CommandBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RootCommandBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    pub command: String,
+    #[serde(default, alias = "payload")]
+    pub args: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RootBatchBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub commands: Vec<CommandBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphQueryBody {
+    pub query: String,
+    #[serde(default)]
+    pub graph: Value,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GraphqlTenantQuery {
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub tenant_slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CrawlRouteBody {
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub budget: Option<CrawlBudget>,
+    #[serde(default)]
+    pub scope: Option<CrawlScope>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct LiveSearchRequest {
+    #[serde(default, alias = "query")]
+    pub q: Option<String>,
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub budget: Option<CrawlBudget>,
+    #[serde(default)]
+    pub scope: Option<CrawlScope>,
+    #[serde(default)]
+    pub crawl: Option<bool>,
+    #[serde(default)]
+    pub min_hits: Option<usize>,
+    #[serde(default)]
+    pub min_links: Option<usize>,
+    #[serde(default)]
+    pub max_pages: Option<usize>,
+    #[serde(default)]
+    pub max_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct LiveSearchAcquisitionJob {
+    run_id: String,
+    tenant: String,
+    query: String,
+    provider_allowlist: Vec<String>,
+    opts: SearchOpts,
+    seed_limit: usize,
+    actor_id: String,
+    wait: bool,
+}
+
+/// The WEB arm of SPEC-CONTEXT-MEMBRANE-1.0: one `web_search_graph` invocation.
+/// Carries everything the synchronous gate needs plus the fire-and-forget
+/// warming knobs.
+#[derive(Clone, Debug)]
+struct WebSearchGraphJob {
+    run_id: String,
+    tenant: String,
+    query: String,
+    provider_allowlist: Vec<String>,
+    options: WebSearchGraphOptions,
+}
+
+#[derive(Clone, Debug)]
+struct LiveFractalExpansionJob {
+    tenant: String,
+    request: FractalExpansionRequest,
+    max_bytes: usize,
+    provider_allowlist: Vec<String>,
+    search_opts: SearchOpts,
+    actor_id: String,
+    wait: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserUseJob {
+    tool_name: String,
+    tenant: String,
+    run_id: String,
+    task: String,
+    surface: BrowserSurface,
+    url: Option<String>,
+    max_bytes: usize,
+    actor_id: String,
+    wait: bool,
+    ingest: bool,
+    control_mode: String,
+    session_id: Option<String>,
+    action: Option<Value>,
+    confirm: bool,
+    veto: bool,
+    human_demonstration: Option<Value>,
+    policy: BrowserActionPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FederateSubmitBody {
+    #[serde(default, alias = "tenant_id")]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub federable: Option<bool>,
+    #[serde(default)]
+    pub graph_delta_hash: Option<String>,
+    #[serde(default)]
+    pub receipt: Option<CrawlReceipt>,
+    #[serde(default)]
+    pub fragment: Option<WebCommonsFragment>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConnectorConnectBody {
+    pub server_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub target: ConnectionTarget,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NodeWriteBody {
+    pub id: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub properties: Value,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+impl NodeWriteBody {
+    fn into_record(self) -> NodeRecord {
+        let mut node = NodeRecord::new(self.id, self.labels, self.properties);
+        node.tombstone = self.tombstone;
+        node
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EdgeWriteBody {
+    pub id: String,
+    pub from_id: String,
+    pub to_id: String,
+    #[serde(rename = "type")]
+    pub edge_type: String,
+    #[serde(default)]
+    pub properties: Value,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+impl EdgeWriteBody {
+    fn into_record(self) -> EdgeRecord {
+        let mut edge = EdgeRecord::new(
+            self.id,
+            self.from_id,
+            self.edge_type,
+            self.to_id,
+            self.properties,
+        );
+        edge.tombstone = self.tombstone;
+        edge
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthBody {
+    pub status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VectorDesignateBody {
+    pub label: String,
+    pub property: String,
+    pub dimension: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VectorSearchBody {
+    pub query: Vec<f32>,
+    #[serde(default = "default_k")]
+    pub k: usize,
+    pub label: Option<String>,
+    pub property: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HybridSearchBody {
+    pub query: Vec<f32>,
+    #[serde(default = "default_k")]
+    pub k: usize,
+    pub label: Option<String>,
+    pub property: String,
+    pub graph_seeds: Vec<String>,
+    #[serde(default = "default_max_hops")]
+    pub max_hops: usize,
+    #[serde(default)]
+    pub alpha: Option<f32>,
+    #[serde(default)]
+    pub confidence_weighted_graph_distance: Option<bool>,
+    #[serde(default)]
+    pub edge_type_weights: Option<std::collections::BTreeMap<String, f32>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EpistemicNeighborsBody {
+    pub node_id: String,
+    #[serde(default)]
+    pub epistemic_types: Option<Vec<EpistemicType>>,
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionBeginBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionMutationBody {
+    pub tx_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionDiffBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub target: Option<GraphSnapshot>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionRefBody {
+    #[serde(default)]
+    pub repository: Option<GraphVersionRepository>,
+    #[serde(default)]
+    pub updated_at_unix_ms: Option<u128>,
+    #[serde(default)]
+    pub expected_commit_hash: Option<String>,
+    #[serde(flatten)]
+    pub options: GraphCompileOptions,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionLogBody {
+    pub repository: GraphVersionRepository,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionCheckoutBody {
+    pub repository: GraphVersionRepository,
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphVersionMergeBody {
+    pub base: GraphSnapshot,
+    #[serde(default)]
+    pub ours: Option<GraphSnapshot>,
+    pub theirs: GraphSnapshot,
+    #[serde(flatten)]
+    pub options: GraphMergeOptions,
+}
+
+fn default_k() -> usize {
+    10
+}
+fn default_max_hops() -> usize {
+    3
+}
+const LIVE_SEARCH_DEFAULT_MIN_HITS: usize = 3;
+const LIVE_SEARCH_DEFAULT_MIN_LINKS: usize = 1;
+const LIVE_SEARCH_DEFAULT_MAX_PAGES: usize = 8;
+const LIVE_SEARCH_DEFAULT_MAX_SECONDS: u64 = 20;
+const LIVE_SEARCH_DEFAULT_MAX_DEPTH: usize = 1;
+const LIVE_SEARCH_DEFAULT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const LIVE_SEARCH_HARD_MAX_PAGES: usize = 25;
+const LIVE_SEARCH_HARD_MAX_SECONDS: u64 = 30;
+const LIVE_SEARCH_HARD_MAX_DEPTH: usize = 2;
+const LIVE_SEARCH_HARD_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+pub fn build_router(state: AppState) -> Router {
+    let cors = cors_layer(&state);
+    Router::new()
+        .route("/", get(search_home))
+        .route("/search", get(search_html))
+        .route("/search.json", get(search_json))
+        .route("/search/live", get(search_live))
+        .route("/search/answer", post(search_answer))
+        .route("/crawl", post(crawl_submit))
+        .route("/federate/submit", post(federate_submit))
+        .route("/health", get(health))
+        .route("/health/", get(health))
+        .route("/ready", get(ready))
+        .route("/ready/", get(ready))
+        .route("/openapi.json", get(crate::openapi::openapi))
+        .route("/.well-known/mcp/rustyred_thg.json", get(mcp_well_known))
+        .route("/.well-known/agent.json", get(agent_well_known))
+        .route("/mcp", post(mcp_post))
+        .route("/graphql", get(graphql_playground).post(graphql_post))
+        .route("/v1/coordination/events", get(coordination_events))
+        .route(
+            "/v1/agent-space/stream",
+            get(crate::agent_space::agent_space_stream),
+        )
+        .route(
+            "/v1/agent-space/snapshot",
+            get(crate::agent_space::agent_space_snapshot),
+        )
+        .route(
+            "/v1/items/stream",
+            get(crate::items_changefeed::items_stream),
+        )
+        .route("/metrics", get(crate::metrics::metrics))
+        .route(
+            "/v1/diagnostics/slow_queries",
+            get(crate::metrics::slow_queries),
+        )
+        .route(
+            "/v1/diagnostics/config",
+            get(crate::metrics::diagnostics_config),
+        )
+        .route("/v1/command", post(root_command))
+        .route("/v1/batch", post(root_batch))
+        .route("/v1/query", post(public_query))
+        .route("/v1/cypher", post(public_cypher))
+        .route("/v1/cypher/explain", post(public_cypher_explain))
+        .route("/v1/transactions/begin", post(transaction_begin))
+        .route("/v1/transactions/commit", post(transaction_commit))
+        .route("/v1/transactions/rollback", post(transaction_rollback))
+        .route("/v1/cache/put", post(root_cache_put))
+        .route("/v1/cache/get", post(root_cache_get))
+        .route("/v1/cache/check", post(root_cache_check))
+        .route("/v1/cache/explain", post(root_cache_explain))
+        .route("/v1/cache/invalidate", post(root_cache_invalidate))
+        .route("/v1/cache/stats", post(root_cache_stats))
+        .route("/v1/tenants/:tenant_id/command", post(command))
+        .route("/v1/tenants/:tenant_id/batch", post(batch))
+        .route("/v1/tenants/:tenant_id/runs/:run_id", get(run_get))
+        .route(
+            "/v1/tenants/:tenant_id/items/events",
+            get(crate::items_changefeed::tenant_items_events),
+        )
+        .route("/v1/tenants/:tenant_id/graph/query", post(graph_query))
+        .route(
+            "/v1/tenants/:tenant_id/graph/nodes",
+            post(graph_node_upsert),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/nodes/query",
+            post(graph_node_query),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/nodes/:node_id",
+            get(graph_node_get),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/edges",
+            post(graph_edge_upsert),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/edges/:edge_id",
+            get(graph_edge_get),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/neighbors",
+            post(graph_neighbors),
+        )
+        .route("/v1/tenants/:tenant_id/graph/stats", get(graph_stats))
+        .route("/v1/tenants/:tenant_id/memory/docs", get(memory_docs_list))
+        .route("/v1/tenants/:tenant_id/connectors", get(connectors_list))
+        .route(
+            "/v1/tenants/:tenant_id/connectors/connect",
+            post(connector_connect),
+        )
+        .route("/v1/tenants/:tenant_id/graph/verify", get(graph_verify))
+        .route(
+            "/v1/tenants/:tenant_id/graph/rebuild-indexes",
+            post(graph_rebuild_indexes),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/compile",
+            post(graph_version_compile),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/diff",
+            post(graph_version_diff),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/ref",
+            post(graph_version_ref),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/log",
+            post(graph_version_log_route),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/checkout",
+            post(graph_version_checkout),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/version/merge",
+            post(graph_version_merge),
+        )
+        .route("/v1/tenants/:tenant_id/context/pack", post(context_pack))
+        .route(
+            "/v1/tenants/:tenant_id/graph/vector/designate",
+            post(graph_vector_designate),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/vector/search",
+            post(graph_vector_search),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/vector/hybrid",
+            post(graph_vector_hybrid),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/epistemic-neighbors",
+            post(graph_epistemic_neighbors),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/ppr",
+            post(graph_algorithm_ppr),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/components",
+            post(graph_algorithm_components),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/pagerank",
+            post(graph_algorithm_pagerank),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/algorithms/communities",
+            post(graph_algorithm_communities),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/spatial/designate",
+            post(graph_spatial_designate),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/spatial/radius",
+            post(graph_spatial_radius),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/spatial/bbox",
+            post(graph_spatial_bbox),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/fulltext/designate",
+            post(graph_fulltext_designate),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/fulltext/search",
+            post(graph_fulltext_search),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/browser/web-consume",
+            post(browser_web_consume),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/browser/browse-with-me",
+            post(browser_browse_with_me),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/browser/browse-for-me",
+            post(browser_browse_for_me),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/bulk/nodes",
+            post(graph_bulk_nodes),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/graph/bulk/edges",
+            post(graph_bulk_edges),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/status",
+            post(instant_kg_status),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/ppr",
+            post(instant_kg_ppr),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/impact",
+            post(instant_kg_impact),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/related-objects",
+            post(instant_kg_related_objects),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/search",
+            post(instant_kg_search),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/instant-kg/explain-edge",
+            post(instant_kg_explain_edge),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_path_tenant_auth,
+        ))
+        .layer(cors)
+        .with_state(state)
+}
+
+async fn enforce_path_tenant_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let Some(tenant_id) = tenant_id_from_v1_path(request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let auth_context = match authenticate(
+        request.headers(),
+        &state.config.api_tokens,
+        state.config.require_auth,
+    ) {
+        Ok(context) => context,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = auth_context.require_tenant(&tenant_id) {
+        return status.into_response();
+    }
+    next.run(request).await
+}
+
+fn tenant_id_from_v1_path(path: &str) -> Option<String> {
+    let mut parts = path.trim_start_matches('/').split('/');
+    if parts.next()? != "v1" || parts.next()? != "tenants" {
+        return None;
+    }
+    percent_decode_path_segment(parts.next()?)
+        .ok()
+        .filter(|tenant| !tenant.trim().is_empty())
+}
+
+fn percent_decode_path_segment(segment: &str) -> Result<String, ()> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = bytes.get(index + 1).copied().ok_or(())?;
+            let low = bytes.get(index + 2).copied().ok_or(())?;
+            decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ())
+}
+
+fn hex_value(byte: u8) -> Result<u8, ()> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
+async fn health() -> Json<HealthBody> {
+    Json(HealthBody { status: "ok" })
+}
+
+async fn mcp_well_known(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.config.mcp_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let config = state.mcp_config();
+    Json(mcp_manifest(state.config.public_url.as_deref(), &config)).into_response()
+}
+
+async fn agent_well_known(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.config.mcp_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let config = state.mcp_config();
+    Json(agent_manifest(state.config.public_url.as_deref(), &config)).into_response()
+}
+
+async fn mcp_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    if !state.config.mcp_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !mcp_origin_allowed(&headers, &state.config.allowed_origins) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let auth_context = match require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        Ok(context) => context,
+        Err(status) => return status.into_response(),
+    };
+
+    let config = state.mcp_config();
+    match mcp_payload_tenant(&config, &payload) {
+        Ok(Some(tenant_id)) => {
+            if let Err(status) = auth_context.require_tenant(&tenant_id) {
+                return status.into_response();
+            }
+        }
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+    let mcp_context = McpRequestContext::with_scopes(auth_context.scopes);
+    if let Some(response) = maybe_handle_browser_use_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
+    if let Some(response) =
+        maybe_handle_live_search_acquisition_mcp(&state, &config, &payload).await
+    {
+        return Json(response).into_response();
+    }
+    if let Some(response) = maybe_handle_hippo_retrieve_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
+    if let Some(response) = maybe_handle_web_search_graph_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
+    if let Some(response) = maybe_handle_live_fractal_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
+    if let Some(response) = maybe_handle_composed_agent_mcp(&state, &config, &payload).await {
+        return Json(response).into_response();
+    }
+    let inject_search_tools = payload.get("method").and_then(Value::as_str) == Some("tools/list");
+    let mut response = handle_mcp_request_with_context(&state, &config, &mcp_context, payload);
+    if inject_search_tools {
+        inject_hippo_retrieve_tool_definition(&mut response);
+        inject_web_search_graph_tool_definition(&mut response);
+    }
+    Json(response).into_response()
+}
+
+async fn graphql_playground(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !state.config.mcp_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !mcp_origin_allowed(&headers, &state.config.allowed_origins) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    Html(graphql_playground_html(&state.mcp_config().default_tenant)).into_response()
+}
+
+async fn graphql_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GraphqlTenantQuery>,
+    Json(arguments): Json<Value>,
+) -> impl IntoResponse {
+    if !state.config.mcp_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !mcp_origin_allowed(&headers, &state.config.allowed_origins) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let auth_context = match require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        Ok(context) => context,
+        Err(status) => return status.into_response(),
+    };
+    if arguments.get("query").and_then(Value::as_str).is_none() {
+        return graphql_mcp_error_response(McpError::invalid_params(
+            "GraphQL POST requires a string query field",
+        ));
+    }
+
+    let config = state.mcp_config();
+    let explicit_tenant = argument_text_any(&arguments, &["tenant", "tenant_id", "tenant_slug"])
+        .or(query.tenant)
+        .or(query.tenant_id)
+        .or(query.tenant_slug);
+    let tenant = match resolve_tenant_id(explicit_tenant.as_deref(), &config.default_tenant) {
+        Ok(tenant) => tenant,
+        Err(error) => return query_surface_error_response(error),
+    };
+    if let Err(status) = auth_context.require_tenant(&tenant) {
+        return status.into_response();
+    }
+
+    let op_kind = if config.read_only {
+        OpKind::Query
+    } else {
+        OpKind::Mutate
+    };
+    let tenant_for_blocking = tenant.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let backend = state.backend_for_tenant(&tenant_for_blocking)?;
+        execute_graphql(&tenant_for_blocking, backend, &arguments, op_kind)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(payload)) => Json(payload).into_response(),
+        Ok(Err(error)) => graphql_mcp_error_response(error),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "errors": [{
+                    "message": format!("GraphQL worker failed: {error}")
+                }]
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn graphql_mcp_error_response(error: McpError) -> axum::response::Response {
+    let status = match error.code {
+        -32600 | -32602 => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(json!({
+            "errors": [{
+                "message": error.message,
+                "extensions": {
+                    "code": error.code,
+                    "data": error.data,
+                }
+            }]
+        })),
+    )
+        .into_response()
+}
+
+fn graphql_playground_html(default_tenant: &str) -> String {
+    let sdl = introspect_sdl();
+    let escaped_sdl = serde_json::to_string(&sdl).unwrap_or_else(|_| "\"\"".to_string());
+    let escaped_tenant =
+        serde_json::to_string(default_tenant).unwrap_or_else(|_| "\"default\"".to_string());
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Theorem Local GraphQL</title>
+    <style>
+      body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #171713; color: #f4ead8; }}
+      main {{ display: grid; grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); min-height: 100vh; }}
+      section {{ padding: 24px; border-right: 1px solid rgba(244,234,216,.16); }}
+      textarea {{ box-sizing: border-box; width: 100%; min-height: 280px; resize: vertical; border: 1px solid rgba(244,234,216,.2); border-radius: 8px; padding: 12px; background: #221f18; color: #f7ead2; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }}
+      pre {{ white-space: pre-wrap; word-break: break-word; background: #221f18; border: 1px solid rgba(244,234,216,.16); border-radius: 8px; padding: 12px; max-height: calc(100vh - 132px); overflow: auto; }}
+      button {{ margin-top: 12px; border: 1px solid rgba(244,234,216,.3); border-radius: 8px; background: #d9a65d; color: #21170c; padding: 8px 12px; font-weight: 700; cursor: pointer; }}
+      .meta {{ color: rgba(244,234,216,.68); font-size: 13px; }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>Theorem Local GraphQL</h1>
+        <p class="meta">POST /graphql with tenant <code id="tenant"></code>. Live item updates remain on <code>/v1/items/stream</code>.</p>
+        <textarea id="query">query {{
+  items(limit: 20) {{
+    id
+    kind
+    title
+    source
+    updatedAtMs
+  }}
+}}</textarea>
+        <button id="run" type="button">Run</button>
+      </section>
+      <section>
+        <h2>Result</h2>
+        <pre id="result"></pre>
+        <h2>SDL</h2>
+        <pre id="sdl"></pre>
+      </section>
+    </main>
+    <script>
+      const tenant = {escaped_tenant};
+      const sdl = {escaped_sdl};
+      document.getElementById("tenant").textContent = tenant;
+      document.getElementById("sdl").textContent = typeof sdl === "string" ? sdl : "";
+      document.getElementById("run").addEventListener("click", async () => {{
+        const response = await fetch(`/graphql?tenant=${{encodeURIComponent(tenant)}}`, {{
+          method: "POST",
+          headers: {{ "content-type": "application/json" }},
+          body: JSON.stringify({{ query: document.getElementById("query").value }}),
+        }});
+        const payload = await response.json();
+        document.getElementById("result").textContent = JSON.stringify(payload, null, 2);
+      }});
+    </script>
+  </body>
+</html>"#
+    )
+}
+
+fn mcp_payload_tenant(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Result<Option<String>, axum::response::Response> {
+    match payload.get("method").and_then(Value::as_str) {
+        Some("tools/call") => {
+            let arguments = payload
+                .get("params")
+                .and_then(|params| params.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            resolve_tenant_id(
+                argument_text_any(&arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+                &config.default_tenant,
+            )
+            .map(Some)
+            .map_err(query_surface_error_response)
+        }
+        Some("resources/read") => {
+            let Some(uri) = payload
+                .get("params")
+                .and_then(|params| params.get("uri"))
+                .and_then(Value::as_str)
+            else {
+                return Ok(None);
+            };
+            Ok(tenant_from_mcp_resource_uri(uri).map(str::to_string))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn tenant_from_mcp_resource_uri(uri: &str) -> Option<&str> {
+    let raw = uri.strip_prefix("rustyred_thg://tenant/")?;
+    raw.split('/').next().filter(|tenant| !tenant.is_empty())
+}
+
+async fn maybe_handle_composed_agent_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "composed_agent_run" | "theorem_composed_agent_run") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let result = if config.read_only {
+        mcp_tool_result_error(json!({
+            "error": "mcp_read_only",
+            "message": "composed_agent_run is unavailable while read-only mode is active."
+        }))
+    } else {
+        let arguments = payload
+            .get("params")
+            .and_then(|params| params.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        match composed_agent_run_payload(state.clone(), config, &arguments).await {
+            Ok(payload) => mcp_tool_result(payload),
+            Err(payload) => mcp_tool_result_error(payload),
+        }
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn composed_agent_run_payload(
+    state: AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let task = argument_text_any(arguments, &["task", "query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_composed_agent_run",
+            "message": "composed_agent_run requires task"
+        })
+    })?;
+    let binding_id = argument_text_any(arguments, &["binding_id", "bindingId"])
+        .unwrap_or_else(|| theorem_harness_runtime::DEFAULT_BINDING_ID.to_string());
+    let claims = grounded_claims_argument(arguments);
+    let tenant_for_blocking = tenant.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut backend = state
+            .backend_for_tenant(&tenant_for_blocking)
+            .map_err(mcp_error_payload)?;
+        let result = backend
+            .composed_agent_run(binding_id, task, claims)
+            .map_err(mcp_error_payload)?;
+        Ok(json!({
+            "tenant": tenant_for_blocking,
+            "result": result
+        }))
+    })
+    .await
+    .map_err(|error| {
+        json!({
+            "error": "composed_agent_join_failed",
+            "message": error.to_string()
+        })
+    })?
+}
+
+async fn coordination_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !state.config.mcp_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !mcp_origin_allowed(&headers, &state.config.allowed_origins) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let stream =
+        BroadcastStream::new(subscribe_coordination_room_events()).filter_map(
+            |event| match event {
+                Ok(message) => {
+                    let sse_event = Event::default()
+                        .event("room_message")
+                        .json_data(message)
+                        .unwrap_or_else(|_| Event::default().event("room_message").data("{}"));
+                    Some(Ok::<Event, Infallible>(sse_event))
+                }
+                Err(_) => None,
+            },
+        );
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn maybe_handle_browser_use_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(
+        name,
+        "web_consume"
+            | "theorem_browser_web_consume"
+            | "browse_with_me"
+            | "theorem_browser_browse_with_me"
+            | "browse_for_me"
+            | "theorem_browser_browse_for_me"
+    ) {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match browser_use_payload(state, config, name, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn browser_use_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let job = browser_use_job(config, tool_name, arguments)?;
+    if config.read_only && (job.surface != BrowserSurface::WebConsume || job.ingest) {
+        return Err(json!({
+            "error": "mcp_read_only",
+            "message": format!("{} is unavailable while read-only mode is active", job.tool_name)
+        }));
+    }
+    if job.wait || config.read_only {
+        return execute_browser_use(state, &job).await;
+    }
+    enqueue_browser_use(state.clone(), job).await
+}
+
+fn browser_use_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<BrowserUseJob, Value> {
+    let canonical_tool_name = match tool_name {
+        "web_consume" | "theorem_browser_web_consume" => "web_consume",
+        "browse_with_me" | "theorem_browser_browse_with_me" => "browse_with_me",
+        "browse_for_me" | "theorem_browser_browse_for_me" => "browse_for_me",
+        _ => tool_name,
+    }
+    .to_string();
+    let surface = match canonical_tool_name.as_str() {
+        "web_consume" => BrowserSurface::WebConsume,
+        "browse_with_me" => BrowserSurface::BrowseWithMe,
+        "browse_for_me" => BrowserSurface::BrowseForMe,
+        _ => BrowserSurface::BrowseForMe,
+    };
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let url = argument_text_any(arguments, &["url", "href"]);
+    if surface == BrowserSurface::WebConsume && url.is_none() {
+        return Err(json!({
+            "error": "invalid_web_consume",
+            "message": "web_consume requires url"
+        }));
+    }
+    let task = argument_text_any(arguments, &["task", "query", "q"])
+        .or_else(|| url.clone().map(|url| format!("consume {url}")))
+        .ok_or_else(|| {
+            json!({
+                "error": "invalid_browser_use",
+                "message": format!("{} requires task or url", canonical_tool_name)
+            })
+        })?;
+    let run_id = argument_text_any(arguments, &["run_id", "runId"])
+        .unwrap_or_else(|| default_live_web_run_id(canonical_tool_name.as_str()));
+    let max_bytes = argument_u64_any(arguments, &["max_bytes", "maxBytes"])
+        .unwrap_or(LIVE_SEARCH_DEFAULT_MAX_BYTES as u64)
+        .clamp(1, LIVE_SEARCH_HARD_MAX_BYTES as u64) as usize;
+    let ingest = argument_bool_any(arguments, &["ingest", "capture"])
+        .unwrap_or(surface != BrowserSurface::BrowseWithMe || url.is_some());
+    let control_mode = argument_text_any(arguments, &["control_mode", "controlMode"])
+        .unwrap_or_else(|| match surface {
+            BrowserSurface::BrowseWithMe => "pair".to_string(),
+            BrowserSurface::BrowseForMe => "agent_drive".to_string(),
+            BrowserSurface::WebConsume => "read".to_string(),
+        });
+    let confirm = argument_bool_any(
+        arguments,
+        &["confirm", "confirmed", "approve", "approved", "apply"],
+    )
+    .unwrap_or(false);
+    let veto = argument_bool_any(arguments, &["veto", "reject", "cancel_action"]).unwrap_or(false);
+    let policy = browser_action_policy(arguments, confirm)?;
+
+    Ok(BrowserUseJob {
+        tool_name: canonical_tool_name,
+        tenant,
+        run_id,
+        task,
+        surface,
+        url,
+        max_bytes,
+        actor_id: argument_text_any(arguments, &["actor", "actor_id", "actorId"])
+            .unwrap_or_else(default_live_web_actor),
+        wait: live_web_wait_requested(arguments),
+        ingest,
+        control_mode,
+        session_id: argument_text_any(arguments, &["session_id", "sessionId"]),
+        action: arguments
+            .get("action")
+            .or_else(|| arguments.get("next_action"))
+            .or_else(|| arguments.get("nextAction"))
+            .cloned(),
+        confirm,
+        veto,
+        human_demonstration: arguments
+            .get("human_demonstration")
+            .or_else(|| arguments.get("humanDemonstration"))
+            .or_else(|| arguments.get("demonstration"))
+            .cloned(),
+        policy,
+    })
+}
+
+fn browser_action_policy(arguments: &Value, confirm: bool) -> Result<BrowserActionPolicy, Value> {
+    let mut policy = match arguments.get("policy") {
+        Some(value) => {
+            serde_json::from_value::<BrowserActionPolicy>(value.clone()).map_err(|error| {
+                json!({
+                    "error": "invalid_browser_policy",
+                    "message": format!("browser action policy did not parse: {error}")
+                })
+            })?
+        }
+        None => BrowserActionPolicy::default(),
+    };
+    if confirm {
+        policy.confirmed = true;
+    }
+    if let Some(allow) = argument_bool_any(
+        arguments,
+        &[
+            "allow_state_changing",
+            "allowStateChanging",
+            "state_changing",
+        ],
+    ) {
+        policy.allow_state_changing = allow;
+    }
+    if let Some(confirmed) = argument_bool_any(arguments, &["confirmed", "confirm"]) {
+        policy.confirmed = confirmed;
+    }
+    if let Some(require_robots) = argument_bool_any(arguments, &["require_robots", "requireRobots"])
+    {
+        policy.require_robots = require_robots;
+    }
+    if let Some(domains) = argument_string_list_any(
+        arguments,
+        &["permitted_domains", "permittedDomains", "allow_domains"],
+    ) {
+        policy.permitted_domains = domains;
+    }
+    if let Some(upload_roots) =
+        argument_string_list_any(arguments, &["upload_roots", "uploadRoots"])
+    {
+        policy.upload_roots = upload_roots;
+    }
+    Ok(policy)
+}
+
+async fn execute_browser_use(state: &AppState, job: &BrowserUseJob) -> Result<Value, Value> {
+    let mut store = state.tenant_graph_store(&job.tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut browser_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "browser_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut web_consume = None;
+    let mut live_browser = None;
+    let mut page_observation = None;
+    let mut pages_reached: Vec<String> = Vec::new();
+    if let Some(url) = &job.url {
+        if should_use_live_browser(state, job) {
+            let outcome = execute_live_browser_use(state, job, url).await?;
+            pages_reached = outcome.pages_reached;
+            page_observation = Some(page_observation_from_state(&outcome.page));
+            live_browser = Some(outcome.payload);
+        } else {
+            let cascade = state.live_fetch_cascade();
+            if job.surface == BrowserSurface::BrowseForMe {
+                // browse_for_me autopilot: a bounded link-following loop. Each step
+                // consumes a page through the robots-checked fetch cascade and
+                // ingests it into the quarantined graph, so the visited pages turn
+                // up in the closing perception. The step cap is a fixed budget until
+                // an Ensemble budget is wired in.
+                let steps =
+                    run_browse_for_me_loop(&mut browser_store, cascade.as_ref(), job, url).await?;
+                pages_reached = steps.pages_reached;
+                page_observation = steps.last_page.as_ref().map(page_observation_from_state);
+                web_consume = Some(Value::Array(steps.step_payloads));
+            } else {
+                let receipt = web_consume_to_graph(
+                    &mut browser_store,
+                    cascade.as_ref(),
+                    WebConsumeRequest {
+                        run_id: job.run_id.clone(),
+                        url: url.clone(),
+                        actor_id: job.actor_id.clone(),
+                        namespace: "open_web_unverified".to_string(),
+                        max_bytes: job.max_bytes,
+                        ingest: job.ingest,
+                        respect_robots: true,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    json!({
+                        "error": "browser_web_consume_failed",
+                        "message": format!("{error:?}")
+                    })
+                })?;
+                pages_reached.push(receipt.url.clone());
+                page_observation = Some(page_observation_from_state(&receipt.page));
+                web_consume = Some(web_consume_receipt_payload(&receipt));
+            }
+        }
+    }
+
+    let command = resolve_context_command(ContextCommandRequest {
+        raw_request: job.task.clone(),
+        surface: Some(job.surface),
+        retrieval_mode: Some(if job.url.is_some() {
+            RetrievalMode::WebAllowed
+        } else {
+            RetrievalMode::LocalFirst
+        }),
+        risk_mode: Some(match job.surface {
+            BrowserSurface::BrowseWithMe => RiskMode::SupervisedAction,
+            BrowserSurface::BrowseForMe => RiskMode::ConfirmBeforeWrite,
+            BrowserSurface::WebConsume => RiskMode::ConfirmBeforeWrite,
+        }),
+        allow_external_web: Some(job.url.is_some()),
+        allow_agent_execution: Some(job.surface != BrowserSurface::WebConsume),
+        ..ContextCommandRequest::default()
+    });
+    let perception = perceive_with_graph(
+        &browser_store,
+        &command,
+        PerceptionInput {
+            mode: match job.surface {
+                BrowserSurface::BrowseWithMe => PerceptionMode::Browse,
+                BrowserSurface::BrowseForMe => PerceptionMode::Act,
+                BrowserSurface::WebConsume => PerceptionMode::Capture,
+            },
+            query: job.task.clone(),
+            page: page_observation,
+            seed_urls: job.url.clone().into_iter().collect(),
+        },
+    );
+    let action_rail = build_action_rail(&command, &perception);
+    let browsing_run = browsing_run_receipt(&job.run_id, &command, &perception, &action_rail);
+    let mut browsing_run_value = serde_json::to_value(&browsing_run).unwrap_or_else(|_| json!({}));
+    if let (Value::Object(map), Some(live_browser)) = (&mut browsing_run_value, &live_browser) {
+        map.insert("live_browser".to_string(), live_browser.clone());
+    }
+
+    // C: publish the playbooks as native skill packs (idempotent) and persist
+    // the BrowsingRun as a content-addressed graph node so the run plus its
+    // event ledger are durable and queryable. These are graph writes, so they
+    // only run when the job already permits writes (job.ingest); a read-only
+    // web_consume (ingest=false) stays read-only.
+    let (playbook_pack_ids, browsing_run_node) = if job.ingest {
+        let playbook_pack_ids =
+            publish_browser_playbooks(&mut browser_store, &job.tenant, &job.actor_id);
+        let browsing_run_node = persist_browsing_run_node(
+            &mut browser_store,
+            &job.tenant,
+            &job.run_id,
+            &browsing_run_value,
+            &pages_reached,
+            &playbook_pack_ids,
+        );
+        (playbook_pack_ids, browsing_run_node)
+    } else {
+        (Vec::new(), None)
+    };
+
+    Ok(json!({
+        "tenant": job.tenant,
+        "run_id": job.run_id,
+        "tool": job.tool_name,
+        "surface": job.surface,
+        "control_mode": job.control_mode,
+        "task": job.task,
+        "context_command": command,
+        "perception": perception,
+        "action_rail": action_rail,
+        "browsing_run": browsing_run_value,
+        "browsing_run_node": browsing_run_node,
+        "playbook_pack_ids": playbook_pack_ids,
+        "web_consume": web_consume,
+        "live_browser": live_browser,
+        "pages_reached": pages_reached,
+        "mode": "sync"
+    }))
+}
+
+fn should_use_live_browser(state: &AppState, job: &BrowserUseJob) -> bool {
+    job.surface != BrowserSurface::WebConsume && state.live_browser_pool().is_some()
+}
+
+struct LiveBrowserUseOutcome {
+    page: PageState,
+    pages_reached: Vec<String>,
+    payload: Value,
+}
+
+async fn execute_live_browser_use(
+    state: &AppState,
+    job: &BrowserUseJob,
+    url: &str,
+) -> Result<LiveBrowserUseOutcome, Value> {
+    let pool = state.live_browser_pool().ok_or_else(|| {
+        json!({
+            "error": "live_browser_pool_unavailable",
+            "message": "no live browser pool is configured"
+        })
+    })?;
+    let existing = state.live_browser_session(&job.run_id);
+    let session_id = job
+        .session_id
+        .clone()
+        .or_else(|| existing.as_ref().map(|record| record.session_id.clone()));
+    let mut session = pool
+        .checkout(BrowserCheckoutRequest {
+            tenant: job.tenant.clone(),
+            run_id: job.run_id.clone(),
+            session_id,
+            url: Some(url.to_string()),
+            max_bytes: job.max_bytes,
+            actor_id: job.actor_id.clone(),
+        })
+        .await
+        .map_err(browser_engine_payload)?;
+    let mut record = existing.unwrap_or_else(|| {
+        BrowserLiveSessionRecord::new(job.run_id.clone(), session.session_id().to_string())
+    });
+    record.session_id = session.session_id().to_string();
+    record.last_page = Some(session.current_page().map_err(browser_engine_payload)?);
+    if let Some(demonstration) = &job.human_demonstration {
+        record.demonstrations.push(demonstration.clone());
+    }
+
+    if job.veto {
+        record.pending_action = None;
+        let page = session.current_page().map_err(browser_engine_payload)?;
+        record.last_page = Some(page.clone());
+        state.upsert_live_browser_session(record);
+        return Ok(LiveBrowserUseOutcome {
+            page: page.clone(),
+            pages_reached: vec![page.url.clone()],
+            payload: json!({
+                "status": "vetoed",
+                "transport": pool.transport(),
+                "session_id": session.session_id(),
+                "page": page_state_payload(&page)
+            }),
+        });
+    }
+
+    if job.surface == BrowserSurface::BrowseWithMe && job.action.is_some() && !job.confirm {
+        record.pending_action = job.action.clone();
+        let page = session.current_page().map_err(browser_engine_payload)?;
+        record.last_page = Some(page.clone());
+        state.upsert_live_browser_session(record);
+        return Ok(LiveBrowserUseOutcome {
+            page: page.clone(),
+            pages_reached: vec![page.url.clone()],
+            payload: json!({
+                "status": "preview_pending",
+                "transport": pool.transport(),
+                "session_id": session.session_id(),
+                "pending_action": job.action.clone(),
+                "page": page_state_payload(&page)
+            }),
+        });
+    }
+
+    let action_to_apply = if job.confirm {
+        job.action.clone().or_else(|| record.pending_action.take())
+    } else {
+        job.action.clone()
+    };
+    let action_receipt = match action_to_apply {
+        Some(action) => {
+            let command = parse_browser_action_command(&action)?;
+            let receipt = session
+                .run_action(&command, &job.policy)
+                .await
+                .map_err(browser_engine_payload)?;
+            record.pending_action = None;
+            Some(receipt)
+        }
+        None => None,
+    };
+    let page = session.current_page().map_err(browser_engine_payload)?;
+    record.last_page = Some(page.clone());
+    state.upsert_live_browser_session(record.clone());
+
+    Ok(LiveBrowserUseOutcome {
+        page: page.clone(),
+        pages_reached: vec![page.url.clone()],
+        payload: json!({
+            "status": if action_receipt.is_some() { "actuated" } else { "session_ready" },
+            "transport": pool.transport(),
+            "session_id": session.session_id(),
+            "pending_action": record.pending_action,
+            "demonstration_count": record.demonstrations.len(),
+            "action_receipt": action_receipt.as_ref().map(action_receipt_payload),
+            "page": page_state_payload(&page)
+        }),
+    })
+}
+
+fn browser_engine_payload(error: rustyred_web::BrowserEngineError) -> Value {
+    json!({
+        "error": "live_browser_action_failed",
+        "message": format!("{error:?}")
+    })
+}
+
+fn action_receipt_payload(receipt: &AutomationActionReceipt) -> Value {
+    serde_json::to_value(receipt).unwrap_or_else(|_| json!({}))
+}
+
+fn parse_browser_action_command(value: &Value) -> Result<BrowserActionCommand, Value> {
+    let locator = parse_action_locator(value)?;
+    let action = parse_locator_action(value)?;
+    let options = value
+        .get("options")
+        .cloned()
+        .map(serde_json::from_value::<ActionOptions>)
+        .transpose()
+        .map_err(|error| {
+            json!({
+                "error": "invalid_browser_action",
+                "message": format!("action options did not parse: {error}")
+            })
+        })?
+        .unwrap_or_default();
+    Ok(BrowserActionCommand {
+        locator,
+        action,
+        options,
+    })
+}
+
+fn parse_action_locator(value: &Value) -> Result<Locator, Value> {
+    if let Some(locator) = value.get("locator") {
+        return serde_json::from_value::<Locator>(locator.clone()).map_err(|error| {
+            json!({
+                "error": "invalid_browser_action",
+                "message": format!("locator did not parse: {error}")
+            })
+        });
+    }
+    let selector = value.get("selector").unwrap_or(value);
+    let mut locator = if let Some(selector_text) = selector.as_str() {
+        Locator::css(selector_text)
+    } else if let Some(selector) = selector.as_object() {
+        if let Some(element_id) = selector
+            .get("element_id")
+            .or_else(|| selector.get("elementId"))
+            .and_then(Value::as_str)
+        {
+            Locator::get_by_test_id(element_id)
+        } else if let Some(test_id) = selector
+            .get("test_id")
+            .or_else(|| selector.get("testId"))
+            .and_then(Value::as_str)
+        {
+            Locator::get_by_test_id(test_id)
+        } else if let Some(css) = selector.get("css").and_then(Value::as_str) {
+            Locator::css(css)
+        } else if let Some(role) = selector.get("role").and_then(Value::as_str) {
+            Locator::get_by_role(
+                role,
+                rustyred_web::RoleOptions {
+                    name: selector
+                        .get("name")
+                        .or_else(|| selector.get("accessible_name"))
+                        .or_else(|| selector.get("accessibleName"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                },
+            )
+        } else if let Some(text) = selector.get("text").and_then(Value::as_str) {
+            Locator::get_by_text(
+                text,
+                selector
+                    .get("exact")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )
+        } else if let Some(label) = selector.get("label").and_then(Value::as_str) {
+            Locator::get_by_label(label)
+        } else {
+            return Err(json!({
+                "error": "invalid_browser_action",
+                "message": "selector must include locator, element_id, test_id, css, role, text, or label"
+            }));
+        }
+    } else {
+        return Err(json!({
+            "error": "invalid_browser_action",
+            "message": "action requires a selector or locator"
+        }));
+    };
+    if let Some(nth) = selector.get("nth").and_then(Value::as_u64) {
+        locator = locator.nth(nth as usize);
+    }
+    Ok(locator)
+}
+
+fn parse_locator_action(value: &Value) -> Result<LocatorAction, Value> {
+    let Some(action) = value
+        .get("action")
+        .or_else(|| value.get("locator_action"))
+        .or_else(|| value.get("locatorAction"))
+        .or_else(|| value.get("kind"))
+    else {
+        return Err(json!({
+            "error": "invalid_browser_action",
+            "message": "action requires action or kind"
+        }));
+    };
+    if action.is_object() {
+        return serde_json::from_value::<LocatorAction>(action.clone()).map_err(|error| {
+            json!({
+                "error": "invalid_browser_action",
+                "message": format!("locator action did not parse: {error}")
+            })
+        });
+    }
+    let Some(kind) = action.as_str().map(|kind| kind.trim().to_ascii_lowercase()) else {
+        return Err(json!({
+            "error": "invalid_browser_action",
+            "message": "action kind must be a string or tagged action object"
+        }));
+    };
+    match kind.as_str() {
+        "click" => Ok(LocatorAction::Click),
+        "double_click" | "doubleclick" | "dblclick" => Ok(LocatorAction::DoubleClick),
+        "check" => Ok(LocatorAction::Check),
+        "set_checked" | "setchecked" => Ok(LocatorAction::SetChecked {
+            checked: value
+                .get("checked")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        }),
+        "tap" => Ok(LocatorAction::Tap),
+        "fill" | "type" => {
+            let text = value
+                .get("value")
+                .or_else(|| value.get("text"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    json!({
+                        "error": "invalid_browser_action",
+                        "message": "fill/type action requires value or text"
+                    })
+                })?;
+            Ok(LocatorAction::Fill {
+                value: text.to_string(),
+            })
+        }
+        "hover" => Ok(LocatorAction::Hover),
+        "scroll_into_view" | "scrollintoview" => Ok(LocatorAction::ScrollIntoView),
+        "select_option" | "selectoption" | "select" => {
+            let selected = value.get("value").and_then(Value::as_str).ok_or_else(|| {
+                json!({
+                    "error": "invalid_browser_action",
+                    "message": "select option action requires value"
+                })
+            })?;
+            Ok(LocatorAction::SelectOption {
+                value: selected.to_string(),
+            })
+        }
+        "set_input_files" | "setinputfiles" | "upload_file" | "upload" => {
+            let paths = value
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .or_else(|| {
+                    value
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(|path| vec![path.to_string()])
+                })
+                .unwrap_or_default();
+            if paths.is_empty() {
+                return Err(json!({
+                    "error": "invalid_browser_action",
+                    "message": "set input files action requires paths or path"
+                }));
+            }
+            Ok(LocatorAction::SetInputFiles { paths })
+        }
+        _ => Err(json!({
+            "error": "invalid_browser_action",
+            "message": format!("unsupported action kind: {kind}")
+        })),
+    }
+}
+
+const BROWSE_FOR_ME_MAX_STEPS: usize = 4;
+
+struct BrowseForMeSteps {
+    last_page: Option<PageState>,
+    pages_reached: Vec<String>,
+    step_payloads: Vec<Value>,
+}
+
+/// browse_for_me autopilot walk: consume the seed, then follow the first
+/// unvisited on-page link, up to `BROWSE_FOR_ME_MAX_STEPS` pages. Every step is
+/// robots-checked and ingested by `web_consume_to_graph`. A robots-blocked or
+/// dead link ends the walk and returns what was reached so far.
+async fn run_browse_for_me_loop<S: GraphStore>(
+    store: &mut S,
+    cascade: &rustyred_web::FetchCascade,
+    job: &BrowserUseJob,
+    seed_url: &str,
+) -> Result<BrowseForMeSteps, Value> {
+    let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pages_reached: Vec<String> = Vec::new();
+    let mut step_payloads: Vec<Value> = Vec::new();
+    let mut last_page: Option<PageState> = None;
+    let mut next: Option<String> = Some(seed_url.to_string());
+    let mut last_error: Option<String> = None;
+
+    while let Some(url) = next.take() {
+        if pages_reached.len() >= BROWSE_FOR_ME_MAX_STEPS {
+            break;
+        }
+        if !visited.insert(url.clone()) {
+            continue;
+        }
+        match web_consume_to_graph(
+            store,
+            cascade,
+            WebConsumeRequest {
+                run_id: job.run_id.clone(),
+                url: url.clone(),
+                actor_id: job.actor_id.clone(),
+                namespace: "open_web_unverified".to_string(),
+                max_bytes: job.max_bytes,
+                ingest: job.ingest,
+                respect_robots: true,
+            },
+        )
+        .await
+        {
+            Ok(receipt) => {
+                pages_reached.push(receipt.url.clone());
+                next = receipt
+                    .page
+                    .interactive_elements
+                    .iter()
+                    .filter(|element| element.role == "link")
+                    .filter_map(|element| element.value.clone())
+                    .find(|candidate| !visited.contains(candidate));
+                step_payloads.push(web_consume_receipt_payload(&receipt));
+                last_page = Some(receipt.page);
+            }
+            Err(error) => {
+                last_error = Some(format!("{error:?}"));
+                break;
+            }
+        }
+    }
+
+    if pages_reached.is_empty() {
+        return Err(json!({
+            "error": "browse_for_me_no_pages",
+            "message": last_error
+                .unwrap_or_else(|| "browse_for_me reached no pages".to_string())
+        }));
+    }
+
+    Ok(BrowseForMeSteps {
+        last_page,
+        pages_reached,
+        step_payloads,
+    })
+}
+
+/// Publish the built-in browser playbooks as native skill packs through the
+/// existing skill encoder/registry. Idempotent: packs are content-hash keyed,
+/// so re-publishing the same playbook is a no-op upsert. Returns the pack ids.
+fn publish_browser_playbooks<S: GraphStore>(
+    store: &mut S,
+    tenant: &str,
+    actor: &str,
+) -> Vec<String> {
+    let mut pack_ids = Vec::new();
+    for playbook in default_browser_playbooks() {
+        let intent = playbook.intent;
+        let title = playbook.title;
+        let body = playbook.skill_markdown;
+        let pack = json!({
+            "kind": "skill_pack",
+            "name": format!("browser-playbook-{intent}"),
+            "title": title,
+            "description": format!("Browser-use playbook for intent '{intent}'"),
+            "intent": intent.clone(),
+            "capabilities": ["browser_playbook", intent.clone()],
+            "body": body,
+        });
+        let input = SkillPackPublishInput {
+            tenant_slug: tenant.to_string(),
+            actor_id: actor.to_string(),
+            status: "advisory".to_string(),
+            pack,
+            ..SkillPackPublishInput::default()
+        };
+        if let Ok(receipt) = publish_skill_pack(store, input) {
+            pack_ids.push(receipt.pack.pack_id);
+        }
+    }
+    pack_ids
+}
+
+/// Persist the BrowsingRun as a content-addressed `BrowsingRun` graph node so
+/// the run plus its ordered event ledger are durable and queryable, mirroring
+/// the EnsembleDecision content-addressing pattern. The write goes through the
+/// tenant store (TenantMirrorGraphStore writes through), so it is durable.
+fn persist_browsing_run_node<S: GraphStore>(
+    store: &mut S,
+    tenant: &str,
+    run_id: &str,
+    browsing_run: &Value,
+    pages_reached: &[String],
+    playbook_pack_ids: &[String],
+) -> Option<String> {
+    let content_hash = stable_hash(json!({
+        "run_id": run_id,
+        "tenant": tenant,
+        "browsing_run": browsing_run,
+        "pages_reached": pages_reached
+    }));
+    let node_id = format!("browsing-run:{tenant}:{content_hash}");
+    let events = browsing_run
+        .get("events")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let node = NodeRecord::new(
+        node_id.clone(),
+        ["BrowsingRun"],
+        json!({
+            "run_id": run_id,
+            "tenant": tenant,
+            "content_hash": content_hash,
+            "browsing_run": browsing_run,
+            "pages_reached": pages_reached,
+            "playbook_pack_ids": playbook_pack_ids,
+            "events": events,
+            "trust_tier": "open_web_unverified"
+        }),
+    );
+    GraphStore::upsert_node(store, node).ok().map(|_| node_id)
+}
+
+async fn enqueue_browser_use(state: AppState, job: BrowserUseJob) -> Result<Value, Value> {
+    start_live_web_harness_run(
+        &state,
+        &job.tenant,
+        &job.run_id,
+        &job.tool_name,
+        &job.task,
+        &job.actor_id,
+    )?;
+    let handoff =
+        live_web_async_handoff_payload(&job.tenant, &job.run_id, &job.tool_name, &job.task);
+    tokio::spawn(async move {
+        let result = execute_browser_use(&state, &job).await;
+        finish_live_web_harness_run(
+            &state,
+            &job.tenant,
+            &job.run_id,
+            &job.tool_name,
+            &job.actor_id,
+            result,
+        )
+        .await;
+    });
+    Ok(handoff)
+}
+
+fn page_observation_from_state(page: &PageState) -> PageObservation {
+    PageObservation {
+        url: page.url.clone(),
+        title: page.title.clone(),
+        distilled_text: page.distilled_text.clone(),
+        active_tab_id: page.active_tab_id.clone(),
+        interactive_elements: page
+            .interactive_elements
+            .iter()
+            .map(|element| ObservedElement {
+                element_id: element.element_id.clone(),
+                role: element.role.clone(),
+                name: element.name.clone(),
+                value: element.value.clone(),
+                visible: element.visible,
+                degraded: element.degraded,
+            })
+            .collect(),
+    }
+}
+
+fn web_consume_receipt_payload(receipt: &WebConsumeReceipt) -> Value {
+    json!({
+        "run_id": receipt.run_id,
+        "url": receipt.url,
+        "ingested": receipt.ingested,
+        "write_count": receipt.writes.len(),
+        "crawl_receipt": receipt.crawl_receipt,
+        "page": page_state_payload(&receipt.page),
+        "extract": receipt.extract
+    })
+}
+
+fn page_state_payload(page: &PageState) -> Value {
+    json!({
+        "url": page.url,
+        "title": page.title,
+        "distilled_text": page.distilled_text,
+        "active_tab_id": page.active_tab_id,
+        "interactive_elements": page.interactive_elements,
+        "fetch": page.fetch.clone()
+    })
+}
+
+async fn browser_web_consume(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    browser_route_response(state, tenant_id, headers, "web_consume", body).await
+}
+
+async fn browser_browse_with_me(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    browser_route_response(state, tenant_id, headers, "browse_with_me", body).await
+}
+
+async fn browser_browse_for_me(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    browser_route_response(state, tenant_id, headers, "browse_for_me", body).await
+}
+
+async fn browser_route_response(
+    state: AppState,
+    tenant_id: String,
+    headers: HeaderMap,
+    tool_name: &str,
+    body: Value,
+) -> axum::response::Response {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let config = state.mcp_config();
+    let arguments = body_with_tenant(body, tenant_id);
+    match browser_use_payload(&state, &config, tool_name, &arguments).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(payload) => {
+            let status = match payload.get("error").and_then(Value::as_str) {
+                Some("store_unavailable") => StatusCode::INTERNAL_SERVER_ERROR,
+                Some("mcp_read_only") => StatusCode::FORBIDDEN,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(payload)).into_response()
+        }
+    }
+}
+
+fn body_with_tenant(body: Value, tenant_id: String) -> Value {
+    let mut object = body.as_object().cloned().unwrap_or_default();
+    object.insert("tenant".to_string(), Value::String(tenant_id));
+    Value::Object(object)
+}
+
+async fn maybe_handle_live_fractal_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(
+        name,
+        "fractal_expansion" | "harness_fractal_expansion" | "theorem_harness_fractal_expansion"
+    ) {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let result = if config.read_only {
+        mcp_tool_result_error(json!({
+            "error": "mcp_read_only",
+            "message": "Live fractal expansion writes are unavailable while read-only mode is active."
+        }))
+    } else {
+        let arguments = payload
+            .get("params")
+            .and_then(|params| params.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        match live_fractal_expansion_payload(state, config, &arguments).await {
+            Ok(payload) => mcp_tool_result(payload),
+            Err(payload) => mcp_tool_result_error(payload),
+        }
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn maybe_handle_live_search_acquisition_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "rustyweb_search_acquisition" | "search_acquisition") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match live_search_acquisition_payload(state, config, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn maybe_handle_hippo_retrieve_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "hippo_retrieve" | "hipporag_retrieve") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match hippo_retrieve_payload(state, config, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn hippo_retrieve_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let query = argument_text_any(arguments, &["query", "q", "text"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_hippo_retrieve",
+            "message": "hippo_retrieve requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let top_k = argument_u64_any(arguments, &["top_k", "topK", "limit"])
+        .unwrap_or(8)
+        .clamp(1, 100) as usize;
+    let include_hubs = arguments
+        .get("include_hubs")
+        .or_else(|| arguments.get("includeHubs"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let auto_index_memory = arguments
+        .get("auto_index_memory")
+        .or_else(|| arguments.get("autoIndexMemory"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let hippo_query_vector = hippo_query_vector_from_env(&query).await?;
+
+    let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut gate_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "hippo_retrieve_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let indexing = if auto_index_memory {
+        warm_hippo_memory_index(&mut gate_store, &tenant, arguments)?
+    } else {
+        json!({
+            "ran": false,
+            "reason": "disabled_by_request"
+        })
+    };
+    let hippo_query = HippoQuery {
+        text: &query,
+        top_k,
+        include_hubs,
+    };
+    let (candidates, trace) = match hippo_query_vector.as_deref() {
+        Some(query_vector) => {
+            rustyred_hipporag::retrieve_with_query_vector(&gate_store, hippo_query, query_vector)
+        }
+        None => rustyred_hipporag::retrieve::retrieve_with_trace(&gate_store, hippo_query),
+    };
+    let stats = json!({
+        "candidates": candidates.len(),
+        "seeds": trace.seeds.len(),
+        "memory_index_pages_upserted": indexing
+            .get("pages_upserted")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        "warm_centrality_reads": trace.warm_centrality_reads,
+        "ran_query_ppr": trace.ran_query_ppr,
+        "ran_global_ppr": trace.ran_global_ppr
+    });
+
+    Ok(json!({
+        "tenant": tenant,
+        "query": query,
+        "candidates": candidates,
+        "trace": trace,
+        "indexing": indexing,
+        "stats": stats
+    }))
+}
+
+fn warm_hippo_memory_index(
+    store: &mut TenantMirrorGraphStore<'_>,
+    tenant: &str,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let index_limit = argument_u64_any(arguments, &["index_limit", "indexLimit"])
+        .unwrap_or(200)
+        .clamp(1, 5_000) as usize;
+    let existing_phrases = store
+        .query_nodes(NodeQuery::label(rustyred_hipporag::schema::LABEL_PHRASE).with_limit(1))
+        .len();
+    let existing_hubs = store
+        .query_nodes(NodeQuery::label(rustyred_hipporag::schema::LABEL_HUB).with_limit(1))
+        .len();
+    let mut memory_sources_seen = 0usize;
+    let mut pages_upserted = 0usize;
+    let mut passages_indexed = 0usize;
+    let mut phrases_upserted = 0usize;
+    let mut contains_edges = 0usize;
+    let mut source_page_ids = Vec::new();
+    let tenant_aliases = hippo_tenant_slug_aliases(tenant);
+    let mut source_ids_seen = BTreeSet::new();
+
+    for label in ["MemoryDocument", "MemoryNode"] {
+        for alias in &tenant_aliases {
+            for node in store
+                .query_nodes(
+                    NodeQuery::label(label)
+                        .with_property("tenant_slug", Value::String(alias.clone()))
+                        .with_limit(index_limit),
+                )
+                .into_iter()
+                .filter(hippo_memory_status_indexable)
+            {
+                if memory_sources_seen >= index_limit {
+                    break;
+                }
+                if !source_ids_seen.insert(node.id.clone()) {
+                    continue;
+                }
+                let text = hippo_memory_page_text(&node);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                memory_sources_seen += 1;
+                let page_id = format!("hippo:page:memory:{}", stable_hash(&node.id));
+                source_page_ids.push(page_id.clone());
+                let should_index = existing_phrases == 0 || store.get_node(&page_id).is_none();
+                if !should_index {
+                    continue;
+                }
+
+                let page = NodeRecord::new(
+                    &page_id,
+                    [rustyred_hipporag::schema::LABEL_PAGE],
+                    json!({
+                        "tenant_slug": tenant,
+                        "source_graph_id": node.id.clone(),
+                        "source_label": label,
+                        "source_doc_id": node.properties.get("doc_id").or_else(|| node.properties.get("node_id")).and_then(Value::as_str).unwrap_or_default(),
+                        "title": node.properties.get("title").and_then(Value::as_str).unwrap_or_default(),
+                        "summary": node.properties.get("summary").and_then(Value::as_str).unwrap_or_default(),
+                        "text": text,
+                    }),
+                );
+                store.upsert_node(page).map_err(hippo_index_store_error)?;
+                pages_upserted += 1;
+                let stats = rustyred_hipporag::index_passage(store, &page_id)
+                    .map_err(|error| hippo_index_error("hippo_index_passage_failed", error))?;
+                passages_indexed += 1;
+                phrases_upserted += stats.phrases_upserted;
+                contains_edges += stats.contains_edges;
+            }
+        }
+    }
+
+    let should_build_hubs =
+        pages_upserted > 0 || (existing_hubs == 0 && !source_page_ids.is_empty());
+    let hub_stats = if !should_build_hubs {
+        json!({
+            "hubs_upserted": 0,
+            "summarize_edges": 0,
+            "hub_parent_edges": 0
+        })
+    } else {
+        let stats = rustyred_hipporag::build_summary_tree_for_region(
+            store,
+            rustyred_hipporag::RaptorPolicy {
+                region_node_threshold: 1,
+                min_members: 2,
+                max_level: 2,
+            },
+            &source_page_ids,
+        )
+        .map_err(|error| hippo_index_error("hippo_build_hubs_failed", error))?;
+        json!({
+            "hubs_upserted": stats.hubs_upserted,
+            "summarize_edges": stats.summarize_edges,
+            "hub_parent_edges": stats.hub_parent_edges
+        })
+    };
+
+    Ok(json!({
+        "ran": pages_upserted > 0,
+        "reason": if pages_upserted > 0 { "memory_sources_indexed" } else { "already_warm_or_no_memory_sources" },
+        "index_limit": index_limit,
+        "existing_phrase_nodes": existing_phrases,
+        "existing_hub_nodes": existing_hubs,
+        "memory_sources_seen": memory_sources_seen,
+        "pages_upserted": pages_upserted,
+        "passages_indexed": passages_indexed,
+        "phrases_upserted": phrases_upserted,
+        "contains_edges": contains_edges,
+        "hubs": hub_stats
+    }))
+}
+
+fn hippo_tenant_slug_aliases(tenant: &str) -> Vec<String> {
+    let normalized = normalize_tenant_slug(tenant);
+    let trimmed = tenant.trim();
+    let candidates = [
+        normalized.clone(),
+        trimmed.to_string(),
+        normalized.to_ascii_lowercase(),
+        trimmed.to_ascii_lowercase(),
+    ];
+    let mut aliases = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_empty() && !aliases.contains(&candidate) {
+            aliases.push(candidate);
+        }
+    }
+    aliases
+}
+
+fn hippo_memory_status_indexable(node: &NodeRecord) -> bool {
+    node.properties
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|status| status == "active")
+        .unwrap_or(true)
+}
+
+fn hippo_memory_page_text(node: &NodeRecord) -> String {
+    ["title", "summary", "content", "search_text"]
+        .iter()
+        .filter_map(|key| node.properties.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn hippo_index_store_error(error: GraphStoreError) -> Value {
+    json!({
+        "error": "hippo_memory_index_store_error",
+        "code": error.code,
+        "message": error.message
+    })
+}
+
+fn hippo_index_error(code: &str, error: rustyred_hipporag::HippoError) -> Value {
+    json!({
+        "error": code,
+        "message": error.to_string()
+    })
+}
+
+async fn hippo_query_vector_from_env(query: &str) -> Result<Option<Vec<f32>>, Value> {
+    let Some(embedder) = configured_qwen3_embedding_4b_client_from_env().map_err(|error| {
+        json!({
+            "error": "hippo_embedding_config_invalid",
+            "message": error.to_string()
+        })
+    })?
+    else {
+        return Ok(None);
+    };
+    let inputs = [query.to_string()];
+    let mut vectors = TextEmbedder::embed(&embedder, &inputs)
+        .await
+        .map_err(|error| {
+            json!({
+                "error": "hippo_embedding_failed",
+                "message": error.to_string()
+            })
+        })?;
+    if vectors.len() != 1 {
+        return Err(json!({
+            "error": "hippo_embedding_response_invalid",
+            "message": format!(
+                "embedding endpoint returned {} query vectors for HippoRAG retrieval",
+                vectors.len()
+            )
+        }));
+    }
+    Ok(vectors.pop())
+}
+
+async fn live_search_acquisition_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let job = live_search_acquisition_job(config, arguments)?;
+    if job.wait || config.read_only {
+        return execute_live_search_acquisition(state, &job).await;
+    }
+    enqueue_live_search_acquisition(state.clone(), job).await
+}
+
+fn live_search_acquisition_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<LiveSearchAcquisitionJob, Value> {
+    let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_search_acquisition",
+            "message": "rustyweb_search_acquisition requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let provider_allowlist = string_array_argument(arguments, "providers");
+    let opts = SearchOpts {
+        provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
+            .unwrap_or(10)
+            .clamp(1, 50) as usize,
+        limit: argument_u64_any(arguments, &["limit", "top_k", "topK"])
+            .unwrap_or(16)
+            .clamp(1, 100) as usize,
+        rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
+            .unwrap_or(60)
+            .clamp(1, 1_000) as usize,
+    };
+    let seed_limit = argument_u64_any(arguments, &["seed_limit", "seedLimit"])
+        .unwrap_or(8)
+        .clamp(1, 50) as usize;
+    Ok(LiveSearchAcquisitionJob {
+        run_id: argument_text_any(arguments, &["run_id", "runId"])
+            .unwrap_or_else(|| default_live_web_run_id("search")),
+        tenant,
+        query,
+        provider_allowlist,
+        opts,
+        seed_limit,
+        actor_id: argument_text_any(arguments, &["actor", "actor_id", "actorId"])
+            .unwrap_or_else(default_live_web_actor),
+        wait: live_web_wait_requested(arguments),
+    })
+}
+
+async fn execute_live_search_acquisition(
+    state: &AppState,
+    job: &LiveSearchAcquisitionJob,
+) -> Result<Value, Value> {
+    let providers = state.search_providers(&job.provider_allowlist);
+    let acquisition = fanout_search_providers(&providers, &job.query, job.opts.clone()).await;
+    let seed_urls = acquisition.seed_urls(job.seed_limit);
+    let normalized_query = acquisition.query.clone();
+    let stats = json!({
+        "candidates": acquisition.candidates.len(),
+        "providers": providers.len(),
+        "provider_receipts": acquisition.providers.len(),
+        "seed_urls": seed_urls.len(),
+    });
+
+    Ok(json!({
+        "tenant": job.tenant,
+        "run_id": job.run_id,
+        "query": normalized_query,
+        "acquisition": acquisition,
+        "seed_urls": seed_urls,
+        "stats": stats,
+        "mode": "sync"
+    }))
+}
+
+async fn enqueue_live_search_acquisition(
+    state: AppState,
+    job: LiveSearchAcquisitionJob,
+) -> Result<Value, Value> {
+    start_live_web_harness_run(
+        &state,
+        &job.tenant,
+        &job.run_id,
+        "rustyweb_search_acquisition",
+        &job.query,
+        &job.actor_id,
+    )?;
+    let handoff = live_web_async_handoff_payload(
+        &job.tenant,
+        &job.run_id,
+        "rustyweb_search_acquisition",
+        &job.query,
+    );
+    tokio::spawn(async move {
+        let result = execute_live_search_acquisition(&state, &job).await;
+        finish_live_web_harness_run(
+            &state,
+            &job.tenant,
+            &job.run_id,
+            "rustyweb_search_acquisition",
+            &job.actor_id,
+            result,
+        )
+        .await;
+    });
+    Ok(handoff)
+}
+
+/// The WEB arm of SPEC-CONTEXT-MEMBRANE-1.0. Intercepts the MCP `web_search_graph`
+/// tool call before it reaches the synchronous MCP backend, runs the membrane gate
+/// over the tenant graph store, and returns the spec's
+/// `{ admitted_context, deferred_handles, subgraph_ref }` shape. Page extraction is
+/// warmed fire-and-forget (acceptance #4): the response never blocks on a fetch.
+async fn maybe_handle_web_search_graph_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "web_search_graph" | "theorem_web_search_graph") {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = match web_search_graph_payload(state, config, &arguments).await {
+        Ok(payload) => mcp_tool_result(payload),
+        Err(payload) => mcp_tool_result_error(payload),
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
+}
+
+async fn web_search_graph_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    if config.read_only {
+        return Err(json!({
+            "error": "mcp_read_only",
+            "message": "web_search_graph persists membrane receipts and warm pages; it is unavailable while read-only mode is active."
+        }));
+    }
+    let job = web_search_graph_job(config, arguments)?;
+    execute_web_search_graph(state, job).await
+}
+
+fn web_search_graph_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<WebSearchGraphJob, Value> {
+    let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_web_search_graph",
+            "message": "web_search_graph requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let provider_allowlist = string_array_argument(arguments, "providers");
+
+    let mut options = WebSearchGraphOptions::default();
+    options.acquisition = SearchOpts {
+        provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
+            .map(|value| value.clamp(1, 50) as usize)
+            .unwrap_or(options.acquisition.provider_limit),
+        limit: argument_u64_any(arguments, &["limit", "top_k", "topK"])
+            .map(|value| value.clamp(1, 100) as usize)
+            .unwrap_or(options.acquisition.limit),
+        rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
+            .map(|value| value.clamp(1, 1_000) as usize)
+            .unwrap_or(options.acquisition.rrf_k),
+    };
+    if let Some(budget_tokens) = argument_u64_any(arguments, &["budget_tokens", "budgetTokens"]) {
+        options.budget_tokens = budget_tokens.clamp(1, 1_000_000) as usize;
+    }
+    if let Some(redundancy_penalty) =
+        argument_f64_any(arguments, &["redundancy_penalty", "redundancyPenalty"])
+    {
+        options.redundancy_penalty = redundancy_penalty.clamp(0.0, 1.0) as f32;
+        options.mmr_lambda = 1.0 - options.redundancy_penalty;
+    }
+    if let Some(mmr_lambda) = argument_f64_any(arguments, &["mmr_lambda", "mmrLambda"]) {
+        options.mmr_lambda = mmr_lambda.clamp(0.0, 1.0) as f32;
+        options.redundancy_penalty = 1.0 - options.mmr_lambda;
+    }
+    if let Some(fetch_top_k) = argument_u64_any(arguments, &["fetch_top_k", "fetchTopK"]) {
+        options.fetch_top_k = fetch_top_k.clamp(0, 100) as usize;
+    }
+
+    Ok(WebSearchGraphJob {
+        run_id: argument_text_any(arguments, &["run_id", "runId"])
+            .unwrap_or_else(|| default_live_web_run_id("web-search-graph")),
+        tenant,
+        query,
+        provider_allowlist,
+        options,
+    })
+}
+
+fn web_cross_encoder_from_env() -> Box<dyn CrossEncoder> {
+    let model_id = env_nonempty(&["THEOREM_RERANKER_MODEL", "RUSTYRED_RERANKER_MODEL"])
+        .unwrap_or_else(|| GTE_RERANKER_MODERNBERT_BASE.to_string());
+    match env_nonempty(&[
+        "THEOREM_RERANKER_URL",
+        "RUSTYRED_RERANKER_URL",
+        "RUSTYWEB_RERANKER_URL",
+    ]) {
+        Some(url) => Box::new(HttpCrossEncoder::new(
+            reranker_endpoint(&url, "score"),
+            model_id,
+        )),
+        None => Box::new(LexicalCrossEncoder::new("lexical-cross-encoder")),
+    }
+}
+
+fn web_listwise_reranker_from_env() -> Option<Box<dyn ListwiseReranker>> {
+    let url = env_nonempty(&[
+        "THEOREM_LISTWISE_RERANKER_URL",
+        "THEOREM_WEB_LISTWISE_URL",
+        "RUSTYWEB_LISTWISE_RERANKER_URL",
+    ])?;
+    let model_id = env_nonempty(&[
+        "THEOREM_LISTWISE_RERANKER_MODEL",
+        "THEOREM_WEB_LISTWISE_MODEL",
+        "RUSTYWEB_LISTWISE_RERANKER_MODEL",
+    ])
+    .unwrap_or_else(|| JINA_RERANKER_V3.to_string());
+    Some(Box::new(HttpListwiseReranker::new(
+        reranker_endpoint(&url, "rerank"),
+        model_id,
+    )))
+}
+
+fn reranker_endpoint(base_or_endpoint: &str, path: &str) -> String {
+    let trimmed = base_or_endpoint.trim().trim_end_matches('/');
+    if trimmed.ends_with("/score") || trimmed.ends_with("/rerank") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/{path}")
+    }
+}
+
+fn env_nonempty(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn execute_web_search_graph(
+    state: &AppState,
+    job: WebSearchGraphJob,
+) -> Result<Value, Value> {
+    let WebSearchGraphJob {
+        run_id,
+        tenant,
+        query,
+        provider_allowlist,
+        options,
+    } = job;
+
+    // (1) FRESH pool fan-out: async, NO tenant store lock held. The store guard is
+    // a non-Send std::sync::Mutex guard, so the fan-out await must complete before
+    // any guard is acquired (otherwise this future stops being Send).
+    let providers = state.search_providers(&provider_allowlist);
+    let acquisition =
+        fanout_search_providers(&providers, &query, options.acquisition.clone()).await;
+    let hippo_query_vector = hippo_query_vector_from_env(&query).await?;
+
+    // (2) Synchronous gate: acquire the tenant store, run the membrane gate, drop
+    // the guard. No `.await` lives inside this scope, so the guard never crosses an
+    // await boundary. gate_search_graph reads the warm substrate, unifies the fresh
+    // + warm pools, admits to the token budget (persisting deferred handles byte-
+    // exact), and emits the membrane receipt.
+    let scorer = RerankScorer::web(web_cross_encoder_from_env());
+    let reranker_version = scorer.version();
+    let listwise = web_listwise_reranker_from_env();
+    let result = {
+        let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
+            json!({
+                "error": "store_unavailable",
+                "code": error.code,
+                "message": error.message
+            })
+        })?;
+        let mut gate_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+            json!({
+                "error": "web_search_graph_store_unavailable",
+                "code": error.code,
+                "message": error.message
+            })
+        })?;
+        match hippo_query_vector.as_deref() {
+            Some(query_vector) => gate_search_graph_with_hippo_query_vector(
+                &mut gate_store,
+                acquisition,
+                &options,
+                &scorer,
+                listwise.as_deref(),
+                reranker_version,
+                query_vector,
+            ),
+            None => gate_search_graph(
+                &mut gate_store,
+                acquisition,
+                &options,
+                &scorer,
+                listwise.as_deref(),
+                reranker_version,
+            ),
+        }
+        .map_err(|error| {
+            json!({
+                "error": "web_search_graph_failed",
+                "message": format!("{error:?}")
+            })
+        })?
+    };
+
+    // (3) Fire-and-forget warming (acceptance #4): fetch the top result urls and
+    // write them back as `state="fetched"` Page nodes so the FetchCompletionHook
+    // extraction runs reactively. The response below is assembled and returned
+    // WITHOUT awaiting this. The TenantMirrorGraphStore guard borrows the store, so
+    // it is not 'static; the spawned task therefore fetches first (store-free), then
+    // re-acquires its own tenant store synchronously to write the fetched pages.
+    let seed_urls = result.fetch_seed_urls.clone();
+    if !seed_urls.is_empty() {
+        spawn_web_search_graph_warming(state.clone(), tenant.clone(), run_id.clone(), seed_urls);
+    }
+
+    Ok(json!({
+        "tenant": tenant,
+        "run_id": run_id,
+        "query": result.query,
+        "admitted_context": result.admitted_context,
+        "deferred_handles": result.deferred_handles,
+        "subgraph_ref": result.subgraph_ref,
+        "providers": result.providers,
+        "tokens_admitted": result.tokens_admitted,
+        "tokens_deferred": result.tokens_deferred,
+        "reranker_version": result.reranker_version,
+        "receipt": result.receipt,
+        "fetch_seed_urls": result.fetch_seed_urls,
+        "stats": {
+            "admitted_context": result.admitted_context.len(),
+            "deferred_handles": result.deferred_handles.len(),
+            "providers": providers.len(),
+            "provider_receipts": result.providers.len(),
+            "fetch_seed_urls": result.fetch_seed_urls.len(),
+        },
+        "mode": "sync"
+    }))
+}
+
+/// Fire-and-forget warming spawn for [`execute_web_search_graph`]. Fetches the seed
+/// urls through the membrane warming pass and writes them back as `state="fetched"`
+/// Page nodes. Owns its own tenant store handle (re-acquired inside the task) so the
+/// response's store guard is never held across the spawn. Per-url fetch failures are
+/// swallowed inside `warm_pages_task`; a missing store is logged and dropped.
+fn spawn_web_search_graph_warming(
+    state: AppState,
+    tenant: String,
+    run_id: String,
+    seed_urls: Vec<String>,
+) {
+    tokio::spawn(async move {
+        let mut store = match state.tenant_graph_store(&tenant) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    target: "web_search_graph",
+                    tenant = %tenant,
+                    run_id = %run_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "web_search_graph warming skipped: tenant store unavailable"
+                );
+                return;
+            }
+        };
+        let mut warm_store = match TenantMirrorGraphStore::new(&mut store) {
+            Ok(warm_store) => warm_store,
+            Err(error) => {
+                tracing::warn!(
+                    target: "web_search_graph",
+                    tenant = %tenant,
+                    run_id = %run_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "web_search_graph warming skipped: mirror store unavailable"
+                );
+                return;
+            }
+        };
+        let written = warm_pages_task(&mut warm_store, &seed_urls, run_id.clone()).await;
+        tracing::debug!(
+            target: "web_search_graph",
+            tenant = %tenant,
+            run_id = %run_id,
+            written,
+            requested = seed_urls.len(),
+            "web_search_graph warming pass complete"
+        );
+    });
+}
+
+/// Append the `web_search_graph` tool definition to a `tools/list` response. The
+/// tool's call execution is intercepted in the async router (it persists membrane
+/// receipts + warm pages), so the synchronous MCP backend does not own its
+/// definition; the router injects it so the tool is discoverable in `tools/list`.
+fn inject_hippo_retrieve_tool_definition(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if tools
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("hippo_retrieve"))
+    {
+        return;
+    }
+    tools.push(hippo_retrieve_tool_definition());
+}
+
+fn hippo_retrieve_tool_definition() -> Value {
+    json!({
+        "name": "hippo_retrieve",
+        "description": "HippoRAG 2 graph-resident candidate generation: run query-specific PPR over Page, Phrase, and Hub nodes and return membrane Candidate values. This tool does not rerank or admit to budget.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The retrieval query."
+                },
+                "tenant": {
+                    "type": "string",
+                    "description": "Tenant slug whose graph store is searched. Defaults to the server's default tenant."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Max candidates returned. Default 8.",
+                    "minimum": 1,
+                    "maximum": 100
+                },
+                "include_hubs": {
+                    "type": "boolean",
+                    "description": "Whether Hub nodes can appear as candidates. Default true."
+                },
+                "auto_index_memory": {
+                    "type": "boolean",
+                    "description": "When true, warm a missing HippoRAG index from active MemoryDocument/MemoryNode records before retrieval. Default true."
+                },
+                "index_limit": {
+                    "type": "integer",
+                    "description": "Maximum memory records to warm-index on this call. Default 200.",
+                    "minimum": 1,
+                    "maximum": 5000
+                }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
+fn inject_web_search_graph_tool_definition(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if tools
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("web_search_graph"))
+    {
+        return;
+    }
+    tools.push(web_search_graph_tool_definition());
+}
+
+fn web_search_graph_tool_definition() -> Value {
+    json!({
+        "name": "web_search_graph",
+        "description": "WEB arm of the context membrane (SPEC-CONTEXT-MEMBRANE-1.0): fan a query across search providers, gate the fresh + warm-substrate pools through the token budget, persist deferred handles byte-exact (recoverable), emit a membrane receipt, and warm the top result pages fire-and-forget. Returns the admitted context, deferred handles, and a stable subgraph reference.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to gate into graph context."
+                },
+                "tenant": {
+                    "type": "string",
+                    "description": "Tenant slug whose graph store the gate reads and writes. Defaults to the server's default tenant."
+                },
+                "budget_tokens": {
+                    "type": "integer",
+                    "description": "Token budget the membrane gate fills; overflow defers (recoverable). Default 2000.",
+                    "minimum": 1
+                },
+                "providers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional provider allowlist for the fresh-pool fan-out. Empty uses all configured providers."
+                },
+                "provider_limit": {
+                    "type": "integer",
+                    "description": "Max results requested per provider during fan-out. Default 10.",
+                    "minimum": 1,
+                    "maximum": 50
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max RRF-merged candidates carried into the gate. Default 16.",
+                    "minimum": 1,
+                    "maximum": 100
+                },
+                "rrf_k": {
+                    "type": "integer",
+                    "description": "Reciprocal-rank-fusion k constant for cross-provider merge. Default 60.",
+                    "minimum": 1,
+                    "maximum": 1000
+                },
+                "redundancy_penalty": {
+                    "type": "number",
+                    "description": "Backward-compatible alias for 1 - mmr_lambda. Default 0.3.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "mmr_lambda": {
+                    "type": "number",
+                    "description": "MMR lambda used by the shared membrane fill. 1.0 is pure score-ordered greedy; default 0.7.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "fetch_top_k": {
+                    "type": "integer",
+                    "description": "How many top result urls the fire-and-forget warming pass fetches + writes back as fetched Page nodes. Default 5.",
+                    "minimum": 0,
+                    "maximum": 100
+                }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
+async fn live_fractal_expansion_payload(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<Value, Value> {
+    let job = live_fractal_expansion_job(config, arguments)?;
+    if job.wait {
+        return execute_live_fractal_expansion(state, &job).await;
+    }
+    enqueue_live_fractal_expansion(state.clone(), job).await
+}
+
+fn live_fractal_expansion_job(
+    config: &rustyred_thg_mcp::McpServerConfig,
+    arguments: &Value,
+) -> Result<LiveFractalExpansionJob, Value> {
+    let query = argument_text_any(arguments, &["query", "q"]).ok_or_else(|| {
+        json!({
+            "error": "invalid_fractal_expansion",
+            "message": "fractal_expansion requires query"
+        })
+    })?;
+    let tenant = resolve_tenant_id(
+        argument_text_any(arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .map_err(|error| error.payload())?;
+    let request = FractalExpansionRequest {
+        run_id: argument_text_any(arguments, &["run_id", "runId"])
+            .unwrap_or_else(|| default_live_web_run_id("fractal")),
+        tenant_id: tenant.clone(),
+        query,
+        web_seed_urls: string_array_argument(arguments, "web_seed_urls"),
+        top_k: argument_u64_any(arguments, &["top_k", "topK"]).unwrap_or(5) as usize,
+        frontier_limit: argument_u64_any(arguments, &["frontier_limit", "frontierLimit"])
+            .unwrap_or(8) as usize,
+        web_seed_limit: argument_u64_any(arguments, &["web_seed_limit", "webSeedLimit"])
+            .unwrap_or(8) as usize,
+        budget_tokens: argument_u64_any(arguments, &["budget_tokens", "budgetTokens"])
+            .unwrap_or(2_000) as usize,
+        mmr_lambda: argument_f64_any(arguments, &["mmr_lambda", "mmrLambda"])
+            .unwrap_or(0.7)
+            .clamp(0.0, 1.0) as f32,
+        embedder_model: argument_text_any(arguments, &["embedder_model", "embedderModel"]),
+        actor_id: argument_text_any(arguments, &["actor", "actor_id", "actorId"]),
+    };
+    let max_bytes = argument_u64_any(arguments, &["max_bytes", "maxBytes"])
+        .unwrap_or(LIVE_SEARCH_DEFAULT_MAX_BYTES as u64)
+        .clamp(1, LIVE_SEARCH_HARD_MAX_BYTES as u64) as usize;
+    let provider_allowlist = string_array_argument(arguments, "providers");
+    let search_opts = SearchOpts {
+        provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
+            .unwrap_or(10)
+            .clamp(1, 50) as usize,
+        limit: argument_u64_any(arguments, &["search_limit", "searchLimit"])
+            .unwrap_or(request.web_seed_limit as u64)
+            .clamp(1, 100) as usize,
+        rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
+            .unwrap_or(60)
+            .clamp(1, 1_000) as usize,
+    };
+    let actor_id = request
+        .actor_id
+        .clone()
+        .unwrap_or_else(default_live_web_actor);
+    Ok(LiveFractalExpansionJob {
+        tenant,
+        request,
+        max_bytes,
+        provider_allowlist,
+        search_opts,
+        actor_id,
+        wait: live_web_wait_requested(arguments),
+    })
+}
+
+async fn execute_live_fractal_expansion(
+    state: &AppState,
+    job: &LiveFractalExpansionJob,
+) -> Result<Value, Value> {
+    let mut store = state.tenant_graph_store(&job.tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let vector_designation = ensure_fractal_vector_designation(&store);
+    let mut fractal_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "fractal_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let providers = state.search_providers(&job.provider_allowlist);
+    let receipt = if providers.is_empty() {
+        run_fractal_expansion(
+            &mut fractal_store,
+            job.request.clone(),
+            state.live_fetch_cascade().as_ref(),
+            job.max_bytes,
+        )
+        .await
+    } else {
+        run_fractal_expansion_with_search_providers(
+            &mut fractal_store,
+            job.request.clone(),
+            state.live_fetch_cascade().as_ref(),
+            job.max_bytes,
+            &providers,
+            job.search_opts.clone(),
+        )
+        .await
+    }
+    .map_err(|error| {
+        json!({
+            "error": error.code,
+            "message": error.message
+        })
+    })?;
+    Ok(json!({
+        "tenant": job.tenant,
+        "run_id": job.request.run_id,
+        "receipt": receipt,
+        "vector_designation": vector_designation,
+        "mode": "sync"
+    }))
+}
+
+async fn enqueue_live_fractal_expansion(
+    state: AppState,
+    job: LiveFractalExpansionJob,
+) -> Result<Value, Value> {
+    start_live_web_harness_run(
+        &state,
+        &job.tenant,
+        &job.request.run_id,
+        "fractal_expansion",
+        &job.request.query,
+        &job.actor_id,
+    )?;
+    let handoff = live_web_async_handoff_payload(
+        &job.tenant,
+        &job.request.run_id,
+        "fractal_expansion",
+        &job.request.query,
+    );
+    tokio::spawn(async move {
+        let result = execute_live_fractal_expansion(&state, &job).await;
+        finish_live_web_harness_run(
+            &state,
+            &job.tenant,
+            &job.request.run_id,
+            "fractal_expansion",
+            &job.actor_id,
+            result,
+        )
+        .await;
+    });
+    Ok(handoff)
+}
+
+fn live_web_async_handoff_payload(
+    tenant: &str,
+    run_id: &str,
+    tool_name: &str,
+    query: &str,
+) -> Value {
+    json!({
+        "tenant": tenant,
+        "run_id": run_id,
+        "query": query,
+        "tool": tool_name,
+        "status": "queued",
+        "mode": "async_handoff",
+        "poll": {
+            "tool": "harness_run",
+            "arguments": {
+                "tenant": tenant,
+                "run_id": run_id
+            }
+        }
+    })
+}
+
+fn start_live_web_harness_run(
+    state: &AppState,
+    tenant: &str,
+    run_id: &str,
+    tool_name: &str,
+    query: &str,
+    actor: &str,
+) -> Result<(), Value> {
+    let actor = if actor.trim().is_empty() {
+        default_live_web_actor()
+    } else {
+        actor.trim().to_string()
+    };
+    let artifact_id = format!("live-web-context:{run_id}");
+    let task_signature = stable_hash(json!({
+        "run_id": run_id,
+        "tenant": tenant,
+        "tool": tool_name,
+        "query": query
+    }));
+    append_live_web_harness_transitions(
+        state,
+        tenant,
+        vec![
+            live_web_transition(
+                run_id,
+                &actor,
+                "RUN.CREATED",
+                json!({
+                    "task": format!("{tool_name} live-web async handoff"),
+                    "actor": actor,
+                    "scope": {
+                        "repo": "Theorem",
+                        "branch": "main",
+                        "commit_sha": "",
+                        "workstream_id": "live-web-reach",
+                        "agent_host": "rustyred-thg-server",
+                        "agent_model": "native",
+                        "tenant": tenant,
+                        "tool_name": tool_name,
+                        "query": query,
+                        "async_handoff": true
+                    }
+                }),
+                "created",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "TASK.RESOLVED",
+                json!({ "task_signature": task_signature }),
+                "task-resolved",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "PROFILE.SELECTED",
+                json!({
+                    "profile_id": "live-web-mcp-route",
+                    "profile_version": "1",
+                    "policy_hash": "policy:live-web-async-handoff:v1"
+                }),
+                "profile-selected",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "TOOLKIT.COMPILED",
+                json!({
+                    "selected_tools": [tool_name, "harness_run"],
+                    "selected_plugins": ["theorems-harness"],
+                    "excluded_tools": [],
+                    "permission_reasons": {
+                        tool_name: "live web work runs in a background task and persists receipts",
+                        "harness_run": "client polls run detail after MCP timeout-safe handoff"
+                    }
+                }),
+                "toolkit-compiled",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "CONTEXT.PLANNED",
+                json!({
+                    "budget_tokens": 1024,
+                    "plan_hash": format!("plan:{run_id}"),
+                    "candidate_token_count": 512
+                }),
+                "context-planned",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "CONTEXT.PACKED",
+                json!({
+                    "artifact_id": artifact_id,
+                    "capsule_tokens": 256,
+                    "budget_tokens": 1024,
+                    "included_atom_count": 1,
+                    "excluded_atom_count": 0,
+                    "token_ledger": {
+                        "request": 128,
+                        "route": 128
+                    }
+                }),
+                "context-packed",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "CONTEXT.INJECTED",
+                json!({
+                    "artifact_id": artifact_id,
+                    "adapter": "rustyred-thg-server",
+                    "target": "background_live_web_worker"
+                }),
+                "context-injected",
+            ),
+            live_web_transition(
+                run_id,
+                &actor,
+                "AGENT.ACTING",
+                json!({
+                    "adapter": "rustyred-thg-server",
+                    "started_at": live_web_now_string()
+                }),
+                "agent-acting",
+            ),
+        ],
+    )
+}
+
+async fn finish_live_web_harness_run(
+    state: &AppState,
+    tenant: &str,
+    run_id: &str,
+    tool_name: &str,
+    actor: &str,
+    result: Result<Value, Value>,
+) {
+    let transitions = match result {
+        Ok(payload) => vec![
+            live_web_transition(
+                run_id,
+                actor,
+                "OUTCOME.RECORDED",
+                json!({
+                    "accepted": true,
+                    "tests_passed": false,
+                    "validator_results": [],
+                    "files_changed": [],
+                    "summary": format!("{tool_name} completed"),
+                    "receipt": payload
+                }),
+                "outcome-recorded",
+            ),
+            live_web_transition(
+                run_id,
+                actor,
+                "RUN.CLOSED",
+                json!({
+                    "summary": format!("{tool_name} completed"),
+                    "closed_by": actor
+                }),
+                "run-closed",
+            ),
+        ],
+        Err(error) => vec![live_web_transition(
+            run_id,
+            actor,
+            "RUN.FAILED",
+            json!({
+                "error_code": error
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("live_web_background_error"),
+                "message": error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("live web background task failed"),
+                "details": error
+            }),
+            "run-failed",
+        )],
+    };
+    if let Err(error) = append_live_web_harness_transitions(state, tenant, transitions) {
+        tracing::warn!(
+            run_id = run_id,
+            tenant = tenant,
+            tool_name = tool_name,
+            error = %error,
+            "failed to persist live-web harness completion"
+        );
+    }
+}
+
+fn append_live_web_harness_transitions(
+    state: &AppState,
+    tenant: &str,
+    transitions: Vec<TransitionInput>,
+) -> Result<(), Value> {
+    let mut store = state.tenant_graph_store(tenant).map_err(|error| {
+        json!({
+            "error": "store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    let mut runtime_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+        json!({
+            "error": "harness_run_store_unavailable",
+            "code": error.code,
+            "message": error.message
+        })
+    })?;
+    for transition in transitions {
+        append_transition_from_store(&mut runtime_store, transition).map_err(|error| {
+            json!({
+                "error": "harness_run_append_failed",
+                "message": error.to_string()
+            })
+        })?;
+    }
+    Ok(())
+}
+
+fn live_web_transition(
+    run_id: &str,
+    actor: &str,
+    event_type: &str,
+    payload: Value,
+    idempotency_key: &str,
+) -> TransitionInput {
+    let mut transition = TransitionInput::new(event_type, json_object(payload));
+    transition.run_id = run_id.to_string();
+    transition.actor = actor.to_string();
+    transition.idempotency_key = format!("{run_id}:{idempotency_key}");
+    transition
+}
+
+fn json_object(value: Value) -> Map<String, Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+fn live_web_wait_requested(arguments: &Value) -> bool {
+    if let Some(wait) = argument_bool_any(arguments, &["wait", "sync", "synchronous"]) {
+        return wait;
+    }
+    argument_bool_any(arguments, &["async", "async_handoff", "asyncHandoff"])
+        .map(|async_requested| !async_requested)
+        .unwrap_or(false)
+}
+
+fn default_live_web_actor() -> String {
+    "rustyred-thg-server".to_string()
+}
+
+fn default_live_web_run_id(prefix: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("{prefix}-{millis}")
+}
+
+fn live_web_now_string() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("{}.{:09}Z", duration.as_secs(), duration.subsec_nanos()),
+        Err(_) => "0.000000000Z".to_string(),
+    }
+}
+
+fn ensure_fractal_vector_designation(store: &TenantGraphStore) -> Value {
+    match store.designate_vector_property(
+        LABEL_PAGE,
+        SEMANTIC_VECTOR_PROPERTY,
+        QWEN3_EMBEDDING_4B_DIMENSION,
+    ) {
+        Ok(()) => json!({
+            "status": "ready",
+            "label": LABEL_PAGE,
+            "property": SEMANTIC_VECTOR_PROPERTY,
+            "dimension": QWEN3_EMBEDDING_4B_DIMENSION
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "label": LABEL_PAGE,
+            "property": SEMANTIC_VECTOR_PROPERTY,
+            "dimension": QWEN3_EMBEDDING_4B_DIMENSION,
+            "code": error.code,
+            "message": error.message
+        }),
+    }
+}
+
+struct TenantMirrorGraphStore<'a> {
+    store: &'a mut TenantGraphStore,
+    mirror: InMemoryGraphStore,
+}
+
+impl<'a> TenantMirrorGraphStore<'a> {
+    fn new(store: &'a mut TenantGraphStore) -> GraphStoreResult<Self> {
+        let mirror = InMemoryGraphStore::from_snapshot(store.graph_snapshot()?)?;
+        Ok(Self { store, mirror })
+    }
+}
+
+impl GraphStore for TenantMirrorGraphStore<'_> {
+    fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
+        let write = self.store.upsert_node(node.clone())?;
+        GraphStore::upsert_node(&mut self.mirror, node)?;
+        Ok(write)
+    }
+
+    fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<GraphWriteResult> {
+        let write = self.store.upsert_edge(edge.clone())?;
+        GraphStore::upsert_edge(&mut self.mirror, edge)?;
+        Ok(write)
+    }
+
+    fn get_node(&self, id: &str) -> Option<&NodeRecord> {
+        GraphStore::get_node(&self.mirror, id)
+    }
+
+    fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
+        GraphStore::get_edge(&self.mirror, id)
+    }
+
+    fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
+        GraphStore::query_nodes(&self.mirror, query)
+    }
+
+    fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
+        GraphStore::neighbors(&self.mirror, query)
+    }
+
+    fn stats(&self) -> GraphStats {
+        GraphStore::stats(&self.mirror)
+    }
+
+    fn verify(&self) -> VerifyReport {
+        GraphStore::verify(&self.mirror)
+    }
+
+    fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
+        let report = self.store.rebuild_indexes()?;
+        GraphStore::rebuild_indexes(&mut self.mirror)?;
+        Ok(report)
+    }
+}
+
+fn mcp_tool_result(payload: Value) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+        }],
+        "structuredContent": payload
+    })
+}
+
+fn mcp_tool_result_error(payload: Value) -> Value {
+    let mut result = mcp_tool_result(payload);
+    if let Value::Object(map) = &mut result {
+        map.insert("isError".to_string(), Value::Bool(true));
+    }
+    result
+}
+
+fn argument_text_any(arguments: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn argument_u64_any(arguments: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_u64))
+}
+
+fn argument_f64_any(arguments: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_f64))
+}
+
+fn argument_bool_any(arguments: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        let value = arguments.get(*key)?;
+        match value {
+            Value::Bool(value) => Some(*value),
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+fn argument_string_list_any(arguments: &Value, keys: &[&str]) -> Option<Vec<String>> {
+    keys.iter().find_map(|key| {
+        let values = string_array_argument(arguments, key);
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        }
+    })
+}
+
+fn grounded_claims_argument(arguments: &Value) -> Vec<GroundedClaim> {
+    arguments
+        .get("claims")
+        .and_then(Value::as_array)
+        .map(|claims| {
+            claims
+                .iter()
+                .filter_map(|claim| {
+                    let text = claim
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    let provenance = claim
+                        .get("provenance")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if text.is_empty() || provenance.is_empty() {
+                        None
+                    } else {
+                        Some(GroundedClaim::new(text, provenance))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mcp_error_payload(error: rustyred_thg_mcp::McpError) -> Value {
+    json!({
+        "error": error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("mcp_error"),
+        "message": error.message,
+        "data": error.data
+    })
+}
+
+fn string_array_argument(arguments: &Value, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store_ready() {
+        Ok(report) => Json(json!({
+            "status": "ready",
+            "store": report.store,
+            "mode": report.mode,
+            "durability": report.durability,
+            "strict_acid": report.strict_acid,
+            "require_volume": report.require_volume,
+            "data_dir": report.data_dir
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "store": "unavailable",
+                "mode": state.config.storage_mode.as_str(),
+                "error": error.code,
+                "message": error.message
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn search_home(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    render_search_response(
+        &state,
+        &headers,
+        SearchQuery {
+            q: None,
+            tenant: None,
+        },
+    )
+}
+
+async fn search_html(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> axum::response::Response {
+    render_search_response(&state, &headers, query)
+}
+
+async fn search_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> axum::response::Response {
+    match execute_search(&state, &headers, &query) {
+        Ok((tenant_id, search)) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "search": search
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn search_live(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveSearchRequest>,
+) -> axum::response::Response {
+    execute_live_search(&state, &headers, query).await
+}
+
+async fn search_answer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LiveSearchRequest>,
+) -> axum::response::Response {
+    execute_live_search(&state, &headers, body).await
+}
+
+async fn execute_live_search(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: LiveSearchRequest,
+) -> axum::response::Response {
+    let search_query = SearchQuery {
+        q: request.q.clone(),
+        tenant: request.tenant.clone(),
+    };
+    let (tenant_id, initial) = match execute_search(state, headers, &search_query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+
+    let query_text = request.q.as_deref().unwrap_or_default().trim();
+    let min_hits = request.min_hits.unwrap_or(LIVE_SEARCH_DEFAULT_MIN_HITS);
+    let min_links = request.min_links.unwrap_or(LIVE_SEARCH_DEFAULT_MIN_LINKS);
+    let crawl_enabled = request.crawl.unwrap_or(true);
+    if !crawl_enabled
+        || query_text.is_empty()
+        || !live_search_is_sparse(&initial, min_hits, min_links)
+    {
+        let reason = if !crawl_enabled {
+            "crawl_disabled"
+        } else if query_text.is_empty() {
+            "empty_query"
+        } else {
+            "substrate_dense_enough"
+        };
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": initial.query,
+            "phase": "search_only",
+            "initial": live_search_summary(&initial),
+            "crawl": {
+                "attempted": false,
+                "reason": reason,
+                "min_hits": min_hits,
+                "min_links": min_links
+            },
+            "search": initial
+        }))
+        .into_response();
+    }
+
+    if let Err(status) = require_scope(
+        headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let (seeds, seed_strategy) = derive_live_search_seeds(query_text, &request.seeds);
+    if seeds.is_empty() {
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": initial.query,
+            "phase": "search_only",
+            "initial": live_search_summary(&initial),
+            "crawl": {
+                "attempted": false,
+                "reason": "no_crawl_seed",
+                "seed_strategy": seed_strategy,
+                "min_hits": min_hits,
+                "min_links": min_links
+            },
+            "search": initial
+        }))
+        .into_response();
+    }
+
+    let crawl_budget = live_search_budget(&request);
+    let scope_was_supplied = request.scope.is_some();
+    let mut crawl_request = CrawlRequest::new(
+        request.run_id.clone().unwrap_or_else(default_crawl_run_id),
+        seeds.clone(),
+    );
+    crawl_request.budget = crawl_budget.clone();
+    crawl_request.scope = request.scope.clone().unwrap_or_default();
+    if federation_enabled() && !scope_was_supplied {
+        crawl_request.scope.federable = true;
+    }
+
+    let federation_request = crawl_request.clone();
+    let output = match run_live_crawl(crawl_request).await {
+        Ok(output) => output,
+        Err(error) => {
+            return Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "query": initial.query,
+                "phase": "crawl_failed",
+                "initial": live_search_summary(&initial),
+                "crawl": {
+                    "attempted": true,
+                    "seed_strategy": seed_strategy,
+                    "seeds": seeds,
+                    "budget": crawl_budget,
+                    "error": "rustyweb_crawl_error",
+                    "message": error.to_string()
+                },
+                "search": initial
+            }))
+            .into_response();
+        }
+    };
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let transaction = match store.commit_batch(output.graph.batch.clone()) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let federation =
+        submit_web_commons_fragment(state, &tenant_id, &federation_request, &output).await;
+    let (_tenant_id, search) = match execute_search(state, headers, &search_query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "query": search.query,
+        "phase": "crawled",
+        "initial": live_search_summary(&initial),
+        "crawl": {
+            "attempted": true,
+            "seed_strategy": seed_strategy,
+            "seeds": seeds,
+            "receipt": output.receipt,
+            "transaction": transaction,
+            "federation": federation,
+            "min_hits": min_hits,
+            "min_links": min_links
+        },
+        "search": search
+    }))
+    .into_response()
+}
+
+fn live_search_is_sparse(
+    search: &rustyred_web::SubstrateSearch,
+    min_hits: usize,
+    min_links: usize,
+) -> bool {
+    search.matched_count < min_hits || search.links.len() < min_links
+}
+
+fn live_search_summary(search: &rustyred_web::SubstrateSearch) -> Value {
+    json!({
+        "matched_count": search.matched_count,
+        "kept_count": search.kept_count,
+        "hits": search.hits.len(),
+        "links": search.links.len()
+    })
+}
+
+fn live_search_budget(request: &LiveSearchRequest) -> CrawlBudget {
+    let mut budget = request.budget.clone().unwrap_or(CrawlBudget {
+        max_pages: LIVE_SEARCH_DEFAULT_MAX_PAGES,
+        max_seconds: LIVE_SEARCH_DEFAULT_MAX_SECONDS,
+        max_depth: LIVE_SEARCH_DEFAULT_MAX_DEPTH,
+        max_bytes: LIVE_SEARCH_DEFAULT_MAX_BYTES,
+    });
+    if let Some(max_pages) = request.max_pages {
+        budget.max_pages = max_pages;
+    }
+    if let Some(max_seconds) = request.max_seconds {
+        budget.max_seconds = max_seconds;
+    }
+    if let Some(max_depth) = request.max_depth {
+        budget.max_depth = max_depth;
+    }
+    if let Some(max_bytes) = request.max_bytes {
+        budget.max_bytes = max_bytes;
+    }
+    budget.max_pages = budget.max_pages.clamp(1, LIVE_SEARCH_HARD_MAX_PAGES);
+    budget.max_seconds = budget.max_seconds.clamp(1, LIVE_SEARCH_HARD_MAX_SECONDS);
+    budget.max_depth = budget.max_depth.min(LIVE_SEARCH_HARD_MAX_DEPTH);
+    budget.max_bytes = budget.max_bytes.clamp(1, LIVE_SEARCH_HARD_MAX_BYTES);
+    budget
+}
+
+fn derive_live_search_seeds(query: &str, supplied: &[String]) -> (Vec<String>, &'static str) {
+    let mut seeds = Vec::new();
+    let mut seen = BTreeSet::new();
+    for seed in supplied {
+        push_live_search_seed(&mut seeds, &mut seen, seed.trim().to_string());
+    }
+    if !seeds.is_empty() {
+        return (seeds, "provided");
+    }
+    if let Some(seed) = direct_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "direct_url");
+    }
+    if let Some(seed) = domain_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "domain_guess");
+    }
+    if let Some(seed) = wikipedia_live_search_seed(query) {
+        push_live_search_seed(&mut seeds, &mut seen, seed);
+        return (seeds, "wikipedia_title_guess");
+    }
+    (seeds, "none")
+}
+
+fn push_live_search_seed(seeds: &mut Vec<String>, seen: &mut BTreeSet<String>, seed: String) {
+    let trimmed = seed.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if seen.insert(trimmed.to_string()) {
+        seeds.push(trimmed.to_string());
+    }
+}
+
+fn direct_live_search_seed(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn domain_live_search_seed(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.chars().any(char::is_whitespace) || trimmed.contains("://") {
+        return None;
+    }
+    let host_like = trimmed
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('.');
+    if host_like.contains('.') && host_like.chars().any(|c| c.is_ascii_alphabetic()) {
+        Some(format!("https://{trimmed}"))
+    } else {
+        None
+    }
+}
+
+fn wikipedia_live_search_seed(query: &str) -> Option<String> {
+    let title: Vec<String> = query
+        .split_whitespace()
+        .filter_map(wikipedia_title_token)
+        .collect();
+    if title.is_empty() {
+        None
+    } else {
+        Some(format!("https://en.wikipedia.org/wiki/{}", title.join("_")))
+    }
+}
+
+fn wikipedia_title_token(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut chars = cleaned.chars();
+    let first = chars.next()?.to_ascii_uppercase();
+    let rest = chars.as_str().to_ascii_lowercase();
+    Some(format!("{first}{rest}"))
+}
+fn render_search_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: SearchQuery,
+) -> axum::response::Response {
+    let (_tenant_id, search) = match execute_search(state, headers, &query) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    (
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        render_serp_html(&search),
+    )
+        .into_response()
+}
+
+fn execute_search(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &SearchQuery,
+) -> Result<(String, rustyred_web::SubstrateSearch), axum::response::Response> {
+    let tenant_id =
+        resolve_authorized_route_tenant(headers, state, "graph:read", query.tenant.as_deref())?;
+    let store = search_snapshot_store(state, &tenant_id)?;
+    let search = search_substrate(
+        &store,
+        query.q.as_deref().unwrap_or_default(),
+        SearchOptions::default(),
+    );
+    Ok((tenant_id, search))
+}
+
+async fn crawl_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CrawlRouteBody>,
+) -> axum::response::Response {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "graph:write",
+        body.tenant.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    let scope_was_supplied = body.scope.is_some();
+    let mut request =
+        CrawlRequest::new(body.run_id.unwrap_or_else(default_crawl_run_id), body.seeds);
+    request.budget = body.budget.unwrap_or_default();
+    request.scope = body.scope.unwrap_or_default();
+    if federation_enabled() && !scope_was_supplied {
+        request.scope.federable = true;
+    }
+
+    let federation_request = request.clone();
+    let output = match run_live_crawl(request).await {
+        Ok(output) => output,
+        Err(error) => return rustyweb_error_response(error),
+    };
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let transaction = match store.commit_batch(output.graph.batch.clone()) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let federation =
+        submit_web_commons_fragment(&state, &tenant_id, &federation_request, &output).await;
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "receipt": output.receipt,
+        "transaction": transaction,
+        "federation": federation
+    }))
+    .into_response()
+}
+
+async fn federate_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FederateSubmitBody>,
+) -> axum::response::Response {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "federation:write",
+        body.tenant.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    if let Some(fragment) = body.fragment {
+        return ingest_web_commons_fragment(&state, &tenant_id, fragment);
+    }
+    let federable = body
+        .federable
+        .or_else(|| body.receipt.as_ref().map(|receipt| receipt.scope.federable))
+        .unwrap_or(false);
+    if !federable {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "not_federable",
+                "message": "federation submit requires federable=true or a federable crawl receipt"
+            })),
+        )
+            .into_response();
+    }
+    let graph_delta_hash = body.graph_delta_hash.or_else(|| {
+        body.receipt
+            .as_ref()
+            .map(|receipt| receipt.graph_delta_hash.clone())
+    });
+    let graph_delta_hash = match graph_delta_hash.filter(|hash| !hash.trim().is_empty()) {
+        Some(hash) => hash,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "fragment_required",
+                    "message": "federation submit requires a signed Web Commons fragment or a non-empty receipt/hash"
+                })),
+            )
+                .into_response();
+        }
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "accepted": true,
+        "merged": false,
+        "status": "validated_noop",
+        "graph_delta_hash": graph_delta_hash
+    }))
+    .into_response()
+}
+
+fn ingest_web_commons_fragment(
+    state: &AppState,
+    tenant_id: &str,
+    fragment: WebCommonsFragment,
+) -> axum::response::Response {
+    if let Err(response) = verify_web_commons_fragment_signature(&fragment) {
+        return response;
+    }
+    let mut store = match state.tenant_graph_store(tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let base = match store.graph_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let trust = web_commons_peer_trust(&base, &fragment.peer_id);
+    if trust.weight <= 0.0 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "peer_blocked",
+                "message": "web_commons peer is blocked",
+                "peer_id": fragment.peer_id,
+                "trust_tier": trust.tier,
+            })),
+        )
+            .into_response();
+    }
+
+    let receipt = web_commons_receipt_for_fragment(&base, &fragment, &trust);
+    let plan = match build_web_commons_ingest_plan(&fragment, receipt) {
+        Ok(plan) => plan,
+        Err(error) => return rustyweb_error_response(error),
+    };
+    let mut projected = match InMemoryGraphStore::from_snapshot(base.clone()) {
+        Ok(store) => store,
+        Err(error) => return graph_store_error_response(error),
+    };
+    if let Err(error) = apply_batch_to_store(&mut projected, &plan.batch) {
+        return graph_store_error_response(error);
+    }
+    let target = projected.snapshot();
+    let merge = merge_graph_snapshots(
+        &base,
+        &base,
+        &target,
+        GraphMergeOptions {
+            strategy: GraphMergeStrategy::PreferTheirs,
+            name: Some("web-commons-merge".to_string()),
+            message: Some("merge signed Web Commons fragment".to_string()),
+            ..GraphMergeOptions::default()
+        },
+    );
+    if !merge.conflicts.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "web_commons_merge_conflict",
+                "message": "signed Web Commons fragment produced merge conflicts",
+                "merge": merge,
+            })),
+        )
+            .into_response();
+    }
+    let transaction = match store.commit_batch(plan.batch.clone()) {
+        Ok(transaction) => transaction,
+        Err(error) => return graph_store_error_response(error),
+    };
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "accepted": plan.receipt.accepted,
+        "merged": true,
+        "status": "merged",
+        "graph_delta_hash": plan.receipt.graph_delta_hash,
+        "receipt": plan.receipt,
+        "merge": merge,
+        "transaction": transaction,
+    }))
+    .into_response()
+}
+
+async fn submit_web_commons_fragment(
+    _state: &AppState,
+    tenant_id: &str,
+    request: &CrawlRequest,
+    output: &rustyred_web::CrawlRunOutput,
+) -> Value {
+    if !federation_enabled() {
+        return json!({"enabled": false, "submitted": false, "reason": "disabled"});
+    }
+    if !request.scope.federable {
+        return json!({"enabled": true, "submitted": false, "reason": "scope_not_federable"});
+    }
+    let Some(hub_url) = federation_hub_url() else {
+        return json!({"enabled": true, "submitted": false, "reason": "hub_url_missing"});
+    };
+    let Some(private_key) = federation_private_key() else {
+        return json!({"enabled": true, "submitted": false, "reason": "private_key_missing"});
+    };
+    let public_peer_id = match public_peer_id_from_private_key(&private_key) {
+        Ok(peer_id) => peer_id,
+        Err(error) => {
+            return json!({"enabled": true, "submitted": false, "reason": "private_key_invalid", "error": error});
+        }
+    };
+    let peer_id = federation_peer_id().unwrap_or_else(|| public_peer_id.clone());
+    if normalize_peer_id(&peer_id) != public_peer_id {
+        return json!({
+            "enabled": true,
+            "submitted": false,
+            "reason": "peer_id_private_key_mismatch",
+        });
+    }
+    let options = WebCommonsFragmentOptions {
+        include_provenance: federation_provenance(),
+        snapshot_text_bytes: federation_snapshot_text_bytes(),
+    };
+    let mut fragment = match build_web_commons_fragment(output, request, peer_id, &options) {
+        Ok(fragment) => fragment,
+        Err(error) => {
+            return json!({"enabled": true, "submitted": false, "reason": "fragment_build_failed", "error": error.to_string()});
+        }
+    };
+    if let Err(error) = sign_web_commons_fragment(&mut fragment, &private_key) {
+        return json!({"enabled": true, "submitted": false, "reason": "fragment_sign_failed", "error": error});
+    }
+
+    let submit_url = federation_submit_url(&hub_url);
+    let mut request_builder = reqwest::Client::new().post(&submit_url).json(&json!({
+        "tenant": tenant_id,
+        "federable": true,
+        "graph_delta_hash": fragment.graph_delta_hash,
+        "fragment": fragment,
+    }));
+    if let Some(token) = federation_token() {
+        request_builder = request_builder.bearer_auth(token);
+    }
+    match request_builder.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.json::<Value>().await.unwrap_or_else(|error| {
+                json!({
+                    "error": "invalid_hub_response",
+                    "message": error.to_string(),
+                })
+            });
+            json!({
+                "enabled": true,
+                "submitted": status.is_success(),
+                "status": status.as_u16(),
+                "hub_url": submit_url,
+                "response": body,
+            })
+        }
+        Err(error) => json!({
+            "enabled": true,
+            "submitted": false,
+            "hub_url": submit_url,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WebCommonsPeerTrust {
+    tier: String,
+    weight: f64,
+}
+
+#[derive(Default)]
+struct PageSupport {
+    peer_weights: BTreeMap<String, f64>,
+    domains: BTreeSet<String>,
+    source_classes: BTreeSet<String>,
+    fetched_times: BTreeSet<i128>,
+    inbound_total: usize,
+    inbound_external: usize,
+}
+
+impl PageSupport {
+    fn weighted_peer_sum(&self) -> f64 {
+        self.peer_weights.values().sum()
+    }
+
+    fn external_support_ratio(&self) -> f64 {
+        if self.inbound_total == 0 {
+            0.0
+        } else {
+            self.inbound_external as f64 / self.inbound_total as f64
+        }
+    }
+
+    fn temporal_spread_ms(&self) -> i128 {
+        match (
+            self.fetched_times.iter().next(),
+            self.fetched_times.iter().next_back(),
+        ) {
+            (Some(first), Some(last)) => last - first,
+            _ => 0,
+        }
+    }
+}
+
+fn web_commons_receipt_for_fragment(
+    base: &GraphSnapshot,
+    fragment: &WebCommonsFragment,
+    trust: &WebCommonsPeerTrust,
+) -> WebCommonsReceipt {
+    let support = web_commons_support(base, fragment, trust);
+    let dispositions = fragment
+        .pages
+        .iter()
+        .map(|page| page_disposition(page, support.get(&page.id)))
+        .collect::<Vec<_>>();
+    let accepted_pages = dispositions
+        .iter()
+        .filter(|disposition| disposition.disposition != "dropped")
+        .count();
+    let dropped_pages = dispositions.len().saturating_sub(accepted_pages);
+
+    WebCommonsReceipt {
+        accepted: accepted_pages > 0,
+        peer_id: fragment.peer_id.clone(),
+        graph_delta_hash: fragment.graph_delta_hash.clone(),
+        accepted_pages,
+        dropped_pages,
+        dispositions,
+    }
+}
+
+fn page_disposition(page: &PageRecord, support: Option<&PageSupport>) -> WebCommonsPageDisposition {
+    if page.id.trim().is_empty() || page.url.trim().is_empty() || page.domain.trim().is_empty() {
+        return WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "dropped".to_string(),
+            reason: "missing required page identity fields".to_string(),
+        };
+    }
+    let Some(support) = support else {
+        return WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "probationary".to_string(),
+            reason: "first attestation recorded".to_string(),
+        };
+    };
+    let canonical = support.peer_weights.len() >= 2
+        && support.weighted_peer_sum() >= 1.0
+        && support.domains.len() >= 2
+        && support.external_support_ratio() >= 0.5
+        && support.temporal_spread_ms() >= 1;
+    if canonical {
+        WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "canonical".to_string(),
+            reason: "independent peer, domain, external-link, and temporal support satisfied"
+                .to_string(),
+        }
+    } else {
+        WebCommonsPageDisposition {
+            page_id: page.id.clone(),
+            url: page.url.clone(),
+            disposition: "probationary".to_string(),
+            reason: format!(
+                "awaiting corroboration: peers={}, domains={}, external_support={:.2}, temporal_spread_ms={}",
+                support.peer_weights.len(),
+                support.domains.len(),
+                support.external_support_ratio(),
+                support.temporal_spread_ms()
+            ),
+        }
+    }
+}
+
+fn web_commons_support(
+    base: &GraphSnapshot,
+    fragment: &WebCommonsFragment,
+    current_trust: &WebCommonsPeerTrust,
+) -> BTreeMap<String, PageSupport> {
+    let mut support: BTreeMap<String, PageSupport> = BTreeMap::new();
+    let peer_weights = web_commons_peer_weights(base);
+    let mut page_domains = page_domains_from_snapshot(base);
+    for page in &fragment.pages {
+        page_domains.insert(page.id.clone(), page.domain.clone());
+    }
+
+    for node in &base.nodes {
+        if !node
+            .labels
+            .iter()
+            .any(|label| label == LABEL_WEB_COMMONS_ATTESTATION)
+        {
+            continue;
+        }
+        let Some(page_id) = json_string(&node.properties, "page_id") else {
+            continue;
+        };
+        let peer_id = json_string(&node.properties, "peer_id").unwrap_or_default();
+        let weight = peer_weights
+            .get(&peer_id)
+            .copied()
+            .unwrap_or_else(|| trust_weight_for_tier("unknown"));
+        add_page_support(
+            support.entry(page_id).or_default(),
+            peer_id,
+            weight,
+            json_string(&node.properties, "domain"),
+            json_string(&node.properties, "source_class"),
+            json_string(&node.properties, "fetched_at"),
+        );
+    }
+
+    for page in &fragment.pages {
+        add_page_support(
+            support.entry(page.id.clone()).or_default(),
+            fragment.peer_id.clone(),
+            current_trust.weight,
+            Some(page.domain.clone()),
+            Some(page.source_class.clone()),
+            page.fetched_at.clone(),
+        );
+    }
+
+    for edge in &base.edges {
+        if edge.edge_type == EDGE_LINKS_TO {
+            add_inbound_support(&mut support, &page_domains, &edge.from_id, &edge.to_id);
+        }
+    }
+    for edge in &fragment.edges {
+        add_inbound_support(
+            &mut support,
+            &page_domains,
+            &edge.from_page_id,
+            &edge.to_page_id,
+        );
+    }
+
+    support
+}
+
+fn add_page_support(
+    support: &mut PageSupport,
+    peer_id: String,
+    weight: f64,
+    domain: Option<String>,
+    source_class: Option<String>,
+    fetched_at: Option<String>,
+) {
+    if !peer_id.trim().is_empty() {
+        support.peer_weights.insert(peer_id, weight);
+    }
+    if let Some(domain) = domain.filter(|value| !value.trim().is_empty()) {
+        support.domains.insert(domain);
+    }
+    if let Some(source_class) = source_class.filter(|value| !value.trim().is_empty()) {
+        support.source_classes.insert(source_class);
+    }
+    if let Some(timestamp) = fetched_at.and_then(|value| value.parse::<i128>().ok()) {
+        support.fetched_times.insert(timestamp);
+    }
+}
+
+fn add_inbound_support(
+    support: &mut BTreeMap<String, PageSupport>,
+    page_domains: &BTreeMap<String, String>,
+    from_page_id: &str,
+    to_page_id: &str,
+) {
+    let Some(from_domain) = page_domains.get(from_page_id) else {
+        return;
+    };
+    let Some(to_domain) = page_domains.get(to_page_id) else {
+        return;
+    };
+    let page_support = support.entry(to_page_id.to_string()).or_default();
+    page_support.inbound_total += 1;
+    page_support.domains.insert(from_domain.clone());
+    if from_domain != to_domain {
+        page_support.inbound_external += 1;
+    }
+}
+
+fn page_domains_from_snapshot(snapshot: &GraphSnapshot) -> BTreeMap<String, String> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.labels.iter().any(|label| label == LABEL_PAGE))
+        .filter_map(|node| {
+            json_string(&node.properties, "domain").map(|domain| (node.id.clone(), domain))
+        })
+        .collect()
+}
+
+fn web_commons_peer_trust(snapshot: &GraphSnapshot, peer_id: &str) -> WebCommonsPeerTrust {
+    let mut selected: Option<WebCommonsPeerTrust> = None;
+    for node in snapshot.nodes.iter().filter(|node| {
+        node.labels
+            .iter()
+            .any(|label| label == LABEL_WEB_COMMONS_PEER)
+            && json_string(&node.properties, "peer_id").as_deref() == Some(peer_id)
+    }) {
+        let tier =
+            json_string(&node.properties, "trust_tier").unwrap_or_else(|| "unknown".to_string());
+        let weight = json_f64(&node.properties, "trust_weight")
+            .unwrap_or_else(|| trust_weight_for_tier(&tier));
+        if tier == "blocked" || weight <= 0.0 {
+            return WebCommonsPeerTrust { tier, weight: 0.0 };
+        }
+        if selected
+            .as_ref()
+            .is_none_or(|current| weight > current.weight)
+        {
+            selected = Some(WebCommonsPeerTrust { tier, weight });
+        }
+    }
+    selected.unwrap_or_else(|| WebCommonsPeerTrust {
+        tier: "unknown".to_string(),
+        weight: trust_weight_for_tier("unknown"),
+    })
+}
+
+fn web_commons_peer_weights(snapshot: &GraphSnapshot) -> BTreeMap<String, f64> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.labels
+                .iter()
+                .any(|label| label == LABEL_WEB_COMMONS_PEER)
+        })
+        .filter_map(|node| {
+            let peer_id = json_string(&node.properties, "peer_id")?;
+            let tier = json_string(&node.properties, "trust_tier")
+                .unwrap_or_else(|| "unknown".to_string());
+            let weight = json_f64(&node.properties, "trust_weight")
+                .unwrap_or_else(|| trust_weight_for_tier(&tier));
+            Some((peer_id, weight))
+        })
+        .fold(BTreeMap::new(), |mut weights, (peer_id, weight)| {
+            weights
+                .entry(peer_id)
+                .and_modify(|current| {
+                    if weight <= 0.0 {
+                        *current = 0.0;
+                    } else if *current > 0.0 {
+                        *current = (*current).max(weight);
+                    }
+                })
+                .or_insert(weight);
+            weights
+        })
+}
+
+fn trust_weight_for_tier(tier: &str) -> f64 {
+    match tier {
+        "self" | "verified" => 1.0,
+        "blocked" => 0.0,
+        _ => 0.3,
+    }
+}
+
+fn verify_web_commons_fragment_signature(
+    fragment: &WebCommonsFragment,
+) -> Result<(), axum::response::Response> {
+    if fragment.signature.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unsigned_fragment",
+                "message": "Web Commons fragment requires an Ed25519 signature"
+            })),
+        )
+            .into_response());
+    }
+    let verifying_key = decode_ed25519_array::<32>(&fragment.peer_id, "peer_id")
+        .and_then(|bytes| VerifyingKey::from_bytes(&bytes).map_err(|error| error.to_string()));
+    let signature = decode_ed25519_array::<64>(&fragment.signature, "signature")
+        .map(|bytes| Signature::from_bytes(&bytes));
+    let signing_bytes = fragment.signing_bytes().map_err(|error| error.to_string());
+    match (verifying_key, signature, signing_bytes) {
+        (Ok(verifying_key), Ok(signature), Ok(signing_bytes)) => verifying_key
+            .verify(&signing_bytes, &signature)
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "bad_signature",
+                        "message": error.to_string(),
+                    })),
+                )
+                    .into_response()
+            }),
+        (verifying_key, signature, signing_bytes) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "bad_signature",
+                "message": verifying_key
+                    .err()
+                    .or_else(|| signature.err())
+                    .or_else(|| signing_bytes.err())
+                    .unwrap_or_else(|| "invalid signature".to_string()),
+            })),
+        )
+            .into_response()),
+    }
+}
+
+fn sign_web_commons_fragment(
+    fragment: &mut WebCommonsFragment,
+    private_key: &str,
+) -> Result<(), String> {
+    let bytes = decode_ed25519_array::<32>(private_key, "private_key")?;
+    let signing_key = SigningKey::from_bytes(&bytes);
+    let expected_peer_id = hex::encode(signing_key.verifying_key().to_bytes());
+    if normalize_peer_id(&fragment.peer_id) != expected_peer_id {
+        return Err("peer_id does not match Ed25519 private key".to_string());
+    }
+    let signature = signing_key.sign(
+        &fragment
+            .signing_bytes()
+            .map_err(|error| error.to_string())?,
+    );
+    fragment.signature = hex::encode(signature.to_bytes());
+    Ok(())
+}
+
+fn public_peer_id_from_private_key(private_key: &str) -> Result<String, String> {
+    let bytes = decode_ed25519_array::<32>(private_key, "private_key")?;
+    let signing_key = SigningKey::from_bytes(&bytes);
+    Ok(hex::encode(signing_key.verifying_key().to_bytes()))
+}
+
+fn normalize_peer_id(peer_id: &str) -> String {
+    peer_id
+        .trim()
+        .strip_prefix("ed25519:")
+        .unwrap_or_else(|| peer_id.trim())
+        .to_ascii_lowercase()
+}
+
+fn decode_ed25519_array<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
+    let normalized = normalize_peer_id(value);
+    let decoded = hex::decode(&normalized).map_err(|error| format!("{field}: {error}"))?;
+    if decoded.len() != N {
+        return Err(format!(
+            "{field}: expected {N} bytes, got {}",
+            decoded.len()
+        ));
+    }
+    let mut bytes = [0u8; N];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+fn federation_submit_url(hub_url: &str) -> String {
+    let trimmed = hub_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/federate/submit") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/federate/submit")
+    }
+}
+
+fn federation_env(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn federation_enabled() -> bool {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE",
+        "RUSTYRED_THG_FEDERATE",
+        "RUSTYRED_FEDERATE",
+    ])
+    .map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+    .unwrap_or(true)
+}
+
+fn federation_hub_url() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_HUB_URL",
+        "RUSTYRED_THG_FEDERATE_HUB_URL",
+        "RUSTYRED_FEDERATE_HUB_URL",
+    ])
+}
+
+fn federation_token() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_TOKEN",
+        "RUSTYRED_THG_FEDERATE_TOKEN",
+        "RUSTYRED_FEDERATE_TOKEN",
+    ])
+}
+
+fn federation_peer_id() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_PEER_ID",
+        "RUSTYRED_THG_FEDERATE_PEER_ID",
+        "RUSTYRED_FEDERATE_PEER_ID",
+    ])
+}
+
+fn federation_private_key() -> Option<String> {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_PRIVATE_KEY",
+        "RUSTYRED_THG_FEDERATE_PRIVATE_KEY",
+        "RUSTYRED_FEDERATE_PRIVATE_KEY",
+    ])
+}
+
+fn federation_provenance() -> bool {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_PROVENANCE",
+        "RUSTYRED_THG_FEDERATE_PROVENANCE",
+        "RUSTYRED_FEDERATE_PROVENANCE",
+    ])
+    .map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn federation_snapshot_text_bytes() -> usize {
+    federation_env(&[
+        "RUSTY_RED_FEDERATE_SNAPSHOT_TEXT_BYTES",
+        "RUSTYRED_THG_FEDERATE_SNAPSHOT_TEXT_BYTES",
+        "RUSTYRED_FEDERATE_SNAPSHOT_TEXT_BYTES",
+    ])
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or(rustyred_web::DEFAULT_WEB_COMMONS_SNAPSHOT_TEXT_BYTES)
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn json_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(Value::as_f64)
+}
+
+fn resolve_route_tenant(
+    state: &AppState,
+    tenant: Option<&str>,
+) -> Result<String, axum::response::Response> {
+    resolve_tenant_id(tenant, &state.config.mcp_default_tenant)
+        .map_err(query_surface_error_response)
+}
+
+fn authorize_scope(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope: &str,
+) -> Result<AuthContext, axum::response::Response> {
+    require_scope(
+        headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+    )
+    .map_err(IntoResponse::into_response)
+}
+
+fn authorize_scope_for_tenant(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope: &str,
+    tenant_id: &str,
+) -> Result<AuthContext, axum::response::Response> {
+    require_scope_for_tenant(
+        headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+        tenant_id,
+    )
+    .map_err(IntoResponse::into_response)
+}
+
+fn resolve_authorized_route_tenant(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope: &str,
+    tenant: Option<&str>,
+) -> Result<String, axum::response::Response> {
+    let auth_context = authorize_scope(headers, state, scope)?;
+    let tenant_id = resolve_route_tenant(state, tenant)?;
+    auth_context
+        .require_tenant(&tenant_id)
+        .map_err(IntoResponse::into_response)?;
+    Ok(tenant_id)
+}
+
+fn search_snapshot_store(
+    state: &AppState,
+    tenant_id: &str,
+) -> Result<InMemoryGraphStore, axum::response::Response> {
+    let store = state
+        .tenant_graph_store(tenant_id)
+        .map_err(store_unavailable_response)?;
+    let snapshot = store.graph_snapshot().map_err(graph_store_error_response)?;
+    InMemoryGraphStore::from_snapshot(snapshot).map_err(graph_store_error_response)
+}
+
+fn default_crawl_run_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("rustyweb-{millis}")
+}
+
+fn rustyweb_error_response(error: RustyWebError) -> axum::response::Response {
+    let status = match error {
+        RustyWebError::Fetch { .. } | RustyWebError::HtmlParse { .. } => StatusCode::BAD_GATEWAY,
+        RustyWebError::InvalidUrl { .. }
+        | RustyWebError::BodyLimitExceeded { .. }
+        | RustyWebError::EmptySeeds
+        | RustyWebError::InvalidBudget { .. }
+        | RustyWebError::BlockedUrl { .. }
+        | RustyWebError::InvalidFragment { .. } => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        Json(json!({
+            "error": "rustyweb_crawl_error",
+            "message": error.to_string()
+        })),
+    )
+        .into_response()
+}
+
+async fn command(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CommandBody>,
+) -> impl IntoResponse {
+    let scope = required_scope_for_command(&body.command);
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        scope,
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    execute_tenant_command(&state, &tenant_id, &body.command, body.args)
+}
+
+async fn root_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RootCommandBody>,
+) -> impl IntoResponse {
+    let scope = required_scope_for_command(&body.command);
+    let tenant_id =
+        match resolve_authorized_route_tenant(&headers, &state, scope, body.tenant_id.as_deref()) {
+            Ok(tenant_id) => tenant_id,
+            Err(response) => return response,
+        };
+    execute_tenant_command(&state, &tenant_id, &body.command, body.args)
+}
+
+async fn batch(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<BatchBody>,
+) -> impl IntoResponse {
+    for item in &body.commands {
+        let scope = required_scope_for_command(&item.command);
+        if let Err(status) = require_scope(
+            &headers,
+            &state.config.api_tokens,
+            scope,
+            state.config.require_auth,
+        ) {
+            return status.into_response();
+        }
+    }
+    execute_batch_commands(&state, &tenant_id, body.commands)
+}
+
+async fn root_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RootBatchBody>,
+) -> impl IntoResponse {
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    for item in &body.commands {
+        let scope = required_scope_for_command(&item.command);
+        if let Err(response) = authorize_scope_for_tenant(&headers, &state, scope, &tenant_id) {
+            return response;
+        }
+    }
+    execute_batch_commands(&state, &tenant_id, body.commands)
+}
+
+async fn root_cache_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCachePutBody>,
+) -> impl IntoResponse {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "graph:write",
+        body.tenant_id.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    match execute_cache_put(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheLookupBody>,
+) -> impl IntoResponse {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "graph:read",
+        body.tenant_id.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    match execute_cache_get(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheLookupBody>,
+) -> impl IntoResponse {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "graph:read",
+        body.tenant_id.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    match execute_cache_check(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheLookupBody>,
+) -> impl IntoResponse {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "graph:read",
+        body.tenant_id.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    match execute_cache_explain(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_invalidate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheInvalidateBody>,
+) -> impl IntoResponse {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "graph:write",
+        body.tenant_id.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    match execute_cache_invalidate(&state, &tenant_id, body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn root_cache_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GraphCacheStatsBody>,
+) -> impl IntoResponse {
+    let tenant_id = match resolve_authorized_route_tenant(
+        &headers,
+        &state,
+        "graph:read",
+        body.tenant_id.as_deref(),
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(response) => return response,
+    };
+    match execute_cache_stats(&state, &tenant_id) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn run_get(
+    State(state): State<AppState>,
+    Path((tenant_id, run_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "run:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    execute_tenant_command(
+        &state,
+        &tenant_id,
+        "RUSTYRED_THG.RUN.GET",
+        json!({ "run_id": run_id }),
+    )
+}
+
+async fn public_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id = match resolve_tenant_id(
+        body.get("tenant_id").and_then(Value::as_str),
+        &state.config.mcp_default_tenant,
+    ) {
+        Ok(tenant_id) => tenant_id,
+        Err(error) => return query_surface_error_response(error),
+    };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:read", &tenant_id) {
+        return response;
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match execute_public_query(&store, &tenant_id, &body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => query_surface_error_response(error),
+    }
+}
+
+async fn public_cypher(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PublicCypherBody>,
+) -> impl IntoResponse {
+    let write_scope = body.tx_id.is_some();
+    let scope = if write_scope {
+        "graph:write"
+    } else {
+        "graph:read"
+    };
+
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, scope, &tenant_id) {
+        return response;
+    }
+    if let Some(tx_id) = body.tx_id.as_deref() {
+        if tx_id.trim().is_empty() {
+            return query_surface_error_response(QuerySurfaceError::invalid(
+                "missing_tx_id",
+                "tx_id is required when staging transactional Cypher statements",
+            ));
+        }
+        let mutations = match parse_tx_cypher_mutations(&body.query, &body.params) {
+            Ok(mutations) => mutations,
+            Err(error) => return query_surface_error_response(error),
+        };
+        let staged_mutations =
+            match state.append_graph_transaction_mutations(&tenant_id, tx_id, mutations) {
+                Ok(staged_mutations) => staged_mutations,
+                Err(error) => return graph_store_error_response(transaction_state_error(error)),
+            };
+        return Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "query": body.query,
+            "tx_id": tx_id,
+            "subset": "opencypher_v0_1_write_tx",
+            "staged_mutations": staged_mutations,
+        }))
+        .into_response();
+    }
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    state.observability.record_cypher();
+    let start = std::time::Instant::now();
+    let outcome = execute_cypher_query_with_steering(
+        &mut store,
+        &tenant_id,
+        &body,
+        Some(state.plan_steering.as_ref()),
+    );
+    let nanos = start.elapsed().as_nanos() as u64;
+    let detail = body.query.chars().take(120).collect::<String>();
+    state
+        .observability
+        .record_query_timing(KIND_CYPHER, &detail, nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => {
+            state.observability.record_error();
+            query_surface_error_response(error)
+        }
+    }
+}
+
+async fn transaction_begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransactionBeginBody>,
+) -> impl IntoResponse {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:write", &tenant_id) {
+        return response;
+    }
+    let tx_id = match state.begin_graph_transaction(&tenant_id) {
+        Ok(tx_id) => tx_id,
+        Err(error) => {
+            state.observability.record_error();
+            return graph_store_error_response(transaction_state_error(error));
+        }
+    };
+    state.observability.record_transaction_begin();
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "tx_id": tx_id,
+    }))
+    .into_response()
+}
+
+async fn transaction_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransactionMutationBody>,
+) -> impl IntoResponse {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tx_id = body.tx_id.trim();
+    if tx_id.is_empty() {
+        return query_surface_error_response(QuerySurfaceError::invalid(
+            "missing_tx_id",
+            "tx_id is required for transaction commit",
+        ));
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:write", &tenant_id) {
+        return response;
+    }
+    let transaction = match state.commit_graph_transaction(&tenant_id, tx_id) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            state.observability.record_error();
+            return graph_store_error_response(transaction_state_error(error));
+        }
+    };
+    state.observability.record_transaction_commit();
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "transaction": transaction,
+    }))
+    .into_response()
+}
+
+async fn transaction_rollback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransactionMutationBody>,
+) -> impl IntoResponse {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tx_id = body.tx_id.trim();
+    if tx_id.is_empty() {
+        return query_surface_error_response(QuerySurfaceError::invalid(
+            "missing_tx_id",
+            "tx_id is required for transaction rollback",
+        ));
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:write", &tenant_id) {
+        return response;
+    }
+    if let Err(error) = state.rollback_graph_transaction(&tenant_id, tx_id) {
+        state.observability.record_error();
+        return graph_store_error_response(transaction_state_error(error));
+    }
+    state.observability.record_transaction_rollback();
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "tx_id": tx_id,
+        "status": "rolled_back",
+    }))
+    .into_response()
+}
+
+async fn public_cypher_explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PublicCypherBody>,
+) -> impl IntoResponse {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let tenant_id =
+        match resolve_tenant_id(body.tenant_id.as_deref(), &state.config.mcp_default_tenant) {
+            Ok(tenant_id) => tenant_id,
+            Err(error) => return query_surface_error_response(error),
+        };
+    if let Err(response) = authorize_scope_for_tenant(&headers, &state, "graph:read", &tenant_id) {
+        return response;
+    }
+    match explain_cypher_query(&tenant_id, &body) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => query_surface_error_response(error),
+    }
+}
+
+async fn graph_query(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphQueryBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    execute_tenant_command(
+        &state,
+        &tenant_id,
+        "RUSTYRED_THG.DEBUG.CYPHER",
+        json!({ "query": body.query, "graph": body.graph, "params": body.params }),
+    )
+}
+
+async fn context_pack(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(args): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "context:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    execute_tenant_command(&state, &tenant_id, "RUSTYRED_THG.CONTEXT.PACK", args)
+}
+
+async fn graph_vector_designate(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VectorDesignateBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.designate_vector_property(&body.label, &body.property, body.dimension) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "label": body.label,
+            "property": body.property,
+            "dimension": body.dimension
+        }))
+        .into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_vector_search(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VectorSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    state.observability.record_vector_search();
+    let label_ref = body.label.as_deref();
+    let detail = format!(
+        "label={} property={}",
+        label_ref.unwrap_or("*"),
+        body.property
+    );
+    let start = std::time::Instant::now();
+    let outcome = store.vector_search(label_ref, &body.property, &body.query, body.k);
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_VECTOR_SEARCH, &detail, nanos, 0, 0);
+    match outcome {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(node_id, distance)| {
+                    let node = store.get_node(&node_id).ok().flatten();
+                    json!({ "node_id": node_id, "distance": distance, "node": node })
+                })
+                .collect();
+            Json(json!({ "ok": true, "results": items })).into_response()
+        }
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
+    }
+}
+
+async fn graph_vector_hybrid(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<HybridSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    state.observability.record_vector_search();
+    let label_ref = body.label.as_deref();
+    let detail = format!(
+        "label={} property={}",
+        label_ref.unwrap_or("*"),
+        body.property
+    );
+    let mut scoring = state.config.tenant_config(&tenant_id).hybrid_scoring;
+    if let Some(alpha) = body.alpha {
+        scoring = scoring.with_alpha(alpha);
+    }
+    if let Some(confidence_weighted) = body.confidence_weighted_graph_distance {
+        scoring.confidence_weighted_graph_distance = confidence_weighted;
+    }
+    if let Some(edge_type_weights) = body.edge_type_weights {
+        scoring.edge_type_weights = edge_type_weights;
+    }
+    let start = std::time::Instant::now();
+    let outcome = store.hybrid_search_with_config(
+        label_ref,
+        &body.property,
+        &body.query,
+        body.k,
+        &body.graph_seeds,
+        body.max_hops,
+        &scoring,
+    );
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_VECTOR_SEARCH, &detail, nanos, 0, 0);
+    match outcome {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(node_id, score)| {
+                    let node = store.get_node(&node_id).ok().flatten();
+                    json!({ "node_id": node_id, "score": score, "node": node })
+                })
+                .collect();
+            Json(json!({
+                "ok": true,
+                "results": items,
+                "scoring": {
+                    "alpha": scoring.alpha,
+                    "confidence_weighted_graph_distance": scoring.confidence_weighted_graph_distance,
+                    "edge_type_weights": scoring.edge_type_weights,
+                }
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
+    }
+}
+
+async fn graph_epistemic_neighbors(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<EpistemicNeighborsBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let types_ref = body.epistemic_types.as_deref();
+    match store.epistemic_neighbors(
+        &body.node_id,
+        types_ref,
+        body.min_confidence,
+        body.max_depth,
+    ) {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(edge, node)| json!({ "edge": edge, "node": node }))
+                .collect();
+            Json(json!({ "ok": true, "results": items })).into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_node_upsert(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NodeWriteBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let record = body.into_record();
+    let index_clone = record.clone();
+    match store.upsert_node(record) {
+        Ok(result) => {
+            state.observability.record_mutation();
+            state.maybe_index_node_spatially(&tenant_id, &index_clone);
+            state.maybe_index_node_fulltext(&tenant_id, &index_clone);
+            Json(json!({ "ok": true, "node": result })).into_response()
+        }
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
+    }
+}
+
+async fn graph_node_get(
+    State(state): State<AppState>,
+    Path((tenant_id, node_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.get_node(&node_id) {
+        Ok(Some(node)) => Json(json!({ "ok": true, "node": node })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_node_query(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(query): Json<NodeQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.query_nodes(query) {
+        Ok(nodes) => Json(json!({ "ok": true, "nodes": nodes })).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_edge_upsert(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<EdgeWriteBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.upsert_edge(body.into_record()) {
+        Ok(result) => {
+            state.observability.record_mutation();
+            Json(json!({ "ok": true, "edge": result })).into_response()
+        }
+        Err(error) => {
+            state.observability.record_error();
+            graph_store_error_response(error)
+        }
+    }
+}
+
+async fn graph_edge_get(
+    State(state): State<AppState>,
+    Path((tenant_id, edge_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.get_edge(&edge_id) {
+        Ok(Some(edge)) => Json(json!({ "ok": true, "edge": edge })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_neighbors(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(query): Json<NeighborQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.neighbors(query) {
+        Ok(neighbors) => Json(json!({ "ok": true, "neighbors": neighbors })).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_stats(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.stats() {
+        Ok(stats) => Json(json!({ "ok": true, "stats": stats })).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MemoryDocsQuery {
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    include_inactive: Option<bool>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// List a tenant's memory documents for the Obsidian sync plugin. Authenticated GET
+/// scoped to `graph:read`; the tenant comes from the path so a token only reads its
+/// own partition. `?since=<watermark>` returns documents updated at or after the
+/// watermark for incremental pulls; `?include_inactive=true` adds superseded and
+/// archived documents (deleted are always omitted). Each doc carries its scalar
+/// fields, `tags`, outgoing `links` (target doc_ids), and a `content_hash` the
+/// plugin uses as its echo gate.
+async fn memory_docs_list(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<MemoryDocsQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let tenant_slug = normalize_tenant_slug(&tenant_id);
+    let since = params.since.unwrap_or_default();
+    let since = since.trim();
+    let include_inactive = params.include_inactive.unwrap_or(false);
+
+    let nodes = match store.query_nodes(
+        NodeQuery::label("MemoryDocument")
+            .with_property("tenant_slug", Value::String(tenant_slug.clone()))
+            .with_limit(10_000),
+    ) {
+        Ok(nodes) => nodes,
+        Err(error) => return graph_store_error_response(error),
+    };
+
+    let mut docs: Vec<Value> = Vec::new();
+    let mut max_updated_at = String::new();
+    for node in nodes {
+        let document: MemoryDocumentState = match serde_json::from_value(node.properties) {
+            Ok(document) => document,
+            Err(_) => continue,
+        };
+        if document.status == "deleted" {
+            continue;
+        }
+        if !include_inactive && document.status != "active" {
+            continue;
+        }
+        if !since.is_empty() && document.updated_at.as_str() < since {
+            continue;
+        }
+        if document.updated_at > max_updated_at {
+            max_updated_at = document.updated_at.clone();
+        }
+        docs.push(json!({
+            "doc_id": document.doc_id,
+            "kind": document.kind,
+            "title": document.title,
+            "summary": document.summary,
+            "content": document.content,
+            "content_hash": memory_content_hash(&document.content),
+            "status": document.status,
+            "tags": document.tags,
+            "links": document.links,
+            "created_at": document.created_at,
+            "updated_at": document.updated_at,
+        }));
+    }
+    docs.sort_by(|left, right| {
+        right["updated_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(left["updated_at"].as_str().unwrap_or_default())
+    });
+    if let Some(limit) = params.limit {
+        docs.truncate(limit);
+    }
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_slug,
+        "count": docs.len(),
+        "max_updated_at": max_updated_at,
+        "docs": docs,
+    }))
+    .into_response()
+}
+
+async fn connectors_list(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope_for_tenant(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+        &tenant_id,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let nodes = match store.query_nodes(
+        NodeQuery::label(CONNECTOR_LABEL)
+            .with_property("tenant_id", json!(tenant_id.clone()))
+            .with_limit(10_000),
+    ) {
+        Ok(nodes) => nodes,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let mut connectors = nodes.iter().map(connector_list_item).collect::<Vec<_>>();
+    connectors.sort_by(|left, right| {
+        left["server_id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["server_id"].as_str().unwrap_or_default())
+    });
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "count": connectors.len(),
+        "connectors": connectors,
+    }))
+    .into_response()
+}
+
+async fn connector_connect(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ConnectorConnectBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope_for_tenant(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+        &tenant_id,
+    ) {
+        return status.into_response();
+    }
+    let server_id = body.server_id.trim().to_string();
+    if server_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "invalid_connector",
+                "message": "server_id is required"
+            })),
+        )
+            .into_response();
+    }
+    let label = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&server_id)
+        .to_string();
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match connect_target(
+        body.target,
+        &mut store,
+        &tenant_id,
+        &server_id,
+        &label,
+        body.actor.as_deref(),
+    ) {
+        Ok(result) => {
+            let tool_count = result.registration.affordance_node_ids.len();
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "server_id": server_id,
+                "server_info": {
+                    "name": result.server_info.server_name,
+                    "version": result.server_info.server_version,
+                    "protocol_version": result.server_info.protocol_version,
+                },
+                "registration": {
+                    "connector_node_id": result.registration.connector_node_id,
+                    "affordance_node_ids": result.registration.affordance_node_ids,
+                    "tool_count": tool_count,
+                    "transaction": result.registration.transaction,
+                }
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "ok": false,
+                "tenant": tenant_id,
+                "server_id": server_id,
+                "error": "connector_connect_failed",
+                "message": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn connector_list_item(node: &NodeRecord) -> Value {
+    let target = node.properties.get("connection_target");
+    json!({
+        "node_id": node.id.clone(),
+        "server_id": node.properties.get("server_id").and_then(Value::as_str).unwrap_or_default(),
+        "label": node.properties.get("label").and_then(Value::as_str).unwrap_or_default(),
+        "tool_count": node.properties.get("tool_count").and_then(Value::as_u64).unwrap_or(0),
+        "has_connection_target": target.is_some(),
+        "transport": target
+            .and_then(|value| value.get("transport"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    })
+}
+
+async fn graph_verify(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.verify() {
+        Ok(report) => Json(json!({ "ok": report.ok, "verify": report })).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_rebuild_indexes(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.rebuild_indexes() {
+        Ok(report) => Json(json!({
+            "ok": report.after.ok,
+            "rebuild": report
+        }))
+        .into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_compile(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(options): Json<GraphCompileOptions>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let pack = compile_graph_pack(&snapshot, options);
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "pack": pack
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_diff(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionDiffBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let target = match body.target {
+        Some(target) => target,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    let diff = diff_graph_snapshots(&body.base, &target);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "diff": diff
+    }))
+    .into_response()
+}
+
+async fn graph_version_ref(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionRefBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    match store.graph_snapshot() {
+        Ok(snapshot) => {
+            let branch = body.options.branch.clone();
+            let pack = compile_graph_pack(&snapshot, body.options);
+            let ref_update = match update_graph_ref_cas(
+                body.repository.unwrap_or_default(),
+                pack,
+                branch,
+                body.expected_commit_hash,
+                body.updated_at_unix_ms,
+            ) {
+                Ok(update) => update,
+                Err(conflict) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "ok": false,
+                            "tenant": tenant_id,
+                            "error": "graph_ref_conflict",
+                            "conflict": conflict,
+                        })),
+                    )
+                        .into_response()
+                }
+            };
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "ref_update": ref_update
+            }))
+            .into_response()
+        }
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_version_log_route(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionLogBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "log": graph_version_log(&body.repository, body.target.as_deref())
+    }))
+    .into_response()
+}
+
+async fn graph_version_checkout(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionCheckoutBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    match checkout_graph_version(&body.repository, &body.target) {
+        Some(checkout) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "checkout": checkout
+        }))
+        .into_response(),
+        None => graph_store_error_response(GraphStoreError::new(
+            "version_target_not_found",
+            format!(
+                "version target not found or has no payloads: {}",
+                body.target
+            ),
+        )),
+    }
+}
+
+async fn graph_version_merge(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GraphVersionMergeBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+
+    let ours = match body.ours {
+        Some(ours) => ours,
+        None => {
+            let store = match state.tenant_graph_store(&tenant_id) {
+                Ok(store) => store,
+                Err(error) => return store_unavailable_response(error),
+            };
+            match store.graph_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return graph_store_error_response(error),
+            }
+        }
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "merge": merge_graph_snapshots(&body.base, &ours, &body.theirs, body.options)
+    }))
+    .into_response()
+}
+
+fn execute_tenant_command(
+    state: &AppState,
+    tenant_id: &str,
+    command: &str,
+    args: Value,
+) -> axum::response::Response {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    if is_graph_command(command) {
+        return Json(execute_tenant_graph_command(
+            state, tenant_id, command, args,
+        ))
+        .into_response();
+    }
+    if is_adapter_command(command) {
+        return Json(execute_tenant_adapter_command(
+            state, tenant_id, command, args,
+        ))
+        .into_response();
+    }
+    if is_cache_command(command) {
+        return Json(execute_tenant_cache_command(
+            state, tenant_id, command, args,
+        ))
+        .into_response();
+    }
+    let store = match state.tenant_store(tenant_id) {
+        Ok(store) => store,
+        Err(error) => return store_unavailable_response(error),
+    };
+    let mut executor = StoreBackedThgExecutor::new(store);
+    let response = executor.execute_request(ThgRequest::new(command, args));
+    Json(response).into_response()
+}
+
+fn execute_tenant_graph_command(
+    state: &AppState,
+    tenant_id: &str,
+    command_name: &str,
+    args: Value,
+) -> ThgResponse {
+    if let Err(error) = state.store_ready() {
+        return ThgResponse::err(
+            command_name,
+            ThgError::new(error.code, error.message),
+            "graph:unavailable",
+        );
+    }
+    let mut store = match state.tenant_graph_store(tenant_id) {
+        Ok(store) => store,
+        Err(error) => {
+            return ThgResponse::err(
+                command_name,
+                ThgError::new(error.code, error.message),
+                "graph:unavailable",
+            )
+        }
+    };
+    execute_graph_store_command(&mut store, command_name, args)
+}
+
+fn execute_tenant_adapter_command(
+    state: &AppState,
+    tenant_id: &str,
+    command_name: &str,
+    args: Value,
+) -> ThgResponse {
+    if let Err(error) = state.store_ready() {
+        return ThgResponse::err(
+            command_name,
+            ThgError::new(error.code, error.message),
+            "graph:unavailable",
+        );
+    }
+    let mut store = match state.tenant_graph_store(tenant_id) {
+        Ok(store) => store,
+        Err(error) => {
+            return ThgResponse::err(
+                command_name,
+                ThgError::new(error.code, error.message),
+                "graph:unavailable",
+            )
+        }
+    };
+    let state_hash = graph_response_hash(&store);
+    execute_adapter_command(&mut store, command_name, args, state_hash)
+}
+
+fn execute_tenant_cache_command(
+    state: &AppState,
+    tenant_id: &str,
+    command_name: &str,
+    args: Value,
+) -> ThgResponse {
+    let cache = match state.tenant_graph_cache(tenant_id) {
+        Ok(cache) => cache,
+        Err(error) => {
+            return ThgResponse::err(
+                command_name,
+                ThgError::new(error.code, error.message),
+                "graph:unavailable",
+            )
+        }
+    };
+    let graph_version = match current_graph_version(state, tenant_id) {
+        Ok(version) => version,
+        Err(error) => {
+            return ThgResponse::err(
+                command_name,
+                ThgError::new(error.code, error.message),
+                "graph:unavailable",
+            )
+        }
+    };
+    execute_graph_cache_command(&cache, command_name, args, graph_version)
+}
+
+fn execute_graph_store_command(
+    store: &mut TenantGraphStore,
+    command_name: &str,
+    args: Value,
+) -> ThgResponse {
+    let command = match ThgCommand::from_name(command_name) {
+        Ok(command) => command,
+        Err(error) => return ThgResponse::err(command_name, error, "graph:unavailable"),
+    };
+    match command {
+        ThgCommand::GraphNodeUpsert => {
+            let node = match serde_json::from_value::<NodeWriteBody>(args) {
+                Ok(body) => body.into_record(),
+                Err(error) => {
+                    return graph_command_invalid_params(command.name(), error.to_string(), store)
+                }
+            };
+            let response_node = rustyred_thg_core::ThgNode {
+                id: node.id.clone(),
+                labels: node.labels.clone(),
+                properties: node.properties.clone(),
+            };
+            match store.upsert_node(node) {
+                Ok(write) => {
+                    let mut response = ThgResponse::ok(
+                        command.name(),
+                        "ok",
+                        json!({ "write": write, "node": response_node }),
+                        graph_response_hash(store),
+                    );
+                    response.nodes.push(response_node);
+                    response
+                }
+                Err(error) => graph_command_error(command.name(), error, store),
+            }
+        }
+        ThgCommand::GraphEdgeUpsert => {
+            let edge = match serde_json::from_value::<EdgeWriteBody>(args) {
+                Ok(body) => body.into_record(),
+                Err(error) => {
+                    return graph_command_invalid_params(command.name(), error.to_string(), store)
+                }
+            };
+            let response_edge = rustyred_thg_core::ThgEdge {
+                from_id: edge.from_id.clone(),
+                edge_type: edge.edge_type.clone(),
+                to_id: edge.to_id.clone(),
+                properties: edge.properties.clone(),
+            };
+            match store.upsert_edge(edge) {
+                Ok(write) => {
+                    let mut response = ThgResponse::ok(
+                        command.name(),
+                        "ok",
+                        json!({ "write": write, "edge": response_edge }),
+                        graph_response_hash(store),
+                    );
+                    response.edges.push(response_edge);
+                    response
+                }
+                Err(error) => graph_command_error(command.name(), error, store),
+            }
+        }
+        ThgCommand::GraphNodesQuery => {
+            let query = match serde_json::from_value::<NodeQuery>(args) {
+                Ok(query) => query,
+                Err(error) => {
+                    return graph_command_invalid_params(command.name(), error.to_string(), store)
+                }
+            };
+            let operation = if query.label.is_some() || !query.properties.is_empty() {
+                "node_index_seek"
+            } else {
+                "node_scan"
+            };
+            match store.query_nodes(query) {
+                Ok(hits) => {
+                    let nodes = hits
+                        .iter()
+                        .map(|node| rustyred_thg_core::ThgNode {
+                            id: node.id.clone(),
+                            labels: node.labels.clone(),
+                            properties: node.properties.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let mut response = ThgResponse::ok(
+                        command.name(),
+                        "ok",
+                        json!({
+                            "nodes": hits,
+                            "plan": { "operation": operation },
+                            "stats": { "returned": nodes.len() },
+                        }),
+                        graph_response_hash(store),
+                    );
+                    response.nodes = nodes;
+                    response
+                }
+                Err(error) => graph_command_error(command.name(), error, store),
+            }
+        }
+        ThgCommand::GraphNeighbors => {
+            let query = match serde_json::from_value::<NeighborQuery>(args) {
+                Ok(query) => query,
+                Err(error) => {
+                    return graph_command_invalid_params(command.name(), error.to_string(), store)
+                }
+            };
+            match store.neighbors(query) {
+                Ok(hits) => ThgResponse::ok(
+                    command.name(),
+                    "ok",
+                    json!({
+                        "neighbors": hits,
+                        "plan": { "operation": "adjacency_seek" },
+                        "stats": { "returned": hits.len() },
+                    }),
+                    graph_response_hash(store),
+                ),
+                Err(error) => graph_command_error(command.name(), error, store),
+            }
+        }
+        ThgCommand::GraphStats => match store.stats() {
+            Ok(stats) => ThgResponse::ok(
+                command.name(),
+                "ok",
+                json!({ "stats": stats }),
+                graph_stats_hash(&stats),
+            ),
+            Err(error) => graph_command_error(command.name(), error, store),
+        },
+        ThgCommand::GraphVerify => match store.verify() {
+            Ok(report) => ThgResponse::ok(
+                command.name(),
+                if report.ok { "ok" } else { "drift_detected" },
+                json!({ "report": report }),
+                graph_response_hash(store),
+            ),
+            Err(error) => graph_command_error(command.name(), error, store),
+        },
+        ThgCommand::GraphRebuildIndexes => match store.rebuild_indexes() {
+            Ok(report) => ThgResponse::ok(
+                command.name(),
+                if report.after.ok {
+                    "ok"
+                } else {
+                    "canonical_graph_problem"
+                },
+                json!({ "report": report }),
+                graph_response_hash(store),
+            ),
+            Err(error) => graph_command_error(command.name(), error, store),
+        },
+        _ => ThgResponse::err(
+            command.name(),
+            ThgError::unsupported_command(command.name()),
+            graph_response_hash(store),
+        ),
+    }
+}
+
+fn is_graph_command(command: &str) -> bool {
+    matches!(
+        command.trim().to_ascii_uppercase().as_str(),
+        "RUSTYRED_THG.GRAPH.NODE.UPSERT"
+            | "RUSTYRED_THG.GRAPH.EDGE.UPSERT"
+            | "RUSTYRED_THG.GRAPH.NODES.QUERY"
+            | "RUSTYRED_THG.GRAPH.NEIGHBORS"
+            | "RUSTYRED_THG.GRAPH.STATS"
+            | "RUSTYRED_THG.GRAPH.VERIFY"
+            | "RUSTYRED_THG.GRAPH.REBUILD_INDEXES"
+            | "RUSTYRED_THG.GRAPH.REBUILD"
+    )
+}
+
+fn is_adapter_command(command: &str) -> bool {
+    matches!(
+        command.trim().to_ascii_uppercase().as_str(),
+        "RUSTYRED_THG.ADAPTERS.UPSERT"
+            | "RUSTYRED_THG.ADAPTERS.FIND"
+            | "RUSTYRED_THG.ADAPTERS.GET"
+            | "RUSTYRED_THG.ADAPTERS.FITNESS.RECORD"
+            | "RUSTYRED_THG.ADAPTERS.LIST"
+            | "RUSTYRED_THG.ADAPTERS.SUPERSEDE"
+    )
+}
+
+fn is_cache_command(command: &str) -> bool {
+    matches!(
+        command.trim().to_ascii_uppercase().as_str(),
+        "RUSTYRED_THG.CACHE.PUT"
+            | "RUSTYRED_THG.CACHE.STORE"
+            | "RUSTYRED_THG.CACHE.GET"
+            | "RUSTYRED_THG.CACHE.CHECK"
+            | "RUSTYRED_THG.CACHE.EXPLAIN"
+            | "RUSTYRED_THG.CACHE.INVALIDATE"
+            | "RUSTYRED_THG.CACHE.STATS"
+    )
+}
+
+fn graph_command_invalid_params(
+    command: &str,
+    message: String,
+    store: &TenantGraphStore,
+) -> ThgResponse {
+    ThgResponse::err(
+        command,
+        ThgError::new("invalid_graph_query", message),
+        graph_response_hash(store),
+    )
+}
+
+fn graph_command_error(
+    command: &str,
+    error: GraphStoreError,
+    store: &TenantGraphStore,
+) -> ThgResponse {
+    ThgResponse::err(
+        command,
+        ThgError::new(error.code, error.message),
+        graph_response_hash(store),
+    )
+}
+
+fn execute_graph_cache_command(
+    cache: &std::sync::Arc<crate::graph_cache::GraphCacheTenant>,
+    command_name: &str,
+    args: Value,
+    graph_version: u64,
+) -> ThgResponse {
+    let upper = command_name.trim().to_ascii_uppercase();
+    let result = match upper.as_str() {
+        "RUSTYRED_THG.CACHE.PUT" | "RUSTYRED_THG.CACHE.STORE" => serde_json::from_value::<
+            GraphCachePutBody,
+        >(args)
+        .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+        .and_then(|body| cache.put(body, graph_version))
+        .map(|payload| {
+            ThgResponse::ok(
+                command_name,
+                "stored",
+                json!({ "cache": payload }),
+                cache_state_hash(cache, graph_version),
+            )
+        }),
+        "RUSTYRED_THG.CACHE.GET" => serde_json::from_value::<GraphCacheLookupBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.get(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.accepted {
+                        "hit"
+                    } else {
+                        payload.reason.as_str()
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "RUSTYRED_THG.CACHE.CHECK" => serde_json::from_value::<GraphCacheLookupBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.check(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.accepted {
+                        "hit"
+                    } else {
+                        payload.reason.as_str()
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "RUSTYRED_THG.CACHE.EXPLAIN" => serde_json::from_value::<GraphCacheLookupBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.explain(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.accepted {
+                        "explain_hit"
+                    } else {
+                        payload.reason.as_str()
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "RUSTYRED_THG.CACHE.INVALIDATE" => serde_json::from_value::<GraphCacheInvalidateBody>(args)
+            .map_err(|error| GraphStoreError::new("invalid_graph_cache_request", error.to_string()))
+            .and_then(|body| cache.invalidate(body, graph_version))
+            .map(|payload| {
+                ThgResponse::ok(
+                    command_name,
+                    if payload.removed > 0 {
+                        "invalidated"
+                    } else {
+                        "no_match"
+                    },
+                    json!({ "cache": payload }),
+                    cache_state_hash(cache, graph_version),
+                )
+            }),
+        "RUSTYRED_THG.CACHE.STATS" => cache.stats(graph_version).map(|payload| {
+            ThgResponse::ok(
+                command_name,
+                "ok",
+                json!({ "cache": payload }),
+                cache_state_hash(cache, graph_version),
+            )
+        }),
+        _ => Err(GraphStoreError::new(
+            "unsupported_graph_cache_command",
+            format!("unsupported graph cache command: {command_name}"),
+        )),
+    };
+    result.unwrap_or_else(|error| {
+        ThgResponse::err(
+            command_name,
+            ThgError::new(error.code, error.message),
+            cache_state_hash(cache, graph_version),
+        )
+    })
+}
+
+fn graph_response_hash(store: &TenantGraphStore) -> String {
+    store
+        .stats()
+        .map(|stats| graph_stats_hash(&stats))
+        .unwrap_or_else(|_| "graph:unavailable".to_string())
+}
+
+fn cache_state_hash(
+    cache: &std::sync::Arc<crate::graph_cache::GraphCacheTenant>,
+    graph_version: u64,
+) -> String {
+    cache
+        .stats(graph_version)
+        .map(|stats| stable_hash(stats))
+        .unwrap_or_else(|_| format!("cache:unavailable:{graph_version}"))
+}
+
+fn graph_stats_hash(stats: &GraphStats) -> String {
+    stable_hash(stats)
+}
+
+fn current_graph_version(state: &AppState, tenant_id: &str) -> Result<u64, GraphStoreError> {
+    let store = state
+        .tenant_graph_store(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    Ok(store.stats()?.version)
+}
+
+fn execute_cache_put(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCachePutBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.put(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_get(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheLookupBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.get(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_check(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheLookupBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.check(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_explain(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheLookupBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.explain(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_invalidate(
+    state: &AppState,
+    tenant_id: &str,
+    body: GraphCacheInvalidateBody,
+) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.invalidate(body, graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_cache_stats(state: &AppState, tenant_id: &str) -> Result<Value, GraphStoreError> {
+    let graph_version = current_graph_version(state, tenant_id)?;
+    let cache = state
+        .tenant_graph_cache(tenant_id)
+        .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+    let payload = cache.stats(graph_version)?;
+    Ok(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "cache": payload,
+    }))
+}
+
+fn execute_batch_commands(
+    state: &AppState,
+    tenant_id: &str,
+    commands: Vec<CommandBody>,
+) -> axum::response::Response {
+    if let Err(error) = state.store_ready() {
+        return store_unavailable_response(error);
+    }
+    let needs_state_store = commands.iter().any(|item| {
+        !is_graph_command(&item.command)
+            && !is_adapter_command(&item.command)
+            && !is_cache_command(&item.command)
+    });
+    let mut executor = if needs_state_store {
+        let store = match state.tenant_store(tenant_id) {
+            Ok(store) => store,
+            Err(error) => return store_unavailable_response(error),
+        };
+        Some(StoreBackedThgExecutor::new(store))
+    } else {
+        None
+    };
+    let mut graph_store: Option<TenantGraphStore> = None;
+    let mut graph_cache = None;
+    let mut results = Vec::with_capacity(commands.len());
+    for item in commands {
+        let command = item.command;
+        let args = item.args;
+        let response = if is_graph_command(&command) {
+            if graph_store.is_none() {
+                match state.tenant_graph_store(tenant_id) {
+                    Ok(store) => graph_store = Some(store),
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            }
+            execute_graph_store_command(
+                graph_store.as_mut().expect("graph store initialized"),
+                &command,
+                args,
+            )
+        } else if is_adapter_command(&command) {
+            if graph_store.is_none() {
+                match state.tenant_graph_store(tenant_id) {
+                    Ok(store) => graph_store = Some(store),
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let state_hash =
+                graph_response_hash(graph_store.as_ref().expect("graph store initialized"));
+            execute_adapter_command(
+                graph_store.as_mut().expect("graph store initialized"),
+                &command,
+                args,
+                state_hash,
+            )
+        } else if is_cache_command(&command) {
+            if graph_cache.is_none() {
+                match state.tenant_graph_cache(tenant_id) {
+                    Ok(cache) => graph_cache = Some(cache),
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let graph_version = if let Some(store) = graph_store.as_ref() {
+                match store.stats() {
+                    Ok(stats) => stats.version,
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                match current_graph_version(state, tenant_id) {
+                    Ok(version) => version,
+                    Err(error) => {
+                        results.push(ThgResponse::err(
+                            command,
+                            ThgError::new(error.code, error.message),
+                            "graph:unavailable",
+                        ));
+                        continue;
+                    }
+                }
+            };
+            execute_graph_cache_command(
+                graph_cache.as_ref().expect("graph cache initialized"),
+                &command,
+                args,
+                graph_version,
+            )
+        } else {
+            executor
+                .as_mut()
+                .expect("state executor initialized for non-graph command")
+                .execute_request(ThgRequest::new(command, args))
+        };
+        results.push(response);
+    }
+    let state_hash = executor
+        .as_ref()
+        .map(|executor| executor.state().hash())
+        .unwrap_or_else(|| {
+            graph_store
+                .as_ref()
+                .map(graph_response_hash)
+                .or_else(|| {
+                    graph_cache.as_ref().map(|cache| {
+                        cache_state_hash(
+                            cache,
+                            current_graph_version(state, tenant_id).unwrap_or(0),
+                        )
+                    })
+                })
+                .unwrap_or_else(|| "graph:empty_batch".to_string())
+        });
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "results": results,
+        "state_hash": state_hash
+    }))
+    .into_response()
+}
+
+fn query_surface_error_response(error: QuerySurfaceError) -> axum::response::Response {
+    (error.status(), Json(error.payload())).into_response()
+}
+
+fn store_unavailable_response(error: StoreAccessError) -> axum::response::Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(error.as_payload())).into_response()
+}
+
+fn transaction_state_error(error: StoreAccessError) -> GraphStoreError {
+    if error.code == "store_mode_unsupported" {
+        GraphStoreError::new("unsupported_operation", error.message)
+    } else {
+        GraphStoreError::new(error.code, error.message)
+    }
+}
+
+fn graph_store_error_response(error: GraphStoreError) -> axum::response::Response {
+    (
+        graph_error_status(error.code.as_str()),
+        Json(json!({
+            "error": error.code,
+            "message": error.message
+        })),
+    )
+        .into_response()
+}
+
+fn graph_error_status(code: &str) -> StatusCode {
+    match code {
+        "empty_graph_field"
+        | "empty_graph_transaction"
+        | "missing_graph_endpoint"
+        | "tombstoned_graph_endpoint"
+        | "invalid_graph_record"
+        | "invalid_graph_cache_request"
+        | "invalid_instant_kg_request"
+        | "unsupported_graph_cache_kind"
+        | "unsupported_graph_cache_command"
+        | "dimension_mismatch"
+        | "invalid_vector_designation"
+        | "unsupported_operation" => StatusCode::BAD_REQUEST,
+        "tenant_memory_quota_exceeded" => StatusCode::TOO_MANY_REQUESTS,
+        "redis_graph_store_error"
+        | "redcore_io_error"
+        | "redcore_aof_frame_invalid"
+        | "redcore_aof_checksum_mismatch"
+        | "redcore_lock_poisoned"
+        | "redcore_lock_unavailable"
+        | "redcore_strict_mode_invalid"
+        | "redcore_writer_lock_poisoned"
+        | "redcore_snapshot_lock_poisoned"
+        | "graph_cache_lock_poisoned" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn required_scope_for_command(command: &str) -> &'static str {
+    match command.trim().to_ascii_uppercase().as_str() {
+        "RUSTYRED_THG.RUN.GET" => "run:read",
+        "RUSTYRED_THG.RUN.BEGIN" | "RUSTYRED_THG.RUN.STEP" => "run:write",
+        "RUSTYRED_THG.CONTEXT.GET" => "context:read",
+        "RUSTYRED_THG.CONTEXT.PACK" => "context:write",
+        "RUSTYRED_THG.GRAPH.NODE.UPSERT"
+        | "RUSTYRED_THG.GRAPH.EDGE.UPSERT"
+        | "RUSTYRED_THG.ADAPTERS.UPSERT"
+        | "RUSTYRED_THG.ADAPTERS.FITNESS.RECORD"
+        | "RUSTYRED_THG.ADAPTERS.SUPERSEDE" => "graph:write",
+        "RUSTYRED_THG.STATE.HASH"
+        | "RUSTYRED_THG.DEBUG.CYPHER"
+        | "RUSTYRED_THG.CYPHER"
+        | "RUSTYRED_THG.GRAPH.NODES.QUERY"
+        | "RUSTYRED_THG.GRAPH.NEIGHBORS"
+        | "RUSTYRED_THG.GRAPH.STATS"
+        | "RUSTYRED_THG.GRAPH.VERIFY"
+        | "RUSTYRED_THG.CACHE.GET"
+        | "RUSTYRED_THG.CACHE.CHECK"
+        | "RUSTYRED_THG.CACHE.EXPLAIN"
+        | "RUSTYRED_THG.CACHE.STATS"
+        | "RUSTYRED_THG.ADAPTERS.FIND"
+        | "RUSTYRED_THG.ADAPTERS.GET"
+        | "RUSTYRED_THG.ADAPTERS.LIST" => "graph:read",
+        "RUSTYRED_THG.GRAPH.REBUILD_INDEXES" | "RUSTYRED_THG.GRAPH.REBUILD" => "graph:write",
+        "RUSTYRED_THG.CACHE.PUT" | "RUSTYRED_THG.CACHE.STORE" | "RUSTYRED_THG.CACHE.INVALIDATE" => {
+            "graph:write"
+        }
+        _ => "run:write",
+    }
+}
+
+fn cors_layer(state: &AppState) -> CorsLayer {
+    let mut layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+    if state
+        .config
+        .allowed_origins
+        .iter()
+        .any(|origin| origin == "*")
+    {
+        layer = layer.allow_origin(Any);
+    } else {
+        let origins = state
+            .config
+            .allowed_origins
+            .iter()
+            .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+            .collect::<Vec<_>>();
+        if !origins.is_empty() {
+            layer = layer.allow_origin(origins);
+        }
+    }
+    layer
+}
+
+pub(crate) fn mcp_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    allowed_origins.iter().any(|allowed| {
+        allowed == "*" || allowed.trim_end_matches('/') == origin.trim_end_matches('/')
+    })
+}
+
+// ===== Phase 6: Graph algorithm endpoints =====
+
+#[derive(Debug, Deserialize)]
+struct PprBody {
+    seeds: std::collections::HashMap<String, f64>,
+    #[serde(default = "default_ppr_alpha")]
+    alpha: f64,
+    #[serde(default = "default_ppr_epsilon")]
+    epsilon: f64,
+    #[serde(default = "default_ppr_max_pushes")]
+    max_pushes: usize,
+    #[serde(default)]
+    top_k: Option<usize>,
+}
+
+fn default_ppr_alpha() -> f64 {
+    0.15
+}
+fn default_ppr_epsilon() -> f64 {
+    1e-4
+}
+fn default_ppr_max_pushes() -> usize {
+    200_000
+}
+
+#[derive(Debug, Deserialize)]
+struct ComponentsBody {
+    #[serde(default)]
+    directed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageRankBody {
+    #[serde(default = "default_pr_damping")]
+    damping: f64,
+    #[serde(default = "default_pr_max_iter")]
+    max_iter: usize,
+    #[serde(default = "default_pr_tolerance")]
+    tolerance: f64,
+    #[serde(default)]
+    top_k: Option<usize>,
+}
+
+fn default_pr_damping() -> f64 {
+    0.85
+}
+fn default_pr_max_iter() -> usize {
+    100
+}
+fn default_pr_tolerance() -> f64 {
+    1e-6
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CommunitiesBody {}
+
+async fn graph_algorithm_ppr(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<PprBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    state.observability.record_ppr();
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let mut adjacency: std::collections::HashMap<String, Vec<(String, f64)>> =
+            std::collections::HashMap::new();
+        for edge in edges.iter() {
+            if edge.tombstone {
+                continue;
+            }
+            adjacency
+                .entry(edge.from_id.clone())
+                .or_default()
+                .push((edge.to_id.clone(), edge.effective_confidence()));
+        }
+        let scores = rustyred_thg_core::personalized_pagerank(
+            &adjacency,
+            &body.seeds,
+            body.alpha,
+            body.epsilon,
+            body.max_pushes,
+        );
+        let mut entries: Vec<(String, f64)> = scores.into_iter().collect();
+        entries.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if let Some(k) = body.top_k {
+            entries.truncate(k);
+        }
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "alpha": body.alpha,
+            "epsilon": body.epsilon,
+            "scores": entries
+                .into_iter()
+                .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
+                .collect::<Vec<_>>(),
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_PPR, "ppr", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_algorithm_components(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ComponentsBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    state.observability.record_components();
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let components = rustyred_thg_core::connected_components(&edges, body.directed);
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "directed": body.directed,
+            "components": components,
+            "count": components.len(),
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_COMPONENTS, "components", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+async fn graph_algorithm_pagerank(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<PageRankBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    state.observability.record_pagerank();
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let rank = rustyred_thg_core::pagerank(&edges, body.damping, body.max_iter, body.tolerance);
+        let mut entries: Vec<(String, f64)> = rank.into_iter().collect();
+        entries.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if let Some(k) = body.top_k {
+            entries.truncate(k);
+        }
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "damping": body.damping,
+            "scores": entries
+                .into_iter()
+                .map(|(node_id, score)| json!({ "node_id": node_id, "score": score }))
+                .collect::<Vec<_>>(),
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_PAGERANK, "pagerank", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+// ===== Phase 3: Bulk loader =====
+//
+// Streaming JSONL + CSV. The handler consumes the HTTP body as it arrives,
+// splits on newlines via `crate::bulk::LineSplitter`, parses each line via
+// the parsers in `crate::bulk`, and flushes mutations in `batch_size` chunks
+// (default 500) so a large body never blocks the worker on a single
+// transaction. CSV branches use `text/csv` Content-Type and read the first
+// row as header (or `?headers=...` query parameter); edges require
+// `?from_col=...&to_col=...` (or default JSONL fields).
+
+#[derive(Debug, Default, Deserialize)]
+pub struct BulkQuery {
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// Comma-separated header list. If absent and Content-Type is text/csv,
+    /// the first row of the body is treated as the header row.
+    #[serde(default)]
+    pub headers: Option<String>,
+    /// CSV-only: name of the source column for edges.
+    #[serde(default)]
+    pub from_col: Option<String>,
+    /// CSV-only: name of the target column for edges.
+    #[serde(default)]
+    pub to_col: Option<String>,
+}
+
+async fn graph_bulk_nodes(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<BulkQuery>,
+    body: Body,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/jsonl")
+        .to_string();
+    let is_csv = content_type.starts_with("text/csv");
+
+    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "bulk_body_read_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let batch_size = query.batch_size.unwrap_or(500).max(1);
+    let mut splitter = crate::bulk::LineSplitter::default();
+    let mut produced_lines = splitter.feed(&bytes);
+    produced_lines.extend(splitter.flush());
+
+    let mut csv_parser: Option<crate::bulk::CsvNodeParser> = None;
+    let mut first_data_line = 1usize;
+    if is_csv {
+        if let Some(header_str) = query.headers.as_deref() {
+            csv_parser = Some(crate::bulk::CsvNodeParser::new(
+                header_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect(),
+            ));
+        } else if !produced_lines.is_empty() {
+            let first = produced_lines.remove(0);
+            first_data_line = 2;
+            csv_parser = Some(crate::bulk::CsvNodeParser::new(
+                first.split(',').map(|s| s.trim().to_string()).collect(),
+            ));
+        }
+    }
+
+    let mut inserted = 0usize;
+    let mut failed = 0usize;
+    let mut errors: Vec<Value> = Vec::new();
+    let mut batches = 0usize;
+    let mut pending: Vec<(usize, rustyred_thg_core::NodeRecord)> = Vec::with_capacity(batch_size);
+
+    for (line_no, line) in produced_lines.iter().enumerate() {
+        let source_line = first_data_line + line_no;
+        let parsed = if is_csv {
+            csv_parser
+                .as_ref()
+                .map(|parser| parser.parse(line))
+                .unwrap_or_else(|| Err("csv parser not initialized".into()))
+        } else {
+            crate::bulk::jsonl_parse_node(line)
+        };
+        match parsed {
+            Ok(node) => {
+                pending.push((source_line, node));
+                if pending.len() >= batch_size {
+                    flush_node_batch(
+                        &mut store,
+                        &state,
+                        &tenant_id,
+                        &mut pending,
+                        &mut inserted,
+                        &mut failed,
+                        &mut errors,
+                    );
+                    batches += 1;
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                if errors.len() < 32 {
+                    errors.push(bulk_parse_error(source_line, &err));
+                }
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        flush_node_batch(
+            &mut store,
+            &state,
+            &tenant_id,
+            &mut pending,
+            &mut inserted,
+            &mut failed,
+            &mut errors,
+        );
+        batches += 1;
+    }
+
+    Json(json!({
+        "ok": failed == 0,
+        "tenant": tenant_id,
+        "inserted": inserted,
+        "failed": failed,
+        "errors": errors,
+        "batches": batches,
+    }))
+    .into_response()
+}
+
+fn flush_node_batch(
+    store: &mut TenantGraphStore,
+    state: &AppState,
+    tenant_id: &str,
+    pending: &mut Vec<(usize, rustyred_thg_core::NodeRecord)>,
+    inserted: &mut usize,
+    failed: &mut usize,
+    errors: &mut Vec<Value>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let snapshot: Vec<(usize, rustyred_thg_core::NodeRecord)> = pending.drain(..).collect();
+    let mutations: Vec<rustyred_thg_core::GraphMutation> = snapshot
+        .iter()
+        .map(|(_, node)| rustyred_thg_core::GraphMutation::NodeUpsert(node.clone()))
+        .collect();
+    let batch = rustyred_thg_core::GraphMutationBatch::new(mutations);
+    match store.commit_batch(batch) {
+        Ok(_transaction) => {
+            *inserted += snapshot.len();
+            for (_, node) in &snapshot {
+                state.observability.record_mutation();
+                state.maybe_index_node_spatially(tenant_id, node);
+                state.maybe_index_node_fulltext(tenant_id, node);
+            }
+        }
+        Err(_) => {
+            for (line, node) in snapshot {
+                let record_id = node.id.clone();
+                let batch = rustyred_thg_core::GraphMutationBatch::new([
+                    rustyred_thg_core::GraphMutation::NodeUpsert(node.clone()),
+                ]);
+                match store.commit_batch(batch) {
+                    Ok(_) => {
+                        *inserted += 1;
+                        state.observability.record_mutation();
+                        state.maybe_index_node_spatially(tenant_id, &node);
+                        state.maybe_index_node_fulltext(tenant_id, &node);
+                    }
+                    Err(err) => {
+                        *failed += 1;
+                        if errors.len() < 32 {
+                            errors.push(bulk_store_error(line, &record_id, &err));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn graph_bulk_edges(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<BulkQuery>,
+    body: Body,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let mut store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/jsonl")
+        .to_string();
+    let is_csv = content_type.starts_with("text/csv");
+
+    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "bulk_body_read_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let batch_size = query.batch_size.unwrap_or(500).max(1);
+    let mut splitter = crate::bulk::LineSplitter::default();
+    let mut produced_lines = splitter.feed(&bytes);
+    produced_lines.extend(splitter.flush());
+
+    let mut csv_parser: Option<crate::bulk::CsvEdgeParser> = None;
+    let mut first_data_line = 1usize;
+    if is_csv {
+        let from_col = query.from_col.as_deref().unwrap_or("from_id");
+        let to_col = query.to_col.as_deref().unwrap_or("to_id");
+        if let Some(header_str) = query.headers.as_deref() {
+            let header_vec: Vec<String> = header_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+            match crate::bulk::CsvEdgeParser::new(header_vec, from_col, to_col) {
+                Ok(parser) => csv_parser = Some(parser),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "bulk_csv_header_invalid",
+                            "message": err,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        } else if !produced_lines.is_empty() {
+            let first = produced_lines.remove(0);
+            first_data_line = 2;
+            let header_vec: Vec<String> = first.split(',').map(|s| s.trim().to_string()).collect();
+            match crate::bulk::CsvEdgeParser::new(header_vec, from_col, to_col) {
+                Ok(parser) => csv_parser = Some(parser),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "bulk_csv_header_invalid",
+                            "message": err,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    let mut inserted = 0usize;
+    let mut failed = 0usize;
+    let mut errors: Vec<Value> = Vec::new();
+    let mut batches = 0usize;
+    let mut pending: Vec<(usize, rustyred_thg_core::EdgeRecord)> = Vec::with_capacity(batch_size);
+
+    for (line_no, line) in produced_lines.iter().enumerate() {
+        let source_line = first_data_line + line_no;
+        let parsed = if is_csv {
+            csv_parser
+                .as_ref()
+                .map(|parser| parser.parse(line))
+                .unwrap_or_else(|| Err("csv parser not initialized".into()))
+        } else {
+            crate::bulk::jsonl_parse_edge(line)
+        };
+        match parsed {
+            Ok(edge) => {
+                pending.push((source_line, edge));
+                if pending.len() >= batch_size {
+                    flush_edge_batch(
+                        &mut store,
+                        &state,
+                        &mut pending,
+                        &mut inserted,
+                        &mut failed,
+                        &mut errors,
+                    );
+                    batches += 1;
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                if errors.len() < 32 {
+                    errors.push(bulk_parse_error(source_line, &err));
+                }
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        flush_edge_batch(
+            &mut store,
+            &state,
+            &mut pending,
+            &mut inserted,
+            &mut failed,
+            &mut errors,
+        );
+        batches += 1;
+    }
+
+    Json(json!({
+        "ok": failed == 0,
+        "tenant": tenant_id,
+        "inserted": inserted,
+        "failed": failed,
+        "errors": errors,
+        "batches": batches,
+    }))
+    .into_response()
+}
+
+fn flush_edge_batch(
+    store: &mut TenantGraphStore,
+    state: &AppState,
+    pending: &mut Vec<(usize, rustyred_thg_core::EdgeRecord)>,
+    inserted: &mut usize,
+    failed: &mut usize,
+    errors: &mut Vec<Value>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let snapshot: Vec<(usize, rustyred_thg_core::EdgeRecord)> = pending.drain(..).collect();
+    let mutations: Vec<rustyred_thg_core::GraphMutation> = snapshot
+        .iter()
+        .map(|(_, edge)| rustyred_thg_core::GraphMutation::EdgeUpsert(edge.clone()))
+        .collect();
+    let batch = rustyred_thg_core::GraphMutationBatch::new(mutations);
+    match store.commit_batch(batch) {
+        Ok(_transaction) => {
+            *inserted += snapshot.len();
+            for _ in snapshot {
+                state.observability.record_mutation();
+            }
+        }
+        Err(_) => {
+            for (line, edge) in snapshot {
+                let record_id = edge.id.clone();
+                let batch = rustyred_thg_core::GraphMutationBatch::new([
+                    rustyred_thg_core::GraphMutation::EdgeUpsert(edge),
+                ]);
+                match store.commit_batch(batch) {
+                    Ok(_) => {
+                        *inserted += 1;
+                        state.observability.record_mutation();
+                    }
+                    Err(err) => {
+                        *failed += 1;
+                        if errors.len() < 32 {
+                            errors.push(bulk_store_error(line, &record_id, &err));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn bulk_parse_error(line: usize, message: &str) -> Value {
+    json!({
+        "line": line,
+        "code": bulk_error_code(message),
+        "message": message,
+    })
+}
+
+fn bulk_store_error(
+    line: usize,
+    record_id: &str,
+    error: &rustyred_thg_core::GraphStoreError,
+) -> Value {
+    json!({
+        "line": line,
+        "code": error.code,
+        "message": error.message,
+        "record_id": record_id,
+    })
+}
+
+fn bulk_error_code(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("properties") {
+        "invalid_properties"
+    } else if lower.contains("json") || lower.contains("expected") || lower.contains("eof") {
+        "invalid_json"
+    } else if lower.contains("missing") {
+        "missing_required_field"
+    } else if lower.contains("csv") {
+        "invalid_csv_row"
+    } else {
+        "invalid_record"
+    }
+}
+
+// ===== Phase 5: Full-text endpoints =====
+
+#[derive(Debug, Deserialize)]
+struct FullTextDesignateBody {
+    label: String,
+    property: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FullTextSearchBody {
+    #[serde(default)]
+    label: Option<String>,
+    property: String,
+    query: String,
+    #[serde(default = "default_fulltext_k")]
+    k: usize,
+}
+
+fn default_fulltext_k() -> usize {
+    10
+}
+
+async fn graph_fulltext_designate(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<FullTextDesignateBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    match state.designate_fulltext_property(&tenant_id, &body.label, &body.property) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "label": body.label,
+            "property": body.property,
+        }))
+        .into_response(),
+        Err(error) => {
+            state.observability.record_error();
+            store_unavailable_response(error)
+        }
+    }
+}
+
+async fn graph_fulltext_search(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<FullTextSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    state.observability.record_fulltext_search();
+    let detail = format!(
+        "label={} property={}",
+        body.label.as_deref().unwrap_or("*"),
+        body.property
+    );
+    let start = std::time::Instant::now();
+    let outcome = state.fulltext_search(
+        &tenant_id,
+        body.label.as_deref(),
+        &body.property,
+        &body.query,
+        body.k,
+    );
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_FULLTEXT_SEARCH, &detail, nanos, 0, 0);
+    match outcome {
+        Ok(results) => {
+            let items: Vec<Value> = results
+                .into_iter()
+                .map(|(id, score)| json!({ "node_id": id, "score": score }))
+                .collect();
+            Json(json!({
+                "ok": true,
+                "tenant": tenant_id,
+                "results": items,
+            }))
+            .into_response()
+        }
+        Err(error) => store_unavailable_response(error),
+    }
+}
+
+// ===== Phase 8: Spatial endpoints =====
+
+#[derive(Debug, Deserialize)]
+struct SpatialDesignateBody {
+    label: String,
+    lat_property: String,
+    lon_property: String,
+    #[serde(default = "default_h3_resolution")]
+    resolution: u8,
+}
+
+fn default_h3_resolution() -> u8 {
+    8
+}
+
+#[derive(Debug, Deserialize)]
+struct SpatialRadiusBody {
+    label: String,
+    lat_property: String,
+    lon_property: String,
+    lat: f64,
+    lon: f64,
+    radius_km: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpatialBboxBody {
+    label: String,
+    lat_property: String,
+    lon_property: String,
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+}
+
+async fn graph_spatial_designate(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpatialDesignateBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    match state.designate_spatial_property(
+        &tenant_id,
+        &body.label,
+        &body.lat_property,
+        &body.lon_property,
+        body.resolution,
+    ) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "label": body.label,
+            "lat_property": body.lat_property,
+            "lon_property": body.lon_property,
+            "resolution": body.resolution,
+        }))
+        .into_response(),
+        Err(error) => {
+            state.observability.record_error();
+            store_unavailable_response(error)
+        }
+    }
+}
+
+async fn graph_spatial_radius(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpatialRadiusBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    state.observability.record_spatial_search();
+    match state.spatial_radius_search(
+        &tenant_id,
+        &body.label,
+        &body.lat_property,
+        &body.lon_property,
+        body.lat,
+        body.lon,
+        body.radius_km,
+    ) {
+        Ok(ids) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "count": ids.len(),
+            "node_ids": ids,
+        }))
+        .into_response(),
+        Err(error) => store_unavailable_response(error),
+    }
+}
+
+async fn graph_spatial_bbox(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpatialBboxBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    state.observability.record_spatial_search();
+    match state.spatial_bbox_search(
+        &tenant_id,
+        &body.label,
+        &body.lat_property,
+        &body.lon_property,
+        body.min_lat,
+        body.min_lon,
+        body.max_lat,
+        body.max_lon,
+    ) {
+        Ok(ids) => Json(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "count": ids.len(),
+            "node_ids": ids,
+        }))
+        .into_response(),
+        Err(error) => store_unavailable_response(error),
+    }
+}
+
+async fn graph_algorithm_communities(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(_body): Json<CommunitiesBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let store = match state.tenant_graph_store(&tenant_id) {
+        Ok(s) => s,
+        Err(error) => return store_unavailable_response(error),
+    };
+    state.observability.record_communities();
+    let start = std::time::Instant::now();
+    let outcome = (|| -> Result<Value, GraphStoreError> {
+        let edges = store.list_edges()?;
+        let (community, modularity) = rustyred_thg_core::label_propagation_communities(&edges);
+        let mut entries: Vec<Value> = community
+            .into_iter()
+            .map(|(node_id, c)| json!({ "node_id": node_id, "community_id": c }))
+            .collect();
+        entries.sort_by(|a, b| {
+            a["node_id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["node_id"].as_str().unwrap_or(""))
+        });
+        Ok(json!({
+            "ok": true,
+            "tenant": tenant_id,
+            "algorithm": "label_propagation",
+            "communities": entries,
+            "modularity": modularity,
+        }))
+    })();
+    let nanos = start.elapsed().as_nanos() as u64;
+    state
+        .observability
+        .record_query_timing(KIND_ALGO_COMMUNITIES, "communities", nanos, 0, 0);
+    match outcome {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => graph_store_error_response(error),
+    }
+}
+
+// ===== Harness Instant KG endpoints =====
+
+#[derive(Debug, Deserialize, Default)]
+struct InstantKgViewBody {
+    #[serde(default)]
+    manifest: Option<CodeKgManifest>,
+    #[serde(default)]
+    delta: Option<SessionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgPprBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    seeds: std::collections::HashMap<String, f64>,
+    #[serde(default = "default_ppr_alpha")]
+    alpha: f64,
+    #[serde(default = "default_ppr_epsilon")]
+    epsilon: f64,
+    #[serde(default = "default_ppr_max_pushes")]
+    max_pushes: usize,
+    #[serde(default = "default_instant_kg_top_k")]
+    top_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgImpactBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    #[serde(default)]
+    seed: Option<String>,
+    #[serde(default)]
+    symbol_name: Option<String>,
+    #[serde(default = "default_impact_direction")]
+    direction: String,
+    #[serde(default = "default_impact_depth")]
+    max_depth: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgRelatedBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    seed: String,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default = "default_instant_kg_top_k")]
+    top_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgSearchBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    query: String,
+    #[serde(default)]
+    kinds: Vec<String>,
+    #[serde(default = "default_instant_kg_top_k")]
+    top_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstantKgExplainEdgeBody {
+    #[serde(flatten)]
+    view: InstantKgViewBody,
+    src: String,
+    dst: String,
+}
+
+fn default_instant_kg_top_k() -> usize {
+    10
+}
+
+fn default_impact_direction() -> String {
+    "out".to_string()
+}
+
+fn default_impact_depth() -> usize {
+    2
+}
+
+fn instant_kg_view(
+    state: &AppState,
+    tenant_id: &str,
+    body: InstantKgViewBody,
+) -> Result<HarnessInstantKg, axum::response::Response> {
+    let store = state
+        .tenant_graph_store(tenant_id)
+        .map_err(store_unavailable_response)?;
+    let base = store.graph_snapshot().map_err(graph_store_error_response)?;
+    Ok(HarnessInstantKg::new(
+        base,
+        body.manifest,
+        body.delta.unwrap_or_default(),
+    ))
+}
+
+fn instant_kg_direction(value: &str) -> Direction {
+    if value.eq_ignore_ascii_case("in") || value.eq_ignore_ascii_case("incoming") {
+        Direction::In
+    } else {
+        Direction::Out
+    }
+}
+
+async fn instant_kg_status(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgViewBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "status": view.status(),
+        "stats": view.stats(),
+    }))
+    .into_response()
+}
+
+async fn instant_kg_ppr(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgPprBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let results = view.ppr(
+        &body.seeds,
+        body.alpha,
+        body.epsilon,
+        body.max_pushes,
+        body.top_k,
+    );
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_impact(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgImpactBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let InstantKgImpactBody {
+        view: view_body,
+        seed,
+        symbol_name,
+        direction,
+        max_depth,
+    } = body;
+    let seed = seed
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let symbol_name = symbol_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if seed.is_none() && symbol_name.is_none() {
+        return graph_store_error_response(GraphStoreError::new(
+            "invalid_instant_kg_request",
+            "instant KG impact requires seed or symbol_name",
+        ));
+    }
+    let direction = instant_kg_direction(&direction);
+    let view = match instant_kg_view(&state, &tenant_id, view_body) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let seed = match seed {
+        Some(seed) => seed,
+        None => match symbol_name
+            .as_deref()
+            .and_then(|symbol| view.resolve_symbol_name(symbol))
+        {
+            Some(seed) => seed,
+            None => {
+                return graph_store_error_response(GraphStoreError::new(
+                    "invalid_instant_kg_request",
+                    "instant KG impact could not resolve symbol_name",
+                ))
+            }
+        },
+    };
+    let results = view.impact(&seed, direction, max_depth);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "seed": seed,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_related_objects(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgRelatedBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let results = view.related_objects(&body.seed, &body.kinds, body.top_k);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "seed": body.seed,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_search(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgSearchBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let results = view.search(&body.query, &body.kinds, body.top_k);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "query": body.query,
+        "status": view.status(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn instant_kg_explain_edge(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstantKgExplainEdgeBody>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let view = match instant_kg_view(&state, &tenant_id, body.view) {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    let explanations = view.explain_edge(&body.src, &body.dst);
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "src": body.src,
+        "dst": body.dst,
+        "status": view.status(),
+        "explanations": explanations,
+    }))
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use axum::body::{to_bytes, Body};
+    use axum::extract::{Query, State};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::Json;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    use super::{
+        browser_use_job, build_router, default_ppr_alpha, default_ppr_epsilon,
+        default_ppr_max_pushes, default_pr_damping, default_pr_max_iter, default_pr_tolerance,
+        derive_live_search_seeds, execute_graph_store_command, execute_tenant_cache_command,
+        execute_tenant_command, graph_algorithm_communities, graph_algorithm_components,
+        graph_algorithm_pagerank, graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes,
+        graph_error_status, graph_fulltext_search, graph_vector_hybrid, graph_vector_search,
+        instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr, instant_kg_search,
+        is_adapter_command, is_cache_command, is_graph_command, live_search_budget,
+        live_search_is_sparse, maybe_handle_browser_use_mcp, maybe_handle_composed_agent_mcp,
+        maybe_handle_hippo_retrieve_mcp, maybe_handle_live_search_acquisition_mcp,
+        maybe_handle_web_search_graph_mcp, mcp_origin_allowed, memory_docs_list, public_cypher,
+        required_scope_for_command, search_live, transaction_begin, transaction_commit,
+        transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody,
+        HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
+        InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, MemoryDocsQuery, PageRankBody,
+        PprBody, PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+    };
+    use crate::{
+        auth::ApiToken,
+        config::{Config, StorageMode, TenantConfigOverride},
+        metrics::diagnostics_config,
+        state::AppState,
+    };
+    use rustyred_thg_affordances::registry::register_connector_with_target;
+    use rustyred_thg_affordances::{ConnectorManifest, ToolManifest};
+    use rustyred_thg_connectors::{ConnectionTarget, ConnectorAuth};
+    use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
+    use rustyred_thg_mcp::{handle_mcp_request_with_context, McpRequestContext};
+    use rustyred_web::{SearchCandidate, SearchProvider, StaticSearchProvider};
+    use theorem_browser_agent::BrowserSurface;
+
+    #[test]
+    fn browser_playbooks_publish_and_browsing_run_node_persists() {
+        let mut store = super::InMemoryGraphStore::default();
+        let ids = super::publish_browser_playbooks(&mut store, "default", "tester");
+        assert_eq!(
+            ids.len(),
+            6,
+            "all six browser playbooks publish as skill packs"
+        );
+        let node_id = super::persist_browsing_run_node(
+            &mut store,
+            "default",
+            "run-1",
+            &json!({ "events": ["context_command.resolved"] }),
+            &["https://example.com/".to_string()],
+            &ids,
+        )
+        .expect("browsing run node persisted");
+        let node = super::GraphStore::get_node(&store, &node_id).expect("node present");
+        assert!(node
+            .labels
+            .iter()
+            .any(|label| label.as_str() == "BrowsingRun"));
+    }
+
+    async fn response_payload_json(response: axum::response::Response) -> Value {
+        serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn memory_product_state() -> AppState {
+        memory_product_state_with_search_providers(Vec::new())
+    }
+
+    fn memory_product_state_with_search_providers(
+        search_providers: Vec<Arc<dyn SearchProvider>>,
+    ) -> AppState {
+        memory_product_state_with_search_providers_and_read_only(search_providers, true)
+    }
+
+    fn memory_product_write_state_with_search_providers(
+        search_providers: Vec<Arc<dyn SearchProvider>>,
+    ) -> AppState {
+        memory_product_state_with_search_providers_and_read_only(search_providers, false)
+    }
+
+    fn memory_product_state_with_search_providers_and_read_only(
+        search_providers: Vec<Arc<dyn SearchProvider>>,
+        read_only: bool,
+    ) -> AppState {
+        AppState::new_with_search_providers(
+            Config {
+                host: "127.0.0.1".to_string(),
+                port: 8380,
+                storage_mode: StorageMode::Memory,
+                data_dir: "data/rusty-red".to_string(),
+                require_volume: false,
+                volume_available: false,
+                durability: RedCoreDurability::None,
+                snapshot_interval_writes: 0,
+                strict_acid: false,
+                concurrency: "single_writer".to_string(),
+                txn_isolation: "snapshot".to_string(),
+                tenant_memory_quota_bytes: 0,
+                tenant_memory_quota_config_error: None,
+                tenant_config_overrides: Default::default(),
+                tenant_config_error: None,
+                slow_query_threshold_nanos: 100_000_000,
+                slow_query_capacity: 128,
+                slow_query_log: None,
+                hybrid_scoring: rustyred_thg_core::HybridScoringConfig::default(),
+                redis_url: "not-a-redis-url".to_string(),
+                redis_key_prefix: "rusty-red".to_string(),
+                require_auth: false,
+                allowed_origins: Vec::new(),
+                api_tokens: Vec::new(),
+                service_name: "rusty-red".to_string(),
+                api_title: "Rusty Red".to_string(),
+                public_url: None,
+                mcp_enabled: true,
+                mcp_read_only: read_only,
+                mcp_allow_admin: false,
+                mcp_default_tenant: "default".to_string(),
+                ttl_sweep_ms: 1000,
+            },
+            search_providers,
+        )
+    }
+
+    fn memory_product_auth_state() -> AppState {
+        let mut config = Config::default_for_tests();
+        config.require_auth = true;
+        config.api_tokens = vec![ApiToken {
+            token: "secret-a".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            scopes: vec!["graph:read".to_string(), "graph:write".to_string()],
+        }];
+        config.mcp_enabled = true;
+        config.mcp_read_only = false;
+        config.mcp_default_tenant = "tenant-a".to_string();
+        AppState::new(config)
+    }
+
+    #[tokio::test]
+    async fn path_tenant_auth_rejects_mismatched_token_before_write() {
+        let state = memory_product_auth_state();
+        let app = build_router(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/tenant-b/graph/nodes")
+            .header("authorization", "Bearer secret-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "node:blocked",
+                    "labels": ["Doc"],
+                    "properties": { "title": "blocked" }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let store = state.tenant_graph_store("tenant-b").unwrap();
+        assert!(store.get_node("node:blocked").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn root_tenant_auth_rejects_mismatched_body_tenant() {
+        let state = memory_product_auth_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/query")
+            .header("authorization", "Bearer secret-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "tenant_id": "tenant-b",
+                    "query": "MATCH (n) RETURN n"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn graphql_route_mutates_and_reads_items_with_default_tenant() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let app = build_router(state);
+        let mutation = axum::http::Request::builder()
+            .method("POST")
+            .uri("/graphql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "query": "mutation Put($input: ItemInput!) { putItem(input: $input) { id kind title source extra } }",
+                    "variables": {
+                        "input": {
+                            "id": "item:graphql-route",
+                            "kind": "note",
+                            "title": "GraphQL route item",
+                            "source": "desktop-test",
+                            "extra": { "panel": "commonplace" }
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(mutation).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["errors"], Value::Null, "mutation errors: {payload}");
+        assert_eq!(payload["data"]["putItem"]["id"], "item:graphql-route");
+        assert_eq!(payload["data"]["putItem"]["kind"], "note");
+
+        let query = axum::http::Request::builder()
+            .method("POST")
+            .uri("/graphql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "query": "{ itemsByKind(kind: \"note\", limit: 5) { id title source } }"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(query).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["errors"], Value::Null, "query errors: {payload}");
+        assert!(payload["data"]["itemsByKind"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .any(|item| item["id"] == "item:graphql-route"
+                && item["title"] == "GraphQL route item"
+                && item["source"] == "desktop-test"));
+    }
+
+    #[tokio::test]
+    async fn agent_space_snapshot_seeds_room_and_returns_cursor() {
+        let state = memory_product_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agent-space/snapshot?tenant=default&room=room:agent-space")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["room_id"], "room:agent-space");
+        // The cursor is the monotonic high-water seq the stream de-dupes against.
+        assert!(
+            payload["cursor"].is_u64(),
+            "snapshot cursor must be a numeric seq, got {}",
+            payload["cursor"]
+        );
+        assert!(payload.get("room").is_some());
+        assert!(payload.get("presence").is_some());
+        assert!(payload.get("work_graph").is_some());
+    }
+
+    #[tokio::test]
+    async fn agent_space_snapshot_requires_tenant() {
+        let state = memory_product_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agent-space/snapshot")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["error"], "missing_tenant");
+    }
+
+    #[tokio::test]
+    async fn agent_space_stream_opens_as_event_stream() {
+        let state = memory_product_state();
+        let app = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/agent-space/stream?tenant=default&room=room:agent-space")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "agent-space stream must be an SSE response, got {content_type}"
+        );
+    }
+
+    #[test]
+    fn live_search_derives_bounded_crawl_inputs() {
+        let (seeds, strategy) = derive_live_search_seeds("knowledge graph", &[]);
+        assert_eq!(strategy, "wikipedia_title_guess");
+        assert_eq!(
+            seeds,
+            vec!["https://en.wikipedia.org/wiki/Knowledge_Graph".to_string()]
+        );
+
+        let (seeds, strategy) = derive_live_search_seeds("example.com/docs", &[]);
+        assert_eq!(strategy, "domain_guess");
+        assert_eq!(seeds, vec!["https://example.com/docs".to_string()]);
+
+        let budget = live_search_budget(&LiveSearchRequest {
+            max_pages: Some(100),
+            max_seconds: Some(100),
+            max_depth: Some(10),
+            max_bytes: Some(100 * 1024 * 1024),
+            ..LiveSearchRequest::default()
+        });
+        assert_eq!(budget.max_pages, 25);
+        assert_eq!(budget.max_seconds, 30);
+        assert_eq!(budget.max_depth, 2);
+        assert_eq!(budget.max_bytes, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn browser_use_job_maps_tool_names_to_surfaces() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let config = state.mcp_config();
+
+        let co_browse = browser_use_job(
+            &config,
+            "browse_with_me",
+            &json!({
+                "task": "co-browse documentation",
+                "url": "https://example.com/docs",
+                "control_mode": "pair",
+                "run_id": "browse-with-me-test"
+            }),
+        )
+        .expect("browse_with_me job");
+        assert_eq!(co_browse.surface, BrowserSurface::BrowseWithMe);
+        assert_eq!(co_browse.control_mode, "pair");
+        assert_eq!(co_browse.run_id, "browse-with-me-test");
+
+        let consume = browser_use_job(
+            &config,
+            "web_consume",
+            &json!({
+                "url": "https://example.com/source",
+                "ingest": false
+            }),
+        )
+        .expect("web_consume job");
+        assert_eq!(consume.surface, BrowserSurface::WebConsume);
+        assert!(!consume.ingest);
+        assert_eq!(consume.task, "consume https://example.com/source");
+        assert!(!super::should_use_live_browser(&state, &consume));
+    }
+
+    #[tokio::test]
+    async fn browse_with_me_live_session_previews_then_confirms_action() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let pool = Arc::new(crate::browser_pool::ScriptedBrowserPool::new(
+            crate::browser_pool::scripted_page_with_textbox(),
+        ));
+        state.set_live_browser_pool(Some(pool.clone()));
+        let config = state.mcp_config();
+        let action = json!({
+            "selector": { "element_id": "name" },
+            "action": "fill",
+            "value": "Travis",
+            "options": { "timeout_ms": 1 }
+        });
+
+        let first = super::browser_use_payload(
+            &state,
+            &config,
+            "browse_with_me",
+            &json!({
+                "tenant": "default",
+                "run_id": "live-run",
+                "task": "fill the name field",
+                "url": "https://example.test/form",
+                "action": action,
+                "wait": true
+            }),
+        )
+        .await
+        .expect("preview response");
+
+        assert_eq!(first["live_browser"]["status"], "preview_pending");
+        assert!(
+            pool.receipts().is_empty(),
+            "preview must not actuate before confirm"
+        );
+
+        let second = super::browser_use_payload(
+            &state,
+            &config,
+            "browse_with_me",
+            &json!({
+                "tenant": "default",
+                "run_id": "live-run",
+                "task": "fill the name field",
+                "url": "https://example.test/form",
+                "confirm": true,
+                "wait": true
+            }),
+        )
+        .await
+        .expect("confirm response");
+
+        assert_eq!(second["live_browser"]["status"], "actuated");
+        assert_eq!(
+            second["live_browser"]["page"]["interactive_elements"][0]["value"],
+            "Travis"
+        );
+        assert_eq!(pool.receipts().len(), 1);
+        assert!(
+            second["browsing_run"]["live_browser"]["action_receipt"]["applied"]
+                .as_bool()
+                .unwrap_or(false),
+            "browsing run ledger should include the applied actuation receipt"
+        );
+    }
+
+    // handoff-7 acceptance #1: with a live pool, a browse_for_me task applies a real
+    // click/type on the page through run_action (not link-following), the DOM change
+    // shows up in the closing perception, and the BrowsingRun ledger records the
+    // actuation -- not only navigation. Hermetic: the live branch replaces the
+    // cascade fetch, so the scripted pool drives it with no network.
+    #[tokio::test]
+    async fn browse_for_me_live_session_actuates_through_run_action() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let pool = Arc::new(crate::browser_pool::ScriptedBrowserPool::new(
+            crate::browser_pool::scripted_page_with_textbox(),
+        ));
+        state.set_live_browser_pool(Some(pool.clone()));
+        let config = state.mcp_config();
+
+        let response = super::browser_use_payload(
+            &state,
+            &config,
+            "browse_for_me",
+            &json!({
+                "tenant": "default",
+                "run_id": "bfm-live-run",
+                "task": "fill the name field",
+                "url": "https://example.test/form",
+                "action": {
+                    "selector": { "element_id": "name" },
+                    "action": "fill",
+                    "value": "Servo",
+                    "options": { "timeout_ms": 1 }
+                },
+                "wait": true
+            }),
+        )
+        .await
+        .expect("browse_for_me live response");
+
+        // The supplied action actuated immediately (no preview gate on browse_for_me).
+        assert_eq!(response["live_browser"]["status"], "actuated");
+        // The DOM change is in the closing perception (the returned page state).
+        assert_eq!(
+            response["live_browser"]["page"]["interactive_elements"][0]["value"],
+            "Servo"
+        );
+        // The ledger records the actuation receipt, not only a navigation.
+        assert!(
+            response["browsing_run"]["live_browser"]["action_receipt"]["applied"]
+                .as_bool()
+                .unwrap_or(false),
+            "browsing run should record the actuation"
+        );
+        assert_eq!(
+            pool.receipts().len(),
+            1,
+            "exactly one real run_action actuation drove the page"
+        );
+    }
+
+    // handoff-7 acceptance #4 (server half): the server derives the governance policy
+    // it feeds into run_action -- a state-changing action stays unconfirmed (so the
+    // engine blocks it) unless confirm is set, and the robots gate stays required by
+    // default. The engine-side enforcement of this policy (action_allowed_by_policy /
+    // action_allowed_by_robots / domain_policy_blocks_off_domain_link_before_fetch) is
+    // proven in rustyred_web::browser_engine tests; this proves the server feeds it.
+    #[test]
+    fn browser_action_policy_gates_state_change_and_robots() {
+        let default_policy = super::browser_action_policy(&json!({}), false).expect("policy");
+        assert!(
+            !default_policy.confirmed,
+            "no confirm -> unconfirmed (a state-changing action is blocked downstream)"
+        );
+        assert!(
+            !default_policy.allow_state_changing,
+            "state-changing actuation is off by default (needs a higher trust tier)"
+        );
+        assert!(
+            default_policy.require_robots,
+            "the robots gate is required by default"
+        );
+
+        // The confirm-before-write path flips confirmed true for the supervised action.
+        let confirmed = super::browser_action_policy(&json!({}), true).expect("policy");
+        assert!(confirmed.confirmed);
+
+        // Explicit opt-ins (higher trust tier) are honored, including permitted domains.
+        let opted = super::browser_action_policy(
+            &json!({
+                "allow_state_changing": true,
+                "require_robots": false,
+                "permitted_domains": ["example.test"]
+            }),
+            true,
+        )
+        .expect("policy");
+        assert!(opted.allow_state_changing && opted.confirmed && !opted.require_robots);
+        assert_eq!(opted.permitted_domains, vec!["example.test".to_string()]);
+    }
+
+    // handoff-7 acceptance #6 + Decision 2: web_consume is the read primitive. Even
+    // with a live pool configured it stays on the cascade path (never actuates), and
+    // ingest=false carries no graph write; the write variant is blocked under
+    // read-only. Hermetic: asserted at the gate/job layer, before any fetch.
+    #[tokio::test]
+    async fn web_consume_stays_cascade_read_path_and_write_gated() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let pool = Arc::new(crate::browser_pool::ScriptedBrowserPool::new(
+            crate::browser_pool::scripted_page_with_textbox(),
+        ));
+        state.set_live_browser_pool(Some(pool.clone()));
+        let config = state.mcp_config();
+
+        let consume_job = super::browser_use_job(
+            &config,
+            "web_consume",
+            &json!({ "url": "https://example.test/source", "ingest": false }),
+        )
+        .expect("web_consume job");
+        assert!(!consume_job.ingest, "ingest=false carries no graph write");
+        assert!(
+            !super::should_use_live_browser(&state, &consume_job),
+            "web_consume stays on the cascade path even when a live pool is present"
+        );
+        assert!(
+            pool.receipts().is_empty(),
+            "web_consume actuates nothing on the live pool"
+        );
+
+        // The write variant (ingest=true) is blocked under read-only, before any fetch.
+        let ro_state = memory_product_state();
+        let ro_config = ro_state.mcp_config();
+        let blocked = super::browser_use_payload(
+            &ro_state,
+            &ro_config,
+            "web_consume",
+            &json!({ "url": "https://example.test/source", "ingest": true }),
+        )
+        .await
+        .expect_err("ingest=true must be blocked under read-only");
+        assert_eq!(blocked["error"], "mcp_read_only");
+    }
+
+    #[tokio::test]
+    async fn mcp_browser_use_read_only_blocks_write_surfaces_without_fetching() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+
+        let response = maybe_handle_browser_use_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "browse-for-me",
+                "method": "tools/call",
+                "params": {
+                    "name": "browse_for_me",
+                    "arguments": { "task": "research pricing" }
+                }
+            }),
+        )
+        .await
+        .expect("browser-use MCP route should be intercepted");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
+
+        let response = maybe_handle_browser_use_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "web-consume",
+                "method": "tools/call",
+                "params": {
+                    "name": "web_consume",
+                    "arguments": { "url": "https://example.com/source" }
+                }
+            }),
+        )
+        .await
+        .expect("web_consume MCP route should be intercepted");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_composed_agent_read_only_blocks_provider_invocation() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+
+        let response = maybe_handle_composed_agent_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "composed-agent",
+                "method": "tools/call",
+                "params": {
+                    "name": "composed_agent_run",
+                    "arguments": { "task": "publish a grounded answer" }
+                }
+            }),
+        )
+        .await
+        .expect("composed-agent MCP route should be intercepted");
+
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_search_acquisition_intercept_returns_empty_registry_shape() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+        let response = maybe_handle_live_search_acquisition_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "search-acquisition",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyweb_search_acquisition",
+                    "arguments": {
+                        "q": " rustyweb ",
+                        "seed_limit": 4
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("search acquisition MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["query"], "rustyweb");
+        assert_eq!(payload["stats"]["providers"], 0);
+        assert_eq!(payload["stats"]["candidates"], 0);
+        assert!(payload["seed_urls"].as_array().unwrap().is_empty());
+        assert!(payload["acquisition"]["providers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_search_acquisition_intercept_returns_provider_seed_urls() {
+        let state =
+            memory_product_state_with_search_providers(vec![Arc::new(StaticSearchProvider::new(
+                "static",
+                vec![
+                    SearchCandidate {
+                        url: "https://example.com/search-candidate".to_string(),
+                        title: Some("Search candidate".to_string()),
+                        snippet: Some("candidate from configured provider".to_string()),
+                        source: "static".to_string(),
+                        rank: 1,
+                    },
+                    SearchCandidate {
+                        url: "https://example.com/other".to_string(),
+                        title: Some("Other".to_string()),
+                        snippet: None,
+                        source: "static".to_string(),
+                        rank: 2,
+                    },
+                ],
+            ))]);
+        let config = state.mcp_config();
+        let response = maybe_handle_live_search_acquisition_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "search-acquisition-with-provider",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyweb_search_acquisition",
+                    "arguments": {
+                        "query": "search candidate",
+                        "providers": ["static"],
+                        "seed_limit": 1
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("search acquisition MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["stats"]["providers"], 1);
+        assert_eq!(payload["stats"]["candidates"], 2);
+        assert_eq!(
+            payload["seed_urls"].as_array().unwrap()[0],
+            "https://example.com/search-candidate"
+        );
+        assert_eq!(payload["acquisition"]["providers"][0]["provider"], "static");
+        assert_eq!(payload["acquisition"]["providers"][0]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn mcp_search_acquisition_async_handoff_persists_pollable_harness_run() {
+        let state = memory_product_write_state_with_search_providers(vec![Arc::new(
+            StaticSearchProvider::new(
+                "static",
+                vec![SearchCandidate {
+                    url: "https://example.com/search-candidate".to_string(),
+                    title: Some("Search candidate".to_string()),
+                    snippet: Some("candidate from configured provider".to_string()),
+                    source: "static".to_string(),
+                    rank: 1,
+                }],
+            ),
+        )]);
+        // harness_run returns the run plus its full lifecycle event log; a populated
+        // run exceeds the default MCP boundary budget and would be truncated into a
+        // tool_result_fetch handle (dropping the inline found/detail fields the poll
+        // below asserts on). Disable the budget so the poll reads the run inline,
+        // matching native_harness_run_transitions_round_trip_through_mcp.
+        let mut config = state.mcp_config();
+        config.tool_result_budget_bytes = 0;
+        let response = maybe_handle_live_search_acquisition_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "search-acquisition-async",
+                "method": "tools/call",
+                "params": {
+                    "name": "rustyweb_search_acquisition",
+                    "arguments": {
+                        "query": "search candidate",
+                        "providers": ["static"],
+                        "seed_limit": 1,
+                        "run_id": "search-run-async-test"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("search acquisition MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["mode"], "async_handoff");
+        assert_eq!(payload["status"], "queued");
+        assert_eq!(payload["run_id"], "search-run-async-test");
+        assert_eq!(payload["poll"]["tool"], "harness_run");
+
+        // Poll until the spawned background task closes the run. The loop exits as
+        // soon as the run reports closed (typically the first iteration once the
+        // background task is scheduled); the generous ceiling only guards against
+        // slow task scheduling on a loaded CI host, so it never re-flakes.
+        let mut run_payload = Value::Null;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let response = handle_mcp_request_with_context(
+                &state,
+                &config,
+                &McpRequestContext::default(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "poll-search-acquisition",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "harness_run",
+                        "arguments": {
+                            "run_id": "search-run-async-test"
+                        }
+                    }
+                }),
+            );
+            run_payload = response["result"]["structuredContent"].clone();
+            if run_payload["detail"]["run"]["status"] == "closed" {
+                break;
+            }
+        }
+
+        assert_eq!(run_payload["found"], true);
+        assert_eq!(run_payload["detail"]["run"]["status"], "closed");
+        assert!(run_payload["detail"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "OUTCOME.RECORDED"));
+        assert_eq!(
+            run_payload["detail"]["run"]["outcome"]["receipt"]["stats"]["candidates"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_hippo_retrieve_intercept_returns_candidates_and_trace() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("default").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:hippo",
+                    [rustyred_hipporag::schema::LABEL_PAGE],
+                    json!({
+                        "url": "https://example.com/hipporag",
+                        "title": "HippoRAG hubs",
+                        "text": "HippoRAG hub summaries connect phrase evidence, graph retrieval, and page passages for associative search."
+                    }),
+                ))
+                .unwrap();
+            let mut gate_store = super::TenantMirrorGraphStore::new(&mut store).unwrap();
+            rustyred_hipporag::indexing::index_passage(&mut gate_store, "page:hippo").unwrap();
+            rustyred_hipporag::raptor::build_summary_tree_for_region(
+                &mut gate_store,
+                rustyred_hipporag::RaptorPolicy {
+                    region_node_threshold: 1,
+                    min_members: 2,
+                    max_level: 1,
+                },
+                &["page:hippo".to_string()],
+            )
+            .unwrap();
+        }
+        let config = state.mcp_config();
+        let response = maybe_handle_hippo_retrieve_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "hippo-retrieve",
+                "method": "tools/call",
+                "params": {
+                    "name": "hippo_retrieve",
+                    "arguments": {
+                        "query": "graph hub phrase retrieval",
+                        "top_k": 4
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("hippo_retrieve MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["query"], "graph hub phrase retrieval");
+        assert!(payload["candidates"].as_array().unwrap().len() >= 1);
+        assert_eq!(payload["trace"]["ran_query_ppr"], true);
+        assert_eq!(payload["trace"]["ran_global_ppr"], false);
+        assert!(payload["stats"]["warm_centrality_reads"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_hippo_retrieve_warms_index_from_memory_documents() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("Travis-Gilbert").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:doc:hippo",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "travis-gilbert",
+                        "doc_id": "doc-hippo",
+                        "kind": "decision",
+                        "title": "Commonplace wedge",
+                        "summary": "Commonplace wedge memory should seed HippoRAG retrieval.",
+                        "content": "The Commonplace wedge connects associative recall, memory summaries, and HippoRAG phrase indexing.",
+                        "status": "active",
+                        "tags": ["commonplace", "hipporag"]
+                    }),
+                ))
+                .unwrap();
+        }
+        let config = state.mcp_config();
+        let response = maybe_handle_hippo_retrieve_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "hippo-retrieve-memory",
+                "method": "tools/call",
+                "params": {
+                    "name": "hippo_retrieve",
+                    "arguments": {
+                        "tenant": "Travis-Gilbert",
+                        "query": "Commonplace wedge associative recall",
+                        "top_k": 4
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("hippo_retrieve MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["tenant"], "Travis-Gilbert");
+        assert_eq!(payload["indexing"]["ran"], true);
+        assert_eq!(payload["indexing"]["pages_upserted"], 1);
+        assert!(payload["indexing"]["phrases_upserted"].as_u64().unwrap() > 0);
+        assert!(payload["candidates"].as_array().unwrap().len() >= 1);
+        assert_eq!(payload["trace"]["ran_query_ppr"], true);
+        assert!(payload["stats"]["seeds"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_web_search_graph_intercept_returns_membrane_shape() {
+        let state = memory_product_write_state_with_search_providers(vec![Arc::new(
+            StaticSearchProvider::new(
+                "static",
+                vec![
+                    SearchCandidate {
+                        url: "https://example.com/membrane-candidate".to_string(),
+                        title: Some("Membrane candidate".to_string()),
+                        snippet: Some("candidate carried into the membrane gate".to_string()),
+                        source: "static".to_string(),
+                        rank: 1,
+                    },
+                    SearchCandidate {
+                        url: "https://example.com/membrane-other".to_string(),
+                        title: Some("Other".to_string()),
+                        snippet: Some("a second candidate for the gate".to_string()),
+                        source: "static".to_string(),
+                        rank: 2,
+                    },
+                ],
+            ),
+        )]);
+        let config = state.mcp_config();
+        let response = maybe_handle_web_search_graph_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "web-search-graph",
+                "method": "tools/call",
+                "params": {
+                    "name": "web_search_graph",
+                    "arguments": {
+                        "query": "membrane candidate",
+                        "providers": ["static"],
+                        "budget_tokens": 2000,
+                        "fetch_top_k": 0,
+                        "run_id": "web-search-graph-test"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("web_search_graph MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["mode"], "sync");
+        assert_eq!(payload["tenant"], "default");
+        assert_eq!(payload["run_id"], "web-search-graph-test");
+        assert_eq!(payload["query"], "membrane candidate");
+        // The spec's { admitted_context, deferred_handles, subgraph_ref } triple.
+        assert!(payload["admitted_context"].is_array());
+        assert!(payload["deferred_handles"].is_array());
+        assert!(payload["subgraph_ref"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()));
+        assert_eq!(payload["stats"]["providers"], 1);
+        assert_eq!(payload["providers"][0]["provider"], "static");
+        assert_eq!(payload["providers"][0]["status"], "ok");
+        assert!(payload["reranker_version"]
+            .as_str()
+            .is_some_and(|version| version.contains("lexical-cross-encoder")));
+    }
+
+    #[tokio::test]
+    async fn mcp_web_search_graph_intercept_rejects_read_only() {
+        let state = memory_product_state_with_search_providers(Vec::new());
+        let config = state.mcp_config();
+        let response = maybe_handle_web_search_graph_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "web-search-graph-read-only",
+                "method": "tools/call",
+                "params": {
+                    "name": "web_search_graph",
+                    "arguments": { "query": "membrane candidate" }
+                }
+            }),
+        )
+        .await
+        .expect("web_search_graph MCP route should be intercepted by the async server");
+
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"],
+            "mcp_read_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_includes_search_tools() {
+        let state = memory_product_state();
+        let config = state.mcp_config();
+        let mut response = handle_mcp_request_with_context(
+            &state,
+            &config,
+            &McpRequestContext::default(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "tools-list",
+                "method": "tools/list",
+                "params": {}
+            }),
+        );
+        super::inject_hippo_retrieve_tool_definition(&mut response);
+        super::inject_web_search_graph_tool_definition(&mut response);
+
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let hippo_retrieve = tools
+            .iter()
+            .find(|tool| tool["name"] == "hippo_retrieve")
+            .expect("tools/list should advertise hippo_retrieve");
+        assert_eq!(hippo_retrieve["inputSchema"]["required"][0], "query");
+        assert!(hippo_retrieve["inputSchema"]["properties"]["include_hubs"].is_object());
+        let web_search_graph = tools
+            .iter()
+            .find(|tool| tool["name"] == "web_search_graph")
+            .expect("tools/list should advertise web_search_graph");
+        assert_eq!(web_search_graph["inputSchema"]["required"][0], "query");
+        assert!(web_search_graph["inputSchema"]["properties"]["budget_tokens"].is_object());
+    }
+
+    #[tokio::test]
+    async fn memory_docs_endpoint_lists_upserted_notes_with_links_and_hash() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let config = state.mcp_config();
+        let tenant = "obsidian-sync-test";
+
+        let target = handle_mcp_request_with_context(
+            &state,
+            &config,
+            &McpRequestContext::default(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "upsert-target",
+                "method": "tools/call",
+                "params": {
+                    "name": "upsert_note",
+                    "arguments": { "tenant": tenant, "title": "Target", "content": "target body" }
+                }
+            }),
+        );
+        let target_doc_id = target["result"]["structuredContent"]["receipt"]["document"]["doc_id"]
+            .as_str()
+            .expect("target doc_id")
+            .to_string();
+
+        handle_mcp_request_with_context(
+            &state,
+            &config,
+            &McpRequestContext::default(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "upsert-source",
+                "method": "tools/call",
+                "params": {
+                    "name": "upsert_note",
+                    "arguments": {
+                        "tenant": tenant,
+                        "title": "Source",
+                        "content": "source body",
+                        "tags": ["alpha", "beta"],
+                        "links": [target_doc_id.clone()]
+                    }
+                }
+            }),
+        );
+
+        let response = memory_docs_list(
+            State(state.clone()),
+            axum::extract::Path(tenant.to_string()),
+            HeaderMap::new(),
+            Query(MemoryDocsQuery::default()),
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["count"], 2);
+        assert!(payload["max_updated_at"].as_str().is_some());
+        let docs = payload["docs"].as_array().unwrap();
+        assert!(docs.iter().all(|doc| doc["content_hash"]
+            .as_str()
+            .map(|hash| !hash.is_empty())
+            .unwrap_or(false)));
+        let source = docs
+            .iter()
+            .find(|doc| doc["title"] == "Source")
+            .expect("source doc present");
+        assert_eq!(source["tags"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            source["links"].as_array().unwrap()[0].as_str().unwrap(),
+            target_doc_id
+        );
+    }
+
+    #[tokio::test]
+    async fn connectors_list_route_redacts_persisted_targets() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let tenant = "connector-list-test";
+        {
+            let mut store = state.tenant_graph_store(tenant).unwrap();
+            let target = ConnectionTarget::Http {
+                url: "https://example.invalid/mcp".to_string(),
+                headers: BTreeMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer header-secret".to_string(),
+                )]),
+                auth: Some(ConnectorAuth::Bearer {
+                    token: "auth-secret".to_string(),
+                }),
+            };
+            register_connector_with_target(
+                &mut store,
+                ConnectorManifest {
+                    tenant_id: tenant.to_string(),
+                    server_id: "github".to_string(),
+                    label: "GitHub MCP".to_string(),
+                    tools: vec![ToolManifest {
+                        name: "get_issue".to_string(),
+                        label: "Get issue".to_string(),
+                        description: "Read one issue.".to_string(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "owner": { "type": "string" },
+                                "repo": { "type": "string" },
+                                "issue_number": { "type": "integer" }
+                            }
+                        }),
+                        permissions: Vec::new(),
+                        cost: json!({}),
+                        writeback_policy: "read-only".to_string(),
+                        tags: vec!["github".to_string()],
+                        description_embedding: None,
+                    }],
+                },
+                Some(serde_json::to_value(target).unwrap()),
+                Some("test"),
+            )
+            .unwrap();
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/tenants/{tenant}/connectors"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["count"], 1);
+        assert_eq!(payload["connectors"][0]["server_id"], "github");
+        assert_eq!(payload["connectors"][0]["transport"], "http");
+        assert_eq!(payload["connectors"][0]["has_connection_target"], true);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains("header-secret"));
+        assert!(!serialized.contains("auth-secret"));
+        assert!(!serialized.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn search_live_returns_existing_connected_substrate_without_crawl() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("tenant-live").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:knowledge",
+                    [rustyred_web::LABEL_PAGE],
+                    json!({ "url": "https://example.test/knowledge-graph" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "page:rustyweb",
+                    [rustyred_web::LABEL_PAGE],
+                    json!({ "url": "https://example.test/rustyweb" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "snapshot:knowledge",
+                    ["ContentSnapshot"],
+                    json!({ "text": "A knowledge graph connects concepts through typed links." }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:knowledge:snapshot",
+                    "page:knowledge",
+                    rustyred_web::EDGE_HAS_SNAPSHOT,
+                    "snapshot:knowledge",
+                    json!({}),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:knowledge:rustyweb",
+                    "page:knowledge",
+                    rustyred_web::EDGE_LINKS_TO,
+                    "page:rustyweb",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+
+        let response = search_live(
+            State(state),
+            HeaderMap::new(),
+            Query(LiveSearchRequest {
+                q: Some("knowledge graph".to_string()),
+                tenant: Some("tenant-live".to_string()),
+                min_hits: Some(1),
+                min_links: Some(1),
+                ..LiveSearchRequest::default()
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["phase"], "search_only");
+        assert_eq!(payload["crawl"]["attempted"], false);
+        assert_eq!(payload["crawl"]["reason"], "substrate_dense_enough");
+        assert_eq!(payload["initial"]["matched_count"], 1);
+        assert_eq!(payload["initial"]["links"], 1);
+        assert_eq!(payload["search"]["links"].as_array().unwrap().len(), 1);
+
+        let sparse = serde_json::from_value(payload["search"].clone()).unwrap();
+        assert!(!live_search_is_sparse(&sparse, 1, 1));
+    }
+
+    #[test]
+    fn maps_core_commands_to_product_scopes() {
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.RUN.GET"),
+            "run:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.RUN.BEGIN"),
+            "run:write"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.CONTEXT.PACK"),
+            "context:write"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.DEBUG.CYPHER"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.GRAPH.NODE.UPSERT"),
+            "graph:write"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.GRAPH.EDGE.UPSERT"),
+            "graph:write"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.GRAPH.NODES.QUERY"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.GRAPH.STATS"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.GRAPH.VERIFY"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.GRAPH.REBUILD_INDEXES"),
+            "graph:write"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.CACHE.CHECK"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.CACHE.PUT"),
+            "graph:write"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.ADAPTERS.FIND"),
+            "graph:read"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.ADAPTERS.UPSERT"),
+            "graph:write"
+        );
+        assert_eq!(
+            required_scope_for_command("RUSTYRED_THG.ADAPTERS.FITNESS.RECORD"),
+            "graph:write"
+        );
+    }
+
+    #[test]
+    fn detects_graph_commands_case_insensitively() {
+        assert!(is_graph_command("rustyred_thg.graph.node.upsert"));
+        assert!(is_graph_command(" RUSTYRED_THG.GRAPH.NEIGHBORS "));
+        assert!(is_graph_command("RUSTYRED_THG.GRAPH.VERIFY"));
+        assert!(is_graph_command("rustyred_thg.graph.rebuild_indexes"));
+        assert!(!is_graph_command("RUSTYRED_THG.RUN.BEGIN"));
+        assert!(is_adapter_command("rustyred_thg.adapters.find"));
+        assert!(is_adapter_command(" RUSTYRED_THG.ADAPTERS.FITNESS.RECORD "));
+        assert!(!is_adapter_command("RUSTYRED_THG.GRAPH.STATS"));
+        assert!(is_cache_command("rustyred_thg.cache.check"));
+        assert!(is_cache_command(" RUSTYRED_THG.CACHE.PUT "));
+        assert!(!is_cache_command("RUSTYRED_THG.RUN.BEGIN"));
+    }
+
+    #[test]
+    fn graph_commands_share_store_unavailable_http_status() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Redis,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::AofEverysec,
+            snapshot_interval_writes: 1_000,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
+            tenant_config_overrides: Default::default(),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: rustyred_thg_core::HybridScoringConfig::default(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+            ttl_sweep_ms: 1000,
+        });
+
+        let response =
+            execute_tenant_command(&state, "tenant-a", "RUSTYRED_THG.GRAPH.STATS", json!({}));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn graph_rebuild_command_returns_before_and_after_reports() {
+        let state = memory_product_state();
+        let mut store = state.tenant_graph_store("tenant-a").unwrap();
+
+        let write = execute_graph_store_command(
+            &mut store,
+            "RUSTYRED_THG.GRAPH.NODE.UPSERT",
+            json!({
+                "id": "node:a",
+                "labels": ["File"],
+                "properties": { "path": "src/lib.rs" }
+            }),
+        );
+        let rebuild = execute_graph_store_command(
+            &mut store,
+            "RUSTYRED_THG.GRAPH.REBUILD_INDEXES",
+            json!({}),
+        );
+
+        assert!(write.ok);
+        assert!(rebuild.ok);
+        assert_eq!(rebuild.status, "ok");
+        assert_eq!(rebuild.payload["report"]["before"]["ok"], true);
+        assert_eq!(rebuild.payload["report"]["after"]["ok"], true);
+    }
+
+    #[test]
+    fn maps_graph_store_errors_to_http_statuses() {
+        assert_eq!(
+            graph_error_status("missing_graph_endpoint"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            graph_error_status("invalid_graph_cache_request"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            graph_error_status("redis_graph_store_error"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            graph_error_status("tenant_memory_quota_exceeded"),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn cache_command_reports_stale_after_graph_write_advances_version() {
+        let state = memory_product_state();
+
+        let first_write = execute_tenant_command(
+            &state,
+            "tenant-a",
+            "RUSTYRED_THG.GRAPH.NODE.UPSERT",
+            json!({
+                "id": "node:a",
+                "labels": ["File"],
+                "properties": { "path": "src/lib.rs" }
+            }),
+        );
+        assert_eq!(first_write.status(), StatusCode::OK);
+
+        let cache_put = execute_tenant_command(
+            &state,
+            "tenant-a",
+            "RUSTYRED_THG.CACHE.PUT",
+            json!({
+                "kind": "query_result",
+                "key": { "label": "File", "path": "src/lib.rs" },
+                "value": { "nodes": ["node:a"] },
+                "metadata": { "operation": "node_match" }
+            }),
+        );
+        assert_eq!(cache_put.status(), StatusCode::OK);
+
+        let second_write = execute_tenant_command(
+            &state,
+            "tenant-a",
+            "RUSTYRED_THG.GRAPH.NODE.UPSERT",
+            json!({
+                "id": "node:b",
+                "labels": ["File"],
+                "properties": { "path": "src/main.rs" }
+            }),
+        );
+        assert_eq!(second_write.status(), StatusCode::OK);
+
+        let cache_check = execute_tenant_cache_command(
+            &state,
+            "tenant-a",
+            "RUSTYRED_THG.CACHE.CHECK",
+            json!({
+                "kind": "query_result",
+                "key": { "label": "File", "path": "src/lib.rs" }
+            }),
+        );
+        assert!(cache_check.ok);
+        assert_eq!(cache_check.status, "graph_version_mismatch");
+        assert_eq!(cache_check.payload["cache"]["stale"], true);
+        assert_eq!(cache_check.payload["cache"]["accepted"], false);
+    }
+
+    #[test]
+    fn mcp_origin_check_allows_absent_or_configured_origin() {
+        let allowed = vec!["https://app.example.com".to_string()];
+        assert!(mcp_origin_allowed(&HeaderMap::new(), &allowed));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://app.example.com"),
+        );
+        assert!(mcp_origin_allowed(&headers, &allowed));
+
+        headers.insert("origin", HeaderValue::from_static("https://evil.example"));
+        assert!(!mcp_origin_allowed(&headers, &allowed));
+    }
+
+    #[tokio::test]
+    async fn graph_vector_hybrid_reports_effective_scoring_overrides() {
+        let state = memory_product_state();
+        let mut store = state.tenant_graph_store("tenant-hybrid").unwrap();
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+        store
+            .upsert_node(rustyred_thg_core::NodeRecord::new(
+                "node:a",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0] }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(rustyred_thg_core::NodeRecord::new(
+                "node:b",
+                ["Doc"],
+                json!({ "embedding": [0.8, 0.2] }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(rustyred_thg_core::EdgeRecord::new(
+                "edge:ab",
+                "node:a",
+                "CONTRADICTS",
+                "node:b",
+                json!({}),
+            ))
+            .unwrap();
+
+        let response = graph_vector_hybrid(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-hybrid".to_string()),
+            HeaderMap::new(),
+            Json(HybridSearchBody {
+                query: vec![1.0, 0.0],
+                k: 2,
+                label: Some("Doc".to_string()),
+                property: "embedding".to_string(),
+                graph_seeds: vec!["node:a".to_string()],
+                max_hops: 2,
+                alpha: Some(0.2),
+                confidence_weighted_graph_distance: Some(false),
+                edge_type_weights: Some(std::collections::BTreeMap::from([(
+                    "CONTRADICTS".to_string(),
+                    -2.0,
+                )])),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["ok"], true);
+        let alpha = payload["scoring"]["alpha"].as_f64().unwrap();
+        assert!((alpha - 0.2).abs() < 1e-6);
+        assert_eq!(
+            payload["scoring"]["confidence_weighted_graph_distance"],
+            false
+        );
+        assert_eq!(payload["scoring"]["edge_type_weights"]["CONTRADICTS"], -2.0);
+        assert!(payload["results"].is_array());
+    }
+
+    #[tokio::test]
+    async fn instant_kg_routes_overlay_session_delta_without_mutating_base() {
+        let state = memory_product_state();
+        let mut store = state.tenant_graph_store("tenant-kg").unwrap();
+        store
+            .upsert_node(rustyred_thg_core::NodeRecord::new(
+                "file:lib",
+                ["File"],
+                json!({ "path": "src/lib.rs" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(rustyred_thg_core::NodeRecord::new(
+                "sym:old",
+                ["Symbol"],
+                json!({ "name": "old_symbol" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(rustyred_thg_core::EdgeRecord::new(
+                "edge:old",
+                "file:lib",
+                "contains",
+                "sym:old",
+                json!({ "path": "src/lib.rs", "line": 10 }),
+            ))
+            .unwrap();
+
+        let delta = rustyred_thg_core::SessionDelta {
+            commit_sha: Some("session-sha".to_string()),
+            changed_files: vec!["src/lib.rs".to_string()],
+            objects: vec![rustyred_thg_core::NodeRecord::new(
+                "sym:new",
+                ["Symbol"],
+                json!({ "name": "new_symbol", "kind": "function", "content": "instant kg carry" }),
+            )],
+            edges: vec![rustyred_thg_core::EdgeRecord::new(
+                "edge:new",
+                "file:lib",
+                "contains",
+                "sym:new",
+                json!({ "path": "src/lib.rs", "line": 42 }),
+            )],
+            tombstoned_object_ids: vec!["sym:old".to_string()],
+            removed_edge_ids: vec!["edge:old".to_string()],
+        };
+
+        let ppr_response = instant_kg_ppr(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgPprBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta.clone()),
+                },
+                seeds: std::collections::HashMap::from([("file:lib".to_string(), 1.0)]),
+                alpha: default_ppr_alpha(),
+                epsilon: default_ppr_epsilon(),
+                max_pushes: default_ppr_max_pushes(),
+                top_k: 5,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ppr_response.status(), StatusCode::OK);
+        let ppr = response_payload_json(ppr_response).await;
+        let result_ids: Vec<_> = ppr["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["object_id"].as_str())
+            .collect();
+        assert!(result_ids.contains(&"sym:new"));
+        assert!(!result_ids.contains(&"sym:old"));
+
+        let search_response = instant_kg_search(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgSearchBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta.clone()),
+                },
+                query: "instant".to_string(),
+                kinds: vec!["Symbol".to_string()],
+                top_k: 5,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(search_response.status(), StatusCode::OK);
+        let search = response_payload_json(search_response).await;
+        assert_eq!(search["results"][0]["object_id"], "sym:new");
+
+        let symbol_impact_response = instant_kg_impact(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgImpactBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta.clone()),
+                },
+                seed: None,
+                symbol_name: Some("new_symbol".to_string()),
+                direction: "in".to_string(),
+                max_depth: 1,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(symbol_impact_response.status(), StatusCode::OK);
+        let symbol_impact = response_payload_json(symbol_impact_response).await;
+        assert_eq!(symbol_impact["seed"], "sym:new");
+        assert_eq!(symbol_impact["results"][0]["object_id"], "file:lib");
+
+        let explain_response = instant_kg_explain_edge(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-kg".to_string()),
+            HeaderMap::new(),
+            Json(InstantKgExplainEdgeBody {
+                view: InstantKgViewBody {
+                    manifest: None,
+                    delta: Some(delta),
+                },
+                src: "file:lib".to_string(),
+                dst: "sym:new".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(explain_response.status(), StatusCode::OK);
+        let explain = response_payload_json(explain_response).await;
+        assert_eq!(explain["explanations"][0]["layer"], "delta");
+    }
+
+    #[tokio::test]
+    async fn route_metrics_include_vector_fulltext_and_algorithm_histograms() {
+        let state = memory_product_state();
+        let tenant_id = "tenant-metrics".to_string();
+        let mut store = state.tenant_graph_store(&tenant_id).unwrap();
+        store
+            .designate_vector_property("Doc", "embedding", 2)
+            .unwrap();
+        store
+            .upsert_node(rustyred_thg_core::NodeRecord::new(
+                "node:a",
+                ["Doc"],
+                json!({ "embedding": [1.0, 0.0], "text": "alpha document" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(rustyred_thg_core::NodeRecord::new(
+                "node:b",
+                ["Doc"],
+                json!({ "embedding": [0.8, 0.2], "text": "beta document" }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(rustyred_thg_core::EdgeRecord::new(
+                "edge:ab",
+                "node:a",
+                "REL",
+                "node:b",
+                json!({}),
+            ))
+            .unwrap();
+        drop(store);
+        state
+            .designate_fulltext_property(&tenant_id, "Doc", "text")
+            .unwrap();
+
+        let vector_response = graph_vector_search(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(VectorSearchBody {
+                query: vec![1.0, 0.0],
+                k: 2,
+                label: Some("Doc".to_string()),
+                property: "embedding".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(vector_response.status(), StatusCode::OK);
+
+        let hybrid_response = graph_vector_hybrid(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(HybridSearchBody {
+                query: vec![1.0, 0.0],
+                k: 2,
+                label: Some("Doc".to_string()),
+                property: "embedding".to_string(),
+                graph_seeds: vec!["node:a".to_string()],
+                max_hops: 2,
+                alpha: None,
+                confidence_weighted_graph_distance: None,
+                edge_type_weights: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(hybrid_response.status(), StatusCode::OK);
+
+        let fulltext_response = graph_fulltext_search(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(FullTextSearchBody {
+                label: Some("Doc".to_string()),
+                property: "text".to_string(),
+                query: "alpha".to_string(),
+                k: 2,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(fulltext_response.status(), StatusCode::OK);
+
+        let ppr_response = graph_algorithm_ppr(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(PprBody {
+                seeds: std::collections::HashMap::from([("node:a".to_string(), 1.0)]),
+                alpha: default_ppr_alpha(),
+                epsilon: default_ppr_epsilon(),
+                max_pushes: default_ppr_max_pushes(),
+                top_k: Some(2),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ppr_response.status(), StatusCode::OK);
+
+        let components_response = graph_algorithm_components(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(ComponentsBody { directed: false }),
+        )
+        .await
+        .into_response();
+        assert_eq!(components_response.status(), StatusCode::OK);
+
+        let pagerank_response = graph_algorithm_pagerank(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id.clone()),
+            HeaderMap::new(),
+            Json(PageRankBody {
+                damping: default_pr_damping(),
+                max_iter: default_pr_max_iter(),
+                tolerance: default_pr_tolerance(),
+                top_k: Some(2),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(pagerank_response.status(), StatusCode::OK);
+
+        let communities_response = graph_algorithm_communities(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(tenant_id),
+            HeaderMap::new(),
+            Json(CommunitiesBody::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(communities_response.status(), StatusCode::OK);
+
+        let metrics = state.observability.render_prometheus();
+        assert!(metrics.contains("rustyred_thg_vector_search_latency_seconds_count 2"));
+        assert!(metrics.contains("rustyred_thg_fulltext_search_latency_seconds_count 1"));
+        assert!(metrics.contains("rustyred_thg_algorithm_latency_seconds_ppr_count 1"));
+        assert!(metrics.contains("rustyred_thg_algorithm_latency_seconds_components_count 1"));
+        assert!(metrics.contains("rustyred_thg_algorithm_latency_seconds_pagerank_count 1"));
+        assert!(metrics.contains("rustyred_thg_algorithm_latency_seconds_communities_count 1"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_config_reports_startup_only_tenant_overrides() {
+        let state = AppState::new(Config {
+            host: "127.0.0.1".to_string(),
+            port: 8380,
+            storage_mode: StorageMode::Memory,
+            data_dir: "data/rusty-red".to_string(),
+            require_volume: false,
+            volume_available: false,
+            durability: RedCoreDurability::None,
+            snapshot_interval_writes: 0,
+            strict_acid: false,
+            concurrency: "single_writer".to_string(),
+            txn_isolation: "snapshot".to_string(),
+            tenant_memory_quota_bytes: 0,
+            tenant_memory_quota_config_error: None,
+            tenant_config_overrides: BTreeMap::from([(
+                "tenant-a".to_string(),
+                TenantConfigOverride {
+                    durability: Some(RedCoreDurability::AofAlways),
+                    snapshot_interval_writes: Some(42),
+                    strict_acid: Some(true),
+                    tenant_memory_quota_bytes: Some(4_096),
+                    hybrid_scoring: Some(rustyred_thg_core::HybridScoringConfig {
+                        alpha: 0.25,
+                        confidence_weighted_graph_distance: false,
+                        edge_type_weights: BTreeMap::from([("CONTRADICTS".to_string(), -2.0)]),
+                    }),
+                },
+            )]),
+            tenant_config_error: None,
+            slow_query_threshold_nanos: 100_000_000,
+            slow_query_capacity: 128,
+            slow_query_log: None,
+            hybrid_scoring: rustyred_thg_core::HybridScoringConfig::default(),
+            redis_url: "not-a-redis-url".to_string(),
+            redis_key_prefix: "rusty-red".to_string(),
+            require_auth: false,
+            allowed_origins: Vec::new(),
+            api_tokens: Vec::new(),
+            service_name: "rusty-red".to_string(),
+            api_title: "Rusty Red".to_string(),
+            public_url: None,
+            mcp_enabled: true,
+            mcp_read_only: true,
+            mcp_allow_admin: false,
+            mcp_default_tenant: "default".to_string(),
+            ttl_sweep_ms: 1000,
+        });
+
+        let response = diagnostics_config(axum::extract::State(state), HeaderMap::new())
+            .await
+            .unwrap()
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["tenant_config_overrides"], 1);
+        assert_eq!(payload["tenant_config_runtime_mutation_supported"], false);
+        assert_eq!(payload["tenant_config_tenants"], json!(["tenant-a"]));
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["durability"],
+            "aof_always"
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["snapshot_interval_writes"],
+            42
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["strict_acid"],
+            true
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["tenant_memory_quota_bytes"],
+            4096
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["hybrid_scoring"]["alpha"],
+            0.25
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["hybrid_scoring"]
+                ["confidence_weighted_graph_distance"],
+            false
+        );
+        assert_eq!(
+            payload["tenant_config_overrides_detail"]["tenant-a"]["hybrid_scoring"]
+                ["edge_type_weights"]["CONTRADICTS"],
+            -2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_routes_support_begin_stage_and_commit() {
+        let state = memory_product_state();
+        let begin_response = transaction_begin(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionBeginBody {
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(begin_response.status(), StatusCode::OK);
+
+        let begin_payload = response_payload_json(begin_response).await;
+        let tx_id = begin_payload["tx_id"]
+            .as_str()
+            .expect("transaction id in begin response");
+
+        let stage_response = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                reflexive_inference: false,
+                tenant_id: Some("tenant-tx".to_string()),
+                query: "CREATE (n:File {id: $id, path: $path})".to_string(),
+                params: BTreeMap::from([
+                    ("id".to_string(), json!("node:tx-commit")),
+                    ("path".to_string(), json!("src/main.rs")),
+                ]),
+                tx_id: Some(tx_id.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stage_response.status(), StatusCode::OK);
+
+        let stage_payload = response_payload_json(stage_response).await;
+        assert_eq!(stage_payload["ok"], true);
+        assert_eq!(stage_payload["staged_mutations"], 1);
+        assert_eq!(stage_payload["tx_id"], tx_id);
+
+        let commit_response = transaction_commit(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionMutationBody {
+                tx_id: tx_id.to_string(),
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::OK);
+
+        let commit_payload = response_payload_json(commit_response).await;
+        assert_eq!(commit_payload["ok"], true);
+        assert_eq!(commit_payload["tenant"], "tenant-tx");
+        assert!(commit_payload["transaction"]["writes"].as_array().is_some());
+
+        let store = state.tenant_graph_store("tenant-tx").unwrap();
+        let node = store.get_node("node:tx-commit").unwrap().unwrap();
+        assert_eq!(node.id, "node:tx-commit");
+    }
+
+    #[tokio::test]
+    async fn transaction_routes_support_rollback() {
+        let state = memory_product_state();
+        let begin_response = transaction_begin(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionBeginBody {
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(begin_response.status(), StatusCode::OK);
+        let begin_payload = response_payload_json(begin_response).await;
+        let tx_id = begin_payload["tx_id"].as_str().unwrap();
+
+        let stage_response = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                reflexive_inference: false,
+                tenant_id: Some("tenant-tx".to_string()),
+                query: "CREATE (n:File {id: $id, path: $path})".to_string(),
+                params: BTreeMap::from([
+                    ("id".to_string(), json!("node:tx-rollback")),
+                    ("path".to_string(), json!("src/rollback.rs")),
+                ]),
+                tx_id: Some(tx_id.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stage_response.status(), StatusCode::OK);
+
+        let rollback_response = transaction_rollback(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionMutationBody {
+                tx_id: tx_id.to_string(),
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(rollback_response.status(), StatusCode::OK);
+        let rollback_payload = response_payload_json(rollback_response).await;
+        assert_eq!(rollback_payload["status"], "rolled_back");
+        assert_eq!(rollback_payload["tx_id"], tx_id);
+
+        let store = state.tenant_graph_store("tenant-tx").unwrap();
+        assert!(store.get_node("node:tx-rollback").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn transaction_commit_rejects_missing_tx_id() {
+        let state = memory_product_state();
+        let response = transaction_commit(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(TransactionMutationBody {
+                tx_id: String::new(),
+                tenant_id: Some("tenant-tx".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["error"], "missing_tx_id");
+    }
+
+    // ===== Phase 3-B: streaming bulk loader tests =====
+
+    #[tokio::test]
+    async fn bulk_nodes_jsonl_streaming_inserts_two_nodes() {
+        let state = memory_product_state();
+        let body = Body::from(
+            "{\"id\":\"n1\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"n2\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+        let response = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-bulk".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 2);
+        assert_eq!(payload["failed"], 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_nodes_csv_streaming_uses_first_row_headers() {
+        let state = memory_product_state();
+        let body = Body::from("id,label,path\nnA,Doc,src/a.rs\nnB,Doc,src/b.rs\n".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("text/csv"));
+        let response = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-bulk".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_nodes_respects_explicit_batch_size_one_per_batch() {
+        let state = memory_product_state();
+        let body = Body::from(
+            "{\"id\":\"n1\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"n2\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+        let response = graph_bulk_nodes(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-bulk".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery {
+                batch_size: Some(1),
+                headers: None,
+                from_col: None,
+                to_col: None,
+            }),
+            body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 2);
+        assert_eq!(payload["batches"], 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_nodes_reports_per_line_parse_errors_and_keeps_good_rows() {
+        let state = memory_product_state();
+        let body = Body::from(
+            "{\"id\":\"bad\",\"labels\":[\"Doc\"],\"properties\":[]}\n\
+             {\"id\":\"good\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+
+        let response = graph_bulk_nodes(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-bulk-errors".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+
+        assert_eq!(payload["inserted"], 1);
+        assert_eq!(payload["failed"], 1);
+        assert_eq!(payload["errors"][0]["line"], 1);
+        assert_eq!(payload["errors"][0]["code"], "invalid_properties");
+    }
+
+    #[tokio::test]
+    async fn bulk_edges_jsonl_streaming_inserts_one_edge() {
+        let state = memory_product_state();
+        let nodes_body = Body::from(
+            "{\"id\":\"a\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"b\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+        let _ = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-edges".to_string()),
+            headers.clone(),
+            axum::extract::Query(BulkQuery::default()),
+            nodes_body,
+        )
+        .await;
+
+        let edges_body = Body::from(
+            "{\"id\":\"e1\",\"from_id\":\"a\",\"to_id\":\"b\",\"type\":\"CITES\",\"properties\":{}}\n"
+                .to_string(),
+        );
+        let response = graph_bulk_edges(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-edges".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            edges_body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_edges_retries_batch_to_report_missing_endpoint_line() {
+        let state = memory_product_state();
+        let nodes_body = Body::from(
+            "{\"id\":\"a\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"b\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+        let _ = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-edge-errors".to_string()),
+            headers.clone(),
+            axum::extract::Query(BulkQuery::default()),
+            nodes_body,
+        )
+        .await;
+
+        let edges_body = Body::from(
+            "{\"id\":\"e1\",\"from_id\":\"a\",\"to_id\":\"b\",\"type\":\"CITES\",\"properties\":{}}\n\
+             {\"id\":\"e2\",\"from_id\":\"a\",\"to_id\":\"missing\",\"type\":\"CITES\",\"properties\":{}}\n"
+                .to_string(),
+        );
+        let response = graph_bulk_edges(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-edge-errors".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery::default()),
+            edges_body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+
+        assert_eq!(payload["inserted"], 1);
+        assert_eq!(payload["failed"], 1);
+        assert_eq!(payload["errors"][0]["line"], 2);
+        assert_eq!(payload["errors"][0]["code"], "missing_graph_endpoint");
+        assert_eq!(payload["errors"][0]["record_id"], "e2");
+    }
+
+    // ===== Phase 3-A: auto-tx write Cypher tests =====
+
+    #[tokio::test]
+    async fn public_cypher_create_auto_opens_and_commits_transaction() {
+        let state = memory_product_state();
+        let response = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                reflexive_inference: false,
+                tenant_id: Some("tenant-w".to_string()),
+                query: "CREATE (n:Doc {id: 'a', path: 'src/lib.rs'})".to_string(),
+                params: BTreeMap::new(),
+                tx_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let store = state.tenant_graph_store("tenant-w").unwrap();
+        let node = store.get_node("a").unwrap().unwrap();
+        assert_eq!(node.id, "a");
+        assert!(node.labels.contains(&"Doc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn public_cypher_merge_is_idempotent_with_on_create_then_on_match() {
+        let state = memory_product_state();
+        let first = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                reflexive_inference: false,
+                tenant_id: Some("tenant-merge".to_string()),
+                query:
+                    "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1"
+                        .to_string(),
+                params: BTreeMap::new(),
+                tx_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = public_cypher(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Json(PublicCypherBody {
+                reflexive_inference: false,
+                tenant_id: Some("tenant-merge".to_string()),
+                query:
+                    "MERGE (n:Doc {id: 'a'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = n.seen + 1"
+                        .to_string(),
+                params: BTreeMap::new(),
+                tx_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let store = state.tenant_graph_store("tenant-merge").unwrap();
+        let node = store.get_node("a").unwrap().unwrap();
+        assert_eq!(node.properties["seen"].as_i64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn bulk_edges_csv_requires_from_to_columns() {
+        let state = memory_product_state();
+        // seed source/target nodes first
+        let nodes_body = Body::from(
+            "{\"id\":\"a\",\"labels\":[\"Doc\"],\"properties\":{}}\n\
+             {\"id\":\"b\",\"labels\":[\"Doc\"],\"properties\":{}}\n"
+                .to_string(),
+        );
+        let mut nh = HeaderMap::new();
+        nh.insert(
+            "Content-Type",
+            HeaderValue::from_static("application/jsonl"),
+        );
+        let _ = graph_bulk_nodes(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("tenant-edges".to_string()),
+            nh,
+            axum::extract::Query(BulkQuery::default()),
+            nodes_body,
+        )
+        .await;
+
+        let body = Body::from("id,src,dst,type\ne1,a,b,CITES\n".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("text/csv"));
+        let response = graph_bulk_edges(
+            axum::extract::State(state),
+            axum::extract::Path("tenant-edges".to_string()),
+            headers,
+            axum::extract::Query(BulkQuery {
+                batch_size: None,
+                headers: None,
+                from_col: Some("src".into()),
+                to_col: Some("dst".into()),
+            }),
+            body,
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+        assert_eq!(payload["inserted"], 1);
+    }
+}

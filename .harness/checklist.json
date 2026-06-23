@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "source": "theorems-harness hook checklist-contract",
+  "created_at": "2026-06-18T00:07:09Z",
+  "task": "\n# Files mentioned by the user:\n\n## SPEC-EPISTEMICRAG.md: /Users/travisgilbert/Downloads/SPEC-EPISTEMICRAG.md\n\n## SPEC-EPISTEMICRAG-INSTANT.md: /Users/travisgilbert/Downloads/SPEC-EPISTEMICRAG-INSTANT.md\n\n## My request for Codex:\ncan you and claude implement the following [$theorems-harness:theorems-harness](/Users/travisgilbert/.codex/plugins/cache/codex-marketplace/theorems-harness/0.5.7/skills/theorems-harness/SKILL.md) ",
+  "source_hash": "10d513afb2c9d8d9bd560a52d8f7a9afba63fca9a7f9cd7e4e6eb0e255507731",
+  "repo": "Theorem",
+  "branch": "main",
+  "items": [
+    {
+      "id": "HH-001",
+      "deliverable": "The structural pass, source-agnostic core",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Implemented source-agnostic structural_epistemic_pass in rustyred-thg-core/src/epistemic.rs. Verified by cargo test -p rustyred-thg-core epistemic --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-002",
+      "deliverable": "Tier 1 topological signals",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Structural pass computes topology-derived orphan, unsupported_leaf, support/attack indegrees, bridge score, grounded status, and chokepoints. Verified by cargo test -p rustyred-thg-core epistemic --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-003",
+      "deliverable": "Tier 2 contradiction extraction",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Tier 2 contradiction extraction is bounded by candidate pairs and top-k in the code hook. Verified by cargo test -p rustyred-thg-code ingest_returns_instant_epistemic_readout_with_drift_and_bounded_pairs --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-004",
+      "deliverable": "Code ingestion hook",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Added code_epistemic_hook after the code KG and embedding hooks. Verified by cargo test -p rustyred-thg-code registry_collects_code_kg_hooks --test code_kg_hooks.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-005",
+      "deliverable": "Ingestion-time surfacing",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Ingest receipts and context packs now include epistemic_readout payloads. Verified by cargo test -p rustyred-thg-code ingest_returns_instant_epistemic_readout_with_drift_and_bounded_pairs --lib and cargo check in apps/theorem-grpc and apps/theorem-gateway.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-006",
+      "deliverable": "Recall consistency",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Memory recall defaults remain unchanged and include_epistemic attaches shadow readouts only when requested. Verified by cargo test -p rustyred-thg-memory recall_include_epistemic_attaches_shadow_without_changing_default --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-007",
+      "deliverable": "Shadow node kind in `rustyred-thg-core`",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Added EpistemicShadow node label and read/write helpers in rustyred-thg-core. Verified by cargo test -p rustyred-thg-core epistemic --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-008",
+      "deliverable": "Content-to-shadow edge in `rustyred-thg-core`",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Added HasEpistemicShadow content-to-shadow edge construction and readout lookup. Verified by cargo test -p rustyred-thg-core epistemic --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-009",
+      "deliverable": "Epistemic-layer edges in `rustyred-thg-core`",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Added Undercuts, Supports, and SameEClass epistemic-layer edges plus shadow PPR ranking over those edges and an MCP epistemic_shadow_ppr tool. Verified by cargo test -p rustyred-thg-core epistemic --lib and cargo test -p rustyred-thg-mcp epistemic_cron_tools_compile_apply_and_rank_shadow_graph --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-010",
+      "deliverable": "gRPC contract, Theorem to Theseus",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Added theseus_epistemic.v1 EpistemicEnrichmentService proto, Python GrpcTheseusClient, and Theorem MCP writeback tools epistemic_dirty_frontier, epistemic_compile_subgraph, and epistemic_enrich_apply. Verified by cargo test -p rustyred-thg-mcp epistemic_cron_tools_compile_apply_and_rank_shadow_graph --lib and cargo check in apps/theorem-grpc and apps/theorem-gateway.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-011",
+      "deliverable": "Population via Modal cron",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Added Modal-ready epistemic cron with delta and nightly full schedules, injectable harness/Theseus clients, and clean gRPC-drop no-op behavior. Verified by direct execution of apps/orchestrate/runtime/test_epistemic_cron.py test functions and cargo test -p rustyred-thg-core epistemic --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-012",
+      "deliverable": "Recall integration in `rustyred-thg-memory`",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Added include_epistemic to MemoryRecallInput and attaches epistemic_shadow provenance when requested without changing default recall. Verified by cargo test -p rustyred-thg-memory recall_include_epistemic_attaches_shadow_without_changing_default --lib.",
+      "deferral_reason": ""
+    },
+    {
+      "id": "HH-013",
+      "deliverable": "Provenance and quarantine",
+      "acceptance_criterion": "Verify this deliverable against the handoff acceptance criterion.",
+      "status": "complete",
+      "verification": "Epistemic fields carry provenance and learned predicted edges are quarantined as pointer-only additions, preserving structural fields. Verified by cargo test -p rustyred-thg-core epistemic --lib.",
+      "deferral_reason": ""
+    }
+  ]
+}

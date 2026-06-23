@@ -1,0 +1,13 @@
+Subject: Contract help for {{title}} - {{company}}
+
+Hi,
+
+You're looking for contract help on {{title}}. {{role_language}}
+
+I take on exactly this kind of contract: a Rust-native graph + retrieval stack, from metal to model. {{proof_metal_to_model}} {{proof_benchmarks}} Code is open: {{proof_repo}}
+
+Directly relevant: {{matched_skills}}.
+
+Can share availability and rate if it's a fit.
+
+- {{sender}}

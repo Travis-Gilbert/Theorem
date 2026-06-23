@@ -1,0 +1,90 @@
+# Company seed list for ATS probing (jobintel ingest).
+#
+# `slug`   is the ATS board slug. jobintel auto-detects which of Greenhouse /
+#          Lever / Ashby the company uses, so you only supply the slug. The slug
+#          is usually the company name; adjust if a board uses a different one
+#          (e.g. some use "<company>labs" or a hyphenated form).
+# `domain` (optional) is the company web domain, used for Hunter.io contact
+#          lookup in `jobintel draft`. Leave it out if unknown.
+#
+# Seeded from the spec's target list. Edit freely - this file is the input knob.
+
+[[company]]
+slug = "qdrant"
+domain = "qdrant.tech"
+
+[[company]]
+slug = "livekit"
+domain = "livekit.io"
+
+[[company]]
+slug = "pinecone"
+domain = "pinecone.io"
+
+[[company]]
+slug = "turbopuffer"
+domain = "turbopuffer.com"
+
+[[company]]
+slug = "deepgram"
+domain = "deepgram.com"
+
+[[company]]
+slug = "runpod"
+domain = "runpod.io"
+
+[[company]]
+slug = "supabase"
+domain = "supabase.com"
+
+[[company]]
+slug = "lancedb"
+domain = "lancedb.com"
+
+[[company]]
+slug = "fireworksai"
+domain = "fireworks.ai"
+
+[[company]]
+slug = "letta"
+domain = "letta.com"
+
+[[company]]
+slug = "exa"
+domain = "exa.ai"
+
+[[company]]
+slug = "modal"
+domain = "modal.com"
+
+[[company]]
+slug = "browserbase"
+domain = "browserbase.com"
+
+[[company]]
+slug = "cognition"
+domain = "cognition.ai"
+
+[[company]]
+slug = "langchain"
+domain = "langchain.com"
+
+[[company]]
+slug = "llamaindex"
+domain = "llamaindex.ai"
+
+[[company]]
+slug = "baseten"
+domain = "baseten.co"
+
+[[company]]
+slug = "mistral"
+domain = "mistral.ai"
+
+[[company]]
+slug = "weaviate"
+domain = "weaviate.io"
+
+[[company]]
+slug = "tigergraph"
+domain = "tigergraph.com"

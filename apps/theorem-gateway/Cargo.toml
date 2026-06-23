@@ -1,0 +1,83 @@
+# Theorem's browser-facing GraphQL gateway.
+#
+# An Axum + async-graphql server whose resolvers call the gRPC services that
+# already exist (theorem-grpc: theseus_search.v1.SearchService +
+# theorem_code.v1.CodeCrawlerService) plus the GL-Fusion model endpoint, and
+# shape the results for the web. It stores nothing durable: it is a front door
+# and a translator. Mirrors our-civic-atlas-backend's GraphQL-over-gRPC shape.
+#
+# Workspace placement: this crate is its OWN Cargo root (bare `[workspace]`
+# table at the bottom) and is NOT a member of rustyredcore_THG. Unlike
+# theorem-grpc it has NO path-deps into the THG crates: it only needs external
+# crates plus the vendored protos. Builds/tests directly here via
+# `cargo build -p theorem-gateway`. Deploys as its own Railway service.
+
+[package]
+name = "theorem-gateway"
+version = "0.0.0"
+edition = "2021"
+build = "build.rs"
+publish = false
+description = "Theorem's browser-facing GraphQL gateway: async-graphql over theorem-grpc (SearchService + CodeCrawlerService) and the GL-Fusion model endpoint."
+license = "MIT"
+
+[dependencies]
+# tonic/prost PINNED at 0.12/0.13 to match theorem-grpc AND the civic-atlas
+# SearchServiceClient. The gateway dials theorem-grpc, so the generated client
+# stubs must stay wire-compatible with the server stubs theorem-grpc emits from
+# the same proto files. A drift to 0.13/0.14 would break codegen + wire parity.
+# The bare [workspace] table isolates this crate's lockfile so a stray bump
+# cannot silently move it.
+tonic = "0.12"
+prost = "0.13"
+
+# Async runtime. `time` is needed for the bounded ingest poll loop; `signal`
+# for clean Railway SIGTERM shutdown; `net` for the listener.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+
+# GraphQL + Axum transport. async-graphql 7 supports axum 0.8 via
+# async-graphql-axum 7.0.x. GraphiQL playground + SDL export ship in core.
+async-graphql = "7"
+async-graphql-axum = "7"
+axum = "0.8"
+
+# CORS (browser boundary) + tracing layer for the HTTP surface.
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async HTTP client for the GL-Fusion model endpoint. NON-blocking (no
+# `blocking` feature): resolvers run on the tokio runtime.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Optional Valkey/Redis backing for the per-IP rate limiter and recomputable
+# response cache. Async (tokio-comp) so it never blocks a resolver. Matches the
+# theorem-grpc cache-aside env conventions (VALKEY_URL / VALKEY_CACHE_TTL_SECONDS).
+redis = { version = "0.27", features = ["tokio-comp"] }
+
+# SceneOS add-on (Deliverables A/B): compile a ScenePackageV2 in-process and
+# serve it as one self-contained HTML asset. These are leaf crates in the THG
+# workspace (serde/serde_json only, no heavy deps), so the gateway path-deps INTO
+# them. This is the one place the SceneOS add-on reverses the core gateway's
+# "no path-dep into rustyredcore_THG" property; the Dockerfile copies the whole
+# crates dir (theorem-grpc's anti-COPY-drift pattern) to stay build-stable.
+scene-os-core = { path = "../../rustyredcore_THG/crates/scene-os-core" }
+scene-os-web = { path = "../../rustyredcore_THG/crates/scene-os-web" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+# build_client(true) + build_server(false): the gateway is a CLIENT of
+# theorem-grpc. Generated SearchServiceClient + CodeCrawlerServiceClient stubs
+# come from the vendored protos (wire-identical to theorem-grpc's server stubs).
+tonic-build = "0.12"
+
+[[bin]]
+name = "theorem-gateway"
+path = "src/main.rs"
+
+# Standalone workspace root: keeps this crate OUT of any ancestor workspace and
+# gives it its own Cargo.lock. Same trick theorem-grpc + reconstruction-engine use.
+[workspace]

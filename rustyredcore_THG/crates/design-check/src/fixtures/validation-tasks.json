@@ -1,0 +1,22 @@
+[
+  { "task_id": "de-001", "domain": "color_contrast", "goal": "Repair a low-contrast text/background pair using system tokens.", "scored_axes": ["css_static", "token_lint"] },
+  { "task_id": "de-002", "domain": "color_contrast", "goal": "Replace raw component colors with palette tokens while preserving contrast.", "scored_axes": ["css_static", "token_lint"] },
+  { "task_id": "de-003", "domain": "target_size", "goal": "Raise compact icon-button hit targets to the 24px floor and 44px preferred size.", "scored_axes": ["css_static"] },
+  { "task_id": "de-004", "domain": "focus", "goal": "Restore visible focus after outline removal.", "scored_axes": ["css_static"] },
+  { "task_id": "de-005", "domain": "motion", "goal": "Add a reduced-motion path for transitions and keyframes.", "scored_axes": ["css_static"] },
+  { "task_id": "de-006", "domain": "motion", "goal": "Bring transition durations into the 100-500ms UI bound.", "scored_axes": ["css_static"] },
+  { "task_id": "de-007", "domain": "spacing", "goal": "Move off-grid padding and gaps onto the 4px spacing base.", "scored_axes": ["css_static"] },
+  { "task_id": "de-008", "domain": "spacing", "goal": "Normalize gutters to spacing-scale tokens.", "scored_axes": ["css_static", "token_lint"] },
+  { "task_id": "de-009", "domain": "typography", "goal": "Repair body font size and line-height floors.", "scored_axes": ["css_static"] },
+  { "task_id": "de-010", "domain": "typography", "goal": "Constrain text measure to the 45-75ch range.", "scored_axes": ["css_static"] },
+  { "task_id": "de-011", "domain": "typography", "goal": "Move ad hoc font sizes onto the modular scale.", "scored_axes": ["css_static"] },
+  { "task_id": "de-012", "domain": "tokens", "goal": "Tokenize radii and border widths in a card component.", "scored_axes": ["token_lint"] },
+  { "task_id": "de-013", "domain": "layout", "goal": "Replace raw media query widths with breakpoint tokens.", "scored_axes": ["token_lint"] },
+  { "task_id": "de-014", "domain": "dialog", "goal": "Prepare a dialog fixture for APG Escape and focus-trap validation.", "scored_axes": ["apg_behavioral"], "pending_axes": ["apg_behavioral"] },
+  { "task_id": "de-015", "domain": "tabs", "goal": "Prepare a tabs fixture for APG arrow-key validation.", "scored_axes": ["apg_behavioral"], "pending_axes": ["apg_behavioral"] },
+  { "task_id": "de-016", "domain": "combobox", "goal": "Prepare a combobox fixture for expanded listbox keyboard behavior.", "scored_axes": ["apg_behavioral"], "pending_axes": ["apg_behavioral"] },
+  { "task_id": "de-017", "domain": "menu", "goal": "Prepare a menu fixture for roving tabindex behavior.", "scored_axes": ["apg_behavioral"], "pending_axes": ["apg_behavioral"] },
+  { "task_id": "de-018", "domain": "forms", "goal": "Verify rendered form-control labels through axe.", "scored_axes": ["axe_render"], "pending_axes": ["axe_render"] },
+  { "task_id": "de-019", "domain": "data_viz", "goal": "Check categorical palette separability and direct labeling.", "scored_axes": ["css_static", "axe_render"], "pending_axes": ["axe_render"] },
+  { "task_id": "de-020", "domain": "fixtures", "goal": "Run the full fixture set and record which axes were scored versus pending.", "scored_axes": ["css_static", "token_lint"], "pending_axes": ["axe_render", "apg_behavioral"] }
+]

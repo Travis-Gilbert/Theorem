@@ -1,0 +1,20 @@
+# Railway deploy config for theorem-gateway (browser-facing GraphQL gateway).
+#
+# Deploy as a NEW Railway service in the existing Theorem project. Set the
+# service Root Directory so the Docker build context is the Theorem repo root
+# (so `COPY apps/theorem-gateway` resolves). Give it a PUBLIC domain: the
+# website calls `/graphql` cross-origin. It reaches theorem-grpc over Railway
+# private networking via THEOREM_GRPC_URL.
+#
+# Unlike theorem-grpc this service exposes an HTTP surface, so a real
+# healthcheck is wired: GET /healthz returns "ok".
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "apps/theorem-gateway/Dockerfile"
+
+[deploy]
+startCommand = "theorem-gateway"
+healthcheckPath = "/healthz"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

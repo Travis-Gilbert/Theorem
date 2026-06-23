@@ -1,0 +1,7 @@
+# Receiver config for the AGD-009 wake dry-run proof.
+# Token is read from THEOREM_HARNESS_TOKEN if set; the harness accepts bare calls.
+harness_url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
+tenant_slug = "default"
+
+[worktrees]
+"Travis-Gilbert/theorem" = "/private/tmp/theorem-current-thg-payload-20260609"

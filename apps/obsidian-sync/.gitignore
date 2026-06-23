@@ -1,0 +1,16 @@
+# build + deps
+node_modules/
+*.js.map
+
+# NOTE: main.js is intentionally committed (it is NOT ignored). It is the
+# loadable plugin artifact, so a fresh checkout or an Obsidian-Git mirror can
+# install the plugin without a build step, and a GitHub release/BRAT can ship it.
+# Rebuild with `npm run build` (production, no sourcemap) before committing.
+# `npm run dev` writes an inline-sourcemap main.js; do not commit a dev build.
+
+# obsidian local
+data.json
+.hotreload
+
+# test output
+test/bundled/

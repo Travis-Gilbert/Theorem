@@ -1,0 +1,14 @@
+.DS_Store
+target/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.theorem/
+.idea/
+.claude/launch.json
+apps/theorem-agentd/*.gguf
+apps/theorem-agentd/.agentd-ledger.jsonl
+rustyredcore_THG/*.zip

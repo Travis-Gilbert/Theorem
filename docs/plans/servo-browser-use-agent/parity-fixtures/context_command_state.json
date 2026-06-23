@@ -1,0 +1,97 @@
+{
+  "command_id": "cmd_0001",
+  "goal": "Compare pricing across vendors",
+  "query": "vendor pricing 2026",
+  "user_id": "user_42",
+  "session_id": "sess_7",
+  "folio_id": null,
+  "notebook_id": "nb_3",
+  "project_id": null,
+  "current_page": {
+    "kind": "page",
+    "id": "https://example.com/pricing",
+    "title": "Pricing",
+    "url": "https://example.com/pricing",
+    "source": "example.com",
+    "salience": 1.0,
+    "required": false,
+    "metadata": {}
+  },
+  "selected_text": "Team plan $20/seat",
+  "working_set": [
+    {
+      "kind": "object",
+      "id": "obj_1",
+      "title": "Vendor A",
+      "url": null,
+      "source": null,
+      "salience": 1.0,
+      "required": false,
+      "metadata": {}
+    }
+  ],
+  "exclusions": [],
+  "hot_context": [
+    {
+      "kind": "webdoc",
+      "id": "wd_9",
+      "title": null,
+      "url": "https://a.test",
+      "source": null,
+      "salience": 0.7,
+      "required": false,
+      "metadata": {}
+    }
+  ],
+  "canonical_context": [],
+  "memory_scope": "session",
+  "graph_layers": [
+    "memgraph_canonical",
+    "rustyred_hot",
+    "redis_hot",
+    "local_webdocs"
+  ],
+  "tool_scope": [
+    "ask",
+    "browser",
+    "capture",
+    "web_research"
+  ],
+  "retrieval_policy": {
+    "mode": "local_first",
+    "freshness_required": false,
+    "max_known_objects": 40,
+    "max_hot_context": 30,
+    "max_web_candidates": 20,
+    "include_counterevidence": true,
+    "include_tensions": true,
+    "include_user_priors": true,
+    "include_browser_hot_graph": true
+  },
+  "output_target": "answer",
+  "risk_mode": "confirm_before_write",
+  "permission_policy": {
+    "allow_read": true,
+    "allow_write_canonical": false,
+    "allow_write_hot_graph": true,
+    "allow_remember": false,
+    "allow_external_web": false,
+    "allow_disclosure": false,
+    "allow_agent_execution": false,
+    "require_confirmation_for_write": true,
+    "require_receipt": true
+  },
+  "trace_policy": {
+    "include_graph_trace": true,
+    "include_receipts": true,
+    "include_context_preview": true,
+    "include_excluded_refs": true,
+    "include_permission_explanations": true
+  },
+  "warnings": [
+    "web disabled by policy"
+  ],
+  "metadata": {
+    "origin": "unit-fixture"
+  }
+}

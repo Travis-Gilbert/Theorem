@@ -1,0 +1,3 @@
+plain: clutter_hits 0; passive <= 10%; adverbs <= 1.5 per 100 words; sentence mean 12-18; stdev >= 4; full sentences
+spare: clutter 0; passive <= 5%; adverbs <= 0.8 per 100 words; mean 7-12; rare fragments; stdev >= 3
+wire: clutter 0; passive <= 5%; mean 5-9; prose-word abbreviations only; article drop allowed only when unambiguous

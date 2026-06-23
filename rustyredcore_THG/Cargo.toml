@@ -1,0 +1,74 @@
+[package]
+name = "rustyredcore_thg"
+version = "0.5.0"
+edition = "2021"
+description = "RustyRedCore-THG: Theseus-customized fork of RustyRed Core, with THG protocol native support. Merger upgrade of the original Theseus Hot Graph (THG) atop the RustyRed substrate. Distinct from the standalone RustyRed-GraphDB OSS repo. Exports PyO3 accelerators including push_ppr."
+license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theseus"
+rust-version = "1.85"
+
+[workspace]
+members = [
+    ".",
+    "crates/rustyred-thg-core",
+    "crates/rustyred-thg-adapters",
+    "crates/rustyred-thg-fractal",
+    "crates/rustyred-thg-geotemporal",
+    "crates/rustyred-thg-mcp",
+    "crates/rustyred-thg-compat-server",
+    "crates/rustyred-thg-server",
+    "crates/rustyred-thg-resp-server",
+    "crates/rustyred-thg-pg-server",
+    "crates/rustyred-membrane",
+    "crates/rustyred-rerank",
+    "crates/rustyred-hipporag",
+    "crates/rustyred-web",
+    "crates/rustyred-thg-code",
+    "crates/rustyred-thg-memory",
+    "crates/rustyred-thg-catalog",
+    "crates/scene-os-core",
+    "crates/scene-os-web",
+    "crates/theorem-harness-core",
+    "crates/theorem-harness-runtime",
+    "crates/theorem-harness",
+    "crates/theorem-dispatch",
+    "crates/theorem-browser-agent",
+    "crates/theorem-agentd",
+    "crates/theorem-receiver",
+    "crates/rustyred-thg-affordances",
+    "crates/rustyred-thg-connectors",
+    "crates/ensemble",
+    "crates/prose-check",
+    "crates/design-check",
+    "crates/pilot-core",
+    "crates/commonplace",
+    "crates/theorem-copresence",
+]
+resolver = "2"
+
+[patch.crates-io]
+# Fork patch: TurboVec 0.8.0 exposes a nightly-only AVX-512 kernel on stable
+# Rust. This branch hides that kernel unless explicitly enabled on nightly,
+# while default stable builds keep the AVX2/scalar dispatch path.
+turbovec = { git = "https://github.com/Travis-Gilbert/turbovec.git", branch = "Travis-Gilbert/stable-avx512-gate" }
+
+[lib]
+name = "rustyredcore_THG"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22.5", features = ["abi3-py312", "extension-module"] }
+numpy = "0.22"
+serde_json = "1.0"
+sha2 = "0.10"
+rustyred-thg-core = { path = "crates/rustyred-thg-core" }
+rustyred-thg-adapters = { path = "crates/rustyred-thg-adapters" }
+egg = "0.10"
+datafrog = "2.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "symbols"

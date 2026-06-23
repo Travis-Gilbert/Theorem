@@ -1,0 +1,35 @@
+:root {
+  --color-field: #f6f5f2;
+  --color-ink: #2a2823;
+  --space-2: 8px;
+  --space-3: 12px;
+  --radius-sm: 4px;
+  --duration-fast: 160ms;
+}
+
+body {
+  color: var(--color-ink);
+  background-color: var(--color-field);
+  font-size: 16px;
+  line-height: 1.5;
+  max-width: 66ch;
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--color-ink);
+  outline-offset: 2px;
+}
+
+.button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  transition: color var(--duration-fast) ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button {
+    transition: none;
+  }
+}

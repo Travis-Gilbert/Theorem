@@ -1,0 +1,23 @@
+[package]
+name = "theorem-harness-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-native Theorem harness runtime: GraphStore-backed event log and run persistence."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+prose-check = { path = "../prose-check" }
+design-check = { path = "../design-check" }
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+theorem-harness-core = { path = "../theorem-harness-core" }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# Test-only: assert the project-anchor id stays byte-identical to the memory crate's
+# recall-side helper (cut-5 cross-crate parity guard). Not a runtime dependency.
+rustyred-thg-memory = { path = "../rustyred-thg-memory" }

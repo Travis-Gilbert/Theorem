@@ -1,0 +1,351 @@
+[
+  {
+    "name": "rrf_fallback_ordering",
+    "results": [
+      {
+        "object_pk": "a",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "b",
+        "rrf_score": 0.3,
+        "learned_score": 0.3,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "c",
+        "rrf_score": 0.15,
+        "learned_score": 0.15,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "epistemic_weight_boost",
+    "results": [
+      {
+        "object_pk": "axiomatic",
+        "rrf_score": 0.4,
+        "learned_score": 0.6,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.5,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "normal",
+        "rrf_score": 0.4,
+        "learned_score": 0.4,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "hypothetical",
+        "rrf_score": 0.4,
+        "learned_score": 0.2,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 0.5,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "acquaintance_dropped",
+    "results": [
+      {
+        "object_pk": "normal",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "code_gate_default_excludes",
+    "results": [
+      {
+        "object_pk": "prose",
+        "rrf_score": 0.7,
+        "learned_score": 0.7,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "code_gate_included",
+    "results": [
+      {
+        "object_pk": "code",
+        "rrf_score": 0.9,
+        "learned_score": 0.9,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "spec",
+        "rrf_score": 0.8,
+        "learned_score": 0.8,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "prose",
+        "rrf_score": 0.7,
+        "learned_score": 0.7,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "code_debug_bump",
+    "results": [
+      {
+        "object_pk": "boost",
+        "rrf_score": 0.4,
+        "learned_score": 0.65,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "plain",
+        "rrf_score": 0.4,
+        "learned_score": 0.4,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "slug_dedup_keeps_higher",
+    "results": [
+      {
+        "object_pk": "high",
+        "rrf_score": 0.9,
+        "learned_score": 0.9,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "other",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "title_overlap_capped",
+    "results": [
+      {
+        "object_pk": "t",
+        "rrf_score": 0.2,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": 0.3
+      },
+      {
+        "object_pk": "u",
+        "rrf_score": 0.4,
+        "learned_score": 0.4,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "acceptance_default_only_accepted",
+    "results": [
+      {
+        "object_pk": "ok",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "acceptance_permissive_keeps_prov_contested",
+    "results": [
+      {
+        "object_pk": "provisional",
+        "rrf_score": 0.8,
+        "learned_score": 0.8,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "provisional",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "contested",
+        "rrf_score": 0.7,
+        "learned_score": 0.7,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "contested",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "ok",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "truncation_before_rerank",
+    "results": [
+      {
+        "object_pk": "first",
+        "rrf_score": 0.9,
+        "learned_score": 0.9,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "final_topn_slice",
+    "results": [
+      {
+        "object_pk": "a",
+        "rrf_score": 0.9,
+        "learned_score": 0.9,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "b",
+        "rrf_score": 0.7,
+        "learned_score": 0.7,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "min_score_threshold",
+    "results": [
+      {
+        "object_pk": "strong",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "rounding_interleave",
+    "results": [
+      {
+        "object_pk": "r",
+        "rrf_score": 0.123457,
+        "learned_score": 0.2482,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.2,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": 0.1
+      },
+      {
+        "object_pk": "s",
+        "rrf_score": 0.111111,
+        "learned_score": 0.1222,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.1,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "tie_preserves_input_order",
+    "results": [
+      {
+        "object_pk": "tieA",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "tieB",
+        "rrf_score": 0.5,
+        "learned_score": 0.5,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      },
+      {
+        "object_pk": "lower",
+        "rrf_score": 0.3,
+        "learned_score": 0.3,
+        "scoring_method": "rrf_fallback",
+        "epistemic_weight": 1.0,
+        "acceptance_status": "accepted",
+        "title_overlap_bonus": null
+      }
+    ]
+  },
+  {
+    "name": "empty_input",
+    "results": []
+  }
+]

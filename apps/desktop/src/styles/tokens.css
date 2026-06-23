@@ -1,0 +1,153 @@
+/*
+ * Theorem Desktop design tokens. Patent-paper ground: a warm paper field with
+ * hairline rules and a faint engineering grid. One accent does the work, the
+ * oxblood "pencil" (annotation, grounding, primary action, focus). Agent and
+ * ingestion are ochre. PCB green is gone. Light is the home; dark is a warm
+ * toasted-paper variant, not a cool grey.
+ *
+ * Direction reference: docs/plans/theorem-desktop/design.md and the Theseus
+ * Atlas iPhone exemplar (paper #f5ecd6, pencil #a8301e, rule #bcae90).
+ * All accent/neutral hex below is contrast-checked; see design.md for the math.
+ */
+
+:root {
+  /* Accent: the oxblood pencil. Primary action, focus, grounding/memory mark.
+     5.50:1 on --bg, so it is legible even as body text. */
+  --accent: #a8301e;
+  --accent-soft: #a8301e26; /* 15% wash for fills/hovers */
+  --accent-strong: #8a2417; /* pressed/active */
+
+  /* Agent and ingestion. Ochre/brass. 2.34:1 on paper, so fills, borders,
+     chips, and large text only, never small body text. */
+  --accent-agent: #b09468;
+  --accent-agent-soft: #b0946826;
+
+  /* Semantic aliases (the two stories the accents tell). Memory and grounding
+     are the pencil; agent activity and ingestion are ochre. */
+  --accent-memory: var(--accent);
+  --accent-memory-soft: var(--accent-soft);
+
+  /* Status. Crimson, a distinct hue from the oxblood accent (cooler, deeper)
+     so destructive never reads as the brand mark. Reserved for destructive
+     and error only. */
+  --danger: #9e2b3f;
+  --danger-soft: #9e2b3f26;
+
+  /* Paper ground (light). Warm cream field; cards lift slightly lighter. */
+  --bg: #f1e7cf;
+  --surface: #f7efda;
+  --surface-2: #ebe0c4;
+  --surface-3: #e2d4b4;
+
+  /* Hairlines. Warm tan rules, never grey. */
+  --border: #cabb98;
+  --border-strong: #a89d8f;
+  --hairline: 1px solid var(--border);
+  --rule: var(--border);
+
+  /* Ink. Warm near-black; dim and faint stay warm. */
+  --text: #140e0c;
+  --text-dim: #554a43;
+  --text-faint: #857a6b; /* labels/metadata/large only (3.42:1) */
+
+  /* Engineering-grid texture. Two 1px rules at --grid-size. Applied to the
+     field in global.css; --grid-fade keeps it faint. 24px sits on the 4/8
+     grid (the exemplar used 26). */
+  --grid-rule: #cabb9866; /* ~40% of the hairline tan */
+  --grid-size: 24px;
+
+  /* Type. Body is full-width IBM Plex Sans for readability (the Condensed face
+     is opt-in via --font-ui-condensed). Display is a Vollkorn serif for
+     headings and epistemic moments. */
+  --font-ui: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    system-ui, sans-serif;
+  --font-ui-condensed: "IBM Plex Sans Condensed", var(--font-ui);
+  --font-display: "Vollkorn", Georgia, "Times New Roman", serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Rhythm. */
+  --radius: 8px;
+  --radius-sm: 6px;
+  --radius-lg: 12px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  /* Chrome geometry. */
+  --sidebar-w: 248px;
+  --rail-w: 360px;
+  --omnibox-h: 48px;
+  --titlebar-h: 38px;
+
+  /* Depth. Warm ink shadows with a paper-edge inset highlight (the lifted-card
+     look from the exemplar). */
+  --shadow-1: 0 1px 2px rgba(30, 22, 18, 0.08), 0 1px 1px rgba(30, 22, 18, 0.06);
+  --shadow-2: 0 4px 16px rgba(30, 22, 18, 0.12);
+  --shadow-pop: 0 18px 44px -18px rgba(30, 22, 18, 0.3),
+    inset 0 1px 0 rgba(255, 250, 238, 0.45);
+
+  /* Motion. Chrome transitions only; content is never animated. The easing is
+     the exemplar's deliberate ease-out (the anime.js motion read, not its
+     color). Pair every transition with the reduced-motion block below. */
+  --motion-fast: 120ms;
+  --motion: 200ms;
+  --motion-slow: 320ms;
+  --ease: cubic-bezier(0.22, 0.9, 0.27, 1);
+  --ease-emphasized: cubic-bezier(0.2, 0, 0, 1);
+  --stagger: 40ms; /* per-item delay for list enters (m-fade-up pattern) */
+
+  /* Focus. Visible on every focusable; never removed without replacement. */
+  --focus-ring: 2px solid var(--accent);
+  --focus-ring-offset: 2px;
+
+  /* Reserve categorical hues (from the exemplar). Not in active chrome; for
+     future tags, series, and node categories. Distinguishable, muted. */
+  --cat-sage: #7fa37a;
+  --cat-indigo: #9aa6d4;
+  --cat-teal: #7db8b4;
+  --cat-mauve: #a27c74;
+  --cat-lilac: #6c607a;
+  --cat-ochre: #b09468;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Warm toasted paper, not cool grey. */
+    --bg: #1b1512;
+    --surface: #241c17;
+    --surface-2: #2c231c;
+    --surface-3: #352a21;
+    --border: #3a2f25;
+    --border-strong: #4d4030;
+    --text: #f1e7d6;
+    --text-dim: #bcae98;
+    --text-faint: #8c8070;
+
+    /* Accent brightened for the dark ground (4.40:1, large/UI and bold labels). */
+    --accent: #d2553f;
+    --accent-soft: #d2553f33;
+    --accent-strong: #e0664f;
+    --accent-agent: #cba56e;
+    --accent-agent-soft: #cba56e33;
+    --danger: #d76a72;
+    --danger-soft: #d76a7233;
+
+    --grid-rule: #4d403040;
+
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-2: 0 6px 20px rgba(0, 0, 0, 0.45);
+    --shadow-pop: 0 18px 40px -16px rgba(0, 0, 0, 0.55),
+      inset 0 1px 0 rgba(214, 222, 236, 0.1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion: 0ms;
+    --motion-slow: 0ms;
+    --stagger: 0ms;
+  }
+}

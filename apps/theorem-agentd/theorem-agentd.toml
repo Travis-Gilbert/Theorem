@@ -1,0 +1,58 @@
+# Live config for the AGD-008 model-driven proof.
+# Model: local Gemma 4 12B (QAT Q4_K_XL) served by llama-server on :8080,
+# with the MTP drafter (speculative decoding) + mmproj (multimodal) attached.
+
+default_room_id = "repo:theorem:branch:main"
+actor = "theorem-agentd"
+
+[model]
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:8080"
+model = "gemma-4-12b-it-qat"
+temperature = 0.2
+max_tokens = 512
+request_timeout_secs = 180
+grammar_constrained = true
+
+# Bucket A: harness MCP (lenient/stateless; no session handshake).
+[harness]
+name = "harness"
+url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
+token_env = "THEOREM_HARNESS_TOKEN"
+tenant_slug = "default"
+
+# Bucket B: the real TickTick MCP (spec-compliant streamable-HTTP -> session = true).
+[[mcp_servers]]
+name = "ticktick"
+url = "https://ticktick-mcp-production-8a84.up.railway.app/mcp"
+session = true
+tenant_slug = "default"
+
+# The local loop wakes heads through the embedded receiver sidecar.
+[receiver]
+enabled = true
+config_path = "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/apps/theorem-agentd/theorem-receiver.toml"
+
+[loop_config]
+max_iterations = 6
+tick_interval_secs = 60
+
+[ledger]
+path = "/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/apps/theorem-agentd/.agentd-ledger.jsonl"
+mirror_to_graph = true
+
+# Personal memory routes to the operator's named tenant; coordination, jobs, and
+# shared substrate stay on the harness default tenant.
+operator_memory_tenant = "operator:travis"
+
+# Agent Queue capture (the only capture trigger).
+[capture]
+enabled = true
+agent_queue_project_id = "6a2911688f08a8907c774531"
+dispatched_project_id = "689cdbfd8f083a8c93d0134e"
+repo = "Travis-Gilbert/theorem"
+dispatched_subtask_title = "dispatched"
+
+# Milestone relay back to the originating task.
+[relay]
+enabled = true

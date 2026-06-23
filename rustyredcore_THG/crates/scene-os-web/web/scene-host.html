@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Scene</title>
+<style>
+  :root {
+    --ink: #2A2823;
+    --ink-soft: #6b665c;
+    --paper: #f4f1ea;
+    --paper-soft: #ece8df;
+    --rule: #d9d4c8;
+    --accent: #b45a2d;
+    --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--paper); color: var(--ink); }
+  body { display: flex; flex-direction: column; font-family: var(--mono); }
+  header {
+    border-bottom: 1px solid var(--rule); background: var(--paper-soft);
+    padding: 13px 22px 12px;
+  }
+  .eyebrow {
+    margin: 0 0 6px; font-size: 10px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--ink-soft);
+  }
+  .titlerow { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  #scene-title { margin: 0; font-size: 17px; font-weight: 600; color: var(--ink); }
+  #scene-meta { font-size: 11px; color: var(--ink-soft); letter-spacing: 0.02em; }
+  #scene-note {
+    display: none; margin-top: 8px; font-size: 11px; color: var(--accent);
+    line-height: 1.45;
+  }
+  #scene-stage { position: relative; flex: 1; min-height: 0; }
+  #scene-canvas { display: block; width: 100%; height: 100%; }
+  /* The d3-annotation explanation layer sits over the canvas. pointer-events
+     are off so it never intercepts the canvas hover / click hit-testing. */
+  #scene-annotations {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    pointer-events: none; z-index: 4; overflow: visible;
+  }
+  #scene-annotations .annotation-note-title {
+    font-family: var(--mono); font-size: 11px; font-weight: 600; fill: var(--ink);
+  }
+  #scene-annotations .annotation-note-label {
+    font-family: var(--mono); font-size: 10px; fill: var(--ink-soft);
+  }
+  #scene-annotations .annotation path,
+  #scene-annotations .annotation line { stroke: var(--accent); }
+  #scene-empty {
+    position: absolute; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    padding: 32px; color: var(--ink-soft); font-size: 13px; line-height: 1.6;
+    max-width: 480px; margin: 0 auto;
+  }
+  #scene-empty strong {
+    display: block; color: var(--ink); font-size: 18px; margin-bottom: 6px;
+  }
+  #scene-tooltip {
+    position: absolute; pointer-events: none; display: none; max-width: 320px;
+    padding: 8px 10px; border: 1px solid var(--rule); border-radius: 6px;
+    background: var(--paper-soft); font-size: 11px; line-height: 1.45;
+    color: var(--ink); box-shadow: 0 4px 14px rgba(42, 40, 35, 0.12); z-index: 5;
+  }
+  #scene-tooltip .tip-title { color: var(--ink); font-weight: 600; word-break: break-word; }
+  #scene-tooltip .tip-kind {
+    color: var(--accent); margin-top: 3px; font-size: 10px;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  #scene-tooltip .tip-src { color: var(--ink-soft); margin-top: 3px; }
+  form.scene-search { display: flex; gap: 8px; align-items: stretch; margin-bottom: 11px; }
+  form.scene-search input {
+    flex: 1; min-width: 0; border: 1.5px solid var(--rule); border-radius: 7px;
+    background: var(--paper); color: var(--ink); font-family: var(--mono);
+    font-size: 15px; padding: 8px 12px; outline: none;
+  }
+  form.scene-search input:focus { border-color: var(--accent); }
+  form.scene-search button {
+    border: 1.5px solid var(--accent); background: var(--accent); color: var(--paper);
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
+    text-transform: uppercase; padding: 0 16px; border-radius: 7px; cursor: pointer;
+  }
+  form.scene-search button:hover { background: #9c4a22; }
+</style>
+</head>
+<body>
+  <header id="scene-header">
+    <form class="scene-search" action="/scene" method="get" autocomplete="off">
+      <input id="scene-q" name="q" type="search" placeholder="Search your substrate…" aria-label="Search your substrate" />
+      <button type="submit">Search</button>
+    </form>
+    <p class="eyebrow">Scene</p>
+    <div class="titlerow">
+      <h1 id="scene-title">Scene</h1>
+      <span id="scene-meta"></span>
+    </div>
+    <p id="scene-note"></p>
+  </header>
+  <div id="scene-stage">
+    <canvas id="scene-canvas"></canvas>
+    <!-- d3-annotation explanation overlay: a single callout for the selected
+         atom. Sized to the stage via CSS, pointer-events:none so the canvas
+         keeps its own hover/click. The bundle renders all text via d3's
+         .text() (textContent); labels are untrusted, never innerHTML. -->
+    <svg id="scene-annotations" aria-hidden="true"></svg>
+    <div id="scene-empty"></div>
+    <div id="scene-tooltip"></div>
+  </div>
+
+<script>
+// Reflect the current query in the search box (read-only prefill from the URL;
+// .value assignment only, never innerHTML).
+(function () {
+  try {
+    var q = new URLSearchParams(window.location.search).get('q');
+    if (q) document.getElementById('scene-q').value = q;
+  } catch (e) { /* no-op */ }
+})();
+</script>
+
+<script>
+// The Rust render_scene_html hook replaces the next line with the real
+// ScenePackageV2 (serde JSON) before serving. Left null -> honest empty state,
+// never fake data. Atom labels are untrusted; the bundle renders all text via
+// textContent (never innerHTML).
+window.__SCENE_PACKAGE__ = null; // __SCENE_PACKAGE__
+</script>
+
+<!-- SceneOS renderer bundle (esbuild IIFE, d3 inlined; injected by the Rust
+     layer so the page is one self-contained asset Servo serves). -->
+<script>/*__SCENE_OS_BUNDLE__*/</script>
+</body>
+</html>

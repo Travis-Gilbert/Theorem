@@ -1,0 +1,83 @@
+# Local satellites for the Theorem harness MCP server.
+#
+#   docker compose -f scripts/dev/docker-compose.yml up -d
+#
+# Brings up: Valkey (gRPC cache), SearXNG (search), a small embedding server
+# (TEI), and the browser sidecar (render + live action loop). All ports bind
+# localhost so theorem-local.env points straight at them.
+#
+# Then: ./scripts/dev/run-grpc.sh   (uses VALKEY_URL)
+#       ./scripts/dev/run-harness.sh
+
+name: theorem-dev
+
+services:
+  # --- Valkey: Redis-wire cache consumed by theorem-grpc -------------------
+  valkey:
+    image: valkey/valkey:8-alpine
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- SearXNG: self-hosted, no-API-key search provider -------------------
+  # JSON output MUST be enabled (see ./searxng/settings.yml); the provider
+  # hits /search?format=json.
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --- Embeddings: HuggingFace text-embeddings-inference (OpenAI route) -----
+  # Default model is small (bge-small-en-v1.5, 384-dim) so it runs on CPU.
+  # NOTE: the TEI cpu image is amd64; on Apple Silicon Docker emulates it
+  # (slow but correct). For a snappy local embedder, skip this service and
+  # point RUSTYWEB_QWEN4B_EMBED_URL at a native OpenAI-compatible server
+  # (LM Studio / llama.cpp --embedding / Ollama /v1/embeddings) instead.
+  # Swap --model-id to the real Qwen3-Embedding-4B and set the dimension to
+  # 2560 in theorem-local.env when you want the production contract.
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    command: ["--model-id", "BAAI/bge-small-en-v1.5"]
+    ports:
+      - "8081:80"
+    volumes:
+      - tei-cache:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # --- Browser sidecar: render endpoint + live action loop -----------------
+  # Implements BOTH browser surfaces in one process (see browser-sidecar/).
+  #   render:      POST /render
+  #   action loop: POST /sessions/{checkout,snapshot,actuate}
+  browser-sidecar:
+    build: ./browser-sidecar
+    ports:
+      - "9223:9223"
+    environment:
+      - PORT=9223
+      - SIDECAR_DISTILLED_TEXT_MAX=20000
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9223/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  tei-cache:

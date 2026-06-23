@@ -1,0 +1,13 @@
+[package]
+name = "rustyred-thg-affordances"
+version = "0.1.0"
+edition = "2021"
+description = "Connector-as-substrate learning registry: MCP tools as first-class Affordance graph nodes with learned, scoped selection over RustyRedCore-THG."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+theorem-harness-core = { path = "../theorem-harness-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

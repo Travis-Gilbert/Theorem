@@ -1,0 +1,12 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/ready"
+healthcheckTimeout = 300
+restartPolicyMaxRetries = 3
+
+# RustyRed base deployments should be one application image running embedded
+# RedCore with a mounted Railway volume. Add Redis only when intentionally
+# running the compatibility path with RUSTY_RED_MODE=redis.

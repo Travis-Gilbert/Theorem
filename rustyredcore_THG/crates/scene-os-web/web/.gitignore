@@ -1,0 +1,7 @@
+node_modules/
+*.log
+# Ignore build byproducts in dist/, but COMMIT the renderer bundle: the Rust
+# crate embeds it via include_str!, mirroring rustyred-web's vendored d3.
+# (Test bundles smoke.cjs / entry-node.mjs are byproducts and stay ignored.)
+/dist/*
+!/dist/scene-os.bundle.js

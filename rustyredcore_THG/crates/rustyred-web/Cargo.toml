@@ -1,0 +1,57 @@
+[package]
+name = "rustyred-web"
+version = "0.1.0"
+edition = "2021"
+description = "RustyWeb graph-native crawler and search kernel for Theorem/Theseus."
+license = "MIT"
+rust-version = "1.85"
+
+[features]
+default = []
+redis-frontier = ["dep:redis"]
+# Live Valkey/Redis cache-aside backend (Spec 3). The in-memory backend, key
+# schemes, stats, and cache-aside logic compile without it; this only adds the
+# networked backend. Shares the `redis` dep with redis-frontier.
+valkey-cache = ["dep:redis"]
+servo = []
+spider_fetch = ["dep:spider"]
+# Browser-fingerprint fetch tier. Pulls wreq (the `rquest` alias) for the client and
+# wreq-util for the Emulation presets; both optional, only built with this feature.
+impersonate-fetch = ["dep:rquest", "dep:wreq-util"]
+# job-007 D1: the real accesskit::TreeUpdate -> A11yTreeUpdate conversion the
+# Servo embedder calls. Off by default so the agent layer stays free of Servo's
+# accesskit version pin; the pure-DTO reader is fully testable without it. When
+# the embedder wires it, reconcile this version with Servo's accesskit pin.
+accesskit = ["dep:accesskit"]
+# Optional dense/vector acceleration. Default browser builds keep exact
+# pure-Rust scoring and avoid TurboVec's BLAS-linked dependency graph.
+vector-accelerated = ["dep:turbovec", "rustyred-thg-core/vector-accelerated"]
+
+[dependencies]
+accesskit = { version = "0.24", optional = true }
+async-trait = "0.1"
+blake3 = "1.8.5"
+futures-util = "0.3.31"
+lol_html = "2.9.0"
+redis = { version = "0.27", features = ["aio", "tokio-comp"], optional = true }
+reqwest = { version = "0.12.22", default-features = false, features = ["http2", "json", "rustls-tls"] }
+rquest = { package = "wreq", version = "5.3.0", optional = true }
+rustyred-membrane = { path = "../rustyred-membrane", features = ["graph-store"] }
+rustyred-hipporag = { path = "../rustyred-hipporag" }
+rustyred-rerank = { path = "../rustyred-rerank" }
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+pilot-core = { path = "../pilot-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+spider = { version = "2.52.0", default-features = false, optional = true }
+texting_robots = "0.2.2"
+tokio = { version = "1.47.1", features = ["rt", "sync", "time"] }
+turbovec = { version = "0.8.0", optional = true }
+url = "2.5.8"
+wreq-util = { version = "2.2.6", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
+serde_json = "1.0"
+rustyred-thg-core = { path = "../rustyred-thg-core" }
