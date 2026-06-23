@@ -11,122 +11,9 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 
 use rustyred_thg_core::{ThgError, ThgResult};
+pub use rustyred_thg_ml::{aggregate_messages_burn, BurnAggregator};
 
-use crate::edge_mpnn::MessageAggregator;
 use crate::reflexive::ScatterAggregationPath;
-
-fn validate_messages(
-    messages: &[Vec<f32>],
-    edge_dst: &[usize],
-    num_nodes: usize,
-) -> ThgResult<usize> {
-    if messages.len() != edge_dst.len() {
-        return Err(ThgError::new(
-            "scatter_shape_mismatch",
-            "messages and edge_dst must have the same length",
-        ));
-    }
-    let feature_dim = messages.first().map(Vec::len).unwrap_or(0);
-    if messages.iter().any(|message| message.len() != feature_dim) {
-        return Err(ThgError::new(
-            "scatter_shape_mismatch",
-            "all message rows must have the same feature dimension",
-        ));
-    }
-    if edge_dst.iter().any(|dst| *dst >= num_nodes) {
-        return Err(ThgError::new(
-            "scatter_index_out_of_bounds",
-            "edge_dst contains a destination outside num_nodes",
-        ));
-    }
-    Ok(feature_dim)
-}
-
-/// Burn-native scatter-add aggregation: the portable high-level tensor path.
-pub fn aggregate_messages_burn<B: Backend>(
-    device: &B::Device,
-    messages: &[Vec<f32>],
-    edge_dst: &[usize],
-    num_nodes: usize,
-    mean_aggregate: bool,
-) -> ThgResult<Vec<Vec<f32>>> {
-    let feature_dim = validate_messages(messages, edge_dst, num_nodes)?;
-    if messages.is_empty() || feature_dim == 0 {
-        return Ok(vec![vec![0.0; feature_dim]; num_nodes]);
-    }
-    let num_edges = messages.len();
-
-    let flat = messages
-        .iter()
-        .flat_map(|row| row.iter().copied())
-        .collect::<Vec<f32>>();
-    let message_tensor =
-        Tensor::<B, 2>::from_data(TensorData::new(flat, [num_edges, feature_dim]), device);
-    let dst_indices = Tensor::<B, 1, Int>::from_data(
-        TensorData::new(
-            edge_dst.iter().map(|dst| *dst as i64).collect::<Vec<_>>(),
-            [num_edges],
-        ),
-        device,
-    );
-
-    // scatter(dim=0, indices [E, D], values [E, D], Add) onto zeros [N, D].
-    let dst_expanded = dst_indices
-        .clone()
-        .unsqueeze_dim::<2>(1)
-        .repeat_dim(1, feature_dim);
-    let aggregated = Tensor::<B, 2>::zeros([num_nodes, feature_dim], device).scatter(
-        0,
-        dst_expanded,
-        message_tensor,
-        burn::tensor::IndexingUpdateOp::Add,
-    );
-
-    let aggregated = if mean_aggregate {
-        let ones = Tensor::<B, 2>::ones([num_edges, 1], device);
-        let degrees = Tensor::<B, 2>::zeros([num_nodes, 1], device).scatter(
-            0,
-            dst_indices.unsqueeze_dim::<2>(1),
-            ones,
-            burn::tensor::IndexingUpdateOp::Add,
-        );
-        aggregated / degrees.clamp_min(1.0)
-    } else {
-        aggregated
-    };
-
-    let values = aggregated
-        .into_data()
-        .to_vec::<f32>()
-        .map_err(|error| ThgError::new("burn_tensor_readback", format!("{error:?}")))?;
-    Ok(values
-        .chunks(feature_dim)
-        .map(|chunk| chunk.to_vec())
-        .collect())
-}
-
-/// [`MessageAggregator`] implementation over a Burn backend, so the sparse
-/// EdgeMPNN completion scorer can run its aggregation on tensors.
-#[derive(Clone, Debug)]
-pub struct BurnAggregator<B: Backend> {
-    pub device: B::Device,
-}
-
-impl<B: Backend> MessageAggregator for BurnAggregator<B> {
-    fn aggregate(
-        &self,
-        messages: &[Vec<f32>],
-        edge_dst: &[usize],
-        num_nodes: usize,
-        mean_aggregate: bool,
-    ) -> ThgResult<Vec<Vec<f32>>> {
-        aggregate_messages_burn::<B>(&self.device, messages, edge_dst, num_nodes, mean_aggregate)
-    }
-
-    fn aggregator_id(&self) -> &'static str {
-        "burn_scatter_add"
-    }
-}
 
 /// One relation-aware EdgeMPNN layer over Burn tensors. `select` gathers the
 /// source rows; messages compose source state with per-edge relation
@@ -234,7 +121,7 @@ pub mod wgpu_launch {
 
     use rustyred_thg_core::ThgResult;
 
-    use super::{validate_messages, CubeclAggregateOutput};
+    use super::CubeclAggregateOutput;
     use crate::pairformer_cubecl::{
         fused_pair_aggregate_fixed_point_kernel, fused_pair_aggregate_float_atomic_kernel,
     };
@@ -242,6 +129,7 @@ pub mod wgpu_launch {
         choose_scatter_aggregation_path, ScatterAggregationPath, ScatterAggregationRequest,
         DEFAULT_FIXED_POINT_SCALE,
     };
+    use rustyred_thg_ml::validate_messages;
 
     fn wgpu_client() -> ComputeClient<WgpuRuntime> {
         WgpuRuntime::client(&WgpuDevice::default())

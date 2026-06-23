@@ -42,8 +42,8 @@ pub use burn_pairformer::{
 pub use commands::{execute_adapter_command, AdapterCommandResponse};
 pub use edge_mpnn::{
     rank_global_completion_candidates, rank_global_completion_candidates_default,
-    FixedPointAggregator, GlobalCompletionConfig, GlobalCompletionRequest, GlobalCompletionResult,
-    MessageAggregator, DEFAULT_COMPLETION_HIDDEN_DIM, DEFAULT_COMPLETION_LAYERS,
+    GlobalCompletionConfig, GlobalCompletionRequest, GlobalCompletionResult,
+    DEFAULT_COMPLETION_HIDDEN_DIM, DEFAULT_COMPLETION_LAYERS,
     DEFAULT_COMPLETION_MAX_FRONTIER_NODES, DEFAULT_COMPLETION_MAX_SEEDS,
 };
 pub use fitness::{
@@ -64,12 +64,12 @@ pub use hot::{
     HotNegativeSamplingScheme, HotNode, HotNodeRepresentation, HotOutput, HotPairLabel,
     HotPairPrediction, HotPairRepresentation, HotPairSequence, HotTemporalEdge,
     HotTemporalLinkDataset, HotTemporalSplitConfig, HotTimeEncoder, HotTimedPairLabel,
-    HotTrainingConfig, HotTrainingReport,
-    DEFAULT_HOT_ALIGNED_DIM, DEFAULT_HOT_BLOCK_SIZE, DEFAULT_HOT_BRT_CELLS,
-    DEFAULT_HOT_COOCCURRENCE_DIM, DEFAULT_HOT_DECODER_HIDDEN_DIM, DEFAULT_HOT_HEADS,
-    DEFAULT_HOT_HORIZONTAL_CELL_INDEX, DEFAULT_HOT_MAX_NODES, DEFAULT_HOT_MAX_TEMPORAL_EDGES,
-    DEFAULT_HOT_OUTPUT_DIM, DEFAULT_HOT_PATCH_SIZE, DEFAULT_HOT_S1, DEFAULT_HOT_S2,
-    DEFAULT_HOT_SEGMENT_SIZE, DEFAULT_HOT_STATE_VECTORS, DEFAULT_HOT_TIME_ENCODING_DIM,
+    HotTrainingConfig, HotTrainingReport, DEFAULT_HOT_ALIGNED_DIM, DEFAULT_HOT_BLOCK_SIZE,
+    DEFAULT_HOT_BRT_CELLS, DEFAULT_HOT_COOCCURRENCE_DIM, DEFAULT_HOT_DECODER_HIDDEN_DIM,
+    DEFAULT_HOT_HEADS, DEFAULT_HOT_HORIZONTAL_CELL_INDEX, DEFAULT_HOT_MAX_NODES,
+    DEFAULT_HOT_MAX_TEMPORAL_EDGES, DEFAULT_HOT_OUTPUT_DIM, DEFAULT_HOT_PATCH_SIZE, DEFAULT_HOT_S1,
+    DEFAULT_HOT_S2, DEFAULT_HOT_SEGMENT_SIZE, DEFAULT_HOT_STATE_VECTORS,
+    DEFAULT_HOT_TIME_ENCODING_DIM,
 };
 #[cfg(feature = "pairformer-burn-cubecl")]
 pub use hot_burn::{featurize_hot_training_examples, BurnHot, BurnHotConfig};
@@ -80,23 +80,19 @@ pub use pairformer::{
     DEFAULT_PAIRFORMER_SINGLE_DIM, DEFAULT_PAIRFORMER_TRANSITION_HIDDEN_DIM,
 };
 pub use reflexive::{
-    aggregate_messages_fixed_point, choose_scatter_aggregation_path,
     densification_candidate_node_id, densification_run_node_id, property_candidate_node_id,
     property_candidate_run_node_id, quarantine_densification_candidates,
     quarantine_property_candidates, quarantine_property_candidates_with_options,
     rank_classification_property_candidates, rank_densification_candidates,
     rank_hot_temporal_densification_candidates, rank_missing_property_candidates,
-    rank_pairformer_densification_candidates,
-    rank_property_candidates, rank_reflexive_organizing_candidates, rank_spatial_candidates,
-    rank_temporal_candidates, representation_sidecar_node_id, upsert_representation_sidecar,
-    DensificationQuarantineResult, DensificationRequest, DensificationResult,
-    InferredEdgeCandidate, InferredPropertyCandidate, PropertyCandidateQuarantineOptions,
-    PropertyCandidateQuarantineResult, PropertyCandidateResult, RepresentationSidecarInput,
-    RepresentationSidecarWriteback, RepresentationTargetKind, ScatterAggregationPath,
-    ScatterAggregationRequest, DEFAULT_DENSIFICATION_CONFIDENCE_CEILING,
-    DEFAULT_DENSIFICATION_MAX_CANDIDATES, DEFAULT_DENSIFICATION_MAX_DEPTH,
-    DEFAULT_DENSIFICATION_MAX_NODES, DEFAULT_FIXED_POINT_SCALE,
-    DEFAULT_SCATTER_BURN_NATIVE_MAX_ELEMENTS, DEFAULT_SPATIAL_RADIUS_KM,
+    rank_pairformer_densification_candidates, rank_property_candidates,
+    rank_reflexive_organizing_candidates, rank_spatial_candidates, rank_temporal_candidates,
+    representation_sidecar_node_id, upsert_representation_sidecar, DensificationQuarantineResult,
+    DensificationRequest, DensificationResult, InferredEdgeCandidate, InferredPropertyCandidate,
+    PropertyCandidateQuarantineOptions, PropertyCandidateQuarantineResult, PropertyCandidateResult,
+    RepresentationSidecarInput, RepresentationSidecarWriteback, RepresentationTargetKind,
+    DEFAULT_DENSIFICATION_CONFIDENCE_CEILING, DEFAULT_DENSIFICATION_MAX_CANDIDATES,
+    DEFAULT_DENSIFICATION_MAX_DEPTH, DEFAULT_DENSIFICATION_MAX_NODES, DEFAULT_SPATIAL_RADIUS_KM,
     DEFAULT_SPATIAL_RESOLUTION, DEFAULT_TEMPORAL_WINDOW_MS, REFLEXIVE_CANDIDATE_OF,
     REFLEXIVE_CANDIDATE_SOURCE, REFLEXIVE_CANDIDATE_TARGET, REFLEXIVE_DENSIFICATION_RUN_LABEL,
     REFLEXIVE_EDGE_CANDIDATE_LABEL, REFLEXIVE_PROPERTY_CANDIDATE_LABEL,
@@ -112,6 +108,11 @@ pub use reflexive_executor::{
 pub use routing::{
     adapter_training_centroid, find_adapters_by_query_embedding, find_adapters_for,
     recompute_embedding,
+};
+pub use rustyred_thg_ml::{
+    aggregate_messages_fixed_point, choose_scatter_aggregation_path, FixedPointAggregator,
+    GraphTensorBatch, MessageAggregator, ScatterAggregationPath, ScatterAggregationRequest,
+    DEFAULT_FIXED_POINT_SCALE, DEFAULT_SCATTER_BURN_NATIVE_MAX_ELEMENTS,
 };
 pub use situation_search::{
     context_candidates_from_similar_situation, default_situation_target_labels,

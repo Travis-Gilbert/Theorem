@@ -15,11 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use rustyred_thg_core::{stable_hash, GraphSnapshot, ThgError, ThgResult};
-
-use crate::reflexive::{
-    aggregate_messages_fixed_point, choose_scatter_aggregation_path, InferredEdgeCandidate,
-    ScatterAggregationPath, ScatterAggregationRequest, DEFAULT_FIXED_POINT_SCALE,
+use rustyred_thg_ml::{
+    choose_scatter_aggregation_path, FixedPointAggregator, MessageAggregator,
+    ScatterAggregationPath, ScatterAggregationRequest,
 };
+
+use crate::reflexive::InferredEdgeCandidate;
 
 pub const DEFAULT_COMPLETION_HIDDEN_DIM: usize = 16;
 pub const DEFAULT_COMPLETION_LAYERS: usize = 3;
@@ -28,52 +29,6 @@ pub const DEFAULT_COMPLETION_MAX_SEEDS: usize = 16;
 pub const DEFAULT_COMPLETION_MAX_CANDIDATES: usize = 64;
 pub const DEFAULT_COMPLETION_CONFIDENCE_CEILING: f32 = 0.74;
 const ACTIVATION_EPSILON: f32 = 1e-4;
-
-/// Pluggable aggregation seam for the sparse layer. The default build uses the
-/// deterministic fixed-point contract; the `pairformer-burn-cubecl` feature
-/// provides a Burn tensor implementation of the same trait.
-pub trait MessageAggregator {
-    fn aggregate(
-        &self,
-        messages: &[Vec<f32>],
-        edge_dst: &[usize],
-        num_nodes: usize,
-        mean_aggregate: bool,
-    ) -> ThgResult<Vec<Vec<f32>>>;
-
-    fn aggregator_id(&self) -> &'static str;
-}
-
-/// Deterministic fixed-point aggregation: the portable floor for every
-/// backend, and the parity oracle for tensor implementations.
-#[derive(Clone, Copy, Debug)]
-pub struct FixedPointAggregator {
-    pub scale: i64,
-}
-
-impl Default for FixedPointAggregator {
-    fn default() -> Self {
-        Self {
-            scale: DEFAULT_FIXED_POINT_SCALE,
-        }
-    }
-}
-
-impl MessageAggregator for FixedPointAggregator {
-    fn aggregate(
-        &self,
-        messages: &[Vec<f32>],
-        edge_dst: &[usize],
-        num_nodes: usize,
-        mean_aggregate: bool,
-    ) -> ThgResult<Vec<Vec<f32>>> {
-        aggregate_messages_fixed_point(messages, edge_dst, num_nodes, self.scale, mean_aggregate)
-    }
-
-    fn aggregator_id(&self) -> &'static str {
-        "fixed_point_deterministic"
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GlobalCompletionConfig {

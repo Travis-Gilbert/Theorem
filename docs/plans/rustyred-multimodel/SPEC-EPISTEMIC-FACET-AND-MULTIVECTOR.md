@@ -311,6 +311,9 @@ Current implementation slice, 2026-06-23:
   epistemic edge and immediately read it through the content-node facet.
 - Canonical epistemic edge writes mark their content endpoints
   `epistemic_shadow_dirty` for projection refresh.
+- `rustyred-thg-ml::multivector` has the first dependency-light retrieval
+  spine: exact MaxSim oracle, sign-bit binary projection, binary Hamming MaxSim
+  scorer, ranking helpers, and cold/exact-vector manifest byte accounting.
 
 ## Multi-Vector Retrieval
 
@@ -326,21 +329,25 @@ hot graph properties would explode memory before multi-user scale.
 
 Planned tiering:
 
-1. **Candle inference path.** Add a Rust-native ColPali encoder behind an
+1. **Reference scoring spine.** Keep exact MaxSim and binary Hamming MaxSim in
+   `rustyred-thg-ml::multivector` as the oracle and candidate-generation
+   contract. This exists before inference so retrieval behavior is testable
+   without model weights.
+2. **Candle inference path.** Add a Rust-native ColPali encoder behind an
    optional feature in `rustyred-thg-ml` or a narrow sibling module. Use the
    Candle example as the first reference implementation, but measure local CPU,
    Metal, and CUDA behavior before making it the default.
-2. **Cold exact vectors.** Store exact page/token/patch vectors in the cold
+3. **Cold exact vectors.** Store exact page/token/patch vectors in the cold
    object or array tier, referenced by a `MultiVectorEmbeddingSet` graph node or
    manifest edge. Use content hash, model id, model version, page/chunk id, and
    vector count for rebuildability.
-3. **Hot binary projection.** Store bit-packed or `int8` binary vectors in a
+4. **Hot binary projection.** Store bit-packed or `int8` binary vectors in a
    dedicated multi-vector access method, not as arbitrary node properties. This
    is the Vespa-style cost tier: Hamming MaxSim for candidate generation.
-4. **Exact bounded rerank.** For the top N candidates only, hydrate exact vectors
+5. **Exact bounded rerank.** For the top N candidates only, hydrate exact vectors
    from cold storage and compute float MaxSim. N is a query budget, not an
    implementation accident.
-5. **Graph-aware merge.** Feed multi-vector scores into the same planner/ranking
+6. **Graph-aware merge.** Feed multi-vector scores into the same planner/ranking
    system as text, PPR, source reliability, and epistemic standing. The
    multi-vector arm is a signal, not a replacement for graph retrieval.
 
@@ -476,6 +483,7 @@ Initial implementation slices should prefer narrow oracles:
 cd rustyredcore_THG
 cargo test -p rustyred-thg-mcp graphql_content_node_epistemic_facet_reads_canonical_edges
 cargo test -p rustyred-thg-mcp graphql_epistemic_domain_matches_flat_tools
+cargo test -p rustyred-thg-ml
 cargo test -p rustyred-thg-core epistemic
 cargo test -p rustyred-thg-memory recall_include_epistemic
 cargo test -p rustyred-thg-mcp graphql_epistemic

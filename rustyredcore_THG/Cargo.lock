@@ -7435,6 +7435,7 @@ dependencies = [
  "burn",
  "cubecl",
  "rustyred-thg-core",
+ "rustyred-thg-ml",
  "serde",
  "serde_json",
 ]
@@ -7576,6 +7577,16 @@ dependencies = [
  "rustyred-thg-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustyred-thg-ml"
+version = "0.5.0"
+dependencies = [
+ "burn",
+ "cubecl",
+ "rustyred-thg-core",
+ "serde",
 ]
 
 [[package]]

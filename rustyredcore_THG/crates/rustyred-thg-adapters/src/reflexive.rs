@@ -24,6 +24,11 @@ use crate::types::{
     THG_ADAPTER_SOURCE,
 };
 
+pub use rustyred_thg_ml::{
+    aggregate_messages_fixed_point, choose_scatter_aggregation_path, ScatterAggregationPath,
+    ScatterAggregationRequest, DEFAULT_FIXED_POINT_SCALE, DEFAULT_SCATTER_BURN_NATIVE_MAX_ELEMENTS,
+};
+
 pub const REPRESENTATION_SIDECAR_LABEL: &str = "RepresentationSidecar";
 pub const REFLEXIVE_DENSIFICATION_RUN_LABEL: &str = "ReflexiveDensificationRun";
 pub const REFLEXIVE_EDGE_CANDIDATE_LABEL: &str = "ReflexiveEdgeCandidate";
@@ -41,109 +46,6 @@ pub const DEFAULT_DENSIFICATION_CONFIDENCE_CEILING: f32 = 0.74;
 pub const DEFAULT_SPATIAL_RADIUS_KM: f64 = 1.0;
 pub const DEFAULT_SPATIAL_RESOLUTION: u8 = 9;
 pub const DEFAULT_TEMPORAL_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-pub const DEFAULT_SCATTER_BURN_NATIVE_MAX_ELEMENTS: usize = 262_144;
-pub const DEFAULT_FIXED_POINT_SCALE: i64 = 1_000_000;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScatterAggregationPath {
-    /// Burn `select` for row gather plus tensor `scatter` sum update.
-    BurnScatterAdd,
-    /// Integer atomic-compatible accumulation, then rescale to floats.
-    FixedPointAtomicCompatible,
-    /// Native-only fast path. Valid only when the runtime advertises float atomics.
-    NativeFloatAtomicFastPath,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ScatterAggregationRequest {
-    pub num_edges: usize,
-    pub feature_dim: usize,
-    pub deterministic_required: bool,
-    pub browser_webgpu_target: bool,
-    pub float_atomic_add_available: bool,
-    pub burn_native_max_elements: usize,
-}
-
-impl ScatterAggregationRequest {
-    pub fn normalized(mut self) -> Self {
-        if self.burn_native_max_elements == 0 {
-            self.burn_native_max_elements = DEFAULT_SCATTER_BURN_NATIVE_MAX_ELEMENTS;
-        }
-        self
-    }
-}
-
-pub fn choose_scatter_aggregation_path(
-    request: ScatterAggregationRequest,
-) -> ScatterAggregationPath {
-    let request = request.normalized();
-    let elements = request.num_edges.saturating_mul(request.feature_dim);
-    if elements <= request.burn_native_max_elements {
-        return ScatterAggregationPath::BurnScatterAdd;
-    }
-    if request.deterministic_required
-        || request.browser_webgpu_target
-        || !request.float_atomic_add_available
-    {
-        return ScatterAggregationPath::FixedPointAtomicCompatible;
-    }
-    ScatterAggregationPath::NativeFloatAtomicFastPath
-}
-
-/// Deterministic fixed-point scatter aggregation for small fixtures and for
-/// backends where float atomics are unavailable. It mirrors the CubeCL kernel's
-/// "one edge contributes once to degree" contract.
-pub fn aggregate_messages_fixed_point(
-    messages: &[Vec<f32>],
-    edge_dst: &[usize],
-    num_nodes: usize,
-    scale: i64,
-    mean_aggregate: bool,
-) -> ThgResult<Vec<Vec<f32>>> {
-    let scale = scale.max(1);
-    if messages.len() != edge_dst.len() {
-        return Err(ThgError::new(
-            "scatter_shape_mismatch",
-            "messages and edge_dst must have the same length",
-        ));
-    }
-    let feature_dim = messages.first().map(Vec::len).unwrap_or(0);
-    if messages.iter().any(|message| message.len() != feature_dim) {
-        return Err(ThgError::new(
-            "scatter_shape_mismatch",
-            "all message rows must have the same feature dimension",
-        ));
-    }
-    if edge_dst.iter().any(|dst| *dst >= num_nodes) {
-        return Err(ThgError::new(
-            "scatter_index_out_of_bounds",
-            "edge_dst contains a destination outside num_nodes",
-        ));
-    }
-
-    let mut sums = vec![vec![0_i64; feature_dim]; num_nodes];
-    let mut degrees = vec![0_i64; num_nodes];
-    for (message, dst) in messages.iter().zip(edge_dst) {
-        degrees[*dst] += 1;
-        for (slot, value) in sums[*dst].iter_mut().zip(message) {
-            *slot += (*value as f64 * scale as f64).round() as i64;
-        }
-    }
-
-    let mut out = vec![vec![0.0_f32; feature_dim]; num_nodes];
-    for node_idx in 0..num_nodes {
-        let divisor = if mean_aggregate {
-            degrees[node_idx].max(1) as f32
-        } else {
-            1.0
-        };
-        for dim_idx in 0..feature_dim {
-            out[node_idx][dim_idx] = sums[node_idx][dim_idx] as f32 / scale as f32 / divisor;
-        }
-    }
-    Ok(out)
-}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RepresentationSidecarInput {
@@ -598,7 +500,10 @@ pub fn rank_hot_temporal_densification_candidates(
         &nodes_by_id,
         &edge_refs,
         &existing_direct_pairs,
-        request.max_candidates.saturating_mul(4).max(request.max_candidates),
+        request
+            .max_candidates
+            .saturating_mul(4)
+            .max(request.max_candidates),
     );
     if query_pairs.is_empty() {
         return Ok(DensificationResult {
@@ -858,8 +763,11 @@ pub fn rank_reflexive_organizing_candidates(
     let graph = rank_densification_candidates(snapshot, request.clone())?;
     let pairformer =
         rank_pairformer_densification_candidates(snapshot, request.clone(), pairformer_config)?;
-    let hot =
-        rank_hot_temporal_densification_candidates(snapshot, request.clone(), HotConfig::default())?;
+    let hot = rank_hot_temporal_densification_candidates(
+        snapshot,
+        request.clone(),
+        HotConfig::default(),
+    )?;
     let spatial = rank_spatial_candidates(snapshot, request.clone())?;
     let temporal = rank_temporal_candidates(snapshot, request.clone())?;
 
@@ -1467,7 +1375,10 @@ fn hot_candidate_pairs(
         if !considered.contains(&edge.from_id) || !considered.contains(&edge.to_id) {
             continue;
         }
-        by_source.entry(edge.from_id.clone()).or_default().push(edge);
+        by_source
+            .entry(edge.from_id.clone())
+            .or_default()
+            .push(edge);
     }
 
     for first in edges {
@@ -1486,8 +1397,7 @@ fn hot_candidate_pairs(
                 existing_direct_pairs,
                 first.from_id.clone(),
                 second.to_id.clone(),
-                0.8 * (first.effective_confidence() * second.effective_confidence()).sqrt()
-                    as f32,
+                0.8 * (first.effective_confidence() * second.effective_confidence()).sqrt() as f32,
             );
         }
     }
@@ -1525,7 +1435,9 @@ fn hot_candidate_pairs(
     let mut recent_edges = edges
         .iter()
         .filter(|edge| considered.contains(&edge.from_id) && considered.contains(&edge.to_id))
-        .filter_map(|edge| temporal_edge_timestamp_for_hot(edge).map(|timestamp| (*edge, timestamp)))
+        .filter_map(|edge| {
+            temporal_edge_timestamp_for_hot(edge).map(|timestamp| (*edge, timestamp))
+        })
         .collect::<Vec<_>>();
     recent_edges.sort_by(|left, right| right.1.cmp(&left.1));
     recent_edges.truncate(limit.max(1));
@@ -1566,7 +1478,9 @@ fn add_hot_pair_score(
     target_id: String,
     score: f32,
 ) {
-    if source_id == target_id || existing_direct_pairs.contains(&(source_id.clone(), target_id.clone())) {
+    if source_id == target_id
+        || existing_direct_pairs.contains(&(source_id.clone(), target_id.clone()))
+    {
         return;
     }
     let slot = by_pair.entry((source_id, target_id)).or_insert(0.0);
