@@ -78,7 +78,7 @@ const initialState: AppState = {
   syncReceipts: [],
   agentIngestionReceipts: [],
   costSummary: { turns: 0, tokensIn: 0, tokensOut: 0, estimatedUsd: 0 },
-  railVisible: true,
+  railVisible: false,
   railView: "chat",
   queuePanelOpen: false,
   settingsOpen: false,
@@ -404,7 +404,7 @@ function newId(): string {
 }
 
 function makeNewTab(): Tab {
-  return { id: newId(), kind: "newtab", url: "", title: "New Tab", pinned: false };
+  return { id: newId(), kind: "newtab", url: "", title: "Intake", pinned: false };
 }
 
 /** Async action orchestrators: they own command side effects + dispatch. */

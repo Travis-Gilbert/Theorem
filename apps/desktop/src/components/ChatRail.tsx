@@ -171,7 +171,7 @@ export function ChatRail() {
             }}
             type="button"
           >
-            Room
+            Coordination
           </button>
         </div>
       )}
@@ -189,7 +189,7 @@ export function ChatRail() {
               records={roomRecords}
             />
             <div className="room-feed">
-              <div className="room-feed__title">Room feed</div>
+              <div className="room-feed__title">Coordination feed</div>
               {roomFeed.length > 0 ? (
                 roomFeed.map((item) => (
                   <div key={item.id} className="turn turn--system">

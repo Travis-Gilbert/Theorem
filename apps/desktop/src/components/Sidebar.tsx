@@ -2,7 +2,17 @@ import { useState } from "react";
 import { useApp } from "../state/store";
 import type { SpaceId } from "../state/types";
 import { TabItem } from "./TabItem";
-import { GearIcon, PanelIcon, PlusIcon } from "./icons";
+import {
+  AgentIcon,
+  GearIcon,
+  PanelIcon,
+  PlusIcon,
+  QueueIcon,
+  ReviewIcon,
+  RouteIcon,
+  SourceIcon,
+  TaskIcon,
+} from "./icons";
 
 export function Sidebar() {
   const { state, actions } = useApp();
@@ -50,14 +60,14 @@ export function Sidebar() {
       <div className="sidebar__head">
         <span className="brand">
           <span className="brand__mark" />
-          Theorem
+          CommonPlace
         </span>
         <span className="sidebar__spacer" />
-        <button className="iconbtn" onClick={actions.newTab} title="New tab (ask-first)">
+        <button className="iconbtn" onClick={actions.newTab} title="New intake view">
           <PlusIcon />
         </button>
-        <button className="iconbtn" onClick={() => void actions.newAgentTab()} title="New agent tab">
-          A
+        <button className="iconbtn" onClick={() => void actions.newAgentTab()} title="New agent review">
+          <AgentIcon />
         </button>
         <button
           className="iconbtn"
@@ -69,6 +79,29 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar__body">
+        <div className="side-nav" aria-label="CommonPlace areas">
+          <button type="button" className="side-nav__item side-nav__item--active">
+            <ReviewIcon size={14} />
+            <span>Review Queue</span>
+            <code>2</code>
+          </button>
+          <button type="button" className="side-nav__item">
+            <SourceIcon size={14} />
+            <span>Sources</span>
+            <code>5</code>
+          </button>
+          <button type="button" className="side-nav__item">
+            <RouteIcon size={14} />
+            <span>Routed</span>
+            <code>1</code>
+          </button>
+          <button type="button" className="side-nav__item">
+            <TaskIcon size={14} />
+            <span>Tasks</span>
+            <code>4</code>
+          </button>
+        </div>
+
         {pinned.length > 0 && (
           <div>
             <div className="section__label">Pinned</div>
@@ -95,7 +128,7 @@ export function Sidebar() {
         )}
 
         <div>
-          <div className="section__label">Tabs</div>
+          <div className="section__label">Open Surfaces</div>
           <div
             className={"tablist" + (dropTarget === "ungrouped" ? " drop-target" : "")}
             onDragOver={(e) => {
@@ -107,7 +140,7 @@ export function Sidebar() {
           >
             {ungrouped.length === 0 ? (
               <div className="newtab__hint" style={{ padding: "4px 8px" }}>
-                No open tabs.
+                No open browser surfaces.
               </div>
             ) : (
               renderList(ungrouped)
@@ -134,14 +167,14 @@ export function Sidebar() {
                 <button
                   className="space__bind"
                   type="button"
-                  title={space.roomId ? "Refresh room" : "Bind room"}
+                  title={space.roomId ? "Refresh coordination" : "Connect coordination"}
                   onClick={() =>
                     space.roomId
                       ? void actions.refreshRoom(space.id)
                       : void actions.bindSpaceToRoom(space.id)
                   }
                 >
-                  {space.roomId ? "Room" : "Bind"}
+                  {space.roomId ? "Synced" : "Connect"}
                 </button>
               </div>
               <div className="tablist">{renderList(spaceTabs)}</div>
@@ -170,15 +203,15 @@ export function Sidebar() {
             actions.setQueuePanelOpen(!state.queuePanelOpen);
             if (!state.queuePanelOpen) void actions.refreshQueue();
           }}
-          title="Queue"
+          title="Review jobs"
         >
-          Q
+          <QueueIcon size={15} />
         </button>
       </div>
       {state.queuePanelOpen && (
         <div className="queue-panel">
           {state.queueJobs.length === 0 ? (
-            <div className="queue-panel__empty">No jobs</div>
+            <div className="queue-panel__empty">No review jobs</div>
           ) : (
             state.queueJobs.map((job) => (
               <div className="queue-row" key={job.jobId}>
