@@ -18,8 +18,13 @@ use sha2::{Digest, Sha256};
 
 use crate::blob::BlobStore;
 use crate::collection::{Collection, CollectionKind};
-use crate::item::{Item, ItemBody, ItemKind, Residency};
+use crate::item::{Item, ItemBody, ItemKind, Residency, SourceRef};
 use crate::store::{Commonplace, COLLECTION_LABEL, ITEM_LABEL};
+
+/// Default bounded source-prior boost (B1): added to a candidate collection's
+/// cosine when that collection already holds an item from the item's source. Set
+/// well below a typical content-match gap so a strong content signal still wins.
+pub const DEFAULT_SOURCE_PRIOR_BOOST: f32 = 0.05;
 
 /// Top-level item node property used by the engine's vector designation.
 pub const ITEM_EMBEDDING_PROPERTY: &str = "embedding";
@@ -91,14 +96,41 @@ pub enum IngestBody {
     },
 }
 
+/// Task scalars carried through the universal capture contract (Layer C). When
+/// present on an [`IngestInput`] of kind [`ItemKind::Task`], they are written onto
+/// the resulting item's indexed `status`/`priority`/`due_at_ms` scalars, so a
+/// source-mapped task (e.g. a Linear issue) lands fully shaped without a bespoke
+/// write path.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct TaskFields {
+    pub status: Option<String>,
+    pub priority: Option<String>,
+    pub due_at_ms: Option<i64>,
+}
+
+impl TaskFields {
+    fn apply(&self, mut item: Item) -> Item {
+        item.status = self.status.clone();
+        item.priority = self.priority.clone();
+        item.due_at_ms = self.due_at_ms;
+        item
+    }
+}
+
 /// A no-button capture request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct IngestInput {
     pub title: String,
     pub body: IngestBody,
     pub source: Option<String>,
+    /// The source record this capture came from (A3), for idempotent re-fetch.
+    #[serde(default)]
+    pub source_ref: Option<SourceRef>,
     pub residency: Residency,
     pub tags: Vec<String>,
+    /// Task scalars (Layer C); meaningful only for `Task`-kind captures.
+    #[serde(default)]
+    pub task: Option<TaskFields>,
 }
 
 impl IngestInput {
@@ -118,8 +150,10 @@ impl IngestInput {
                 kind,
             },
             source: None,
+            source_ref: None,
             residency: Residency::Local,
             tags: Vec::new(),
+            task: None,
         }
     }
 
@@ -132,8 +166,10 @@ impl IngestInput {
                 kind: ItemKind::Image,
             },
             source: None,
+            source_ref: None,
             residency: Residency::Local,
             tags: Vec::new(),
+            task: None,
         }
     }
 
@@ -146,13 +182,33 @@ impl IngestInput {
                 text: text.into(),
             },
             source: Some(url),
+            source_ref: None,
             residency: Residency::Local,
             tags: Vec::new(),
+            task: None,
         }
     }
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    /// Stamp the source record this capture came from (A3): sets `source` to the
+    /// ref's source and records the full ref for idempotent re-fetch.
+    pub fn with_source_ref(mut self, source_ref: SourceRef) -> Self {
+        self.source = Some(source_ref.source.clone());
+        self.source_ref = Some(source_ref);
+        self
+    }
+
+    /// Attach task scalars (Layer C). Forces the capture to `Task` kind so the
+    /// scalars land on a task item.
+    pub fn as_task(mut self, task: TaskFields) -> Self {
+        if let IngestBody::Text { kind, .. } = &mut self.body {
+            *kind = ItemKind::Task;
+        }
+        self.task = Some(task);
         self
     }
 
@@ -171,6 +227,11 @@ impl IngestInput {
     }
 
     fn item_kind(&self) -> ItemKind {
+        // Task scalars force `Task` kind for any body shape (e.g. a link-bodied
+        // capture turned into a task), so it appears in task queries.
+        if self.task.is_some() {
+            return ItemKind::Task;
+        }
         match &self.body {
             IngestBody::Text { kind, .. } | IngestBody::Binary { kind, .. } => kind.clone(),
             IngestBody::Link { .. } => ItemKind::Link,
@@ -275,7 +336,7 @@ pub struct ResolvedEntity {
 
 /// One ranked candidate collection for an item, by cosine to the collection's
 /// label embedding (the same signal `best_collection` gates on).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClassificationRank {
     pub collection_id: String,
     pub collection_name: String,
@@ -366,14 +427,104 @@ where
         S: EmbeddingGraphStore,
         B: BlobStore,
     {
-        let embedding = self.embed_input(&input)?;
         commonplace
             .store_mut()
             .designate_commonplace_item_embedding(self.embedder.dimension())?;
+        let mut prior_items = commonplace.all_items()?;
+        self.ingest_one(commonplace, input, &mut prior_items, None)
+    }
 
-        let prior_items = commonplace.all_items()?;
+    /// Ingest a batch, amortizing the prior-items snapshot and the vector-index
+    /// designation across the whole batch (A4): one snapshot and one designation,
+    /// not N of each. Similarity for each input is computed against the snapshot
+    /// plus the items earlier in the same batch, so the resulting graph is
+    /// identical to ingesting the same inputs one at a time through `ingest`.
+    pub fn ingest_batch<S, B>(
+        &self,
+        commonplace: &mut Commonplace<S, B>,
+        inputs: Vec<IngestInput>,
+    ) -> GraphStoreResult<Vec<IngestReceipt>>
+    where
+        S: EmbeddingGraphStore,
+        B: BlobStore,
+    {
+        commonplace
+            .store_mut()
+            .designate_commonplace_item_embedding(self.embedder.dimension())?;
+        let mut prior_items = commonplace.all_items()?;
+        let mut receipts = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            receipts.push(self.ingest_one(commonplace, input, &mut prior_items, None)?);
+        }
+        Ok(receipts)
+    }
+
+    /// Ingest one input hard-routed into a named collection (B1): bypass the
+    /// cosine collection choice and file into `collection_name` (create-or-get),
+    /// regardless of content. Still embeds, links similars, and resolves entities.
+    pub fn ingest_routed<S, B>(
+        &self,
+        commonplace: &mut Commonplace<S, B>,
+        input: IngestInput,
+        collection_name: &str,
+    ) -> GraphStoreResult<IngestReceipt>
+    where
+        S: EmbeddingGraphStore,
+        B: BlobStore,
+    {
+        commonplace
+            .store_mut()
+            .designate_commonplace_item_embedding(self.embedder.dimension())?;
+        let forced =
+            commonplace.get_or_create_collection(collection_name, CollectionKind::Manual)?;
+        let mut prior_items = commonplace.all_items()?;
+        self.ingest_one(commonplace, input, &mut prior_items, Some(forced))
+    }
+
+    /// The per-item ingest core shared by `ingest`, `ingest_batch`, and
+    /// `ingest_routed`. `prior_items` is the running set of already-stored items
+    /// (snapshot plus earlier batch items); the just-written item is appended so
+    /// the next call sees it as a similarity candidate. `forced` bypasses cosine
+    /// collection choice (the routed path).
+    fn ingest_one<S, B>(
+        &self,
+        commonplace: &mut Commonplace<S, B>,
+        input: IngestInput,
+        prior_items: &mut Vec<Item>,
+        forced: Option<Collection>,
+    ) -> GraphStoreResult<IngestReceipt>
+    where
+        S: EmbeddingGraphStore,
+        B: BlobStore,
+    {
+        let embedding = self.embed_input(&input)?;
         let searchable_text = input.searchable_text();
-        let collection = self.choose_or_create_collection(commonplace, &input, &embedding)?;
+
+        // A3 idempotency: a re-fetched source record updates the same item in
+        // place (reusing its id upserts every outgoing edge), never a duplicate.
+        let existing_item = match &input.source_ref {
+            Some(source_ref) => {
+                commonplace.item_by_source_ref(&source_ref.source, &source_ref.external_id)?
+            }
+            None => None,
+        };
+
+        let collection = match (forced, &existing_item) {
+            (Some(collection), _) => collection,
+            // Sticky on update: keep the item's current collection. No durable
+            // edge-delete is available, so re-classifying to a different
+            // collection would leave the item a member of both; staying put
+            // keeps membership single and correct. (A genuine re-file is an
+            // explicit `ingest_routed`/move, not a side effect of re-sync.)
+            (None, Some(existing)) => match existing.collections.first() {
+                Some(collection_id) => match commonplace.get_collection(collection_id)? {
+                    Some(collection) => collection,
+                    None => self.choose_or_create_collection(commonplace, &input, &embedding)?,
+                },
+                None => self.choose_or_create_collection(commonplace, &input, &embedding)?,
+            },
+            (None, None) => self.choose_or_create_collection(commonplace, &input, &embedding)?,
+        };
         let folder_path = folder_path_for(&collection.name, &input.title);
 
         let mut item = Item::new(input.item_kind(), input.title.clone())
@@ -386,8 +537,21 @@ where
             .with_extra("folder_path", json!(folder_path.clone()))
             .with_extra("auto_structured", json!(true));
 
+        if let Some(existing) = &existing_item {
+            // Reuse the id and preserve the original creation time (put_item only
+            // sets created_at_ms when it is 0, so carrying it forward stops a
+            // re-fetch from resetting it).
+            item = item.with_id(existing.id.clone());
+            item.created_at_ms = existing.created_at_ms;
+        }
         if let Some(source) = input.source.clone() {
             item = item.with_source(source);
+        }
+        if let Some(source_ref) = input.source_ref.clone() {
+            item = item.with_source_ref(source_ref);
+        }
+        if let Some(task) = &input.task {
+            item = task.apply(item);
         }
         item = match &input.body {
             IngestBody::Text { text, .. } => item.with_text(text.clone()),
@@ -404,8 +568,9 @@ where
 
         let item = commonplace.put_item(item)?;
         let similar_items =
-            self.write_similarity_edges(commonplace, &item.id, &prior_items, &embedding)?;
+            self.write_similarity_edges(commonplace, &item.id, prior_items.as_slice(), &embedding)?;
         let entities = self.resolve_entities(commonplace, &item.id, &searchable_text)?;
+        prior_items.push(item.clone());
 
         Ok(IngestReceipt {
             item,
@@ -538,46 +703,50 @@ where
         S: EmbeddingGraphStore,
         B: BlobStore,
     {
-        let Some(embedding) = item
-            .extra
-            .get(ITEM_EMBEDDING_PROPERTY)
-            .and_then(value_to_f32_vec)
-        else {
-            return Ok(Classification::default());
-        };
+        classify_item_ranking(commonplace, item)
+    }
 
-        let mut ranked: Vec<ClassificationRank> = Vec::new();
-        for node in commonplace
-            .store()
-            .query_nodes(NodeQuery::label(COLLECTION_LABEL).with_limit(usize::MAX))
-        {
-            let Some(candidate) = float_array(&node.properties, COLLECTION_EMBEDDING_PROPERTY)
-            else {
-                continue;
-            };
-            if candidate.len() != embedding.len() {
-                continue;
+    /// Classify like [`classify_item`](Self::classify_item) but add a small,
+    /// bounded source prior (B1): a candidate collection that already holds an
+    /// item from the same `source` as `item` gets `boost` added to its cosine,
+    /// then the list is re-sorted. The prior is a separate additive term, not a
+    /// replacement, so a strong content match still wins and `classify_item`
+    /// itself stays source-agnostic. `boost` is clamped to a bounded range.
+    ///
+    /// `boost` ceiling: pass [`DEFAULT_SOURCE_PRIOR_BOOST`] for the default dial.
+    // ponytail: O(members) scan per candidate collection; fine at personal-DB
+    // scale. If a tenant grows huge, precompute a (collection, source) presence
+    // index instead.
+    pub fn classify_item_with_source_prior<S, B>(
+        &self,
+        commonplace: &Commonplace<S, B>,
+        item: &Item,
+        boost: f32,
+    ) -> GraphStoreResult<Classification>
+    where
+        S: EmbeddingGraphStore,
+        B: BlobStore,
+    {
+        let mut classification = self.classify_item(commonplace, item)?;
+        let Some(source) = item.source.as_deref() else {
+            return Ok(classification);
+        };
+        let boost = boost.clamp(0.0, 0.25);
+        if boost > 0.0 {
+            for rank in &mut classification.ranked {
+                if collection_holds_source(commonplace, &rank.collection_id, source)? {
+                    rank.score = (rank.score + boost).min(1.0);
+                }
             }
-            let score = cosine(&embedding, &candidate);
-            let collection_name = commonplace
-                .get_collection(&node.id)?
-                .map(|collection| collection.name)
-                .unwrap_or_default();
-            ranked.push(ClassificationRank {
-                collection_id: node.id.clone(),
-                collection_name,
-                score,
+            classification.ranked.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.collection_id.cmp(&right.collection_id))
             });
         }
-        ranked.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.collection_id.cmp(&right.collection_id))
-        });
-
-        Ok(Classification { ranked })
+        Ok(classification)
     }
 
     fn write_similarity_edges<S, B>(
@@ -593,6 +762,11 @@ where
     {
         let mut links = Vec::new();
         for prior in prior_items {
+            // Never link an item to itself (possible on an idempotent re-ingest,
+            // where the item appears in its own prior snapshot under the same id).
+            if prior.id == item_id {
+                continue;
+            }
             let Some(candidate) = prior
                 .extra
                 .get(ITEM_EMBEDDING_PROPERTY)
@@ -860,6 +1034,75 @@ fn cosine(left: &[f32], right: &[f32]) -> f32 {
 
 fn float_array(properties: &Value, key: &str) -> Option<Vec<f32>> {
     properties.get(key).and_then(value_to_f32_vec)
+}
+
+/// Rank every collection by cosine to an item's stored embedding, best first
+/// (the body of [`IngestPipeline::classify_item`], lifted to a free function so
+/// the two-tier [`crate::organize::decide`] can classify with no embedder in
+/// play). Ungated: the caller applies its own ceiling.
+pub fn classify_item_ranking<S, B>(
+    commonplace: &Commonplace<S, B>,
+    item: &Item,
+) -> GraphStoreResult<Classification>
+where
+    S: EmbeddingGraphStore,
+    B: BlobStore,
+{
+    let Some(embedding) = item
+        .extra
+        .get(ITEM_EMBEDDING_PROPERTY)
+        .and_then(value_to_f32_vec)
+    else {
+        return Ok(Classification::default());
+    };
+
+    let mut ranked: Vec<ClassificationRank> = Vec::new();
+    for node in commonplace
+        .store()
+        .query_nodes(NodeQuery::label(COLLECTION_LABEL).with_limit(usize::MAX))
+    {
+        let Some(candidate) = float_array(&node.properties, COLLECTION_EMBEDDING_PROPERTY) else {
+            continue;
+        };
+        if candidate.len() != embedding.len() {
+            continue;
+        }
+        let score = cosine(&embedding, &candidate);
+        let collection_name = commonplace
+            .get_collection(&node.id)?
+            .map(|collection| collection.name)
+            .unwrap_or_default();
+        ranked.push(ClassificationRank {
+            collection_id: node.id.clone(),
+            collection_name,
+            score,
+        });
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.collection_id.cmp(&right.collection_id))
+    });
+
+    Ok(Classification { ranked })
+}
+
+/// Whether a collection already holds an item from `source` (B1 source prior).
+fn collection_holds_source<S, B>(
+    commonplace: &Commonplace<S, B>,
+    collection_id: &str,
+    source: &str,
+) -> GraphStoreResult<bool>
+where
+    S: EmbeddingGraphStore,
+    B: BlobStore,
+{
+    Ok(commonplace
+        .collection_items(collection_id)?
+        .iter()
+        .any(|item| item.source.as_deref() == Some(source)))
 }
 
 fn value_to_f32_vec(value: &Value) -> Option<Vec<f32>> {

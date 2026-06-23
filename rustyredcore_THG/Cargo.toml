@@ -43,6 +43,7 @@ members = [
     "crates/design-check",
     "crates/pilot-core",
     "crates/commonplace",
+    "crates/rustyred-thg-intake",
     "crates/theorem-copresence",
 ]
 resolver = "2"

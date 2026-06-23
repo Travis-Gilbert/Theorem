@@ -1,0 +1,20 @@
+[package]
+name = "rustyred-thg-intake"
+version = "0.1.0"
+edition = "2021"
+description = "CommonPlace source intake: the ingestion-spoke framework (SourceSpoke), the scoped incremental sync driver, curated + MappedSpoke sources, and the NeedsYou-residue -> delegation act seam."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+commonplace = { path = "../commonplace" }
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+# The act seam's production binding fires federated-MCP affordances through the
+# existing connector path; sync + tokio-free, matching the rest of the substrate.
+rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
+rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Blocking HTTP for the live REST source transports (e.g. GSuite/Drive); sync,
+# already in the workspace tree via the connectors crate's HTTP MCP transport.
+ureq = "3"

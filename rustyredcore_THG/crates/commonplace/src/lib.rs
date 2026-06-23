@@ -26,19 +26,25 @@ pub mod blob;
 pub mod collection;
 pub mod ingest;
 pub mod item;
+pub mod organize;
 pub mod store;
 pub mod tag;
 
 pub use blob::{content_hash, BlobStore, InMemoryBlobStore};
 pub use collection::{Collection, CollectionKind};
 pub use ingest::{
-    Classification, ClassificationRank, DeterministicEmbedder, Embedder, EmbeddingGraphStore,
-    IngestBody, IngestInput, IngestPipeline, IngestReceipt, ResolvedEntity, SimilarityLink,
-    COLLECTION_EMBEDDING_PROPERTY, ENTITY_LABEL, ITEM_EMBEDDING_PROPERTY, MENTIONS_ENTITY_EDGE,
+    classify_item_ranking, Classification, ClassificationRank, DeterministicEmbedder, Embedder,
+    EmbeddingGraphStore, IngestBody, IngestInput, IngestPipeline, IngestReceipt, ResolvedEntity,
+    SimilarityLink, TaskFields, COLLECTION_EMBEDDING_PROPERTY, DEFAULT_SOURCE_PRIOR_BOOST,
+    ENTITY_LABEL, ITEM_EMBEDDING_PROPERTY, MENTIONS_ENTITY_EDGE,
 };
-pub use item::{Item, ItemBody, ItemKind, Residency};
+pub use item::{Item, ItemBody, ItemKind, Residency, SourceRef};
+pub use organize::{
+    decide, route, NeedsYouReason, OrganizeDecision, OrganizePolicy, RoutingRule,
+};
 pub use store::{
-    Commonplace, COLLECTION_LABEL, HAS_TAG_EDGE, IN_COLLECTION_EDGE, ITEM_LABEL, SIMILAR_TO_EDGE,
-    TAG_LABEL,
+    Commonplace, ABOUT_EDGE, COLLECTION_LABEL, DEPENDS_ON_EDGE, HAS_TAG_EDGE, IN_COLLECTION_EDGE,
+    ITEM_LABEL, SIMILAR_TO_EDGE, SOURCE_REF_KEY_PROPERTY, SUBTASK_OF_EDGE, TAG_LABEL,
+    WORKED_BY_EDGE,
 };
 pub use tag::{tag_id, Tag};
