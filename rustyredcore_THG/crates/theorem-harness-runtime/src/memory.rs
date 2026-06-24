@@ -27,6 +27,8 @@ const DEFAULT_RECENCY_HALF_LIFE_SECONDS: f64 = 0.0;
 const DEFAULT_PROJECT_PERMEABILITY: f64 = 0.75;
 const DEFAULT_GIST_CHARS: usize = 200;
 const MAX_FULL_TIER_RESULTS: usize = 10;
+const INDEXED_RECALL_CANDIDATE_MULTIPLIER: usize = 5;
+const MIN_INDEXED_RECALL_CANDIDATES: usize = 32;
 const COMMUNITY_SUMMARY_KIND: &str = "community_summary";
 const COMMUNITY_SUMMARY_EDGE: &str = "MEMORY_SUMMARIZES";
 const MEMORY_IN_PROJECT_EDGE: &str = "MEMORY_IN_PROJECT";
@@ -717,16 +719,36 @@ pub fn recall_memory<S: MemoryGraphStore>(
     let actor_filter = input.actor.trim().to_string();
     let since = input.since.trim().to_string();
     let limit = bounded_limit(input.limit);
+    let seed_limit = bounded_seed_limit(input.seed_limit);
     let query_time = timestamp_or_now(&input.query_time);
-    let mut atoms = load_recall_atoms(
-        store,
-        &tenant_slug,
-        &kind_filter,
-        &surface_filter,
-        &actor_filter,
-        &since,
-        input.include_low_fitness,
-    )?;
+    let mut atoms =
+        if should_try_indexed_recall_candidates(&query, &kind_filter, input.overall_state) {
+            load_indexed_recall_atoms(
+                store,
+                &tenant_slug,
+                &query,
+                &kind_filter,
+                &surface_filter,
+                &actor_filter,
+                &since,
+                input.include_low_fitness,
+                indexed_recall_candidate_limit(limit, seed_limit),
+                &input,
+            )?
+        } else {
+            Vec::new()
+        };
+    if atoms.is_empty() {
+        atoms = load_recall_atoms(
+            store,
+            &tenant_slug,
+            &kind_filter,
+            &surface_filter,
+            &actor_filter,
+            &since,
+            input.include_low_fitness,
+        )?;
+    }
     let mut atom_by_graph_id = atoms
         .iter()
         .map(|atom| (atom.graph_id.clone(), atom.clone()))
@@ -751,7 +773,6 @@ pub fn recall_memory<S: MemoryGraphStore>(
             .collect::<HashMap<_, _>>();
     }
 
-    let seed_limit = bounded_seed_limit(input.seed_limit);
     let mut seeds = if broad_query {
         seed_community_summaries(&atoms, &query, seed_limit)
     } else {
@@ -2055,6 +2076,139 @@ fn load_recall_atoms<S: MemoryGraphStore>(
         });
     }
     Ok(atoms)
+}
+
+fn should_try_indexed_recall_candidates(
+    query: &str,
+    kind_filter: &str,
+    overall_state: bool,
+) -> bool {
+    !query.trim().is_empty()
+        && !overall_state
+        && (kind_filter.is_empty() || kind_filter != COMMUNITY_SUMMARY_KIND)
+}
+
+fn indexed_recall_candidate_limit(limit: usize, seed_limit: usize) -> usize {
+    seed_limit
+        .max(limit.saturating_mul(INDEXED_RECALL_CANDIDATE_MULTIPLIER))
+        .max(MIN_INDEXED_RECALL_CANDIDATES)
+        .min(MAX_GRAPH_QUERY_LIMIT)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_indexed_recall_atoms<S: MemoryGraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    query: &str,
+    kind_filter: &str,
+    surface_filter: &str,
+    actor_filter: &str,
+    since: &str,
+    include_low_fitness: bool,
+    candidate_limit: usize,
+    input: &RecallMemoryInput,
+) -> MemoryResult<Vec<RecallAtom>> {
+    let mut candidate_ids = indexed_fulltext_seed_scores(store, query, candidate_limit)?
+        .into_iter()
+        .map(|(graph_id, score)| (graph_id, score))
+        .collect::<Vec<_>>();
+    candidate_ids.extend(indexed_vector_seed_scores(store, input, candidate_limit)?);
+    let candidate_ids = dedupe_rank_scores(candidate_ids, true, candidate_limit)?;
+    if candidate_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut atoms = Vec::new();
+    for (graph_id, _) in candidate_ids {
+        let Some(atom) = load_recall_atom_by_graph_id(store, tenant_slug, &graph_id)? else {
+            continue;
+        };
+        let matches = if atom.item.item_type == "node" {
+            atom.item.node.as_ref().is_some_and(|node| {
+                node_matches_recall(
+                    node,
+                    "",
+                    kind_filter,
+                    surface_filter,
+                    actor_filter,
+                    since,
+                    include_low_fitness,
+                )
+            })
+        } else {
+            atom.item.document.as_ref().is_some_and(|document| {
+                document_matches_recall(
+                    document,
+                    "",
+                    kind_filter,
+                    surface_filter,
+                    actor_filter,
+                    since,
+                    include_low_fitness,
+                )
+            })
+        };
+        if matches {
+            atoms.push(atom);
+        }
+    }
+    Ok(atoms)
+}
+
+fn load_recall_atom_by_graph_id<S: MemoryGraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    graph_id: &str,
+) -> MemoryResult<Option<RecallAtom>> {
+    let Some(record) = store.memory_get_node(graph_id)? else {
+        return Ok(None);
+    };
+    let node_id = record.id.clone();
+    if record.labels.iter().any(|label| label == "MemoryDocument") {
+        match document_from_node(record) {
+            Ok(document) => {
+                let graph_id = memory_document_node_id(&document.tenant_slug, &document.doc_id);
+                let text = memory_document_text(&document);
+                Ok(Some(RecallAtom {
+                    graph_id,
+                    item: recall_item_for_document(document),
+                    text,
+                }))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tenant_slug = %normalize_tenant_slug(tenant_slug),
+                    node_id = %node_id,
+                    error = %error,
+                    "skipping malformed indexed memory document"
+                );
+                Ok(None)
+            }
+        }
+    } else if record.labels.iter().any(|label| label == "MemoryNode") {
+        match node_from_node(record) {
+            Ok(node) => {
+                let graph_id = memory_node_node_id(&node.tenant_slug, &node.node_id);
+                let text = memory_node_text(&node);
+                Ok(Some(RecallAtom {
+                    graph_id,
+                    item: recall_item_for_node(node),
+                    text,
+                }))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tenant_slug = %normalize_tenant_slug(tenant_slug),
+                    node_id = %node_id,
+                    error = %error,
+                    "skipping malformed indexed memory node"
+                );
+                Ok(None)
+            }
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 fn memory_document_text(document: &MemoryDocumentState) -> String {
@@ -4555,6 +4709,99 @@ mod tests {
                 "no fulltext designations for this tenant",
             ))
         }
+    }
+
+    struct IndexedOnlyStore {
+        inner: InMemoryGraphStore,
+        indexed_id: String,
+    }
+
+    impl IndexedOnlyStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryGraphStore::new(),
+                indexed_id: String::new(),
+            }
+        }
+    }
+
+    impl MemoryGraphStore for IndexedOnlyStore {
+        fn memory_upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+            self.inner.upsert_node(node).map(|_| ())
+        }
+
+        fn memory_upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+            self.inner.upsert_edge(edge).map(|_| ())
+        }
+
+        fn memory_get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+            Ok(self.inner.get_node(id).cloned())
+        }
+
+        fn memory_get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+            Ok(self.inner.get_edge(id).cloned())
+        }
+
+        fn memory_query_nodes(&self, _query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+            panic!("indexed recall should not perform a tenant-wide query_nodes scan")
+        }
+
+        fn memory_neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+            Ok(self.inner.neighbors(query))
+        }
+
+        fn memory_fulltext_search(
+            &self,
+            label: Option<&str>,
+            property: &str,
+            query: &str,
+            _k: usize,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            if label == Some("MemoryAtom")
+                && property == "search_text"
+                && query.contains("railway recall")
+                && !self.indexed_id.is_empty()
+            {
+                Ok(vec![(self.indexed_id.clone(), 1.0)])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    #[test]
+    fn recall_uses_indexed_candidates_before_tenant_wide_scan() {
+        let mut store = IndexedOnlyStore::new();
+        let document = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Railway recall path".to_string(),
+                content: "Remote MCP recall should hydrate a bounded indexed candidate set."
+                    .to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        store.indexed_id = memory_document_node_id(TENANT, &document.doc_id);
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "railway recall".to_string(),
+                query_time: T2.to_string(),
+                limit: 1,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, document.doc_id);
+        assert_eq!(results[0].served_tier, "abstract");
     }
 
     #[test]
