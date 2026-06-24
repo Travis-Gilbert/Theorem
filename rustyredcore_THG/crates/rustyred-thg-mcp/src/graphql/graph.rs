@@ -14,7 +14,7 @@ use rustyred_thg_ml::{
     rerank_exact_maxsim_bounded, BinaryMultiVectorSet, MaxSimAggregation, MaxSimScorer,
     MultiVectorEmbeddingSet, MultiVectorManifest, MultiVectorScore,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::scalars::Json;
 use super::{map_err, with_invoker};
@@ -873,7 +873,7 @@ impl GraphQuery {
         let aggregation = aggregation.unwrap_or(MultiVectorAggregation::Mean).into();
         let limit = limit.unwrap_or(10).clamp(1, 256) as usize;
         let candidate_limit = candidate_limit.unwrap_or(limit as i32 * 4).clamp(1, 4096) as usize;
-        let exact_rerank_limit = exact_rerank_limit.unwrap_or(limit as i32).clamp(0, 4096) as usize;
+        let exact_rerank_limit = exact_rerank_limit.unwrap_or(0).clamp(0, 4096) as usize;
         let catalog_limit = catalog_limit.unwrap_or(4096).clamp(1, 50_000) as usize;
         let query_set = MultiVectorEmbeddingSet {
             embedding_set_id: "query:adhoc".to_string(),
@@ -958,10 +958,39 @@ impl GraphQuery {
                                     format!("exact artifact node {exact_id} is absent"),
                                 )
                             })?;
-                        exact_set_from_node(&node)?.ok_or_else(|| {
+                        if let Some(exact) = exact_set_from_node(&node)? {
+                            return Ok(exact);
+                        }
+                        let exact_ref = str_prop(&node, "exact_object_ref").ok_or_else(|| {
                             ThgError::new(
                                 "multivector_exact_artifact_invalid",
-                                format!("exact artifact node {exact_id} is invalid"),
+                                format!("exact artifact node {exact_id} has no vectors or ref"),
+                            )
+                        })?;
+                        let Some(cold_hash) = cold_document_hash(&exact_ref) else {
+                            return Err(ThgError::new(
+                                "multivector_exact_artifact_invalid",
+                                format!("unsupported exact vector ref {exact_ref}"),
+                            ));
+                        };
+                        let bytes = inv
+                            .get_cold_document_bytes(cold_hash)
+                            .map_err(|error| {
+                                ThgError::new(
+                                    "multivector_exact_artifact_read",
+                                    format!("{error:?}"),
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                ThgError::new(
+                                    "multivector_exact_artifact_missing",
+                                    format!("cold exact vector object {cold_hash} is absent"),
+                                )
+                            })?;
+                        exact_set_from_cold_bytes(&bytes)?.ok_or_else(|| {
+                            ThgError::new(
+                                "multivector_exact_artifact_invalid",
+                                format!("cold exact vector object {cold_hash} is invalid"),
                             )
                         })
                     },
@@ -1047,22 +1076,36 @@ impl GraphMutation {
         exact.dim().map_err(map_thg_err)?;
         let exact_artifact_id = format!("multivector:exact:{}", exact.embedding_set_id);
         let binary_projection_id = format!("multivector:binary:{}", exact.embedding_set_id);
-        let exact_object_ref = input
-            .exact_object_ref
-            .or_else(|| Some(format!("graph://{exact_artifact_id}")));
-        let binary_projection_ref = input
-            .binary_projection_ref
-            .or_else(|| Some(format!("graph://{binary_projection_id}")));
-        let bundle = project_multivector_tiers(&exact, exact_object_ref, binary_projection_ref)
-            .map_err(map_thg_err)?;
-        let manifest = bundle.manifest;
-        let binary = bundle.binary_projection;
-        let manifest_node =
-            manifest_node_json(&manifest, &exact_artifact_id, &binary_projection_id);
-        let exact_node = exact_node_json(&exact, &exact_artifact_id);
-        let binary_node = binary_node_json(&binary, &exact_artifact_id, &binary_projection_id);
+        let explicit_exact_object_ref = input.exact_object_ref;
+        let binary_projection_ref = input.binary_projection_ref;
 
         with_invoker(|inv| {
+            let cold_exact_hash = if explicit_exact_object_ref.is_none() {
+                let exact_bytes = exact_payload_bytes(&exact)?;
+                inv.put_cold_document_bytes(&exact_bytes).map_err(map_err)?
+            } else {
+                None
+            };
+            let exact_object_ref = explicit_exact_object_ref
+                .clone()
+                .or_else(|| cold_exact_hash.as_deref().map(cold_document_ref))
+                .or_else(|| Some(format!("graph://{exact_artifact_id}")));
+            let binary_projection_ref = binary_projection_ref
+                .clone()
+                .or_else(|| Some(format!("graph://{binary_projection_id}")));
+            let bundle = project_multivector_tiers(&exact, exact_object_ref, binary_projection_ref)
+                .map_err(map_thg_err)?;
+            let manifest = bundle.manifest;
+            let binary = bundle.binary_projection;
+            let manifest_node =
+                manifest_node_json(&manifest, &exact_artifact_id, &binary_projection_id);
+            let exact_node = exact_node_json(
+                &exact,
+                &exact_artifact_id,
+                manifest.exact_object_ref.as_deref(),
+                cold_exact_hash.as_deref(),
+            );
+            let binary_node = binary_node_json(&binary, &exact_artifact_id, &binary_projection_id);
             let mut edges = vec![
                 json!({
                     "id": format!("{}:{}:{}", HAS_EXACT_MULTIVECTOR_EDGE, exact.embedding_set_id, exact_artifact_id),
@@ -1152,18 +1195,55 @@ fn manifest_node_json(
     })
 }
 
-fn exact_node_json(exact: &MultiVectorEmbeddingSet, exact_artifact_id: &str) -> Value {
+fn exact_node_json(
+    exact: &MultiVectorEmbeddingSet,
+    exact_artifact_id: &str,
+    exact_object_ref: Option<&str>,
+    cold_exact_hash: Option<&str>,
+) -> Value {
+    let mut properties = exact_payload_json(exact);
+    let props = properties.as_object_mut().expect("exact payload object");
+    if let Some(exact_object_ref) = exact_object_ref {
+        props.insert(
+            "exact_object_ref".to_string(),
+            json!(exact_object_ref.to_string()),
+        );
+    }
+    if let Some(cold_exact_hash) = cold_exact_hash {
+        props.insert("cold_object_hash".to_string(), json!(cold_exact_hash));
+        props.remove("vectors");
+    }
     json!({
         "id": exact_artifact_id,
         "labels": [MULTIVECTOR_EXACT_LABEL],
-        "properties": {
-            "embedding_set_id": exact.embedding_set_id.clone(),
-            "content_id": exact.content_id.clone(),
-            "model_id": exact.model_id.clone(),
-            "model_version": exact.model_version.clone(),
-            "vectors": exact.vectors.clone(),
-        }
+        "properties": properties,
     })
+}
+
+fn exact_payload_json(exact: &MultiVectorEmbeddingSet) -> Value {
+    json!({
+        "embedding_set_id": exact.embedding_set_id.clone(),
+        "content_id": exact.content_id.clone(),
+        "model_id": exact.model_id.clone(),
+        "model_version": exact.model_version.clone(),
+        "vectors": exact.vectors.clone(),
+    })
+}
+
+fn exact_payload_bytes(exact: &MultiVectorEmbeddingSet) -> GqlResult<Vec<u8>> {
+    serde_json::to_vec(&exact_payload_json(exact)).map_err(|error| {
+        async_graphql::Error::new(format!(
+            "failed to encode exact multivector payload: {error}"
+        ))
+    })
+}
+
+fn cold_document_ref(content_hash: &str) -> String {
+    format!("cold://document/{content_hash}")
+}
+
+fn cold_document_hash(object_ref: &str) -> Option<&str> {
+    object_ref.strip_prefix("cold://document/")
 }
 
 fn binary_node_json(
@@ -1246,6 +1326,29 @@ fn exact_set_from_node(node: &NodeRecord) -> Result<Option<MultiVectorEmbeddingS
     let Some(props) = node.properties.as_object() else {
         return Ok(None);
     };
+    exact_set_from_props(&node.id, props)
+}
+
+fn exact_set_from_cold_bytes(bytes: &[u8]) -> Result<Option<MultiVectorEmbeddingSet>, ThgError> {
+    let payload: Value = serde_json::from_slice(bytes).map_err(|error| {
+        ThgError::new(
+            "multivector_exact_artifact_invalid",
+            format!("cold exact vector payload is not JSON: {error}"),
+        )
+    })?;
+    let Some(props) = payload.as_object() else {
+        return Err(ThgError::new(
+            "multivector_exact_artifact_invalid",
+            "cold exact vector payload must be an object",
+        ));
+    };
+    exact_set_from_props("cold:exact", props)
+}
+
+fn exact_set_from_props(
+    fallback_id: &str,
+    props: &Map<String, Value>,
+) -> Result<Option<MultiVectorEmbeddingSet>, ThgError> {
     let Some(vectors) = props.get("vectors").and_then(Value::as_array) else {
         return Ok(None);
     };
@@ -1274,7 +1377,7 @@ fn exact_set_from_node(node: &NodeRecord) -> Result<Option<MultiVectorEmbeddingS
         })
         .collect::<Result<Vec<_>, _>>()?;
     let set = MultiVectorEmbeddingSet {
-        embedding_set_id: prop_str(props, "embedding_set_id").unwrap_or_else(|| node.id.clone()),
+        embedding_set_id: prop_str(props, "embedding_set_id").unwrap_or_else(|| fallback_id.into()),
         content_id: prop_str(props, "content_id").unwrap_or_default(),
         model_id: prop_str(props, "model_id").unwrap_or_default(),
         model_version: prop_str(props, "model_version").unwrap_or_default(),
@@ -1318,7 +1421,9 @@ fn ensure_bulk_ok(payload: &Value, operation: &str) -> GqlResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use rustyred_thg_core::InMemoryGraphStore;
+    use rustyred_thg_core::{
+        InMemoryGraphStore, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+    };
     use serde_json::{json, Value};
 
     use crate::graphql::{execute_graphql, OpKind};
@@ -1326,6 +1431,22 @@ mod tests {
 
     fn run(
         store: SharedStore<InMemoryGraphStore>,
+        query: &str,
+        variables: Value,
+        op: OpKind,
+    ) -> Value {
+        execute_graphql(
+            "tenant-a",
+            store,
+            &json!({ "query": query, "variables": variables }),
+            op,
+            false,
+        )
+        .expect("graphql runs")
+    }
+
+    fn run_redcore(
+        store: SharedStore<RedCoreGraphStore>,
         query: &str,
         variables: Value,
         op: OpKind,
@@ -1371,6 +1492,46 @@ mod tests {
         )
     }
 
+    fn upsert_doc_redcore(
+        store: SharedStore<RedCoreGraphStore>,
+        id: &str,
+        vectors: Value,
+    ) -> Value {
+        run_redcore(
+            store,
+            "mutation($input: MultiVectorExactInput!){
+                upsertMultiVector(input:$input){
+                    manifest{
+                        embeddingSetId
+                        contentId
+                        exactObjectRef
+                        binaryProjectionRef
+                    }
+                    exactArtifactId
+                    binaryProjectionId
+                }
+            }",
+            json!({
+                "input": {
+                    "embeddingSetId": format!("mv:{id}"),
+                    "contentId": id,
+                    "modelId": "colpali-fixture",
+                    "modelVersion": "test-v1",
+                    "vectors": vectors,
+                }
+            }),
+            OpKind::Mutate,
+        )
+    }
+
+    fn temp_redcore_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("theorem-{name}-{}-{nanos}", std::process::id()))
+    }
+
     #[test]
     fn multivector_graphql_indexes_hot_binary_and_reranks_cold_exact() {
         let store = SharedStore::new(InMemoryGraphStore::new());
@@ -1413,6 +1574,33 @@ mod tests {
             "upsertMultiVector should not stuff exact vectors onto the content node"
         );
 
+        let hot_only = run(
+            store.clone(),
+            "query($q:[[Float!]!]!){
+                multiVectorSearch(
+                    queryVectors:$q,
+                    modelId:\"colpali-fixture\",
+                    limit:2,
+                    candidateLimit:4
+                ){
+                    contentId
+                    embeddingSetId
+                    scorer
+                    vectorCount
+                    score
+                }
+            }",
+            json!({ "q": [[1.0, 0.0], [0.0, 1.0]] }),
+            OpKind::Query,
+        );
+        assert_eq!(hot_only["errors"], Value::Null, "{hot_only}");
+        let hot_hits = hot_only["data"]["multiVectorSearch"]
+            .as_array()
+            .expect("hot hits array");
+        assert_eq!(hot_hits.len(), 2, "{hot_only}");
+        assert_eq!(hot_hits[0]["contentId"], "doc:a", "{hot_only}");
+        assert_eq!(hot_hits[0]["scorer"], "binary_hamming", "{hot_only}");
+
         let searched = run(
             store.clone(),
             "query($q:[[Float!]!]!){
@@ -1442,5 +1630,80 @@ mod tests {
         assert_eq!(hits[0]["embeddingSetId"], "mv:doc:a", "{searched}");
         assert_eq!(hits[0]["scorer"], "exact_float", "{searched}");
         assert_eq!(hits[0]["vectorCount"], 2, "{searched}");
+    }
+
+    #[test]
+    fn multivector_redcore_stores_exact_vectors_in_cold_object_store() {
+        let dir = temp_redcore_dir("multivector-redcore-cold");
+        {
+            let store = SharedStore::new(
+                RedCoreGraphStore::open(
+                    &dir,
+                    RedCoreOptions {
+                        durability: RedCoreDurability::None,
+                        snapshot_interval_writes: 0,
+                        strict_acid: false,
+                    },
+                )
+                .expect("redcore opens"),
+            );
+
+            let indexed =
+                upsert_doc_redcore(store.clone(), "doc:cold", json!([[1.0, 0.0], [0.0, 1.0]]));
+            assert_eq!(indexed["errors"], Value::Null, "{indexed}");
+            let exact_ref = indexed["data"]["upsertMultiVector"]["manifest"]["exactObjectRef"]
+                .as_str()
+                .expect("exact object ref");
+            assert!(
+                exact_ref.starts_with("cold://document/sha256:"),
+                "redcore should store exact vectors in the cold object store: {indexed}"
+            );
+
+            let exact_node = store.with_store(|inner| {
+                RedCoreGraphStore::get_node(inner, "multivector:exact:mv:doc:cold")
+                    .expect("read exact node")
+                    .expect("exact node")
+            });
+            let props = exact_node
+                .properties
+                .as_object()
+                .expect("properties object");
+            assert_eq!(
+                props.get("exact_object_ref").and_then(Value::as_str),
+                Some(exact_ref)
+            );
+            assert!(
+                props.get("vectors").is_none(),
+                "cold-backed exact artifact nodes must not keep the full vector array hot"
+            );
+
+            let searched = run_redcore(
+                store.clone(),
+                "query($q:[[Float!]!]!){
+                    multiVectorSearch(
+                        queryVectors:$q,
+                        modelId:\"colpali-fixture\",
+                        limit:1,
+                        exactRerankLimit:1
+                    ){
+                        contentId
+                        embeddingSetId
+                        scorer
+                    }
+                }",
+                json!({ "q": [[1.0, 0.0], [0.0, 1.0]] }),
+                OpKind::Query,
+            );
+            assert_eq!(searched["errors"], Value::Null, "{searched}");
+            assert_eq!(
+                searched["data"]["multiVectorSearch"][0]["contentId"], "doc:cold",
+                "{searched}"
+            );
+            assert_eq!(
+                searched["data"]["multiVectorSearch"][0]["scorer"], "exact_float",
+                "{searched}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

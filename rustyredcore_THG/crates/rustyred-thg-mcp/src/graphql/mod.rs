@@ -168,6 +168,8 @@ pub(crate) trait GraphqlInvoker {
     // single node by id, for the projection. Wraps query_nodes / get_node.
     fn items_nodes(&self, labels: &[&str], limit: usize) -> Result<Vec<NodeRecord>, McpError>;
     fn item_node(&self, id: &str) -> Result<Option<NodeRecord>, McpError>;
+    fn put_cold_document_bytes(&self, body: &[u8]) -> Result<Option<String>, McpError>;
+    fn get_cold_document_bytes(&self, content_hash: &str) -> Result<Option<Vec<u8>>, McpError>;
     /// Item domain (SPEC-2 putItem): create-or-update a real Item node by id and
     /// return the written record (for projection). Wraps get_node + upsert_node.
     fn put_item(&self, args: Value) -> Result<NodeRecord, McpError>;
@@ -469,6 +471,15 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
     }
     fn item_node(&self, id: &str) -> Result<Option<NodeRecord>, McpError> {
         Ok(self.backend.borrow().get_node(id)?)
+    }
+    fn put_cold_document_bytes(&self, body: &[u8]) -> Result<Option<String>, McpError> {
+        Ok(self.backend.borrow_mut().put_cold_document_bytes(body)?)
+    }
+    fn get_cold_document_bytes(&self, content_hash: &str) -> Result<Option<Vec<u8>>, McpError> {
+        Ok(self
+            .backend
+            .borrow()
+            .get_cold_document_bytes(content_hash)?)
     }
     fn put_item(&self, args: Value) -> Result<NodeRecord, McpError> {
         let mut backend = self.backend.borrow_mut();

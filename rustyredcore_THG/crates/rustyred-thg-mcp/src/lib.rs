@@ -441,6 +441,12 @@ pub trait McpGraphBackend {
             "app_affordance": response,
         }))
     }
+    fn put_cold_document_bytes(&mut self, _body: &[u8]) -> GraphStoreResult<Option<String>> {
+        Ok(None)
+    }
+    fn get_cold_document_bytes(&self, _content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>>;
     fn designate_vector_property(
         &mut self,
@@ -785,6 +791,12 @@ impl<S: McpGraphBackend> McpGraphBackend for SharedStore<S> {
         self.0
             .borrow_mut()
             .invoke_code_search(tenant, arguments, operation)
+    }
+    fn put_cold_document_bytes(&mut self, body: &[u8]) -> GraphStoreResult<Option<String>> {
+        self.0.borrow_mut().put_cold_document_bytes(body)
+    }
+    fn get_cold_document_bytes(&self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+        self.0.borrow().get_cold_document_bytes(content_hash)
     }
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
         self.0.borrow().vector_designations()
@@ -13103,6 +13115,14 @@ impl McpGraphBackend for RedCoreGraphStore {
         actor: String,
     ) -> Result<Value, McpError> {
         job_archive_to_store(self, job_id, reason, actor)
+    }
+
+    fn put_cold_document_bytes(&mut self, body: &[u8]) -> GraphStoreResult<Option<String>> {
+        RedCoreGraphStore::put_cold_document_bytes(self, body)
+    }
+
+    fn get_cold_document_bytes(&self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+        RedCoreGraphStore::get_cold_document_bytes(self, content_hash)
     }
 
     fn invoke_code_search(

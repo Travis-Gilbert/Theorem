@@ -13,6 +13,7 @@ use serde_json::Value;
 use turbovec::IdMapIndex;
 
 use crate::hooks::{changed_property_keys, HookEmitter, MutationEvent, MutationKind};
+use crate::object_store::DiskObjectStore;
 use crate::ordered::{OrderedDesignation, OrderedIndex};
 use crate::state::stable_hash;
 
@@ -2480,6 +2481,27 @@ impl RedCoreGraphStore {
         engine.last_recovery_ok = true;
         engine.write_manifest()?;
         Ok(engine)
+    }
+
+    pub fn put_cold_document_bytes(&self, body: &[u8]) -> GraphStoreResult<Option<String>> {
+        let Some(store) = self.cold_object_store()? else {
+            return Ok(None);
+        };
+        store.put_document_bytes(body).map(Some)
+    }
+
+    pub fn get_cold_document_bytes(&self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+        let Some(store) = self.cold_object_store()? else {
+            return Ok(None);
+        };
+        store.get_document_bytes(content_hash)
+    }
+
+    fn cold_object_store(&self) -> GraphStoreResult<Option<DiskObjectStore>> {
+        self.data_dir
+            .as_ref()
+            .map(|data_dir| DiskObjectStore::open(data_dir.join("cold_objects")))
+            .transpose()
     }
 
     pub fn readiness_check(

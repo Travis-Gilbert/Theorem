@@ -323,8 +323,12 @@ Current implementation slice, 2026-06-23:
 - MCP GraphQL now exposes `upsertMultiVector(input)` and `multiVectorSearch`.
   `upsertMultiVector` writes a lean manifest node, a cold exact-vector artifact
   node, and a hot binary-projection node. `multiVectorSearch` scans/ranks hot
-  binary projections first, then hydrates exact vectors only for the bounded
-  rerank budget.
+  binary projections first. Exact vector hydration is opt-in by passing a
+  positive `exactRerankLimit`; omitting it keeps the query hot-only.
+- On durable RedCore backends, `upsertMultiVector` writes exact-vector JSON into
+  the disk object store and keeps only a `cold://document/sha256:...` ref on the
+  exact artifact node. In-memory backends keep the graph-node fallback for tests
+  and ephemeral use.
 
 ## Multi-Vector Retrieval
 
@@ -373,7 +377,9 @@ Acceptance for the study gate:
   projection.
 - Prove the default GraphQL query does not hydrate cold exact vectors. The
   first MCP GraphQL acceptance now proves hot binary candidate search plus
-  bounded cold exact rerank.
+  opt-in bounded cold exact rerank.
+- Prove durable RedCore exact artifacts do not keep the full vector array hot;
+  exact rerank hydrates from the disk object store by ref.
 - Compile the Candle ColPali inference path behind an opt-in feature, then
   record a local benchmark before committing to a production ingestion path.
 
