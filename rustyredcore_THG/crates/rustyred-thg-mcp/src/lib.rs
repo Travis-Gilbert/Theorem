@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! # rustyred-thg-mcp
 //!
 //! The native Rust MCP server over the RustyRed graph store. It exposes the
@@ -5649,6 +5651,8 @@ fn harness_prepare_payload(
         ensemble_select_from_store(&store, tenant, None, request).map_err(mcp_ensemble_error)?
     };
     let signature = decision.content_address();
+    let memory_limit =
+        argument_u64(arguments, &["memory_limit", "memoryLimit", "limit"]).unwrap_or(8) as usize;
     let recall_results = {
         let mut store = McpMemoryStore { backend };
         recall_memory(
@@ -5658,10 +5662,11 @@ fn harness_prepare_payload(
                 query: task.clone(),
                 surface: argument_text(arguments, &["surface"]).unwrap_or_default(),
                 actor: actor.clone(),
-                limit: argument_u64(arguments, &["memory_limit", "memoryLimit", "limit"])
-                    .unwrap_or(8) as usize,
+                limit: memory_limit,
                 include_low_fitness: false,
                 include_consolidation_sources: false,
+                detail: "overview".to_string(),
+                detail_top_k: memory_limit.max(1),
                 ..RecallMemoryInput::default()
             },
         )
@@ -6219,6 +6224,10 @@ fn recall_memory_payload(
             &["content_preview_chars", "contentPreviewChars"],
         )
         .unwrap_or(0) as usize,
+        detail: argument_text(arguments, &["detail"]).unwrap_or_default(),
+        detail_top_k: argument_u64(arguments, &["detail_top_k", "detailTopK"]).unwrap_or(0)
+            as usize,
+        detail_ids: string_array_any(arguments, &["detail_ids", "detailIds"]),
     };
     let results = recall_memory(&mut store, input).map_err(mcp_memory_error)?;
     Ok(json!({
@@ -6281,6 +6290,7 @@ fn revise_memory_payload(
         content: required_text_any(arguments, &["content"], "self_revise")?,
         title: argument_text(arguments, &["title"]).unwrap_or_default(),
         summary: argument_text(arguments, &["summary"]).unwrap_or_default(),
+        gist: argument_text(arguments, &["gist"]).unwrap_or_default(),
         reason: argument_text(arguments, &["reason"]).unwrap_or_default(),
         memory_node_type: argument_text(arguments, &["memory_node_type", "memoryNodeType"])
             .unwrap_or_default(),
@@ -6349,6 +6359,10 @@ fn recall_archived_memory_payload(
             &["content_preview_chars", "contentPreviewChars"],
         )
         .unwrap_or(0) as usize,
+        detail: argument_text(arguments, &["detail"]).unwrap_or_default(),
+        detail_top_k: argument_u64(arguments, &["detail_top_k", "detailTopK"]).unwrap_or(0)
+            as usize,
+        detail_ids: string_array_any(arguments, &["detail_ids", "detailIds"]),
         ..RecallMemoryInput::default()
     };
     let mut store = McpMemoryStore { backend };
@@ -6418,6 +6432,7 @@ fn upsert_note_payload(
         title: argument_text(arguments, &["title"]).unwrap_or_default(),
         content: required_text_any(arguments, &["content"], "upsert_note")?,
         summary: argument_text(arguments, &["summary"]).unwrap_or_default(),
+        gist: argument_text(arguments, &["gist"]).unwrap_or_default(),
         tags: string_array_any(arguments, &["tags"]),
         links: string_array_any(arguments, &["links"]),
         status: argument_text(arguments, &["status"]).unwrap_or_default(),
@@ -6534,6 +6549,10 @@ fn observe_payload(
                     &["content_preview_chars", "contentPreviewChars"],
                 )
                 .unwrap_or(0) as usize,
+                detail: argument_text(arguments, &["detail"]).unwrap_or_default(),
+                detail_top_k: argument_u64(arguments, &["detail_top_k", "detailTopK"]).unwrap_or(0)
+                    as usize,
+                detail_ids: string_array_any(arguments, &["detail_ids", "detailIds"]),
                 ..RecallMemoryInput::default()
             },
         )
@@ -7484,10 +7503,12 @@ fn read_coordination_mentions_filtered(
     let actor_id = require_actor_id(actor_id, "mentions requires actor")?;
     let mut messages = Vec::new();
     for tenant_alias in tenant_slug_aliases(tenant) {
-        for node in backend.query_nodes(
-            NodeQuery::label("CoordinationMessage")
-                .with_property("tenant_slug", Value::String(tenant_alias)),
-        )? {
+        let mut query = NodeQuery::label("CoordinationMessage")
+            .with_property("tenant_slug", Value::String(tenant_alias));
+        if let Some(room_id) = room_id.as_ref() {
+            query = query.with_property("room_id", Value::String(room_id.clone()));
+        }
+        for node in backend.query_nodes(query)? {
             let message = parse_node_properties::<CoordinationMessageState>(node.properties)?;
             if message
                 .mentions
@@ -8143,6 +8164,7 @@ fn memory_write_input(
         title: argument_text(arguments, &["title"]).unwrap_or_default(),
         content: required_text_any(arguments, &["content"], tool_name)?,
         summary: argument_text(arguments, &["summary"]).unwrap_or_default(),
+        gist: argument_text(arguments, &["gist"]).unwrap_or_default(),
         tags: string_array_any(arguments, &["tags"]),
         links: string_array_any(arguments, &["links"]),
         status: argument_text(arguments, &["status"]).unwrap_or_default(),
@@ -11369,7 +11391,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ),
         tool(
             "recall",
-            "Recall native Theorem harness memory documents and graph-node memories from the tenant GraphStore.",
+            "Recall native Theorem harness memory documents and graph-node memories from the tenant GraphStore. Default recall returns an abstract scan list keyed by id; use detail=\"overview\" with detail_top_k to read summaries/previews, then pass chosen ids as detail_ids to open full content.",
             json!({
                 "type": "object",
                 "properties": {
@@ -11408,6 +11430,11 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "includeContent": { "type": "boolean", "default": false },
                     "hydrate_top_k": { "type": "integer", "default": 0, "description": "Hydrate full content only for the first N ranked results." },
                     "hydrateTopK": { "type": "integer" },
+                    "detail": { "type": "string", "enum": ["abstract", "overview", "full"], "default": "abstract", "description": "Disclosure tier to promote with detail_top_k. Default returns L0 abstract scan items." },
+                    "detail_top_k": { "type": "integer", "default": 0, "description": "Promote the first N ranked results to the requested detail tier." },
+                    "detailTopK": { "type": "integer" },
+                    "detail_ids": { "type": "array", "items": { "type": "string" }, "description": "Specific recalled ids to return as full L2 items." },
+                    "detailIds": { "type": "array", "items": { "type": "string" } },
                     "content_preview_chars": { "type": "integer", "default": 700 },
                     "contentPreviewChars": { "type": "integer" }
                 }
@@ -11491,6 +11518,11 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "includeContent": { "type": "boolean", "default": false },
                     "hydrate_top_k": { "type": "integer", "default": 0 },
                     "hydrateTopK": { "type": "integer" },
+                    "detail": { "type": "string", "enum": ["abstract", "overview", "full"], "default": "abstract" },
+                    "detail_top_k": { "type": "integer", "default": 0 },
+                    "detailTopK": { "type": "integer" },
+                    "detail_ids": { "type": "array", "items": { "type": "string" } },
+                    "detailIds": { "type": "array", "items": { "type": "string" } },
                     "content_preview_chars": { "type": "integer", "default": 700 },
                     "contentPreviewChars": { "type": "integer" }
                 }
@@ -11513,6 +11545,9 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "include_consolidation_sources": { "type": "boolean", "default": false },
                     "hydrate": { "type": "boolean", "default": false },
                     "hydrate_top_k": { "type": "integer", "default": 0 },
+                    "detail": { "type": "string", "enum": ["abstract", "overview", "full"], "default": "abstract" },
+                    "detail_top_k": { "type": "integer", "default": 0 },
+                    "detail_ids": { "type": "array", "items": { "type": "string" } },
                     "content_preview_chars": { "type": "integer", "default": 700 }
                 }
             }),
@@ -12321,6 +12356,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "title": { "type": "string" },
                     "content": { "type": "string" },
                     "summary": { "type": "string" },
+                    "gist": { "type": "string", "description": "Optional caller-authored L0 one-line abstract." },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "links": { "type": "array", "items": { "type": "string" } },
                     "metadata": { "type": "object" }
@@ -12344,7 +12380,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "memory_node_type": { "type": "string", "default": "belief" },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "links": { "type": "array", "items": { "type": "string" } },
-                    "summary": { "type": "string" }
+                    "summary": { "type": "string" },
+                    "gist": { "type": "string", "description": "Optional caller-authored L0 one-line abstract." }
                 },
                 "required": ["content"]
             }),
@@ -12364,6 +12401,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "content": { "type": "string" },
                     "title": { "type": "string" },
                     "summary": { "type": "string" },
+                    "gist": { "type": "string", "description": "Optional caller-authored L0 one-line abstract." },
                     "reason": { "type": "string" },
                     "memory_node_type": { "type": "string" },
                     "cites_doc_ids": { "type": "array", "items": { "type": "string" } },
@@ -12411,6 +12449,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "links": { "type": "array", "items": { "type": "string" } },
                     "summary": { "type": "string" },
+                    "gist": { "type": "string", "description": "Optional caller-authored L0 one-line abstract." },
                     "metadata": { "type": "object" },
                     "context": { "type": "object" },
                     "auto_triggered": { "type": "boolean", "default": false }
@@ -12434,6 +12473,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "title": { "type": "string" },
                     "content": { "type": "string" },
                     "summary": { "type": "string" },
+                    "gist": { "type": "string", "description": "Optional caller-authored L0 one-line abstract." },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "wikilink targets: doc_id when resolved, target title when a forward reference" },
                     "status": { "type": "string" },
@@ -14269,6 +14309,70 @@ mod tests {
     }
 
     #[test]
+    fn observe_reads_mentions_from_the_requested_room() {
+        let (provider, config) = fixture();
+        let tenant = "travis-gilbert";
+        let mut backend = SharedFixtureBackend(provider.0.clone());
+
+        let other_message = theorem_harness_runtime::CoordinationMessageState {
+            tenant_slug: tenant.to_string(),
+            room_id: "room:other".to_string(),
+            message_id: "other-message".to_string(),
+            actor_id: "codex".to_string(),
+            urgency: "info".to_string(),
+            delivery: "passive".to_string(),
+            message: "Other-room mention should stay out of observe.".to_string(),
+            mentions: vec!["claude-code".to_string()],
+            metadata: Default::default(),
+            consumed_by: Vec::new(),
+            created_at: "2026-06-01T00:00:00Z".to_string(),
+        };
+        backend
+            .upsert_node(
+                super::coordination_message_node(&other_message)
+                    .expect("coordination message node"),
+            )
+            .unwrap();
+        let target_message = theorem_harness_runtime::CoordinationMessageState {
+            tenant_slug: tenant.to_string(),
+            room_id: "room:target".to_string(),
+            message_id: "target-message".to_string(),
+            actor_id: "codex".to_string(),
+            urgency: "info".to_string(),
+            delivery: "passive".to_string(),
+            message: "Target-room mention should be visible.".to_string(),
+            mentions: vec!["claude-code".to_string()],
+            metadata: Default::default(),
+            consumed_by: Vec::new(),
+            created_at: "2026-06-01T00:01:00Z".to_string(),
+        };
+        backend
+            .upsert_node(
+                super::coordination_message_node(&target_message)
+                    .expect("coordination message node"),
+            )
+            .unwrap();
+
+        let observed = call_tool_json(
+            &provider,
+            &config,
+            "observe",
+            json!({
+                "tenant": tenant,
+                "room_id": "room:target",
+                "actor": "claude-code"
+            }),
+        );
+        let pending = observed["pending_mentions"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["room_id"], json!("room:target"));
+        assert_eq!(
+            pending[0]["message"],
+            json!("Target-room mention should be visible.")
+        );
+    }
+
+    #[test]
     fn concurrent_publishers_get_distinct_tokens_in_total_order() {
         // AC3: two heads publishing to one stream receive distinct ordering
         // tokens; both events read back in a single total order, no merge step.
@@ -15945,13 +16049,14 @@ mod tests {
         assert_eq!(receipt["delivery"], "wake");
         assert_eq!(receipt["unread_count"], 2);
         assert_eq!(receipt["urgency"], "ask");
-        let room_event = room_events.try_recv().expect("room event emitted");
+        let expected_message_id = receipt["message_id"].as_str().unwrap();
+        let room_event = (0..16)
+            .filter_map(|_| room_events.try_recv().ok())
+            .find(|event| event.message_id == expected_message_id)
+            .expect("room event emitted");
         assert_eq!(room_event.tenant_slug, "smoke");
         assert_eq!(room_event.room_id, "harness-rust-port");
-        assert_eq!(
-            room_event.message_id,
-            receipt["message_id"].as_str().unwrap()
-        );
+        assert_eq!(room_event.message_id, expected_message_id);
         assert_eq!(room_event.author, "codex");
         assert_eq!(
             room_event.mentions,
@@ -16256,16 +16361,67 @@ mod tests {
             .any(|item| item["item_type"] == "node"));
         for item in recall["results"].as_array().unwrap() {
             assert!(item.get("content").is_none());
+            assert!(item.get("content_preview").is_none());
             assert!(item.get("document").is_none());
             assert!(item.get("node").is_none());
             assert!(
+                item.get("gist")
+                    .and_then(Value::as_str)
+                    .map(|gist| !gist.is_empty())
+                    .unwrap_or(false),
+                "default recall includes an abstract gist"
+            );
+            assert_eq!(item["served_tier"], "abstract");
+        }
+
+        let overview = call_tool_json(
+            &provider,
+            &config,
+            "recall",
+            json!({
+                "tenant": "smoke",
+                "query": "memory",
+                "limit": 10,
+                "detail": "overview",
+                "detail_top_k": 2,
+                "content_preview_chars": 24
+            }),
+        );
+        for item in overview["results"].as_array().unwrap().iter().take(2) {
+            assert_eq!(item["served_tier"], "overview");
+            assert!(item.get("content").is_none());
+            assert!(
                 item.get("content_preview")
                     .and_then(Value::as_str)
-                    .map(|preview| !preview.is_empty())
+                    .map(|preview| !preview.is_empty() && preview.chars().count() <= 24)
                     .unwrap_or(false),
-                "default recall includes a bounded preview"
+                "overview recall includes a bounded preview"
             );
         }
+
+        let opened = call_tool_json(
+            &provider,
+            &config,
+            "recall",
+            json!({
+                "tenant": "smoke",
+                "query": "memory",
+                "limit": 10,
+                "detail_ids": [second_doc_id.clone()]
+            }),
+        );
+        let opened_second = opened["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == json!(second_doc_id))
+            .expect("detail_ids opens the requested memory");
+        assert_eq!(opened_second["served_tier"], "full");
+        assert_eq!(
+            opened_second["content"],
+            "This entry links to the first memory atom."
+        );
+        assert!(opened_second.get("document").is_some());
 
         let hydrated = call_tool_json(
             &provider,
@@ -16283,7 +16439,10 @@ mod tests {
             hydrated["results"][0].get("document").is_some()
                 || hydrated["results"][0].get("node").is_some()
         );
+        assert_eq!(hydrated["results"][0]["served_tier"], "full");
         assert!(hydrated["results"][1].get("content").is_none());
+        assert_eq!(hydrated["results"][1]["served_tier"], "overview");
+        assert!(hydrated["results"][1].get("content_preview").is_some());
         assert!(hydrated["results"][1].get("document").is_none());
         assert!(hydrated["results"][1].get("node").is_none());
 

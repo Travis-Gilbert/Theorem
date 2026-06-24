@@ -1932,6 +1932,7 @@ mod tests {
                 tenant_slug: "default".to_string(),
                 query: "run-capture-positive".to_string(),
                 limit: 10,
+                hydrate: true,
                 ..RecallMemoryInput::default()
             },
         )

@@ -17,9 +17,11 @@ pub struct MemoryDoc {
     pub id: ID,
     pub kind: String,
     pub title: Option<String>,
+    pub gist: Option<String>,
     pub summary: Option<String>,
     pub content_preview: Option<String>,
     pub content: String,
+    pub served_tier: Option<String>,
     pub tags: Vec<String>,
     pub status: String,
     pub fitness: Option<f64>,
@@ -85,9 +87,11 @@ impl MemoryDoc {
                 .or_else(|| first_label(value))
                 .unwrap_or_else(|| "memory".to_string()),
             title: str_field(value, &["title"]),
+            gist: str_field(value, &["gist"]),
             summary: str_field(value, &["summary"]),
             content_preview: str_field(value, &["content_preview", "contentPreview"]),
             content: str_field(value, &["content"]).unwrap_or_default(),
+            served_tier: str_field(value, &["served_tier", "servedTier"]),
             tags: arr_strings(value, &["tags"]),
             status: str_field(value, &["status"]).unwrap_or_else(|| "active".to_string()),
             fitness: f64_field(value, &["fitness", "score"]),
@@ -126,6 +130,7 @@ pub struct MemoryInput {
     pub kind: String,
     pub title: Option<String>,
     pub summary: Option<String>,
+    pub gist: Option<String>,
     pub tags: Option<Vec<String>>,
     pub links: Option<Vec<ID>>,
     pub outcome: Option<String>,
@@ -143,6 +148,9 @@ impl MemoryInput {
         }
         if let Some(summary) = self.summary {
             obj.insert("summary".to_string(), json!(summary));
+        }
+        if let Some(gist) = self.gist {
+            obj.insert("gist".to_string(), json!(gist));
         }
         if let Some(tags) = self.tags {
             obj.insert("tags".to_string(), json!(tags));
@@ -190,6 +198,9 @@ impl MemoryQuery {
         #[graphql(default = false)] hydrate: bool,
         hydrate_top_k: Option<i32>,
         content_preview_chars: Option<i32>,
+        detail: Option<String>,
+        detail_top_k: Option<i32>,
+        detail_ids: Option<Vec<ID>>,
     ) -> GqlResult<Vec<MemoryDoc>> {
         let mut args = json!({ "limit": limit, "include_low_fitness": include_low_fitness });
         let obj = args.as_object_mut().expect("json object");
@@ -222,6 +233,16 @@ impl MemoryQuery {
         }
         if let Some(hydrate_top_k) = hydrate_top_k {
             obj.insert("hydrate_top_k".to_string(), json!(hydrate_top_k));
+        }
+        if let Some(detail) = detail {
+            obj.insert("detail".to_string(), json!(detail));
+        }
+        if let Some(detail_top_k) = detail_top_k {
+            obj.insert("detail_top_k".to_string(), json!(detail_top_k));
+        }
+        if let Some(detail_ids) = detail_ids {
+            let ids: Vec<String> = detail_ids.into_iter().map(|id| id.to_string()).collect();
+            obj.insert("detail_ids".to_string(), json!(ids));
         }
         if let Some(content_preview_chars) = content_preview_chars {
             obj.insert(

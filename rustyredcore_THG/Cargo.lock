@@ -9042,6 +9042,7 @@ dependencies = [
  "serde_json",
  "theorem-harness-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

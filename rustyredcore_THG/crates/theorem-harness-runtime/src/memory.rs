@@ -25,6 +25,8 @@ const DEFAULT_PPR_EPSILON: f64 = 1e-6;
 const DEFAULT_PPR_MAX_PUSHES: usize = 100_000;
 const DEFAULT_RECENCY_HALF_LIFE_SECONDS: f64 = 0.0;
 const DEFAULT_PROJECT_PERMEABILITY: f64 = 0.75;
+const DEFAULT_GIST_CHARS: usize = 200;
+const MAX_FULL_TIER_RESULTS: usize = 10;
 const COMMUNITY_SUMMARY_KIND: &str = "community_summary";
 const COMMUNITY_SUMMARY_EDGE: &str = "MEMORY_SUMMARIZES";
 const MEMORY_IN_PROJECT_EDGE: &str = "MEMORY_IN_PROJECT";
@@ -148,6 +150,8 @@ pub struct MemoryWriteInput {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
+    pub gist: String,
+    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
     pub links: Vec<String>,
@@ -217,6 +221,12 @@ pub struct RecallMemoryInput {
     pub hydrate_top_k: usize,
     #[serde(default)]
     pub content_preview_chars: usize,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub detail_top_k: usize,
+    #[serde(default)]
+    pub detail_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -249,6 +259,8 @@ pub struct ReviseMemoryInput {
     pub title: String,
     #[serde(default)]
     pub summary: String,
+    #[serde(default)]
+    pub gist: String,
     #[serde(default)]
     pub reason: String,
     #[serde(default)]
@@ -359,6 +371,8 @@ pub struct UpsertNoteInput {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
+    pub gist: String,
+    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
     pub links: Vec<String>,
@@ -408,6 +422,8 @@ pub struct MemoryDocumentState {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
+    pub gist: String,
+    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
     pub links: Vec<String>,
@@ -447,6 +463,8 @@ pub struct MemoryNodeState {
     pub kind: String,
     pub title: String,
     pub content: String,
+    #[serde(default)]
+    pub gist: String,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -497,6 +515,10 @@ pub struct MemoryRecallItem {
     pub content: String,
     #[serde(default)]
     pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gist: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub served_tier: String,
     pub status: String,
     #[serde(default)]
     pub actor_id: String,
@@ -607,13 +629,16 @@ pub fn create_memory_document<S: MemoryGraphStore>(
     } else {
         input.doc_id.trim().to_string()
     };
+    let summary = input.summary.trim().to_string();
+    let gist = normalize_gist(&input.gist, &summary, &content);
     let document = MemoryDocumentState {
         tenant_slug,
         doc_id,
         kind,
         title: input.title.trim().to_string(),
         content,
-        summary: input.summary.trim().to_string(),
+        summary,
+        gist,
         tags: normalize_strings(&input.tags),
         links: normalize_strings(&input.links),
         actor_id,
@@ -655,12 +680,14 @@ pub fn create_memory_node<S: MemoryGraphStore>(
     } else {
         input.node_id.trim().to_string()
     };
+    let gist = normalize_gist(&input.gist, "", &content);
     let node = MemoryNodeState {
         tenant_slug,
         node_id,
         kind,
         title: input.title.trim().to_string(),
         content,
+        gist,
         tags: normalize_strings(&input.tags),
         links: normalize_strings(&input.links),
         actor_id: input.actor_id.trim().to_string(),
@@ -920,6 +947,7 @@ pub fn revise_memory_document<S: MemoryGraphStore>(
             title: choose_text(&input.title, Some(&original.title)),
             content: input.content,
             summary: choose_text(&input.summary, Some(&original.summary)),
+            gist: choose_text(&input.gist, Some(&original.gist)),
             tags: original.tags.clone(),
             links: original.links.clone(),
             memory_node_type: choose_text(
@@ -1172,6 +1200,7 @@ pub fn upsert_note<S: MemoryGraphStore>(
             document.title = input.title.trim().to_string();
             document.content = content.clone();
             document.summary = input.summary.trim().to_string();
+            document.gist = normalize_gist(&input.gist, &document.summary, &document.content);
             document.tags = tags.clone();
             document.links = desired_links.clone();
             if !input.status.trim().is_empty() {
@@ -1206,6 +1235,7 @@ pub fn upsert_note<S: MemoryGraphStore>(
                 title: input.title.trim().to_string(),
                 content: content.clone(),
                 summary: input.summary.trim().to_string(),
+                gist: normalize_gist(&input.gist, &input.summary, &content),
                 tags: tags.clone(),
                 links: desired_links.clone(),
                 actor_id: input.actor_id.trim().to_string(),
@@ -1741,12 +1771,14 @@ fn load_memory_documents<S: MemoryGraphStore>(
     let mut seen_nodes = BTreeSet::new();
     let mut documents = Vec::new();
     for alias in tenant_slug_aliases(&tenant_slug) {
-        for node in store.memory_query_nodes(
-            NodeQuery::label("MemoryDocument")
-                .with_property("tenant_slug", Value::String(alias))
-                .with_limit(MAX_GRAPH_QUERY_LIMIT),
-        )? {
-            if !seen_nodes.insert(node.id.clone()) {
+        let mut query =
+            NodeQuery::label("MemoryDocument").with_property("tenant_slug", Value::String(alias));
+        if !include_inactive {
+            query = query.with_property("status", Value::String(DEFAULT_STATUS.to_string()));
+        }
+        for node in store.memory_query_nodes(query.with_limit(MAX_GRAPH_QUERY_LIMIT))? {
+            let node_id = node.id.clone();
+            if !seen_nodes.insert(node_id.clone()) {
                 continue;
             }
             match document_from_node(node) {
@@ -1754,7 +1786,14 @@ fn load_memory_documents<S: MemoryGraphStore>(
                     documents.push(document)
                 }
                 Ok(_) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        tenant_slug = %tenant_slug,
+                        node_id = %node_id,
+                        error = %error,
+                        "skipping malformed memory document"
+                    );
+                }
             }
         }
     }
@@ -1771,18 +1810,27 @@ fn load_memory_nodes<S: MemoryGraphStore>(
     let mut seen_nodes = BTreeSet::new();
     let mut nodes = Vec::new();
     for alias in tenant_slug_aliases(&tenant_slug) {
-        for record in store.memory_query_nodes(
-            NodeQuery::label("MemoryNode")
-                .with_property("tenant_slug", Value::String(alias))
-                .with_limit(MAX_GRAPH_QUERY_LIMIT),
-        )? {
-            if !seen_nodes.insert(record.id.clone()) {
+        let mut query =
+            NodeQuery::label("MemoryNode").with_property("tenant_slug", Value::String(alias));
+        if !include_inactive {
+            query = query.with_property("status", Value::String(DEFAULT_STATUS.to_string()));
+        }
+        for record in store.memory_query_nodes(query.with_limit(MAX_GRAPH_QUERY_LIMIT))? {
+            let node_id = record.id.clone();
+            if !seen_nodes.insert(node_id.clone()) {
                 continue;
             }
             match node_from_node(record) {
                 Ok(node) if include_inactive || node.status == DEFAULT_STATUS => nodes.push(node),
                 Ok(_) => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        tenant_slug = %tenant_slug,
+                        node_id = %node_id,
+                        error = %error,
+                        "skipping malformed memory node"
+                    );
+                }
             }
         }
     }
@@ -1861,7 +1909,10 @@ fn node_matches_recall(
     query.is_empty() || score_match(query, &node.title, &node.content, "") > 0.0
 }
 
-fn recall_item_for_document(document: MemoryDocumentState) -> MemoryRecallItem {
+fn recall_item_for_document(mut document: MemoryDocumentState) -> MemoryRecallItem {
+    if document.gist.trim().is_empty() {
+        document.gist = derive_gist(&document.summary, &document.content);
+    }
     let mut provenance = Map::new();
     provenance.insert(
         "actor".to_string(),
@@ -1884,6 +1935,8 @@ fn recall_item_for_document(document: MemoryDocumentState) -> MemoryRecallItem {
         content_preview: preview_text(&document.content, default_recall_preview_chars()),
         content: document.content.clone(),
         summary: document.summary.clone(),
+        gist: document.gist.clone(),
+        served_tier: String::new(),
         status: document.status.clone(),
         actor_id: document.actor_id.clone(),
         origin_surface: document.origin_surface.clone(),
@@ -1898,7 +1951,10 @@ fn recall_item_for_document(document: MemoryDocumentState) -> MemoryRecallItem {
     }
 }
 
-fn recall_item_for_node(node: MemoryNodeState) -> MemoryRecallItem {
+fn recall_item_for_node(mut node: MemoryNodeState) -> MemoryRecallItem {
+    if node.gist.trim().is_empty() {
+        node.gist = derive_gist("", &node.content);
+    }
     let mut provenance = Map::new();
     provenance.insert("actor".to_string(), Value::String(node.actor_id.clone()));
     provenance.insert(
@@ -1918,6 +1974,8 @@ fn recall_item_for_node(node: MemoryNodeState) -> MemoryRecallItem {
         content_preview: preview_text(&node.content, default_recall_preview_chars()),
         content: node.content.clone(),
         summary: String::new(),
+        gist: node.gist.clone(),
+        served_tier: String::new(),
         status: node.status.clone(),
         actor_id: node.actor_id.clone(),
         origin_surface: node.origin_surface.clone(),
@@ -1956,7 +2014,7 @@ fn load_recall_atoms<S: MemoryGraphStore>(
     include_low_fitness: bool,
 ) -> MemoryResult<Vec<RecallAtom>> {
     let mut atoms = Vec::new();
-    for document in load_memory_documents(store, tenant_slug, true)? {
+    for document in load_memory_documents(store, tenant_slug, false)? {
         if !document_matches_recall(
             &document,
             "",
@@ -1976,7 +2034,7 @@ fn load_recall_atoms<S: MemoryGraphStore>(
             text,
         });
     }
-    for node in load_memory_nodes(store, tenant_slug, true)? {
+    for node in load_memory_nodes(store, tenant_slug, false)? {
         if !node_matches_recall(
             &node,
             "",
@@ -2554,28 +2612,113 @@ fn compare_recall_items(left: &MemoryRecallItem, right: &MemoryRecallItem) -> st
         .then_with(|| left.id.cmp(&right.id))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecallTier {
+    Abstract,
+    Overview,
+    Full,
+}
+
+fn tier_for(index: usize, item_id: &str, input: &RecallMemoryInput) -> RecallTier {
+    if detail_id_matches(input, item_id) {
+        return RecallTier::Full;
+    }
+    if input.hydrate {
+        return RecallTier::Full;
+    }
+    if index < input.hydrate_top_k {
+        return RecallTier::Full;
+    }
+    if input.hydrate_top_k > 0 && !new_detail_knobs_set(input) {
+        return RecallTier::Overview;
+    }
+    if index < input.detail_top_k {
+        return match input.detail.trim().to_lowercase().as_str() {
+            "full" => RecallTier::Full,
+            "overview" => RecallTier::Overview,
+            _ => RecallTier::Abstract,
+        };
+    }
+    RecallTier::Abstract
+}
+
+fn detail_id_matches(input: &RecallMemoryInput, item_id: &str) -> bool {
+    input.detail_ids.iter().any(|id| id == item_id)
+}
+
+fn new_detail_knobs_set(input: &RecallMemoryInput) -> bool {
+    !input.detail.trim().is_empty() || input.detail_top_k > 0 || !input.detail_ids.is_empty()
+}
+
+fn tier_name(tier: RecallTier) -> &'static str {
+    match tier {
+        RecallTier::Abstract => "abstract",
+        RecallTier::Overview => "overview",
+        RecallTier::Full => "full",
+    }
+}
+
 fn apply_recall_payload_policy(results: &mut [MemoryRecallItem], input: &RecallMemoryInput) {
     let preview_chars = effective_recall_preview_chars(input.content_preview_chars);
-    let hydrate_top_k = if input.hydrate {
-        usize::MAX
-    } else {
-        input.hydrate_top_k
-    };
+    let mut implicit_full_count = 0usize;
 
     for (index, item) in results.iter_mut().enumerate() {
-        if item.content_preview.is_empty() && !item.content.is_empty() {
-            item.content_preview = preview_text(&item.content, preview_chars);
-        } else if !item.content_preview.is_empty() {
-            item.content_preview = preview_text(&item.content_preview, preview_chars);
+        if item.gist.trim().is_empty() {
+            let gist_source = if item.content.trim().is_empty() {
+                item.content_preview.as_str()
+            } else {
+                item.content.as_str()
+            };
+            item.gist = derive_gist(&item.summary, gist_source);
         }
 
-        if index < hydrate_top_k {
-            continue;
+        let explicit_detail_id = detail_id_matches(input, &item.id);
+        let mut tier = tier_for(index, &item.id, input);
+        let guard_full_payload = tier == RecallTier::Full
+            && !explicit_detail_id
+            && !input.hydrate
+            && index >= input.hydrate_top_k;
+        if guard_full_payload {
+            implicit_full_count += 1;
+            if implicit_full_count > MAX_FULL_TIER_RESULTS {
+                tier = RecallTier::Overview;
+                item.rank_signals.insert(
+                    "truncated_full_payload".to_string(),
+                    json!(format!(
+                        "full tier capped at {MAX_FULL_TIER_RESULTS}; pass this id in detail_ids to retrieve full content"
+                    )),
+                );
+            }
         }
 
-        item.content.clear();
-        item.document = None;
-        item.node = None;
+        match tier {
+            RecallTier::Abstract => {
+                item.content.clear();
+                item.content_preview.clear();
+                item.summary.clear();
+                item.document = None;
+                item.node = None;
+            }
+            RecallTier::Overview => {
+                let preview_source = if item.content.trim().is_empty() {
+                    item.content_preview.as_str()
+                } else {
+                    item.content.as_str()
+                };
+                item.content_preview = preview_text(preview_source, preview_chars);
+                item.content.clear();
+                item.document = None;
+                item.node = None;
+            }
+            RecallTier::Full => {
+                if item.content_preview.is_empty() && !item.content.is_empty() {
+                    item.content_preview = preview_text(&item.content, preview_chars);
+                } else if !item.content_preview.is_empty() {
+                    item.content_preview = preview_text(&item.content_preview, preview_chars);
+                }
+            }
+        }
+        item.served_tier = tier_name(tier).to_string();
     }
 }
 
@@ -2593,6 +2736,41 @@ fn effective_recall_preview_chars(value: usize) -> usize {
 
 fn preview_text(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
+}
+
+fn normalize_gist(gist: &str, summary: &str, content: &str) -> String {
+    let gist = gist.trim();
+    if gist.is_empty() {
+        derive_gist(summary, content)
+    } else {
+        preview_text(gist, DEFAULT_GIST_CHARS)
+    }
+}
+
+fn derive_gist(summary: &str, content: &str) -> String {
+    let source = if summary.trim().is_empty() {
+        content.trim()
+    } else {
+        summary.trim()
+    };
+    first_sentence_preview(source, DEFAULT_GIST_CHARS)
+}
+
+fn first_sentence_preview(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let sentence_end = match (text.find(". "), text.find('\n')) {
+        (Some(period), Some(newline)) => Some((period + 1).min(newline)),
+        (Some(period), None) => Some(period + 1),
+        (None, Some(newline)) => Some(newline),
+        (None, None) => None,
+    };
+    let sentence = sentence_end
+        .map(|index| text[..index].trim())
+        .unwrap_or(text);
+    preview_text(sentence, max_chars)
 }
 
 fn recall_item_graph_id(tenant_slug: &str, item: &MemoryRecallItem) -> String {
@@ -3158,13 +3336,16 @@ fn community_summary_document(
                 .collect(),
         ),
     );
+    let summary = format!("{} memory atoms", members.len());
+    let gist = normalize_gist("", &summary, &content);
     MemoryDocumentState {
         tenant_slug: tenant_slug.to_string(),
         doc_id: doc_id.to_string(),
         kind: COMMUNITY_SUMMARY_KIND.to_string(),
         title: title.to_string(),
         content,
-        summary: format!("{} memory atoms", members.len()),
+        summary,
+        gist,
         tags: vec!["community-summary".to_string()],
         links: Vec::new(),
         actor_id: "theorem-harness".to_string(),
@@ -3809,6 +3990,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(document.gist, "Short payload summary");
 
         let results = recall_memory(
             &mut store,
@@ -3826,15 +4008,227 @@ mod tests {
             .iter()
             .find(|item| item.id == document.doc_id)
             .expect("document recalled");
-        assert_eq!(item.summary, "Short payload summary");
+        assert_eq!(item.served_tier, "abstract");
         assert_eq!(item.tags, vec!["memory".to_string(), "payload".to_string()]);
-        assert!(!item.content_preview.is_empty());
-        assert!(item.content_preview.len() < long_content.len());
+        assert_eq!(item.gist, "Short payload summary");
+        assert!(item.summary.is_empty(), "abstract recall omits summary");
+        assert!(
+            item.content_preview.is_empty(),
+            "abstract recall omits previews"
+        );
         assert!(item.content.is_empty(), "default recall omits full content");
         assert!(
             item.document.is_none(),
             "default recall omits nested document"
         );
+    }
+
+    #[test]
+    fn recall_overview_promotes_top_k_only() {
+        let mut store = InMemoryGraphStore::new();
+        let first = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Alpha payload".to_string(),
+                content: "alpha payload full content with additional details".to_string(),
+                summary: "Alpha summary. Extra summary sentence.".to_string(),
+                created_at: T2.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let second = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Beta payload".to_string(),
+                content: "beta payload full content".to_string(),
+                summary: "Beta summary".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "payload".to_string(),
+                query_time: T3.to_string(),
+                limit: 10,
+                detail: "overview".to_string(),
+                detail_top_k: 1,
+                content_preview_chars: 12,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results[0].id, first.doc_id);
+        assert_eq!(results[0].served_tier, "overview");
+        assert_eq!(results[0].summary, "Alpha summary. Extra summary sentence.");
+        assert!(!results[0].content_preview.is_empty());
+        assert!(results[0].content_preview.chars().count() <= 12);
+        assert!(results[0].content.is_empty());
+        assert!(results[0].document.is_none());
+
+        let second_item = results
+            .iter()
+            .find(|item| item.id == second.doc_id)
+            .expect("second document recalled");
+        assert_eq!(second_item.served_tier, "abstract");
+        assert_eq!(second_item.gist, "Beta summary");
+        assert!(second_item.summary.is_empty());
+        assert!(second_item.content_preview.is_empty());
+        assert!(second_item.content.is_empty());
+        assert!(second_item.document.is_none());
+    }
+
+    #[test]
+    fn recall_detail_ids_open_full_content_regardless_of_rank() {
+        let mut store = InMemoryGraphStore::new();
+        let first = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Alpha payload".to_string(),
+                content: "alpha payload full content".to_string(),
+                created_at: T2.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let second = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Beta payload".to_string(),
+                content: "beta payload full content".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "payload".to_string(),
+                query_time: T3.to_string(),
+                limit: 10,
+                detail_ids: vec![second.doc_id.clone()],
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        let first_item = results
+            .iter()
+            .find(|item| item.id == first.doc_id)
+            .expect("first document recalled");
+        assert_eq!(first_item.served_tier, "abstract");
+        assert!(first_item.content.is_empty());
+        assert!(first_item.document.is_none());
+
+        let second_item = results
+            .iter()
+            .find(|item| item.id == second.doc_id)
+            .expect("second document recalled");
+        assert_eq!(second_item.served_tier, "full");
+        assert_eq!(second_item.content, "beta payload full content");
+        assert!(second_item.document.is_some());
+    }
+
+    #[test]
+    fn recall_hydrate_true_preserves_legacy_full_payloads_past_guard_ceiling() {
+        let mut store = InMemoryGraphStore::new();
+        for index in 0..12 {
+            create_memory_document(
+                &mut store,
+                MemoryWriteInput {
+                    tenant_slug: TENANT.to_string(),
+                    kind: "decision".to_string(),
+                    title: format!("Bulk payload {index}"),
+                    content: format!("bulk payload full content {index}"),
+                    created_at: T1.to_string(),
+                    ..MemoryWriteInput::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "bulk payload".to_string(),
+                query_time: T3.to_string(),
+                limit: 12,
+                hydrate: true,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 12);
+        assert!(results.iter().all(|item| item.served_tier == "full"));
+        assert!(results.iter().all(|item| !item.content.is_empty()));
+        assert!(results.iter().all(|item| item.document.is_some()));
+    }
+
+    #[test]
+    fn recall_detail_full_caps_implicit_full_payloads() {
+        let mut store = InMemoryGraphStore::new();
+        for index in 0..12 {
+            create_memory_document(
+                &mut store,
+                MemoryWriteInput {
+                    tenant_slug: TENANT.to_string(),
+                    kind: "decision".to_string(),
+                    title: format!("Capped payload {index}"),
+                    content: format!("capped payload full content {index}"),
+                    created_at: T1.to_string(),
+                    ..MemoryWriteInput::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "capped payload".to_string(),
+                query_time: T3.to_string(),
+                limit: 12,
+                detail: "full".to_string(),
+                detail_top_k: 12,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        let full_count = results
+            .iter()
+            .filter(|item| item.served_tier == "full")
+            .count();
+        let overflow = results
+            .iter()
+            .filter(|item| item.served_tier == "overview")
+            .collect::<Vec<_>>();
+        assert_eq!(full_count, MAX_FULL_TIER_RESULTS);
+        assert_eq!(overflow.len(), 2);
+        assert!(overflow.iter().all(|item| item.content.is_empty()));
+        assert!(overflow
+            .iter()
+            .all(|item| item.rank_signals.contains_key("truncated_full_payload")));
     }
 
     #[test]
@@ -3879,14 +4273,127 @@ mod tests {
         .unwrap();
 
         assert_eq!(results[0].id, first.doc_id);
+        assert_eq!(results[0].served_tier, "full");
         assert!(!results[0].content.is_empty());
         assert!(results[0].document.is_some());
         let second_item = results
             .iter()
             .find(|item| item.id == second.doc_id)
             .expect("second document recalled");
+        assert_eq!(second_item.served_tier, "overview");
+        assert!(!second_item.content_preview.is_empty());
         assert!(second_item.content.is_empty());
         assert!(second_item.document.is_none());
+    }
+
+    #[test]
+    fn recall_derives_gist_for_legacy_rows_missing_the_field() {
+        let mut store = InMemoryGraphStore::new();
+        let doc_id = "legacy-gist";
+        store
+            .upsert_node(NodeRecord::new(
+                memory_document_node_id(TENANT, doc_id),
+                vec![
+                    "HarnessMemory".to_string(),
+                    "MemoryAtom".to_string(),
+                    "MemoryDocument".to_string(),
+                ],
+                json!({
+                    "tenant_slug": TENANT,
+                    "doc_id": doc_id,
+                    "kind": "decision",
+                    "title": "Legacy gist",
+                    "content": "Legacy content should become the abstract. Extra sentence.",
+                    "summary": "Legacy summary should become the abstract. Extra sentence.",
+                    "status": DEFAULT_STATUS,
+                    "created_at": T1,
+                    "updated_at": T1
+                }),
+            ))
+            .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "legacy gist".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        let item = results
+            .iter()
+            .find(|item| item.id == doc_id)
+            .expect("legacy document recalled");
+        assert_eq!(item.served_tier, "abstract");
+        assert_eq!(item.gist, "Legacy summary should become the abstract.");
+        assert!(item.summary.is_empty());
+        assert!(item.content.is_empty());
+    }
+
+    #[test]
+    fn recall_skips_malformed_memory_rows_without_failing_the_read() {
+        let mut store = InMemoryGraphStore::new();
+        let good = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Good row".to_string(),
+                content: "Good row should still be returned.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                memory_document_node_id(TENANT, "bad-row"),
+                vec![
+                    "HarnessMemory".to_string(),
+                    "MemoryAtom".to_string(),
+                    "MemoryDocument".to_string(),
+                ],
+                json!({
+                    "tenant_slug": TENANT,
+                    "doc_id": "bad-row",
+                    "kind": "decision",
+                    "title": "Bad row",
+                    "content": 42,
+                    "status": DEFAULT_STATUS
+                }),
+            ))
+            .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "row".to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        assert!(results.iter().any(|item| item.id == good.doc_id));
+        assert!(results.iter().all(|item| item.id != "bad-row"));
+
+        let queryless = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query_time: T2.to_string(),
+                limit: 10,
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+        assert!(queryless.iter().all(|item| item.id != "bad-row"));
     }
 
     #[test]
@@ -4317,6 +4824,7 @@ mod tests {
                 query: "overall state".to_string(),
                 query_time: T2.to_string(),
                 limit: 10,
+                hydrate: true,
                 ..RecallMemoryInput::default()
             },
         )
@@ -4860,6 +5368,7 @@ mod tests {
                     tenant_slug: TENANT.to_string(),
                     query: "lesson".to_string(),
                     include_low_fitness: true,
+                    hydrate: true,
                     ..RecallMemoryInput::default()
                 },
             )

@@ -150,6 +150,8 @@ pub fn recall_reasoning_strategies<S: MemoryGraphStore>(
             query: query.into(),
             limit: limit * 3,
             include_low_fitness: true,
+            detail: "overview".to_string(),
+            detail_top_k: limit * 3,
             ..RecallMemoryInput::default()
         },
     )?;
