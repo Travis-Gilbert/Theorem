@@ -272,6 +272,22 @@ impl AppState {
         Ok(entries)
     }
 
+    pub fn has_fulltext_designation(
+        &self,
+        tenant_id: &str,
+        labels: &[&str],
+        property: &str,
+    ) -> bool {
+        let Ok(indexes) = self.fulltext_indexes.lock() else {
+            return false;
+        };
+        indexes.get(tenant_id).is_some_and(|tenant_map| {
+            labels
+                .iter()
+                .any(|label| tenant_map.contains_key(&((*label).to_string(), property.to_string())))
+        })
+    }
+
     // ===== Phase 8: spatial designation + indexing =====
 
     pub fn designate_spatial_property(

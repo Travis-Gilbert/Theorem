@@ -771,6 +771,9 @@ async fn mcp_post(
         Err(response) => return response,
     }
     let mcp_context = McpRequestContext::with_scopes(auth_context.scopes);
+    if let Some(response) = maybe_handle_cold_memory_recall_mcp(&state, &config, &payload) {
+        return Json(response).into_response();
+    }
     if let Some(response) = maybe_handle_browser_use_mcp(&state, &config, &payload).await {
         return Json(response).into_response();
     }
@@ -857,6 +860,71 @@ fn mcp_payload_tenant(
 fn tenant_from_mcp_resource_uri(uri: &str) -> Option<&str> {
     let raw = uri.strip_prefix("rustyred_thg://tenant/")?;
     raw.split('/').next().filter(|tenant| !tenant.is_empty())
+}
+
+fn maybe_handle_cold_memory_recall_mcp(
+    state: &AppState,
+    config: &rustyred_thg_mcp::McpServerConfig,
+    payload: &Value,
+) -> Option<Value> {
+    let name = payload
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)?;
+    if !matches!(name, "recall" | "observe") {
+        return None;
+    }
+
+    let arguments = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let tenant = resolve_tenant_id(
+        argument_text_any(&arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    )
+    .ok()?;
+    if state.has_fulltext_designation(
+        &tenant,
+        &["MemoryAtom", "MemoryDocument", "MemoryNode"],
+        "search_text",
+    ) {
+        return None;
+    }
+
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let result = match name {
+        "recall" => mcp_tool_result(json!({
+            "tenant": tenant,
+            "results": [],
+            "count": 0,
+            "rank_signals": ["cold_memory_fulltext_index"]
+        })),
+        "observe" => {
+            let actor_id = argument_text_any(&arguments, &["actor", "actor_id", "actorId"])
+                .unwrap_or_default();
+            let room_id = argument_text_any(&arguments, &["room", "room_id", "roomId"])
+                .unwrap_or_else(|| "default".to_string());
+            mcp_tool_result(json!({
+                "actor": { "actor_id": actor_id },
+                "tenant": { "slug": tenant },
+                "coordination_room": { "tenant_slug": tenant, "room_id": room_id },
+                "pending_mentions": [],
+                "continuity_pack": {},
+                "orchestrate_notes": [],
+                "recall_results": [],
+                "rank_signals": ["cold_memory_fulltext_index"]
+            }))
+        }
+        _ => return None,
+    };
+
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    }))
 }
 
 async fn maybe_handle_composed_agent_mcp(
@@ -9446,6 +9514,51 @@ mod tests {
             .expect("tools/list should advertise web_search_graph");
         assert_eq!(web_search_graph["inputSchema"]["required"][0], "query");
         assert!(web_search_graph["inputSchema"]["properties"]["budget_tokens"].is_object());
+    }
+
+    #[tokio::test]
+    async fn mcp_recall_cold_fulltext_index_returns_fast_empty_scan() {
+        let state = memory_product_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": "cold-recall",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "recall",
+                                "arguments": {
+                                    "tenant": "Travis-Gilbert",
+                                    "query": "recall tiering",
+                                    "limit": 1
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        let structured = &payload["result"]["structuredContent"];
+        assert_eq!(structured["tenant"], "Travis-Gilbert");
+        assert_eq!(structured["count"], 0);
+        assert_eq!(structured["results"].as_array().unwrap().len(), 0);
+        assert!(structured["rank_signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|signal| signal == "cold_memory_fulltext_index"));
     }
 
     #[tokio::test]
