@@ -8,7 +8,10 @@
 use std::collections::BTreeMap;
 
 use async_graphql::{Enum, InputObject, Object, Result as GqlResult, SimpleObject, ID};
-use rustyred_thg_core::{NodeRecord, ThgError};
+use rustyred_thg_core::{
+    apply_cascade, state::stable_hash, NodeRecord, QueryContext, RankCandidate, RankingRule,
+    ThgError,
+};
 use rustyred_thg_ml::{
     project_multivector_tiers, quantize_sign_bits, rank_binary_hamming_maxsim,
     rerank_exact_maxsim_bounded, BinaryMultiVectorSet, MaxSimAggregation, MaxSimScorer,
@@ -88,6 +91,27 @@ impl From<MultiVectorAggregation> for MaxSimAggregation {
     }
 }
 
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum MultiVectorRankRule {
+    Vector,
+    GraphProximity,
+    SourceReliability,
+    Recency,
+    EpistemicStatus,
+}
+
+impl From<MultiVectorRankRule> for RankingRule {
+    fn from(value: MultiVectorRankRule) -> Self {
+        match value {
+            MultiVectorRankRule::Vector => RankingRule::Vector,
+            MultiVectorRankRule::GraphProximity => RankingRule::GraphProximity,
+            MultiVectorRankRule::SourceReliability => RankingRule::SourceReliability,
+            MultiVectorRankRule::Recency => RankingRule::Recency,
+            MultiVectorRankRule::EpistemicStatus => RankingRule::EpistemicStatus,
+        }
+    }
+}
+
 #[derive(InputObject)]
 pub struct MultiVectorExactInput {
     pub embedding_set_id: String,
@@ -127,7 +151,10 @@ pub struct MultiVectorSearchHit {
     pub content_id: String,
     pub embedding_set_id: String,
     pub score: f64,
+    pub vector_score: f64,
     pub scorer: String,
+    pub ranker: String,
+    pub components: Json,
     pub vector_count: i32,
 }
 
@@ -138,6 +165,7 @@ pub struct EpistemicProjectionReceipt {
     pub graph_version: Option<i64>,
     pub projection_version: Option<String>,
     pub computed_at_ms: Option<i64>,
+    pub as_of_ms: Option<i64>,
 }
 
 #[derive(SimpleObject)]
@@ -169,6 +197,32 @@ pub struct EpistemicRelationshipView {
     pub raw: Json,
 }
 
+#[derive(SimpleObject)]
+pub struct EpistemicEvidenceView {
+    pub evidence_ref: String,
+    pub source: String,
+    pub found: bool,
+    pub body: Option<Json>,
+}
+
+#[derive(InputObject)]
+pub struct EpistemicRelationshipPromotionInput {
+    pub relationship_id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub assertion_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(SimpleObject)]
+pub struct EpistemicRelationshipPromotionResult {
+    pub assertion_id: String,
+    pub assertion: Json,
+    pub source_edge_id: String,
+    pub target_edge_id: String,
+    pub superseded_relationship: EpistemicRelationshipView,
+}
+
 pub struct ContentNode {
     id: String,
     raw: Json,
@@ -197,8 +251,8 @@ pub struct EpistemicFacet {
 
 #[Object]
 impl EpistemicFacet {
-    async fn standing(&self, top_k: Option<i32>) -> GqlResult<Json> {
-        let standing = standing_view_for_node(&self.node_id, top_k)?;
+    async fn standing(&self, top_k: Option<i32>, as_of_ms: Option<i64>) -> GqlResult<Json> {
+        let standing = standing_view_for_node(&self.node_id, top_k, as_of_ms)?;
         Ok(Json(json!({
             "source": standing.source.clone(),
             "scores": standing.scores.0.clone(),
@@ -209,8 +263,12 @@ impl EpistemicFacet {
         })))
     }
 
-    async fn standing_view(&self, top_k: Option<i32>) -> GqlResult<EpistemicStandingView> {
-        standing_view_for_node(&self.node_id, top_k)
+    async fn standing_view(
+        &self,
+        top_k: Option<i32>,
+        as_of_ms: Option<i64>,
+    ) -> GqlResult<EpistemicStandingView> {
+        standing_view_for_node(&self.node_id, top_k, as_of_ms)
     }
 
     async fn relationships(
@@ -218,12 +276,14 @@ impl EpistemicFacet {
         epistemic_types: Option<Vec<String>>,
         min_confidence: Option<f64>,
         max_depth: Option<i32>,
+        as_of_ms: Option<i64>,
     ) -> GqlResult<Json> {
         Ok(Json(Value::Array(relationship_hits_for_node(
             &self.node_id,
             epistemic_types,
             min_confidence,
             max_depth,
+            as_of_ms,
         )?)))
     }
 
@@ -232,15 +292,30 @@ impl EpistemicFacet {
         epistemic_types: Option<Vec<String>>,
         min_confidence: Option<f64>,
         max_depth: Option<i32>,
+        as_of_ms: Option<i64>,
     ) -> GqlResult<Vec<EpistemicRelationshipView>> {
-        relationship_hits_for_node(&self.node_id, epistemic_types, min_confidence, max_depth)?
-            .iter()
-            .map(|hit| relationship_view_from_hit(&self.node_id, hit))
-            .collect()
+        relationship_hits_for_node(
+            &self.node_id,
+            epistemic_types,
+            min_confidence,
+            max_depth,
+            as_of_ms,
+        )?
+        .iter()
+        .map(|hit| relationship_view_from_hit(&self.node_id, hit))
+        .collect()
+    }
+
+    async fn evidence(&self, evidence_ref: String) -> GqlResult<EpistemicEvidenceView> {
+        hydrate_evidence_ref(evidence_ref)
     }
 }
 
-fn standing_view_for_node(node_id: &str, top_k: Option<i32>) -> GqlResult<EpistemicStandingView> {
+fn standing_view_for_node(
+    node_id: &str,
+    top_k: Option<i32>,
+    as_of_ms: Option<i64>,
+) -> GqlResult<EpistemicStandingView> {
     with_invoker(|inv| {
         let mut seeds = serde_json::Map::new();
         seeds.insert(node_id.to_string(), json!(1.0));
@@ -248,7 +323,11 @@ fn standing_view_for_node(node_id: &str, top_k: Option<i32>) -> GqlResult<Episte
             "seeds": Value::Object(seeds),
             "top_k": top_k.unwrap_or(8).max(1),
         });
-        let shadow = inv.epistemic_shadow_ppr(args.clone()).map_err(map_err)?;
+        let shadow = if as_of_ms.is_none() {
+            inv.epistemic_shadow_ppr(args.clone()).map_err(map_err)?
+        } else {
+            json!({ "scores": [] })
+        };
         let relationship_args = epistemic_neighbor_args(node_id, None, None, Some(1));
         let relationships = inv
             .epistemic_neighbors(relationship_args.clone())
@@ -257,6 +336,7 @@ fn standing_view_for_node(node_id: &str, top_k: Option<i32>) -> GqlResult<Episte
             .get("results")
             .and_then(Value::as_array)
             .cloned()
+            .map(|items| filter_relationship_hits_as_of(items, as_of_ms))
             .unwrap_or_default();
         let (support_in_degree, attack_in_degree) = epistemic_degree_counts(&direct);
         let scores = shadow.get("scores").cloned().unwrap_or_else(|| json!([]));
@@ -281,6 +361,8 @@ fn standing_view_for_node(node_id: &str, top_k: Option<i32>) -> GqlResult<Episte
         });
         let source = if has_scores {
             "shadow_ppr"
+        } else if as_of_ms.is_some() {
+            "degree_fallback_as_of"
         } else {
             "degree_fallback"
         }
@@ -298,6 +380,7 @@ fn standing_view_for_node(node_id: &str, top_k: Option<i32>) -> GqlResult<Episte
                 graph_version: None,
                 projection_version,
                 computed_at_ms,
+                as_of_ms,
             },
         })
     })
@@ -308,6 +391,7 @@ fn relationship_hits_for_node(
     epistemic_types: Option<Vec<String>>,
     min_confidence: Option<f64>,
     max_depth: Option<i32>,
+    as_of_ms: Option<i64>,
 ) -> GqlResult<Vec<Value>> {
     let fallback_types = epistemic_types.clone();
     let explicit_empty_filter = epistemic_types
@@ -324,7 +408,94 @@ fn relationship_hits_for_node(
     if results.is_empty() && !explicit_empty_filter {
         results = legacy_shadow_relationships(node_id, fallback_types, min_confidence, max_depth)?;
     }
+    results = filter_relationship_hits_as_of(results, as_of_ms);
     Ok(results)
+}
+
+fn filter_relationship_hits_as_of(results: Vec<Value>, as_of_ms: Option<i64>) -> Vec<Value> {
+    let Some(as_of_ms) = as_of_ms else {
+        return results;
+    };
+    results
+        .into_iter()
+        .filter(|hit| {
+            hit.get("edge")
+                .map(|edge| relationship_active_at(edge, as_of_ms))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn relationship_active_at(edge: &Value, as_of_ms: i64) -> bool {
+    let valid_from = int_prop(edge, &["properties", "valid_from_ms"])
+        .or_else(|| int_prop(edge, &["properties", "validFromMs"]));
+    if valid_from.is_some_and(|valid_from| valid_from > as_of_ms) {
+        return false;
+    }
+    let valid_to = int_prop(edge, &["properties", "valid_to_ms"])
+        .or_else(|| int_prop(edge, &["properties", "validToMs"]));
+    if valid_to.is_some_and(|valid_to| valid_to <= as_of_ms) {
+        return false;
+    }
+    let recorded_at = int_prop(edge, &["properties", "recorded_at_ms"])
+        .or_else(|| int_prop(edge, &["properties", "recordedAtMs"]));
+    if recorded_at.is_some_and(|recorded_at| recorded_at > as_of_ms) {
+        return false;
+    }
+    let superseded_at = int_prop(edge, &["properties", "superseded_at_ms"])
+        .or_else(|| int_prop(edge, &["properties", "supersededAtMs"]));
+    !superseded_at.is_some_and(|superseded_at| superseded_at <= as_of_ms)
+}
+
+fn hydrate_evidence_ref(evidence_ref: String) -> GqlResult<EpistemicEvidenceView> {
+    with_invoker(|inv| {
+        if let Some(content_hash) = cold_document_hash(&evidence_ref) {
+            let body = inv
+                .get_cold_document_bytes(content_hash)
+                .map_err(map_err)?
+                .map(|bytes| Json(evidence_body_from_bytes(&bytes)));
+            return Ok(EpistemicEvidenceView {
+                evidence_ref,
+                source: "cold_document".to_string(),
+                found: body.is_some(),
+                body,
+            });
+        }
+        if let Some(content_hash) = evidence_ref.strip_prefix("sha256:") {
+            let cold_hash = format!("sha256:{content_hash}");
+            let body = inv
+                .get_cold_document_bytes(&cold_hash)
+                .map_err(map_err)?
+                .map(|bytes| Json(evidence_body_from_bytes(&bytes)));
+            return Ok(EpistemicEvidenceView {
+                evidence_ref,
+                source: "cold_document_hash".to_string(),
+                found: body.is_some(),
+                body,
+            });
+        }
+        if let Some(node_id) = evidence_ref.strip_prefix("graph://") {
+            let body = inv.get_doc(node_id).map_err(map_err)?.map(Json);
+            return Ok(EpistemicEvidenceView {
+                evidence_ref,
+                source: "graph_node".to_string(),
+                found: body.is_some(),
+                body,
+            });
+        }
+        let body = inv.get_doc(&evidence_ref).map_err(map_err)?.map(Json);
+        Ok(EpistemicEvidenceView {
+            evidence_ref,
+            source: "graph_node".to_string(),
+            found: body.is_some(),
+            body,
+        })
+    })
+}
+
+fn evidence_body_from_bytes(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).to_string()))
 }
 
 fn epistemic_neighbor_args(
@@ -524,6 +695,7 @@ fn relationship_view_from_hit(
                 .or_else(|| int_prop(edge, &["properties", "computedAt"]))
                 .or_else(|| int_prop(edge, &["properties", "computed_at_ms"]))
                 .or_else(|| int_prop(edge, &["properties", "computedAtMs"])),
+            as_of_ms: None,
         },
         raw: Json(hit.clone()),
     })
@@ -869,6 +1041,10 @@ impl GraphQuery {
         candidate_limit: Option<i32>,
         exact_rerank_limit: Option<i32>,
         catalog_limit: Option<i32>,
+        graph_seed_ids: Option<Vec<String>>,
+        rank_rules: Option<Vec<MultiVectorRankRule>>,
+        include_epistemic: Option<bool>,
+        as_of_ms: Option<i64>,
     ) -> GqlResult<Vec<MultiVectorSearchHit>> {
         let aggregation = aggregation.unwrap_or(MultiVectorAggregation::Mean).into();
         let limit = limit.unwrap_or(10).clamp(1, 256) as usize;
@@ -1000,7 +1176,26 @@ impl GraphQuery {
                 binary_ranked.into_iter().take(limit).collect()
             };
 
-            Ok(ranked.into_iter().map(search_hit_from_score).collect())
+            let graph_seed_ids = graph_seed_ids.unwrap_or_default();
+            let rank_rules = rank_rules.unwrap_or_default();
+            let graph_aware = !graph_seed_ids.is_empty()
+                || !rank_rules.is_empty()
+                || include_epistemic.unwrap_or(false)
+                || as_of_ms.is_some();
+            if graph_aware {
+                graph_aware_search_hits(
+                    inv,
+                    ranked,
+                    graph_seed_ids,
+                    rank_rules,
+                    include_epistemic.unwrap_or(true),
+                    as_of_ms,
+                    limit,
+                    catalog_limit,
+                )
+            } else {
+                Ok(ranked.into_iter().map(search_hit_from_score).collect())
+            }
         })
     }
 }
@@ -1058,6 +1253,15 @@ impl GraphMutation {
     async fn bulk_edges(&self, edges: Json) -> GqlResult<BulkResult> {
         let args = json!({ "edges": edges.0 });
         with_invoker(|inv| Ok(bulk_result(&inv.bulk_edges(args.clone()).map_err(map_err)?)))
+    }
+
+    /// Promote an epistemic relationship edge into a reified assertion node when
+    /// the relationship needs identity, evidence, or its own lifecycle.
+    async fn promote_epistemic_relationship(
+        &self,
+        input: EpistemicRelationshipPromotionInput,
+    ) -> GqlResult<EpistemicRelationshipPromotionResult> {
+        promote_epistemic_relationship(input)
     }
 
     /// Store exact multi-vectors off the content node, create the hot binary
@@ -1276,17 +1480,267 @@ fn binary_projection_json(binary: &BinaryMultiVectorSet) -> Value {
 }
 
 fn search_hit_from_score(score: MultiVectorScore) -> MultiVectorSearchHit {
+    let vector_score = score.score as f64;
     MultiVectorSearchHit {
         content_id: score.content_id,
         embedding_set_id: score.embedding_set_id,
-        score: score.score as f64,
+        score: vector_score,
+        vector_score,
         scorer: match score.scorer {
             MaxSimScorer::ExactFloat => "exact_float",
             MaxSimScorer::BinaryHamming => "binary_hamming",
         }
         .to_string(),
+        ranker: "vector_only".to_string(),
+        components: Json(json!({
+            "vector_score": vector_score,
+            "vector_score01": vector_score01(score.score),
+            "rank_rules": ["vector"],
+        })),
         vector_count: score.vector_count as i32,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_aware_search_hits(
+    inv: &dyn super::GraphqlInvoker,
+    scores: Vec<MultiVectorScore>,
+    graph_seed_ids: Vec<String>,
+    rank_rules: Vec<MultiVectorRankRule>,
+    include_epistemic: bool,
+    as_of_ms: Option<i64>,
+    limit: usize,
+    catalog_limit: usize,
+) -> GqlResult<Vec<MultiVectorSearchHit>> {
+    let graph_scores = if graph_seed_ids.is_empty() {
+        BTreeMap::new()
+    } else {
+        graph_ppr_scores(inv, &graph_seed_ids, catalog_limit)?
+    };
+    let rules = if rank_rules.is_empty() {
+        vec![
+            RankingRule::Vector,
+            RankingRule::GraphProximity,
+            RankingRule::SourceReliability,
+            RankingRule::EpistemicStatus,
+            RankingRule::Recency,
+        ]
+    } else {
+        rank_rules.into_iter().map(Into::into).collect::<Vec<_>>()
+    };
+    let mut query = QueryContext::default();
+    query.as_of_ms = as_of_ms;
+    query.recency_reference_ms = as_of_ms;
+
+    let mut components_by_embedding = BTreeMap::new();
+    let candidates = scores
+        .iter()
+        .map(|score| {
+            let mut candidate = RankCandidate::new(score.embedding_set_id.clone());
+            let vector_score01 = vector_score01(score.score);
+            candidate.vector_score = Some(vector_score01);
+            if let Some(graph_score) = graph_scores.get(&score.content_id).copied() {
+                candidate.graph_hops = Some(graph_score_to_hops(graph_score));
+            }
+            if include_epistemic || as_of_ms.is_some() {
+                apply_epistemic_rank_signals(inv, &score.content_id, &mut candidate, as_of_ms)?;
+            }
+            components_by_embedding.insert(
+                score.embedding_set_id.clone(),
+                json!({
+                    "vector_score": score.score,
+                    "vector_score01": vector_score01,
+                    "graph_score": graph_scores.get(&score.content_id).copied(),
+                    "graph_hops": candidate.graph_hops,
+                    "source_reliability": candidate.source_reliability,
+                    "acceptance_status": candidate.acceptance_status,
+                    "epistemic_weight": candidate.epistemic_weight,
+                    "valid_from_ms": candidate.valid_from_ms,
+                    "superseded": candidate.superseded,
+                }),
+            );
+            Ok(candidate)
+        })
+        .collect::<GqlResult<Vec<_>>>()?;
+    let outcome = apply_cascade(candidates, &rules, &query);
+    let by_embedding = scores
+        .into_iter()
+        .map(|score| (score.embedding_set_id.clone(), score))
+        .collect::<BTreeMap<_, _>>();
+    let n = outcome.ranked.len();
+    let rule_names = outcome.rule_order.clone();
+    let mut out = Vec::new();
+    for (idx, ranked) in outcome.ranked.into_iter().enumerate() {
+        let Some(score) = by_embedding.get(&ranked.row_id) else {
+            continue;
+        };
+        let mut components = components_by_embedding
+            .remove(&ranked.row_id)
+            .unwrap_or_else(|| json!({}));
+        if let Some(map) = components.as_object_mut() {
+            map.insert("rank_rules".to_string(), json!(rule_names.clone()));
+            map.insert("rank_buckets".to_string(), json!(ranked.buckets));
+            map.insert("as_of_ms".to_string(), json!(as_of_ms));
+        }
+        out.push(MultiVectorSearchHit {
+            content_id: score.content_id.clone(),
+            embedding_set_id: score.embedding_set_id.clone(),
+            score: (n - idx) as f64,
+            vector_score: score.score as f64,
+            scorer: match score.scorer {
+                MaxSimScorer::ExactFloat => "exact_float",
+                MaxSimScorer::BinaryHamming => "binary_hamming",
+            }
+            .to_string(),
+            ranker: "graph_aware_cascade".to_string(),
+            components: Json(components),
+            vector_count: score.vector_count as i32,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn graph_ppr_scores(
+    inv: &dyn super::GraphqlInvoker,
+    seed_ids: &[String],
+    top_k: usize,
+) -> GqlResult<BTreeMap<String, f64>> {
+    let seeds = seed_ids
+        .iter()
+        .filter(|seed| !seed.trim().is_empty())
+        .map(|seed| (seed.clone(), json!(1.0)))
+        .collect::<Map<_, _>>();
+    if seeds.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let payload = inv
+        .algorithm(
+            "PPR",
+            false,
+            json!({
+                "seeds": Value::Object(seeds),
+                "top_k": top_k.max(1),
+            }),
+        )
+        .map_err(map_err)?;
+    Ok(payload
+        .get("scores")
+        .and_then(Value::as_array)
+        .map(|scores| {
+            scores
+                .iter()
+                .filter_map(|score| {
+                    Some((
+                        score.get("node_id")?.as_str()?.to_string(),
+                        score.get("score")?.as_f64()?,
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default())
+}
+
+fn apply_epistemic_rank_signals(
+    inv: &dyn super::GraphqlInvoker,
+    content_id: &str,
+    candidate: &mut RankCandidate,
+    as_of_ms: Option<i64>,
+) -> GqlResult<()> {
+    if let Some(node) = inv.item_node(content_id).map_err(map_err)? {
+        candidate.acceptance_status = node_prop_str(&node, "acceptance_status").unwrap_or_default();
+        candidate.epistemic_weight = node_prop_f64(&node, "epistemic_weight")
+            .map(|value| value as f32)
+            .unwrap_or(candidate.epistemic_weight);
+        candidate.source_reliability = node_prop_f64(&node, "source_reliability")
+            .or_else(|| node_prop_f64(&node, "justification_prior"))
+            .map(|value| value as f32);
+        candidate.valid_from_ms = node_prop_i64(&node, "valid_from_ms");
+        candidate.superseded = node_prop_bool(&node, "superseded").unwrap_or(false);
+    }
+    if as_of_ms.is_some() {
+        return Ok(());
+    }
+    let shadow = first_shadow_for_content(inv, content_id)?;
+    let Some(shadow) = shadow else {
+        return Ok(());
+    };
+    if candidate.acceptance_status.is_empty() {
+        if let Some(status) = node_prop_str(&shadow, "grounded_extension_status") {
+            candidate.acceptance_status = match status.as_str() {
+                "in" => "supported",
+                "out" => "undercut",
+                "undecided" => "provisional",
+                other => other,
+            }
+            .to_string();
+        }
+    }
+    if let Some(mean) = shadow_source_reliability_mean(&shadow) {
+        candidate.source_reliability = Some(mean as f32);
+    }
+    if (candidate.epistemic_weight - 1.0).abs() < f32::EPSILON {
+        candidate.epistemic_weight = match candidate.acceptance_status.as_str() {
+            "supported" | "grounded" => 1.2,
+            "undercut" | "attacked" => 0.8,
+            _ => 1.0,
+        };
+    }
+    Ok(())
+}
+
+fn first_shadow_for_content(
+    inv: &dyn super::GraphqlInvoker,
+    content_id: &str,
+) -> GqlResult<Option<NodeRecord>> {
+    let mut seeds = Map::new();
+    seeds.insert(content_id.to_string(), json!(1.0));
+    let payload = inv
+        .epistemic_shadow_ppr(json!({ "seeds": Value::Object(seeds), "top_k": 1 }))
+        .map_err(map_err)?;
+    let Some(shadow_id) = first_shadow_node(&payload) else {
+        return Ok(None);
+    };
+    inv.item_node(&shadow_id).map_err(map_err)
+}
+
+fn graph_score_to_hops(score: f64) -> u32 {
+    if score <= 0.0 {
+        return u32::MAX;
+    }
+    ((1.0 / score) - 1.0).round().max(0.0) as u32
+}
+
+fn vector_score01(score: f32) -> f32 {
+    ((score + 1.0) / 2.0).clamp(0.0, 1.0)
+}
+
+fn node_prop_str(node: &NodeRecord, key: &str) -> Option<String> {
+    node.properties
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn node_prop_f64(node: &NodeRecord, key: &str) -> Option<f64> {
+    node.properties.get(key).and_then(Value::as_f64)
+}
+
+fn node_prop_i64(node: &NodeRecord, key: &str) -> Option<i64> {
+    node.properties.get(key).and_then(value_i64)
+}
+
+fn node_prop_bool(node: &NodeRecord, key: &str) -> Option<bool> {
+    node.properties.get(key).and_then(Value::as_bool)
+}
+
+fn shadow_source_reliability_mean(node: &NodeRecord) -> Option<f64> {
+    node.properties
+        .get("source_reliability")
+        .and_then(|value| value.get("mean"))
+        .and_then(Value::as_f64)
 }
 
 fn binary_set_from_node(node: &NodeRecord) -> GqlResult<Option<BinaryMultiVectorSet>> {
@@ -1419,10 +1873,154 @@ fn ensure_bulk_ok(payload: &Value, operation: &str) -> GqlResult<()> {
     }
 }
 
+fn promote_epistemic_relationship(
+    input: EpistemicRelationshipPromotionInput,
+) -> GqlResult<EpistemicRelationshipPromotionResult> {
+    let hits = relationship_hits_for_node(&input.source_id, None, None, Some(1), None)?;
+    let hit = hits
+        .iter()
+        .find(|hit| {
+            value_at_path(hit, &["edge", "id"]).and_then(Value::as_str)
+                == Some(input.relationship_id.as_str())
+        })
+        .ok_or_else(|| {
+            async_graphql::Error::new(format!(
+                "relationship {} was not reachable from {}",
+                input.relationship_id, input.source_id
+            ))
+        })?;
+    let view = relationship_view_from_hit(&input.source_id, hit)?;
+    let assertion_id = input.assertion_id.unwrap_or_else(|| {
+        format!(
+            "epistemic:assertion:{}",
+            stable_hash(json!([
+                input.relationship_id,
+                input.source_id,
+                input.target_id
+            ]))
+        )
+    });
+    let promoted_at_ms = unix_ms();
+    let source_edge_id = format!("epistemic:assertion_source:{assertion_id}");
+    let target_edge_id = format!("epistemic:assertion_target:{assertion_id}");
+    let assertion = json!({
+        "id": assertion_id,
+        "labels": ["EpistemicAssertion"],
+        "properties": {
+            "relationship_id": view.relationship_id,
+            "source_id": input.source_id,
+            "target_id": input.target_id,
+            "relation_type": view.relation_type,
+            "confidence": view.confidence,
+            "source_kind": view.source_kind,
+            "evidence_ref": view.evidence_ref,
+            "valid_from_ms": view.valid_from_ms,
+            "valid_to_ms": view.valid_to_ms,
+            "recorded_at_ms": view.recorded_at_ms.unwrap_or(promoted_at_ms),
+            "promoted_at_ms": promoted_at_ms,
+            "promotion_reason": input.reason.unwrap_or_else(|| "relationship_needed_identity".to_string()),
+        }
+    });
+    let superseded_edge = promoted_relationship_edge_payload(hit, &assertion_id, promoted_at_ms)?;
+    let source_edge = json!({
+        "id": source_edge_id,
+        "from_id": input.source_id,
+        "to_id": assertion_id,
+        "type": "ASSERTS_RELATION_SOURCE",
+        "properties": {
+            "relationship_id": view.relationship_id,
+            "promoted_at_ms": promoted_at_ms,
+        }
+    });
+    let target_edge = json!({
+        "id": target_edge_id,
+        "from_id": assertion_id,
+        "to_id": input.target_id,
+        "type": "ASSERTS_RELATION_TARGET",
+        "properties": {
+            "relationship_id": view.relationship_id,
+            "relation_type": view.relation_type,
+            "promoted_at_ms": promoted_at_ms,
+        }
+    });
+    with_invoker(|inv| {
+        let node_payload = inv
+            .bulk_nodes(json!({ "nodes": [assertion.clone()] }))
+            .map_err(map_err)?;
+        ensure_bulk_ok(&node_payload, "promoteEpistemicRelationship node")?;
+        let edge_payload = inv
+            .bulk_edges(json!({ "edges": [superseded_edge, source_edge, target_edge] }))
+            .map_err(map_err)?;
+        ensure_bulk_ok(&edge_payload, "promoteEpistemicRelationship edges")?;
+        Ok(EpistemicRelationshipPromotionResult {
+            assertion_id,
+            assertion: Json(assertion),
+            source_edge_id,
+            target_edge_id,
+            superseded_relationship: view,
+        })
+    })
+}
+
+fn promoted_relationship_edge_payload(
+    hit: &Value,
+    assertion_id: &str,
+    promoted_at_ms: i64,
+) -> GqlResult<Value> {
+    let edge = hit
+        .get("edge")
+        .ok_or_else(|| async_graphql::Error::new("relationship hit missing edge"))?;
+    let relationship_id = value_at_path(edge, &["id"])
+        .and_then(Value::as_str)
+        .ok_or_else(|| async_graphql::Error::new("relationship edge missing id"))?;
+    let from_id = value_at_path(edge, &["from_id"])
+        .or_else(|| value_at_path(edge, &["fromId"]))
+        .and_then(Value::as_str)
+        .ok_or_else(|| async_graphql::Error::new("relationship edge missing from_id"))?;
+    let to_id = value_at_path(edge, &["to_id"])
+        .or_else(|| value_at_path(edge, &["toId"]))
+        .and_then(Value::as_str)
+        .ok_or_else(|| async_graphql::Error::new("relationship edge missing to_id"))?;
+    let edge_type = value_at_path(edge, &["type"])
+        .and_then(Value::as_str)
+        .ok_or_else(|| async_graphql::Error::new("relationship edge missing type"))?;
+    let mut properties = value_at_path(edge, &["properties"])
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let props = ensure_json_object(&mut properties);
+    props.insert("promoted_to".to_string(), json!(assertion_id));
+    props.insert("canonical_assertion_id".to_string(), json!(assertion_id));
+    props.insert("superseded_at_ms".to_string(), json!(promoted_at_ms));
+    Ok(json!({
+        "id": relationship_id,
+        "from_id": from_id,
+        "to_id": to_id,
+        "type": edge_type,
+        "confidence": value_at_path(edge, &["confidence"]).cloned().unwrap_or(Value::Null),
+        "epistemic_type": value_at_path(edge, &["epistemic_type"]).cloned().unwrap_or(Value::Null),
+        "properties": properties,
+    }))
+}
+
+fn ensure_json_object(value: &mut Value) -> &mut Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value.as_object_mut().expect("json object")
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use rustyred_thg_core::{
-        InMemoryGraphStore, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+        EdgeRecord, EpistemicType, GraphStore, InMemoryGraphStore, NodeRecord, RedCoreDurability,
+        RedCoreGraphStore, RedCoreOptions,
     };
     use serde_json::{json, Value};
 
@@ -1522,6 +2120,34 @@ mod tests {
             }),
             OpKind::Mutate,
         )
+    }
+
+    fn put_content(store: &SharedStore<InMemoryGraphStore>, id: &str, properties: Value) {
+        store.with_store(|inner| {
+            GraphStore::upsert_node(inner, NodeRecord::new(id, ["Claim"], properties))
+                .expect("content node");
+        });
+    }
+
+    fn put_epistemic_edge(
+        store: &SharedStore<InMemoryGraphStore>,
+        id: &str,
+        from_id: &str,
+        edge_type: &str,
+        to_id: &str,
+        properties: Value,
+        epistemic_type: EpistemicType,
+        confidence: f64,
+    ) {
+        store.with_store(|inner| {
+            GraphStore::upsert_edge(
+                inner,
+                EdgeRecord::new(id, from_id, edge_type, to_id, properties)
+                    .with_epistemic_type(epistemic_type)
+                    .with_confidence(confidence),
+            )
+            .expect("epistemic edge");
+        });
     }
 
     fn temp_redcore_dir(name: &str) -> std::path::PathBuf {
@@ -1630,6 +2256,176 @@ mod tests {
         assert_eq!(hits[0]["embeddingSetId"], "mv:doc:a", "{searched}");
         assert_eq!(hits[0]["scorer"], "exact_float", "{searched}");
         assert_eq!(hits[0]["vectorCount"], 2, "{searched}");
+    }
+
+    #[test]
+    fn multivector_graph_aware_cascade_uses_epistemic_standing() {
+        let store = SharedStore::new(InMemoryGraphStore::new());
+        put_content(
+            &store,
+            "doc:trusted",
+            json!({
+                "acceptance_status": "supported",
+                "epistemic_weight": 1.2,
+                "source_reliability": 0.9,
+            }),
+        );
+        put_content(
+            &store,
+            "doc:weak",
+            json!({
+                "acceptance_status": "undercut",
+                "epistemic_weight": 0.8,
+                "source_reliability": 0.2,
+            }),
+        );
+        let indexed_trusted = upsert_doc(store.clone(), "doc:trusted", json!([[0.7, 0.3]]));
+        assert_eq!(indexed_trusted["errors"], Value::Null, "{indexed_trusted}");
+        let indexed_weak = upsert_doc(store.clone(), "doc:weak", json!([[1.0, 0.0]]));
+        assert_eq!(indexed_weak["errors"], Value::Null, "{indexed_weak}");
+
+        let searched = run(
+            store,
+            "query($q:[[Float!]!]!){
+                multiVectorSearch(
+                    queryVectors:$q,
+                    modelId:\"colpali-fixture\",
+                    limit:2,
+                    exactRerankLimit:2,
+                    rankRules:[EPISTEMIC_STATUS,VECTOR],
+                    includeEpistemic:true
+                ){
+                    contentId
+                    score
+                    vectorScore
+                    ranker
+                    components
+                }
+            }",
+            json!({ "q": [[1.0, 0.0]] }),
+            OpKind::Query,
+        );
+        assert_eq!(searched["errors"], Value::Null, "{searched}");
+        let hits = searched["data"]["multiVectorSearch"]
+            .as_array()
+            .expect("hits array");
+        assert_eq!(hits[0]["contentId"], "doc:trusted", "{searched}");
+        assert_eq!(hits[0]["ranker"], "graph_aware_cascade", "{searched}");
+        assert!(
+            hits[0]["vectorScore"].as_f64().unwrap() < hits[1]["vectorScore"].as_f64().unwrap(),
+            "epistemic-first cascade should outrank the stronger raw vector hit: {searched}"
+        );
+        assert_eq!(
+            hits[0]["components"]["acceptance_status"], "supported",
+            "{searched}"
+        );
+    }
+
+    #[test]
+    fn epistemic_facet_supports_as_of_evidence_and_promotion() {
+        let store = SharedStore::new(InMemoryGraphStore::new());
+        put_content(&store, "claim:a", json!({"claim_text": "alpha"}));
+        put_content(&store, "claim:b", json!({"claim_text": "beta"}));
+        put_content(
+            &store,
+            "evidence:1",
+            json!({"body": "source paragraph", "kind": "evidence"}),
+        );
+        put_epistemic_edge(
+            &store,
+            "edge:ab",
+            "claim:a",
+            "SUPPORTS",
+            "claim:b",
+            json!({
+                "evidence_ref": "graph://evidence:1",
+                "valid_from_ms": 1_000,
+                "valid_to_ms": 2_000,
+                "recorded_at_ms": 900,
+            }),
+            EpistemicType::Supports,
+            0.7,
+        );
+
+        let active = run(
+            store.clone(),
+            "query{
+                contentNode(id:\"claim:a\"){
+                    epistemic{
+                        standingView(asOfMs:1500){ source stale supportInDegree receipt{ asOfMs } }
+                        relationshipViews(maxDepth:1, asOfMs:1500){ relationshipId evidenceRef }
+                        evidence(evidenceRef:\"graph://evidence:1\"){ found source body }
+                    }
+                }
+            }",
+            json!({}),
+            OpKind::Query,
+        );
+        assert_eq!(active["errors"], Value::Null, "{active}");
+        let facet = &active["data"]["contentNode"]["epistemic"];
+        assert_eq!(facet["standingView"]["source"], "degree_fallback_as_of");
+        assert_eq!(facet["standingView"]["receipt"]["asOfMs"], json!(1500));
+        assert_eq!(
+            facet["relationshipViews"][0]["evidenceRef"],
+            "graph://evidence:1"
+        );
+        assert_eq!(facet["evidence"]["found"], true);
+        assert_eq!(facet["evidence"]["source"], "graph_node");
+
+        let inactive = run(
+            store.clone(),
+            "query{
+                contentNode(id:\"claim:a\"){
+                    epistemic{
+                        relationshipViews(maxDepth:1, asOfMs:2500){ relationshipId }
+                    }
+                }
+            }",
+            json!({}),
+            OpKind::Query,
+        );
+        assert_eq!(inactive["errors"], Value::Null, "{inactive}");
+        assert!(
+            inactive["data"]["contentNode"]["epistemic"]["relationshipViews"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{inactive}"
+        );
+
+        let promoted = run(
+            store.clone(),
+            "mutation{
+                promoteEpistemicRelationship(input:{
+                    relationshipId:\"edge:ab\",
+                    sourceId:\"claim:a\",
+                    targetId:\"claim:b\"
+                }){
+                    assertionId
+                    sourceEdgeId
+                    targetEdgeId
+                    supersededRelationship{ relationshipId }
+                }
+            }",
+            json!({}),
+            OpKind::Mutate,
+        );
+        assert_eq!(promoted["errors"], Value::Null, "{promoted}");
+        let assertion_id = promoted["data"]["promoteEpistemicRelationship"]["assertionId"]
+            .as_str()
+            .expect("assertion id")
+            .to_string();
+        store.with_store(|inner| {
+            let assertion = GraphStore::get_node(inner, &assertion_id).expect("assertion node");
+            assert!(assertion.labels.contains(&"EpistemicAssertion".to_string()));
+            let edge = GraphStore::get_edge(inner, "edge:ab").expect("promoted edge");
+            assert_eq!(
+                edge.properties
+                    .get("canonical_assertion_id")
+                    .and_then(Value::as_str),
+                Some(assertion_id.as_str())
+            );
+        });
     }
 
     #[test]

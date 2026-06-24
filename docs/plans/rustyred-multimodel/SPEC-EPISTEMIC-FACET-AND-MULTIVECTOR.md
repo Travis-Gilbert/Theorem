@@ -329,6 +329,22 @@ Current implementation slice, 2026-06-23:
   the disk object store and keeps only a `cold://document/sha256:...` ref on the
   exact artifact node. In-memory backends keep the graph-node fallback for tests
   and ephemeral use.
+- `multiVectorSearch` can now run a graph-aware cascade ranker when callers pass
+  graph seeds, rank rules, `includeEpistemic`, or `asOfMs`. The raw vector score
+  remains visible as `vectorScore`; `score` becomes the final cascade rank, and
+  `components` carries vector/PPR/source-reliability/standing buckets.
+- `ContentNode.epistemic` now accepts `asOfMs` on standing and relationships.
+  Historical standing uses filtered canonical edge degrees instead of current
+  shadow PPR, so a future edge does not leak into an `asOf` read.
+- `ContentNode.epistemic.evidence(evidenceRef)` hydrates only the selected
+  evidence ref (`graph://...`, `cold://document/sha256:...`, bare node id, or
+  bare `sha256:...`). No relationship query hydrates evidence by default.
+- `promoteEpistemicRelationship` writes an `EpistemicAssertion` node and the
+  two assertion edges, while marking the original edge with
+  `canonical_assertion_id` / `superseded_at_ms`.
+- `epistemic_enrich_apply` now exposes deterministic `computedAtMs` through
+  GraphQL, and the projection persistence path sorts shadow nodes/edges and
+  returns a stable `projection_hash`.
 
 ## Multi-Vector Retrieval
 
@@ -382,6 +398,58 @@ Acceptance for the study gate:
   exact rerank hydrates from the disk object store by ref.
 - Compile the Candle ColPali inference path behind an opt-in feature, then
   record a local benchmark before committing to a production ingestion path.
+
+Current fixture benchmark, recorded 2026-06-24 on the default dev build:
+
+Command:
+
+```bash
+cd rustyredcore_THG
+cargo run -p rustyred-thg-ml --example multivector_bench
+```
+
+Config: corpus=96, queries=12, vectors_per_document=32, dim=128,
+exact_top_k=10.
+
+| candidate_top_k | exact_top_k | recall | overlap | missing | exact_ms | binary_ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 10 | 0.408 | 49 | 71 | 524.868 | 29.816 |
+| 20 | 10 | 0.558 | 67 | 53 | 562.133 | 30.507 |
+| 40 | 10 | 0.767 | 92 | 28 | 528.382 | 29.567 |
+| 80 | 10 | 0.950 | 114 | 6 | 542.803 | 32.382 |
+
+| vectors | dim | exact_f32_bytes | exact_f16_bytes | binary_bytes | f32_binary_ratio | f16_binary_ratio |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 128 | 16384 | 8192 | 512 | 32.0 | 16.0 |
+
+| backend | status | notes |
+|---|---|---|
+| hashing_fixture_cpu | measured | Default deterministic producer/search oracle; no model weights required. |
+| candle_colpali_cpu | feature_disabled | Feature-gated producer; real run needs ColPali weights and tokenizer. |
+| candle_colpali_metal | not_wired | The current producer selects CPU only; Metal needs explicit feature/device wiring before measurement. |
+| candle_colpali_cuda | not_wired | The current producer selects CPU only; CUDA needs explicit feature/device wiring before measurement. |
+
+## Railway Operations
+
+RustyRedCore is still a stateful embedded primary on Railway, with `/data`
+mounted into the application container. A two-replica Railway
+`multiRegionConfig` was present during the June 24 deploy checks, and the
+RustyRedCore deployments were failing before any memory validation could run.
+The source manifest now keeps the primary at one replica:
+
+```toml
+[deploy.multiRegionConfig."us-east4-eqdc4a"]
+numReplicas = 1
+```
+
+Operational rule:
+
+- Do not scale the writable RustyRedCore primary horizontally while it owns the
+  mounted volume. Memory pressure should be reduced by hot/cold tiering,
+  bounded caches, and explicit cold hydration first.
+- Add a replica only as a separately designed read/projection tier, or after the
+  writable state moves behind storage that supports the intended consistency
+  model.
 
 ## Implementation Phases
 

@@ -133,6 +133,7 @@ impl EpistemicMutation {
         mode: Option<String>,
         engine: Option<String>,
         engine_version: Option<String>,
+        computed_at_ms: Option<i64>,
         density_floor: Option<f64>,
     ) -> GqlResult<Json> {
         let mut args = json!({ "annotations": annotations.0 });
@@ -148,6 +149,9 @@ impl EpistemicMutation {
         }
         if let Some(engine_version) = engine_version {
             obj.insert("engine_version".to_string(), json!(engine_version));
+        }
+        if let Some(computed_at_ms) = computed_at_ms {
+            obj.insert("computed_at".to_string(), json!(computed_at_ms));
         }
         if let Some(density_floor) = density_floor {
             obj.insert("density_floor".to_string(), json!(density_floor));

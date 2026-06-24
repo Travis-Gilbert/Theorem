@@ -4,6 +4,7 @@
 //! Model-specific policy, admission, quarantine, and graph mutation stay in
 //! the consuming crates.
 
+pub mod benchmark;
 pub mod multivector;
 pub mod producer;
 
@@ -11,6 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use rustyred_thg_core::{ThgError, ThgResult};
 
+pub use benchmark::{
+    run_fixture_benchmark, MultiVectorBackendRow, MultiVectorBenchmarkConfig,
+    MultiVectorBenchmarkReport, MultiVectorBenchmarkRow,
+};
 pub use multivector::{
     binary_hamming_maxsim_score, binary_projection_bytes, exact_f16_bytes, exact_f32_bytes,
     exact_maxsim_score, quantize_sign_bits, rank_binary_hamming_maxsim, rank_exact_maxsim,

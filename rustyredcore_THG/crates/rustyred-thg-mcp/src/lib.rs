@@ -3165,8 +3165,9 @@ fn epistemic_enrich_apply_payload(
         "report": report,
         "shadows_written": shadows_written,
         "shadow_edges_written": shadow_edges_written,
-        "persisted_shadow_nodes": persisted.0,
-        "persisted_shadow_edges": persisted.1,
+        "persisted_shadow_nodes": persisted.shadow_nodes,
+        "persisted_shadow_edges": persisted.shadow_edges,
+        "projection_hash": persisted.projection_hash,
     }))
 }
 
@@ -3198,26 +3199,46 @@ fn in_memory_store_from_backend(
     Ok(store)
 }
 
+struct PersistedEpistemicProjection {
+    shadow_nodes: usize,
+    shadow_edges: usize,
+    projection_hash: String,
+}
+
 fn persist_epistemic_projection(
     backend: &mut impl McpGraphBackend,
     store: &InMemoryGraphStore,
-) -> Result<(usize, usize), McpError> {
+) -> Result<PersistedEpistemicProjection, McpError> {
     let snapshot = GraphStore::graph_snapshot(store)?;
-    let mut nodes = 0usize;
-    let mut edges = 0usize;
-    for node in snapshot.nodes {
-        if is_epistemic_shadow_node(&node) {
-            backend.upsert_node(node)?;
-            nodes += 1;
-        }
+    let mut projection_nodes = snapshot
+        .nodes
+        .into_iter()
+        .filter(is_epistemic_shadow_node)
+        .collect::<Vec<_>>();
+    let mut projection_edges = snapshot
+        .edges
+        .into_iter()
+        .filter(is_epistemic_shadow_edge)
+        .collect::<Vec<_>>();
+    projection_nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    projection_edges.sort_by(|left, right| left.id.cmp(&right.id));
+    let projection_hash = stable_value_hash(&json!({
+        "nodes": projection_nodes.clone(),
+        "edges": projection_edges.clone(),
+    }));
+    let shadow_nodes = projection_nodes.len();
+    let shadow_edges = projection_edges.len();
+    for node in projection_nodes {
+        backend.upsert_node(node)?;
     }
-    for edge in snapshot.edges {
-        if is_epistemic_shadow_edge(&edge) {
-            backend.upsert_edge(edge)?;
-            edges += 1;
-        }
+    for edge in projection_edges {
+        backend.upsert_edge(edge)?;
     }
-    Ok((nodes, edges))
+    Ok(PersistedEpistemicProjection {
+        shadow_nodes,
+        shadow_edges,
+        projection_hash,
+    })
 }
 
 fn inferred_epistemic_dirty_nodes(store: &InMemoryGraphStore) -> Result<Vec<String>, McpError> {
