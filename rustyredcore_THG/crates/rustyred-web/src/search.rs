@@ -30,11 +30,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::future::join_all;
 use rustyred_thg_core::graph_store::{GraphStore, NeighborQuery, NodeQuery, NodeRecord};
 use rustyred_thg_core::personalized_pagerank;
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 #[cfg(feature = "vector-accelerated")]
 use turbovec::IdMapIndex;
 use url::Url;
@@ -62,6 +64,8 @@ const DEFAULT_RRF_K: usize = 60;
 const DEFAULT_PROVIDER_LIMIT: usize = 10;
 /// Total deduped candidates returned after fan-out + RRF merge.
 const DEFAULT_ACQUISITION_LIMIT: usize = 16;
+/// Maximum time to wait for one external search provider before admitting partial results.
+const DEFAULT_PROVIDER_TIMEOUT_MS: u64 = 6_000;
 /// Hash embedding dimensionality for the standalone dense layer.
 const DENSE_DIM: usize = 128;
 /// TurboVec quantization bit width for ephemeral local search indexes.
@@ -119,6 +123,9 @@ pub struct SearchOpts {
     pub limit: usize,
     /// Reciprocal-rank fusion constant.
     pub rrf_k: usize,
+    /// Per-provider wall-clock timeout. Slow providers fail soft through receipts.
+    #[serde(default = "default_provider_timeout_ms")]
+    pub provider_timeout_ms: u64,
 }
 
 impl Default for SearchOpts {
@@ -127,8 +134,13 @@ impl Default for SearchOpts {
             provider_limit: DEFAULT_PROVIDER_LIMIT,
             limit: DEFAULT_ACQUISITION_LIMIT,
             rrf_k: DEFAULT_RRF_K,
+            provider_timeout_ms: DEFAULT_PROVIDER_TIMEOUT_MS,
         }
     }
+}
+
+fn default_provider_timeout_ms() -> u64 {
+    DEFAULT_PROVIDER_TIMEOUT_MS
 }
 
 impl SearchOpts {
@@ -136,6 +148,7 @@ impl SearchOpts {
         self.provider_limit = self.provider_limit.max(1);
         self.limit = self.limit.max(1);
         self.rrf_k = self.rrf_k.max(1);
+        self.provider_timeout_ms = self.provider_timeout_ms.clamp(1, 120_000);
         self
     }
 }
@@ -319,9 +332,17 @@ pub async fn fanout_search_providers(
 ) -> SearchAcquisition {
     let opts = opts.normalized();
     let normalized_query = query.trim().to_string();
+    let provider_timeout = Duration::from_millis(opts.provider_timeout_ms);
     let calls = providers.iter().map(|provider| async {
         let provider_name = provider.name().trim().to_string();
-        let result = provider.search(&normalized_query, &opts).await;
+        let result =
+            match timeout(provider_timeout, provider.search(&normalized_query, &opts)).await {
+                Ok(result) => result,
+                Err(_) => Err(SearchProviderError::new(
+                    provider_name.clone(),
+                    format!("provider timed out after {}ms", opts.provider_timeout_ms),
+                )),
+            };
         (provider_name, result)
     });
     let results = join_all(calls).await;
@@ -1070,6 +1091,46 @@ mod tests {
         store
     }
 
+    #[derive(Clone, Debug)]
+    struct SlowSearchProvider {
+        name: String,
+        delay_ms: u64,
+    }
+
+    impl SlowSearchProvider {
+        fn new(name: impl Into<String>, delay_ms: u64) -> Self {
+            Self {
+                name: name.into(),
+                delay_ms,
+            }
+        }
+    }
+
+    impl SearchProvider for SlowSearchProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _opts: &'a SearchOpts,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<SearchCandidate>, SearchProviderError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+                Ok(vec![SearchCandidate {
+                    url: "https://slow.example.com/result".to_string(),
+                    title: Some("Slow result".to_string()),
+                    snippet: None,
+                    source: self.name.clone(),
+                    rank: 1,
+                }])
+            })
+        }
+    }
+
     fn urls(search: &SubstrateSearch) -> Vec<String> {
         search.hits.iter().map(|h| h.url.clone()).collect()
     }
@@ -1394,6 +1455,57 @@ mod tests {
             acquisition.seed_urls(1),
             vec!["https://Example.com/a#section".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn provider_fanout_times_out_slow_providers_and_keeps_fast_results() {
+        let providers: Vec<Arc<dyn SearchProvider>> = vec![
+            Arc::new(StaticSearchProvider::new(
+                "fast",
+                vec![SearchCandidate {
+                    url: "https://fast.example.com/result".to_string(),
+                    title: Some("Fast result".to_string()),
+                    snippet: Some("available immediately".to_string()),
+                    source: "fast".to_string(),
+                    rank: 1,
+                }],
+            )),
+            Arc::new(SlowSearchProvider::new("slow", 80)),
+        ];
+        let started = std::time::Instant::now();
+
+        let acquisition = fanout_search_providers(
+            &providers,
+            "provider timeout",
+            SearchOpts {
+                provider_limit: 5,
+                limit: 5,
+                rrf_k: 60,
+                provider_timeout_ms: 10,
+            },
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "slow providers should not hold the whole fan-out open"
+        );
+        assert_eq!(acquisition.candidates.len(), 1);
+        assert_eq!(
+            acquisition.candidates[0].candidate.url,
+            "https://fast.example.com/result"
+        );
+        let slow_receipt = acquisition
+            .providers
+            .iter()
+            .find(|receipt| receipt.provider == "slow")
+            .expect("slow provider receipt");
+        assert_eq!(slow_receipt.status, "error");
+        assert_eq!(slow_receipt.returned_candidates, 0);
+        assert!(slow_receipt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out after 10ms")));
     }
 
     #[tokio::test]

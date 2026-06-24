@@ -2320,6 +2320,7 @@ fn live_search_acquisition_job(
     )
     .map_err(|error| error.payload())?;
     let provider_allowlist = string_array_argument(arguments, "providers");
+    let default_opts = SearchOpts::default();
     let opts = SearchOpts {
         provider_limit: argument_u64_any(arguments, &["provider_limit", "providerLimit"])
             .unwrap_or(10)
@@ -2330,6 +2331,12 @@ fn live_search_acquisition_job(
         rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
             .unwrap_or(60)
             .clamp(1, 1_000) as usize,
+        provider_timeout_ms: argument_u64_any(
+            arguments,
+            &["provider_timeout_ms", "providerTimeoutMs"],
+        )
+        .unwrap_or(default_opts.provider_timeout_ms)
+        .clamp(100, 30_000),
     };
     let seed_limit = argument_u64_any(arguments, &["seed_limit", "seedLimit"])
         .unwrap_or(8)
@@ -2486,6 +2493,12 @@ fn web_search_graph_job(
         rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
             .map(|value| value.clamp(1, 1_000) as usize)
             .unwrap_or(options.acquisition.rrf_k),
+        provider_timeout_ms: argument_u64_any(
+            arguments,
+            &["provider_timeout_ms", "providerTimeoutMs"],
+        )
+        .unwrap_or(options.acquisition.provider_timeout_ms)
+        .clamp(100, 30_000),
     };
     if let Some(budget_tokens) = argument_u64_any(arguments, &["budget_tokens", "budgetTokens"]) {
         options.budget_tokens = budget_tokens.clamp(1, 1_000_000) as usize;
@@ -2927,6 +2940,12 @@ fn live_fractal_expansion_job(
         rrf_k: argument_u64_any(arguments, &["rrf_k", "rrfK"])
             .unwrap_or(60)
             .clamp(1, 1_000) as usize,
+        provider_timeout_ms: argument_u64_any(
+            arguments,
+            &["provider_timeout_ms", "providerTimeoutMs"],
+        )
+        .unwrap_or(SearchOpts::default().provider_timeout_ms)
+        .clamp(100, 30_000),
     };
     let actor_id = request
         .actor_id

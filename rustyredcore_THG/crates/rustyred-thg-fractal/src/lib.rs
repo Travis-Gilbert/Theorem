@@ -1375,6 +1375,7 @@ mod tests {
                 provider_limit: 2,
                 limit: 2,
                 rrf_k: 60,
+                provider_timeout_ms: SearchOpts::default().provider_timeout_ms,
             },
         )
         .await
