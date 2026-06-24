@@ -97,7 +97,10 @@ impl ItemQuery {
     /// is not a node the Item domain projects.
     async fn item(&self, id: ID) -> GqlResult<Option<Item>> {
         let node = with_invoker(|inv| inv.item_node(id.as_str()).map_err(map_err))?;
-        Ok(node.as_ref().and_then(projection::project_node).map(Item::from))
+        Ok(node
+            .as_ref()
+            .and_then(projection::project_node)
+            .map(Item::from))
     }
 }
 
@@ -191,7 +194,7 @@ mod tests {
 
     fn run_query(store: InMemoryGraphStore, query: &str) -> Value {
         let args = json!({ "query": query });
-        execute_graphql("tenant-a", store, &args, OpKind::Query).expect("graphql query runs")
+        execute_graphql("tenant-a", store, &args, OpKind::Query, false).expect("graphql query runs")
     }
 
     // SPEC-2 acceptance 1 + 3: a work-graph task node yields a projected Item
@@ -227,9 +230,11 @@ mod tests {
         // Same field set as the projected task; only kind/source differ by origin.
         assert_eq!(item["kind"], "note");
         assert_eq!(item["source"], "commonplace");
-        assert_eq!(item.as_object().unwrap().keys().collect::<Vec<_>>(),
-                   task.as_object().unwrap().keys().collect::<Vec<_>>(),
-                   "harness-origin and user-origin Items share one shape");
+        assert_eq!(
+            item.as_object().unwrap().keys().collect::<Vec<_>>(),
+            task.as_object().unwrap().keys().collect::<Vec<_>>(),
+            "harness-origin and user-origin Items share one shape"
+        );
     }
 
     #[test]
@@ -304,7 +309,7 @@ mod tests {
                 "extra": { "type_key": "notes", "order": 50, "enabled": true }
             }}
         });
-        let wrote = execute_graphql("tenant-a", shared.clone(), &mutate, OpKind::Mutate)
+        let wrote = execute_graphql("tenant-a", shared.clone(), &mutate, OpKind::Mutate, false)
             .expect("mutation runs");
         assert_eq!(wrote["errors"], Value::Null, "{wrote}");
         assert_eq!(wrote["data"]["putItem"]["kind"], "space_type");
@@ -318,6 +323,7 @@ mod tests {
             shared.clone(),
             &json!({ "query": "{ itemsByKind(kind: \"space_type\"){ id title extra } }" }),
             OpKind::Query,
+            false,
         )
         .expect("query runs");
         assert_eq!(read["errors"], Value::Null, "{read}");

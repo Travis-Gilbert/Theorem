@@ -5,7 +5,15 @@
 //! `bulk*` as mutations. Every resolver lowers to the matching `*_payload`
 //! handler through the scoped invoker; no graph logic is reimplemented here.
 
-use async_graphql::{Enum, Object, Result as GqlResult, SimpleObject, ID};
+use std::collections::BTreeMap;
+
+use async_graphql::{Enum, InputObject, Object, Result as GqlResult, SimpleObject, ID};
+use rustyred_thg_core::{NodeRecord, ThgError};
+use rustyred_thg_ml::{
+    project_multivector_tiers, quantize_sign_bits, rank_binary_hamming_maxsim,
+    rerank_exact_maxsim_bounded, BinaryMultiVectorSet, MaxSimAggregation, MaxSimScorer,
+    MultiVectorEmbeddingSet, MultiVectorManifest, MultiVectorScore,
+};
 use serde_json::{json, Value};
 
 use super::scalars::Json;
@@ -14,6 +22,12 @@ use super::{map_err, with_invoker};
 const DEFAULT_EPISTEMIC_TYPES: &[&str] =
     &["supports", "contradicts", "tension", "derives", "cites"];
 const HAS_EPISTEMIC_SHADOW_EDGE: &str = "HasEpistemicShadow";
+const MULTIVECTOR_MANIFEST_LABEL: &str = "MultiVectorManifest";
+const MULTIVECTOR_EXACT_LABEL: &str = "ColdMultiVectorArtifact";
+const MULTIVECTOR_BINARY_LABEL: &str = "HotMultiVectorProjection";
+const HAS_MULTIVECTOR_EDGE: &str = "HAS_MULTIVECTOR";
+const HAS_EXACT_MULTIVECTOR_EDGE: &str = "HAS_EXACT_MULTIVECTOR";
+const HAS_BINARY_MULTIVECTOR_EDGE: &str = "HAS_BINARY_MULTIVECTOR";
 
 /// Which graph algorithm to run. The eight flat tools become this enum x `inline`.
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
@@ -59,6 +73,102 @@ pub struct BulkResult {
     pub epistemic_dirty_nodes_marked: i32,
 }
 
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum MultiVectorAggregation {
+    Sum,
+    Mean,
+}
+
+impl From<MultiVectorAggregation> for MaxSimAggregation {
+    fn from(value: MultiVectorAggregation) -> Self {
+        match value {
+            MultiVectorAggregation::Sum => MaxSimAggregation::Sum,
+            MultiVectorAggregation::Mean => MaxSimAggregation::Mean,
+        }
+    }
+}
+
+#[derive(InputObject)]
+pub struct MultiVectorExactInput {
+    pub embedding_set_id: String,
+    pub content_id: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub vectors: Vec<Vec<f64>>,
+    pub exact_object_ref: Option<String>,
+    pub binary_projection_ref: Option<String>,
+}
+
+#[derive(Clone, SimpleObject)]
+pub struct MultiVectorManifestView {
+    pub embedding_set_id: String,
+    pub content_id: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub dim: i32,
+    pub vector_count: i32,
+    pub exact_object_ref: Option<String>,
+    pub binary_projection_ref: Option<String>,
+    pub exact_bytes: i32,
+    pub binary_projection_bytes: i32,
+    pub exact_to_binary_byte_ratio: f64,
+}
+
+#[derive(SimpleObject)]
+pub struct MultiVectorUpsertResult {
+    pub manifest: MultiVectorManifestView,
+    pub exact_artifact_id: String,
+    pub binary_projection_id: String,
+    pub binary_projection: Json,
+}
+
+#[derive(SimpleObject)]
+pub struct MultiVectorSearchHit {
+    pub content_id: String,
+    pub embedding_set_id: String,
+    pub score: f64,
+    pub scorer: String,
+    pub vector_count: i32,
+}
+
+#[derive(Clone, serde::Serialize, SimpleObject)]
+pub struct EpistemicProjectionReceipt {
+    pub source: String,
+    pub stale: bool,
+    pub graph_version: Option<i64>,
+    pub projection_version: Option<String>,
+    pub computed_at_ms: Option<i64>,
+}
+
+#[derive(SimpleObject)]
+pub struct EpistemicStandingView {
+    pub source: String,
+    pub stale: bool,
+    pub scores: Json,
+    pub support_in_degree: i32,
+    pub attack_in_degree: i32,
+    pub receipt: EpistemicProjectionReceipt,
+}
+
+#[derive(SimpleObject)]
+pub struct EpistemicRelationshipView {
+    pub relationship_id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub relation_type: String,
+    pub direction: String,
+    pub confidence: Option<f64>,
+    pub source_kind: Option<String>,
+    pub evidence_ref: Option<String>,
+    pub assertion_id: Option<String>,
+    pub valid_from_ms: Option<i64>,
+    pub valid_to_ms: Option<i64>,
+    pub recorded_at_ms: Option<i64>,
+    pub superseded_at_ms: Option<i64>,
+    pub receipt: EpistemicProjectionReceipt,
+    pub raw: Json,
+}
+
 pub struct ContentNode {
     id: String,
     raw: Json,
@@ -88,18 +198,61 @@ pub struct EpistemicFacet {
 #[Object]
 impl EpistemicFacet {
     async fn standing(&self, top_k: Option<i32>) -> GqlResult<Json> {
+        let standing = standing_view_for_node(&self.node_id, top_k)?;
+        Ok(Json(json!({
+            "source": standing.source.clone(),
+            "scores": standing.scores.0.clone(),
+            "support_in_degree": standing.support_in_degree,
+            "attack_in_degree": standing.attack_in_degree,
+            "stale": standing.stale,
+            "receipt": standing.receipt.clone(),
+        })))
+    }
+
+    async fn standing_view(&self, top_k: Option<i32>) -> GqlResult<EpistemicStandingView> {
+        standing_view_for_node(&self.node_id, top_k)
+    }
+
+    async fn relationships(
+        &self,
+        epistemic_types: Option<Vec<String>>,
+        min_confidence: Option<f64>,
+        max_depth: Option<i32>,
+    ) -> GqlResult<Json> {
+        Ok(Json(Value::Array(relationship_hits_for_node(
+            &self.node_id,
+            epistemic_types,
+            min_confidence,
+            max_depth,
+        )?)))
+    }
+
+    async fn relationship_views(
+        &self,
+        epistemic_types: Option<Vec<String>>,
+        min_confidence: Option<f64>,
+        max_depth: Option<i32>,
+    ) -> GqlResult<Vec<EpistemicRelationshipView>> {
+        relationship_hits_for_node(&self.node_id, epistemic_types, min_confidence, max_depth)?
+            .iter()
+            .map(|hit| relationship_view_from_hit(&self.node_id, hit))
+            .collect()
+    }
+}
+
+fn standing_view_for_node(node_id: &str, top_k: Option<i32>) -> GqlResult<EpistemicStandingView> {
+    with_invoker(|inv| {
         let mut seeds = serde_json::Map::new();
-        seeds.insert(self.node_id.clone(), json!(1.0));
+        seeds.insert(node_id.to_string(), json!(1.0));
         let args = json!({
             "seeds": Value::Object(seeds),
             "top_k": top_k.unwrap_or(8).max(1),
         });
-        let shadow = with_invoker(|inv| inv.epistemic_shadow_ppr(args.clone()).map_err(map_err))?;
-        let relationship_args = epistemic_neighbor_args(&self.node_id, None, None, Some(1));
-        let relationships = with_invoker(|inv| {
-            inv.epistemic_neighbors(relationship_args.clone())
-                .map_err(map_err)
-        })?;
+        let shadow = inv.epistemic_shadow_ppr(args.clone()).map_err(map_err)?;
+        let relationship_args = epistemic_neighbor_args(node_id, None, None, Some(1));
+        let relationships = inv
+            .epistemic_neighbors(relationship_args.clone())
+            .map_err(map_err)?;
         let direct = relationships
             .get("results")
             .and_then(Value::as_array)
@@ -111,45 +264,67 @@ impl EpistemicFacet {
             .as_array()
             .map(|arr| !arr.is_empty())
             .unwrap_or(false);
-
-        Ok(Json(json!({
-            "source": if has_scores { "shadow_ppr" } else { "degree_fallback" },
-            "scores": scores,
-            "support_in_degree": support_in_degree,
-            "attack_in_degree": attack_in_degree,
-            "stale": !has_scores,
-        })))
-    }
-
-    async fn relationships(
-        &self,
-        epistemic_types: Option<Vec<String>>,
-        min_confidence: Option<f64>,
-        max_depth: Option<i32>,
-    ) -> GqlResult<Json> {
-        let fallback_types = epistemic_types.clone();
-        let explicit_empty_filter = epistemic_types
-            .as_ref()
-            .map(|values| values.is_empty())
-            .unwrap_or(false);
-        let args =
-            epistemic_neighbor_args(&self.node_id, epistemic_types, min_confidence, max_depth);
-        let payload = with_invoker(|inv| inv.epistemic_neighbors(args.clone()).map_err(map_err))?;
-        let mut results = payload
-            .get("results")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if results.is_empty() && !explicit_empty_filter {
-            results = legacy_shadow_relationships(
-                &self.node_id,
-                fallback_types,
-                min_confidence,
-                max_depth,
-            )?;
+        let shadow_node = if has_scores {
+            first_shadow_node(&shadow)
+                .and_then(|shadow_node_id| inv.get_doc(&shadow_node_id).ok().flatten())
+        } else {
+            None
+        };
+        let computed_at_ms = shadow_node.as_ref().and_then(|node| {
+            value_at_path(node, &["properties", "computed_at"]).and_then(value_i64)
+        });
+        let projection_version = shadow_node.as_ref().and_then(|node| {
+            value_at_path(node, &["properties", "engine_version"])
+                .or_else(|| value_at_path(node, &["properties", "projection_version"]))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        let source = if has_scores {
+            "shadow_ppr"
+        } else {
+            "degree_fallback"
         }
-        Ok(Json(Value::Array(results)))
+        .to_string();
+        let stale = !has_scores;
+        Ok(EpistemicStandingView {
+            source: source.clone(),
+            stale,
+            scores: Json(scores),
+            support_in_degree: support_in_degree as i32,
+            attack_in_degree: attack_in_degree as i32,
+            receipt: EpistemicProjectionReceipt {
+                source,
+                stale,
+                graph_version: None,
+                projection_version,
+                computed_at_ms,
+            },
+        })
+    })
+}
+
+fn relationship_hits_for_node(
+    node_id: &str,
+    epistemic_types: Option<Vec<String>>,
+    min_confidence: Option<f64>,
+    max_depth: Option<i32>,
+) -> GqlResult<Vec<Value>> {
+    let fallback_types = epistemic_types.clone();
+    let explicit_empty_filter = epistemic_types
+        .as_ref()
+        .map(|values| values.is_empty())
+        .unwrap_or(false);
+    let args = epistemic_neighbor_args(node_id, epistemic_types, min_confidence, max_depth);
+    let payload = with_invoker(|inv| inv.epistemic_neighbors(args.clone()).map_err(map_err))?;
+    let mut results = payload
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if results.is_empty() && !explicit_empty_filter {
+        results = legacy_shadow_relationships(node_id, fallback_types, min_confidence, max_depth)?;
     }
+    Ok(results)
 }
 
 fn epistemic_neighbor_args(
@@ -238,6 +413,162 @@ fn epistemic_degree_counts(results: &[Value]) -> (usize, usize) {
         }
     }
     (support, attack)
+}
+
+fn first_shadow_node(payload: &Value) -> Option<String> {
+    payload
+        .get("scores")
+        .and_then(Value::as_array)
+        .and_then(|scores| scores.first())
+        .and_then(|score| score.get("shadow_node_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn relationship_view_from_hit(
+    anchor_node_id: &str,
+    hit: &Value,
+) -> GqlResult<EpistemicRelationshipView> {
+    let edge = hit
+        .get("edge")
+        .ok_or_else(|| async_graphql::Error::new("relationship hit missing edge"))?;
+    let node = hit.get("node").unwrap_or(&Value::Null);
+    let relationship_id = value_at_path(edge, &["id"])
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let source_id = value_at_path(edge, &["from_id"])
+        .or_else(|| value_at_path(edge, &["fromId"]))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let edge_target_id = value_at_path(edge, &["to_id"])
+        .or_else(|| value_at_path(edge, &["toId"]))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let node_id = value_at_path(node, &["id"])
+        .and_then(Value::as_str)
+        .unwrap_or(edge_target_id.as_str())
+        .to_string();
+    let target_id = value_at_path(node, &["properties", "content_node_id"])
+        .and_then(Value::as_str)
+        .unwrap_or(node_id.as_str())
+        .to_string();
+    let direction = if source_id == anchor_node_id {
+        "out"
+    } else if edge_target_id == anchor_node_id {
+        "in"
+    } else {
+        "projection"
+    }
+    .to_string();
+    let relation_type = value_at_path(edge, &["epistemic_type"])
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            value_at_path(edge, &["type"])
+                .and_then(Value::as_str)
+                .map(normalize_relationship_type)
+                .unwrap_or_default()
+        });
+    let confidence = value_at_path(edge, &["confidence"])
+        .and_then(Value::as_f64)
+        .or_else(|| value_at_path(edge, &["properties", "confidence"]).and_then(Value::as_f64));
+    let source_kind = string_prop(edge, &["properties", "source_kind"])
+        .or_else(|| string_prop(edge, &["properties", "sourceKind"]));
+    let evidence_ref = string_prop(edge, &["properties", "evidence_ref"])
+        .or_else(|| string_prop(edge, &["properties", "evidenceRef"]))
+        .or_else(|| string_prop(edge, &["properties", "evidence"]));
+    let assertion_id = string_prop(edge, &["properties", "assertion_id"])
+        .or_else(|| string_prop(edge, &["properties", "assertionId"]))
+        .or_else(|| string_prop(edge, &["properties", "promoted_to"]))
+        .or_else(|| string_prop(edge, &["properties", "canonical_assertion_id"]));
+    let projection_source = if value_array_contains(node, &["labels"], "EpistemicShadow") {
+        "shadow_projection"
+    } else {
+        "canonical_edge"
+    }
+    .to_string();
+    let stale = value_at_path(edge, &["properties", "stale"])
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(EpistemicRelationshipView {
+        relationship_id,
+        source_id,
+        target_id,
+        relation_type,
+        direction,
+        confidence,
+        source_kind,
+        evidence_ref,
+        assertion_id,
+        valid_from_ms: int_prop(edge, &["properties", "valid_from_ms"])
+            .or_else(|| int_prop(edge, &["properties", "validFromMs"])),
+        valid_to_ms: int_prop(edge, &["properties", "valid_to_ms"])
+            .or_else(|| int_prop(edge, &["properties", "validToMs"])),
+        recorded_at_ms: int_prop(edge, &["properties", "recorded_at_ms"])
+            .or_else(|| int_prop(edge, &["properties", "recordedAtMs"])),
+        superseded_at_ms: int_prop(edge, &["properties", "superseded_at_ms"])
+            .or_else(|| int_prop(edge, &["properties", "supersededAtMs"])),
+        receipt: EpistemicProjectionReceipt {
+            source: projection_source,
+            stale,
+            graph_version: int_prop(edge, &["properties", "graph_version"])
+                .or_else(|| int_prop(edge, &["properties", "graphVersion"])),
+            projection_version: string_prop(edge, &["properties", "projection_version"])
+                .or_else(|| string_prop(edge, &["properties", "projectionVersion"]))
+                .or_else(|| string_prop(edge, &["properties", "engine_version"]))
+                .or_else(|| string_prop(edge, &["properties", "engineVersion"])),
+            computed_at_ms: int_prop(edge, &["properties", "computed_at"])
+                .or_else(|| int_prop(edge, &["properties", "computedAt"]))
+                .or_else(|| int_prop(edge, &["properties", "computed_at_ms"]))
+                .or_else(|| int_prop(edge, &["properties", "computedAtMs"])),
+        },
+        raw: Json(hit.clone()),
+    })
+}
+
+fn normalize_relationship_type(value: &str) -> String {
+    match value {
+        "Supports" => "supports",
+        "Undercuts" => "contradicts",
+        "SameEClass" => "same_eclass",
+        other => other,
+    }
+    .to_ascii_lowercase()
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn string_prop(value: &Value, path: &[&str]) -> Option<String> {
+    value_at_path(value, path)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn int_prop(value: &Value, path: &[&str]) -> Option<i64> {
+    value_at_path(value, path).and_then(value_i64)
+}
+
+fn value_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+}
+
+fn value_array_contains(value: &Value, path: &[&str], expected: &str) -> bool {
+    value_at_path(value, path)
+        .and_then(Value::as_array)
+        .map(|values| values.iter().any(|value| value.as_str() == Some(expected)))
+        .unwrap_or(false)
 }
 
 /// Parse the `results: [{node_id, score}]` shape the search payloads return.
@@ -524,6 +855,125 @@ impl GraphQuery {
     async fn expected_value(&self, input: Json) -> GqlResult<Json> {
         with_invoker(|inv| Ok(Json(inv.expected_value(input.0.clone()).map_err(map_err)?)))
     }
+
+    /// ColPali-style multi-vector retrieval: hot binary/Hamming candidate search
+    /// with bounded exact MaxSim rerank from the cold artifact node.
+    #[allow(clippy::too_many_arguments)]
+    async fn multi_vector_search(
+        &self,
+        query_vectors: Vec<Vec<f64>>,
+        model_id: Option<String>,
+        content_ids: Option<Vec<String>>,
+        aggregation: Option<MultiVectorAggregation>,
+        limit: Option<i32>,
+        candidate_limit: Option<i32>,
+        exact_rerank_limit: Option<i32>,
+        catalog_limit: Option<i32>,
+    ) -> GqlResult<Vec<MultiVectorSearchHit>> {
+        let aggregation = aggregation.unwrap_or(MultiVectorAggregation::Mean).into();
+        let limit = limit.unwrap_or(10).clamp(1, 256) as usize;
+        let candidate_limit = candidate_limit.unwrap_or(limit as i32 * 4).clamp(1, 4096) as usize;
+        let exact_rerank_limit = exact_rerank_limit.unwrap_or(limit as i32).clamp(0, 4096) as usize;
+        let catalog_limit = catalog_limit.unwrap_or(4096).clamp(1, 50_000) as usize;
+        let query_set = MultiVectorEmbeddingSet {
+            embedding_set_id: "query:adhoc".to_string(),
+            content_id: "query".to_string(),
+            model_id: model_id.clone().unwrap_or_else(|| "adhoc".to_string()),
+            model_version: "adhoc".to_string(),
+            vectors: f64_matrix_to_f32(query_vectors)?,
+        };
+        query_set.dim().map_err(map_thg_err)?;
+        let query_binary = quantize_sign_bits(&query_set).map_err(map_thg_err)?;
+        let content_filter = content_ids.map(|ids| ids.into_iter().collect::<Vec<_>>());
+
+        with_invoker(|inv| {
+            let nodes = inv
+                .items_nodes(&[MULTIVECTOR_BINARY_LABEL], catalog_limit)
+                .map_err(map_err)?;
+            let mut exact_by_embedding = BTreeMap::new();
+            let mut binary_sets = Vec::new();
+            for node in nodes {
+                let Some(binary) = binary_set_from_node(&node)? else {
+                    continue;
+                };
+                if binary.dim != query_binary.dim {
+                    continue;
+                }
+                if let Some(model_id) = model_id.as_deref() {
+                    if binary.model_id != model_id {
+                        continue;
+                    }
+                }
+                if let Some(content_filter) = content_filter.as_ref() {
+                    if !content_filter.contains(&binary.content_id) {
+                        continue;
+                    }
+                }
+                if let Some(exact_id) = str_prop(&node, "exact_artifact_id") {
+                    exact_by_embedding.insert(binary.embedding_set_id.clone(), exact_id);
+                }
+                binary_sets.push(binary);
+            }
+            if binary_sets.is_empty() {
+                return Ok(Vec::new());
+            }
+            let binary_ranked = rank_binary_hamming_maxsim(
+                &query_binary,
+                &binary_sets,
+                aggregation,
+                candidate_limit,
+            )
+            .map_err(map_thg_err)?;
+
+            let ranked = if exact_rerank_limit > 0 {
+                rerank_exact_maxsim_bounded(
+                    &query_set.vectors,
+                    &binary_ranked,
+                    exact_rerank_limit,
+                    limit,
+                    aggregation,
+                    |candidate| {
+                        let exact_id = exact_by_embedding
+                            .get(&candidate.embedding_set_id)
+                            .ok_or_else(|| {
+                                ThgError::new(
+                                    "multivector_exact_artifact_missing",
+                                    format!(
+                                        "no exact artifact pointer for {}",
+                                        candidate.embedding_set_id
+                                    ),
+                                )
+                            })?;
+                        let node = inv
+                            .item_node(exact_id)
+                            .map_err(|error| {
+                                ThgError::new(
+                                    "multivector_exact_artifact_read",
+                                    format!("{error:?}"),
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                ThgError::new(
+                                    "multivector_exact_artifact_missing",
+                                    format!("exact artifact node {exact_id} is absent"),
+                                )
+                            })?;
+                        exact_set_from_node(&node)?.ok_or_else(|| {
+                            ThgError::new(
+                                "multivector_exact_artifact_invalid",
+                                format!("exact artifact node {exact_id} is invalid"),
+                            )
+                        })
+                    },
+                )
+                .map_err(map_thg_err)?
+            } else {
+                binary_ranked.into_iter().take(limit).collect()
+            };
+
+            Ok(ranked.into_iter().map(search_hit_from_score).collect())
+        })
+    }
 }
 
 #[derive(Default)]
@@ -579,5 +1029,418 @@ impl GraphMutation {
     async fn bulk_edges(&self, edges: Json) -> GqlResult<BulkResult> {
         let args = json!({ "edges": edges.0 });
         with_invoker(|inv| Ok(bulk_result(&inv.bulk_edges(args.clone()).map_err(map_err)?)))
+    }
+
+    /// Store exact multi-vectors off the content node, create the hot binary
+    /// projection, and connect both through a manifest node.
+    async fn upsert_multi_vector(
+        &self,
+        input: MultiVectorExactInput,
+    ) -> GqlResult<MultiVectorUpsertResult> {
+        let exact = MultiVectorEmbeddingSet {
+            embedding_set_id: input.embedding_set_id,
+            content_id: input.content_id,
+            model_id: input.model_id,
+            model_version: input.model_version,
+            vectors: f64_matrix_to_f32(input.vectors)?,
+        };
+        exact.dim().map_err(map_thg_err)?;
+        let exact_artifact_id = format!("multivector:exact:{}", exact.embedding_set_id);
+        let binary_projection_id = format!("multivector:binary:{}", exact.embedding_set_id);
+        let exact_object_ref = input
+            .exact_object_ref
+            .or_else(|| Some(format!("graph://{exact_artifact_id}")));
+        let binary_projection_ref = input
+            .binary_projection_ref
+            .or_else(|| Some(format!("graph://{binary_projection_id}")));
+        let bundle = project_multivector_tiers(&exact, exact_object_ref, binary_projection_ref)
+            .map_err(map_thg_err)?;
+        let manifest = bundle.manifest;
+        let binary = bundle.binary_projection;
+        let manifest_node =
+            manifest_node_json(&manifest, &exact_artifact_id, &binary_projection_id);
+        let exact_node = exact_node_json(&exact, &exact_artifact_id);
+        let binary_node = binary_node_json(&binary, &exact_artifact_id, &binary_projection_id);
+
+        with_invoker(|inv| {
+            let mut edges = vec![
+                json!({
+                    "id": format!("{}:{}:{}", HAS_EXACT_MULTIVECTOR_EDGE, exact.embedding_set_id, exact_artifact_id),
+                    "from_id": exact.embedding_set_id,
+                    "to_id": exact_artifact_id,
+                    "type": HAS_EXACT_MULTIVECTOR_EDGE,
+                }),
+                json!({
+                    "id": format!("{}:{}:{}", HAS_BINARY_MULTIVECTOR_EDGE, exact.embedding_set_id, binary_projection_id),
+                    "from_id": exact.embedding_set_id,
+                    "to_id": binary_projection_id,
+                    "type": HAS_BINARY_MULTIVECTOR_EDGE,
+                }),
+            ];
+            if inv.get_doc(&exact.content_id).map_err(map_err)?.is_some() {
+                edges.push(json!({
+                    "id": format!("{}:{}:{}", HAS_MULTIVECTOR_EDGE, exact.content_id, exact.embedding_set_id),
+                    "from_id": exact.content_id,
+                    "to_id": exact.embedding_set_id,
+                    "type": HAS_MULTIVECTOR_EDGE,
+                }));
+            }
+            let node_payload = inv
+                .bulk_nodes(json!({ "nodes": [manifest_node, exact_node, binary_node] }))
+                .map_err(map_err)?;
+            ensure_bulk_ok(&node_payload, "upsertMultiVector nodes")?;
+            let edge_payload = inv.bulk_edges(json!({ "edges": edges })).map_err(map_err)?;
+            ensure_bulk_ok(&edge_payload, "upsertMultiVector edges")?;
+            Ok(MultiVectorUpsertResult {
+                manifest: manifest_view(&manifest),
+                exact_artifact_id,
+                binary_projection_id,
+                binary_projection: Json(binary_projection_json(&binary)),
+            })
+        })
+    }
+}
+
+fn f64_matrix_to_f32(vectors: Vec<Vec<f64>>) -> GqlResult<Vec<Vec<f32>>> {
+    Ok(vectors
+        .into_iter()
+        .map(|row| row.into_iter().map(|value| value as f32).collect())
+        .collect())
+}
+
+fn map_thg_err(err: ThgError) -> async_graphql::Error {
+    async_graphql::Error::new(format!("{}: {}", err.code, err.message))
+}
+
+fn manifest_view(manifest: &MultiVectorManifest) -> MultiVectorManifestView {
+    MultiVectorManifestView {
+        embedding_set_id: manifest.embedding_set_id.clone(),
+        content_id: manifest.content_id.clone(),
+        model_id: manifest.model_id.clone(),
+        model_version: manifest.model_version.clone(),
+        dim: manifest.dim as i32,
+        vector_count: manifest.vector_count as i32,
+        exact_object_ref: manifest.exact_object_ref.clone(),
+        binary_projection_ref: manifest.binary_projection_ref.clone(),
+        exact_bytes: manifest.exact_bytes as i32,
+        binary_projection_bytes: manifest.binary_projection_bytes as i32,
+        exact_to_binary_byte_ratio: manifest.exact_to_binary_byte_ratio() as f64,
+    }
+}
+
+fn manifest_node_json(
+    manifest: &MultiVectorManifest,
+    exact_artifact_id: &str,
+    binary_projection_id: &str,
+) -> Value {
+    json!({
+        "id": manifest.embedding_set_id.clone(),
+        "labels": [MULTIVECTOR_MANIFEST_LABEL],
+        "properties": {
+            "content_id": manifest.content_id.clone(),
+            "model_id": manifest.model_id.clone(),
+            "model_version": manifest.model_version.clone(),
+            "dim": manifest.dim,
+            "vector_count": manifest.vector_count,
+            "exact_object_ref": manifest.exact_object_ref.clone(),
+            "binary_projection_ref": manifest.binary_projection_ref.clone(),
+            "exact_artifact_id": exact_artifact_id,
+            "binary_projection_id": binary_projection_id,
+            "exact_bytes": manifest.exact_bytes,
+            "binary_projection_bytes": manifest.binary_projection_bytes,
+        }
+    })
+}
+
+fn exact_node_json(exact: &MultiVectorEmbeddingSet, exact_artifact_id: &str) -> Value {
+    json!({
+        "id": exact_artifact_id,
+        "labels": [MULTIVECTOR_EXACT_LABEL],
+        "properties": {
+            "embedding_set_id": exact.embedding_set_id.clone(),
+            "content_id": exact.content_id.clone(),
+            "model_id": exact.model_id.clone(),
+            "model_version": exact.model_version.clone(),
+            "vectors": exact.vectors.clone(),
+        }
+    })
+}
+
+fn binary_node_json(
+    binary: &BinaryMultiVectorSet,
+    exact_artifact_id: &str,
+    binary_projection_id: &str,
+) -> Value {
+    let mut payload = binary_projection_json(binary);
+    if let Value::Object(map) = &mut payload {
+        map.insert("exact_artifact_id".to_string(), json!(exact_artifact_id));
+    }
+    json!({
+        "id": binary_projection_id,
+        "labels": [MULTIVECTOR_BINARY_LABEL],
+        "properties": payload,
+    })
+}
+
+fn binary_projection_json(binary: &BinaryMultiVectorSet) -> Value {
+    json!({
+        "embedding_set_id": binary.embedding_set_id.clone(),
+        "content_id": binary.content_id.clone(),
+        "model_id": binary.model_id.clone(),
+        "model_version": binary.model_version.clone(),
+        "dim": binary.dim,
+        "vector_count": binary.vector_count,
+        "words_per_vector": binary.words_per_vector,
+        "words_hex": binary.words.iter().map(|word| format!("{word:016x}")).collect::<Vec<_>>(),
+    })
+}
+
+fn search_hit_from_score(score: MultiVectorScore) -> MultiVectorSearchHit {
+    MultiVectorSearchHit {
+        content_id: score.content_id,
+        embedding_set_id: score.embedding_set_id,
+        score: score.score as f64,
+        scorer: match score.scorer {
+            MaxSimScorer::ExactFloat => "exact_float",
+            MaxSimScorer::BinaryHamming => "binary_hamming",
+        }
+        .to_string(),
+        vector_count: score.vector_count as i32,
+    }
+}
+
+fn binary_set_from_node(node: &NodeRecord) -> GqlResult<Option<BinaryMultiVectorSet>> {
+    let props = node.properties.as_object();
+    let Some(props) = props else {
+        return Ok(None);
+    };
+    let Some(words_hex) = props.get("words_hex").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let words = words_hex
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| async_graphql::Error::new("words_hex values must be strings"))
+                .and_then(|raw| {
+                    u64::from_str_radix(raw, 16).map_err(|error| {
+                        async_graphql::Error::new(format!("invalid words_hex value: {error}"))
+                    })
+                })
+        })
+        .collect::<GqlResult<Vec<_>>>()?;
+    Ok(Some(BinaryMultiVectorSet {
+        embedding_set_id: prop_str(props, "embedding_set_id").unwrap_or_else(|| node.id.clone()),
+        content_id: prop_str(props, "content_id").unwrap_or_default(),
+        model_id: prop_str(props, "model_id").unwrap_or_default(),
+        model_version: prop_str(props, "model_version").unwrap_or_default(),
+        dim: prop_usize(props, "dim").unwrap_or_default(),
+        vector_count: prop_usize(props, "vector_count").unwrap_or_default(),
+        words_per_vector: prop_usize(props, "words_per_vector").unwrap_or_default(),
+        words,
+    }))
+}
+
+fn exact_set_from_node(node: &NodeRecord) -> Result<Option<MultiVectorEmbeddingSet>, ThgError> {
+    let Some(props) = node.properties.as_object() else {
+        return Ok(None);
+    };
+    let Some(vectors) = props.get("vectors").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let vectors = vectors
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .ok_or_else(|| {
+                    ThgError::new(
+                        "multivector_exact_artifact_invalid",
+                        "exact vectors must be an array of arrays",
+                    )
+                })
+                .and_then(|row| {
+                    row.iter()
+                        .map(|value| {
+                            value.as_f64().map(|value| value as f32).ok_or_else(|| {
+                                ThgError::new(
+                                    "multivector_exact_artifact_invalid",
+                                    "exact vector values must be numbers",
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let set = MultiVectorEmbeddingSet {
+        embedding_set_id: prop_str(props, "embedding_set_id").unwrap_or_else(|| node.id.clone()),
+        content_id: prop_str(props, "content_id").unwrap_or_default(),
+        model_id: prop_str(props, "model_id").unwrap_or_default(),
+        model_version: prop_str(props, "model_version").unwrap_or_default(),
+        vectors,
+    };
+    set.dim()?;
+    Ok(Some(set))
+}
+
+fn str_prop(node: &NodeRecord, key: &str) -> Option<String> {
+    node.properties
+        .as_object()
+        .and_then(|props| prop_str(props, key))
+}
+
+fn prop_str(props: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    props
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn prop_usize(props: &serde_json::Map<String, Value>, key: &str) -> Option<usize> {
+    props
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+}
+
+fn ensure_bulk_ok(payload: &Value, operation: &str) -> GqlResult<()> {
+    if payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(async_graphql::Error::new(format!(
+            "{operation} failed: {}",
+            payload
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustyred_thg_core::InMemoryGraphStore;
+    use serde_json::{json, Value};
+
+    use crate::graphql::{execute_graphql, OpKind};
+    use crate::SharedStore;
+
+    fn run(
+        store: SharedStore<InMemoryGraphStore>,
+        query: &str,
+        variables: Value,
+        op: OpKind,
+    ) -> Value {
+        execute_graphql(
+            "tenant-a",
+            store,
+            &json!({ "query": query, "variables": variables }),
+            op,
+            false,
+        )
+        .expect("graphql runs")
+    }
+
+    fn upsert_doc(store: SharedStore<InMemoryGraphStore>, id: &str, vectors: Value) -> Value {
+        run(
+            store,
+            "mutation($input: MultiVectorExactInput!){
+                upsertMultiVector(input:$input){
+                    manifest{
+                        embeddingSetId
+                        contentId
+                        dim
+                        vectorCount
+                        exactObjectRef
+                        binaryProjectionRef
+                        exactToBinaryByteRatio
+                    }
+                    exactArtifactId
+                    binaryProjectionId
+                }
+            }",
+            json!({
+                "input": {
+                    "embeddingSetId": format!("mv:{id}"),
+                    "contentId": id,
+                    "modelId": "colpali-fixture",
+                    "modelVersion": "test-v1",
+                    "vectors": vectors,
+                }
+            }),
+            OpKind::Mutate,
+        )
+    }
+
+    #[test]
+    fn multivector_graphql_indexes_hot_binary_and_reranks_cold_exact() {
+        let store = SharedStore::new(InMemoryGraphStore::new());
+
+        let indexed_a = upsert_doc(store.clone(), "doc:a", json!([[1.0, 0.0], [0.0, 1.0]]));
+        assert_eq!(indexed_a["errors"], Value::Null, "{indexed_a}");
+        assert_eq!(
+            indexed_a["data"]["upsertMultiVector"]["manifest"]["contentId"],
+            "doc:a"
+        );
+        assert_eq!(
+            indexed_a["data"]["upsertMultiVector"]["manifest"]["vectorCount"],
+            2
+        );
+        assert!(
+            indexed_a["data"]["upsertMultiVector"]["manifest"]["exactToBinaryByteRatio"]
+                .as_f64()
+                .unwrap()
+                > 1.0
+        );
+
+        let indexed_b = upsert_doc(store.clone(), "doc:b", json!([[-1.0, 0.0], [0.0, -1.0]]));
+        assert_eq!(indexed_b["errors"], Value::Null, "{indexed_b}");
+
+        let exact_node = store.with_store(|inner| {
+            InMemoryGraphStore::get_node(inner, "multivector:exact:mv:doc:a").cloned()
+        });
+        assert!(
+            exact_node.is_some(),
+            "exact vectors should live on a separate cold-artifact node"
+        );
+        assert_eq!(
+            exact_node.unwrap().labels,
+            vec!["ColdMultiVectorArtifact".to_string()]
+        );
+        let content_node =
+            store.with_store(|inner| InMemoryGraphStore::get_node(inner, "doc:a").cloned());
+        assert!(
+            content_node.is_none(),
+            "upsertMultiVector should not stuff exact vectors onto the content node"
+        );
+
+        let searched = run(
+            store.clone(),
+            "query($q:[[Float!]!]!){
+                multiVectorSearch(
+                    queryVectors:$q,
+                    modelId:\"colpali-fixture\",
+                    limit:2,
+                    candidateLimit:4,
+                    exactRerankLimit:2
+                ){
+                    contentId
+                    embeddingSetId
+                    scorer
+                    vectorCount
+                    score
+                }
+            }",
+            json!({ "q": [[1.0, 0.0], [0.0, 1.0]] }),
+            OpKind::Query,
+        );
+        assert_eq!(searched["errors"], Value::Null, "{searched}");
+        let hits = searched["data"]["multiVectorSearch"]
+            .as_array()
+            .expect("hits array");
+        assert_eq!(hits.len(), 2, "{searched}");
+        assert_eq!(hits[0]["contentId"], "doc:a", "{searched}");
+        assert_eq!(hits[0]["embeddingSetId"], "mv:doc:a", "{searched}");
+        assert_eq!(hits[0]["scorer"], "exact_float", "{searched}");
+        assert_eq!(hits[0]["vectorCount"], 2, "{searched}");
     }
 }

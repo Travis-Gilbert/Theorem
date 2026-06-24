@@ -1,6 +1,7 @@
 # Epistemic Facet And Multi-Vector Retrieval Plan
 
-Status: implementation started, first GraphQL facet slice landed 2026-06-23.
+Status: implementation in progress. The first GraphQL epistemic facet and
+GraphQL multi-vector retrieval slices landed 2026-06-23.
 
 Source inputs:
 
@@ -319,6 +320,11 @@ Current implementation slice, 2026-06-23:
   for tests, `project_multivector_tiers` for manifest plus hot binary
   projection bundles, and an opt-in CPU `colpali-candle` path that loads
   Candle's ColPali model and emits exact `MultiVectorEmbeddingSet`s.
+- MCP GraphQL now exposes `upsertMultiVector(input)` and `multiVectorSearch`.
+  `upsertMultiVector` writes a lean manifest node, a cold exact-vector artifact
+  node, and a hot binary-projection node. `multiVectorSearch` scans/ranks hot
+  binary projections first, then hydrates exact vectors only for the bounded
+  rerank budget.
 
 ## Multi-Vector Retrieval
 
@@ -365,7 +371,9 @@ Acceptance for the study gate:
   float MaxSim on a fixed fixture.
 - Measure memory bytes per page for exact float, fp16/bf16 if used, and binary
   projection.
-- Prove the default GraphQL query does not hydrate cold exact vectors.
+- Prove the default GraphQL query does not hydrate cold exact vectors. The
+  first MCP GraphQL acceptance now proves hot binary candidate search plus
+  bounded cold exact rerank.
 - Compile the Candle ColPali inference path behind an opt-in feature, then
   record a local benchmark before committing to a production ingestion path.
 
@@ -458,6 +466,8 @@ Acceptance:
 - Define `MultiVectorEmbeddingSet` manifests and cold exact-vector references.
 - Prototype Candle ColPali ingestion on a tiny fixture.
 - Keep producer output tiered through manifest plus binary projection helpers.
+- Surface GraphQL `upsertMultiVector` and `multiVectorSearch` over the tiered
+  manifest/exact/binary projection layout.
 
 Acceptance:
 

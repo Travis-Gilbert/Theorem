@@ -217,13 +217,15 @@ pub(crate) fn map_err(err: McpError) -> async_graphql::Error {
 struct DispatchInvoker<B: McpGraphBackend> {
     backend: RefCell<B>,
     tenant: String,
+    allow_admin_projection_rebuild: bool,
 }
 
 impl<B: McpGraphBackend> DispatchInvoker<B> {
-    fn new(backend: B, tenant: String) -> Self {
+    fn new(backend: B, tenant: String, allow_admin_projection_rebuild: bool) -> Self {
         Self {
             backend: RefCell::new(backend),
             tenant,
+            allow_admin_projection_rebuild,
         }
     }
 }
@@ -401,6 +403,11 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
         crate::epistemic_shadow_ppr_payload(&self.tenant, &*self.backend.borrow(), &args)
     }
     fn epistemic_enrich_apply(&self, args: Value) -> Result<Value, McpError> {
+        if !self.allow_admin_projection_rebuild {
+            return Err(McpError::invalid_params(
+                "epistemic_enrich_apply requires admin:write or rustyred_thg:graph:admin:projection scope",
+            ));
+        }
         crate::epistemic_enrich_apply_payload(&self.tenant, &mut *self.backend.borrow_mut(), &args)
     }
     fn code(&self, operation: &str, args: Value) -> Result<Value, McpError> {
@@ -483,11 +490,9 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
             .get("created_at_ms")
             .and_then(Value::as_i64)
             .or_else(|| {
-                existing.as_ref().and_then(|node| {
-                    node.properties
-                        .get("created_at_ms")
-                        .and_then(Value::as_i64)
-                })
+                existing
+                    .as_ref()
+                    .and_then(|node| node.properties.get("created_at_ms").and_then(Value::as_i64))
             })
             .unwrap_or(now);
         let updated_at_ms = args
@@ -575,6 +580,7 @@ pub(crate) fn execute_graphql<B: McpGraphBackend>(
     backend: B,
     arguments: &Value,
     op: OpKind,
+    allow_admin_projection_rebuild: bool,
 ) -> Result<Value, McpError> {
     let tenant = tenant.trim();
     if tenant.is_empty() {
@@ -593,7 +599,7 @@ pub(crate) fn execute_graphql<B: McpGraphBackend>(
         _ => Variables::default(),
     };
 
-    let invoker = DispatchInvoker::new(backend, tenant.to_string());
+    let invoker = DispatchInvoker::new(backend, tenant.to_string(), allow_admin_projection_rebuild);
     let _guard = set_invoker(&invoker);
     let request = Request::new(query).variables(variables);
     let response = match op {

@@ -1,7 +1,7 @@
 //! T7 acceptance: skill-corpus bring-up, end to end.
 //!
 //! Proves the addendum's skill-corpus acceptance on one store:
-//! - publishing the three engineering packs makes `skill_list` return them (not zero);
+//! - publishing the engineering packs makes `skill_list` return them (not zero);
 //! - applying a pack records a use receipt;
 //! - a repeatedly-useful pack ranks higher in a later `ensemble_select`, because `skill_apply`
 //!   receipts compound through the run-close hook (the Compound spine) and the ensemble selector
@@ -100,7 +100,10 @@ fn apply_and_close_positive_run(
             "CONTEXT.INJECTED",
             json!({"artifact_id":"ctx:1","adapter":"claude-code","target":"active_context"}),
         ),
-        ("AGENT.ACTING", json!({"adapter":"claude-code","started_at": TS})),
+        (
+            "AGENT.ACTING",
+            json!({"adapter":"claude-code","started_at": TS}),
+        ),
         (
             "SESSION.EVENT_RECORDED",
             json!({"event_subtype":"tool_invocation","tool_id":"apply_patch"}),
@@ -139,9 +142,13 @@ fn select(store: &InMemoryGraphStore, task: &str) -> ensemble::decision::Ensembl
 fn skill_corpus_publish_apply_and_rank_end_to_end() {
     let mut store = InMemoryGraphStore::new();
 
-    // Acceptance 1: publishing the three engineering packs makes skill_list return them.
+    // Acceptance 1: publishing the engineering packs makes skill_list return them.
     let receipts = publish_engineering_packs(&mut store, TENANT, "claude-code").unwrap();
-    assert_eq!(receipts.len(), 3);
+    assert!(
+        receipts.len() >= 3,
+        "expected at least the original three engineering packs, got {}",
+        receipts.len()
+    );
     let listed = list_skill_packs(
         &store,
         SkillPackListInput {
@@ -171,8 +178,12 @@ fn skill_corpus_publish_apply_and_rank_end_to_end() {
     // Acceptance 2 + 3: apply rust-engineering across three positive closed runs (repeatedly
     // useful). Each apply records a use receipt.
     for index in 0..3 {
-        let receipt =
-            apply_and_close_positive_run(&mut store, &format!("run-rust-{index}"), task, RUST_ENGINEERING_PACK_CONTENT_HASH);
+        let receipt = apply_and_close_positive_run(
+            &mut store,
+            &format!("run-rust-{index}"),
+            task,
+            RUST_ENGINEERING_PACK_CONTENT_HASH,
+        );
         assert_eq!(receipt.status, "applied", "apply records a use receipt");
         assert_eq!(receipt.run_id, format!("run-rust-{index}"));
     }

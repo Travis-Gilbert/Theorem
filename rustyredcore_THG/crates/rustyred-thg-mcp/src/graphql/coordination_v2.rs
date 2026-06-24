@@ -53,7 +53,12 @@ fn insert_i64(args: &mut Value, key: &str, value: Option<i64>) {
 }
 
 fn call(operation: &str, args: Value) -> GqlResult<Json> {
-    with_invoker(|inv| Ok(Json(inv.coordination_v2(operation, args.clone()).map_err(map_err)?)))
+    with_invoker(|inv| {
+        Ok(Json(
+            inv.coordination_v2(operation, args.clone())
+                .map_err(map_err)?,
+        ))
+    })
 }
 
 #[derive(Default)]

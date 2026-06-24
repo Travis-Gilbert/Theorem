@@ -7563,6 +7563,7 @@ dependencies = [
  "rustyred-thg-code",
  "rustyred-thg-connectors",
  "rustyred-thg-core",
+ "rustyred-thg-ml",
  "serde",
  "serde_json",
  "theorem-harness-core",

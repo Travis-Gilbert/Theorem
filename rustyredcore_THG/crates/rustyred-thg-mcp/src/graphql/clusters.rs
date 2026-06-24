@@ -262,10 +262,7 @@ impl EnsembleSelection {
     fn from_envelope(envelope: &Value) -> EnsembleSelection {
         let decision = envelope.get("decision").cloned().unwrap_or(Value::Null);
         EnsembleSelection {
-            decision_content_hash: s(
-                envelope,
-                &["decision_content_hash", "decisionContentHash"],
-            ),
+            decision_content_hash: s(envelope, &["decision_content_hash", "decisionContentHash"]),
             task: s_or(&decision, &["task"]),
             budget_units: u(&decision, &["budget_units", "budgetUnits"]),
             spent_units: u(&decision, &["spent_units", "spentUnits"]).unwrap_or(0),
@@ -584,9 +581,7 @@ impl ClustersMutation {
     /// `ensemble_register`). `input` carries the pack plus content/artifact hashes.
     async fn ensemble_register(&self, input: Json) -> GqlResult<EnsemblePack> {
         with_invoker(|inv| {
-            let value = inv
-                .ensemble("register", input.0.clone())
-                .map_err(map_err)?;
+            let value = inv.ensemble("register", input.0.clone()).map_err(map_err)?;
             Ok(EnsemblePack::from_envelope(&value))
         })
     }
@@ -663,14 +658,17 @@ mod tests {
         op: super::super::OpKind,
     ) -> Value {
         let arguments = json!({ "query": query, "variables": variables });
-        super::super::execute_graphql("smoke", store.clone(), &arguments, op)
+        super::super::execute_graphql("smoke", store.clone(), &arguments, op, false)
             .expect("graphql execution")
     }
 
     fn assert_no_errors(response: &Value) {
         assert!(
             response.get("errors").map(Value::is_null).unwrap_or(true)
-                || response["errors"].as_array().map(|e| e.is_empty()).unwrap_or(false),
+                || response["errors"]
+                    .as_array()
+                    .map(|e| e.is_empty())
+                    .unwrap_or(false),
             "unexpected graphql errors: {response}"
         );
     }
@@ -739,7 +737,10 @@ mod tests {
             }
         });
         let selection = EnsembleSelection::from_envelope(&envelope);
-        assert_eq!(selection.decision_content_hash.as_deref(), Some("sha256:dec"));
+        assert_eq!(
+            selection.decision_content_hash.as_deref(),
+            Some("sha256:dec")
+        );
         assert_eq!(selection.task, "use rust graph store");
         assert_eq!(selection.budget_units, Some(100));
         assert_eq!(selection.spent_units, 7);
@@ -787,13 +788,17 @@ mod tests {
             "idempotency_key": "sha256:k2"
         });
         let job = Job::from_value(&submitted);
-        assert_eq!(job.state, "pending", "submit shape must derive pending state");
+        assert_eq!(
+            job.state, "pending",
+            "submit shape must derive pending state"
+        );
         assert_eq!(job.spec_ref.as_deref(), Some("docs/x.md"));
     }
 
     #[test]
     fn harness_run_from_envelope_is_none_when_missing_and_reads_detail() {
-        let missing = json!({ "tenant": "smoke", "run_id": "missing", "detail": null, "found": false });
+        let missing =
+            json!({ "tenant": "smoke", "run_id": "missing", "detail": null, "found": false });
         assert!(HarnessRun::from_envelope(&missing).is_none());
 
         let present = json!({
@@ -835,7 +840,10 @@ mod tests {
             .expect("published pack hash")
             .to_string();
         assert!(!hash.is_empty());
-        assert_eq!(published["data"]["skillPublish"]["title"], json!("Rust Engineering"));
+        assert_eq!(
+            published["data"]["skillPublish"]["title"],
+            json!("Rust Engineering")
+        );
 
         let listed = run(
             &store,
@@ -846,7 +854,9 @@ mod tests {
         assert_no_errors(&listed);
         let packs = listed["data"]["skillList"].as_array().expect("packs array");
         assert!(
-            packs.iter().any(|pack| pack["packContentHash"] == json!(hash)),
+            packs
+                .iter()
+                .any(|pack| pack["packContentHash"] == json!(hash)),
             "skillList must surface the typed published pack: {listed}"
         );
     }
@@ -876,7 +886,8 @@ mod tests {
         assert_no_errors(&listed);
         let jobs = listed["data"]["jobList"].as_array().expect("jobs array");
         assert!(
-            jobs.iter().any(|job| job["jobId"] == json!(job_id) && job["state"] == json!("pending")),
+            jobs.iter()
+                .any(|job| job["jobId"] == json!(job_id) && job["state"] == json!("pending")),
             "jobList must surface the typed submitted job: {listed}"
         );
 
@@ -888,7 +899,10 @@ mod tests {
         );
         assert_no_errors(&archived);
         assert_eq!(archived["data"]["jobArchive"]["found"], json!(true));
-        assert_eq!(archived["data"]["jobArchive"]["job"]["state"], json!("archived"));
+        assert_eq!(
+            archived["data"]["jobArchive"]["job"]["state"],
+            json!("archived")
+        );
     }
 
     #[test]

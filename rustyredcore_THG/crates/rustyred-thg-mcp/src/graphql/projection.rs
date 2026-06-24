@@ -102,9 +102,7 @@ fn harness_origin(labels: &[String]) -> Option<(&'static str, &'static str)> {
     for label in labels {
         match label.as_str() {
             TASK_NODE_LABEL => return Some(("task", "harness:task")),
-            COORDINATION_RECORD_LABEL => {
-                return Some(("coordination", "harness:coordination"))
-            }
+            COORDINATION_RECORD_LABEL => return Some(("coordination", "harness:coordination")),
             MEMORY_DOCUMENT_LABEL => return Some(("memory", "harness:memory")),
             JOB_LABEL => return Some(("job", "dispatch:job")),
             _ => {}
@@ -148,7 +146,12 @@ fn first_ms(props: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
 /// name carriers; finally the node id so an Item always has a non-empty title.
 const TITLE_KEYS: &[&str] = &["title", "goal", "name", "summary", "label"];
 const CREATED_KEYS: &[&str] = &["created_at_ms", "created_at", "createdAt"];
-const UPDATED_KEYS: &[&str] = &["updated_at_ms", "updated_at", "updatedAt", "committed_at_ms"];
+const UPDATED_KEYS: &[&str] = &[
+    "updated_at_ms",
+    "updated_at",
+    "updatedAt",
+    "committed_at_ms",
+];
 
 /// Project a graph node to a [`ProjectedItem`], or `None` if the node is not one
 /// the Item domain recognizes. The node is read, never mutated.
@@ -309,7 +312,11 @@ mod tests {
 
     #[test]
     fn title_falls_back_to_id_when_absent() {
-        let n = node("naked-task", &[TASK_NODE_LABEL], json!({ "created_at_ms": 1 }));
+        let n = node(
+            "naked-task",
+            &[TASK_NODE_LABEL],
+            json!({ "created_at_ms": 1 }),
+        );
         let p = project_node(&n).unwrap();
         assert_eq!(p.title, "naked-task");
     }

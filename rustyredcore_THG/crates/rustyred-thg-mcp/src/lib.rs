@@ -40,16 +40,16 @@ use ensemble::{
 use rustyred_thg_core::{
     checkout_graph_version, compile_graph_pack, compile_graphql_selection, compile_user_subgraph,
     diff_graph_snapshots, epistemic_shadow_ppr, execute_query_with_resolver, graph_version_log,
-    merge_graph_snapshots, read_epistemic_shadow, run_epistemic_cron_pass,
-    update_graph_ref_cas, CodeKgManifest, Direction, EdgeRecord, EpistemicAnnotations,
-    EpistemicCronInput, EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode,
-    EpistemicType, FusionPolicy, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats,
-    GraphStore, GraphStoreError, GraphStoreResult, GraphVersionRepository, GraphqlSelection,
-    HarnessInstantKg, HybridScoringConfig, InMemoryGraphStore, ModalityResolver, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord, QueryIr, RankOutcome, RankedRow, RedCoreGraphStore,
-    RelationalStore, SessionDelta, StreamEvent, StreamLog, StreamUrgency, UserSubgraph,
-    VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
-    HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
+    merge_graph_snapshots, read_epistemic_shadow, run_epistemic_cron_pass, update_graph_ref_cas,
+    CodeKgManifest, Direction, EdgeRecord, EpistemicAnnotations, EpistemicCronInput,
+    EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicType,
+    FusionPolicy, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore,
+    GraphStoreError, GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
+    HybridScoringConfig, InMemoryGraphStore, ModalityResolver, NeighborHit, NeighborQuery,
+    NodeQuery, NodeRecord, QueryIr, RankOutcome, RankedRow, RedCoreGraphStore, RelationalStore,
+    SessionDelta, StreamEvent, StreamLog, StreamUrgency, UserSubgraph, VectorDesignation,
+    VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, SAME_ECLASS,
+    UNDERCUTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1288,8 +1288,22 @@ fn call_tool<P: McpGraphProvider>(
         }
         "epistemic_enrich_apply" | "rustyred_thg_epistemic_enrich_apply" if config.read_only => {
             return Ok(tool_result_error(json!({
-                "error": "read_only",
+                "error": "mcp_read_only",
                 "message": "epistemic_enrich_apply is unavailable while read-only mode is active."
+            })))
+        }
+        "epistemic_enrich_apply" | "rustyred_thg_epistemic_enrich_apply" if !config.allow_admin => {
+            return Ok(tool_result_error(json!({
+                "error": "admin_tools_disabled",
+                "message": "epistemic_enrich_apply writes the epistemic projection and is hidden unless THG_MCP_ALLOW_ADMIN/RUSTY_RED_MCP_ALLOW_ADMIN is true."
+            })))
+        }
+        "epistemic_enrich_apply" | "rustyred_thg_epistemic_enrich_apply"
+            if !context.allows("admin:write") =>
+        {
+            return Ok(tool_result_error(json!({
+                "error": "admin_scope_required",
+                "message": "epistemic_enrich_apply requires admin:write or rustyred_thg:graph:admin:projection scope."
             })))
         }
         "epistemic_enrich_apply" | "rustyred_thg_epistemic_enrich_apply" => {
@@ -1989,9 +2003,13 @@ fn call_tool<P: McpGraphProvider>(
         "observe" | "theorem_harness_observe" => {
             observe_payload(&tenant, &mut backend, &arguments)?
         }
-        "graphql_query" | "theorem_harness_graphql_query" => {
-            graphql::execute_graphql(&tenant, backend, &arguments, graphql::OpKind::Query)?
-        }
+        "graphql_query" | "theorem_harness_graphql_query" => graphql::execute_graphql(
+            &tenant,
+            backend,
+            &arguments,
+            graphql::OpKind::Query,
+            config.allow_admin && context.allows("admin:write"),
+        )?,
         "graphql_mutate" | "theorem_harness_graphql_mutate" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
@@ -1999,7 +2017,13 @@ fn call_tool<P: McpGraphProvider>(
                     "message": "GraphQL mutations are unavailable while read-only mode is active."
                 })));
             }
-            graphql::execute_graphql(&tenant, backend, &arguments, graphql::OpKind::Mutate)?
+            graphql::execute_graphql(
+                &tenant,
+                backend,
+                &arguments,
+                graphql::OpKind::Mutate,
+                config.allow_admin && context.allows("admin:write"),
+            )?
         }
         "graphql_introspect" | "theorem_harness_graphql_introspect" => graphql::introspect_sdl(),
         "rustyred_thg_fulltext_search" | "rustyred_thg_graph_fulltext_search" => {
@@ -2312,6 +2336,14 @@ fn bulk_nodes_payload(
     let mut errors = Vec::new();
     for (idx, raw) in records.iter().enumerate() {
         match parse_node_record(raw) {
+            Ok(node) if is_epistemic_shadow_node(&node) => {
+                errors.push(projection_write_forbidden(
+                    idx + 1,
+                    "node",
+                    &node.id,
+                    "EpistemicShadow nodes are maintained by the projection rebuild path.",
+                ));
+            }
             Ok(node) => match backend.upsert_node(node.clone()) {
                 Ok(()) => inserted += 1,
                 Err(error) => errors.push(json!({
@@ -2352,6 +2384,14 @@ fn bulk_edges_payload(
     let mut epistemic_dirty_node_ids = BTreeSet::new();
     for (idx, raw) in records.iter().enumerate() {
         match parse_edge_record(raw) {
+            Ok(edge) if projection_edge_write_forbidden(backend, &edge)? => {
+                errors.push(projection_write_forbidden(
+                    idx + 1,
+                    "edge",
+                    &edge.id,
+                    "Epistemic projection edges are maintained by the projection rebuild path.",
+                ));
+            }
             Ok(edge) => match backend.upsert_edge(edge.clone()) {
                 Ok(()) => {
                     inserted += 1;
@@ -2386,6 +2426,43 @@ fn bulk_edges_payload(
     }))
 }
 
+fn projection_write_forbidden(
+    line: usize,
+    record_kind: &str,
+    record_id: &str,
+    reason: &str,
+) -> Value {
+    json!({
+        "line": line,
+        "code": "projection_write_forbidden",
+        "message": format!(
+            "normal bulk writes cannot write epistemic projection {record_kind} {record_id}: {reason}"
+        ),
+        "record_id": record_id,
+    })
+}
+
+fn projection_edge_write_forbidden(
+    backend: &impl McpGraphBackend,
+    edge: &EdgeRecord,
+) -> Result<bool, McpError> {
+    if matches!(edge.edge_type.as_str(), HAS_EPISTEMIC_SHADOW | SAME_ECLASS) {
+        return Ok(true);
+    }
+    if !matches!(edge.edge_type.as_str(), UNDERCUTS | EPISTEMIC_SUPPORTS) {
+        return Ok(false);
+    }
+    let from_shadow = backend
+        .get_node(&edge.from_id)?
+        .as_ref()
+        .is_some_and(is_epistemic_shadow_node);
+    let to_shadow = backend
+        .get_node(&edge.to_id)?
+        .as_ref()
+        .is_some_and(is_epistemic_shadow_node);
+    Ok(from_shadow || to_shadow)
+}
+
 fn mark_epistemic_dirty_nodes(
     backend: &mut impl McpGraphBackend,
     node_ids: BTreeSet<String>,
@@ -2401,7 +2478,10 @@ fn mark_epistemic_dirty_nodes(
         if !node.properties.is_object() {
             node.properties = json!({});
         }
-        let properties = node.properties.as_object_mut().expect("node properties object");
+        let properties = node
+            .properties
+            .as_object_mut()
+            .expect("node properties object");
         properties.insert("epistemic_shadow_dirty".to_string(), json!(true));
         properties.insert("epistemic_dirty_at_ms".to_string(), json!(now_unix_ms()));
         backend.upsert_node(node)?;
@@ -4120,7 +4200,8 @@ fn coordination_v2_error(err: theorem_harness_runtime::CoordinationError) -> Mcp
 }
 
 fn coordination_v2_parse<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, McpError> {
-    serde_json::from_value(args.clone()).map_err(|error| McpError::invalid_params(error.to_string()))
+    serde_json::from_value(args.clone())
+        .map_err(|error| McpError::invalid_params(error.to_string()))
 }
 
 fn coordination_v2_value<T: serde::Serialize>(value: T) -> Result<Value, McpError> {
@@ -4138,7 +4219,12 @@ pub(crate) fn coordination_v2_payload(
 ) -> Result<Value, McpError> {
     use theorem_harness_runtime as thr;
     let tenant = tenant.to_string();
-    let arg_str = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let arg_str = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     let arg_limit = || args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
 
     match operation {
@@ -4158,9 +4244,8 @@ pub(crate) fn coordination_v2_payload(
             coordination_v2_value(task_ref)
         }
         "route_message" => {
-            let mut task: thr::TaskRefInput = coordination_v2_parse(
-                args.get("task").unwrap_or(&Value::Null),
-            )?;
+            let mut task: thr::TaskRefInput =
+                coordination_v2_parse(args.get("task").unwrap_or(&Value::Null))?;
             task.tenant_slug = tenant.clone();
             let message = thr::CoordinationMessageState {
                 tenant_slug: tenant,
@@ -4169,7 +4254,11 @@ pub(crate) fn coordination_v2_payload(
                 actor_id: arg_str("actor"),
                 urgency: {
                     let urgency = arg_str("urgency");
-                    if urgency.is_empty() { "info".to_string() } else { urgency }
+                    if urgency.is_empty() {
+                        "info".to_string()
+                    } else {
+                        urgency
+                    }
                 },
                 delivery: "passive".to_string(),
                 message: arg_str("message"),
@@ -4204,14 +4293,15 @@ pub(crate) fn coordination_v2_payload(
             let worktree = args.get("worktree").and_then(Value::as_str);
             let checkout = match (branch, worktree) {
                 (None, None) => None,
-                (branch, worktree) => Some((branch.unwrap_or_default(), worktree.unwrap_or_default())),
+                (branch, worktree) => {
+                    Some((branch.unwrap_or_default(), worktree.unwrap_or_default()))
+                }
             };
             let limit = arg_limit();
             let mut store = McpCoordinationStore { backend };
-            let pings = thr::read_open_pings_for_actor(
-                &mut store, &tenant, &actor, checkout, false, limit,
-            )
-            .map_err(coordination_v2_error)?;
+            let pings =
+                thr::read_open_pings_for_actor(&mut store, &tenant, &actor, checkout, false, limit)
+                    .map_err(coordination_v2_error)?;
             coordination_v2_value(pings)
         }
         "open_contradictions" => {
@@ -4239,8 +4329,8 @@ pub(crate) fn coordination_v2_payload(
         "consume_ping" => {
             let ping_id = arg_str("ping_id");
             let mut store = McpCoordinationStore { backend };
-            let ping = thr::consume_ping(&mut store, &tenant, &ping_id)
-                .map_err(coordination_v2_error)?;
+            let ping =
+                thr::consume_ping(&mut store, &tenant, &ping_id).map_err(coordination_v2_error)?;
             coordination_v2_value(ping)
         }
         "record_claim" => {
@@ -5192,15 +5282,21 @@ fn append_harness_transition_payload(
         *scope_value = Value::Object(serde_json::Map::new());
     }
     if let Some(scope) = scope_value.as_object_mut() {
-        let has_tenant = ["tenant_slug", "tenantSlug", "tenant", "tenant_id", "tenantId"]
-            .iter()
-            .any(|key| {
-                scope
-                    .get(*key)
-                    .and_then(Value::as_str)
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false)
-            });
+        let has_tenant = [
+            "tenant_slug",
+            "tenantSlug",
+            "tenant",
+            "tenant_id",
+            "tenantId",
+        ]
+        .iter()
+        .any(|key| {
+            scope
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        });
         if !has_tenant && !tenant.trim().is_empty() {
             scope.insert("tenant_slug".to_string(), Value::String(tenant.to_string()));
         }
@@ -11329,26 +11425,6 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 "required": ["seeds"]
             }),
         ),
-        tool_write(
-            "epistemic_enrich_apply",
-            "Apply Theseus epistemic annotations to EpistemicShadow nodes and shadow edges only.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "tenant": { "type": "string" },
-                    "tenant_slug": { "type": "string" },
-                    "annotations": { "type": "object" },
-                    "content_ids": { "type": "array", "items": { "type": "string" } },
-                    "content_node_ids": { "type": "array", "items": { "type": "string" } },
-                    "mode": { "type": "string", "enum": ["delta", "full"], "default": "delta" },
-                    "engine": { "type": "string", "default": "theseus.epistemic_enrichment" },
-                    "engine_version": { "type": "string", "default": "epistemic-v1" },
-                    "density_floor": { "type": "number", "default": 0 },
-                    "computed_at": { "type": "integer" }
-                },
-                "required": ["annotations"]
-            }),
-        ),
         tool(
             "relate",
             "Find native graph neighbors connected to a saved memory document or memory node.",
@@ -12471,6 +12547,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         ));
     }
     if config.allow_admin && !config.read_only {
+        tools.push(epistemic_enrich_apply_tool());
         tools.push(tool(
             "rustyred_thg_admin_verify",
             "Run graph verification. Hidden unless admin MCP mode is enabled.",
@@ -12503,6 +12580,7 @@ fn mcp_scope_alias(scope: &str) -> &str {
         "rustyred_thg:graph:write:propose" | "rustyred_thg:graph:write:apply" => "graph:write",
         "rustyred_thg:graph:context" => "context:read",
         "rustyred_thg:graph:admin:verify" => "admin:read",
+        "rustyred_thg:graph:admin:projection" | "rustyred_thg:graph:admin:write" => "admin:write",
         other => other,
     }
 }
@@ -12533,6 +12611,29 @@ fn tool_write(name: &str, description: &str, input_schema: Value) -> Value {
             "openWorldHint": open_world_hint_for_tool(name)
         }
     })
+}
+
+fn epistemic_enrich_apply_tool() -> Value {
+    tool_write(
+        "epistemic_enrich_apply",
+        "Apply Theseus epistemic annotations to EpistemicShadow nodes and shadow edges only. Hidden unless admin MCP mode is enabled.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tenant": { "type": "string" },
+                "tenant_slug": { "type": "string" },
+                "annotations": { "type": "object" },
+                "content_ids": { "type": "array", "items": { "type": "string" } },
+                "content_node_ids": { "type": "array", "items": { "type": "string" } },
+                "mode": { "type": "string", "enum": ["delta", "full"], "default": "delta" },
+                "engine": { "type": "string", "default": "theseus.epistemic_enrichment" },
+                "engine_version": { "type": "string", "default": "epistemic-v1" },
+                "density_floor": { "type": "number", "default": 0 },
+                "computed_at": { "type": "integer" }
+            },
+            "required": ["annotations"]
+        }),
+    )
 }
 
 fn output_schema_for_tool(name: &str) -> Value {
@@ -14402,7 +14503,8 @@ mod tests {
 
     #[test]
     fn epistemic_cron_tools_compile_apply_and_rank_shadow_graph() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.allow_admin = true;
         let listed = handle_mcp_request(
             &provider,
             &config,
@@ -14444,9 +14546,10 @@ mod tests {
             .iter()
             .any(|node| node.as_str() == Some("node:a")));
 
-        let applied = call_tool_json(
+        let applied = call_tool_json_with_context(
             &provider,
             &config,
+            &McpRequestContext::with_scopes(["rustyred_thg:graph:admin:projection"]),
             "epistemic_enrich_apply",
             json!({
                 "engine_version": "test-epistemic-v1",
@@ -14488,6 +14591,74 @@ mod tests {
             json!({"seeds": {"node:a": 1.0}, "top_k": 4}),
         );
         assert!(!ranked["scores"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn epistemic_enrich_apply_requires_admin_mode_and_projection_scope() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let listed = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        assert!(!listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "epistemic_enrich_apply"));
+
+        let annotations = json!({
+            "annotations": { "annotations": [], "support_relations": [], "attack_relations": [] }
+        });
+        let disabled = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "apply",
+                "method": "tools/call",
+                "params": { "name": "epistemic_enrich_apply", "arguments": annotations }
+            }),
+        );
+        assert_eq!(
+            disabled["result"]["structuredContent"]["error"],
+            "admin_tools_disabled"
+        );
+
+        config.allow_admin = true;
+        let listed = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "epistemic_enrich_apply"));
+
+        let missing_scope = handle_mcp_request_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["graph:write"]),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "apply",
+                "method": "tools/call",
+                "params": {
+                    "name": "epistemic_enrich_apply",
+                    "arguments": {
+                        "annotations": { "annotations": [], "support_relations": [], "attack_relations": [] }
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            missing_scope["result"]["structuredContent"]["error"],
+            "admin_scope_required"
+        );
     }
 
     fn call_tool_json_with_context(
@@ -16564,6 +16735,122 @@ mod tests {
     }
 
     #[test]
+    fn bulk_writes_reject_epistemic_projection_records() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let shadow_node = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_bulk_nodes",
+            json!({
+                "nodes": [{
+                    "id": "shadow:node:a",
+                    "labels": ["EpistemicShadow"],
+                    "properties": { "content_node_id": "node:a" }
+                }]
+            }),
+        );
+        assert_eq!(shadow_node["ok"], false, "{shadow_node}");
+        assert_eq!(shadow_node["inserted"], 0, "{shadow_node}");
+        assert_eq!(
+            shadow_node["errors"][0]["code"], "projection_write_forbidden",
+            "{shadow_node}"
+        );
+        assert!(InMemoryGraphStore::get_node(&provider.0.borrow(), "shadow:node:a").is_none());
+
+        provider
+            .0
+            .borrow_mut()
+            .upsert_node(NodeRecord::new(
+                "shadow:node:a",
+                ["EpistemicShadow"],
+                json!({"content_node_id": "node:a"}),
+            ))
+            .unwrap();
+        provider
+            .0
+            .borrow_mut()
+            .upsert_node(NodeRecord::new(
+                "shadow:node:b",
+                ["EpistemicShadow"],
+                json!({"content_node_id": "node:b"}),
+            ))
+            .unwrap();
+
+        let reserved_link = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_bulk_edges",
+            json!({
+                "edges": [{
+                    "id": "shadow:node:a-link",
+                    "from_id": "node:a",
+                    "to_id": "shadow:node:a",
+                    "type": "HasEpistemicShadow"
+                }]
+            }),
+        );
+        assert_eq!(reserved_link["ok"], false, "{reserved_link}");
+        assert_eq!(
+            reserved_link["errors"][0]["code"], "projection_write_forbidden",
+            "{reserved_link}"
+        );
+        assert!(InMemoryGraphStore::get_edge(&provider.0.borrow(), "shadow:node:a-link").is_none());
+
+        let shadow_support = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_bulk_edges",
+            json!({
+                "edges": [{
+                    "id": "shadow:node:a-supports-shadow:node:b",
+                    "from_id": "shadow:node:a",
+                    "to_id": "shadow:node:b",
+                    "type": "Supports",
+                    "epistemic_type": "supports"
+                }]
+            }),
+        );
+        assert_eq!(shadow_support["ok"], false, "{shadow_support}");
+        assert_eq!(
+            shadow_support["errors"][0]["code"], "projection_write_forbidden",
+            "{shadow_support}"
+        );
+    }
+
+    #[test]
+    fn bulk_edges_allow_canonical_epistemic_content_edges() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let canonical = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_bulk_edges",
+            json!({
+                "edges": [{
+                    "id": "node:a-supports-node:b",
+                    "from_id": "node:a",
+                    "to_id": "node:b",
+                    "type": "Supports",
+                    "epistemic_type": "supports",
+                    "confidence": 0.7
+                }]
+            }),
+        );
+        assert_eq!(canonical["ok"], true, "{canonical}");
+        assert_eq!(canonical["inserted"], 1, "{canonical}");
+        assert_eq!(
+            canonical["epistemic_dirty_nodes_marked"], 2,
+            "canonical epistemic writes should dirty only content endpoints: {canonical}"
+        );
+        assert!(
+            InMemoryGraphStore::get_edge(&provider.0.borrow(), "node:a-supports-node:b").is_some()
+        );
+    }
+
+    #[test]
     fn graphql_content_node_epistemic_facet_reads_canonical_edges() {
         let (provider, mut config) = fixture();
         config.read_only = false;
@@ -16610,7 +16897,7 @@ mod tests {
             &provider,
             &config,
             "graphql_query",
-            "query{ contentNode(id:\"claim:a\"){ raw epistemic{ relationships(maxDepth:1) standing(topK:3) } } }",
+            "query{ contentNode(id:\"claim:a\"){ raw epistemic{ relationships(maxDepth:1) standing(topK:3) standingView(topK:3){ source stale supportInDegree attackInDegree receipt{ source stale } } relationshipViews(maxDepth:1){ relationshipId sourceId targetId relationType direction confidence evidenceRef receipt{ source stale } } } } }",
             Value::Null,
         );
         assert_no_graphql_errors(&facet);
@@ -16646,6 +16933,29 @@ mod tests {
             standing["scores"].as_array().map(Vec::len),
             Some(0),
             "direct canonical edge should be visible even before shadow scores exist: {facet}"
+        );
+        let standing_view = &facet["data"]["contentNode"]["epistemic"]["standingView"];
+        assert_eq!(standing_view["source"], json!("degree_fallback"));
+        assert_eq!(standing_view["stale"], json!(true));
+        assert_eq!(standing_view["supportInDegree"], json!(1));
+        assert_eq!(standing_view["attackInDegree"], json!(0));
+        assert_eq!(standing_view["receipt"]["source"], json!("degree_fallback"));
+        let relationship_views = facet["data"]["contentNode"]["epistemic"]["relationshipViews"]
+            .as_array()
+            .expect("relationshipViews should be an array");
+        assert_eq!(relationship_views.len(), 1, "{facet}");
+        assert_eq!(
+            relationship_views[0]["relationshipId"],
+            json!("claim:a-supports-claim:b")
+        );
+        assert_eq!(relationship_views[0]["sourceId"], json!("claim:a"));
+        assert_eq!(relationship_views[0]["targetId"], json!("claim:b"));
+        assert_eq!(relationship_views[0]["relationType"], json!("supports"));
+        assert_eq!(relationship_views[0]["direction"], json!("out"));
+        assert_eq!(relationship_views[0]["confidence"], json!(0.7));
+        assert_eq!(
+            relationship_views[0]["receipt"]["source"],
+            json!("canonical_edge")
         );
     }
 
@@ -17002,7 +17312,10 @@ mod tests {
         let task_ref = &resolved["data"]["taskRef"];
         let task_ref_id = task_ref["task_ref_id"].as_str().unwrap().to_string();
         let canonical = task_ref["canonical_room_id"].as_str().unwrap().to_string();
-        assert_eq!(canonical, "task:spec-9-commonplace-desktop-tauri", "{resolved}");
+        assert_eq!(
+            canonical, "task:spec-9-commonplace-desktop-tauri",
+            "{resolved}"
+        );
 
         // TRR-002: Claude's handoff lands in ungrouped, routes to canonical.
         let routed = graphql_tool_call(
@@ -17027,7 +17340,11 @@ mod tests {
             Value::Null,
         );
         assert_no_graphql_errors(&pinged);
-        assert_eq!(pinged["data"]["createPing"]["status"], json!("pending"), "{pinged}");
+        assert_eq!(
+            pinged["data"]["createPing"]["status"],
+            json!("pending"),
+            "{pinged}"
+        );
 
         // TRR-004/010: codex's turn-start discovery surfaces both before edits.
         let discovery = graphql_tool_call(
@@ -17139,16 +17456,76 @@ mod tests {
     // GraphQL returns the shadow nodes the flat rustyred_thg_epistemic_neighbors
     // call returns; shadowPpr and compileSubgraph also match their flat tools.
     #[test]
+    fn graphql_enrich_apply_requires_admin_projection_scope() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        config.allow_admin = true;
+        config.tool_result_budget_bytes = 0;
+        let annotations = json!({
+            "annotations": [
+                { "content_node_id": "node:a", "grounded_extension_status": "in" }
+            ],
+            "support_relations": [],
+            "attack_relations": []
+        });
+        let query = "mutation($a:JSON!){ enrichApply(annotations:$a) }";
+
+        let denied = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_mutate",
+            query,
+            json!({ "a": annotations.clone() }),
+        );
+        let errors = denied["errors"].as_array().expect("graphql errors");
+        assert!(
+            errors[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("admin:write"),
+            "enrichApply should require admin projection scope: {denied}"
+        );
+
+        let allowed_response = handle_mcp_request_with_context(
+            &provider,
+            &config,
+            &McpRequestContext::with_scopes(["rustyred_thg:graph:admin:projection"]),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "graphql",
+                "method": "tools/call",
+                "params": {
+                    "name": "graphql_mutate",
+                    "arguments": {
+                        "tenant": "smoke",
+                        "query": query,
+                        "variables": { "a": annotations }
+                    }
+                }
+            }),
+        );
+        let allowed = allowed_response["result"]["structuredContent"].clone();
+        assert_no_graphql_errors(&allowed);
+        assert_eq!(
+            allowed["data"]["enrichApply"]["shadows_written"].as_u64(),
+            Some(1),
+            "admin-scoped GraphQL enrichApply should rebuild projection: {allowed}"
+        );
+    }
+
+    #[test]
     fn graphql_epistemic_domain_matches_flat_tools() {
         let (provider, mut config) = fixture();
         config.read_only = false;
+        config.allow_admin = true;
         config.tool_result_budget_bytes = 0;
 
         // Seed the shadow graph: node:a/node:b are fixture-seeded content nodes;
         // enrich writes two shadows plus a Supports shadow edge.
-        let applied = call_tool_json(
+        let applied = call_tool_json_with_context(
             &provider,
             &config,
+            &McpRequestContext::with_scopes(["admin:write"]),
             "epistemic_enrich_apply",
             json!({
                 "engine_version": "a4-test-v1",
@@ -17193,7 +17570,7 @@ mod tests {
             &provider,
             &config,
             "graphql_query",
-            "query{ contentNode(id:\"node:a\"){ id raw epistemic{ relationships(maxDepth:2) standing(topK:4) } } }",
+            "query{ contentNode(id:\"node:a\"){ id raw epistemic{ relationships(maxDepth:2) standing(topK:4) standingView(topK:4){ source stale receipt{ source stale projectionVersion computedAtMs } } relationshipViews(maxDepth:2){ targetId relationType evidenceRef receipt{ source projectionVersion } } } } }",
             Value::Null,
         );
         assert_no_graphql_errors(&facet);
@@ -17215,6 +17592,30 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "contentNode.epistemic.standing should expose shadow PPR readout: {facet}"
+        );
+        let standing_view = &facet["data"]["contentNode"]["epistemic"]["standingView"];
+        assert_eq!(standing_view["source"], json!("shadow_ppr"), "{facet}");
+        assert_eq!(standing_view["stale"], json!(false), "{facet}");
+        assert_eq!(
+            standing_view["receipt"]["projectionVersion"],
+            json!("a4-test-v1"),
+            "{facet}"
+        );
+        assert!(
+            standing_view["receipt"]["computedAtMs"].as_i64().is_some(),
+            "{facet}"
+        );
+        let relationship_views = facet["data"]["contentNode"]["epistemic"]["relationshipViews"]
+            .as_array()
+            .expect("relationshipViews should be an array");
+        assert!(
+            relationship_views.iter().any(|relationship| {
+                relationship["targetId"] == json!("node:b")
+                    && relationship["relationType"] == json!("supports")
+                    && relationship["receipt"]["source"] == json!("shadow_projection")
+                    && relationship["receipt"]["projectionVersion"] == json!("a4-test-v1")
+            }),
+            "shadow-backed relationship view should normalize target content and projection receipt: {facet}"
         );
 
         // shadowPpr parity over the populated shadow layer.
@@ -17646,6 +18047,7 @@ mod tests {
     fn graphql_default_surface_hides_covered_flat_tools() {
         let (provider, mut config) = fixture();
         config.read_only = false;
+        config.allow_admin = true;
 
         // Default mode (flag off): the flat surface is unchanged -- covered tools present.
         let default_names = tool_names(&provider, &config);

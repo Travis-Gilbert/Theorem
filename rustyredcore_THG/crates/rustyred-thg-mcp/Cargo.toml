@@ -18,6 +18,7 @@ serde_json = "1.0"
 ensemble = { path = "../ensemble" }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 rustyred-thg-code = { path = "../rustyred-thg-code" }
+rustyred-thg-ml = { path = "../rustyred-thg-ml" }
 rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
 rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
 theorem-harness-core = { path = "../theorem-harness-core" }
