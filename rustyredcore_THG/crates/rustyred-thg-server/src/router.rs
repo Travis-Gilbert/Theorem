@@ -19,9 +19,11 @@ use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyred_hipporag::HippoQuery;
+use rustyred_membrane::ScoreContext;
 use rustyred_rerank::{
-    CrossEncoder, HttpCrossEncoder, HttpListwiseReranker, LexicalCrossEncoder, ListwiseReranker,
-    RerankScorer, GTE_RERANKER_MODERNBERT_BASE, JINA_RERANKER_V3,
+    stamp_listwise_rank, ArmWeights, CrossEncoder, HttpCrossEncoder, HttpListwiseReranker,
+    LexicalCrossEncoder, ListwiseReranker, PrecomputedRerankScorer, GTE_RERANKER_MODERNBERT_BASE,
+    JINA_RERANKER_V3,
 };
 use rustyred_thg_adapters::execute_adapter_command;
 use rustyred_thg_affordances::CONNECTOR_LABEL;
@@ -46,13 +48,15 @@ use rustyred_thg_mcp::{
 };
 use rustyred_web::{
     apply_batch_to_store, build_web_commons_fragment, build_web_commons_ingest_plan,
-    configured_qwen3_embedding_4b_client_from_env, fanout_search_providers, gate_search_graph,
-    gate_search_graph_with_hippo_query_vector, render_serp_html, run_live_crawl, search_substrate,
-    warm_pages_task, web_consume_to_graph, ActionOptions, AutomationActionReceipt,
-    BrowserActionPolicy, CrawlBudget, CrawlReceipt, CrawlRequest, CrawlScope, Locator,
-    LocatorAction, PageRecord, PageState, RustyWebError, SearchOptions, SearchOpts, TextEmbedder,
-    WebCommonsFragment, WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt,
-    WebConsumeReceipt, WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
+    cheap_neural_rerank_indices, complete_prepared_search_graph_gate,
+    configured_qwen3_embedding_4b_client_from_env, fanout_search_providers,
+    prepare_search_graph_gate, render_serp_html, run_live_crawl, search_substrate,
+    stamp_cheap_relevance_scores, stamp_model_relevance_scores, warm_pages_task,
+    web_consume_to_graph, ActionOptions, AutomationActionReceipt, BrowserActionPolicy, CrawlBudget,
+    CrawlReceipt, CrawlRequest, CrawlScope, Locator, LocatorAction, PageRecord, PageState,
+    RustyWebError, SearchOptions, SearchOpts, TextEmbedder, WebCommonsFragment,
+    WebCommonsFragmentOptions, WebCommonsPageDisposition, WebCommonsReceipt, WebConsumeReceipt,
+    WebConsumeRequest, WebSearchGraphOptions, EDGE_LINKS_TO, LABEL_PAGE,
     LABEL_WEB_COMMONS_ATTESTATION, LABEL_WEB_COMMONS_PEER, QWEN3_EMBEDDING_4B_DIMENSION,
     SEMANTIC_VECTOR_PROPERTY,
 };
@@ -2516,6 +2520,17 @@ fn web_search_graph_job(
     if let Some(fetch_top_k) = argument_u64_any(arguments, &["fetch_top_k", "fetchTopK"]) {
         options.fetch_top_k = fetch_top_k.clamp(0, 100) as usize;
     }
+    if let Some(neural_rerank_top_k) = argument_u64_any(
+        arguments,
+        &[
+            "neural_rerank_top_k",
+            "neuralRerankTopK",
+            "rerank_top_k",
+            "rerankTopK",
+        ],
+    ) {
+        options.neural_rerank_top_k = neural_rerank_top_k.clamp(0, 100) as usize;
+    }
 
     Ok(WebSearchGraphJob {
         run_id: argument_text_any(arguments, &["run_id", "runId"])
@@ -2527,7 +2542,36 @@ fn web_search_graph_job(
     })
 }
 
-fn web_cross_encoder_from_env() -> Box<dyn CrossEncoder> {
+enum WebCrossEncoder {
+    Http(HttpCrossEncoder),
+    Lexical(LexicalCrossEncoder),
+}
+
+impl WebCrossEncoder {
+    fn model_id(&self) -> &str {
+        match self {
+            Self::Http(encoder) => encoder.model_id(),
+            Self::Lexical(encoder) => encoder.model_id(),
+        }
+    }
+
+    fn version(&self) -> String {
+        format!("{}:membrane-v1", self.model_id())
+    }
+
+    async fn score_batch_async(&self, query: &str, texts: &[String]) -> Option<Vec<f32>> {
+        match self {
+            Self::Http(encoder) => encoder.score_batch_async(query, texts).await,
+            Self::Lexical(encoder) => Some(encoder.score_batch(query, texts)),
+        }
+    }
+
+    fn is_http(&self) -> bool {
+        matches!(self, Self::Http(_))
+    }
+}
+
+fn web_cross_encoder_from_env() -> WebCrossEncoder {
     let model_id = env_nonempty(&["THEOREM_RERANKER_MODEL", "RUSTYRED_RERANKER_MODEL"])
         .unwrap_or_else(|| GTE_RERANKER_MODERNBERT_BASE.to_string());
     match env_nonempty(&[
@@ -2535,11 +2579,11 @@ fn web_cross_encoder_from_env() -> Box<dyn CrossEncoder> {
         "RUSTYRED_RERANKER_URL",
         "RUSTYWEB_RERANKER_URL",
     ]) {
-        Some(url) => Box::new(HttpCrossEncoder::new(
+        Some(url) => WebCrossEncoder::Http(HttpCrossEncoder::new(
             reranker_endpoint(&url, "score"),
             model_id,
         )),
-        None => Box::new(LexicalCrossEncoder::new("lexical-cross-encoder")),
+        None => WebCrossEncoder::Lexical(LexicalCrossEncoder::new("lexical-cross-encoder")),
     }
 }
 
@@ -2597,14 +2641,77 @@ async fn execute_web_search_graph(
         fanout_search_providers(&providers, &query, options.acquisition.clone()).await;
     let hippo_query_vector = hippo_query_vector_from_env(&query).await?;
 
-    // (2) Synchronous gate: acquire the tenant store, run the membrane gate, drop
-    // the guard. No `.await` lives inside this scope, so the guard never crosses an
-    // await boundary. gate_search_graph reads the warm substrate, unifies the fresh
-    // + warm pools, admits to the token budget (persisting deferred handles byte-
-    // exact), and emits the membrane receipt.
-    let scorer = RerankScorer::web(web_cross_encoder_from_env());
-    let reranker_version = scorer.version();
+    // (2) Cheap recall/unification: acquire the tenant store, read the warm
+    // substrate + HippoRAG candidates, build the unified candidate pool, then
+    // drop the guard before any model I/O.
+    let mut prepared = {
+        let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
+            json!({
+                "error": "store_unavailable",
+                "code": error.code,
+                "message": error.message
+            })
+        })?;
+        let mut gate_store = TenantMirrorGraphStore::new(&mut store).map_err(|error| {
+            json!({
+                "error": "web_search_graph_store_unavailable",
+                "code": error.code,
+                "message": error.message
+            })
+        })?;
+        prepare_search_graph_gate(
+            &mut gate_store,
+            acquisition,
+            &options,
+            hippo_query_vector.as_deref(),
+        )
+    };
+
+    // (3) Neural rerank: pre-rank cheaply, cap the paid set, then batch-score the
+    // selected candidate texts in one async HTTP call. If the model is absent or
+    // fails, the already-stamped cheap relevance scores drive the gate.
+    let cross_encoder = web_cross_encoder_from_env();
+    let mut reranker_version = cross_encoder.version();
+    stamp_cheap_relevance_scores(&mut prepared.candidates, &prepared.acquisition.query);
+    if cross_encoder.is_http() && options.neural_rerank_top_k > 0 {
+        let rerank_indices = cheap_neural_rerank_indices(
+            &prepared.candidates,
+            &prepared.acquisition.query,
+            ArmWeights::web(),
+            options.neural_rerank_top_k,
+        );
+        let rerank_texts: Vec<String> = rerank_indices
+            .iter()
+            .filter_map(|index| prepared.candidates.get(*index))
+            .map(|candidate| candidate.text.clone())
+            .collect();
+        if let Some(scores) = cross_encoder
+            .score_batch_async(&prepared.acquisition.query, &rerank_texts)
+            .await
+        {
+            stamp_model_relevance_scores(
+                &mut prepared.candidates,
+                &rerank_indices,
+                &scores,
+                cross_encoder.model_id(),
+            );
+        }
+    }
+
+    let scorer = PrecomputedRerankScorer::web();
     let listwise = web_listwise_reranker_from_env();
+    if let Some(listwise) = listwise.as_deref() {
+        let active = Vec::new();
+        let ctx = ScoreContext::new(&prepared.acquisition.query, &active)
+            .with_mmr_lambda(options.mmr_lambda);
+        let candidates = std::mem::take(&mut prepared.candidates);
+        prepared.candidates = stamp_listwise_rank(listwise.rerank(candidates, &scorer, &ctx));
+        reranker_version = format!("{reranker_version}+listwise:{}", listwise.model_id());
+    }
+
+    // (4) Final gate: reacquire the tenant store only for sync admission,
+    // deferred-context persistence, and receipt emission. The scorer reads the
+    // precomputed relevance metadata and never performs model I/O under the lock.
     let result = {
         let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
             json!({
@@ -2620,25 +2727,14 @@ async fn execute_web_search_graph(
                 "message": error.message
             })
         })?;
-        match hippo_query_vector.as_deref() {
-            Some(query_vector) => gate_search_graph_with_hippo_query_vector(
-                &mut gate_store,
-                acquisition,
-                &options,
-                &scorer,
-                listwise.as_deref(),
-                reranker_version,
-                query_vector,
-            ),
-            None => gate_search_graph(
-                &mut gate_store,
-                acquisition,
-                &options,
-                &scorer,
-                listwise.as_deref(),
-                reranker_version,
-            ),
-        }
+        complete_prepared_search_graph_gate(
+            &mut gate_store,
+            prepared,
+            &options,
+            &scorer,
+            None,
+            reranker_version,
+        )
         .map_err(|error| {
             json!({
                 "error": "web_search_graph_failed",
@@ -2647,7 +2743,7 @@ async fn execute_web_search_graph(
         })?
     };
 
-    // (3) Fire-and-forget warming (acceptance #4): fetch the top result urls and
+    // (5) Fire-and-forget warming (acceptance #4): fetch the top result urls and
     // write them back as `state="fetched"` Page nodes so the FetchCompletionHook
     // extraction runs reactively. The response below is assembled and returned
     // WITHOUT awaiting this. The TenantMirrorGraphStore guard borrows the store, so
@@ -2871,6 +2967,12 @@ fn web_search_graph_tool_definition() -> Value {
                 "fetch_top_k": {
                     "type": "integer",
                     "description": "How many top result urls the fire-and-forget warming pass fetches + writes back as fetched Page nodes. Default 5.",
+                    "minimum": 0,
+                    "maximum": 100
+                },
+                "neural_rerank_top_k": {
+                    "type": "integer",
+                    "description": "How many cheap-recalled candidates may pay neural rerank cost. Default 20; 0 disables neural rerank.",
                     "minimum": 0,
                     "maximum": 100
                 }

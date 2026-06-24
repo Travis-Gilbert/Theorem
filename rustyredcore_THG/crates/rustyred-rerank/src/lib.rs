@@ -17,6 +17,7 @@ pub use cross_encoder::{
 
 pub const LISTWISE_RANK_SCORE_KEY: &str = "listwise_rank_score";
 pub const DEFAULT_LISTWISE_RANK_WEIGHT: f32 = 0.20;
+pub const PRECOMPUTED_RELEVANCE_SCORE_KEY: &str = "precomputed_relevance_score";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArmWeights {
@@ -80,6 +81,34 @@ impl RerankScorer {
 impl Scorer for RerankScorer {
     fn score(&self, c: &Candidate, ctx: &ScoreContext<'_>) -> f32 {
         let relevance = self.cross_encoder.score(ctx.query, &c.text);
+        self.weights.relevance * relevance
+            + self.weights.ppr * c.ppr_proximity
+            + self.weights.epistemic * c.epistemic.combined()
+    }
+}
+
+pub struct PrecomputedRerankScorer {
+    pub weights: ArmWeights,
+}
+
+impl PrecomputedRerankScorer {
+    pub fn new(weights: ArmWeights) -> Self {
+        Self { weights }
+    }
+
+    pub fn web() -> Self {
+        Self::new(ArmWeights::web())
+    }
+}
+
+impl Scorer for PrecomputedRerankScorer {
+    fn score(&self, c: &Candidate, _ctx: &ScoreContext<'_>) -> f32 {
+        let relevance = c
+            .metadata
+            .get(PRECOMPUTED_RELEVANCE_SCORE_KEY)
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         self.weights.relevance * relevance
             + self.weights.ppr * c.ppr_proximity
             + self.weights.epistemic * c.epistemic.combined()
@@ -179,5 +208,24 @@ mod tests {
         let scorer = ListwiseRankScorer::with_weight(&base, 0.2);
 
         assert!(scorer.score(&ranked[0], &ctx) > scorer.score(&ranked[1], &ctx));
+    }
+
+    #[test]
+    fn precomputed_rerank_scorer_never_calls_a_model() {
+        let active = Vec::new();
+        let ctx = ScoreContext::new("parser", &active).without_redundancy();
+        let mut relevant = Candidate::new("relevant", "body", 1);
+        relevant.metadata.insert(
+            PRECOMPUTED_RELEVANCE_SCORE_KEY.to_string(),
+            "0.900000".to_string(),
+        );
+        let mut irrelevant = Candidate::new("irrelevant", "body", 1);
+        irrelevant.metadata.insert(
+            PRECOMPUTED_RELEVANCE_SCORE_KEY.to_string(),
+            "0.100000".to_string(),
+        );
+        let scorer = PrecomputedRerankScorer::web();
+
+        assert!(scorer.score(&relevant, &ctx) > scorer.score(&irrelevant, &ctx));
     }
 }

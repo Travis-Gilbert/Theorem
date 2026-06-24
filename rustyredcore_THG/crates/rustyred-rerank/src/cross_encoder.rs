@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client as BlockingClient, Client as AsyncClient};
 use rustyred_membrane::{Candidate, ScoreContext, Scorer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,6 +14,10 @@ const DEFAULT_HTTP_TIMEOUT_SECONDS: u64 = 8;
 pub trait CrossEncoder: Send + Sync {
     fn model_id(&self) -> &str;
     fn score(&self, query: &str, text: &str) -> f32;
+
+    fn score_batch(&self, query: &str, texts: &[String]) -> Vec<f32> {
+        texts.iter().map(|text| self.score(query, text)).collect()
+    }
 }
 
 /// Configuration record for the intended v1 model family. Runtime bindings can
@@ -82,7 +86,8 @@ impl CrossEncoder for LexicalCrossEncoder {
 pub struct HttpCrossEncoder {
     endpoint: String,
     model_id: String,
-    client: Client,
+    blocking_client: BlockingClient,
+    async_client: AsyncClient,
 }
 
 impl HttpCrossEncoder {
@@ -90,22 +95,34 @@ impl HttpCrossEncoder {
         Self {
             endpoint: endpoint.into(),
             model_id: model_id.into(),
-            client: Client::builder()
+            blocking_client: BlockingClient::builder()
                 .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECONDS))
                 .build()
                 .expect("reqwest blocking client"),
+            async_client: AsyncClient::builder()
+                .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECONDS))
+                .build()
+                .expect("reqwest async client"),
         }
     }
 
     fn score_one(&self, query: &str, text: &str) -> Option<f32> {
+        self.score_batch_blocking(query, &[text.to_string()])
+            .and_then(|scores| scores.into_iter().next())
+    }
+
+    fn score_batch_blocking(&self, query: &str, texts: &[String]) -> Option<Vec<f32>> {
+        if texts.is_empty() {
+            return Some(Vec::new());
+        }
         let payload = json!({
             "query": query,
-            "text": text,
-            "texts": [text],
+            "text": texts.first().map(String::as_str).unwrap_or_default(),
+            "texts": texts,
             "model": self.model_id,
         });
         let response = self
-            .client
+            .blocking_client
             .post(&self.endpoint)
             .json(&payload)
             .send()
@@ -114,7 +131,32 @@ impl HttpCrossEncoder {
             .ok()?
             .json::<Value>()
             .ok()?;
-        parse_score_response(&response)
+        parse_score_vector_response(&response, texts.len())
+    }
+
+    pub async fn score_batch_async(&self, query: &str, texts: &[String]) -> Option<Vec<f32>> {
+        if texts.is_empty() {
+            return Some(Vec::new());
+        }
+        let payload = json!({
+            "query": query,
+            "text": texts.first().map(String::as_str).unwrap_or_default(),
+            "texts": texts,
+            "model": self.model_id,
+        });
+        let response = self
+            .async_client
+            .post(&self.endpoint)
+            .json(&payload)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?;
+        parse_score_vector_response(&response, texts.len())
     }
 }
 
@@ -125,6 +167,11 @@ impl CrossEncoder for HttpCrossEncoder {
 
     fn score(&self, query: &str, text: &str) -> f32 {
         self.score_one(query, text).unwrap_or(0.0)
+    }
+
+    fn score_batch(&self, query: &str, texts: &[String]) -> Vec<f32> {
+        self.score_batch_blocking(query, texts)
+            .unwrap_or_else(|| vec![0.0; texts.len()])
     }
 }
 
@@ -199,7 +246,7 @@ pub trait ListwiseReranker: Send + Sync {
 pub struct HttpListwiseReranker {
     endpoint: String,
     model_id: String,
-    client: Client,
+    client: BlockingClient,
 }
 
 impl HttpListwiseReranker {
@@ -207,7 +254,7 @@ impl HttpListwiseReranker {
         Self {
             endpoint: endpoint.into(),
             model_id: model_id.into(),
-            client: Client::builder()
+            client: BlockingClient::builder()
                 .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECONDS))
                 .build()
                 .expect("reqwest blocking client"),
@@ -346,6 +393,27 @@ fn parse_score_response(value: &Value) -> Option<f32> {
         .map(normalize_model_score)
 }
 
+fn parse_score_vector_response(value: &Value, expected_len: usize) -> Option<Vec<f32>> {
+    if expected_len == 0 {
+        return Some(Vec::new());
+    }
+
+    let indexed = parse_rerank_scores(value);
+    if !indexed.is_empty() {
+        let mut scores = Vec::with_capacity(expected_len);
+        for index in 0..expected_len {
+            scores.push(*indexed.get(&index)?);
+        }
+        return Some(scores);
+    }
+
+    if expected_len == 1 {
+        return parse_score_response(value).map(|score| vec![score]);
+    }
+
+    None
+}
+
 fn parse_rerank_scores(value: &Value) -> BTreeMap<usize, f32> {
     if let Some(scores) = value.get("scores").and_then(Value::as_array) {
         return scores
@@ -421,6 +489,46 @@ mod tests {
 
         let selected = select_small_cpu_sequence_classifier(&ledger).unwrap();
         assert_eq!(selected.model_id, GTE_RERANKER_MODERNBERT_BASE);
+    }
+
+    #[test]
+    fn lexical_cross_encoder_scores_batch_without_reordering() {
+        let scorer = LexicalCrossEncoder::new("lexical");
+        let scores = scorer.score_batch(
+            "fast reranker",
+            &[
+                "fast sequence reranker".to_string(),
+                "unrelated weather".to_string(),
+            ],
+        );
+
+        assert_eq!(scores.len(), 2);
+        assert!(scores[0] > scores[1]);
+    }
+
+    #[test]
+    fn batch_score_parser_reads_scores_array() {
+        let response = json!({
+            "scores": [0.25, {"score": 2.0}]
+        });
+
+        let scores = parse_score_vector_response(&response, 2).expect("batch scores");
+
+        assert_eq!(scores, vec![0.25, 2.0]);
+    }
+
+    #[test]
+    fn batch_score_parser_reads_indexed_rows() {
+        let response = json!({
+            "results": [
+                {"index": 1, "score": 0.4},
+                {"index": 0, "score": 0.9}
+            ]
+        });
+
+        let scores = parse_score_vector_response(&response, 2).expect("indexed scores");
+
+        assert_eq!(scores, vec![0.9, 0.4]);
     }
 
     #[test]

@@ -138,8 +138,10 @@ pub use search::{
 
 pub mod search_graph;
 pub use search_graph::{
-    gate_search_graph, gate_search_graph_with_hippo_query_vector, warm_pages_task,
-    web_search_graph, write_fetched_pages, WebSearchGraph, WebSearchGraphOptions,
+    cheap_neural_rerank_indices, complete_prepared_search_graph_gate, gate_search_graph,
+    gate_search_graph_with_hippo_query_vector, prepare_search_graph_gate,
+    stamp_cheap_relevance_scores, stamp_model_relevance_scores, warm_pages_task, web_search_graph,
+    write_fetched_pages, PreparedSearchGraphGate, WebSearchGraph, WebSearchGraphOptions,
 };
 
 // The browser's SERP: render a search as a node-and-edge graph page. See serp.rs.

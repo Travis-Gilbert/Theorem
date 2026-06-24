@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use futures_util::{stream, StreamExt};
 use rustyred_hipporag::{
     retrieve as hippo_retrieve, retrieve_with_query_vector as hippo_retrieve_with_query_vector,
     HippoQuery,
@@ -41,7 +42,10 @@ use rustyred_membrane::recover::{admit_to_budget, emit_receipt};
 use rustyred_membrane::{
     Candidate, Handle, MembraneReceipt, ScoreContext, Scorer, Source, SourceArm,
 };
-use rustyred_rerank::{stamp_listwise_rank, ListwiseRankScorer, ListwiseReranker};
+use rustyred_rerank::{
+    stamp_listwise_rank, ArmWeights, CrossEncoder, LexicalCrossEncoder, ListwiseRankScorer,
+    ListwiseReranker, PRECOMPUTED_RELEVANCE_SCORE_KEY,
+};
 use rustyred_thg_core::GraphStore;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -61,6 +65,10 @@ const DEFAULT_FETCH_TIMEOUT_SECONDS: u64 = 15;
 const FETCH_USER_AGENT: &str = "RustyWeb/0.2 membrane-warm";
 /// Namespace the warming pass writes Page nodes under (matches the crawler scope).
 const WARM_NAMESPACE: &str = "open_web_unverified";
+/// Default number of cheap-recalled candidates that may pay neural rerank cost.
+pub const DEFAULT_NEURAL_RERANK_TOP_K: usize = 20;
+/// Maximum concurrent fetches in the fire-and-forget warming pass.
+const WARM_FETCH_CONCURRENCY: usize = 4;
 
 /// Knobs for one [`web_search_graph`] invocation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +90,9 @@ pub struct WebSearchGraphOptions {
     /// How many top result URLs the fire-and-forget pass fetches + writes back
     /// as `state="fetched"` Page nodes (firing the extraction hook).
     pub fetch_top_k: usize,
+    /// How many cheap-recalled candidates may pay neural rerank cost. Candidates
+    /// outside this cap keep their cheap lexical/vector score.
+    pub neural_rerank_top_k: usize,
 }
 
 impl Default for WebSearchGraphOptions {
@@ -93,6 +104,7 @@ impl Default for WebSearchGraphOptions {
             mmr_lambda: rustyred_membrane::scorer::DEFAULT_MMR_LAMBDA,
             redundancy_penalty: rustyred_membrane::scorer::DEFAULT_REDUNDANCY_PENALTY,
             fetch_top_k: 5,
+            neural_rerank_top_k: DEFAULT_NEURAL_RERANK_TOP_K,
         }
     }
 }
@@ -125,6 +137,21 @@ pub struct WebSearchGraph {
     /// The top result URLs the fire-and-forget pass will fetch + write back.
     /// Exposed so the MCP layer can report what is warming.
     pub fetch_seed_urls: Vec<String>,
+}
+
+/// Store-derived, model-free candidate set for the second-stage reranker.
+///
+/// This is intentionally detached from a store borrow so callers can release a
+/// tenant-store guard, batch neural rerank these candidates, then reacquire the
+/// store only for final admission and receipt persistence.
+#[derive(Clone, Debug)]
+pub struct PreparedSearchGraphGate {
+    pub acquisition: SearchAcquisition,
+    pub candidates: Vec<Candidate>,
+    pub fresh_urls: Vec<String>,
+    pub warm_ids: Vec<String>,
+    pub warm_urls: BTreeSet<String>,
+    pub candidates_scored: usize,
 }
 
 impl WebSearchGraph {
@@ -200,14 +227,14 @@ pub fn gate_search_graph<S: GraphStore>(
     listwise: Option<&dyn ListwiseReranker>,
     reranker_version: impl Into<String>,
 ) -> RustyWebResult<WebSearchGraph> {
-    gate_search_graph_inner(
+    let prepared = prepare_search_graph_gate(store, acquisition, options, None);
+    complete_prepared_search_graph_gate(
         store,
-        acquisition,
+        prepared,
         options,
         scorer,
         listwise,
         reranker_version,
-        None,
     )
 }
 
@@ -220,26 +247,23 @@ pub fn gate_search_graph_with_hippo_query_vector<S: GraphStore>(
     reranker_version: impl Into<String>,
     hippo_query_vector: &[f32],
 ) -> RustyWebResult<WebSearchGraph> {
-    gate_search_graph_inner(
+    let prepared = prepare_search_graph_gate(store, acquisition, options, Some(hippo_query_vector));
+    complete_prepared_search_graph_gate(
         store,
-        acquisition,
+        prepared,
         options,
         scorer,
         listwise,
         reranker_version,
-        Some(hippo_query_vector),
     )
 }
 
-fn gate_search_graph_inner<S: GraphStore>(
+pub fn prepare_search_graph_gate<S: GraphStore>(
     store: &mut S,
     acquisition: SearchAcquisition,
     options: &WebSearchGraphOptions,
-    scorer: &dyn Scorer,
-    listwise: Option<&dyn ListwiseReranker>,
-    reranker_version: impl Into<String>,
     hippo_query_vector: Option<&[f32]>,
-) -> RustyWebResult<WebSearchGraph> {
+) -> PreparedSearchGraphGate {
     // (b) WARM pool: the substrate subgraph for the query, read over the store.
     let substrate = search_substrate(store, &acquisition.query, options.substrate.clone());
     let hippo_query = HippoQuery {
@@ -267,6 +291,32 @@ fn gate_search_graph_inner<S: GraphStore>(
     } = pools;
     let candidates_scored = candidates.len();
 
+    PreparedSearchGraphGate {
+        acquisition,
+        candidates,
+        fresh_urls,
+        warm_ids,
+        warm_urls,
+        candidates_scored,
+    }
+}
+
+pub fn complete_prepared_search_graph_gate<S: GraphStore>(
+    store: &mut S,
+    prepared: PreparedSearchGraphGate,
+    options: &WebSearchGraphOptions,
+    scorer: &dyn Scorer,
+    listwise: Option<&dyn ListwiseReranker>,
+    reranker_version: impl Into<String>,
+) -> RustyWebResult<WebSearchGraph> {
+    let PreparedSearchGraphGate {
+        acquisition,
+        candidates,
+        fresh_urls,
+        warm_ids,
+        warm_urls,
+        candidates_scored,
+    } = prepared;
     let active: Vec<String> = Vec::new();
     let ctx = ScoreContext::new(&acquisition.query, &active).with_mmr_lambda(options.mmr_lambda);
 
@@ -337,6 +387,75 @@ fn gate_search_graph_inner<S: GraphStore>(
     })
 }
 
+pub fn stamp_cheap_relevance_scores(candidates: &mut [Candidate], query: &str) {
+    let lexical = LexicalCrossEncoder::default();
+    for candidate in candidates {
+        let score = lexical.score(query, &candidate.text);
+        stamp_relevance_score(candidate, score);
+    }
+}
+
+pub fn cheap_neural_rerank_indices(
+    candidates: &[Candidate],
+    query: &str,
+    weights: ArmWeights,
+    limit: usize,
+) -> Vec<usize> {
+    if limit == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+    let lexical = LexicalCrossEncoder::default();
+    let mut indexed: Vec<(usize, f32)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let relevance = lexical.score(query, &candidate.text);
+            let score = weights.relevance * relevance
+                + weights.ppr * candidate.ppr_proximity
+                + weights.epistemic * candidate.epistemic.combined();
+            (index, score)
+        })
+        .collect();
+    indexed.sort_by(|(left_index, left_score), (right_index, right_score)| {
+        right_score
+            .partial_cmp(left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                candidates[*left_index]
+                    .node_id
+                    .cmp(&candidates[*right_index].node_id)
+            })
+    });
+    indexed
+        .into_iter()
+        .take(limit)
+        .map(|(index, _score)| index)
+        .collect()
+}
+
+pub fn stamp_model_relevance_scores(
+    candidates: &mut [Candidate],
+    indices: &[usize],
+    scores: &[f32],
+    model_id: &str,
+) {
+    for (index, score) in indices.iter().copied().zip(scores.iter().copied()) {
+        if let Some(candidate) = candidates.get_mut(index) {
+            stamp_relevance_score(candidate, score);
+            candidate
+                .metadata
+                .insert("neural_rerank_model".to_string(), model_id.to_string());
+        }
+    }
+}
+
+fn stamp_relevance_score(candidate: &mut Candidate, score: f32) {
+    candidate.metadata.insert(
+        PRECOMPUTED_RELEVANCE_SCORE_KEY.to_string(),
+        format!("{:.6}", score.clamp(0.0, 1.0)),
+    );
+}
+
 /// The fire-and-forget warming pass: fetch each url through [`FetchCascade`] and
 /// write it as a `state="fetched"` Page node (plus its `ContentSnapshot`). The
 /// `state="fetched"` write is what [`crate::crawl_hooks::fetch_completion_hook`]
@@ -359,39 +478,44 @@ pub async fn warm_pages_task<S: GraphStore>(
         Err(_) => return 0,
     };
 
-    let mut fetched = Vec::new();
-    for url in urls {
-        let canonical = match crate::canonicalize_url(url) {
-            Ok(canonical) => canonical,
-            Err(_) => continue,
-        };
-        match cascade
-            .fetch_with_promotion(&canonical, DEFAULT_FETCH_MAX_BYTES)
-            .await
-        {
-            Ok(result) if (200..400).contains(&result.http_status) => {
-                let body = String::from_utf8_lossy(&result.html_bytes).into_owned();
-                fetched.push(FixturePage {
-                    url: if result.final_url.trim().is_empty() {
-                        canonical
-                    } else {
-                        result.final_url.clone()
-                    },
-                    status: result.http_status,
-                    body,
-                    content_type: if result.content_type.trim().is_empty() {
-                        "text/html".to_string()
-                    } else {
-                        result.content_type.clone()
-                    },
-                    fetched_at: String::new(),
-                });
-            }
-            _ => continue,
-        }
-    }
+    let fetched: Vec<FixturePage> = stream::iter(urls.iter().cloned())
+        .map(|url| {
+            let cascade = cascade.clone();
+            async move { fetch_warm_page(cascade, url).await }
+        })
+        .buffer_unordered(WARM_FETCH_CONCURRENCY.max(1))
+        .filter_map(|page| async move { page })
+        .collect()
+        .await;
 
     write_fetched_pages(store, fetched, run_id.into())
+}
+
+async fn fetch_warm_page(cascade: FetchCascade, url: String) -> Option<FixturePage> {
+    let canonical = crate::canonicalize_url(&url).ok()?;
+    let result = cascade
+        .fetch_with_promotion(&canonical, DEFAULT_FETCH_MAX_BYTES)
+        .await
+        .ok()?;
+    if !(200..400).contains(&result.http_status) {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&result.html_bytes).into_owned();
+    Some(FixturePage {
+        url: if result.final_url.trim().is_empty() {
+            canonical
+        } else {
+            result.final_url.clone()
+        },
+        status: result.http_status,
+        body,
+        content_type: if result.content_type.trim().is_empty() {
+            "text/html".to_string()
+        } else {
+            result.content_type.clone()
+        },
+        fetched_at: String::new(),
+    })
 }
 
 /// Pure write seam: turn already-fetched pages into `state="fetched"` Page nodes
@@ -1041,6 +1165,51 @@ mod tests {
             candidate.metadata.get("pool").map(String::as_str) == Some("hipporag")
                 && candidate.metadata.get("hippo_label").map(String::as_str) == Some("hub")
         }));
+    }
+
+    #[test]
+    fn cheap_neural_rerank_indices_caps_candidates_before_model_cost() {
+        let mut high = Candidate::new("high", "fast sequence reranker", 1);
+        let mut mid = Candidate::new("mid", "fast model", 1);
+        let low = Candidate::new("low", "unrelated weather", 1);
+        high.ppr_proximity = 0.2;
+        mid.ppr_proximity = 0.1;
+        let candidates = vec![low, mid, high];
+
+        let indices =
+            cheap_neural_rerank_indices(&candidates, "fast reranker", ArmWeights::web(), 2);
+
+        assert_eq!(indices.len(), 2);
+        assert_eq!(candidates[indices[0]].node_id, "high");
+        assert_eq!(candidates[indices[1]].node_id, "mid");
+    }
+
+    #[test]
+    fn model_scores_replace_only_the_bounded_candidate_set() {
+        let mut candidates = vec![
+            Candidate::new("a", "first", 1),
+            Candidate::new("b", "second", 1),
+            Candidate::new("c", "third", 1),
+        ];
+        stamp_cheap_relevance_scores(&mut candidates, "first");
+        stamp_model_relevance_scores(&mut candidates, &[1], &[0.95], "test-model");
+
+        assert_eq!(
+            candidates[1]
+                .metadata
+                .get(PRECOMPUTED_RELEVANCE_SCORE_KEY)
+                .map(String::as_str),
+            Some("0.950000")
+        );
+        assert_eq!(
+            candidates[1]
+                .metadata
+                .get("neural_rerank_model")
+                .map(String::as_str),
+            Some("test-model")
+        );
+        assert!(!candidates[0].metadata.contains_key("neural_rerank_model"));
+        assert!(!candidates[2].metadata.contains_key("neural_rerank_model"));
     }
 
     #[test]
