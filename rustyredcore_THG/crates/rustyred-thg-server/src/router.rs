@@ -16,7 +16,7 @@ use axum::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyred_hipporag::HippoQuery;
 use rustyred_membrane::ScoreContext;
@@ -792,7 +792,29 @@ async fn mcp_post(
         return Json(response).into_response();
     }
     let inject_search_tools = payload.get("method").and_then(Value::as_str) == Some("tools/list");
-    let mut response = handle_mcp_request_with_context(&state, &config, &mcp_context, payload);
+    let request_id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let state_for_mcp = state.clone();
+    let config_for_mcp = config.clone();
+    let mcp_context_for_call = mcp_context.clone();
+    let call = tokio::task::spawn_blocking(move || {
+        handle_mcp_request_with_context(
+            &state_for_mcp,
+            &config_for_mcp,
+            &mcp_context_for_call,
+            payload,
+        )
+    });
+    let mut response = match tokio::time::timeout(Duration::from_secs(20), call).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => mcp_http_error_response(
+            request_id,
+            rustyred_thg_mcp::McpError::internal(format!("MCP handler task failed: {error}")),
+        ),
+        Err(_) => mcp_http_error_response(
+            request_id,
+            rustyred_thg_mcp::McpError::internal("MCP request exceeded the HTTP execution budget"),
+        ),
+    };
     if inject_search_tools {
         inject_hippo_retrieve_tool_definition(&mut response);
         inject_web_search_graph_tool_definition(&mut response);
@@ -3626,6 +3648,18 @@ fn mcp_error_payload(error: rustyred_thg_mcp::McpError) -> Value {
             .unwrap_or("mcp_error"),
         "message": error.message,
         "data": error.data
+    })
+}
+
+fn mcp_http_error_response(id: Value, error: rustyred_thg_mcp::McpError) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "data": error.data.unwrap_or_else(|| json!({ "code": "mcp_http_error" }))
+        }
     })
 }
 
