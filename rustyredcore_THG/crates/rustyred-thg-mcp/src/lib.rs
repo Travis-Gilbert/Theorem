@@ -518,6 +518,9 @@ pub trait McpGraphBackend {
             "full-text search is not supported by this MCP backend",
         ))
     }
+    fn skip_tenant_wide_recall_scan_when_indexed_empty(&self) -> bool {
+        false
+    }
     fn designate_spatial_property(
         &mut self,
         _label: &str,
@@ -10230,6 +10233,11 @@ impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryStore<'_, B> {
     ) -> GraphStoreResult<Vec<(String, f32)>> {
         self.backend.vector_search(label, property, query, k)
     }
+
+    fn skip_tenant_wide_recall_scan_when_indexed_empty(&self) -> bool {
+        self.backend
+            .skip_tenant_wide_recall_scan_when_indexed_empty()
+    }
 }
 
 impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryReadStore<'_, B> {
@@ -10281,6 +10289,11 @@ impl<B: McpGraphBackend> MemoryGraphStore for McpMemoryReadStore<'_, B> {
         k: usize,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
         self.backend.vector_search(label, property, query, k)
+    }
+
+    fn skip_tenant_wide_recall_scan_when_indexed_empty(&self) -> bool {
+        self.backend
+            .skip_tenant_wide_recall_scan_when_indexed_empty()
     }
 }
 

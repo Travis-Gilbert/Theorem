@@ -2342,6 +2342,10 @@ impl McpGraphBackend for ProductMcpBackend {
             .map_err(|error| GraphStoreError::new(error.code, error.message))
     }
 
+    fn skip_tenant_wide_recall_scan_when_indexed_empty(&self) -> bool {
+        true
+    }
+
     fn designate_spatial_property(
         &mut self,
         label: &str,

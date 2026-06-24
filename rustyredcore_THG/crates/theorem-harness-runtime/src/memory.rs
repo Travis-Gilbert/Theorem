@@ -64,6 +64,9 @@ pub trait MemoryGraphStore {
     fn memory_graph_version(&self) -> u64 {
         0
     }
+    fn skip_tenant_wide_recall_scan_when_indexed_empty(&self) -> bool {
+        false
+    }
 }
 
 impl<T: GraphStore> MemoryGraphStore for T {
@@ -721,33 +724,43 @@ pub fn recall_memory<S: MemoryGraphStore>(
     let limit = bounded_limit(input.limit);
     let seed_limit = bounded_seed_limit(input.seed_limit);
     let query_time = timestamp_or_now(&input.query_time);
-    let mut atoms =
-        if should_try_indexed_recall_candidates(&query, &kind_filter, input.overall_state) {
-            load_indexed_recall_atoms(
-                store,
-                &tenant_slug,
-                &query,
-                &kind_filter,
-                &surface_filter,
-                &actor_filter,
-                &since,
-                input.include_low_fitness,
-                indexed_recall_candidate_limit(limit, seed_limit),
-                &input,
-            )?
-        } else {
-            Vec::new()
-        };
-    if atoms.is_empty() {
-        atoms = load_recall_atoms(
+    let use_indexed_candidates =
+        should_try_indexed_recall_candidates(&query, &kind_filter, input.overall_state);
+    let mut atoms = if use_indexed_candidates {
+        load_indexed_recall_atoms(
             store,
             &tenant_slug,
+            &query,
             &kind_filter,
             &surface_filter,
             &actor_filter,
             &since,
             input.include_low_fitness,
-        )?;
+            indexed_recall_candidate_limit(limit, seed_limit),
+            &input,
+        )?
+    } else {
+        Vec::new()
+    };
+    if atoms.is_empty() {
+        if use_indexed_candidates && store.skip_tenant_wide_recall_scan_when_indexed_empty() {
+            tracing::warn!(
+                tenant_slug = %tenant_slug,
+                query = %query,
+                "indexed recall returned no candidates; skipping tenant-wide recall scan"
+            );
+            return Ok(Vec::new());
+        } else {
+            atoms = load_recall_atoms(
+                store,
+                &tenant_slug,
+                &kind_filter,
+                &surface_filter,
+                &actor_filter,
+                &since,
+                input.include_low_fitness,
+            )?;
+        }
     }
     let mut atom_by_graph_id = atoms
         .iter()
@@ -4709,6 +4722,10 @@ mod tests {
                 "no fulltext designations for this tenant",
             ))
         }
+
+        fn skip_tenant_wide_recall_scan_when_indexed_empty(&self) -> bool {
+            true
+        }
     }
 
     struct IndexedOnlyStore {
@@ -5338,9 +5355,9 @@ mod tests {
     }
 
     #[test]
-    fn recall_falls_back_when_fulltext_designations_are_missing() {
+    fn recall_skips_tenant_wide_scan_when_fulltext_designations_are_missing() {
         let mut store = MissingFulltextStore::new();
-        let document = create_memory_document(
+        create_memory_document(
             &mut store,
             MemoryWriteInput {
                 tenant_slug: TENANT.to_string(),
@@ -5367,8 +5384,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            results.iter().any(|item| item.id == document.doc_id),
-            "lexical fallback should preserve recall when fulltext designations are missing"
+            results.is_empty(),
+            "non-empty indexed recall must not fall back to a tenant-wide lexical scan"
         );
     }
 
