@@ -27,6 +27,7 @@ pub mod collection;
 pub mod ingest;
 pub mod item;
 pub mod organize;
+pub mod renderable;
 pub mod store;
 pub mod tag;
 
@@ -39,8 +40,11 @@ pub use ingest::{
     ENTITY_LABEL, ITEM_EMBEDDING_PROPERTY, MENTIONS_ENTITY_EDGE,
 };
 pub use item::{Item, ItemBody, ItemKind, Residency, SourceRef};
-pub use organize::{
-    decide, route, NeedsYouReason, OrganizeDecision, OrganizePolicy, RoutingRule,
+pub use organize::{decide, route, NeedsYouReason, OrganizeDecision, OrganizePolicy, RoutingRule};
+pub use renderable::{
+    get_object_type_identity, item_object_type_slug, renderable_from_item, renderables_from_items,
+    ObjectTypeIdentity, OrganizeAction, OrganizeActionReceipt, OrganizeActionVerb,
+    RenderableObject, OBJECT_TYPE_SLUGS,
 };
 pub use store::{
     Commonplace, ABOUT_EDGE, COLLECTION_LABEL, DEPENDS_ON_EDGE, HAS_TAG_EDGE, IN_COLLECTION_EDGE,

@@ -48,7 +48,7 @@ export function AtomEditor({ atom, open, onOpenChange, onMutated, onOpenLink }: 
       <SheetContent className="gap-0 p-0">
         {atom && (
           <AtomEditorForm
-            key={atom.id}
+            key={`${atom.id}:${atom.hydrated ? "hydrated" : "reference"}`}
             atom={atom}
             onOpenChange={onOpenChange}
             onMutated={onMutated}

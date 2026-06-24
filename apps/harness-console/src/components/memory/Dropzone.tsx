@@ -89,6 +89,8 @@ export function Dropzone({ onIngested }: { onIngested: () => void }) {
           kind: kindForExt(ext),
           summary: `Ingested from ${file.name} (${ext.toUpperCase()}, ${(file.size / 1024).toFixed(0)} KB).`,
           body: `# ${title}\n\nIngested from \`${file.name}\`. The harness auto-structured this drop into one or more atoms; this top-level atom carries the source and is vector-searchable.\n`,
+          hydrated: true,
+          contentPreview: `Ingested from ${file.name}.`,
           tags: ["ingest", ext],
           salience: 0.5,
           source: ext === "pdf" ? "pdf" : ext === "zip" ? "archive" : "upload",

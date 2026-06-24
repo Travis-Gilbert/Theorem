@@ -52,6 +52,27 @@ const tasks: Task[] = TASKS.map((t) => ({ ...t }));
 const delay = <T,>(value: T, ms = 90): Promise<T> =>
   new Promise((resolve) => setTimeout(() => resolve(value), ms));
 
+function contentPreview(body: string, chars = 220): string {
+  return body.replace(/\s+/g, " ").trim().slice(0, chars);
+}
+
+function slimAtom(atom: Atom): Atom {
+  return {
+    ...atom,
+    body: "",
+    hydrated: false,
+    contentPreview: contentPreview(atom.body),
+  };
+}
+
+function hydratedAtom(atom: Atom): Atom {
+  return {
+    ...atom,
+    hydrated: true,
+    contentPreview: contentPreview(atom.body),
+  };
+}
+
 function matchesQuery(a: Atom, q?: MemoryQuery): boolean {
   if (!q) return a.lifecycle === "active";
   if ((q.view ?? "active") !== a.lifecycle) return false;
@@ -71,19 +92,20 @@ export const mockClient: HarnessClient = {
     const filtered = atoms.filter((a) => matchesQuery(a, query));
     const ids = new Set(filtered.map((a) => a.id));
     return delay<MemoryList>({
-      atoms: filtered,
+      atoms: filtered.map(slimAtom),
       edges: EDGES.filter((e) => ids.has(e.from) && ids.has(e.to)),
       clusters: CLUSTERS,
     });
   },
   async getAtom(id) {
-    return delay(atoms.find((a) => a.id === id) ?? null);
+    const atom = atoms.find((a) => a.id === id);
+    return delay(atom ? hydratedAtom(atom) : null);
   },
   async saveAtom(atom) {
-    const next: Atom = { ...atom, updated: new Date().toISOString() };
+    const next: Atom = { ...atom, updated: new Date().toISOString(), hydrated: true };
     atoms = atoms.map((a) => (a.id === atom.id ? next : a));
     if (!atoms.find((a) => a.id === atom.id)) atoms.push(next);
-    return delay(next);
+    return delay(hydratedAtom(next));
   },
   async archiveAtom(id) {
     atoms = atoms.map((a) => (a.id === id ? { ...a, lifecycle: "archived" } : a));
@@ -156,18 +178,46 @@ export const mockClient: HarnessClient = {
   },
   async runAgent(prompt) {
     const now = new Date().toISOString();
+    const lower = prompt.toLowerCase();
+    const trace: NonNullable<ChatMessage["trace"]> = [
+      {
+        id: "t0",
+        role: "tool" as const,
+        tool: "recall",
+        content: "reasoning-strategy recall returned slim references; hydrated only the top relevant strategy",
+        at: now,
+      },
+    ];
+    if (/cite|cited|evidence|claim|source/.test(lower)) {
+      trace.push({
+        id: "t1",
+        role: "tool" as const,
+        tool: "rustyred_thg_symbolic_probabilistic_source_reliability",
+        content: "governor injected source-reliability before answer generation",
+        at: now,
+      });
+    }
+    if (/verify|deep retrieval|large recall|adversarial/.test(lower)) {
+      trace.push({
+        id: "t2",
+        role: "tool" as const,
+        tool: "rustyred_thg_symbolic_probabilistic_expected_value",
+        content: "governor gated the costly check with expected value of information",
+        at: now,
+      });
+    }
+    trace.push(
+      { id: "t3", role: "head" as const, head: "claude", content: "answer with injected substrate context", at: now },
+      { id: "t4", role: "head" as const, head: "deepseek", content: "verify plan against run ledger", at: now },
+      { id: "t5", role: "system" as const, content: "alignment-gate: aligned", at: now },
+    );
     const msg: ChatMessage = {
       id: `msg_${Date.now()}`,
       role: "assistant",
-      content: `The composed agent ran the heads as peers. Claude proposed an approach grounded in the harness memory; DeepSeek verified it against the run ledger. Answer to: "${prompt}".`,
+      content: `The composed agent ran with proactive governor context and slim-first strategy memory. Answer to: "${prompt}".`,
       at: now,
       verdict: "aligned",
-      trace: [
-        { id: "t1", role: "head", head: "claude", content: "recall scope, propose plan", at: now },
-        { id: "t2", role: "tool", tool: "recall", content: "5 atoms returned", at: now },
-        { id: "t3", role: "head", head: "deepseek", content: "verify plan against run ledger", at: now },
-        { id: "t4", role: "system", content: "alignment-gate: aligned", at: now },
-      ],
+      trace,
     };
     return delay(msg, 400);
   },

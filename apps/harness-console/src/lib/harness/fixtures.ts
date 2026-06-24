@@ -68,7 +68,7 @@ const KINDS: AtomKind[] = [
 const TAG_POOL = [
   "rustyred", "graphql", "mcp", "embedded", "deploy", "railway", "harness",
   "coordination", "epistemic", "memory", "browser", "ios", "skills", "ensemble",
-  "console", "tokens", "depth", "search",
+  "console", "tokens", "depth", "search", "reasoning-strategy",
 ];
 
 const TITLES = [
@@ -128,6 +128,7 @@ function makeAtom(i: number): Atom {
     kind,
     summary: pick(SUMMARIES),
     body: `# ${title}\n\n${pick(SUMMARIES)}\n\nThis atom is a projection of a graph node. Editing it edits the truth via \`self_revise\` / \`upsert_note\`, producing a revision rather than overwriting.\n\nSee [[${pick(TITLES)}]] for the related decision.`,
+    hydrated: true,
     tags: Array.from({ length: 1 + Math.floor(rnd() * 3) }, () => pick(TAG_POOL)),
     salience: Math.round(rnd() * 100) / 100,
     fitness: kind === "skill" ? Math.round(rnd() * 100) / 100 : undefined,

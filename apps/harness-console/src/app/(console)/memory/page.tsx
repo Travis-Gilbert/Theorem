@@ -67,6 +67,7 @@ export default function MemoryPage() {
 
   // ---- Editor side-panel state (managed at page level) --------------------
   const [editorId, setEditorId] = React.useState<string | null>(null);
+  const [editorAtom, setEditorAtom] = React.useState<Atom | null>(null);
   const [editorOpen, setEditorOpen] = React.useState(false);
 
   const tagList = React.useMemo(
@@ -110,14 +111,15 @@ export default function MemoryPage() {
     return order;
   }, [data, searchHits, query]);
 
-  const editorAtom = React.useMemo(
-    () => (data?.atoms ?? []).find((a) => a.id === editorId) ?? null,
-    [data, editorId],
-  );
-
   const openAtom = (a: Atom) => {
     setEditorId(a.id);
+    setEditorAtom(a);
     setEditorOpen(true);
+    void harness.getAtom(a.id).then((hydrated) => {
+      if (hydrated) {
+        setEditorAtom((current) => (current?.id === hydrated.id ? hydrated : current));
+      }
+    });
   };
 
   // Open a wikilink target by title (resolve against the loaded set).

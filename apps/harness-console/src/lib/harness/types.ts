@@ -49,6 +49,10 @@ export interface Atom {
   kind: AtomKind;
   summary: string;
   body: string; // markdown
+  /** Slim recall/list payloads leave body empty until getAtom hydrates it. */
+  hydrated?: boolean;
+  /** Short body preview returned with slim references. */
+  contentPreview?: string;
   tags: string[];
   /** salience for recall ranking; fitness for learned/skill atoms. */
   salience: number;
