@@ -107,12 +107,10 @@ impl NoteAdapter {
                 index,
                 text,
             } => {
-                peer.text_region(&self.body_region(&section_id))?
-                    .insert(index, &text)?;
+                peer.insert_text(&self.body_region(&section_id), index, &text)?;
             }
             NoteIntent::PushSectionText { section_id, text } => {
-                peer.text_region(&self.body_region(&section_id))?
-                    .push(&text)?;
+                peer.push_text(&self.body_region(&section_id), &text)?;
             }
         }
         Ok(())
@@ -128,12 +126,9 @@ impl SurfaceAdapter for NoteAdapter {
                 region_id,
                 index,
                 text,
-            } => peer
-                .text_region(&region_id)?
-                .insert(index, &text)
-                .map(|_| ()),
+            } => peer.insert_text(&region_id, index, &text).map(|_| ()),
             SurfaceIntent::TextPush { region_id, text } => {
-                peer.text_region(&region_id)?.push(&text).map(|_| ())
+                peer.push_text(&region_id, &text).map(|_| ())
             }
             SurfaceIntent::Presence { presence } => peer.announce(presence),
             SurfaceIntent::Code { .. } => Err(CoError::Invalid(

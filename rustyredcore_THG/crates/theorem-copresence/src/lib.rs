@@ -7,6 +7,7 @@ pub mod adapter;
 pub mod adapters;
 pub mod peer;
 pub mod presence;
+pub mod scratchpad;
 pub mod text_region;
 
 pub use adapter::{
@@ -17,8 +18,14 @@ pub use adapters::code::{
     CodeSurfaceAdapter, FileRange,
 };
 pub use adapters::note::{NoteAdapter, NoteIntent, NoteSectionSnapshot, NoteSnapshot};
-pub use peer::{PeerConfig, PeerEvent, SharedWorkingLog, StructuredOp, SubstratePeer};
+pub use peer::{
+    AppliedPeerEvent, PeerConfig, PeerEvent, PeerSyncDelta, SharedWorkingLog, StructuredOp,
+    SubstratePeer, MUTATION_PAYLOAD_TYPE, TEXT_UPDATE_PAYLOAD_TYPE,
+};
 pub use presence::{CursorPos, Presence, PresenceKind};
+pub use scratchpad::{
+    ScratchpadLiveDelta, ScratchpadLiveEvent, ScratchpadPublishReceipt, ScratchpadSession,
+};
 pub use text_region::{TextRegionHandle, TextRegionUpdate};
 
 pub type CoResult<T> = Result<T, CoError>;

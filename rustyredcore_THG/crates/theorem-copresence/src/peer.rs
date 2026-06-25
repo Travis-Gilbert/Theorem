@@ -12,12 +12,13 @@ use rustyred_thg_core::{
 };
 
 use crate::presence::{Presence, PRESENCE_PAYLOAD_TYPE};
-use crate::text_region::{open_object_store, TextRegionHandle};
+use crate::text_region::{open_object_store, TextRegionHandle, TextRegionUpdate};
 use crate::{CoError, CoResult};
 
 pub type SharedWorkingLog = Arc<Mutex<WorkingLog>>;
 
-const MUTATION_PAYLOAD_TYPE: &str = "copresence.structured_mutation.v1";
+pub const MUTATION_PAYLOAD_TYPE: &str = "copresence.structured_mutation.v1";
+pub const TEXT_UPDATE_PAYLOAD_TYPE: &str = "copresence.text_update.v1";
 const YRS_CLIENT_MASK_53: u64 = (1_u64 << 53) - 1;
 
 #[derive(Clone, Debug)]
@@ -85,6 +86,16 @@ pub enum StructuredOp {
 pub enum PeerEvent {
     Presence { cursor: u64, presence: Presence },
     WorkingLog { cursor: u64, event: WorkingLogEvent },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct PeerSyncDelta {
+    pub from_cursor: u64,
+    pub to_cursor: u64,
+    pub events: Vec<WorkingLogEvent>,
+    pub applied_structured: usize,
+    pub applied_text: usize,
+    pub presence_seen: usize,
 }
 
 pub struct SubstratePeer {
@@ -178,12 +189,26 @@ impl SubstratePeer {
     }
 
     pub fn merge_delta(&mut self, batch: StampedBatch) -> CoResult<JoinReport> {
+        self.merge_delta_inner(batch, true)
+    }
+
+    pub fn merge_remote_delta(&mut self, batch: StampedBatch) -> CoResult<JoinReport> {
+        self.merge_delta_inner(batch, false)
+    }
+
+    fn merge_delta_inner(
+        &mut self,
+        batch: StampedBatch,
+        append_event: bool,
+    ) -> CoResult<JoinReport> {
         for mutation in &batch.mutations {
             self.clock.observe(mutation.hlc);
             self.seen.observe(mutation.hlc);
         }
         let report = join_delta(&mut self.store, batch.clone());
-        self.append_mutation_event(batch)?;
+        if append_event {
+            self.append_mutation_event(batch)?;
+        }
         Ok(report)
     }
 
@@ -222,6 +247,23 @@ impl SubstratePeer {
 
     pub fn apply_text_update(&mut self, region_id: &str, update_v1: &[u8]) -> CoResult<()> {
         self.text_region(region_id)?.apply_update(update_v1)
+    }
+
+    pub fn insert_text(
+        &mut self,
+        region_id: &str,
+        index: u32,
+        text: &str,
+    ) -> CoResult<TextRegionUpdate> {
+        let update = self.text_region(region_id)?.insert(index, text)?;
+        self.append_text_event("insert", &update, Some(index), Some(text))?;
+        Ok(update)
+    }
+
+    pub fn push_text(&mut self, region_id: &str, text: &str) -> CoResult<TextRegionUpdate> {
+        let update = self.text_region(region_id)?.push(text)?;
+        self.append_text_event("push", &update, None, Some(text))?;
+        Ok(update)
     }
 
     pub fn text_region_contents(&self, region_id: &str) -> Option<String> {
@@ -277,6 +319,72 @@ impl SubstratePeer {
             }
         }
         Ok(out)
+    }
+
+    pub fn sync_after(&mut self, since_cursor: u64, limit: usize) -> CoResult<PeerSyncDelta> {
+        let events = self
+            .working_log
+            .lock()
+            .map_err(|_| CoError::Lock("working log"))?
+            .subscribe_after(since_cursor, limit);
+        let mut delta = PeerSyncDelta {
+            from_cursor: since_cursor,
+            to_cursor: events
+                .last()
+                .map(|event| event.cursor)
+                .unwrap_or(since_cursor),
+            events,
+            ..PeerSyncDelta::default()
+        };
+        for event in delta.events.clone() {
+            match self.apply_working_log_event(&event)? {
+                AppliedPeerEvent::Structured(applied) => {
+                    delta.applied_structured += applied;
+                }
+                AppliedPeerEvent::Text => {
+                    delta.applied_text += 1;
+                }
+                AppliedPeerEvent::Presence => {
+                    delta.presence_seen += 1;
+                }
+                AppliedPeerEvent::Ignored => {}
+            }
+        }
+        Ok(delta)
+    }
+
+    pub fn apply_working_log_event(
+        &mut self,
+        event: &WorkingLogEvent,
+    ) -> CoResult<AppliedPeerEvent> {
+        match event.payload.get("type").and_then(Value::as_str) {
+            Some(MUTATION_PAYLOAD_TYPE) => {
+                if event.payload.get("scope").and_then(Value::as_str) != Some(self.scope.as_str()) {
+                    return Ok(AppliedPeerEvent::Ignored);
+                }
+                let Some(batch_value) = event.payload.get("batch").cloned() else {
+                    return Ok(AppliedPeerEvent::Ignored);
+                };
+                let batch = serde_json::from_value::<StampedBatch>(batch_value)?;
+                let report = self.merge_remote_delta(batch)?;
+                Ok(AppliedPeerEvent::Structured(report.applied))
+            }
+            Some(TEXT_UPDATE_PAYLOAD_TYPE) => {
+                if event.payload.get("scope").and_then(Value::as_str) != Some(self.scope.as_str()) {
+                    return Ok(AppliedPeerEvent::Ignored);
+                }
+                let Some(region_id) = event.payload.get("region_id").and_then(Value::as_str) else {
+                    return Ok(AppliedPeerEvent::Ignored);
+                };
+                let Some(update_v1) = byte_array(event.payload.get("update_v1")) else {
+                    return Ok(AppliedPeerEvent::Ignored);
+                };
+                self.apply_text_update(region_id, &update_v1)?;
+                Ok(AppliedPeerEvent::Text)
+            }
+            Some(PRESENCE_PAYLOAD_TYPE) => Ok(AppliedPeerEvent::Presence),
+            _ => Ok(AppliedPeerEvent::Ignored),
+        }
     }
 
     fn lower_structured(&self, mutation: StructuredOp) -> CoResult<GraphMutation> {
@@ -373,6 +481,39 @@ impl SubstratePeer {
             .append_mutation(self.scope.clone(), payload);
         Ok(())
     }
+
+    fn append_text_event(
+        &self,
+        op: &str,
+        update: &TextRegionUpdate,
+        index: Option<u32>,
+        text: Option<&str>,
+    ) -> CoResult<()> {
+        let payload = json!({
+            "type": TEXT_UPDATE_PAYLOAD_TYPE,
+            "actor": self.actor,
+            "scope": self.scope,
+            "op": op,
+            "region_id": update.region_id,
+            "state_vector_v1": update.state_vector_v1,
+            "update_v1": update.update_v1,
+            "index": index,
+            "text": text,
+        });
+        self.working_log
+            .lock()
+            .map_err(|_| CoError::Lock("working log"))?
+            .append_mutation(self.scope.clone(), payload);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppliedPeerEvent {
+    Structured(usize),
+    Text,
+    Presence,
+    Ignored,
 }
 
 fn mutation_after_join(
@@ -430,4 +571,12 @@ fn safe_segment(value: &str) -> String {
     } else {
         cleaned
     }
+}
+
+fn byte_array(value: Option<&Value>) -> Option<Vec<u8>> {
+    value?
+        .as_array()?
+        .iter()
+        .map(|item| item.as_u64().and_then(|value| u8::try_from(value).ok()))
+        .collect()
 }

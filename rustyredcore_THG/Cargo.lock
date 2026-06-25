@@ -9469,6 +9469,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "theorem-harness-core",
  "thiserror 1.0.69",
  "yrs",
 ]
