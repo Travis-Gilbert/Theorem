@@ -189,6 +189,18 @@ pub(super) fn extract_symbols(
 
 fn language_spec(language: &str, file_path: &str) -> Option<LanguageSpec> {
     match language {
+        "c" => Some(LanguageSpec {
+            language: tree_sitter_c::LANGUAGE.into(),
+            query: C_TAGS_QUERY,
+        }),
+        "cpp" => Some(LanguageSpec {
+            language: tree_sitter_cpp::LANGUAGE.into(),
+            query: CPP_TAGS_QUERY,
+        }),
+        "java" => Some(LanguageSpec {
+            language: tree_sitter_java::LANGUAGE.into(),
+            query: tree_sitter_java::TAGS_QUERY,
+        }),
         "javascript" => Some(LanguageSpec {
             language: tree_sitter_javascript::LANGUAGE.into(),
             query: tree_sitter_javascript::TAGS_QUERY,
@@ -196,6 +208,10 @@ fn language_spec(language: &str, file_path: &str) -> Option<LanguageSpec> {
         "python" => Some(LanguageSpec {
             language: tree_sitter_python::LANGUAGE.into(),
             query: tree_sitter_python::TAGS_QUERY,
+        }),
+        "ruby" => Some(LanguageSpec {
+            language: tree_sitter_ruby::LANGUAGE.into(),
+            query: tree_sitter_ruby::TAGS_QUERY,
         }),
         "rust" => Some(LanguageSpec {
             language: tree_sitter_rust::LANGUAGE.into(),
@@ -263,6 +279,7 @@ fn is_low_signal_token(token: &str) -> bool {
             | "const"
             | "def"
             | "else"
+            | "enum"
             | "export"
             | "false"
             | "fn"
@@ -272,6 +289,7 @@ fn is_low_signal_token(token: &str) -> bool {
             | "impl"
             | "interface"
             | "let"
+            | "module"
             | "new"
             | "None"
             | "null"
@@ -279,6 +297,7 @@ fn is_low_signal_token(token: &str) -> bool {
             | "return"
             | "Self"
             | "self"
+            | "static"
             | "struct"
             | "this"
             | "trait"
@@ -288,6 +307,82 @@ fn is_low_signal_token(token: &str) -> bool {
             | "void"
     )
 }
+
+const C_TAGS_QUERY: &str = r#"
+(struct_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.struct
+
+(union_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.union
+
+(enum_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.enum
+
+(type_definition
+  declarator: (type_identifier) @name) @definition.type
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @definition.function
+
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @name))) @definition.function
+
+(call_expression
+  function: [
+    (identifier) @name
+    (field_expression
+      field: (field_identifier) @name)
+  ]) @reference.call
+"#;
+
+const CPP_TAGS_QUERY: &str = r#"
+(class_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.class
+
+(struct_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.struct
+
+(union_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.union
+
+(enum_specifier
+  name: (type_identifier) @name
+  body: (_)) @definition.enum
+
+(type_definition
+  declarator: (type_identifier) @name) @definition.type
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @definition.function
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (field_identifier) @name)) @definition.method
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      name: (identifier) @name))) @definition.method
+
+(call_expression
+  function: [
+    (identifier) @name
+    (field_expression
+      field: (field_identifier) @name)
+    (qualified_identifier
+      name: (identifier) @name)
+  ]) @reference.call
+"#;
 
 const TYPESCRIPT_TAGS_QUERY: &str = r#"
 (function_signature

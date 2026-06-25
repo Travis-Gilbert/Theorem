@@ -4100,7 +4100,10 @@ fn extract_symbols(
 }
 
 fn should_try_tree_sitter(language: &str, text: &str) -> bool {
-    if !matches!(language, "javascript" | "python" | "rust" | "typescript") {
+    if !matches!(
+        language,
+        "c" | "cpp" | "java" | "javascript" | "python" | "ruby" | "rust" | "typescript"
+    ) {
         return false;
     }
     let mut symbol_lines = 0usize;
@@ -4766,7 +4769,24 @@ fn symbol_from_line(line: &str, language: &str) -> Option<(String, String)> {
         return go_symbol_from_line(normalized);
     }
     let patterns: &[(&str, &str)] = match language {
+        "c" | "cpp" => &[
+            ("struct ", "struct"),
+            ("union ", "union"),
+            ("enum ", "enum"),
+            ("typedef ", "type"),
+        ],
+        "java" => &[
+            ("class ", "class"),
+            ("interface ", "interface"),
+            ("enum ", "enum"),
+            ("record ", "record"),
+        ],
         "python" => &[("def ", "function"), ("class ", "class")],
+        "ruby" => &[
+            ("def ", "method"),
+            ("class ", "class"),
+            ("module ", "module"),
+        ],
         "swift" => &[
             ("func ", "function"),
             ("class ", "class"),
@@ -5614,8 +5634,8 @@ fn normalize_set(values: Vec<String>) -> BTreeSet<String> {
 
 fn default_extensions() -> BTreeSet<String> {
     [
-        "rs", "go", "swift", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml", "md",
-        "json",
+        "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "java", "rb", "rs", "go", "swift", "py",
+        "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml", "md", "json",
     ]
     .into_iter()
     .map(str::to_string)
@@ -5676,8 +5696,12 @@ fn extension_for(path: &Path) -> String {
 
 fn language_for_extension(extension: &str) -> &str {
     match extension {
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => "cpp",
         "go" => "go",
+        "java" => "java",
         "py" => "python",
+        "rb" => "ruby",
         "swift" => "swift",
         "ts" | "tsx" => "typescript",
         "js" | "jsx" | "mjs" | "cjs" => "javascript",
@@ -6212,6 +6236,27 @@ mod tests {
         let repo_dir = unique_dir("tree-sitter-repo");
         fs::create_dir_all(repo_dir.join("src")).unwrap();
         fs::write(
+            repo_dir.join("src/native.c"),
+            "typedef struct SearchState {\n  int count;\n} SearchState;\n\n\
+int c_helper(int value) {\n  return value + 1;\n}\n\n\
+int c_entry(int value) {\n  return c_helper(value);\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("src/engine.cpp"),
+            "class SearchEngine {\npublic:\n  int run(int value) { return cpp_helper(value); }\n};\n\n\
+int cpp_helper(int value) {\n  return value + 1;\n}\n\n\
+int cpp_entry(int value) {\n  return cpp_helper(value);\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("src/SearchService.java"),
+            "interface SearchPort {}\n\n\
+class SearchService implements SearchPort {\n  int helperLength(String query) { return query.length(); }\n\n\
+  int runJava(String query) { return helperLength(query); }\n}\n",
+        )
+        .unwrap();
+        fs::write(
             repo_dir.join("src/app.ts"),
             "export interface SearchShape { query: string }\n\
 export function helperLen(query: string): number {\n    return query.length\n}\n\n\
@@ -6236,6 +6281,11 @@ function makeLabel() {\n  return 'ok'\n}\n",
             "pub struct SearchKernel {}\n\npub fn rust_entry() -> usize {\n    1\n}\n",
         )
         .unwrap();
+        fs::write(
+            repo_dir.join("src/search_adapter.rb"),
+            "module SearchModule\n  class RubyAdapter\n    def helper_length(query)\n      query.length\n    end\n\n    def run_ruby(query)\n      helper_length(query)\n    end\n  end\nend\n",
+        )
+        .unwrap();
 
         let mut store = RedCoreGraphStore::memory();
         let ingest = ingest_codebase_in_store(
@@ -6248,7 +6298,7 @@ function makeLabel() {\n  return 'ok'\n}\n",
             },
         )
         .unwrap();
-        assert_eq!(ingest.files_indexed, 4);
+        assert_eq!(ingest.files_indexed, 8);
 
         let symbols = store
             .query_nodes(
@@ -6258,10 +6308,18 @@ function makeLabel() {\n  return 'ok'\n}\n",
             )
             .unwrap();
         for (name, language, kind) in [
+            ("SearchState", "c", "struct"),
+            ("c_entry", "c", "function"),
+            ("SearchEngine", "cpp", "class"),
+            ("cpp_entry", "cpp", "function"),
+            ("SearchPort", "java", "interface"),
+            ("runJava", "java", "method"),
             ("SearchShape", "typescript", "interface"),
             ("runSearch", "typescript", "function"),
             ("PythonAdapter", "python", "class"),
             ("build_context", "python", "function"),
+            ("RubyAdapter", "ruby", "class"),
+            ("run_ruby", "ruby", "method"),
             ("SearchWidget", "javascript", "class"),
             ("makeLabel", "javascript", "function"),
             ("SearchKernel", "rust", "struct"),
@@ -6281,6 +6339,52 @@ function makeLabel() {\n  return 'ok'\n}\n",
                         node.properties.get("language").and_then(Value::as_str),
                         node.properties.get("kind").and_then(Value::as_str),
                     ))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        for (source, target) in [
+            ("c_entry", "c_helper"),
+            ("cpp_entry", "cpp_helper"),
+            ("runJava", "helperLength"),
+            ("run_ruby", "helper_length"),
+            ("runSearch", "helperLen"),
+        ] {
+            let search = search_code_in_store(
+                &mut store,
+                SearchCodeInput {
+                    tenant_id: "theorem".to_string(),
+                    query: source.to_string(),
+                    repo_id: ingest.repo_id.clone(),
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(search.hits[0].name, source);
+            let explored = explore_code_in_store(
+                &mut store,
+                ExploreCodeInput {
+                    tenant_id: "theorem".to_string(),
+                    node_id: search.hits[0].node_id.clone(),
+                    max_depth: 1,
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                explored.edges.iter().any(|edge| {
+                    edge.edge_type == CALLS_SYMBOL
+                        && edge.from_name == source
+                        && edge.to_name == target
+                        && edge.evidence.contains("tree_sitter_call")
+                }),
+                "Tree-sitter call edge {source}->{target}: {:?}",
+                explored
+                    .edges
+                    .iter()
+                    .map(|edge| (&edge.from_name, &edge.to_name, &edge.evidence))
                     .collect::<Vec<_>>()
             );
         }
