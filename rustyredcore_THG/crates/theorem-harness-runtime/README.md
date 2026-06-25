@@ -1,40 +1,38 @@
 # theorem-harness-runtime
 
-Rust-native Theorem harness runtime: GraphStore-backed event log and run persistence.
+The GraphStore-backed runtime seam for `theorem-harness-core`: it persists kernel transition receipts as `HarnessRun`/`HarnessEvent` graph nodes with append-chain edges, and adds the Dispatch v2 job board, durable coordination (v1/v2/push), graph-native memory and reasoning bank, skill/engineering packs, work-graph persistence, the governor, and live provider head invocation. Storage stays out of the parity kernel.
+
+## Key API
+
+- Run/event persistence (`event_log.rs`): `load_run`, `load_events`, `append_transition[_from_store]`, `persist_transition_result`, `replay_persisted_run`, `run_node_id`, `event_node_id`.
+- Binding persistence (`binding_store.rs`): `persist_binding`, `load_binding`, `append_binding_transition`, `load_scratchpad_revisions`.
+- Job board (`job_queue.rs`): `job_submit`, `job_list`, `job_note`, `job_archive`.
+- Head invocation (`head_invoker/`): `RealHeadInvoker` (= `ProviderHeadInvoker`) impl of core's `HeadInvoker`; provider profiles (`AnthropicMessages`, `OpenAiChatCompletions`); `CredentialResolver` (`env:<VAR>`); `invoke_mcp_head`.
+- Composition/coordination: `run_composed_agent[_with_claims]`, `default_theorem_binding`; coordination v1 (`join_room`, `write_message`/`write_intent`/`write_record`, `read_mentions_for_actor`, `room_status`), v2 Task-Reference Rooms (`resolve_task_ref`, `room_digest`), and `coordination_push` broadcast buses (`subscribe_coordination_room_events`, `wake_targets`).
+- Memory/reasoning: `remember_memory`, `recall_memory`, `encode_memory`, `upsert_note` (Obsidian sync), `reasoning_bank`.
+- Packs/work-graph/governor: `skill_pack`, `engineering_capability_packs()`, `work_graph_store` (`persist_work_graph`, `claim_task_node_durable`), `governor::govern_turn`, `patch_sequencer`.
+
+Path deps: `rustyred-thg-affordances`, `rustyred-thg-core`, `theorem-harness-core`, `prose-check`, `design-check`. Uses `reqwest` (blocking) and `tokio` (sync, for the broadcast buses).
+
+## Live provider heads
+
+For the API-backed composed-agent binding:
+
+```bash
+THEOREM_AGENT_HEADS=deepseek,mistral,minimax
+DEEPSEEK_API_KEY=...   # plus MISTRAL_API_KEY, MINIMAX_API_KEY
+THEOREM_HEAD_INVOKER=real
+```
+
+Override models with `DEEPSEEK_MODEL` / `MISTRAL_MODEL` / `MINIMAX_MODEL`; endpoints with `*_CHAT_URL`. `HeadTransport::Local` uses `THEOREM_LOCAL_OPENAI_URL` (default `http://127.0.0.1:8080/v1/chat/completions`). Production `run_composed_agent` allocates `THEOREM_COMPOSED_AGENT_BUDGET_UNITS` (default 5000).
 
 ## Build and test
 
 ```bash
 cd rustyredcore_THG && cargo test -p theorem-harness-runtime
+cargo run -p theorem-harness-runtime --example dump_engineering_packs
 ```
 
-## Live provider heads
+Tests: `provider_invoker.rs` (offline mock server), `project_anchor_parity.rs` (cross-crate guard), and `live_single_head_smoke.rs` (`#[ignore]`, needs `THEOREM_LIVE_PROVIDER_TEST=1` plus a provider key or `THEOREM_LOCAL_OPENAI_URL`).
 
-For the API-backed composed-agent binding, set:
-
-```bash
-THEOREM_AGENT_HEADS=deepseek,mistral,minimax
-DEEPSEEK_API_KEY=...
-MISTRAL_API_KEY=...
-MINIMAX_API_KEY=...
-```
-
-Current default models are `deepseek-v4-flash`, `mistral-large-latest`, and
-`MiniMax-M3`. Override with `DEEPSEEK_MODEL`, `MISTRAL_MODEL`, or
-`MINIMAX_MODEL` when an operator wants a specific provider model. Provider
-endpoint overrides stay credential-free and use `DEEPSEEK_CHAT_URL`,
-`MISTRAL_CHAT_URL`, or `MINIMAX_CHAT_URL`.
-
-`THEOREM_HEAD_INVOKER=real` selects live provider calls in the MCP composed-agent
-handler; tests default to `fake` unless they opt in. `HeadTransport::Local`
-uses `THEOREM_LOCAL_OPENAI_URL` (default `http://127.0.0.1:8080/v1/chat/completions`)
-and allows no bearer token for llama-server/Gemma. `HeadTransport::Hosted` uses
-`THEOREM_HOSTED_OPENAI_URL`, `THEOREM_LITELLM_CHAT_URL`, or
-`THEOREM_LITELLM_BASE_URL` and requires the configured credential reference.
-
-Production `run_composed_agent` allocates
-`THEOREM_COMPOSED_AGENT_BUDGET_UNITS` when set, or `5000` units by default. The
-default is sized for real provider token costs; the lower fake-loop budget remains
-only inside the pure core test fixture.
-
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

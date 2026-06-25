@@ -1,38 +1,22 @@
 # scene-os-web
 
-Theorem SceneOS renderer bundle (Lane B): embeds the self-contained canvas renderer and serves a scene-package-v2 as one HTML asset, the SERP injection pattern.
+The SceneOS renderer (Lane B): turn a `ScenePackageV2` into one self-contained HTML page that draws it, with script-safe payload escaping. Lane A (`scene-os-core`) produces the package; this crate serves the page. The browser's `load_web_resource` hook (Lane C) intercepts a scene URL, calls Lane A, and serves the HTML this module returns, mirroring how `rustyred-web` serves its SERP graph page.
 
-## What it is
+## Key API
 
-SceneOS renderer serving — turn a scene package into the browser's scene PAGE.
+- `render_scene(package: &ScenePackageV2) -> Result<String, serde_json::Error>`: typed entry.
+- `render_scene_html(package_json: &str) -> String`: engine-agnostic entry over already-serialized JSON (pass `"null"` for the honest empty state).
+- `scene_payload_json(package_json: &str) -> String`: escapes `<`/`>`/`&` to `\uXXXX` so a label containing `</script>` cannot break out of the script block.
 
-This is Lane B of the SceneOS -> Theorem port: the renderer half. Lane A
-(`scene-os-core`) is the director that produces a [`ScenePackageV2`]; this
-crate takes that package and serves the page that DRAWS it. The browser's
-`load_web_resource` hook (Lane C) intercepts a scene URL, calls Lane A to
-produce the package, and serves the HTML this module returns — exactly as
-`rustyred-web` serves its SERP graph page.
-
-The page is a single self-contained HTML document (`web/scene-host.html`,
-embedded via `include_str!`) with the renderer bundle (`web/dist/
-scene-os.bundle.js`, an esbuild IIFE with d3 inlined) injected in place of a
-placeholder. No bundler at serve time, no npm, no CDN: Servo serves one
-asset. The only dynamic part is the scene package, injected in place of a
-`null` marker.
-
-Security: the page renders atom labels / kinds that may come from CRAWLED
-pages or agent output, which are untrusted. Two defenses, both required and
-mirroring `rustyred-web::serp`:
-  1. `scene-host.html` + the bundle set every piece of DOM text via
-     `textContent` / `createElement`, never `innerHTML`.
-  2. [`scene_payload_json`] escapes `<`, `>`, `&` to their `\uXXXX` forms so
-     a label containing `</script>` cannot break out of the `<script>` block
-     the payload is injected into.
+The page is `web/scene-host.html` plus the esbuild bundle `web/dist/scene-os.bundle.js` (d3 inlined), both embedded via `include_str!` and committed so the crate is self-contained: no bundler, npm, or CDN at serve time. XSS defense is two-layer: all DOM text is set via `textContent`/`createElement` (never `innerHTML`), plus `scene_payload_json`. TypeScript renderer source lives under `web/src/`. Path dep: `scene-os-core`.
 
 ## Build and test
 
 ```bash
 cd rustyredcore_THG && cargo test -p scene-os-web
+cargo run -p scene-os-web --example render_sample -- /tmp/scene.html
 ```
 
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+Tests are inline (injection/marker consumption, payload-stays-valid-JSON, script-breakout neutralized, null-package empty page). No `#[ignore]`.
+
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

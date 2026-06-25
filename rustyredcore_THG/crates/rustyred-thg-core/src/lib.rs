@@ -13,6 +13,7 @@ pub mod doc_tree;
 pub mod epistemic;
 pub mod errors;
 pub mod executor;
+pub mod feature_dsl;
 pub mod fulltext;
 #[cfg(feature = "tantivy")]
 pub mod fulltext_tantivy;
@@ -33,11 +34,13 @@ pub mod spatial;
 #[cfg(feature = "s2")]
 pub mod spatial_s2;
 pub mod state;
+pub mod statement;
 pub mod store;
 pub mod stream;
 pub mod symbolic;
 pub mod versioned_graph;
 pub mod working_log;
+pub mod zerocopy;
 
 pub use access_method::{
     AccessMethod, AccessMethodRegistry, AccessMethodStats, AmResult, ColumnId, Cost,
@@ -66,19 +69,32 @@ pub use epistemic::{
     compile_user_subgraph, epistemic_egraph_dedup, epistemic_shadow_edge_id,
     epistemic_shadow_node_id, epistemic_shadow_ppr, has_epistemic_shadow_edge_id,
     read_epistemic_shadow, read_same_eclass, run_epistemic_cron_pass, same_eclass_edge_id,
-    structural_epistemic_pass, EpistemicAnnotation, EpistemicAnnotations, EpistemicCandidatePair,
+    select_nli_pairs, structural_epistemic_pass, ConnectionFeatures, ConnectionScore,
+    ConnectionScorer, EpistemicAnnotation, EpistemicAnnotations, EpistemicCandidatePair,
     EpistemicChokepoint, EpistemicCongruence, EpistemicCronInput, EpistemicCronReport,
     EpistemicDedupConfig, EpistemicDedupReport, EpistemicEnricher, EpistemicEnrichmentError,
     EpistemicEnrichmentMode, EpistemicEquivalenceClass, EpistemicFieldProvenance, EpistemicReadout,
     EpistemicRelationInput, EpistemicRelationKind, EpistemicRelationReadout,
-    EpistemicShadowReadout, EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer,
-    SameEClassRef, SourceReliability, StructuralEpistemicConfig, StructuralEpistemicInput,
-    UserSubgraph, DEFAULT_EPISTEMIC_ENGINE_VERSION, EGRAPH_EPISTEMIC_ENGINE,
+    EpistemicShadowReadout, EpistemicSourceKind, GroundedExtensionStatus, LearnedConnectionScorer,
+    LearnedConnectionScorerConfig, LearnedConnectionScorerPair, LearnedConnectionScorerRequest,
+    LearnedConnectionScorerResponse, NliClassifier, NliEpistemicEnricher, NliPairInput,
+    NliPairSelectionConfig, NliVerdict, PredictedEdgePointer, SameEClassRef, SourceReliability,
+    StructuralEpistemicConfig, StructuralEpistemicInput, UserSubgraph,
+    DEFAULT_CONNECTION_CALIBRATION_VERSION, DEFAULT_CONNECTION_FEATURE_VERSION,
+    DEFAULT_CONNECTION_SCORER_MODEL_ID, DEFAULT_EPISTEMIC_ENGINE_VERSION, DEFAULT_NLI_MODEL_ID,
+    EGRAPH_EPISTEMIC_ENGINE, EPISTEMIC_DETERMINISTIC_FALLBACK_ENV,
+    EPISTEMIC_SCORER_CALIBRATION_ENV, EPISTEMIC_SCORER_ENDPOINT_ENV, EPISTEMIC_SCORER_MODEL_ENV,
     EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, LEARNED_EPISTEMIC_ENGINE,
-    SAME_ECLASS, STRUCTURAL_EPISTEMIC_ENGINE, UNDERCUTS,
+    NLI_EPISTEMIC_ENGINE, SAME_ECLASS, STRUCTURAL_EPISTEMIC_ENGINE, UNDERCUTS,
 };
 pub use errors::{ThgError, ThgResult};
 pub use executor::{execute_request_json, InMemoryThgExecutor, ThgExecutor};
+pub use feature_dsl::{
+    eval_feature, feature_score, malicious_probe_expressions, ArithOp, CompareOp, DynamicFeature,
+    DynamicFeatureStatus, EvalResult, EvalSentinel, EvalValue, FeatureEvalBudget,
+    FeatureEvalContext, FeatureExpr, TraversalTarget, TraverseKind, DEFAULT_MAX_AST_DEPTH,
+    DEFAULT_MAX_STEPS, DEFAULT_MAX_TRAVERSAL_DEPTH, DEFAULT_MAX_TRAVERSAL_NODES,
+};
 pub use fulltext::{
     make_fulltext_backend, make_fulltext_backend_from_value, FullTextBackend, FullTextBackendError,
     FullTextDesignation, FullTextIndex, RUSTY_RED_FULLTEXT_BACKEND_ENV,
@@ -133,9 +149,9 @@ pub use ppr_cache::{
     merge_ppr_scores, scoped_ppr_cache_len,
 };
 pub use ranking::{
-    apply_cascade, compute_term_match, CascadeOutcome, EpistemicGate, ExpandRankingMethod,
-    QueryContext, RankCandidate, RankedCandidate, RankingRule, TermMatch, TextRankingMethod,
-    TypoConfig, VectorRankingMethod,
+    apply_cascade, apply_feature_scores, compute_term_match, CascadeOutcome, EpistemicGate,
+    ExpandRankingMethod, FeatureRankingConfig, QueryContext, RankCandidate, RankedCandidate,
+    RankingRule, TermMatch, TextRankingMethod, TypoConfig, VectorRankingMethod,
 };
 pub use relational::{
     ColumnSchema, NativeAuthPrincipalRecord, NativeBillingAccountRecord, NativeCatalog,
@@ -157,6 +173,16 @@ pub use spatial::{
     SpatialError, SpatialIndex, RUSTY_RED_SPATIAL_BACKEND_ENV,
 };
 pub use state::{stable_hash, ThgEdge, ThgNode, ThgState};
+pub use statement::{
+    canonical_entity_id, collapse_if_corroborated, flatten_statements, literal_ref,
+    migrate_epistemic_shadows_to_statements, predicate_id, predicate_incidence_edge,
+    predicate_node, promote_statement_predicate, propose_same_as, statement_id,
+    statement_incidence_edge_id, statement_incidence_edges, write_statement, Confidence,
+    EpistemicShadowStatementMigrationReport, FlatObject, FlatTriple, StatementFieldProvenance,
+    StatementProvenance, StatementQuery, StatementRecord, StatementSemiring, StatementWriteReceipt,
+    CANONICAL_ENTITY_LABEL, HAS_OBJECT, HAS_PREDICATE, HAS_SUBJECT, PREDICATE_LABEL, SAME_AS,
+    STATEMENT_LABEL,
+};
 pub use store::{InMemoryThgStore, ThgStore};
 pub use stream::{
     StreamDelta, StreamError, StreamEvent, StreamKey, StreamLog, StreamRegistry, StreamStore,
@@ -174,7 +200,7 @@ pub use versioned_graph::{
     build_prolly_tree_incremental, checkout_graph_version, compile_graph_pack,
     compile_graph_pack_incremental, diff_graph_snapshots, diff_graph_trees,
     edge_from_content_object, edge_to_content_object, graph_version_log, merge_graph_snapshots,
-    node_from_content_object, node_to_content_object, prolly_validation_enabled,
+    node_from_content_object, node_to_content_object, object_bytes, prolly_validation_enabled,
     resolve_auto_confidence_edge, snapshot_content_objects, update_graph_ref, update_graph_ref_cas,
     CommitCost, CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
     GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
@@ -187,4 +213,13 @@ pub use versioned_graph::{
 };
 pub use working_log::{
     RecencyCounter, RecencyState, TemporalFact, WorkingLog, WorkingLogEvent, WorkingLogEventKind,
+};
+pub use zerocopy::{
+    access_archive, access_graph_archive, archive_content_object, archive_content_objects,
+    archive_event_log, archive_hash, content_object_archive_bytes, edge_to_archive,
+    mutation_to_archive, node_to_archive, replay_event_log, to_archive, tree_node_archive_bytes,
+    ArchiveEdge, ArchiveGraphMutation, ArchiveGraphMutationLog, ArchiveNode, GraphArchiveBody,
+    GraphArchiveContentObject, GraphArchiveEnvelope, GraphArchiveObjectBytes,
+    GraphArchiveTreeChild, GraphArchiveTreeEntry, GraphArchiveTreeNode, MappedArchive,
+    ZeroCopyArchiveError, GRAPH_ARCHIVE_FORMAT_VERSION, GRAPH_ARCHIVE_MIME_TYPE,
 };

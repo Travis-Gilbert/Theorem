@@ -1,14 +1,16 @@
 # rustyred-thg-fractal
 
-Native Rust fractal expansion pipeline over RustyRed and RustyWeb.
+Native fractal expansion over the RustyRed substrate and RustyWeb. A run is corpus growth, not graph-only retrieval: the runner always builds a web crawl request and ingests admitted web graph state into a lower-trust, quarantined tier.
 
-## What it is
+## Key API
 
-Native Rust fractal expansion over RustyRed and RustyWeb.
+- Sync fixture runners: `run_fixture_fractal_expansion<S>(&mut S, FractalExpansionRequest, &[FetchedPage]) -> ThgResult<FractalExpansionReceipt>`, `run_fixture_fractal_expansion_with_scorer`.
+- Async live runners: `run_fractal_expansion`, `run_fractal_expansion_with_scorer`, `run_fractal_expansion_with_search_providers`, and `..._and_scorer` variants.
+- `open_web_pages_for_tenant(&S, tenant_id) -> Vec<String>`.
+- Types: `FractalExpansionRequest`, `FractalExpansionReceipt`, `FractalFrontierHit`, `FractalProviderCandidate`, `FractalProviderReceipt`, `FractalPageExcerpt`.
+- Quarantine: `OPEN_WEB_UNVERIFIED_TRUST_TIER = "open_web_unverified"`, `DEFAULT_OPEN_WEB_CONFIDENCE_CEILING = 0.35`. Default embedder model is Qwen3-Embedding-4B; default budget 2000 tokens.
 
-A fractal expansion run is corpus growth, not graph-only retrieval. The
-public runner in this crate always builds a web crawl request and ingests
-admitted web graph state as a lower-trust, quarantined tier.
+Path deps: `rustyred-hipporag`, `rustyred-membrane` (feature `graph-store`), `rustyred-rerank`, `rustyred-thg-core`, `rustyred-web`.
 
 ## Build and test
 
@@ -16,4 +18,6 @@ admitted web graph state as a lower-trust, quarantined tier.
 cd rustyredcore_THG && cargo test -p rustyred-thg-fractal
 ```
 
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+Tests are inline in `lib.rs`. No `#[ignore]`.
+
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

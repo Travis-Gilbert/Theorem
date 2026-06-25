@@ -88,7 +88,14 @@ pub fn featurize_hot_training_examples<B: Backend>(
     let mut labels = Vec::with_capacity(examples.len());
     for example in examples {
         for idx in 0..config.input_dim {
-            features.push(example.features.get(idx).copied().unwrap_or_default().tanh());
+            features.push(
+                example
+                    .features
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_default()
+                    .tanh(),
+            );
         }
         labels.push(if example.label { 1.0 } else { 0.0 });
     }

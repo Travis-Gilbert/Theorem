@@ -1,15 +1,24 @@
 # rustyred-thg-resp-server
 
-RESP protocol server for RustyRedCore-THG ordered-index commands.
+A RESP/Redis-protocol server exposing the core's scoped sorted-set commands over `OrderedIndexRegistry`. Binary-only (no lib target).
 
-## What it is
+## Binary
 
-`rustyred-thg-resp-server` is a small Tokio RESP command loop over `OrderedIndexRegistry`. It accepts Redis-shaped commands, parses both array and whitespace command forms, executes ordered-index protocol operations, and returns RESP-encoded responses for focused compatibility and smoke testing.
+`rustyred-thg-resp-server` (`src/main.rs`). Bind env `RUSTYRED_THG_RESP_ADDR` (default `127.0.0.1:6380`); prints `RUSTYRED_THG_RESP_READY <addr>`. Tokio multi-threaded, one task per connection. Reads both the RESP array form (`*N`/`$len`) and the whitespace command form.
+
+## Commands
+
+`execute_resp_command` (`protocol.rs`) implements `PING`, `ZADD`, `ZSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZRANGEBYSCORE` (`WITHSCORES`, `LIMIT offset count`), `ZREM`, `ZCARD`, `ZRANK`. Scores parse `-inf`/`+inf`/`inf` and reject NaN. Unknown commands return an explicit "scoped ZSET commands only" error. `RespValue` carries `encode()`.
+
+Path dep: `rustyred-thg-core` (feature `redis-store`). Other: `redis-protocol 5`, `tokio`.
 
 ## Build and test
 
 ```bash
 cd rustyredcore_THG && cargo test -p rustyred-thg-resp-server
+RUSTYRED_THG_RESP_ADDR=127.0.0.1:6380 cargo run -p rustyred-thg-resp-server
 ```
 
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+Tests are inline in `protocol.rs`. No `#[ignore]`.
+
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

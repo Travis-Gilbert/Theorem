@@ -110,6 +110,16 @@ pub use coordination::{
     CoordinationRecordState, CoordinationResult, CoordinationRoomMember, CoordinationRoomState,
     JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput, WriteRecordInput,
 };
+pub use coordination_push::{
+    agent_space_event_kind, agent_space_event_matches, agent_space_high_water_seq,
+    global_agent_space_bus, global_coordination_room_bus, publish_agent_space_event,
+    publish_agent_space_room_message, publish_coordination_room_event_from_state,
+    publish_crdt_delta, publish_footprint_event, publish_presence_event, publish_record_event,
+    publish_work_graph_transition, stream_event_matches, subscribe_agent_space_events,
+    subscribe_coordination_room_events, wake_targets, AddOrRemove, AgentSpaceEnvelope,
+    AgentSpaceEvent, AgentSpaceEventBus, CausalMeta, CrdtDelta, DeltaOp, RoomEventBus,
+    RoomMessageDelivery, RoomMessageEvent, DEFAULT_ROOM_BUS_CAPACITY,
+};
 pub use coordination_v2::{
     attach_related_event, consume_ping, coordination_manifest_path, create_ping,
     ping_targets_checkout, read_claims_for_task, read_coordination_manifest,
@@ -120,16 +130,6 @@ pub use coordination_v2::{
     CoordinationManifest, CoordinationStore, DigestInput, DiscoveryInput, ManifestActor, PingInput,
     RelatedEvent, RoomAlias, RoomDigest, TaskRef, TaskRefConfidence, TaskRefInput,
     TurnStartDiscovery, PING_CONSUMED, PING_PENDING, PING_SEEN,
-};
-pub use coordination_push::{
-    agent_space_event_kind, agent_space_event_matches, agent_space_high_water_seq,
-    global_agent_space_bus, global_coordination_room_bus, publish_agent_space_event,
-    publish_agent_space_room_message, publish_coordination_room_event_from_state,
-    publish_crdt_delta, publish_footprint_event, publish_presence_event, publish_record_event,
-    publish_work_graph_transition, stream_event_matches, subscribe_agent_space_events,
-    subscribe_coordination_room_events, wake_targets, AddOrRemove, AgentSpaceEnvelope,
-    AgentSpaceEvent, AgentSpaceEventBus, CausalMeta, CrdtDelta, DeltaOp, RoomEventBus,
-    RoomMessageDelivery, RoomMessageEvent, DEFAULT_ROOM_BUS_CAPACITY,
 };
 pub use design_check::{
     contrast_ratio as design_contrast_ratio, css_static_report, design_engineering_pack_payload,

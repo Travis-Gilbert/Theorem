@@ -255,7 +255,8 @@ fn hot_options_from(opts: &BTreeMap<String, String>) -> HotTrainingRunOptions {
     training.epochs = option_usize(opts, "epochs").unwrap_or(training.epochs);
     training.batch_size = option_usize(opts, "batch-size").unwrap_or(training.batch_size);
     training.learning_rate = option_f32(opts, "learning-rate").unwrap_or(training.learning_rate);
-    training.l2_weight_decay = option_f32(opts, "l2-weight-decay").unwrap_or(training.l2_weight_decay);
+    training.l2_weight_decay =
+        option_f32(opts, "l2-weight-decay").unwrap_or(training.l2_weight_decay);
     training.model = HotConfig {
         max_nodes: option_usize(opts, "max-nodes").unwrap_or(HotConfig::default().max_nodes),
         max_temporal_edges: option_usize(opts, "max-temporal-edges")

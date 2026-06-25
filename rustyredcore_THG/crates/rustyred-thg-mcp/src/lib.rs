@@ -5277,6 +5277,12 @@ fn coordination_context_payload(
     let message_count = messages.len();
     let record_count = records.len();
     let pending_mention_count = pending_mentions.len();
+    let ambient_code = ambient_code_context_payload(tenant, &*backend, arguments)?;
+    let ambient_code_markdown = ambient_code
+        .as_ref()
+        .and_then(|value| value.get("rendered_markdown"))
+        .cloned()
+        .unwrap_or(Value::Null);
 
     Ok(json!({
         "tenant": tenant,
@@ -5288,6 +5294,8 @@ fn coordination_context_payload(
         "messages": messages,
         "records": records,
         "pending_mentions": pending_mentions,
+        "ambient_code": ambient_code,
+        "ambient_code_markdown": ambient_code_markdown,
         "counts": {
             "presence": presence_count,
             "intents": intent_count,
@@ -5296,6 +5304,427 @@ fn coordination_context_payload(
             "pending_mentions": pending_mention_count
         }
     }))
+}
+
+fn ambient_code_context_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Option<Value>, McpError> {
+    let repo_candidates = ambient_code_repo_candidates(arguments);
+    if repo_candidates.is_empty() {
+        return Ok(None);
+    }
+
+    for repo_id in repo_candidates {
+        let mut specs = query_compiler_nodes(
+            backend,
+            tenant,
+            &repo_id,
+            rustyred_thg_code::CODE_SPEC_LABEL,
+            16,
+        )?;
+        let mut drifts = query_compiler_nodes(
+            backend,
+            tenant,
+            &repo_id,
+            rustyred_thg_code::CODE_COMPILER_DRIFT_LABEL,
+            256,
+        )?;
+        let mut processes = query_compiler_nodes(
+            backend,
+            tenant,
+            &repo_id,
+            rustyred_thg_code::CODE_PROCESS_LABEL,
+            256,
+        )?;
+        let mut patterns = query_compiler_nodes(
+            backend,
+            tenant,
+            &repo_id,
+            rustyred_thg_code::CODE_PATTERN_LABEL,
+            256,
+        )?;
+        let features = query_compiler_nodes(
+            backend,
+            tenant,
+            &repo_id,
+            rustyred_thg_code::CODE_FEATURE_LABEL,
+            10_000,
+        )?;
+        let annotations = query_compiler_nodes(
+            backend,
+            tenant,
+            &repo_id,
+            rustyred_thg_code::CODE_ANNOTATION_LABEL,
+            10_000,
+        )?;
+
+        if specs.is_empty()
+            && drifts.is_empty()
+            && processes.is_empty()
+            && patterns.is_empty()
+            && features.is_empty()
+            && annotations.is_empty()
+        {
+            continue;
+        }
+
+        specs.sort_by(|left, right| {
+            node_u64(&right.properties, "compiled_at_ms")
+                .cmp(&node_u64(&left.properties, "compiled_at_ms"))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        drifts.sort_by(|left, right| {
+            severity_rank(node_string(&right.properties, "severity").as_deref())
+                .cmp(&severity_rank(
+                    node_string(&left.properties, "severity").as_deref(),
+                ))
+                .then_with(|| {
+                    node_string(&left.properties, "file_path")
+                        .cmp(&node_string(&right.properties, "file_path"))
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        processes.sort_by(|left, right| {
+            node_f64(&right.properties, "confidence")
+                .partial_cmp(&node_f64(&left.properties, "confidence"))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        patterns.sort_by(|left, right| {
+            node_f64(&right.properties, "confidence")
+                .partial_cmp(&node_f64(&left.properties, "confidence"))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    node_u64(&right.properties, "created_at_ms")
+                        .cmp(&node_u64(&left.properties, "created_at_ms"))
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let spec = specs.first().map(|node| {
+            json!({
+                "node_id": node.id,
+                "title": node_string(&node.properties, "title").unwrap_or_default(),
+                "artifact_hash": node_string(&node.properties, "artifact_hash").unwrap_or_default(),
+                "compiler_version": node_string(&node.properties, "compiler_version").unwrap_or_default(),
+                "feature_version": node_string(&node.properties, "feature_version").unwrap_or_default(),
+                "file_count": node_u64(&node.properties, "file_count"),
+                "symbol_count": node_u64(&node.properties, "symbol_count"),
+                "structure_count": node_u64(&node.properties, "structure_count"),
+                "dependency_edge_count": node_u64(&node.properties, "dependency_edge_count"),
+            })
+        });
+        let drift_findings = drifts
+            .iter()
+            .take(8)
+            .map(|node| {
+                json!({
+                    "finding_id": node.id,
+                    "severity": node_string(&node.properties, "severity").unwrap_or_default(),
+                    "drift_kind": node_string(&node.properties, "drift_kind").unwrap_or_default(),
+                    "file_path": node_string(&node.properties, "file_path").unwrap_or_default(),
+                    "name": node_string(&node.properties, "name").unwrap_or_default(),
+                    "suggested_next_step": node_string(&node.properties, "suggested_next_step").unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let process_flows = processes
+            .iter()
+            .take(5)
+            .map(|node| {
+                json!({
+                    "process_id": node.id,
+                    "entry_name": node_string(&node.properties, "entry_name").unwrap_or_default(),
+                    "entry_file_path": node_string(&node.properties, "entry_file_path").unwrap_or_default(),
+                    "trigger": node_string(&node.properties, "trigger").unwrap_or_default(),
+                    "confidence": node_f64(&node.properties, "confidence"),
+                    "step_count": node_u64(&node.properties, "step_count"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let pattern_memories = patterns
+            .iter()
+            .take(5)
+            .map(|node| {
+                json!({
+                    "pattern_id": node.id,
+                    "title": node_string(&node.properties, "title").unwrap_or_default(),
+                    "fix_summary": node_string(&node.properties, "fix_summary").unwrap_or_default(),
+                    "root_cause": node_string(&node.properties, "root_cause").unwrap_or_default(),
+                    "confidence": node_f64(&node.properties, "confidence"),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut payload = json!({
+            "tenant": tenant,
+            "repo_id": repo_id,
+            "spec": spec,
+            "drift_findings": drift_findings,
+            "process_flows": process_flows,
+            "pattern_memories": pattern_memories,
+            "counts": {
+                "specs": specs.len(),
+                "drift_findings": drifts.len(),
+                "process_flows": processes.len(),
+                "pattern_memories": patterns.len(),
+                "feature_vectors": features.len(),
+                "annotations": annotations.len()
+            },
+            "source": "compiler_artifacts"
+        });
+        let rendered_markdown = render_ambient_code_markdown(&payload);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "rendered_markdown".to_string(),
+                Value::String(rendered_markdown),
+            );
+        }
+        return Ok(Some(payload));
+    }
+
+    Ok(None)
+}
+
+fn query_compiler_nodes(
+    backend: &impl McpGraphBackend,
+    tenant: &str,
+    repo_id: &str,
+    label: &str,
+    limit: usize,
+) -> Result<Vec<NodeRecord>, McpError> {
+    let mut nodes = backend.query_nodes(
+        NodeQuery::label(label)
+            .with_property("tenant_id", json!(tenant))
+            .with_property("repo_id", json!(repo_id))
+            .with_limit(limit),
+    )?;
+    nodes.retain(|node| !node.tombstone);
+    Ok(nodes)
+}
+
+fn ambient_code_repo_candidates(arguments: &Value) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    for key in [
+        "repo_id",
+        "repoId",
+        "repository_id",
+        "repositoryId",
+        "repo",
+        "repository",
+        "repo_url",
+        "repoUrl",
+    ] {
+        if let Some(value) = argument_text(arguments, &[key]) {
+            add_repo_candidate_variants(&mut candidates, &value);
+        }
+    }
+    if let Some(room_id) = argument_text(arguments, &["room_id", "roomId"]) {
+        if let Some(repo) = room_id
+            .split(':')
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find_map(|window| (window[0] == "repo").then(|| window[1]))
+        {
+            add_repo_candidate_variants(&mut candidates, repo);
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+fn add_repo_candidate_variants(candidates: &mut BTreeSet<String>, raw: &str) {
+    let trimmed = raw
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    insert_repo_candidate(candidates, trimmed);
+    let without_query = trimmed
+        .split(|ch| ch == '?' || ch == '#')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    if let Some(last_segment) = without_query
+        .rsplit(|ch| ch == '/' || ch == '\\' || ch == ':')
+        .find(|segment| !segment.trim().is_empty())
+    {
+        insert_repo_candidate(candidates, last_segment.trim());
+    }
+}
+
+fn insert_repo_candidate(candidates: &mut BTreeSet<String>, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    candidates.insert(trimmed.to_string());
+    candidates.insert(trimmed.to_ascii_lowercase());
+    if let Some(first) = trimmed.chars().next() {
+        let rest = &trimmed[first.len_utf8()..];
+        candidates.insert(format!("{}{}", first.to_ascii_uppercase(), rest));
+    }
+}
+
+fn render_ambient_code_markdown(payload: &Value) -> String {
+    let repo_id = payload
+        .get("repo_id")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown repo)");
+    let counts = &payload["counts"];
+    let mut lines = vec![format!(
+        "- Repo `{repo_id}`: {} spec artifact(s), {} drift finding(s), {} process flow(s), {} pattern memory item(s), {} feature vector(s), {} annotation(s).",
+        value_u64(&counts["specs"]),
+        value_u64(&counts["drift_findings"]),
+        value_u64(&counts["process_flows"]),
+        value_u64(&counts["pattern_memories"]),
+        value_u64(&counts["feature_vectors"]),
+        value_u64(&counts["annotations"])
+    )];
+
+    if let Some(spec) = payload.get("spec").filter(|value| !value.is_null()) {
+        let title = spec
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("(untitled spec)");
+        let hash = spec
+            .get("artifact_hash")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unhashed");
+        lines.push(format!(
+            "- Current compiled spec `{}` covers {} file(s), {} symbol(s), {} structure(s); artifact `{}`.",
+            one_line(title),
+            value_u64(&spec["file_count"]),
+            value_u64(&spec["symbol_count"]),
+            value_u64(&spec["structure_count"]),
+            one_line(hash)
+        ));
+    }
+
+    let drift_findings = payload["drift_findings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if drift_findings.is_empty() {
+        lines.push("- Drift: no current findings in the compiler artifacts.".to_string());
+    } else {
+        for finding in drift_findings.iter().take(3) {
+            let severity = finding
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let kind = finding
+                .get("drift_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("drift");
+            let file = finding
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown file)");
+            let name = finding
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown symbol)");
+            lines.push(format!(
+                "- Drift `{}` `{}`: {} :: {}.",
+                one_line(severity),
+                one_line(kind),
+                one_line(file),
+                one_line(name)
+            ));
+        }
+    }
+
+    for pattern in payload["pattern_memories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+    {
+        let title = pattern
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("(untitled pattern)");
+        let fix = pattern
+            .get("fix_summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        lines.push(format!(
+            "- Pattern `{}`: {}",
+            one_line(title),
+            one_line(fix)
+        ));
+    }
+
+    for process in payload["process_flows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+    {
+        let entry = process
+            .get("entry_name")
+            .and_then(Value::as_str)
+            .unwrap_or("(entry)");
+        let file = process
+            .get("entry_file_path")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown file)");
+        let trigger = process
+            .get("trigger")
+            .and_then(Value::as_str)
+            .unwrap_or("process");
+        lines.push(format!(
+            "- Process `{}` starts at {} :: {}.",
+            one_line(trigger),
+            one_line(file),
+            one_line(entry)
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn node_string(properties: &Value, key: &str) -> Option<String> {
+    properties
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn node_u64(properties: &Value, key: &str) -> u64 {
+    properties.get(key).map(value_u64).unwrap_or(0)
+}
+
+fn node_f64(properties: &Value, key: &str) -> f64 {
+    properties.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn value_u64(value: &Value) -> u64 {
+    value.as_u64().unwrap_or(0)
+}
+
+fn severity_rank(severity: Option<&str>) -> u8 {
+    match severity.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn append_harness_transition_payload(
@@ -5715,11 +6144,13 @@ fn harness_prepare_payload(
             })
         })
         .collect::<Vec<_>>();
+    let ambient_code = ambient_code_context_payload(tenant, &*backend, arguments)?;
     let rendered_markdown = render_harness_prepare_markdown(
         &task,
         &signature,
         &selected_capabilities,
         &memory_contract,
+        ambient_code.as_ref(),
     );
     Ok(json!({
         "tenant": tenant,
@@ -5729,6 +6160,7 @@ fn harness_prepare_payload(
         "budget_units": budget_units,
         "selected_capabilities": selected_capabilities,
         "memory_contract": memory_contract,
+        "ambient_code": ambient_code,
         "recall_results": recall_results,
         "decision_content_hash": signature,
         "decision": decision,
@@ -5736,7 +6168,8 @@ fn harness_prepare_payload(
             "task": task,
             "signature": signature,
             "selected_capabilities": selected_capabilities,
-            "memory_contract": memory_contract
+            "memory_contract": memory_contract,
+            "ambient_code": ambient_code
         },
         "rendered_markdown": rendered_markdown
     }))
@@ -5821,6 +6254,7 @@ fn render_harness_prepare_markdown(
     signature: &str,
     selected_capabilities: &[Value],
     memory_contract: &Value,
+    ambient_code: Option<&Value>,
 ) -> String {
     fn list(values: &[String]) -> String {
         if values.is_empty() {
@@ -5857,8 +6291,14 @@ fn render_harness_prepare_markdown(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let ambient_code_section = ambient_code
+        .and_then(|value| value.get("rendered_markdown"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\n\n### Ambient code intelligence\n{value}"))
+        .unwrap_or_default();
     format!(
-        "## Theorem Context Brief\n\n**Task:** {task}\n**Signature:** `{signature}`\n\n### Selected capabilities\n{selected}\n\n### Read first\n{read_first}\n\n### Risks\n{risks}\n\n### Do not\n{do_not}",
+        "## Theorem Context Brief\n\n**Task:** {task}\n**Signature:** `{signature}`\n\n### Selected capabilities\n{selected}{ambient_code_section}\n\n### Read first\n{read_first}\n\n### Risks\n{risks}\n\n### Do not\n{do_not}",
         read_first = list(&read_first),
         risks = list(&risks),
         do_not = list(&do_not)
@@ -15805,6 +16245,141 @@ mod tests {
         assert!(markdown.contains("Theorem Context Brief"));
         assert!(markdown.contains("Rust Engineering"));
         assert!(markdown.contains("### Read first"));
+    }
+
+    #[test]
+    fn ambient_code_intelligence_is_folded_into_context_surfaces() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        {
+            let mut store = provider.0.borrow_mut();
+            store
+                .upsert_node(NodeRecord::new(
+                    "code:spec:theorem",
+                    [rustyred_thg_code::CODE_SPEC_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "Theorem",
+                        "title": "Theorem compiled spec",
+                        "artifact_hash": "sha256:spec",
+                        "compiler_version": "rustyred-code-compiler-v0",
+                        "feature_version": "code-compiler-ir-v1",
+                        "file_count": 2,
+                        "symbol_count": 7,
+                        "structure_count": 3,
+                        "dependency_edge_count": 4,
+                        "compiled_at_ms": 10
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "code:drift:theorem",
+                    [rustyred_thg_code::CODE_COMPILER_DRIFT_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "Theorem",
+                        "severity": "high",
+                        "drift_kind": "signature_changed",
+                        "file_path": "src/lib.rs",
+                        "name": "compile_context",
+                        "suggested_next_step": "Refresh the compiled spec."
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "code:process:theorem",
+                    [rustyred_thg_code::CODE_PROCESS_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "Theorem",
+                        "entry_name": "main",
+                        "entry_file_path": "src/main.rs",
+                        "trigger": "main_entrypoint",
+                        "confidence": 0.92,
+                        "step_count": 3
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "code:pattern:theorem",
+                    [rustyred_thg_code::CODE_PATTERN_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "Theorem",
+                        "title": "Keep context ambient",
+                        "fix_summary": "Route compiler readouts through run-start context.",
+                        "root_cause": "Agents should perceive stable code intelligence.",
+                        "confidence": 0.88,
+                        "created_at_ms": 11
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "code:feature:theorem",
+                    [rustyred_thg_code::CODE_FEATURE_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "Theorem",
+                        "active_feature_count": 21
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "code:annotation:theorem",
+                    [rustyred_thg_code::CODE_ANNOTATION_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "Theorem",
+                        "epistemic_uncertainty": 0.2,
+                        "aleatoric_uncertainty": 0.1
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let context = call_tool_json(
+            &provider,
+            &config,
+            "coordination_context",
+            json!({
+                "tenant": "smoke",
+                "room_id": "repo:theorem:branch:main",
+                "repo": "Travis-Gilbert/theorem"
+            }),
+        );
+        assert_eq!(context["ambient_code"]["repo_id"], "Theorem");
+        assert_eq!(context["ambient_code"]["counts"]["feature_vectors"], 1);
+        assert_eq!(context["ambient_code"]["counts"]["annotations"], 1);
+        assert!(context["ambient_code_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Keep context ambient"));
+
+        let prepared = call_tool_json(
+            &provider,
+            &config,
+            "harness_prepare",
+            json!({
+                "tenant": "smoke",
+                "task": "work on Theorem compiler context",
+                "repo": "Travis-Gilbert/theorem",
+                "memory_limit": 1
+            }),
+        );
+        assert_eq!(prepared["brief"]["ambient_code"]["repo_id"], "Theorem");
+        assert!(prepared["rendered_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("### Ambient code intelligence"));
+        assert!(prepared["rendered_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Theorem compiled spec"));
     }
 
     #[test]

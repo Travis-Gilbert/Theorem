@@ -7,6 +7,7 @@ use crate::graph_store::{
     unix_ms, EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, NodeRecord,
 };
 use crate::state::stable_hash;
+use crate::zerocopy::{archive_content_object, archive_content_objects, GraphArchiveObjectBytes};
 
 pub const VERSIONED_GRAPH_PROTOCOL_VERSION: &str = "rustyred-versioned-graph-v1";
 pub const GRAPH_PACK_COMPILER_VERSION: &str = "rustyred-graph-pack-compiler-v1";
@@ -36,6 +37,8 @@ pub struct GraphContentObject {
     pub key: String,
     pub kind: GraphObjectKind,
     pub hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parent_hashes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,6 +127,8 @@ pub struct CompiledGraphPack {
     pub capabilities: Vec<GraphCompilerCapability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<GraphContentObject>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_objects: Vec<GraphArchiveObjectBytes>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -398,6 +403,11 @@ pub fn compile_graph_pack(
     let message = clean_or_default(options.message, "compile graph snapshot");
     let timestamp_unix_ms = options.timestamp_unix_ms.unwrap_or_else(unix_ms);
     let objects = snapshot_content_objects(snapshot, options.include_payloads);
+    let archive_objects = if options.include_payloads {
+        archive_content_objects_or_panic(&objects)
+    } else {
+        Vec::new()
+    };
     let tree = build_prolly_tree(&objects);
     let commit = build_commit(
         &tree,
@@ -456,6 +466,7 @@ pub fn compile_graph_pack(
         } else {
             Vec::new()
         },
+        archive_objects,
     }
 }
 
@@ -583,6 +594,11 @@ pub fn compile_graph_pack_incremental(
     let nodes_total = build.nodes_total;
     let edges_total = build.edges_total;
     let objects = changed_objects;
+    let archive_objects = if options.include_payloads {
+        archive_content_objects_or_panic(&objects)
+    } else {
+        Vec::new()
+    };
     let graph_version = prior_pack.commit.graph_version.saturating_add(1);
     let commit = build_commit(
         &tree,
@@ -651,6 +667,7 @@ pub fn compile_graph_pack_incremental(
             } else {
                 Vec::new()
             },
+            archive_objects,
         },
         changed_object_keys: changed_object_keys.into_iter().collect(),
         changed_tree_nodes,
@@ -1314,6 +1331,7 @@ fn index_pack_content(repository: &mut GraphVersionRepository, pack: &CompiledGr
 fn compact_repository_pack(pack: &CompiledGraphPack) -> CompiledGraphPack {
     let mut compact = pack.clone();
     compact.objects.clear();
+    compact.archive_objects.clear();
     compact.tree.nodes.clear();
     compact
 }
@@ -1552,24 +1570,48 @@ pub fn edge_from_content_object(object: &GraphContentObject) -> Option<EdgeRecor
     serde_json::from_value(object.payload.clone()?).ok()
 }
 
+pub fn object_bytes<'a>(pack: &'a CompiledGraphPack, hash: &str) -> Option<&'a [u8]> {
+    pack.archive_objects
+        .iter()
+        .find(|object| object.hash == hash)
+        .map(|object| object.bytes.as_slice())
+}
+
 fn node_content_object(node: &NodeRecord, include_payload: bool) -> GraphContentObject {
-    GraphContentObject {
+    finalize_archive_content_hash(GraphContentObject {
         key: format!("node/{}", node.id),
         kind: GraphObjectKind::Node,
-        hash: node.content_hash.clone().unwrap_or_else(|| node.checksum()),
+        hash: String::new(),
+        logical_hash: Some(node.content_hash.clone().unwrap_or_else(|| node.checksum())),
         parent_hashes: node.parent_hashes.clone(),
         payload: include_payload.then(|| serde_json::to_value(node).unwrap_or_else(|_| json!({}))),
-    }
+    })
 }
 
 fn edge_content_object(edge: &EdgeRecord, include_payload: bool) -> GraphContentObject {
-    GraphContentObject {
+    finalize_archive_content_hash(GraphContentObject {
         key: format!("edge/{}", edge.id),
         kind: GraphObjectKind::Edge,
-        hash: edge.content_hash.clone().unwrap_or_else(|| edge.checksum()),
+        hash: String::new(),
+        logical_hash: Some(edge.content_hash.clone().unwrap_or_else(|| edge.checksum())),
         parent_hashes: edge.parent_hashes.clone(),
         payload: include_payload.then(|| serde_json::to_value(edge).unwrap_or_else(|_| json!({}))),
-    }
+    })
+}
+
+fn finalize_archive_content_hash(mut object: GraphContentObject) -> GraphContentObject {
+    object.hash = archive_content_object(&object)
+        .map(|archive| archive.hash)
+        .unwrap_or_else(|_| stable_hash(&object));
+    object
+}
+
+fn archive_content_objects_or_panic(
+    objects: &[GraphContentObject],
+) -> Vec<GraphArchiveObjectBytes> {
+    archive_content_objects(objects).unwrap_or_else(|error| {
+        panic!("could not archive graph content objects: {}", error.message)
+    })
 }
 
 fn leaf_nodes(entries: Vec<GraphTreeEntry>) -> Vec<GraphTreeNode> {
@@ -2397,6 +2439,53 @@ mod tests {
         let edge = &merged.merged_snapshot.unwrap().edges[0];
         assert_eq!(edge.confidence, Some(0.9));
         assert_eq!(merged.resolved[0].reason, "higher_edge_confidence");
+    }
+
+    #[test]
+    fn compiled_pack_carries_archive_bytes_addressed_by_object_hash() {
+        let snapshot = GraphSnapshot {
+            version: 1,
+            nodes: vec![NodeRecord::new("node:a", ["Claim"], json!({"claim": "A"}))],
+            edges: vec![EdgeRecord::new(
+                "edge:a",
+                "node:a",
+                "SUPPORTS",
+                "node:a",
+                json!({}),
+            )],
+        };
+        let pack = compile_graph_pack(&snapshot, GraphCompileOptions::default());
+
+        assert_eq!(pack.archive_objects.len(), pack.objects.len());
+        for object in &pack.objects {
+            let bytes = object_bytes(&pack, &object.hash).expect("archive bytes by object hash");
+            assert_eq!(crate::zerocopy::archive_hash(bytes), object.hash);
+            crate::zerocopy::access_graph_archive(bytes).expect("checked archive access");
+        }
+    }
+
+    #[test]
+    fn incremental_pack_carries_only_changed_archive_bytes() {
+        let base = GraphSnapshot {
+            version: 1,
+            nodes: vec![NodeRecord::new("node:a", ["Claim"], json!({"claim": "A"}))],
+            edges: Vec::new(),
+        };
+        let base_pack = compile_graph_pack(&base, GraphCompileOptions::default());
+        let batch = GraphMutationBatch::new([GraphMutation::NodeUpsert(NodeRecord::new(
+            "node:b",
+            ["Claim"],
+            json!({"claim": "B"}),
+        ))]);
+        let incremental =
+            compile_graph_pack_incremental(&base_pack, &batch, GraphCompileOptions::default());
+
+        assert_eq!(incremental.changed_object_keys, vec!["node/node:b"]);
+        assert_eq!(incremental.pack.objects.len(), 1);
+        assert_eq!(incremental.pack.archive_objects.len(), 1);
+        let changed = &incremental.pack.objects[0];
+        assert!(object_bytes(&base_pack, &changed.hash).is_none());
+        assert!(object_bytes(&incremental.pack, &changed.hash).is_some());
     }
 
     #[test]

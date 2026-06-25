@@ -11,6 +11,7 @@ rust-version = "1.85"
 members = [
     ".",
     "crates/rustyred-thg-core",
+    "crates/rustyred-thg-fuse",
     "crates/rustyred-thg-adapters",
     "crates/rustyred-thg-fractal",
     "crates/rustyred-thg-geotemporal",

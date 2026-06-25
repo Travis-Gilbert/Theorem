@@ -10,6 +10,7 @@ pub mod burn_mpnn;
 pub mod burn_pairformer;
 pub mod commands;
 pub mod edge_mpnn;
+pub mod epistemic_scorer;
 pub mod fitness;
 pub mod grounded_skill;
 pub mod hot;
@@ -45,6 +46,10 @@ pub use edge_mpnn::{
     GlobalCompletionConfig, GlobalCompletionRequest, GlobalCompletionResult,
     DEFAULT_COMPLETION_HIDDEN_DIM, DEFAULT_COMPLETION_LAYERS,
     DEFAULT_COMPLETION_MAX_FRONTIER_NODES, DEFAULT_COMPLETION_MAX_SEEDS,
+};
+pub use epistemic_scorer::{
+    run_epistemic_cron_pass_with_runpod_scorer, RunPodConnectionScorer,
+    RunPodConnectionScorerConfig, EPISTEMIC_SCORER_TOKEN_ENV,
 };
 pub use fitness::{
     effective_fitness, find_adapter_by_id, list_adapters, record_fitness, supersede_adapter,

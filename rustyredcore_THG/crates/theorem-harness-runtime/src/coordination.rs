@@ -1689,7 +1689,11 @@ fn record_room_edge(state: &CoordinationRecordState) -> CoordinationResult<EdgeR
     ))
 }
 
-pub(crate) fn empty_room_state(tenant_slug: &str, room_id: &str, now: &str) -> CoordinationRoomState {
+pub(crate) fn empty_room_state(
+    tenant_slug: &str,
+    room_id: &str,
+    now: &str,
+) -> CoordinationRoomState {
     CoordinationRoomState {
         tenant_slug: normalize_tenant_slug(tenant_slug),
         room_id: normalize_room_id(room_id),

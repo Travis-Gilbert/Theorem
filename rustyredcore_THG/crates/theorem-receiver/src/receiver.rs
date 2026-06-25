@@ -446,7 +446,7 @@ fn run_job(
     })?;
 
     let spec_text = resolve_spec_text(job, worktree)?;
-    let context_packet = coordination_context_packet(client, &job.job_id);
+    let context_packet = coordination_context_packet(client, &job.job_id, &job.repo);
     probe_harness(client).map_err(|error| {
         ReceiverError::Protocol(format!("harness probe failed before launch: {error}"))
     })?;
@@ -541,10 +541,14 @@ fn resolve_spec_text(job: &Job, worktree: &Path) -> ReceiverResult<String> {
     })
 }
 
-fn coordination_context_packet(client: &HarnessClient, job_id: &str) -> String {
+fn coordination_context_packet(client: &HarnessClient, job_id: &str, repo: &str) -> String {
     match client.call_tool(
         "coordination_context",
-        json!({ "room_id": "repo:theorem:branch:main", "job_id": job_id }),
+        json!({
+            "room_id": "repo:theorem:branch:main",
+            "job_id": job_id,
+            "repo": repo
+        }),
     ) {
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
         Err(error) => format!("coordination_context unavailable: {error}"),

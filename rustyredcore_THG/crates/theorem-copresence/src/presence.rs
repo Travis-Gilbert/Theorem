@@ -16,11 +16,7 @@ pub enum PresenceKind {
 pub enum CursorPos {
     TextIndex { region_id: String, index: u32 },
     Object { object_id: String },
-    FilePosition {
-        path: String,
-        line: u32,
-        col: u32,
-    },
+    FilePosition { path: String, line: u32, col: u32 },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -48,10 +48,16 @@ impl Default for OrganizePolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub enum OrganizeDecision {
     /// Tier one is confident and unambiguous. File silently.
-    AutoFiled { collection_id: String, confidence: f32 },
+    AutoFiled {
+        collection_id: String,
+        confidence: f32,
+    },
     /// Tier one filed it but the call is close enough to show for review.
     /// Reversible, low-stakes, lands in "organized today".
-    FiledForReview { collection_id: String, confidence: f32 },
+    FiledForReview {
+        collection_id: String,
+        confidence: f32,
+    },
     /// Tier one declined. The bounded "needs you" set: the tier-two queue,
     /// optionally carrying an agent suggestion downstream.
     NeedsYou {

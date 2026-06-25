@@ -1,14 +1,13 @@
 # rustyred-rerank
 
-Reranker scorer implementations for RustyRed membrane admission.
+Reranker-backed `Scorer` implementations for membrane admission, including the lexical cross-encoder seam. v1 keeps model execution behind a `CrossEncoder`; the hot-path default is a single SequenceClassification forward pass.
 
-## What it is
+## Key API
 
-Reranker-backed [`Scorer`](rustyred_membrane::Scorer) implementations.
+- `RerankScorer` (impl `rustyred_membrane::Scorer`), `ArmWeights` (`web()`/`code()`/`balanced()` presets), `ListwiseRankScorer`, `stamp_listwise_rank`.
+- `cross_encoder`: `CrossEncoder` trait, `LexicalCrossEncoder`, `HttpCrossEncoder`, `SequenceClassificationModel`, `select_small_cpu_sequence_classifier`; listwise `ListwiseReranker`/`HttpListwiseReranker`/`NoopListwiseReranker`; benchmarking (`BenchmarkLedger`, `ModelBenchmark`); model-id consts `BGE_RERANKER_V2_M3`, `GTE_RERANKER_MODERNBERT_BASE`, `JINA_RERANKER_V3`.
 
-v1 keeps model execution behind [`CrossEncoder`]. The hot-path default is a
-SequenceClassification-style single forward pass. Causal-LM rerankers can be
-benchmarked elsewhere, but they do not sit on the default gate path.
+Modules: `lib.rs`, `cross_encoder.rs`. Path dep: `rustyred-membrane`. The HTTP cross-encoder/listwise reranker uses blocking reqwest.
 
 ## Build and test
 
@@ -16,4 +15,6 @@ benchmarked elsewhere, but they do not sit on the default gate path.
 cd rustyredcore_THG && cargo test -p rustyred-rerank
 ```
 
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+`tests/ordering_quality.rs` plus inline tests. No `#[ignore]`.
+
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

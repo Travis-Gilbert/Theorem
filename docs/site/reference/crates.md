@@ -22,6 +22,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `rustyred-thg-connectors` | Live MCP connector transport: connect to an external MCP server, list its tools, and register them as learnable Affordance graph nodes via rustyred-thg-affordances. |
 | `rustyred-thg-core` | Theorem HotGraph core command executor and state machine, including graph/vector indexes whose vector designation rebuilds when dimensions change, plus RedCore AOF/snapshot durability with logical `NodeDelete` replay for durable node removal. |
 | `rustyred-thg-fractal` | Native Rust fractal expansion pipeline over RustyRed and RustyWeb. |
+| `rustyred-thg-fuse` | Read-only filesystem/path index over zero-copy RustyRed THG graph archives, with optional fuser mount glue. |
 | `rustyred-thg-geotemporal` | Tenant-scoped geotemporal composition over THG H3 spatial indexes. |
 | `rustyred-thg-intake` | CommonPlace source intake: the ingestion-spoke framework (SourceSpoke), the scoped incremental sync driver, curated + MappedSpoke sources, and the NeedsYou-residue -> delegation act seam. |
 | `rustyred-thg-mcp` | Model Context Protocol adapter for the Theorem HotGraph graph database. |

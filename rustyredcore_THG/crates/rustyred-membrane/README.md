@@ -1,20 +1,21 @@
 # rustyred-membrane
 
-Shared context admission and eviction membrane for RustyRed graph-backed context.
+The shared context admission and eviction membrane. The context window is treated as a cache over graph-resident nodes: callers generate candidates, a `Scorer` ranks them, and one gate admits a budgeted subset while converting overflow into recoverable handles.
 
-## What it is
+## Key API
 
-Shared context admission and eviction membrane.
+- Always available: `fill_to_budget(...) -> Admission`, `Admission`, `Handle` (`gate.rs`); `Candidate`, `Scorer`, `ScoreContext`, `EpistemicFeatures`, `SourceArm`, `DEFAULT_MMR_LAMBDA`, `DEFAULT_REDUNDANCY_PENALTY` (`scorer.rs`); `MembraneReceipt`, `Source` (`receipt.rs`); compaction-side eviction `page_back[_with_scorer]`, `CompactionFitnessScorer`, `CompactionWeights` (`compaction.rs`).
+- Behind the `graph-store` feature (`recover.rs`): `admit_to_budget`, `context_fetch`, `emit_receipt`, `persist_deferred`, `DEFERRED_CONTEXT_LABEL`. The default build is pure cache mechanics with no graph dependency; the feature gates the lossless overflow recovery against `rustyred-thg-core`.
 
-The context window is treated as a cache over graph-resident nodes. Callers
-generate candidates, a [`Scorer`] ranks them for the current arm, and the
-shared gate admits a budgeted subset while converting overflow into
-recoverable graph handles.
+Admission and eviction share one gate; consumers include HippoRAG, RustyWeb, and fractal expansion.
 
 ## Build and test
 
 ```bash
 cd rustyredcore_THG && cargo test -p rustyred-membrane
+cargo test -p rustyred-membrane --features graph-store
 ```
 
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+Tests are inline (`gate`, `recover`, `compaction`). No `#[ignore]`.
+
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

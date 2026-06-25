@@ -23,6 +23,7 @@
 //! catalog stays the home for the tenant/key/billing rows that F3 will read.
 
 pub mod blob;
+pub mod block_view;
 pub mod collection;
 pub mod ingest;
 pub mod item;
@@ -32,6 +33,16 @@ pub mod store;
 pub mod tag;
 
 pub use blob::{content_hash, BlobStore, InMemoryBlobStore};
+pub use block_view::{
+    ActionKind, AgentTier, BlockHost, CardinalityRequirement, CommonplaceBlockHost, Constraint,
+    EdgeDirection, EdgeWalk, H3Window, JobSpec, LiveBinding, ObjectAction, ObjectActionReceipt,
+    ObjectActionStatus, ObjectActionTarget, ObjectAxes, ObjectCardinality, ObjectFusionPolicy,
+    ObjectPointer, ObjectQuery, ObjectQuerySlice, ObjectRef, ObjectSet, ObjectShape,
+    ObjectShapeMatch, PageRequest, Predicate, ProjectedRelation, Projection, PropType, PropertyDef,
+    RankDirection, Ranker, RelationDef, ShapeRelation, ShapeRelationMatch, ThemeTokens, TimeRange,
+    TypeAxes, TypeDef, TypeRef, ViewDescriptor, ViewRegistry, BLOCK_VIEW_CONTRACT_VERSION,
+    DEFAULT_RECORD_POLL_INTERVAL_MS,
+};
 pub use collection::{Collection, CollectionKind};
 pub use ingest::{
     classify_item_ranking, Classification, ClassificationRank, DeterministicEmbedder, Embedder,

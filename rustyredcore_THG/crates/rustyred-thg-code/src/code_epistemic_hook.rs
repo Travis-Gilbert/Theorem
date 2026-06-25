@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use rustyred_thg_core::{
     structural_epistemic_pass, EpistemicCandidatePair, EpistemicReadout, EpistemicRelationInput,
-    EpistemicRelationKind, HookContext, HookError, HookHandler, HookOutcome, HookRegistration,
-    MutationEvent, MutationKind, MutationMatcher, NodeQuery, NodeRecord, RedCoreGraphStore,
-    StructuralEpistemicConfig, StructuralEpistemicInput,
+    EpistemicRelationKind, EpistemicSourceKind, HookContext, HookError, HookHandler, HookOutcome,
+    HookRegistration, MutationEvent, MutationKind, MutationMatcher, NodeQuery, NodeRecord,
+    RedCoreGraphStore, StructuralEpistemicConfig, StructuralEpistemicInput,
 };
 use serde_json::{json, Value};
 
@@ -228,10 +228,12 @@ fn warm_missing_embeddings(
         if text.trim().is_empty() {
             continue;
         }
-        let vector = embedder.embed_code(&text).map_err(|error| crate::CodeIndexError {
-            code: "code_embedding_error".to_string(),
-            message: error.to_string(),
-        })?;
+        let vector = embedder
+            .embed_code(&text)
+            .map_err(|error| crate::CodeIndexError {
+                code: "code_embedding_error".to_string(),
+                message: error.to_string(),
+            })?;
         let up_to_date = extract_float_vec(&node.properties, EMBEDDING_PROPERTY)
             .map(|existing| vectors_close(&existing, &vector))
             .unwrap_or(false);
@@ -348,6 +350,12 @@ fn drift_findings(symbols: &[NodeRecord]) -> (Vec<CodeDriftFinding>, Vec<Epistem
                 kind: EpistemicRelationKind::Undercuts,
                 confidence: 0.7,
                 evidence: finding.evidence.clone(),
+                source_kind: EpistemicSourceKind::Structural,
+                score: None,
+                model_id: None,
+                calibration_version: None,
+                feature_version: None,
+                connection_features: None,
             });
             drift.push(finding);
         }

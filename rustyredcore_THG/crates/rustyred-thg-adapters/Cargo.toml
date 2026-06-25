@@ -16,5 +16,6 @@ rustyred-thg-core = { path = "../rustyred-thg-core" }
 rustyred-thg-ml = { path = "../rustyred-thg-ml" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "wgpu", "fusion", "cubecl", "autodiff"], optional = true }
 cubecl = { version = "0.10.0", default-features = false, features = ["std", "stdlib", "wgpu"], optional = true }

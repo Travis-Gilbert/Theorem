@@ -12,6 +12,7 @@
 //! crate they verify.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use rustyred_thg_core::epistemic::{
     epistemic_egraph_dedup, epistemic_shadow_node_id, epistemic_shadow_ppr, read_epistemic_shadow,
@@ -20,10 +21,12 @@ use rustyred_thg_core::epistemic::{
     EpistemicDedupConfig, EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode,
     EpistemicSourceKind, GroundedExtensionStatus, PredictedEdgePointer, SourceReliability,
     StructuralEpistemicConfig, StructuralEpistemicInput, DEFAULT_EPISTEMIC_ENGINE_VERSION,
-    EPISTEMIC_SHADOW_LABEL, SAME_ECLASS,
+    EPISTEMIC_DETERMINISTIC_FALLBACK_ENV, EPISTEMIC_SHADOW_LABEL, SAME_ECLASS,
 };
 use rustyred_thg_core::{EdgeRecord, GraphStore, InMemoryGraphStore, NodeQuery, NodeRecord};
 use serde_json::json;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // --------------------------------------------------------------------------- //
 // Test fixtures
@@ -116,7 +119,11 @@ fn instant_tier1_populates_with_no_model() {
 #[test]
 fn instant_planted_contradiction_undercuts_and_grounded_marks_loser_out() {
     // INSTANT #3 / EPISTEMICRAG (grounded extension): a contradiction becomes an
-    // UNDERCUTS edge and the grounded extension marks the loser OUT.
+    // UNDERCUTS edge and the grounded extension marks the loser OUT. Lexical
+    // pair inference is an explicit deterministic fallback, not the product
+    // default.
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var(EPISTEMIC_DETERMINISTIC_FALLBACK_ENV, "1");
     let mut store = InMemoryGraphStore::new();
     store
         .upsert_node(claim("A", "the cache is safe under concurrency"))
@@ -126,6 +133,7 @@ fn instant_planted_contradiction_undercuts_and_grounded_marks_loser_out() {
         .unwrap();
 
     run_structural(&mut store, &["A", "B"], vec![("A", "B")]);
+    std::env::remove_var(EPISTEMIC_DETERMINISTIC_FALLBACK_ENV);
 
     let sa = read_epistemic_shadow(&store, "A").expect("shadow A");
     let sb = read_epistemic_shadow(&store, "B").expect("shadow B");

@@ -1,15 +1,19 @@
 # scene-os-core
 
-Rust SceneOS atom, catalog, selection, and package compiler contracts for Theorem.
+The Rust-native SceneOS director: serde-only scene contracts, trusted projection and chrome catalogs, goal/shape classifiers, and `compile_scene_package` that turns a scene into a `ScenePackageV2` without crossing a Python API boundary. Atoms and relations use the same JSON contract as Index-API/Theseus-UI. serde-only leaf (no substrate dep).
 
-## What it is
+## Key API
 
-SceneOS core contracts for Theorem.
+- Atoms (`atoms.rs`): `SceneAtom`, `SceneRelation`, `SceneScene`, `AtomPosition`, `CoordinateSpace` (Graph/Geo/Timeline/Rank/Matrix/Diagram/Frame/Gallery/Freeform), `AtomLifecycle`.
+- Package (`package.rs`): `ScenePackageV2`, `ProjectionBinding`, `ChromeBinding`, `ActionDescriptor`, `TransitionDescriptor`, `TerminalStateArtifact`, `SCENE_PACKAGE_V2_VERSION`.
+- Capabilities (`capabilities.rs`): `ProjectionCapability`, `ChromeCapability`, `ProjectionRequirements`, `ProjectionBudgets`.
+- Catalogs (`catalogs.rs`): `production_projection_catalog()`, `mobile_projection_catalog()`, `production_chrome_catalog()`.
+- Compile (`compile.rs`): `compile_scene_package(SceneCompileInput) -> Result<ScenePackageV2, SceneCompileError>`. `SceneCompileInput` carries the query and an optional `answer_type` hint that can force a projection.
+- Select (`select.rs`): `classify_goal`, `detect_shape`, `select_projection`, `select_chrome`. `Goal` (Compare/Locate/ExplainProcess/InspectEvidence/Rank/FindPattern/TellStory/Summarize/Navigate/Simulate), `DataShape`.
+- Mobile (`mobile.rs`): `available_projections`, `center_node_id`, `reproject`, `CentralityMode` (PprMass/Degree).
+- Patent (`patent.rs`): `lift_patent_scene_payload`.
 
-This crate is the Rust-native director seam for the browser: atoms and
-relations use the same JSON contract as Index-API/Theseus-UI, catalogs
-describe trusted projections/chromes, and the compiler selects a package
-without crossing a Python API boundary.
+Path dep: none beyond serde. Consumed in-process by `apps/theorem-gateway` and `apps/theorem-ios`.
 
 ## Build and test
 
@@ -17,4 +21,6 @@ without crossing a Python API boundary.
 cd rustyredcore_THG && cargo test -p scene-os-core
 ```
 
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+Tests are inline. No `#[ignore]`.
+
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

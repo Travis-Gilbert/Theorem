@@ -93,7 +93,10 @@ fn ac2_residency_is_in_process_no_db_no_network() {
     // "Rehydration": resolve it back. The only collaborators are the path-keyed
     // tree and the on-disk object store -- no sqlx, no network.
     let rehydrated = tree.resolve_body(&path, &store).unwrap().unwrap();
-    assert_eq!(rehydrated, body, "cold body must rehydrate to identical bytes");
+    assert_eq!(
+        rehydrated, body,
+        "cold body must rehydrate to identical bytes"
+    );
 
     // A miss is a keyed lookup returning None, not a scan/error.
     let absent = PathKey::from_slash_path("tenant/memory/missing").unwrap();
@@ -116,16 +119,33 @@ fn ac3_inline_and_overflow_round_trip_identical() {
     let large_path = PathKey::from_slash_path("t/p/doc/large").unwrap();
 
     let small_entry = tree
-        .put_body(small_path.clone(), small, ColdTierKind::Cold, 1, None, &store)
+        .put_body(
+            small_path.clone(),
+            small,
+            ColdTierKind::Cold,
+            1,
+            None,
+            &store,
+        )
         .unwrap();
     let large_entry = tree
-        .put_body(large_path.clone(), large, ColdTierKind::Cold, 1, None, &store)
+        .put_body(
+            large_path.clone(),
+            large,
+            ColdTierKind::Cold,
+            1,
+            None,
+            &store,
+        )
         .unwrap();
 
     // Inline: body lives in the leaf, no object-store file written for it.
     assert!(small_entry.is_inline(), "sub-threshold body must be inline");
     // Overflow: leaf holds the pointer (content_hash), body in the object store.
-    assert!(!large_entry.is_inline(), "over-threshold body must overflow");
+    assert!(
+        !large_entry.is_inline(),
+        "over-threshold body must overflow"
+    );
     let large_hash = large_entry.content_hash.clone().expect("overflow hash");
     assert!(
         store.document_path(&large_hash).exists(),
@@ -133,8 +153,14 @@ fn ac3_inline_and_overflow_round_trip_identical() {
     );
 
     // Both round-trip to identical bytes.
-    assert_eq!(tree.resolve_body(&small_path, &store).unwrap().unwrap(), small);
-    assert_eq!(tree.resolve_body(&large_path, &store).unwrap().unwrap(), large);
+    assert_eq!(
+        tree.resolve_body(&small_path, &store).unwrap().unwrap(),
+        small
+    );
+    assert_eq!(
+        tree.resolve_body(&large_path, &store).unwrap().unwrap(),
+        large
+    );
 }
 
 /// AC #4: Cold bodies are ZStandard-compressed at rest and round-trip to
@@ -180,7 +206,11 @@ fn ac4_compressed_at_rest_hash_over_uncompressed() {
     // Compressed at rest: the on-disk file is a zstd frame, not the raw body.
     let on_disk = std::fs::read(store.document_path(&hash)).expect("read cold file");
     assert_eq!(&on_disk[..4], &ZSTD_MAGIC, "cold body must be a zstd frame");
-    assert_ne!(on_disk.as_slice(), b"abc", "stored bytes differ from the raw body");
+    assert_ne!(
+        on_disk.as_slice(),
+        b"abc",
+        "stored bytes differ from the raw body"
+    );
 
     // Round-trips to identical bytes.
     assert_eq!(store.get_document_bytes(&hash).unwrap().unwrap(), b"abc");
@@ -220,7 +250,14 @@ fn ac5_update_retains_prior_and_snapshot_resolves_it() {
     let path = PathKey::from_slash_path("tenant/project/doc/evolving").unwrap();
 
     let before = tree
-        .put_body(path.clone(), b"the original body", ColdTierKind::Cold, 1, None, &store)
+        .put_body(
+            path.clone(),
+            b"the original body",
+            ColdTierKind::Cold,
+            1,
+            None,
+            &store,
+        )
         .unwrap();
     let before_hash = before.content_hash.clone().unwrap();
 
@@ -228,11 +265,21 @@ fn ac5_update_retains_prior_and_snapshot_resolves_it() {
     let snapshot = tree.snapshot();
 
     let after = tree
-        .put_body(path.clone(), b"the revised body", ColdTierKind::Cold, 2, None, &store)
+        .put_body(
+            path.clone(),
+            b"the revised body",
+            ColdTierKind::Cold,
+            2,
+            None,
+            &store,
+        )
         .unwrap();
 
     // Live tree resolves the new body; the snapshot still resolves the old one.
-    assert_eq!(tree.resolve_body(&path, &store).unwrap().unwrap(), b"the revised body");
+    assert_eq!(
+        tree.resolve_body(&path, &store).unwrap().unwrap(),
+        b"the revised body"
+    );
     assert_eq!(
         snapshot.resolve_body(&path, &store).unwrap().unwrap(),
         b"the original body",
@@ -267,7 +314,10 @@ fn ac6_memory_node_dock_resolves_body() {
     // The node now carries the dock path; resolution is one tree lookup + one
     // body fetch via the path property.
     assert!(node.properties.get(DOC_TREE_PATH_PROPERTY).is_some());
-    let resolved = tree.resolve_memory_node_body(&node, &store).unwrap().unwrap();
+    let resolved = tree
+        .resolve_memory_node_body(&node, &store)
+        .unwrap()
+        .unwrap();
     assert_eq!(resolved, body);
 }
 
@@ -296,7 +346,10 @@ fn ac7_promotion_keeps_node_findable() {
         .unwrap();
 
     // The body left the hot node...
-    assert!(node.properties.get("body").is_none(), "heavy body must leave the hot node");
+    assert!(
+        node.properties.get("body").is_none(),
+        "heavy body must leave the hot node"
+    );
 
     // ...and the promoted dock node is still FOUND by a real index after promotion:
     // insert it into a graph store and retrieve it through the label query (not
@@ -312,18 +365,25 @@ fn ac7_promotion_keeps_node_findable() {
     // The dock retrieved from the store still carries the searchable surface
     // (gist/topic/project) and the cold content-hash dock; only the body is gone.
     assert!(dock.labels.contains(&"Episode".to_string()));
-    assert_eq!(dock.properties.get("gist"), Some(&json!("the searchable summary")));
+    assert_eq!(
+        dock.properties.get("gist"),
+        Some(&json!("the searchable summary"))
+    );
     assert_eq!(dock.properties.get("topic"), Some(&json!("planning")));
     assert_eq!(dock.properties.get("project"), Some(&json!("theorem")));
     assert!(dock.properties.get("body").is_none());
     assert!(
-        dock.properties.get(DOC_TREE_CONTENT_HASH_PROPERTY).is_some(),
+        dock.properties
+            .get(DOC_TREE_CONTENT_HASH_PROPERTY)
+            .is_some(),
         "promoted node must keep the cold content-hash dock"
     );
 
     // And the promoted body is recoverable from the cold tier via the dock.
     assert_eq!(
-        tree.resolve_memory_node_body(dock, &store).unwrap().unwrap(),
+        tree.resolve_memory_node_body(dock, &store)
+            .unwrap()
+            .unwrap(),
         body
     );
 }

@@ -19,6 +19,16 @@ pub const SAME_ECLASS: &str = "SameEClass";
 pub const DEFAULT_EPISTEMIC_ENGINE_VERSION: &str = "epistemic-v1";
 pub const STRUCTURAL_EPISTEMIC_ENGINE: &str = "rustyred-thg-core.structural_epistemic";
 pub const LEARNED_EPISTEMIC_ENGINE: &str = "theseus.epistemic_enrichment";
+pub const NLI_EPISTEMIC_ENGINE: &str = "theseus.nli_epistemic_enrichment";
+pub const DEFAULT_NLI_MODEL_ID: &str = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli";
+pub const DEFAULT_CONNECTION_SCORER_MODEL_ID: &str = "theseus.learned_connection_scorer";
+pub const DEFAULT_CONNECTION_FEATURE_VERSION: &str = "connection-features-v1";
+pub const DEFAULT_CONNECTION_CALIBRATION_VERSION: &str = "connection-calibration-v1";
+pub const EPISTEMIC_DETERMINISTIC_FALLBACK_ENV: &str =
+    "THEOREM_EPISTEMIC_ALLOW_DETERMINISTIC_FALLBACK";
+pub const EPISTEMIC_SCORER_ENDPOINT_ENV: &str = "THEOREM_EPISTEMIC_SCORER_ENDPOINT";
+pub const EPISTEMIC_SCORER_MODEL_ENV: &str = "THEOREM_EPISTEMIC_SCORER_MODEL";
+pub const EPISTEMIC_SCORER_CALIBRATION_ENV: &str = "THEOREM_EPISTEMIC_SCORER_CALIBRATION";
 /// Engine tag for the e-graph dedup pass (Strand A phase 3 / cut 9). The
 /// equivalence relation is a symbolic, model-free computation over the shadow
 /// claim forms, so it carries the `structural` source kind on the edges it
@@ -40,6 +50,12 @@ impl EpistemicSourceKind {
             Self::Learned => "learned",
             Self::Mixed => "mixed",
         }
+    }
+}
+
+impl Default for EpistemicSourceKind {
+    fn default() -> Self {
+        Self::Structural
     }
 }
 
@@ -179,6 +195,202 @@ impl EpistemicRelationKind {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ConnectionFeatures {
+    pub from_content_id: String,
+    pub to_content_id: String,
+    #[serde(default)]
+    pub premise: String,
+    #[serde(default)]
+    pub hypothesis: String,
+    #[serde(default)]
+    pub candidate_evidence: Vec<String>,
+    #[serde(default)]
+    pub provenance: Vec<String>,
+    #[serde(default)]
+    pub nli_entailment_score: f64,
+    #[serde(default)]
+    pub nli_neutral_score: f64,
+    #[serde(default)]
+    pub nli_contradiction_score: f64,
+    #[serde(default)]
+    pub support_in_degree: u64,
+    #[serde(default)]
+    pub attack_in_degree: u64,
+    #[serde(default)]
+    pub bridge_score: f64,
+    #[serde(default)]
+    pub source_reliability_mean: Option<f64>,
+    #[serde(default)]
+    pub graph_edge_count: usize,
+    #[serde(default = "default_connection_feature_version_string")]
+    pub feature_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ConnectionScore {
+    #[serde(default)]
+    pub kind: Option<EpistemicRelationKind>,
+    pub score: f64,
+    pub confidence: f64,
+    pub model_id: String,
+    pub calibration_version: String,
+    pub feature_version: String,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+pub trait ConnectionScorer {
+    fn score(
+        &self,
+        features: &ConnectionFeatures,
+    ) -> Result<ConnectionScore, EpistemicEnrichmentError>;
+
+    fn score_batch(
+        &self,
+        features: &[ConnectionFeatures],
+    ) -> Result<Vec<ConnectionScore>, EpistemicEnrichmentError> {
+        features.iter().map(|feature| self.score(feature)).collect()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LearnedConnectionScorerConfig {
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_connection_scorer_model_id")]
+    pub model_id: String,
+    #[serde(default = "default_connection_calibration_version_string")]
+    pub calibration_version: String,
+    #[serde(default = "default_connection_feature_version_string")]
+    pub feature_version: String,
+}
+
+impl Default for LearnedConnectionScorerConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: std::env::var(EPISTEMIC_SCORER_ENDPOINT_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            model_id: std::env::var(EPISTEMIC_SCORER_MODEL_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(default_connection_scorer_model_id),
+            calibration_version: std::env::var(EPISTEMIC_SCORER_CALIBRATION_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(default_connection_calibration_version_string),
+            feature_version: default_connection_feature_version_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LearnedConnectionScorer {
+    pub config: LearnedConnectionScorerConfig,
+}
+
+impl LearnedConnectionScorer {
+    pub fn new(config: LearnedConnectionScorerConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl ConnectionScorer for LearnedConnectionScorer {
+    fn score(
+        &self,
+        _features: &ConnectionFeatures,
+    ) -> Result<ConnectionScore, EpistemicEnrichmentError> {
+        let Some(endpoint) = self.config.endpoint.as_deref() else {
+            return Err(EpistemicEnrichmentError::new(
+                "learned_scorer_unavailable",
+                format!(
+                    "learned connection scorer is the default; configure {EPISTEMIC_SCORER_ENDPOINT_ENV} or inject a scorer"
+                ),
+            ));
+        };
+        Err(EpistemicEnrichmentError::new(
+            "learned_scorer_transport_unbound",
+            format!(
+                "learned scorer endpoint {endpoint} is configured, but this core crate only defines the RunPod scoring contract"
+            ),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LearnedConnectionScorerPair {
+    pub left_content_id: String,
+    pub right_content_id: String,
+    pub premise: String,
+    pub hypothesis: String,
+    pub features: ConnectionFeatures,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LearnedConnectionScorerRequest {
+    pub model_id: String,
+    pub calibration_version: String,
+    pub feature_version: String,
+    pub pairs: Vec<LearnedConnectionScorerPair>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LearnedConnectionScorerResponse {
+    pub scores: Vec<ConnectionScore>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NliPairInput {
+    pub left_content_id: String,
+    pub right_content_id: String,
+    pub premise: String,
+    pub hypothesis: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NliVerdict {
+    pub entailment: f64,
+    pub neutral: f64,
+    pub contradiction: f64,
+    pub model_id: String,
+}
+
+pub trait NliClassifier {
+    fn classify_batch(
+        &self,
+        pairs: &[NliPairInput],
+    ) -> Result<Vec<NliVerdict>, EpistemicEnrichmentError>;
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NliPairSelectionConfig {
+    pub max_pairs: usize,
+}
+
+impl Default for NliPairSelectionConfig {
+    fn default() -> Self {
+        Self { max_pairs: 64 }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NliEpistemicEnricher<C, S> {
+    classifier: C,
+    scorer: S,
+    pair_selection: NliPairSelectionConfig,
+}
+
+impl<C, S> NliEpistemicEnricher<C, S> {
+    pub fn new(classifier: C, scorer: S, pair_selection: NliPairSelectionConfig) -> Self {
+        Self {
+            classifier,
+            scorer,
+            pair_selection,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EpistemicRelationInput {
     pub from_content_id: String,
@@ -188,6 +400,18 @@ pub struct EpistemicRelationInput {
     pub confidence: f64,
     #[serde(default)]
     pub evidence: String,
+    #[serde(default)]
+    pub source_kind: EpistemicSourceKind,
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub calibration_version: Option<String>,
+    #[serde(default)]
+    pub feature_version: Option<String>,
+    #[serde(default)]
+    pub connection_features: Option<ConnectionFeatures>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -356,6 +580,85 @@ pub trait EpistemicEnricher {
     ) -> Result<EpistemicAnnotations, EpistemicEnrichmentError>;
 }
 
+impl<C, S> EpistemicEnricher for NliEpistemicEnricher<C, S>
+where
+    C: NliClassifier,
+    S: ConnectionScorer,
+{
+    fn enrich(
+        &self,
+        subgraph: UserSubgraph,
+        _mode: EpistemicEnrichmentMode,
+    ) -> Result<EpistemicAnnotations, EpistemicEnrichmentError> {
+        let pairs = select_nli_pairs(&subgraph, &self.pair_selection);
+        if pairs.is_empty() {
+            return Ok(EpistemicAnnotations::default());
+        }
+        let verdicts = self.classifier.classify_batch(&pairs)?;
+        if verdicts.len() != pairs.len() {
+            return Err(EpistemicEnrichmentError::new(
+                "nli_result_count_mismatch",
+                format!(
+                    "classifier returned {} verdicts for {} pairs",
+                    verdicts.len(),
+                    pairs.len()
+                ),
+            ));
+        }
+
+        let graph_signals = graph_signal_index(&subgraph);
+        let features = pairs
+            .iter()
+            .zip(verdicts.iter())
+            .map(|(pair, verdict)| connection_features_for_pair(pair, verdict, &graph_signals))
+            .collect::<Vec<_>>();
+        let scores = self.scorer.score_batch(&features)?;
+        if scores.len() != features.len() {
+            return Err(EpistemicEnrichmentError::new(
+                "connection_score_count_mismatch",
+                format!(
+                    "scorer returned {} scores for {} feature rows",
+                    scores.len(),
+                    features.len()
+                ),
+            ));
+        }
+        let mut support_relations = Vec::new();
+        let mut attack_relations = Vec::new();
+        for ((pair, features), score) in pairs.into_iter().zip(features.into_iter()).zip(scores) {
+            let Some(kind) = score.kind.clone() else {
+                continue;
+            };
+            let relation = EpistemicRelationInput {
+                from_content_id: pair.left_content_id.clone(),
+                to_content_id: pair.right_content_id.clone(),
+                kind: kind.clone(),
+                confidence: normalized_confidence(score.confidence),
+                evidence: if score.evidence.trim().is_empty() {
+                    format!("learned_connection_score: {}", score.model_id)
+                } else {
+                    score.evidence.clone()
+                },
+                source_kind: EpistemicSourceKind::Learned,
+                score: Some(score.score.clamp(0.0, 1.0)),
+                model_id: Some(score.model_id),
+                calibration_version: Some(score.calibration_version),
+                feature_version: Some(score.feature_version),
+                connection_features: Some(features),
+            };
+            match kind {
+                EpistemicRelationKind::Supports => support_relations.push(relation),
+                EpistemicRelationKind::Undercuts => attack_relations.push(relation),
+            }
+        }
+        Ok(EpistemicAnnotations {
+            support_relations,
+            attack_relations,
+            ..EpistemicAnnotations::default()
+        })
+    }
+}
+
 pub fn epistemic_shadow_node_id(content_node_id: &str, engine_version: &str) -> String {
     format!(
         "epistemic:shadow:{}",
@@ -427,8 +730,10 @@ pub fn structural_epistemic_pass<S: GraphStore>(
     let mut relations = existing_epistemic_relations(&existing_edges, &config);
     let checked_pair_count = input.candidate_pairs.len();
     for pair in input.candidate_pairs {
-        if let Some(relation) = infer_pair_relation(store, &pair) {
-            relations.push(relation);
+        if deterministic_pair_fallback_enabled() {
+            if let Some(relation) = infer_pair_relation(store, &pair) {
+                relations.push(relation);
+            }
         }
     }
     relations.extend(input.explicit_relations);
@@ -944,6 +1249,41 @@ fn write_shadow_relation<S: GraphStore>(
     to_shadow_id: &str,
     config: &StructuralEpistemicConfig,
 ) -> GraphStoreResult<()> {
+    let mut properties = json!({
+        "from_content_id": relation.from_content_id,
+        "to_content_id": relation.to_content_id,
+        "confidence": normalized_confidence(relation.confidence),
+        "evidence": relation.evidence,
+        "source_kind": relation.source_kind.as_str(),
+        "engine": config.engine,
+        "engine_version": config.engine_version,
+        "computed_at": config.computed_at,
+        "quarantine": true,
+    });
+    {
+        let object = ensure_object(&mut properties);
+        if let Some(score) = relation.score {
+            object.insert("score".to_string(), json!(score.clamp(0.0, 1.0)));
+        }
+        if let Some(model_id) = &relation.model_id {
+            object.insert("model_id".to_string(), json!(model_id));
+        }
+        if let Some(calibration_version) = &relation.calibration_version {
+            object.insert(
+                "calibration_version".to_string(),
+                json!(calibration_version),
+            );
+        }
+        if let Some(feature_version) = &relation.feature_version {
+            object.insert("feature_version".to_string(), json!(feature_version));
+        }
+        if let Some(features) = &relation.connection_features {
+            object.insert(
+                "connection_features".to_string(),
+                serde_json::to_value(features).unwrap_or_else(|_| json!({})),
+            );
+        }
+    }
     let edge = EdgeRecord::new(
         epistemic_shadow_edge_id(
             relation.kind.clone(),
@@ -954,17 +1294,7 @@ fn write_shadow_relation<S: GraphStore>(
         from_shadow_id,
         relation.kind.edge_type(),
         to_shadow_id,
-        json!({
-            "from_content_id": relation.from_content_id,
-            "to_content_id": relation.to_content_id,
-            "confidence": normalized_confidence(relation.confidence),
-            "evidence": relation.evidence,
-            "source_kind": "structural",
-            "engine": config.engine,
-            "engine_version": config.engine_version,
-            "computed_at": config.computed_at,
-            "quarantine": true,
-        }),
+        properties,
     )
     .with_confidence(normalized_confidence(relation.confidence))
     .with_epistemic_type(relation.kind.epistemic_type())
@@ -1027,6 +1357,12 @@ fn existing_epistemic_relations(
                 kind,
                 confidence: edge.confidence.unwrap_or(1.0),
                 evidence: prop_str(&edge.properties, "evidence").unwrap_or_default(),
+                source_kind: EpistemicSourceKind::Structural,
+                score: None,
+                model_id: None,
+                calibration_version: None,
+                feature_version: None,
+                connection_features: None,
             });
         }
     }
@@ -1058,6 +1394,12 @@ fn infer_pair_relation<S: GraphStore>(
             kind: EpistemicRelationKind::Undercuts,
             confidence: 0.75,
             evidence: format!("bounded_pair_contradiction: {left_text} :: {right_text}"),
+            source_kind: EpistemicSourceKind::Structural,
+            score: None,
+            model_id: None,
+            calibration_version: None,
+            feature_version: None,
+            connection_features: None,
         });
     }
     if left_norm == right_norm {
@@ -1067,6 +1409,12 @@ fn infer_pair_relation<S: GraphStore>(
             kind: EpistemicRelationKind::Supports,
             confidence: 0.6,
             evidence: "bounded_pair_equivalent_claim".to_string(),
+            source_kind: EpistemicSourceKind::Structural,
+            score: None,
+            model_id: None,
+            calibration_version: None,
+            feature_version: None,
+            connection_features: None,
         });
     }
     None
@@ -1272,6 +1620,97 @@ pub fn compile_user_subgraph<S: GraphStore>(store: &S, node_ids: &[String]) -> U
     UserSubgraph { nodes, edges }
 }
 
+pub fn select_nli_pairs(
+    subgraph: &UserSubgraph,
+    config: &NliPairSelectionConfig,
+) -> Vec<NliPairInput> {
+    if config.max_pairs == 0 {
+        return Vec::new();
+    }
+    let mut nodes = subgraph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let text = claim_text(node);
+            (!text.trim().is_empty()).then(|| (node.id.clone(), text))
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut pairs = Vec::new();
+    for (left_id, premise) in &nodes {
+        for (right_id, hypothesis) in &nodes {
+            if left_id == right_id {
+                continue;
+            }
+            pairs.push(NliPairInput {
+                left_content_id: left_id.clone(),
+                right_content_id: right_id.clone(),
+                premise: premise.clone(),
+                hypothesis: hypothesis.clone(),
+            });
+            if pairs.len() >= config.max_pairs {
+                return pairs;
+            }
+        }
+    }
+    pairs
+}
+
+#[derive(Default)]
+struct GraphSignalIndex {
+    support_in: HashMap<String, u64>,
+    attack_in: HashMap<String, u64>,
+    edge_count: usize,
+}
+
+fn graph_signal_index(subgraph: &UserSubgraph) -> GraphSignalIndex {
+    let mut index = GraphSignalIndex {
+        edge_count: subgraph.edges.len(),
+        ..GraphSignalIndex::default()
+    };
+    for edge in &subgraph.edges {
+        let edge_type = edge.edge_type.to_ascii_lowercase();
+        if matches!(edge_type.as_str(), "supports" | "cites" | "derived_from") {
+            *index.support_in.entry(edge.to_id.clone()).or_insert(0) += 1;
+        } else if matches!(edge_type.as_str(), "undercuts" | "contradicts" | "attacks") {
+            *index.attack_in.entry(edge.to_id.clone()).or_insert(0) += 1;
+        }
+    }
+    index
+}
+
+fn connection_features_for_pair(
+    pair: &NliPairInput,
+    verdict: &NliVerdict,
+    graph_signals: &GraphSignalIndex,
+) -> ConnectionFeatures {
+    ConnectionFeatures {
+        from_content_id: pair.left_content_id.clone(),
+        to_content_id: pair.right_content_id.clone(),
+        premise: pair.premise.clone(),
+        hypothesis: pair.hypothesis.clone(),
+        candidate_evidence: Vec::new(),
+        provenance: vec![format!("nli_model:{}", verdict.model_id)],
+        nli_entailment_score: verdict.entailment.clamp(0.0, 1.0),
+        nli_neutral_score: verdict.neutral.clamp(0.0, 1.0),
+        nli_contradiction_score: verdict.contradiction.clamp(0.0, 1.0),
+        support_in_degree: graph_signals
+            .support_in
+            .get(&pair.right_content_id)
+            .copied()
+            .unwrap_or(0),
+        attack_in_degree: graph_signals
+            .attack_in
+            .get(&pair.right_content_id)
+            .copied()
+            .unwrap_or(0),
+        bridge_score: 0.0,
+        source_reliability_mean: None,
+        graph_edge_count: graph_signals.edge_count,
+        feature_version: default_connection_feature_version_string(),
+    }
+}
+
 fn edge_density(subgraph: &UserSubgraph) -> f64 {
     let n = subgraph.nodes.len();
     if n < 2 {
@@ -1350,6 +1789,25 @@ fn without_negation(normalized: &str) -> String {
         .filter(|token| !matches!(*token, "not" | "no" | "never" | "without"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn deterministic_pair_fallback_enabled() -> bool {
+    std::env::var(EPISTEMIC_DETERMINISTIC_FALLBACK_ENV)
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn default_connection_scorer_model_id() -> String {
+    DEFAULT_CONNECTION_SCORER_MODEL_ID.to_string()
+}
+
+fn default_connection_feature_version_string() -> String {
+    DEFAULT_CONNECTION_FEATURE_VERSION.to_string()
+}
+
+fn default_connection_calibration_version_string() -> String {
+    DEFAULT_CONNECTION_CALIBRATION_VERSION.to_string()
 }
 
 fn parse_grounded_status(raw: &str) -> GroundedExtensionStatus {
@@ -1836,6 +2294,9 @@ fn write_same_eclass_edge<S: GraphStore>(
 mod tests {
     use super::*;
     use crate::graph_store::InMemoryGraphStore;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn claim(id: &str, text: &str) -> NodeRecord {
         NodeRecord::new(
@@ -1846,7 +2307,9 @@ mod tests {
     }
 
     #[test]
-    fn structural_pass_writes_shadow_and_bounded_contradiction() {
+    fn structural_pass_does_not_use_deterministic_pair_fallback_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(EPISTEMIC_DETERMINISTIC_FALLBACK_ENV);
         let mut store = InMemoryGraphStore::new();
         store.upsert_node(claim("a", "cache is enabled")).unwrap();
         store
@@ -1872,6 +2335,44 @@ mod tests {
 
         assert_eq!(readout.checked_pair_count, 1);
         assert_eq!(readout.candidate_pair_bound, 2);
+        assert_eq!(readout.contradictions.len(), 0);
+        let shadow = read_epistemic_shadow(&store, "b").expect("shadow");
+        assert_eq!(shadow.attack_in_degree, 0);
+        assert_eq!(
+            shadow.grounded_extension_status,
+            GroundedExtensionStatus::In
+        );
+        assert!(shadow.field_provenance.contains_key("support_in_degree"));
+    }
+
+    #[test]
+    fn structural_pass_uses_deterministic_pair_fallback_only_when_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(EPISTEMIC_DETERMINISTIC_FALLBACK_ENV, "1");
+        let mut store = InMemoryGraphStore::new();
+        store.upsert_node(claim("a", "cache is enabled")).unwrap();
+        store
+            .upsert_node(claim("b", "cache is not enabled"))
+            .unwrap();
+
+        let readout = structural_epistemic_pass(
+            &mut store,
+            StructuralEpistemicInput {
+                batch_node_ids: vec!["a".to_string(), "b".to_string()],
+                candidate_pairs: vec![EpistemicCandidatePair {
+                    left_content_id: "a".to_string(),
+                    right_content_id: "b".to_string(),
+                }],
+                config: StructuralEpistemicConfig {
+                    candidate_top_k: 1,
+                    ..StructuralEpistemicConfig::default()
+                },
+                ..StructuralEpistemicInput::default()
+            },
+        )
+        .unwrap();
+        std::env::remove_var(EPISTEMIC_DETERMINISTIC_FALLBACK_ENV);
+
         assert_eq!(readout.contradictions.len(), 1);
         let shadow = read_epistemic_shadow(&store, "b").expect("shadow");
         assert_eq!(shadow.attack_in_degree, 1);
@@ -1879,7 +2380,6 @@ mod tests {
             shadow.grounded_extension_status,
             GroundedExtensionStatus::Out
         );
-        assert!(shadow.field_provenance.contains_key("support_in_degree"));
     }
 
     #[test]
@@ -1897,6 +2397,12 @@ mod tests {
                     kind: EpistemicRelationKind::Supports,
                     confidence: 1.0,
                     evidence: "test".to_string(),
+                    source_kind: EpistemicSourceKind::Structural,
+                    score: None,
+                    model_id: None,
+                    calibration_version: None,
+                    feature_version: None,
+                    connection_features: None,
                 }],
                 ..StructuralEpistemicInput::default()
             },
@@ -2019,6 +2525,168 @@ mod tests {
         assert_eq!(after.predicted_edges.len(), 1);
         assert!(after.predicted_edges[0].quarantine);
         assert_eq!(after.source_kind, EpistemicSourceKind::Mixed);
+    }
+
+    struct StubNliClassifier;
+
+    impl NliClassifier for StubNliClassifier {
+        fn classify_batch(
+            &self,
+            pairs: &[NliPairInput],
+        ) -> Result<Vec<NliVerdict>, EpistemicEnrichmentError> {
+            Ok(pairs
+                .iter()
+                .map(|pair| {
+                    if pair.left_content_id == "a" && pair.right_content_id == "b" {
+                        NliVerdict {
+                            entailment: 0.91,
+                            neutral: 0.04,
+                            contradiction: 0.05,
+                            model_id: DEFAULT_NLI_MODEL_ID.to_string(),
+                        }
+                    } else {
+                        NliVerdict {
+                            entailment: 0.03,
+                            neutral: 0.06,
+                            contradiction: 0.91,
+                            model_id: DEFAULT_NLI_MODEL_ID.to_string(),
+                        }
+                    }
+                })
+                .collect())
+        }
+    }
+
+    struct FixtureLearnedScorer;
+
+    impl ConnectionScorer for FixtureLearnedScorer {
+        fn score(
+            &self,
+            features: &ConnectionFeatures,
+        ) -> Result<ConnectionScore, EpistemicEnrichmentError> {
+            let kind = if features.from_content_id == "a" && features.to_content_id == "b" {
+                Some(EpistemicRelationKind::Supports)
+            } else {
+                Some(EpistemicRelationKind::Undercuts)
+            };
+            Ok(ConnectionScore {
+                kind,
+                score: 0.93,
+                confidence: 0.91,
+                model_id: "fixture-learned-connection-scorer".to_string(),
+                calibration_version: DEFAULT_CONNECTION_CALIBRATION_VERSION.to_string(),
+                feature_version: DEFAULT_CONNECTION_FEATURE_VERSION.to_string(),
+                evidence: "fixture learned scorer response".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn nli_cron_uses_learned_scorer_by_default_and_writes_metadata() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(claim("a", "cache layer is enabled"))
+            .unwrap();
+        store
+            .upsert_node(claim("b", "cache layer accelerates reads"))
+            .unwrap();
+        structural_epistemic_pass(
+            &mut store,
+            StructuralEpistemicInput {
+                batch_node_ids: vec!["a".to_string(), "b".to_string()],
+                ..StructuralEpistemicInput::default()
+            },
+        )
+        .unwrap();
+        let enricher = NliEpistemicEnricher::new(
+            StubNliClassifier,
+            FixtureLearnedScorer,
+            NliPairSelectionConfig { max_pairs: 2 },
+        );
+        let report = run_epistemic_cron_pass(
+            &mut store,
+            EpistemicCronInput {
+                content_node_ids: vec!["a".to_string(), "b".to_string()],
+                engine: NLI_EPISTEMIC_ENGINE.to_string(),
+                ..EpistemicCronInput::default()
+            },
+            &enricher,
+        )
+        .unwrap();
+
+        assert_eq!(report.shadow_edges_written, 2);
+        let from_shadow = epistemic_shadow_node_id("a", DEFAULT_EPISTEMIC_ENGINE_VERSION);
+        let to_shadow = epistemic_shadow_node_id("b", DEFAULT_EPISTEMIC_ENGINE_VERSION);
+        let edge = store
+            .get_edge(&epistemic_shadow_edge_id(
+                EpistemicRelationKind::Supports,
+                &from_shadow,
+                &to_shadow,
+                DEFAULT_EPISTEMIC_ENGINE_VERSION,
+            ))
+            .expect("learned support edge");
+        assert_eq!(
+            edge.properties.get("source_kind").and_then(Value::as_str),
+            Some("learned")
+        );
+        assert_eq!(
+            edge.properties.get("model_id").and_then(Value::as_str),
+            Some("fixture-learned-connection-scorer")
+        );
+        assert_eq!(
+            edge.properties.get("score").and_then(Value::as_f64),
+            Some(0.93)
+        );
+        assert_eq!(
+            edge.properties
+                .get("connection_features")
+                .and_then(|value| value.get("nli_entailment_score"))
+                .and_then(Value::as_f64),
+            Some(0.91)
+        );
+    }
+
+    #[test]
+    fn missing_learned_scorer_noops_without_deterministic_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(EPISTEMIC_SCORER_ENDPOINT_ENV);
+        std::env::remove_var(EPISTEMIC_DETERMINISTIC_FALLBACK_ENV);
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(claim("a", "cache layer is enabled"))
+            .unwrap();
+        store
+            .upsert_node(claim("b", "cache layer is not enabled"))
+            .unwrap();
+        structural_epistemic_pass(
+            &mut store,
+            StructuralEpistemicInput {
+                batch_node_ids: vec!["a".to_string(), "b".to_string()],
+                ..StructuralEpistemicInput::default()
+            },
+        )
+        .unwrap();
+        let before_edges = store.stats().edges_total;
+        let enricher = NliEpistemicEnricher::new(
+            StubNliClassifier,
+            LearnedConnectionScorer::default(),
+            NliPairSelectionConfig { max_pairs: 1 },
+        );
+        let report = run_epistemic_cron_pass(
+            &mut store,
+            EpistemicCronInput {
+                content_node_ids: vec!["a".to_string(), "b".to_string()],
+                engine: NLI_EPISTEMIC_ENGINE.to_string(),
+                ..EpistemicCronInput::default()
+            },
+            &enricher,
+        )
+        .unwrap();
+
+        assert!(report.no_op);
+        assert!(!report.grpc_ok);
+        assert!(report.skipped_reason.contains("learned_scorer_unavailable"));
+        assert_eq!(store.stats().edges_total, before_edges);
     }
 
     fn shadows_for(store: &mut InMemoryGraphStore, ids: &[&str]) {

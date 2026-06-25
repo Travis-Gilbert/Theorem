@@ -27,6 +27,7 @@ use syn::visit::Visit;
 mod code_embed_hook;
 mod code_epistemic_hook;
 mod code_hooks;
+mod compiler;
 mod context_pack;
 mod ensure;
 mod ingest_jobs;
@@ -35,14 +36,35 @@ mod repo_fetch;
 mod tree_sitter_extract;
 
 pub use code_embed_hook::{
-    incremental_embed_hook, incremental_embed_hook_with_embedder, EMBEDDING_DIM,
-    EMBEDDING_PROPERTY,
+    incremental_embed_hook, incremental_embed_hook_with_embedder, EMBEDDING_DIM, EMBEDDING_PROPERTY,
 };
 pub use code_epistemic_hook::{
     code_epistemic_hook, run_code_epistemic_pass_for_repo, CodeDriftFinding, CodeEpistemicReadout,
     CODE_EPISTEMIC_ENGINE, DEFAULT_CODE_EPISTEMIC_TOP_K,
 };
 pub use code_hooks::{code_kg_hooks, incremental_centrality_hook, CENTRALITY_PROPERTY};
+pub use compiler::{
+    annotate_code_features_in_store, build_runpod_burst_request,
+    build_runpod_burst_request_from_store, compile_code_spec_in_store, compile_code_spec_snapshot,
+    compiler_ambient_readout_in_store, detect_code_processes_in_store, detect_code_spec_drift,
+    detect_code_spec_drift_in_store, extract_code_features_in_store,
+    import_runpod_burst_response_in_store, incremental_code_compiler_hook,
+    record_code_pattern_memory_in_store, refresh_code_compiler_artifacts_for_repo,
+    relevant_code_patterns, AmbientCompilerReadout, CodeAnnotationInput, CodeAnnotationOutput,
+    CodeCompilerAnnotationRecord, CodeConnectionFeatureVector, CodeDependencySnapshot,
+    CodeEblFeatureContribution, CodeFeatureExtractInput, CodeFeatureExtractOutput,
+    CodeFeatureRecord, CodeFileSnapshot, CodePatternMemoryInput, CodePatternMemoryRecord,
+    CodeProcessDetectInput, CodeProcessDetectOutput, CodeProcessFlow, CodeProcessStep,
+    CodeRunPodArtifact, CodeRunPodBurstRequest, CodeRunPodBurstResponse, CodeRunPodImportReport,
+    CodeSpecCompileInput, CodeSpecCompileOutput, CodeSpecDriftFinding, CodeSpecDriftInput,
+    CodeSpecDriftKind, CodeSpecDriftReport, CodeSymbolSnapshot, ANNOTATES_CODE_FEATURE,
+    BURST_PRODUCED_ARTIFACT, CODE_ANNOTATION_LABEL, CODE_BURST_ARTIFACT_LABEL,
+    CODE_BURST_JOB_LABEL, CODE_COMPILER_DRIFT_LABEL, CODE_COMPILER_FEATURE_VERSION,
+    CODE_COMPILER_VERSION, CODE_FEATURE_LABEL, CODE_PATTERN_LABEL, CODE_PROCESS_LABEL,
+    CODE_SPEC_LABEL, DEFAULT_AMBIENT_COMPILER_FINDING_LIMIT, DEFAULT_CODE_COMPILER_SYMBOL_LIMIT,
+    DRIFT_FOR_CODE, DRIFT_FOR_SPEC, FEATURE_SOURCE_CODE, FEATURE_TARGET_CODE,
+    PATTERN_APPLIES_TO_CODE, PROCESS_ENTRYPOINT, PROCESS_TOUCHES_CODE, SPECIFIES_CODE,
+};
 pub use context_pack::{
     code_context_pack_in_store, context_pack, context_pack_fetch, AdmittedSymbol,
     CodeContextPackInput, CodeContextPackOutput, ContextPackOutput,
@@ -201,6 +223,14 @@ impl CodeParsingPlugin {
                 CODE_SYMBOL_LABEL,
                 CODE_SYMBOL_NAME_LABEL,
                 CODE_RECEIPT_LABEL,
+                CODE_SPEC_LABEL,
+                CODE_COMPILER_DRIFT_LABEL,
+                CODE_PROCESS_LABEL,
+                CODE_PATTERN_LABEL,
+                CODE_FEATURE_LABEL,
+                CODE_ANNOTATION_LABEL,
+                CODE_BURST_JOB_LABEL,
+                CODE_BURST_ARTIFACT_LABEL,
                 EPISTEMIC_SHADOW_LABEL,
             ],
             edge_types: &[
@@ -208,6 +238,16 @@ impl CodeParsingPlugin {
                 DECLARES_SYMBOL,
                 CALLS_SYMBOL,
                 DEPENDS_ON_SYMBOL,
+                SPECIFIES_CODE,
+                DRIFT_FOR_SPEC,
+                DRIFT_FOR_CODE,
+                PROCESS_ENTRYPOINT,
+                PROCESS_TOUCHES_CODE,
+                PATTERN_APPLIES_TO_CODE,
+                FEATURE_SOURCE_CODE,
+                FEATURE_TARGET_CODE,
+                ANNOTATES_CODE_FEATURE,
+                BURST_PRODUCED_ARTIFACT,
                 HAS_EPISTEMIC_SHADOW,
                 UNDERCUTS,
                 EPISTEMIC_SUPPORTS,
@@ -6819,8 +6859,7 @@ pub fn caller() -> usize { helper_len("abc") }
                     repo_id: repo_id.to_string(),
                     repo_root_display: "embedded://repo/w4-configured-embedding".to_string(),
                     file_path: "src/lib.rs".to_string(),
-                    content: b"pub fn parse_request(json: &str) -> usize { json.len() }\n"
-                        .to_vec(),
+                    content: b"pub fn parse_request(json: &str) -> usize { json.len() }\n".to_vec(),
                     actor: "w4-test".to_string(),
                     generation: 1,
                     materialize_symbol_name_index: true,

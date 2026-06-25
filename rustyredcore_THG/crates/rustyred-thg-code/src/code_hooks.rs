@@ -43,6 +43,7 @@ pub fn code_kg_hooks() -> Vec<HookRegistration> {
     let mut hooks = vec![incremental_centrality_hook()];
     hooks.push(crate::code_embed_hook::incremental_embed_hook());
     hooks.push(crate::code_epistemic_hook::code_epistemic_hook());
+    hooks.push(crate::incremental_code_compiler_hook());
     hooks
 }
 

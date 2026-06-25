@@ -12,8 +12,9 @@ built from what it knows about the thing.
 
 ## Status
 
-- **Compiles, 9 tests pass** (the full 8-stage pipeline, the generic
-  `run_domain_pipeline`, the building reference impl, merge-conflict logic).
+- **Compiles, 11 tests pass** (the full 8-stage pipeline, the generic
+  `run_domain_pipeline`, the building reference impl, merge-conflict logic, and
+  the `scene_atoms.rs` SceneOS adapter `scene_from_subgraph`/`scene_from_pipeline`).
 - Step 1 of the browser plan (generalize the engine) is **already done**: the
   `ReconstructionDomain` trait + generic `run_domain_pipeline` + `PriorModel` /
   `AssetGenerator` port seams are all here, with `BuildingDomain` as the

@@ -162,7 +162,10 @@ fn hot_temporal_training_smoke_writes_model_metrics_and_receipt() {
         result.metrics.deterministic_report.examples,
         result.metrics.test_examples
     );
-    assert!(result.metrics.burn_path_policy.contains("promote only after"));
+    assert!(result
+        .metrics
+        .burn_path_policy
+        .contains("promote only after"));
 
     let artifact_raw = std::fs::read_to_string(&result.model_artifact_input_path).unwrap();
     let artifact: crate::ModelArtifactInput = serde_json::from_str(&artifact_raw).unwrap();

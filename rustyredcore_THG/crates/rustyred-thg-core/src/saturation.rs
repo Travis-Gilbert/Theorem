@@ -19,6 +19,11 @@ use crate::hooks::{
 };
 use crate::plugin::{PluginCapability, PluginCapabilityKind, RustyRedPlugin};
 use crate::state::stable_hash;
+use crate::statement::{
+    literal_ref, statement_id as hyper_statement_id, statement_incidence_edges,
+    StatementFieldProvenance, StatementProvenance, StatementRecord, StatementSemiring, HAS_OBJECT,
+    HAS_SUBJECT, STATEMENT_LABEL,
+};
 use crate::symbolic::{derive_datalog_receipt, stable_hash_value};
 use crate::versioned_graph::{
     compile_graph_pack, compile_graph_pack_incremental, CommitCost, GraphCompileOptions,
@@ -450,7 +455,7 @@ pub fn materialize_closure<S: GraphStore>(
     let live_statement_ids = closure
         .derived_statements
         .iter()
-        .map(|statement| statement_node_id(&statement.fact_id))
+        .map(|statement| derived_statement_hyper_id(store, statement))
         .collect::<BTreeSet<_>>();
     if config.prune_stale {
         let revision = prune_stale_derived_artifacts(
@@ -473,17 +478,30 @@ pub fn materialize_closure<S: GraphStore>(
     }
 
     for statement in &closure.derived_statements {
-        let node = derived_statement_node(statement, &component_key, &config);
+        let node = derived_statement_node(store, statement, &component_key, &config);
         match upsert_node_if_changed(store, node.clone())? {
             WriteDisposition::Written => {
                 report.nodes_written += 1;
-                mutations.push(GraphMutation::NodeUpsert(node));
+                mutations.push(GraphMutation::NodeUpsert(node.clone()));
             }
             WriteDisposition::Skipped => report.idempotent_skips += 1,
         }
 
+        for edge in statement_incidence_edges(&node) {
+            if store.get_node(&edge.to_id).is_none() {
+                continue;
+            }
+            match upsert_edge_if_changed(store, edge.clone())? {
+                WriteDisposition::Written => {
+                    report.edges_written += 1;
+                    mutations.push(GraphMutation::EdgeUpsert(edge));
+                }
+                WriteDisposition::Skipped => report.idempotent_skips += 1,
+            }
+        }
+
         if store.get_node(&statement.subject_id).is_some() {
-            let edge = derived_statement_edge(statement, &config);
+            let edge = derived_statement_edge(statement, &node.id, &config);
             match upsert_edge_if_changed(store, edge.clone())? {
                 WriteDisposition::Written => {
                     report.edges_written += 1;
@@ -1388,19 +1406,32 @@ fn same_edge_payload(left: &EdgeRecord, right: &EdgeRecord) -> bool {
         && left.provenance == right.provenance
 }
 
-fn derived_statement_node(
+fn derived_statement_node<S: GraphStore>(
+    store: &S,
     statement: &SaturationDerivedStatement,
     component_key: &str,
     config: &SaturationConfig,
 ) -> NodeRecord {
-    NodeRecord::new(
-        statement_node_id(&statement.fact_id),
-        [SATURATION_DERIVED_STATEMENT_LABEL],
-        json!({
+    let (object_ref, object_value) = derived_statement_object_ref(store, statement);
+    let field_provenance = StatementFieldProvenance::new(
+        crate::epistemic::EpistemicSourceKind::Structural,
+        config.engine.clone(),
+        config.engine_version.clone(),
+        config.computed_at,
+    );
+    let provenance = StatementProvenance::new(
+        field_provenance,
+        statement.dependency_fact_ids.clone(),
+        statement.rule_id.clone(),
+        StatementSemiring::Viterbi,
+    );
+    let mut properties = json!({
             "fact_id": statement.fact_id,
             "rule_id": statement.rule_id,
             "relation": statement.relation,
             "subject_id": statement.subject_id,
+            "subject_ref": statement.subject_id,
+            "object_ref": object_ref.clone(),
             "reason": statement.reason,
             "dependency_fact_ids": statement.dependency_fact_ids,
             "contributors": statement.contributors,
@@ -1426,22 +1457,45 @@ fn derived_statement_node(
                     "computed_at": config.computed_at
                 }
             }
-        }),
-    )
+    });
+    if let Some(object_value) = object_value {
+        if let Some(object) = properties.as_object_mut() {
+            object.insert("object_value".to_string(), object_value);
+        }
+    }
+    let mut node = StatementRecord::derive(
+        &statement.subject_id,
+        &statement.relation,
+        &object_ref,
+        provenance,
+        properties,
+    );
+    if !node
+        .labels
+        .iter()
+        .any(|label| label == SATURATION_DERIVED_STATEMENT_LABEL)
+    {
+        node.labels
+            .push(SATURATION_DERIVED_STATEMENT_LABEL.to_string());
+        node.labels.sort();
+        node.labels.dedup();
+    }
+    node
 }
 
 fn derived_statement_edge(
     statement: &SaturationDerivedStatement,
+    statement_node_id: &str,
     config: &SaturationConfig,
 ) -> EdgeRecord {
-    let from_id = statement_node_id(&statement.fact_id);
     EdgeRecord::new(
         statement_edge_id(&statement.fact_id, &statement.subject_id),
-        from_id,
+        statement_node_id,
         SATURATION_DERIVES_EDGE,
         &statement.subject_id,
         json!({
             "fact_id": statement.fact_id,
+            "statement_id": statement_node_id,
             "rule_id": statement.rule_id,
             "confidence": statement.confidence,
             "dependency_fact_ids": statement.dependency_fact_ids,
@@ -1460,8 +1514,46 @@ fn derived_statement_edge(
     })
 }
 
-fn statement_node_id(fact_id: &str) -> String {
-    format!("saturation:stmt:{fact_id}")
+fn derived_statement_hyper_id<S: GraphStore>(
+    store: &S,
+    statement: &SaturationDerivedStatement,
+) -> String {
+    let (object_ref, _) = derived_statement_object_ref(store, statement);
+    hyper_statement_id(&statement.subject_id, &statement.relation, &object_ref)
+}
+
+fn derived_statement_object_ref<S: GraphStore>(
+    store: &S,
+    statement: &SaturationDerivedStatement,
+) -> (String, Option<Value>) {
+    for key in ["target_id", "depends_on_object_id", "artifact_id"] {
+        let candidate = prop_str(&statement.attributes, key);
+        if let Some(candidate) = candidate.filter(|candidate| store.get_node(candidate).is_some()) {
+            return (candidate, None);
+        }
+    }
+    if let Some(edge_id) = prop_str(&statement.attributes, "edge_id") {
+        if store.get_node(&edge_id).is_some() {
+            return (edge_id, None);
+        }
+        let value = json!({
+            "edge_id": edge_id,
+            "attributes": statement.attributes,
+        });
+        return (literal_ref(&value), Some(value));
+    }
+    for key in ["target_id", "depends_on_object_id", "artifact_id"] {
+        if let Some(candidate) = prop_str(&statement.attributes, key) {
+            let value = Value::String(candidate);
+            return (literal_ref(&value), Some(value));
+        }
+    }
+    let value = if statement.attributes.is_null() {
+        Value::String(statement.reason.clone())
+    } else {
+        statement.attributes.clone()
+    };
+    (literal_ref(&value), Some(value))
 }
 
 fn statement_edge_id(fact_id: &str, subject_id: &str) -> String {
@@ -1619,7 +1711,114 @@ fn datalog_facts_from_graph_records(nodes: &[NodeRecord], edges: &[EdgeRecord]) 
             ));
         }
     }
+    facts.extend(statement_facts_from_graph_records(nodes, edges));
     facts.sort_by(|left, right| object_field(left, "fact_id").cmp(object_field(right, "fact_id")));
+    facts
+}
+
+fn statement_facts_from_graph_records(nodes: &[NodeRecord], edges: &[EdgeRecord]) -> Vec<Value> {
+    let mut subject_by_statement = BTreeMap::<String, String>::new();
+    let mut object_by_statement = BTreeMap::<String, String>::new();
+    for edge in edges {
+        match edge.edge_type.as_str() {
+            HAS_SUBJECT => {
+                subject_by_statement.insert(edge.from_id.clone(), edge.to_id.clone());
+            }
+            HAS_OBJECT => {
+                object_by_statement.insert(edge.from_id.clone(), edge.to_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let mut facts = Vec::new();
+    for node in nodes {
+        if !node.labels.iter().any(|label| label == STATEMENT_LABEL) {
+            continue;
+        }
+        if prop_bool(&node.properties, "derived") {
+            continue;
+        }
+        let relation = prop_str(&node.properties, "relation")
+            .or_else(|| prop_str(&node.properties, "predicate_key"))
+            .unwrap_or_default();
+        if relation.is_empty() {
+            continue;
+        }
+        let subject_id = subject_by_statement
+            .get(&node.id)
+            .cloned()
+            .or_else(|| prop_str(&node.properties, "subject_ref"))
+            .or_else(|| prop_str(&node.properties, "subject_id"))
+            .unwrap_or_default();
+        if subject_id.is_empty() {
+            continue;
+        }
+        let object_id = object_by_statement
+            .get(&node.id)
+            .cloned()
+            .or_else(|| {
+                prop_str(&node.properties, "object_ref").filter(|value| !value.starts_with("lit:"))
+            })
+            .unwrap_or_default();
+        let confidence = node
+            .properties
+            .get("confidence")
+            .and_then(value_to_f64)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+
+        if is_claim_dependency_edge(&relation) {
+            if object_id.is_empty() {
+                continue;
+            }
+            facts.push(graph_fact(
+                "claim_dependency",
+                &node.id,
+                &node.id,
+                json!({
+                    "claim_id": subject_id,
+                    "depends_on_object_id": object_id,
+                    "justification_type": prop_value(&node.properties, "justification_type").unwrap_or_else(|| json!("dependency")),
+                    "strength": confidence,
+                }),
+                &prop_str(&node.properties, "source_ref").unwrap_or_else(|| "statement".to_string()),
+            ));
+        } else if is_evidence_link_edge(&relation) {
+            if object_id.is_empty() {
+                continue;
+            }
+            facts.push(graph_fact(
+                "evidence_link",
+                &node.id,
+                &node.id,
+                json!({
+                    "claim_id": subject_id,
+                    "artifact_id": object_id,
+                    "strength": confidence,
+                }),
+                &prop_str(&node.properties, "source_ref")
+                    .unwrap_or_else(|| "statement".to_string()),
+            ));
+        } else if is_contradiction_edge(&relation) {
+            if object_id.is_empty() {
+                continue;
+            }
+            facts.push(graph_fact(
+                "edge",
+                &node.id,
+                &node.id,
+                json!({
+                    "edge_type": "contradicts",
+                    "from_object_id": subject_id,
+                    "to_object_id": object_id,
+                    "acceptance_status": prop_value(&node.properties, "acceptance_status").unwrap_or_else(|| json!("contested")),
+                    "confidence": confidence,
+                }),
+                &prop_str(&node.properties, "source_ref").unwrap_or_else(|| "statement".to_string()),
+            ));
+        }
+    }
     facts
 }
 
@@ -1975,6 +2174,14 @@ fn prop_value(value: &Value, key: &str) -> Option<Value> {
         .as_object()
         .and_then(|object| object.get(key))
         .cloned()
+}
+
+fn prop_bool(value: &Value, key: &str) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn value_to_string(value: &Value) -> String {

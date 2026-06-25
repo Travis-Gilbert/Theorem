@@ -32,10 +32,10 @@ use serde_json::{json, Value};
 use crate::ensure::{ensure_repo_kg_in_store, RepoKgStatus};
 use crate::repo_fetch::{is_fetchable_repo_url, RepoFetchCaps};
 use crate::{
-    bounded_limit, hit_from_node, latest_repo_generations, normalize_tenant, property_string,
-    property_u64, record_receipt, search_code_with_store, CodeHitRecord, CodeIndexError,
-    SearchCodeInput, CALLS_SYMBOL, CENTRALITY_PROPERTY, CODE_SYMBOL_LABEL, DEFAULT_LIMIT,
-    DEPENDS_ON_SYMBOL,
+    bounded_limit, compiler_ambient_readout_in_store, hit_from_node, latest_repo_generations,
+    normalize_tenant, property_string, property_u64, record_receipt, search_code_with_store,
+    CodeHitRecord, CodeIndexError, SearchCodeInput, CALLS_SYMBOL, CENTRALITY_PROPERTY,
+    CODE_SYMBOL_LABEL, DEFAULT_LIMIT, DEPENDS_ON_SYMBOL,
 };
 
 pub const DEFAULT_CONTEXT_PACK_BUDGET_TOKENS: usize = 2_000;
@@ -83,6 +83,7 @@ pub struct CodeContextPackOutput {
     pub receipt_hash: String,
     pub receipt_json: String,
     pub epistemic_readout: Option<Value>,
+    pub compiler_readout: Option<Value>,
 }
 
 impl CodeContextPackOutput {
@@ -97,6 +98,7 @@ impl CodeContextPackOutput {
             "tokens_deferred": self.admission.tokens_deferred,
             "total_candidates": self.total_candidates,
             "epistemic_readout": self.epistemic_readout,
+            "compiler_readout": self.compiler_readout,
             "receipt": self.receipt,
             "receipt_hash": self.receipt_hash,
         })
@@ -130,6 +132,7 @@ pub struct ContextPackOutput {
     /// already-resident graph with no entry step.
     pub ingest_status: Option<RepoKgStatus>,
     pub epistemic_readout: Option<Value>,
+    pub compiler_readout: Option<Value>,
     pub receipt: MembraneReceipt,
     pub receipt_hash: String,
 }
@@ -149,6 +152,7 @@ impl ContextPackOutput {
             "reranker_version": self.reranker_version,
             "ingest_status": self.ingest_status.as_ref().map(RepoKgStatus::to_json),
             "epistemic_readout": self.epistemic_readout,
+            "compiler_readout": self.compiler_readout,
             "receipt": self.receipt,
             "receipt_hash": self.receipt_hash,
         })
@@ -235,7 +239,13 @@ pub fn context_pack(
         .iter()
         .map(admitted_symbol_from_candidate)
         .collect();
-    let code_map = compose_code_map(&repo_id, &query, &admitted, &pack.admission);
+    let code_map = compose_code_map(
+        &repo_id,
+        &query,
+        &admitted,
+        &pack.admission,
+        pack.compiler_readout.as_ref(),
+    );
 
     Ok(ContextPackOutput {
         tenant_id: pack.tenant_id,
@@ -250,6 +260,7 @@ pub fn context_pack(
         reranker_version: pack.receipt.reranker_version.clone(),
         ingest_status,
         epistemic_readout: pack.epistemic_readout,
+        compiler_readout: pack.compiler_readout,
         receipt: pack.receipt,
         receipt_hash: pack.receipt_hash,
     })
@@ -358,6 +369,22 @@ fn build_code_context_pack(
     } else {
         Some(crate::run_code_epistemic_pass_for_repo(store, &tenant_id, &repo_id, None)?.to_json())
     };
+    let compiler_readout = if repo_id.trim().is_empty() {
+        None
+    } else {
+        Some(
+            compiler_ambient_readout_in_store(
+                store,
+                &tenant_id,
+                &repo_id,
+                &query,
+                &input.path_prefix,
+                crate::DEFAULT_AMBIENT_COMPILER_FINDING_LIMIT,
+            )
+            .map_err(CodeIndexError::from_store)?
+            .to_json(),
+        )
+    };
     let mut receipt_payload = json!({
         "tenant_id": tenant_id,
         "operation": "code_context_pack",
@@ -369,6 +396,7 @@ fn build_code_context_pack(
         "tokens_deferred": admission.tokens_deferred,
         "membrane_receipt_hash": membrane_receipt_hash,
         "epistemic_readout": epistemic_readout,
+        "compiler_readout": compiler_readout,
     });
     if let (Some(status), Some(map)) = (ingest_status, receipt_payload.as_object_mut()) {
         map.insert("ingest_status".to_string(), status.to_json());
@@ -385,6 +413,7 @@ fn build_code_context_pack(
         receipt_hash: stored_receipt.receipt_hash,
         receipt_json: stored_receipt.receipt_json,
         epistemic_readout,
+        compiler_readout,
     })
 }
 
@@ -502,6 +531,7 @@ fn compose_code_map(
     query: &str,
     admitted: &[AdmittedSymbol],
     admission: &Admission,
+    compiler_readout: Option<&Value>,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     if query.trim().is_empty() {
@@ -512,6 +542,7 @@ fn compose_code_map(
     lines.push(String::new());
     if admitted.is_empty() {
         lines.push("_No code neighborhood resolved within budget._".to_string());
+        append_compiler_readout(&mut lines, compiler_readout);
         return lines.join("\n");
     }
     lines.push("**Admitted code (membrane-ranked):**".to_string());
@@ -536,7 +567,113 @@ fn compose_code_map(
             admission.tokens_deferred
         ));
     }
+    append_compiler_readout(&mut lines, compiler_readout);
     lines.join("\n")
+}
+
+fn append_compiler_readout(lines: &mut Vec<String>, compiler_readout: Option<&Value>) {
+    let Some(readout) = compiler_readout else {
+        return;
+    };
+    let spec_node_id = readout
+        .get("spec_node_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if spec_node_id.is_empty() {
+        return;
+    }
+    let symbol_count = readout
+        .get("symbol_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let process_count = readout
+        .get("process_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let pattern_count = readout
+        .get("pattern_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let feature_count = readout
+        .get("feature_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let annotation_count = readout
+        .get("annotation_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let drift_count = readout
+        .get("drift_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let bootstrapped = readout
+        .get("bootstrapped_spec")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let bootstrap_note = if bootstrapped { " bootstrapped" } else { "" };
+    lines.push(String::new());
+    lines.push("**Ambient code intelligence:**".to_string());
+    lines.push(format!(
+        "- Spec `{spec_node_id}` covers {symbol_count} symbol(s); {drift_count} drift finding(s){bootstrap_note}."
+    ));
+    lines.push(format!(
+        "- Processes: {process_count}; patterns: {pattern_count}; feature records: {feature_count}; EDL/EBL annotations: {annotation_count}."
+    ));
+
+    let Some(findings) = readout.get("drift_findings").and_then(Value::as_array) else {
+        append_pattern_memories(lines, readout);
+        return;
+    };
+    for finding in findings.iter().take(5) {
+        let drift_kind = finding
+            .get("drift_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("drift");
+        let name = finding
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("symbol");
+        let file_path = finding
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let next = finding
+            .get("suggested_next_step")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if next.is_empty() {
+            lines.push(format!(
+                "- Drift `{drift_kind}`: `{name}` in `{file_path}`."
+            ));
+        } else {
+            lines.push(format!(
+                "- Drift `{drift_kind}`: `{name}` in `{file_path}` -- {}",
+                truncate(next, 180)
+            ));
+        }
+    }
+    append_pattern_memories(lines, readout);
+}
+
+fn append_pattern_memories(lines: &mut Vec<String>, readout: &Value) {
+    let Some(patterns) = readout.get("pattern_memories").and_then(Value::as_array) else {
+        return;
+    };
+    for pattern in patterns.iter().take(3) {
+        let title = pattern
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("pattern");
+        let fix = pattern
+            .get("fix_summary")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if fix.is_empty() {
+            lines.push(format!("- Pattern `{title}`."));
+        } else {
+            lines.push(format!("- Pattern `{title}` -- {}", truncate(fix, 180)));
+        }
+    }
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -704,21 +841,29 @@ fn centrality_seed_hits(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use rustyred_thg_core::{
-        EdgeRecord, GraphMutation, GraphMutationBatch, NodeRecord, RedCoreGraphStore,
+        EdgeRecord, GraphMutation, GraphMutationBatch, NodeQuery, NodeRecord, RedCoreGraphStore,
         RedCoreOptions,
     };
 
     use super::*;
-    use crate::{CALLS_SYMBOL, CODE_REPO_LABEL};
+    use crate::{CALLS_SYMBOL, CODE_COMPILER_DRIFT_LABEL, CODE_REPO_LABEL, CODE_SPEC_LABEL};
+
+    static TEMP_STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_store() -> RedCoreGraphStore {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let suffix = TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
         RedCoreGraphStore::open(
-            std::env::temp_dir().join(format!("context-pack-test-{}-{nanos}", std::process::id())),
+            std::env::temp_dir().join(format!(
+                "context-pack-test-{}-{nanos}-{suffix}",
+                std::process::id()
+            )),
             RedCoreOptions::default(),
         )
         .unwrap()
@@ -808,6 +953,132 @@ mod tests {
             ))
             .unwrap();
         assert!(receipt_node.is_some());
+    }
+
+    #[test]
+    fn context_pack_bootstraps_and_surfaces_ambient_compiler_readout() {
+        let mut store = temp_store();
+        let repo = NodeRecord::new(
+            "repo:test",
+            [CODE_REPO_LABEL],
+            json!({
+                "tenant_id": "theorem",
+                "repo_id": "repo",
+                "latest_generation": 1,
+            }),
+        );
+        let symbol = NodeRecord::new(
+            "sym:compiler_entry",
+            [CODE_SYMBOL_LABEL],
+            json!({
+                "tenant_id": "theorem",
+                "repo_id": "repo",
+                "file_id": "file:lib",
+                "file_path": "src/lib.rs",
+                "kind": "function",
+                "name": "compiler_entry",
+                "language": "rust",
+                "line": 7,
+                "signature": "pub fn compiler_entry()",
+                "snippet": "compiler entry point",
+                "generation": 1,
+                CENTRALITY_PROPERTY: 0.40,
+            }),
+        );
+        store
+            .commit_batch(GraphMutationBatch::new([
+                GraphMutation::NodeUpsert(repo),
+                GraphMutation::NodeUpsert(symbol),
+            ]))
+            .unwrap();
+
+        let output =
+            context_pack(&mut store, "theorem", "repo", None, Some("compiler"), 4_000).unwrap();
+
+        let readout = output
+            .compiler_readout
+            .as_ref()
+            .expect("ambient compiler readout");
+        assert_eq!(readout["symbol_count"], 1);
+        assert_eq!(readout["bootstrapped_spec"], true);
+        assert!(output.code_map.contains("Ambient code intelligence"));
+        assert!(output.to_json().get("compiler_readout").is_some());
+        let specs = store
+            .query_nodes(NodeQuery::label(CODE_SPEC_LABEL))
+            .unwrap();
+        assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn context_pack_surfaces_spec_drift_without_tool_call() {
+        let mut store = temp_store();
+        let repo = NodeRecord::new(
+            "repo:test",
+            [CODE_REPO_LABEL],
+            json!({
+                "tenant_id": "theorem",
+                "repo_id": "repo",
+                "latest_generation": 1,
+            }),
+        );
+        let symbol = |signature: &str| {
+            NodeRecord::new(
+                "sym:compiler_entry",
+                [CODE_SYMBOL_LABEL],
+                json!({
+                    "tenant_id": "theorem",
+                    "repo_id": "repo",
+                    "file_id": "file:lib",
+                    "file_path": "src/lib.rs",
+                    "kind": "function",
+                    "name": "compiler_entry",
+                    "language": "rust",
+                    "line": 7,
+                    "signature": signature,
+                    "snippet": "compiler entry point",
+                    "generation": 1,
+                    CENTRALITY_PROPERTY: 0.40,
+                }),
+            )
+        };
+        store
+            .commit_batch(GraphMutationBatch::new([
+                GraphMutation::NodeUpsert(repo),
+                GraphMutation::NodeUpsert(symbol("pub fn compiler_entry()")),
+            ]))
+            .unwrap();
+
+        let baseline = code_context_pack_in_store(
+            &mut store,
+            CodeContextPackInput {
+                tenant_id: "theorem".to_string(),
+                query: "compiler".to_string(),
+                repo_id: "repo".to_string(),
+                budget_tokens: 4_000,
+                ..CodeContextPackInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.compiler_readout.as_ref().unwrap()["drift_count"],
+            0
+        );
+
+        store
+            .commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(
+                symbol("pub fn compiler_entry(input: &str)"),
+            )]))
+            .unwrap();
+
+        let output =
+            context_pack(&mut store, "theorem", "repo", None, Some("compiler"), 4_000).unwrap();
+        let readout = output.compiler_readout.as_ref().unwrap();
+        assert_eq!(readout["drift_count"], 1);
+        assert!(output.code_map.contains("signature_changed"));
+        let drift_nodes = store
+            .query_nodes(NodeQuery::label(CODE_COMPILER_DRIFT_LABEL))
+            .unwrap();
+        assert_eq!(drift_nodes.len(), 1);
     }
 
     #[test]

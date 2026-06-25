@@ -26,6 +26,8 @@ fs2 = "0.4"
 h3o = "0.7"
 imbl = { version = "7.0.0", features = ["serde"] }
 redis = { version = "0.27", optional = true }
+memmap2 = "0.9.11"
+rkyv = "0.8.16"
 roaring = "0.10"
 s2 = { version = "0.0.12", optional = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -34,3 +36,6 @@ sha2 = "0.10"
 tantivy = { version = "0.22", optional = true }
 turbovec = { version = "0.8.0", optional = true }
 zstd = "0.13"
+
+[dev-dependencies]
+theorem-harness-core = { path = "../theorem-harness-core" }

@@ -10,7 +10,7 @@
 //! planner runs them over the relation's own scalar/structured columns after an over-approximate
 //! filter, exactly as the spec's "residual exact check in `row_matches`" requires.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -132,9 +132,9 @@ impl RankingAccessMethod for TextRankingMethod {
         if k == 0 {
             return Ok(RankOutcome::default());
         }
-        Ok(RankOutcome::scored(resolver.text_rank(
-            relation, column, query, candidates, k,
-        )?))
+        Ok(RankOutcome::scored(
+            resolver.text_rank(relation, column, query, candidates, k)?,
+        ))
     }
 }
 
@@ -292,7 +292,7 @@ const MAX_HOPS: u32 = 6; // graph-proximity hop cap
 const PROX_CAP: u32 = 8; // per-adjacent-pair proximity penalty cap (Meilisearch default)
 const ATTR_CAP: u32 = 64; // first-match position cap for the single-attribute model
 const RECENCY_WORST: u32 = BANDS + 1; // superseded lands strictly below every aged/unknown band
-// ponytail: weekly recency grain; tune AGE_BAND_MS, or pass a per-query value, if recency matters.
+                                      // ponytail: weekly recency grain; tune AGE_BAND_MS, or pass a per-query value, if recency matters.
 const AGE_BAND_MS: i64 = 7 * 24 * 3_600 * 1_000;
 
 /// One ranking rule. Lexical UX rules (the forgiving instant-search feel), relevance rules
@@ -312,6 +312,7 @@ pub enum RankingRule {
     SourceReliability,
     Recency,
     EpistemicStatus,
+    Feature,
 }
 
 impl RankingRule {
@@ -329,6 +330,7 @@ impl RankingRule {
             Self::SourceReliability => "source_reliability",
             Self::Recency => "recency",
             Self::EpistemicStatus => "epistemic_status",
+            Self::Feature => "feature",
         }
     }
 
@@ -355,7 +357,13 @@ impl RankingRule {
                 }
             }
             Self::Attribute => match &c.term_match {
-                Some(tm) => tm.positions.iter().min().copied().unwrap_or(ATTR_CAP).min(ATTR_CAP),
+                Some(tm) => tm
+                    .positions
+                    .iter()
+                    .min()
+                    .copied()
+                    .unwrap_or(ATTR_CAP)
+                    .min(ATTR_CAP),
                 None => ATTR_CAP,
             },
             Self::Exactness => match &c.term_match {
@@ -364,13 +372,18 @@ impl RankingRule {
             },
             Self::Vector => c.vector_score.map(|s| band(s, BANDS)).unwrap_or(BANDS),
             // bm25 is unbounded >= 0; squash to [0,1) so the band is index-independent.
-            Self::Text => c.bm25_score.map(|s| band(s / (s + 1.0), BANDS)).unwrap_or(BANDS),
+            Self::Text => c
+                .bm25_score
+                .map(|s| band(s / (s + 1.0), BANDS))
+                .unwrap_or(BANDS),
             Self::GraphProximity => c.graph_hops.map(|h| h.min(MAX_HOPS)).unwrap_or(MAX_HOPS),
-            Self::SourceReliability => {
-                c.source_reliability.map(|s| band(s, BANDS)).unwrap_or(BANDS)
-            }
+            Self::SourceReliability => c
+                .source_reliability
+                .map(|s| band(s, BANDS))
+                .unwrap_or(BANDS),
             Self::Recency => return recency_bucket(c, q),
             Self::EpistemicStatus => return epistemic_bucket(c, q),
+            Self::Feature => c.feature_score.map(|s| band(s, BANDS)).unwrap_or(BANDS),
         })
     }
 }
@@ -532,6 +545,7 @@ pub struct RankCandidate {
     pub superseded: bool,
     pub epistemic_weight: f32,
     pub acceptance_status: String,
+    pub feature_score: Option<f32>,
 }
 
 impl RankCandidate {
@@ -548,8 +562,47 @@ impl RankCandidate {
             superseded: false,
             epistemic_weight: 1.0,
             acceptance_status: String::new(),
+            feature_score: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FeatureRankingConfig {
+    pub enabled: bool,
+    pub weight: f32,
+}
+
+impl Default for FeatureRankingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 1.0,
+        }
+    }
+}
+
+pub fn apply_feature_scores<I>(
+    mut candidates: Vec<RankCandidate>,
+    scores: I,
+    config: FeatureRankingConfig,
+) -> Vec<RankCandidate>
+where
+    I: IntoIterator<Item = (RowId, f32)>,
+{
+    if !config.enabled {
+        return candidates;
+    }
+    let scores = scores
+        .into_iter()
+        .map(|(row_id, score)| (row_id, (score * config.weight.max(0.0)).clamp(0.0, 1.0)))
+        .collect::<BTreeMap<_, _>>();
+    for candidate in &mut candidates {
+        if let Some(score) = scores.get(&candidate.row_id) {
+            candidate.feature_score = Some(*score);
+        }
+    }
+    candidates
 }
 
 /// A candidate in final order, carrying the bucket it landed in under each rule (rule order).
@@ -589,7 +642,11 @@ pub fn apply_cascade(
         })
         .collect::<Vec<_>>();
     // Vec<u32> compares lexicographically: earlier rules dominate, later rules break ties.
-    ranked.sort_by(|a, b| a.buckets.cmp(&b.buckets).then_with(|| a.row_id.cmp(&b.row_id)));
+    ranked.sort_by(|a, b| {
+        a.buckets
+            .cmp(&b.buckets)
+            .then_with(|| a.row_id.cmp(&b.row_id))
+    });
     CascadeOutcome {
         ranked,
         rule_order: rules.iter().map(|rule| rule.name().to_string()).collect(),
@@ -638,7 +695,12 @@ fn allowed_typos(term: &str, cfg: &TypoConfig) -> u32 {
 /// Best match of `term` over the doc tokens: returns (position, typos, is_exact). Exact equality
 /// wins; on the last term a prefix expansion matches with zero typos but is not "exact"; otherwise
 /// a bounded-Levenshtein match within `max_typos`. Lowest typo count wins, exact breaks ties.
-fn best_match(doc: &[String], term: &str, max_typos: u32, is_last: bool) -> Option<(usize, u32, bool)> {
+fn best_match(
+    doc: &[String],
+    term: &str,
+    max_typos: u32,
+    is_last: bool,
+) -> Option<(usize, u32, bool)> {
     let mut best: Option<(usize, u32, bool)> = None;
     for (position, token) in doc.iter().enumerate() {
         let found = if token == term {
@@ -705,6 +767,31 @@ mod cascade_tests {
         }
     }
 
+    #[test]
+    fn feature_rule_is_default_off_and_scores_when_enabled() {
+        let q = QueryContext::default();
+        let candidates = vec![RankCandidate::new("a"), RankCandidate::new("b")];
+        let base = apply_cascade(candidates.clone(), &[RankingRule::Feature], &q);
+        let disabled = apply_feature_scores(
+            candidates.clone(),
+            [("b".to_string(), 1.0), ("a".to_string(), 0.2)],
+            FeatureRankingConfig::default(),
+        );
+        let disabled_out = apply_cascade(disabled, &[RankingRule::Feature], &q);
+        assert_eq!(base.ranked, disabled_out.ranked);
+
+        let enabled = apply_feature_scores(
+            candidates,
+            [("b".to_string(), 1.0), ("a".to_string(), 0.2)],
+            FeatureRankingConfig {
+                enabled: true,
+                weight: 1.0,
+            },
+        );
+        let enabled_out = apply_cascade(enabled, &[RankingRule::Feature], &q);
+        assert_eq!(order(&enabled_out), vec!["b", "a"]);
+    }
+
     // D1 acceptance 1: [Text, EpistemicStatus] excludes a high-bm25 retracted candidate and ranks
     // a lower-bm25 supported candidate first.
     #[test]
@@ -767,15 +854,27 @@ mod cascade_tests {
         assert_eq!(tme.exact_terms, 1);
         // Typo rule ranks the exact match (bucket 0) above the one-typo match (bucket 1).
         assert!(
-            RankingRule::Typo
-                .bucket(&RankCandidate { term_match: Some(tme), ..RankCandidate::new("e") }, &exact)
-                < RankingRule::Typo
-                    .bucket(&RankCandidate { term_match: Some(tm), ..RankCandidate::new("t") }, &typo)
+            RankingRule::Typo.bucket(
+                &RankCandidate {
+                    term_match: Some(tme),
+                    ..RankCandidate::new("e")
+                },
+                &exact
+            ) < RankingRule::Typo.bucket(
+                &RankCandidate {
+                    term_match: Some(tm),
+                    ..RankCandidate::new("t")
+                },
+                &typo
+            )
         );
 
         let disabled = QueryContext {
             terms: vec!["databse".to_string()],
-            typo: TypoConfig { enabled: false, ..TypoConfig::default() },
+            typo: TypoConfig {
+                enabled: false,
+                ..TypoConfig::default()
+            },
             ..QueryContext::default()
         };
         assert_eq!(compute_term_match(doc, &disabled).matched_terms, 0);

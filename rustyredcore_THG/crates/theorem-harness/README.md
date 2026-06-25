@@ -1,49 +1,21 @@
 # theorem-harness
 
-theorem-harness SDK v2: the idiomatic Rust surface over theorem-harness-core and theorem-harness-runtime. Streamed runs, sessions-as-scopes, idempotency, cancellation, resumable events, and trace export. The source of truth the Python/Node/Swift/WASM bindings are generated from.
+The SDK v2 idiomatic Rust surface over `theorem-harness-core` (the pure run state machine, guards, hashes, contracts) and `theorem-harness-runtime` (GraphStore-backed persistence). Synchronous and GraphStore-backed, with no async runtime.
 
-## What it is
+This crate is the SDK v2 source of truth: the bindings for Python and Swift (UniFFI), Node (NAPI-RS), and the browser (wasm-bindgen) are generated from this surface, so there is no hand-maintained per-language contract that can drift.
 
-# theorem-harness
+## Surface
 
-The idiomatic Rust SDK surface over [`theorem_harness_core`] (the pure run
-state machine, guards, hashes, and contracts) and [`theorem_harness_runtime`]
-(GraphStore-backed persistence: the durable event log and run state).
+- `RunHandle` (`run.rs`): a run as a sequence of typed events. `start`, `attach`, `append`, `events`, `events_since(store, after_seq)` (the resumable primitive), `state`, `replay`, `cancel`, `cancel_token()`.
+- `RunStream` (`stream.rs`): a resumable, poll-based cursor over a run's events (`poll`, `poll_text`); the synchronous core each binding wraps into a language-native async stream.
+- `Session` (`session.rs`): continuity over an AgentBinding scope (`open`, `with_tenant`, `remember`, `recall`).
+- `Event` / `RunEventKind` (`event.rs`): the typed view of the transition log.
+- `IdempotencyToken` (`idempotency.rs`), `CancelToken` (`cancel.rs`, runtime-free polled flag).
+- Trace export (`export.rs`): `export_run_trace`, `export_run_sft`, `export_preference_pair`.
 
-This crate is the SDK v2 source of truth. The bindings for Python and Swift
-(UniFFI), Node (NAPI-RS), and the browser (wasm-bindgen) are GENERATED from
-this surface; there is no hand-maintained per-language SDK contract that can
-drift. Stabilizing this crate is the THPS-011 deliverable that the binding
-generation (THPS-012) waits on.
+Re-exports `MemoryRecallItem` and `RememberMemoryReceipt` from runtime so SDK consumers need not depend on runtime directly. Path deps: `rustyred-thg-core`, `theorem-harness-core`, `theorem-harness-runtime`.
 
-## Surface (the THPS-011 freeze)
-
-- [`RunHandle`]: a run as a sequence of typed events. Start it, append
-  transitions, read its events, resume from a sequence boundary, replay it
-  deterministically, and cancel it.
-- [`RunStream`]: a resumable, poll-based cursor over a run's typed events,
-  with a typed view and a text-projection view. The synchronous core that
-  each binding wraps into a language-native async stream.
-- [`Session`]: a continuity handle over an AgentBinding scope. Within-session
-  working memory is the versioned scratchpad; state published across sessions
-  is the committed graph.
-- [`Event`] / [`RunEventKind`]: the typed view of the canonical transition
-  log, carrying its sequence number and post-transition state hash.
-- [`IdempotencyToken`]: a client-provided token threaded onto every
-  state-changing call.
-- [`CancelToken`]: a runtime-free polled flag the run loop checks before each
-  append.
-- [`export_run_trace`]: a run's events exported as training rows.
-
-## Runtime-neutral discipline
-
-This crate composes core + runtime, both synchronous and GraphStore-backed
-(no network, no async runtime). The live async push-stream (subscribe and
-await new events) is intentionally NOT in this crate: it belongs to the
-binding layer (NAPI's tokio, UniFFI's RustFuture polling), so the core
-surface never drags an async runtime across the FFI boundary. The resumable
-primitive that IS here is [`RunHandle::events_since`]: a synchronous bounded
-replay from a sequence number that every binding wraps into its own stream.
+The live async push-stream is intentionally not in this crate: it belongs to the binding layer (NAPI's tokio, UniFFI's RustFuture), so the core surface never drags an async runtime across the FFI boundary. The resumable primitive that is here is `RunHandle::events_since`, a synchronous bounded replay every binding wraps into its own stream.
 
 ## Build and test
 
@@ -51,4 +23,4 @@ replay from a sequence number that every binding wraps into its own stream.
 cd rustyredcore_THG && cargo test -p theorem-harness
 ```
 
-Part of the `rustyredcore_THG` Cargo workspace. See the crate table in [CLAUDE.md](../../../CLAUDE.md) for how this fits the substrate. This README is generated from the crate's `Cargo.toml` description and `//!` module docs; edit those and regenerate with `scripts/gen-crate-readmes.sh`.
+Part of the `rustyredcore_THG` workspace. See [the workspace README](../../README.md) for the crate map.

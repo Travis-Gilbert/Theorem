@@ -7,8 +7,8 @@ use crate::{
     hot_input_from_snapshot, hot_temporal_link_dataset_from_snapshot, patch_align_and_concatenate,
     rank_hot_temporal_densification_candidates, run_hot, score_hot_timed_labels,
     tgat_time_encoding, train_hot_link_model, DensificationRequest, HotConfig, HotInput,
-    HotLinkTrainingExample, HotNegativeSamplingScheme, HotNode, HotPairLabel,
-    HotTemporalEdge, HotTemporalSplitConfig, HotTrainingConfig,
+    HotLinkTrainingExample, HotNegativeSamplingScheme, HotNode, HotPairLabel, HotTemporalEdge,
+    HotTemporalSplitConfig, HotTrainingConfig,
 };
 
 fn hot_config() -> HotConfig {
@@ -156,18 +156,9 @@ fn extractor_respects_cutoff_and_recency_caps() {
 #[test]
 fn feature_matrices_mark_hops_and_tgat_encoding_is_interleaved() {
     let input = direct_hot_input();
-    let matrices =
-        build_hot_feature_matrices(&input, "node:a", "node:c", hot_config()).unwrap();
-    let hop_one = matrices
-        .hop_marks
-        .iter()
-        .position(|hop| *hop == 1)
-        .unwrap();
-    let hop_two = matrices
-        .hop_marks
-        .iter()
-        .position(|hop| *hop == 2)
-        .unwrap();
+    let matrices = build_hot_feature_matrices(&input, "node:a", "node:c", hot_config()).unwrap();
+    let hop_one = matrices.hop_marks.iter().position(|hop| *hop == 1).unwrap();
+    let hop_two = matrices.hop_marks.iter().position(|hop| *hop == 2).unwrap();
     let hop_one_row = &matrices.node_matrix[hop_one];
     let hop_two_row = &matrices.node_matrix[hop_two];
     assert_eq!(&hop_one_row[hop_one_row.len() - 2..], &[1.0, 0.0]);
@@ -180,8 +171,7 @@ fn feature_matrices_mark_hops_and_tgat_encoding_is_interleaved() {
 #[test]
 fn shared_neighbor_produces_cooccurrence_signal() {
     let input = direct_hot_input();
-    let matrices =
-        build_hot_feature_matrices(&input, "node:a", "node:c", hot_config()).unwrap();
+    let matrices = build_hot_feature_matrices(&input, "node:a", "node:c", hot_config()).unwrap();
     let shared_idx = matrices
         .neighbor_ids
         .iter()
@@ -347,7 +337,8 @@ fn training_examples_can_be_derived_from_hot_input_labels() {
         label: true,
     }];
     let examples =
-        crate::hot_training_examples_from_input(&direct_hot_input(), &labels, hot_config()).unwrap();
+        crate::hot_training_examples_from_input(&direct_hot_input(), &labels, hot_config())
+            .unwrap();
     assert_eq!(examples.len(), 1);
     assert!(examples[0].label);
     assert!(!examples[0].features.is_empty());
@@ -413,7 +404,8 @@ fn temporal_dataset_uses_pre_label_context_and_holdout_scores() {
         edge.timestamp < positive.as_of
             && (edge.source_id != positive.source_id || edge.target_id != positive.target_id)
     }));
-    let predictions = score_hot_timed_labels(&snapshot, &dataset.test_labels, hot_config()).unwrap();
+    let predictions =
+        score_hot_timed_labels(&snapshot, &dataset.test_labels, hot_config()).unwrap();
     assert_eq!(predictions.len(), dataset.test_labels.len());
 }
 

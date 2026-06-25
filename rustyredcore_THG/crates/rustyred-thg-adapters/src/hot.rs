@@ -508,7 +508,9 @@ pub fn hot_input_from_snapshot(
         .collect::<BTreeSet<_>>();
     let query_pairs = query_pairs
         .into_iter()
-        .filter(|(source_id, target_id)| retained.contains(source_id) && retained.contains(target_id))
+        .filter(|(source_id, target_id)| {
+            retained.contains(source_id) && retained.contains(target_id)
+        })
         .collect::<Vec<_>>();
 
     Ok(HotInput {
@@ -571,7 +573,10 @@ pub fn patch_align_and_concatenate(
     let mut rows = Vec::with_capacity(patched_sequence_len);
     let zero = vec![0.0; config.per_node_width()];
     for idx in 0..patched_sequence_len {
-        let mut row = source_rows.get(idx).cloned().unwrap_or_else(|| zero.clone());
+        let mut row = source_rows
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| zero.clone());
         row.extend(
             target_rows
                 .get(idx)
@@ -613,16 +618,12 @@ pub fn run_hot(input: &HotInput, config: HotConfig) -> ThgResult<HotOutput> {
                 format!("query pair {source_id}->{target_id} references a missing node"),
             ));
         }
-        let pair_sequence = patch_align_and_concatenate(input, source_id, target_id, config.clone())?;
+        let pair_sequence =
+            patch_align_and_concatenate(input, source_id, target_id, config.clone())?;
         let encoded_rows = block_recurrent_encode(&pair_sequence.rows, &config);
         let support = best_temporal_support_path(input, source_id, target_id, &config);
-        let source_rep = pooled_node_representation(
-            &encoded_rows,
-            &pair_sequence.rows,
-            0,
-            source_id,
-            &config,
-        );
+        let source_rep =
+            pooled_node_representation(&encoded_rows, &pair_sequence.rows, 0, source_id, &config);
         let target_rep = pooled_node_representation(
             &encoded_rows,
             &pair_sequence.rows,
@@ -733,7 +734,8 @@ pub fn hot_training_examples_from_input(
         .filter_map(|pair| {
             let label = labels.get(&(pair.source_id.clone(), pair.target_id.clone()))?;
             let mut features = pair.values;
-            if let Some(extra) = score_features.get(&(pair.source_id.clone(), pair.target_id.clone()))
+            if let Some(extra) =
+                score_features.get(&(pair.source_id.clone(), pair.target_id.clone()))
             {
                 features.extend(extra);
             }
@@ -825,8 +827,8 @@ pub fn train_hot_link_model(
                     0.0
                 };
                 for (feature_idx, value) in x.iter().enumerate().take(input_dim) {
-                    let grad = hidden_grad * *value
-                        + l2 * model.hidden_weights[hidden_idx][feature_idx];
+                    let grad =
+                        hidden_grad * *value + l2 * model.hidden_weights[hidden_idx][feature_idx];
                     model.hidden_weights[hidden_idx][feature_idx] -= learning_rate * grad;
                 }
                 model.hidden_bias[hidden_idx] -= learning_rate * hidden_grad;
@@ -1294,9 +1296,24 @@ fn feature_matrices_from_interactions(
 }
 
 fn patched_node_rows(matrices: &HotFeatureMatrices, config: &HotConfig) -> Vec<Vec<f32>> {
-    let node = align_patched_matrix(&matrices.node_matrix, config.patch_size, config.aligned_dim, "node");
-    let edge = align_patched_matrix(&matrices.edge_matrix, config.patch_size, config.aligned_dim, "edge");
-    let time = align_patched_matrix(&matrices.time_matrix, config.patch_size, config.aligned_dim, "time");
+    let node = align_patched_matrix(
+        &matrices.node_matrix,
+        config.patch_size,
+        config.aligned_dim,
+        "node",
+    );
+    let edge = align_patched_matrix(
+        &matrices.edge_matrix,
+        config.patch_size,
+        config.aligned_dim,
+        "edge",
+    );
+    let time = align_patched_matrix(
+        &matrices.time_matrix,
+        config.patch_size,
+        config.aligned_dim,
+        "time",
+    );
     let co = align_patched_matrix(
         &matrices.cooccurrence_matrix,
         config.patch_size,
@@ -1553,15 +1570,16 @@ fn pooled_node_representation(
     out
 }
 
-fn pair_representation_values(
-    source: &[f32],
-    target: &[f32],
-    config: &HotConfig,
-) -> Vec<f32> {
+fn pair_representation_values(source: &[f32], target: &[f32], config: &HotConfig) -> Vec<f32> {
     let mut values = Vec::with_capacity(config.output_dim * 4);
     values.extend_from_slice(source);
     values.extend_from_slice(target);
-    values.extend(source.iter().zip(target).map(|(left, right)| (left - right).abs()));
+    values.extend(
+        source
+            .iter()
+            .zip(target)
+            .map(|(left, right)| (left - right).abs()),
+    );
     values.extend(source.iter().zip(target).map(|(left, right)| left * right));
     values
 }
@@ -1571,7 +1589,11 @@ fn decode_link_score(
     support: Option<&PairformerSupportPath>,
     config: &HotConfig,
 ) -> f32 {
-    let hidden = geglu_feed_forward(pair_values, config.decoder_hidden_dim, config.decoder_hidden_dim);
+    let hidden = geglu_feed_forward(
+        pair_values,
+        config.decoder_hidden_dim,
+        config.decoder_hidden_dim,
+    );
     let positive_signal = positive_mean(&hidden) + positive_mean(pair_values) * 0.25;
     let support_signal = support
         .map(|support| support.confidence.clamp(0.0, 1.0))
@@ -1743,7 +1765,10 @@ fn temporal_feature_values(properties: &Value) -> Vec<f32> {
     )
     .unwrap_or(start);
     let duration = end.saturating_sub(start).abs().max(1) as f32;
-    vec![(start as f32 / 86_400_000.0).tanh(), duration.ln_1p() / 32.0]
+    vec![
+        (start as f32 / 86_400_000.0).tanh(),
+        duration.ln_1p() / 32.0,
+    ]
 }
 
 fn neighbor_counts(interactions: &[HotNeighborInteraction]) -> BTreeMap<String, usize> {
@@ -1789,11 +1814,7 @@ fn count_mlp(count: f32, dim: usize, salt: &str) -> Vec<f32> {
         .collect()
 }
 
-fn tgat_time_encoding_with_frequencies(
-    delta_ms: i64,
-    dim: usize,
-    frequencies: &[f32],
-) -> Vec<f32> {
+fn tgat_time_encoding_with_frequencies(delta_ms: i64, dim: usize, frequencies: &[f32]) -> Vec<f32> {
     let dim = if dim % 2 == 0 { dim } else { dim + 1 };
     let pairs = (dim / 2).max(1);
     let scale = (1.0 / dim as f32).sqrt();
@@ -1814,9 +1835,14 @@ fn tgat_time_encoding_with_frequencies(
 
 fn add_position_embedding(row: &mut [f32], position: usize, config: &HotConfig) {
     for (idx, value) in row.iter_mut().enumerate() {
-        let frequency = 1.0 / 10_000.0_f32.powf((idx % config.output_dim) as f32 / config.output_dim as f32);
+        let frequency =
+            1.0 / 10_000.0_f32.powf((idx % config.output_dim) as f32 / config.output_dim as f32);
         let phase = position as f32 * frequency;
-        let pos = if idx % 2 == 0 { phase.sin() } else { phase.cos() };
+        let pos = if idx % 2 == 0 {
+            phase.sin()
+        } else {
+            phase.cos()
+        };
         *value += pos * 0.02;
     }
 }
@@ -1857,7 +1883,11 @@ fn geglu_feed_forward(input: &[f32], output_dim: usize, hidden_dim: usize) -> Ve
     for (dim_idx, slot) in out.iter_mut().enumerate() {
         let mut sum = 0.0;
         for (hidden_idx, value) in hidden.iter().enumerate() {
-            let sign = if (hidden_idx + dim_idx) % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (hidden_idx + dim_idx) % 2 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             let weight = sign * (0.5 + stable_noise("hot-geglu", hidden_idx + dim_idx).abs());
             sum += value * weight;
         }
@@ -2043,12 +2073,7 @@ fn clamp_vector(values: &mut [f32], limit: f32) {
 
 fn average_precision(scored_labels: &[(f32, bool)]) -> f32 {
     let mut rows = scored_labels.to_vec();
-    rows.sort_by(|left, right| {
-        right
-            .0
-            .partial_cmp(&left.0)
-            .unwrap_or(Ordering::Equal)
-    });
+    rows.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
     let positives = rows.iter().filter(|(_, label)| *label).count();
     if positives == 0 {
         return 0.0;

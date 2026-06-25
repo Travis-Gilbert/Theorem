@@ -1,10 +1,11 @@
 use rustyred_thg_core::{
     differential_check, epistemic_egraph_dedup, epistemic_shadow_node_id, facts_from_payload,
     facts_from_subgraph, materialize_closure, read_same_eclass, run_saturation, saturation_handler,
-    validate_egglog_program, EdgeRecord, EpistemicDedupConfig, HookContext, HookOutcome,
-    InMemoryGraphStore, MutationEvent, MutationKind, NodeQuery, NodeRecord, RedCoreGraphStore,
-    SaturationConfig, SaturationProgram, SATURATION_DERIVED_STATEMENT_LABEL,
-    SATURATION_SHARED_RULE_IDS,
+    validate_egglog_program, write_statement, EdgeRecord, EpistemicDedupConfig, FlatObject,
+    HookContext, HookOutcome, InMemoryGraphStore, MutationEvent, MutationKind, NeighborQuery,
+    NodeQuery, NodeRecord, RedCoreGraphStore, SaturationConfig, SaturationProgram, StatementQuery,
+    StatementRecord, HAS_OBJECT, HAS_SUBJECT, SATURATION_DERIVED_STATEMENT_LABEL,
+    SATURATION_SHARED_RULE_IDS, STATEMENT_LABEL,
 };
 use serde_json::{json, Value};
 
@@ -276,6 +277,94 @@ fn materialization_is_idempotent_and_marks_derived_artifacts_quarantined() {
     assert!(derived_nodes
         .iter()
         .all(|node| node.properties.get("field_provenance").is_some()));
+}
+
+#[test]
+fn saturation_reads_asserted_statement_hyperedges_as_facts() {
+    let mut store = InMemoryGraphStore::new();
+    for id in ["a", "b", "c"] {
+        store.upsert_node(object(id)).unwrap();
+    }
+    let ab = StatementRecord::assert(
+        "a",
+        "claim_dependency",
+        "b",
+        json!({ "confidence": 1.0, "justification_type": "dependency" }),
+    );
+    let bc = StatementRecord::assert(
+        "b",
+        "claim_dependency",
+        "c",
+        json!({ "confidence": 1.0, "justification_type": "dependency" }),
+    );
+    write_statement(&mut store, ab.clone(), false).unwrap();
+    write_statement(&mut store, bc, false).unwrap();
+
+    let facts = facts_from_subgraph(&store, &[]);
+    assert!(facts
+        .facts
+        .iter()
+        .any(|fact| fact["relation"] == json!("claim_dependency") && fact["fact_id"] == ab.id));
+    let closure = run_saturation(facts, &SaturationProgram::default());
+    let stmt = support_stmt(&closure, "a", "c");
+
+    assert_eq!(stmt.attributes["path_length"], json!(2));
+}
+
+#[test]
+fn saturation_materializes_statement_hypernodes_and_flatten_view() {
+    let mut store = InMemoryGraphStore::new();
+    for id in ["a", "b", "d"] {
+        store.upsert_node(object(id)).unwrap();
+    }
+    for edge in [
+        dep_edge("dep:ab", "a", "b", 0.5),
+        dep_edge("dep:bd", "b", "d", 0.8),
+    ] {
+        store.upsert_edge(edge).unwrap();
+    }
+    let closure = run_saturation(
+        facts_from_subgraph(&store, &[]),
+        &SaturationProgram::default(),
+    );
+    materialize_closure(
+        &mut store,
+        closure,
+        SaturationConfig {
+            computed_at: 11,
+            ..SaturationConfig::default()
+        },
+    )
+    .unwrap();
+
+    let derived = derived_node_by_subject(&store, "a", "d").expect("a->d statement");
+    assert!(derived.labels.iter().any(|label| label == STATEMENT_LABEL));
+    assert!(store
+        .neighbors(NeighborQuery::out(&derived.id).with_edge_type(HAS_SUBJECT))
+        .into_iter()
+        .any(|hit| hit.node_id == "a"));
+    assert!(store
+        .neighbors(NeighborQuery::out(&derived.id).with_edge_type(HAS_OBJECT))
+        .into_iter()
+        .any(|hit| hit.node_id == "d"));
+
+    let triples = rustyred_thg_core::flatten_statements(
+        &store,
+        StatementQuery::subject("a").with_relation("support_reachable"),
+    );
+    let triple = triples
+        .iter()
+        .find(|triple| triple.object == FlatObject::Entity("d".to_string()))
+        .expect("flattened a support_reachable d triple");
+    assert!((triple.confidence.value() - 0.36).abs() < 1e-9);
+    assert_eq!(
+        triple
+            .provenance
+            .as_ref()
+            .expect("statement provenance")
+            .dependency_fact_ids,
+        vec!["dep:ab", "dep:bd"]
+    );
 }
 
 #[test]

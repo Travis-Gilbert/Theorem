@@ -5,7 +5,7 @@ This file briefs coding agents working in this repository. CLAUDE.md carries the
 ## Start of every session
 
 - Run `git pull` first. Commits made through the GitHub MCP land on the remote, not on this local checkout, until you pull.
-- This is a Cargo workspace; cargo operates from the repo root, so start here. Let the spec point you at the specific crates and files for the task rather than discovering them by wandering.
+- There is no top-level Cargo workspace. Use `rustyredcore_THG/` for workspace Cargo commands, or the specific standalone app manifest when the task points at one.
 
 ## The harness (Theorems-Harness V2)
 

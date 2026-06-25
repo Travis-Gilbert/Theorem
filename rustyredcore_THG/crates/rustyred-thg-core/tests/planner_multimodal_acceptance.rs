@@ -185,8 +185,8 @@ impl ModalityResolver for InMemoryModality {
             .iter()
             .map(|(id, s)| (id.clone(), tokenize(s)))
             .collect::<BTreeMap<_, _>>();
-        let avg = (docs.values().map(Vec::len).sum::<usize>() as f32 / docs.len().max(1) as f32)
-            .max(1.0);
+        let avg =
+            (docs.values().map(Vec::len).sum::<usize>() as f32 / docs.len().max(1) as f32).max(1.0);
         let n = docs.len() as f32;
         let mut rows = Vec::new();
         for (id, doc_tokens) in &docs {
@@ -353,7 +353,11 @@ fn id_order(result: &rustyred_thg_core::QueryResult, field: &str) -> Vec<String>
         .collect()
 }
 
-fn run(store: &RelationalStore, resolver: &InMemoryModality, query: QueryIr) -> rustyred_thg_core::QueryResult {
+fn run(
+    store: &RelationalStore,
+    resolver: &InMemoryModality,
+    query: QueryIr,
+) -> rustyred_thg_core::QueryResult {
     execute_query_with_resolver(store, query, resolver).unwrap()
 }
 
@@ -576,7 +580,9 @@ fn two_ranker_rrf_fusion_matches_reference() {
         .vector_knn("docs", "embedding", &[1.0, 0.0], None, 3)
         .unwrap()
         .rows;
-    let text_list = modality.text_rank("docs", "body", "alpha", None, 3).unwrap();
+    let text_list = modality
+        .text_rank("docs", "body", "alpha", None, 3)
+        .unwrap();
     let reference = reciprocal_rank_fusion(&[vector_list, text_list], 60.0);
 
     assert_eq!(id_order(&result, "d.id"), reference);
@@ -657,7 +663,10 @@ fn expand_rank_orders_by_hop_distance() {
     );
 
     // a (1 hop) closer than b (2) closer than c (3); all are label == doc.
-    assert_eq!(id_order(&result, "n.id"), vec!["node:a", "node:b", "node:c"]);
+    assert_eq!(
+        id_order(&result, "n.id"),
+        vec!["node:a", "node:b", "node:c"]
+    );
     assert!(result
         .trace
         .rankers
@@ -727,7 +736,10 @@ fn geo_overapprox_is_residually_exact() {
             .upsert_row(scalar_row(
                 "places",
                 id,
-                &[("lat", ScalarValue::F64(lat)), ("lon", ScalarValue::F64(lon))],
+                &[
+                    ("lat", ScalarValue::F64(lat)),
+                    ("lon", ScalarValue::F64(lon)),
+                ],
             ))
             .unwrap();
         modality.coord("places", "geo", id, lat, lon);
@@ -887,7 +899,11 @@ fn cascade_demotes_undercut_below_supported_against_rrf() {
     assert_eq!(id_order(&trust_first, "d.id"), vec!["doc:b", "doc:a"]);
     assert_eq!(trust_first.trace.fusion, "cascade");
     assert_eq!(
-        trust_first.trace.cascade_rule_order.first().map(String::as_str),
+        trust_first
+            .trace
+            .cascade_rule_order
+            .first()
+            .map(String::as_str),
         Some("epistemic_status")
     );
     // The trace explains it: doc:b's EpistemicStatus bucket beats doc:a's.

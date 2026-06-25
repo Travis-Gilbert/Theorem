@@ -12,7 +12,7 @@ use crate::agent_binding::{
 };
 use crate::types::Payload;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;

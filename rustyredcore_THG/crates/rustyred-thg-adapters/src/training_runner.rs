@@ -211,10 +211,12 @@ pub fn seed_hot_temporal_fixture(
 ) -> ThgResult<HotTemporalFixtureResult> {
     let mut store = open_training_store(data_dir)?;
     let tenant_id = tenant_id.trim().to_string();
-    let node_ids = ["hot:a", "hot:b", "hot:c", "hot:d", "hot:e", "hot:f", "hot:g"]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let node_ids = [
+        "hot:a", "hot:b", "hot:c", "hot:d", "hot:e", "hot:f", "hot:g",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
     let mut mutations = Vec::new();
     for (idx, node_id) in node_ids.iter().enumerate() {
         mutations.push(GraphMutation::NodeUpsert(NodeRecord::new(

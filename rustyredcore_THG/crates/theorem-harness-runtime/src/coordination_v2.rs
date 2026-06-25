@@ -179,7 +179,13 @@ pub fn resolve_task_ref(input: &TaskRefInput) -> TaskRef {
     );
 
     let canonical_room_id = canonical_room_for(&repo, &branch, &workstream, &spec_tokens);
-    let confidence = confidence_for(&repo, &branch, &workstream, &spec_tokens, &canonical_room_id);
+    let confidence = confidence_for(
+        &repo,
+        &branch,
+        &workstream,
+        &spec_tokens,
+        &canonical_room_id,
+    );
     let aliases = derive_aliases(
         &tenant_slug,
         &task_ref_id,
@@ -283,7 +289,10 @@ fn derive_aliases(
         candidates.push((format!("repo:{}", repo_leaf_slug(repo)), "repo-room"));
     }
     if !branch.is_empty() {
-        candidates.push((format!("branch:{}", slugify_room_part(branch)), "branch-room"));
+        candidates.push((
+            format!("branch:{}", slugify_room_part(branch)),
+            "branch-room",
+        ));
     }
     if !workstream.is_empty() {
         candidates.push((format!("task:{workstream}"), "workstream-room"));
@@ -296,7 +305,9 @@ fn derive_aliases(
     let mut aliases = Vec::new();
     for (from_room_id, reason) in candidates {
         let from_room_id = from_room_id.trim().to_string();
-        if from_room_id.is_empty() || from_room_id == canonical || !seen.insert(from_room_id.clone())
+        if from_room_id.is_empty()
+            || from_room_id == canonical
+            || !seen.insert(from_room_id.clone())
         {
             continue;
         }
@@ -595,10 +606,8 @@ pub fn ping_targets_checkout(ping: &ActorPing, actor: &str, branch: &str, worktr
     if normalize_actor_id(&ping.target_actor) != normalize_actor_id(actor) {
         return false;
     }
-    let branch_ok =
-        ping.target_branch.is_empty() || ping.target_branch == branch.trim();
-    let worktree_ok =
-        ping.target_worktree.is_empty() || ping.target_worktree == worktree.trim();
+    let branch_ok = ping.target_branch.is_empty() || ping.target_branch == branch.trim();
+    let worktree_ok = ping.target_worktree.is_empty() || ping.target_worktree == worktree.trim();
     branch_ok && worktree_ok
 }
 
@@ -622,7 +631,9 @@ pub fn read_open_pings_for_actor<S: CoordinationStore>(
             ping.status != PING_CONSUMED
                 && normalize_actor_id(&ping.target_actor) == target_actor
                 && checkout
-                    .map(|(branch, worktree)| ping_targets_checkout(ping, &target_actor, branch, worktree))
+                    .map(|(branch, worktree)| {
+                        ping_targets_checkout(ping, &target_actor, branch, worktree)
+                    })
                     .unwrap_or(true)
         })
         .collect();
@@ -927,8 +938,7 @@ fn resolve_contradictions_for_claim<S: CoordinationStore>(
 ) -> CoordinationResult<()> {
     for contradiction in read_contradictions(store, tenant_slug, task_ref_id)? {
         if contradiction.resolved
-            || (contradiction.left_claim_id != claim_id
-                && contradiction.right_claim_id != claim_id)
+            || (contradiction.left_claim_id != claim_id && contradiction.right_claim_id != claim_id)
         {
             continue;
         }
@@ -1137,8 +1147,10 @@ pub fn room_digest<S: CoordinationStore>(
     if aliases.is_empty() {
         aliases = task_ref.aliases.clone();
     }
-    let (active_actors, stale_actors) = digest_actors(store, &tenant_slug, &canonical, &now, stale_after_ms)?;
-    let pending_pings = read_pending_pings_for_task(store, &tenant_slug, &task_ref.task_ref_id, limit)?;
+    let (active_actors, stale_actors) =
+        digest_actors(store, &tenant_slug, &canonical, &now, stale_after_ms)?;
+    let pending_pings =
+        read_pending_pings_for_task(store, &tenant_slug, &task_ref.task_ref_id, limit)?;
     let related_messages = read_related_events(store, &tenant_slug, &canonical, limit)?;
     let contradictions = read_open_contradictions(store, &tenant_slug, &task_ref.task_ref_id)?;
 
@@ -1319,9 +1331,7 @@ pub fn write_coordination_manifest(
 }
 
 /// Read the manifest if present.
-pub fn read_coordination_manifest(
-    worktree_dir: &Path,
-) -> io::Result<Option<CoordinationManifest>> {
+pub fn read_coordination_manifest(worktree_dir: &Path) -> io::Result<Option<CoordinationManifest>> {
     let path = coordination_manifest_path(worktree_dir);
     match std::fs::read_to_string(&path) {
         Ok(body) => {
@@ -1338,7 +1348,10 @@ pub fn read_coordination_manifest(
 // Node / edge persistence.
 // ---------------------------------------------------------------------------
 
-fn persist_room_alias<S: CoordinationStore>(store: &mut S, alias: &RoomAlias) -> CoordinationResult<()> {
+fn persist_room_alias<S: CoordinationStore>(
+    store: &mut S,
+    alias: &RoomAlias,
+) -> CoordinationResult<()> {
     ensure_room_exists(
         store,
         &alias.tenant_slug,
@@ -1381,14 +1394,26 @@ fn persist_related_event<S: CoordinationStore>(
         &event.created_at,
     )?;
     let node = NodeRecord::new(
-        related_event_node_id(&event.tenant_slug, &event.canonical_room_id, &event.event_id),
+        related_event_node_id(
+            &event.tenant_slug,
+            &event.canonical_room_id,
+            &event.event_id,
+        ),
         ["HarnessCoordination", "CoordinationRelatedEvent"],
         serialize(event)?,
     );
     upsert_node_if_changed(store, node)?;
     let edge = EdgeRecord::new(
-        related_event_edge_id(&event.tenant_slug, &event.canonical_room_id, &event.event_id),
-        related_event_node_id(&event.tenant_slug, &event.canonical_room_id, &event.event_id),
+        related_event_edge_id(
+            &event.tenant_slug,
+            &event.canonical_room_id,
+            &event.event_id,
+        ),
+        related_event_node_id(
+            &event.tenant_slug,
+            &event.canonical_room_id,
+            &event.event_id,
+        ),
         "COORDINATION_RELATED_OF",
         crate::coordination::coordination_room_node_id(
             &event.tenant_slug,
@@ -1937,9 +1962,12 @@ mod tests {
         assert_eq!(open[0].ping_id, ping.ping_id);
         assert_eq!(open[0].status, PING_SEEN);
 
-        let consumed = consume_ping(&mut store, TENANT, &ping.ping_id).unwrap().unwrap();
+        let consumed = consume_ping(&mut store, TENANT, &ping.ping_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(consumed.status, PING_CONSUMED);
-        let after = read_open_pings_for_actor(&mut store, TENANT, "codex", None, false, 10).unwrap();
+        let after =
+            read_open_pings_for_actor(&mut store, TENANT, "codex", None, false, 10).unwrap();
         assert!(after.is_empty());
 
         // info urgency is not a ping.
@@ -1975,15 +2003,30 @@ mod tests {
         )
         .unwrap();
 
-        let intended =
-            read_open_pings_for_actor(&mut store, TENANT, "codex", Some(("branch-a", "/work/a")), false, 10)
-                .unwrap();
+        let intended = read_open_pings_for_actor(
+            &mut store,
+            TENANT,
+            "codex",
+            Some(("branch-a", "/work/a")),
+            false,
+            10,
+        )
+        .unwrap();
         assert_eq!(intended.len(), 1);
 
-        let other_checkout =
-            read_open_pings_for_actor(&mut store, TENANT, "codex", Some(("branch-b", "/work/b")), false, 10)
-                .unwrap();
-        assert!(other_checkout.is_empty(), "a different checkout is not the target");
+        let other_checkout = read_open_pings_for_actor(
+            &mut store,
+            TENANT,
+            "codex",
+            Some(("branch-b", "/work/b")),
+            false,
+            10,
+        )
+        .unwrap();
+        assert!(
+            other_checkout.is_empty(),
+            "a different checkout is not the target"
+        );
     }
 
     // TRR-007 ---------------------------------------------------------------
@@ -2029,7 +2072,12 @@ mod tests {
             store.get_edge(&edge_id).is_some() || store.get_edge(&alt_id).is_some(),
             "a CONTRADICTS edge must exist between the two claims"
         );
-        assert_eq!(read_open_contradictions(&store, TENANT, task).unwrap().len(), 1);
+        assert_eq!(
+            read_open_contradictions(&store, TENANT, task)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // codex changes its mind to 3000: its old claim is superseded and the
         // contradiction resolves; no re-alert.
@@ -2047,7 +2095,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(read_open_contradictions(&store, TENANT, task).unwrap().is_empty());
+        assert!(read_open_contradictions(&store, TENANT, task)
+            .unwrap()
+            .is_empty());
     }
 
     // TRR-004 ---------------------------------------------------------------
@@ -2180,9 +2230,12 @@ mod tests {
             worktree: dir.to_string_lossy().to_string(),
             ..Default::default()
         };
-        manifest
-            .actors
-            .insert("codex".to_string(), ManifestActor { role: "primary".to_string() });
+        manifest.actors.insert(
+            "codex".to_string(),
+            ManifestActor {
+                role: "primary".to_string(),
+            },
+        );
         write_coordination_manifest(&dir, &manifest).unwrap();
 
         // A later head reads the canonical room without guessing.
@@ -2199,7 +2252,9 @@ mod tests {
         };
         update.actors.insert(
             "claude-code".to_string(),
-            ManifestActor { role: "frontend".to_string() },
+            ManifestActor {
+                role: "frontend".to_string(),
+            },
         );
         write_coordination_manifest(&dir, &update).unwrap();
         let merged = read_coordination_manifest(&dir).unwrap().unwrap();
@@ -2313,8 +2368,14 @@ mod tests {
 
         assert_eq!(digest.canonical_room_id, canonical);
         assert!(!digest.aliases.is_empty(), "aliases should be registered");
-        assert!(digest.active_actors.iter().any(|a| a.actor_id == "claude-code"));
-        assert!(digest.stale_actors.iter().any(|a| a.actor_id == "stale-bot"));
+        assert!(digest
+            .active_actors
+            .iter()
+            .any(|a| a.actor_id == "claude-code"));
+        assert!(digest
+            .stale_actors
+            .iter()
+            .any(|a| a.actor_id == "stale-bot"));
         assert_eq!(digest.pending_pings.len(), 1);
         assert_eq!(digest.related_messages.len(), 1);
         assert_eq!(digest.contradictions.len(), 1);
@@ -2433,13 +2494,13 @@ mod tests {
             .unwrap();
         }
         let store = RedCoreGraphStore::open(
-                &dir,
-                RedCoreOptions {
-                    durability: RedCoreDurability::AofAlways,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            &dir,
+            RedCoreOptions {
+                durability: RedCoreDurability::AofAlways,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let aliases = read_room_aliases(&store, TENANT, &task_ref.canonical_room_id).unwrap();
         assert!(!aliases.is_empty());
         let inbox = read_related_events(&store, TENANT, &task_ref.canonical_room_id, 10).unwrap();

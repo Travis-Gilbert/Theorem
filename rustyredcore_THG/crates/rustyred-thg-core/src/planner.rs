@@ -51,12 +51,18 @@ pub struct QueryIr {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum FusionPolicy {
-    Rrf { k: usize },
-    Weighted { weights: BTreeMap<String, f32> },
+    Rrf {
+        k: usize,
+    },
+    Weighted {
+        weights: BTreeMap<String, f32>,
+    },
     /// Ordered ranking-rule cascade (SPEC-RUSTYRED-RANKING-CASCADE): bucket-sort by each rule in
     /// turn, later rules only breaking ties left by earlier ones. The epistemic rules are first
     /// class and reorderable, so trust can rank ahead of relevance.
-    Cascade { rules: Vec<RankingRule> },
+    Cascade {
+        rules: Vec<RankingRule>,
+    },
 }
 
 impl Default for FusionPolicy {
@@ -532,8 +538,13 @@ fn score_rankers(
             ));
         };
         let rank_k = rank_k_for_predicate(predicate, k, candidate_count);
-        let outcome =
-            method.rank(&relation_query.relation, predicate, candidates, rank_k, resolver)?;
+        let outcome = method.rank(
+            &relation_query.relation,
+            predicate,
+            candidates,
+            rank_k,
+            resolver,
+        )?;
         // The execution strategy and overfetch round count are reported by the resolver: the trace
         // records what actually ran rather than a fixed label.
         if let Some(strategy) = outcome.strategy {
@@ -596,14 +607,16 @@ fn cascade_scores(
     }
 
     let query = cascade_query_context(rank_predicates);
-    let text_column = rank_predicates.iter().find_map(|predicate| match predicate {
-        Predicate::TextMatch {
-            column,
-            mode: PredicateMode::Rank,
-            ..
-        } => Some(column.as_str()),
-        _ => None,
-    });
+    let text_column = rank_predicates
+        .iter()
+        .find_map(|predicate| match predicate {
+            Predicate::TextMatch {
+                column,
+                mode: PredicateMode::Rank,
+                ..
+            } => Some(column.as_str()),
+            _ => None,
+        });
 
     let relation = store.relation(&relation_query.relation);
     let candidates = candidate_ids
@@ -614,10 +627,10 @@ fn cascade_scores(
             candidate.bm25_score = text.get(id.as_str()).copied();
             candidate.graph_hops = expand.get(id.as_str()).map(|score| score_to_hops(*score));
             if let Some(row) = relation.and_then(|relation| relation.get(&id)) {
-                candidate.acceptance_status =
-                    str_col(row, "acceptance_status").unwrap_or_default();
-                candidate.epistemic_weight =
-                    f64_col(row, "epistemic_weight").map(|v| v as f32).unwrap_or(1.0);
+                candidate.acceptance_status = str_col(row, "acceptance_status").unwrap_or_default();
+                candidate.epistemic_weight = f64_col(row, "epistemic_weight")
+                    .map(|v| v as f32)
+                    .unwrap_or(1.0);
                 candidate.source_reliability = f64_col(row, "source_reliability")
                     .or_else(|| f64_col(row, "justification_prior"))
                     .map(|v| v as f32);
@@ -954,9 +967,14 @@ fn row_matches(row: &RelationalRow, predicate: &Predicate) -> bool {
                     max_lon,
                 },
             ..
-        } => crate::ranking::row_coords(row, column, lat_property.as_deref(), lon_property.as_deref())
-            .map(|(lat, lon)| lat >= *min_lat && lat <= *max_lat && lon >= *min_lon && lon <= *max_lon)
-            .unwrap_or(false),
+        } => crate::ranking::row_coords(
+            row,
+            column,
+            lat_property.as_deref(),
+            lon_property.as_deref(),
+        )
+        .map(|(lat, lon)| lat >= *min_lat && lat <= *max_lat && lon >= *min_lon && lon <= *max_lon)
+        .unwrap_or(false),
         Predicate::TextMatch {
             column,
             query,
