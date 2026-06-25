@@ -79,6 +79,15 @@ const DEFINITIONS: SpaceTypeDefinition[] = [
     defaultEditor: CodeMirrorEditorSlot,
   },
   {
+    typeKey: "code-workspace",
+    defaultLabel: "Workspace",
+    icon: Code2,
+    href: "/workspace",
+    capabilities: ["view", "editor", "agent"],
+    view: EmptySpaceView,
+    defaultEditor: CodeMirrorEditorSlot,
+  },
+  {
     typeKey: "notes",
     defaultLabel: "Notes",
     icon: FileText,

@@ -292,7 +292,7 @@ export function DynamicIsland() {
                 <Paperclip size={15} />
               </button>
               <button
-                className="rounded-lg bg-ox p-1.5 text-white hover:bg-[#73241f]"
+                className="rounded-lg bg-ox p-1.5 text-white hover:bg-ox-hover"
                 aria-label="Submit"
                 onClick={() => {
                   const r = results[activeIndex] ?? results[0];

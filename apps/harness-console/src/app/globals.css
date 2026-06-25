@@ -34,6 +34,7 @@
   --line: rgba(17, 17, 19, 0.16); /* black hairline outlines, 1px */
   --line-strong: rgba(17, 17, 19, 0.28);
   --ox: #a8301e; /* the single accent, oxblood. 6.6:1 on white. */
+  --ox-hover: #73241f; /* active primary hover, still white text AA */
   --ox-tint: rgba(168, 48, 30, 0.08); /* faint accent wash for active nav */
   --ox-ring: rgba(168, 48, 30, 0.4); /* focus ring */
   --live: #5f7d4f; /* the single status color, calm green */
@@ -96,6 +97,7 @@
   --line: rgba(237, 237, 240, 0.16);
   --line-strong: rgba(237, 237, 240, 0.28);
   --ox: #c8554a; /* lighten oxblood to hold contrast on dark */
+  --ox-hover: #a8301e;
   --ox-tint: rgba(200, 85, 74, 0.12);
   --ox-ring: rgba(200, 85, 74, 0.5);
   --live: #8bb277;
@@ -133,6 +135,7 @@
   --line: rgba(237, 237, 240, 0.14);
   --line-strong: rgba(237, 237, 240, 0.26);
   --ox: #d2655a;
+  --ox-hover: #a8301e;
   --ox-tint: rgba(210, 101, 90, 0.18);
   --ox-ring: rgba(210, 101, 90, 0.55);
   color-scheme: dark;
@@ -147,6 +150,7 @@
   --color-faint: var(--faint);
   --color-line: var(--line);
   --color-ox: var(--ox);
+  --color-ox-hover: var(--ox-hover);
   --color-ox-tint: var(--ox-tint);
   --color-live: var(--live);
   --color-warn: var(--warn);

@@ -10,7 +10,7 @@ import { useMediaQuery } from "@/lib/hooks/useMediaQuery";
 // Canvas and Inbox are full-bleed instruments: they own the whole content area
 // and manage their own scrolling, rather than sitting in the centered reading
 // column the document surfaces use.
-const FULL_BLEED = ["/canvas", "/inbox"];
+const FULL_BLEED = ["/canvas", "/inbox", "/workspace"];
 
 export function Shell({ children }: { children: React.ReactNode }) {
   const narrow = useMediaQuery("(max-width: 820px)");
