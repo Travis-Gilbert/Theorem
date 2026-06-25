@@ -15,6 +15,11 @@ rustyred-rerank = { path = "../rustyred-rerank" }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 serde_json = "1.0"
 syn = { version = "2", features = ["full", "visit"] }
+tree-sitter = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
 
 [features]
 default = []

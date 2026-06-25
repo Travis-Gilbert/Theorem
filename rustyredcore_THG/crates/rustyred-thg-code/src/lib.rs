@@ -32,6 +32,7 @@ mod ensure;
 mod ingest_jobs;
 mod map_projection;
 mod repo_fetch;
+mod tree_sitter_extract;
 
 pub use code_embed_hook::{
     incremental_embed_hook, incremental_embed_hook_with_embedder, EMBEDDING_DIM,
@@ -100,6 +101,11 @@ const EDGE_NAME_BUCKET_CAP: usize = 24;
 const EDGE_TARGETS_PER_NAME_CAP: usize = 8;
 /// Files parsed per progress/budget checkpoint during ingest.
 const PARSE_CHUNK_FILES: usize = 200;
+/// Dense/generated files can contain hundreds of shallow declarations where
+/// the line extractor is both cheaper and semantically equivalent for graph
+/// ranking. Tree-sitter stays on for normal source files and falls back here
+/// to protect large-repo ingest latency.
+const TREE_SITTER_SYMBOL_LINE_CAP: usize = 80;
 
 #[derive(Clone)]
 pub struct CodeIndexRuntime {
@@ -251,6 +257,10 @@ impl RustyRedPlugin for CodeParsingPlugin {
 
     fn capabilities(&self) -> Vec<PluginCapability> {
         vec![
+            PluginCapability {
+                kind: PluginCapabilityKind::Encoder,
+                name: "code.encoder.tree_sitter_tags".to_string(),
+            },
             PluginCapability {
                 kind: PluginCapabilityKind::Encoder,
                 name: "code.encoder.rust_syn".to_string(),
@@ -4070,7 +4080,12 @@ fn extract_symbols(
     language: &str,
     text: &str,
 ) -> Vec<IndexedSymbol> {
-    let mut symbols = extract_line_symbols(repo_id, file_id, file_path, language, text);
+    let mut symbols = if should_try_tree_sitter(language, text) {
+        tree_sitter_extract::extract_symbols(repo_id, file_id, file_path, language, text)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| extract_line_symbols(repo_id, file_id, file_path, language, text));
     if language == "rust" {
         let references = rust_reference_index(text);
         for symbol in &mut symbols {
@@ -4082,6 +4097,22 @@ fn extract_symbols(
         }
     }
     symbols
+}
+
+fn should_try_tree_sitter(language: &str, text: &str) -> bool {
+    if !matches!(language, "javascript" | "python" | "rust" | "typescript") {
+        return false;
+    }
+    let mut symbol_lines = 0usize;
+    for line in text.lines() {
+        if symbol_from_line(line.trim(), language).is_some() {
+            symbol_lines += 1;
+            if symbol_lines > TREE_SITTER_SYMBOL_LINE_CAP {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn extract_line_symbols(
@@ -4196,7 +4227,7 @@ fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<
                     name,
                     CALLS_SYMBOL,
                     "code:edge:symbol_call",
-                    "rust_ast_call",
+                    parser_call_evidence_kind(symbol),
                     config,
                 );
             }
@@ -4209,7 +4240,7 @@ fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<
                     name,
                     DEPENDS_ON_SYMBOL,
                     "code:edge:symbol_dependency",
-                    "rust_ast_dependency",
+                    parser_dependency_evidence_kind(symbol),
                     config,
                 );
             }
@@ -4236,6 +4267,22 @@ fn infer_symbol_call_edges(files: &[IndexedFile], config: &IngestConfig) -> Vec<
         }
     }
     edges
+}
+
+fn parser_call_evidence_kind(symbol: &IndexedSymbol) -> &'static str {
+    if symbol.language == "rust" {
+        "rust_ast_call"
+    } else {
+        "tree_sitter_call"
+    }
+}
+
+fn parser_dependency_evidence_kind(symbol: &IndexedSymbol) -> &'static str {
+    if symbol.language == "rust" {
+        "rust_ast_dependency"
+    } else {
+        "tree_sitter_dependency"
+    }
 }
 
 /// Split a symbol body into its distinct identifier tokens. Same character
@@ -6161,6 +6208,125 @@ mod tests {
     }
 
     #[test]
+    fn tree_sitter_ingest_extracts_multilingual_symbols_and_edges() {
+        let repo_dir = unique_dir("tree-sitter-repo");
+        fs::create_dir_all(repo_dir.join("src")).unwrap();
+        fs::write(
+            repo_dir.join("src/app.ts"),
+            "export interface SearchShape { query: string }\n\
+export function helperLen(query: string): number {\n    return query.length\n}\n\n\
+export const runSearch = (query: string): number => helperLen(query)\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("src/app.py"),
+            "class PythonAdapter:\n    pass\n\n\
+def normalize_query(query):\n    return query.strip()\n\n\
+def build_context(query):\n    return normalize_query(query)\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("src/widget.js"),
+            "class SearchWidget {\n  render() {\n    return makeLabel()\n  }\n}\n\n\
+function makeLabel() {\n  return 'ok'\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub struct SearchKernel {}\n\npub fn rust_entry() -> usize {\n    1\n}\n",
+        )
+        .unwrap();
+
+        let mut store = RedCoreGraphStore::memory();
+        let ingest = ingest_codebase_in_store(
+            &mut store,
+            IngestCodebaseInput {
+                tenant_id: "theorem".to_string(),
+                repo_path: repo_dir.display().to_string(),
+                repo_id: "repo:tree-sitter-fixture".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ingest.files_indexed, 4);
+
+        let symbols = store
+            .query_nodes(
+                NodeQuery::label(CODE_SYMBOL_LABEL)
+                    .with_property("tenant_id", json!("theorem"))
+                    .with_limit(100),
+            )
+            .unwrap();
+        for (name, language, kind) in [
+            ("SearchShape", "typescript", "interface"),
+            ("runSearch", "typescript", "function"),
+            ("PythonAdapter", "python", "class"),
+            ("build_context", "python", "function"),
+            ("SearchWidget", "javascript", "class"),
+            ("makeLabel", "javascript", "function"),
+            ("SearchKernel", "rust", "struct"),
+        ] {
+            assert!(
+                symbols.iter().any(|node| {
+                    node.properties.get("name").and_then(Value::as_str) == Some(name)
+                        && node.properties.get("language").and_then(Value::as_str) == Some(language)
+                        && node.properties.get("kind").and_then(Value::as_str) == Some(kind)
+                        && property_bool(&node.properties, "parser_backed")
+                }),
+                "missing parser-backed {language} {kind} {name}; symbols={:?}",
+                symbols
+                    .iter()
+                    .map(|node| (
+                        node.properties.get("name").and_then(Value::as_str),
+                        node.properties.get("language").and_then(Value::as_str),
+                        node.properties.get("kind").and_then(Value::as_str),
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let search = search_code_in_store(
+            &mut store,
+            SearchCodeInput {
+                tenant_id: "theorem".to_string(),
+                query: "runSearch".to_string(),
+                repo_id: ingest.repo_id.clone(),
+                limit: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(search.hits[0].name, "runSearch");
+        let explored = explore_code_in_store(
+            &mut store,
+            ExploreCodeInput {
+                tenant_id: "theorem".to_string(),
+                node_id: search.hits[0].node_id.clone(),
+                max_depth: 1,
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            explored.edges.iter().any(|edge| {
+                edge.edge_type == CALLS_SYMBOL
+                    && edge.from_name == "runSearch"
+                    && edge.to_name == "helperLen"
+                    && edge.evidence.contains("tree_sitter_call")
+            }),
+            "TypeScript Tree-sitter call edge: {:?}",
+            explored
+                .edges
+                .iter()
+                .map(|edge| (&edge.from_name, &edge.to_name, &edge.evidence))
+                .collect::<Vec<_>>()
+        );
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
     fn ingest_reports_stage_timings_language_stats_and_preread_skips() {
         let repo_dir = unique_dir("instrumented-repo");
         fs::create_dir_all(repo_dir.join("src")).unwrap();
@@ -7712,6 +7878,10 @@ pub fn caller() -> usize { helper_len("abc") }
             .operations
             .iter()
             .any(|operation| operation.operation == "context_pack" && operation.writes_graph));
+        assert!(manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.name == "code.encoder.tree_sitter_tags"));
         assert!(CodeParsingPlugin.manifest_json()["operations"]
             .as_array()
             .unwrap()
