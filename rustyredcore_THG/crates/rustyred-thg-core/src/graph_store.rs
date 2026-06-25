@@ -2414,6 +2414,10 @@ pub struct RedCoreGraphStore {
     // Tenant label stamped onto emitted events. Per-tenant embedders set this
     // when they open the store so events carry the right scope; empty by default.
     hook_tenant: String,
+    // Optional recorder used by embedders that maintain an external read mirror.
+    // When enabled around a hook batch, committed node/edge records are copied
+    // here after durable publication so the embedder can refresh incrementally.
+    recorded_committed_mutations: Option<Vec<GraphMutation>>,
 }
 
 #[derive(Debug)]
@@ -2453,6 +2457,7 @@ impl RedCoreGraphStore {
             hook_emitter: None,
             hook_emit_depth: 0,
             hook_tenant: String::new(),
+            recorded_committed_mutations: None,
         }
     }
 
@@ -2476,6 +2481,7 @@ impl RedCoreGraphStore {
             hook_emitter: None,
             hook_emit_depth: 0,
             hook_tenant: String::new(),
+            recorded_committed_mutations: None,
         };
         engine.recover()?;
         engine.last_recovery_ok = true;
@@ -2559,6 +2565,48 @@ impl RedCoreGraphStore {
 
     pub fn graph_snapshot(&self) -> GraphSnapshot {
         self.store.snapshot()
+    }
+
+    pub fn start_recording_committed_mutations(&mut self) {
+        self.recorded_committed_mutations = Some(Vec::new());
+    }
+
+    pub fn take_recorded_committed_mutations(&mut self) -> Option<GraphMutationBatch> {
+        self.recorded_committed_mutations
+            .take()
+            .map(GraphMutationBatch::new)
+    }
+
+    fn record_committed_redcore_mutations(&mut self, mutations: &[RedCoreMutation]) {
+        if self.recorded_committed_mutations.is_none() {
+            return;
+        }
+        let mut recorded = Vec::new();
+        for mutation in mutations {
+            Self::collect_recordable_mutations(mutation, &mut recorded);
+        }
+        if let Some(recorder) = &mut self.recorded_committed_mutations {
+            recorder.extend(recorded);
+        }
+    }
+
+    fn collect_recordable_mutations(mutation: &RedCoreMutation, out: &mut Vec<GraphMutation>) {
+        match mutation {
+            RedCoreMutation::NodeUpsert(node) => {
+                out.push(GraphMutation::NodeUpsert(node.clone()));
+            }
+            RedCoreMutation::EdgeUpsert(edge) => {
+                out.push(GraphMutation::EdgeUpsert(edge.clone()));
+            }
+            RedCoreMutation::Batch(mutations) => {
+                for mutation in mutations {
+                    Self::collect_recordable_mutations(mutation, out);
+                }
+            }
+            RedCoreMutation::VectorDesignation(_)
+            | RedCoreMutation::OrderedDesignation(_)
+            | RedCoreMutation::NodeDelete(_) => {}
+        }
     }
 
     // ---- Graph-level hooks (additive emit seam; see crate::hooks) -------
@@ -2819,6 +2867,7 @@ impl RedCoreGraphStore {
         }
 
         let graph_version = staged.stats().version;
+        let committed_mutations = durable_mutations.clone();
         let durable_mutation = if durable_mutations.len() == 1 {
             durable_mutations
                 .pop()
@@ -2834,6 +2883,7 @@ impl RedCoreGraphStore {
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
         }
+        self.record_committed_redcore_mutations(&committed_mutations);
 
         // Post-commit, post-publish: the batch is durable and visible. Emit is
         // non-blocking and outside the commit critical section.
@@ -2862,33 +2912,40 @@ impl RedCoreGraphStore {
         batch: GraphMutationBatch,
     ) -> GraphStoreResult<GraphTransaction> {
         let emit_hooks = self.hook_emitter.is_some();
-        let plan = self.prepare_commit_plan(batch, emit_hooks)?;
-        self.persist_delta_before_publish(
-            txn_id,
-            plan.graph_version,
-            plan.durable_mutation.clone(),
-        )?;
+        let RedCoreCommitPlan {
+            graph_version,
+            durable_mutation,
+            publish_mutations,
+            writes,
+            pending_events,
+        } = self.prepare_commit_plan(batch, emit_hooks)?;
+        self.persist_delta_before_publish(txn_id, graph_version, durable_mutation)?;
 
-        for mutation in plan.publish_mutations {
+        for mutation in &publish_mutations {
             match mutation {
-                RedCoreMutation::NodeUpsert(node) => self.store.apply_recovered_node(node)?,
-                RedCoreMutation::EdgeUpsert(edge) => self.store.apply_recovered_edge(edge)?,
+                RedCoreMutation::NodeUpsert(node) => {
+                    self.store.apply_recovered_node(node.clone())?;
+                }
+                RedCoreMutation::EdgeUpsert(edge) => {
+                    self.store.apply_recovered_edge(edge.clone())?;
+                }
                 _ => {}
             }
         }
         self.last_txn_id = txn_id;
+        self.record_committed_redcore_mutations(&publish_mutations);
 
-        if emit_hooks && !plan.pending_events.is_empty() {
+        if emit_hooks && !pending_events.is_empty() {
             let committed_at_ms = now_ms().max(0) as u64;
-            for (kind, id, labels, changed_props) in plan.pending_events {
+            for (kind, id, labels, changed_props) in pending_events {
                 self.emit_hook_event(kind, id, labels, changed_props, committed_at_ms);
             }
         }
 
         Ok(GraphTransaction {
             txn_id,
-            graph_version: plan.graph_version,
-            writes: plan.writes,
+            graph_version,
+            writes,
         })
     }
 
@@ -6517,6 +6574,48 @@ mod tests {
         assert_eq!(transaction.writes.len(), 3);
         assert_eq!(store.status().last_txn_id, 1);
         assert_eq!(store.verify().unwrap().ok, true);
+    }
+
+    #[test]
+    fn redcore_records_committed_mutations_for_external_mirrors() {
+        let mut store = RedCoreGraphStore::memory();
+        store.start_recording_committed_mutations();
+
+        store
+            .commit_batch(GraphMutationBatch::new([
+                GraphMutation::NodeUpsert(NodeRecord::new("node:a", ["File"], json!({}))),
+                GraphMutation::NodeUpsert(NodeRecord::new("node:b", ["File"], json!({}))),
+                GraphMutation::EdgeUpsert(EdgeRecord::new(
+                    "edge:ab",
+                    "node:a",
+                    "IMPORTS",
+                    "node:b",
+                    json!({}),
+                )),
+            ]))
+            .unwrap();
+
+        let recorded = store
+            .take_recorded_committed_mutations()
+            .expect("recording session returns a batch");
+        assert_eq!(recorded.mutations.len(), 3);
+        match &recorded.mutations[0] {
+            GraphMutation::NodeUpsert(node) => {
+                assert_eq!(node.id, "node:a");
+                assert_eq!(node.version, 1);
+                assert!(node.content_hash.is_some());
+            }
+            GraphMutation::EdgeUpsert(_) => panic!("first recorded mutation should be node:a"),
+        }
+        match &recorded.mutations[2] {
+            GraphMutation::EdgeUpsert(edge) => {
+                assert_eq!(edge.id, "edge:ab");
+                assert_eq!(edge.version, 3);
+                assert!(edge.content_hash.is_some());
+            }
+            GraphMutation::NodeUpsert(_) => panic!("third recorded mutation should be edge:ab"),
+        }
+        assert!(store.take_recorded_committed_mutations().is_none());
     }
 
     #[test]

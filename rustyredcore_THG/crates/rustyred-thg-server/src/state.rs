@@ -1035,23 +1035,94 @@ impl RedCoreTenantExecutor {
         })
     }
 
-    /// Run a coalesced hook batch under the writer lock, then refresh the read
-    /// mirror. Hook handlers write through the writer (bypassing `commit_batch`'s
-    /// own snapshot refresh), so the committed snapshot must be rebuilt here for
-    /// the derived structure to be visible to reads. Off the commit critical
-    /// path; never unwraps a lock (fails open on poison).
+    /// Run a coalesced hook batch under the writer lock, then advance the read
+    /// mirror with the hook's committed node/edge records. Hook handlers write
+    /// through the writer, bypassing `RedCoreTenantExecutor::commit_batch`, so
+    /// the writer records committed mutations while this bridge is active. Rare
+    /// hook writes that cannot be represented as node/edge upserts fall back to a
+    /// full refresh. Never unwraps a lock (fails open on poison).
     fn run_hook_batch(&self, f: &mut dyn FnMut(&mut RedCoreGraphStore)) -> bool {
         let mut writer = match self.writer.lock() {
             Ok(writer) => writer,
             Err(_) => return false,
         };
+        let before = writer.status();
+        writer.start_recording_committed_mutations();
         f(&mut writer);
-        if let Ok(snapshot) = InMemoryGraphStore::from_snapshot(writer.graph_snapshot()) {
-            if let Ok(mut guard) = self.committed_snapshot.write() {
-                *guard = snapshot;
+        let recorded = writer.take_recorded_committed_mutations();
+        let after = writer.status();
+        if let Some(batch) = recorded {
+            if !batch.mutations.is_empty() {
+                if let Err(error) = self.apply_committed_batch_or_refresh(&writer, batch) {
+                    tracing::warn!(
+                        error_code = %error.code,
+                        error_message = %error.message,
+                        "hook committed snapshot refresh failed"
+                    );
+                }
+            } else if (after.graph_version, after.last_txn_id)
+                != (before.graph_version, before.last_txn_id)
+            {
+                if let Err(error) = self.refresh_committed_snapshot_from_writer(&writer) {
+                    tracing::warn!(
+                        error_code = %error.code,
+                        error_message = %error.message,
+                        "hook changed RedCore without recordable mutations; full snapshot refresh failed"
+                    );
+                }
             }
         }
         true
+    }
+
+    fn refresh_committed_snapshot_from_writer(
+        &self,
+        writer: &RedCoreGraphStore,
+    ) -> GraphStoreResult<()> {
+        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
+        *self.committed_snapshot.write().map_err(|_| {
+            GraphStoreError::new(
+                "redcore_snapshot_lock_poisoned",
+                "RedCore committed snapshot lock poisoned",
+            )
+        })? = committed_snapshot;
+        Ok(())
+    }
+
+    fn apply_committed_batch_to_snapshot(&self, batch: GraphMutationBatch) -> GraphStoreResult<()> {
+        let mut snapshot = self.committed_snapshot.write().map_err(|_| {
+            GraphStoreError::new(
+                "redcore_snapshot_lock_poisoned",
+                "RedCore committed snapshot lock poisoned",
+            )
+        })?;
+        for mutation in batch.mutations {
+            match mutation {
+                GraphMutation::NodeUpsert(node) => {
+                    snapshot.upsert_node(node)?;
+                }
+                GraphMutation::EdgeUpsert(edge) => {
+                    snapshot.upsert_edge(edge)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_committed_batch_or_refresh(
+        &self,
+        writer: &RedCoreGraphStore,
+        batch: GraphMutationBatch,
+    ) -> GraphStoreResult<()> {
+        if let Err(error) = self.apply_committed_batch_to_snapshot(batch) {
+            tracing::warn!(
+                error_code = %error.code,
+                error_message = %error.message,
+                "incremental committed snapshot refresh failed; rebuilding from writer"
+            );
+            self.refresh_committed_snapshot_from_writer(writer)?;
+        }
+        Ok(())
     }
 
     /// Attach a hook dispatcher to this tenant store: start the worker over the
@@ -1123,16 +1194,22 @@ impl RedCoreTenantExecutor {
     }
 
     pub fn commit_batch(&self, batch: GraphMutationBatch) -> GraphStoreResult<GraphTransaction> {
+        let fallback_batch = batch.clone();
         let mut writer = self.lock_writer()?;
         self.enforce_tenant_memory_quota(&writer, &batch)?;
-        let transaction = writer.commit_batch(batch)?;
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
-        *self.committed_snapshot.write().map_err(|_| {
-            GraphStoreError::new(
-                "redcore_snapshot_lock_poisoned",
-                "RedCore committed snapshot lock poisoned",
-            )
-        })? = committed_snapshot;
+        writer.start_recording_committed_mutations();
+        let transaction = match writer.commit_batch(batch) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let _ = writer.take_recorded_committed_mutations();
+                return Err(error);
+            }
+        };
+        let snapshot_batch = writer
+            .take_recorded_committed_mutations()
+            .filter(|batch| !batch.mutations.is_empty())
+            .unwrap_or(fallback_batch);
+        self.apply_committed_batch_or_refresh(&writer, snapshot_batch)?;
         Ok(transaction)
     }
 
@@ -1213,13 +1290,7 @@ impl RedCoreTenantExecutor {
     pub fn rebuild_indexes(&self) -> GraphStoreResult<GraphRebuildReport> {
         let mut writer = self.lock_writer()?;
         let report = writer.rebuild_indexes()?;
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
-        *self.committed_snapshot.write().map_err(|_| {
-            GraphStoreError::new(
-                "redcore_snapshot_lock_poisoned",
-                "RedCore committed snapshot lock poisoned",
-            )
-        })? = committed_snapshot;
+        self.refresh_committed_snapshot_from_writer(&writer)?;
         Ok(report)
     }
 
@@ -1240,13 +1311,15 @@ impl RedCoreTenantExecutor {
     ) -> GraphStoreResult<GraphWriteResult> {
         let mut writer = self.lock_writer()?;
         let write = writer.set_node_ttl(id, expires_at_ms)?;
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
-        *self.committed_snapshot.write().map_err(|_| {
-            GraphStoreError::new(
-                "redcore_snapshot_lock_poisoned",
-                "RedCore committed snapshot lock poisoned",
-            )
-        })? = committed_snapshot;
+        match writer.get_node_including_expired(&write.id)? {
+            Some(node) => {
+                self.apply_committed_batch_or_refresh(
+                    &writer,
+                    GraphMutationBatch::new([GraphMutation::NodeUpsert(node)]),
+                )?;
+            }
+            None => self.refresh_committed_snapshot_from_writer(&writer)?,
+        }
         Ok(write)
     }
 
@@ -1275,19 +1348,13 @@ impl RedCoreTenantExecutor {
 
     /// Sweep expired nodes from this tenant's graph durably. Locks the
     /// writer, journals each expired node as a NodeDelete AOF op,
-    /// refreshes the committed snapshot. Returns the count purged.
+    /// refreshes the committed snapshot when needed. Returns the count purged.
     /// Called by the background sweep task.
     pub fn purge_expired_nodes(&self) -> GraphStoreResult<usize> {
         let mut writer = self.lock_writer()?;
         let purged = writer.purge_expired_nodes()?;
         if purged > 0 {
-            let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
-            *self.committed_snapshot.write().map_err(|_| {
-                GraphStoreError::new(
-                    "redcore_snapshot_lock_poisoned",
-                    "RedCore committed snapshot lock poisoned",
-                )
-            })? = committed_snapshot;
+            self.refresh_committed_snapshot_from_writer(&writer)?;
         }
         Ok(purged)
     }
@@ -1334,13 +1401,15 @@ impl RedCoreTenantExecutor {
     ) -> GraphStoreResult<()> {
         let mut writer = self.lock_writer()?;
         writer.designate_vector_property(label, property_name, dimension)?;
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
-        *self.committed_snapshot.write().map_err(|_| {
-            GraphStoreError::new(
-                "redcore_snapshot_lock_poisoned",
-                "RedCore committed snapshot lock poisoned",
-            )
-        })? = committed_snapshot;
+        self.committed_snapshot
+            .write()
+            .map_err(|_| {
+                GraphStoreError::new(
+                    "redcore_snapshot_lock_poisoned",
+                    "RedCore committed snapshot lock poisoned",
+                )
+            })?
+            .designate_vector_property(label, property_name, dimension)?;
         Ok(())
     }
 
