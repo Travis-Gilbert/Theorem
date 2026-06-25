@@ -1142,9 +1142,22 @@ async fn theorem_agent_run(
             .into_response();
     }
 
-    match composed_agent_run_payload(state, &config, &arguments).await {
-        Ok(payload) => Json(payload).into_response(),
-        Err(payload) => (theorem_agent_error_status(&payload), Json(payload)).into_response(),
+    match tokio::time::timeout(
+        theorem_agent_http_timeout(),
+        composed_agent_run_payload(state, &config, &arguments),
+    )
+    .await
+    {
+        Ok(Ok(payload)) => Json(payload).into_response(),
+        Ok(Err(payload)) => (theorem_agent_error_status(&payload), Json(payload)).into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({
+                "error": "theorem_agent_timeout",
+                "message": "Theorem agent run exceeded the HTTP response window; use a queued or streaming agent surface for this run."
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1152,8 +1165,18 @@ fn theorem_agent_error_status(payload: &Value) -> StatusCode {
     match payload.get("error").and_then(Value::as_str) {
         Some("invalid_composed_agent_run") | Some("invalid_tenant_id") => StatusCode::BAD_REQUEST,
         Some("store_unavailable") => StatusCode::SERVICE_UNAVAILABLE,
+        Some("theorem_agent_timeout") => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     }
+}
+
+fn theorem_agent_http_timeout() -> Duration {
+    std::env::var("THEOREM_AGENT_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=60).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(12))
 }
 
 fn mcp_payload_tenant(
