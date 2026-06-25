@@ -447,6 +447,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/.well-known/mcp/rustyred_thg.json", get(mcp_well_known))
         .route("/.well-known/agent.json", get(agent_well_known))
         .route("/mcp", post(mcp_post))
+        .route("/v1/rustyweb/search", post(rustyweb_search))
         .route("/v1/coordination/events", get(coordination_events))
         .route(
             "/v1/agent-space/stream",
@@ -823,6 +824,30 @@ async fn mcp_post(
         inject_web_search_graph_tool_definition(&mut response);
     }
     Json(response).into_response()
+}
+
+async fn rustyweb_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(arguments): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(status) = require_scope(
+        &headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return status.into_response();
+    }
+    let config = state.mcp_config();
+    let job = match live_search_acquisition_job(&config, &arguments) {
+        Ok(job) => job,
+        Err(payload) => return (StatusCode::BAD_REQUEST, Json(payload)).into_response(),
+    };
+    match execute_live_search_acquisition(&state, &job).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(payload) => (StatusCode::BAD_GATEWAY, Json(payload)).into_response(),
+    }
 }
 
 fn mcp_payload_tenant(
@@ -9188,6 +9213,60 @@ mod tests {
         );
         assert_eq!(payload["acquisition"]["providers"][0]["provider"], "static");
         assert_eq!(payload["acquisition"]["providers"][0]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn product_rustyweb_search_route_returns_provider_seed_urls_without_mcp_envelope() {
+        let state =
+            memory_product_state_with_search_providers(vec![Arc::new(StaticSearchProvider::new(
+                "static",
+                vec![SearchCandidate {
+                    url: "https://example.com/search-candidate".to_string(),
+                    title: Some("Search candidate".to_string()),
+                    snippet: Some("candidate from configured provider".to_string()),
+                    source: "static".to_string(),
+                    rank: 1,
+                }],
+            ))]);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/rustyweb/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant": "Travis-Gilbert",
+                            "query": "search candidate",
+                            "providers": ["static"],
+                            "provider_limit": 4,
+                            "provider_timeout_ms": 1000,
+                            "limit": 8,
+                            "seed_limit": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_payload_json(response).await;
+        assert!(payload.get("jsonrpc").is_none());
+        assert!(payload.get("result").is_none());
+        assert_eq!(payload["tenant"], "Travis-Gilbert");
+        assert_eq!(payload["query"], "search candidate");
+        assert_eq!(payload["mode"], "sync");
+        assert_eq!(payload["stats"]["providers"], 1);
+        assert_eq!(payload["stats"]["candidates"], 1);
+        assert_eq!(
+            payload["seed_urls"].as_array().unwrap()[0],
+            "https://example.com/search-candidate"
+        );
+        assert_eq!(payload["acquisition"]["providers"][0]["provider"], "static");
     }
 
     #[tokio::test]
