@@ -1,0 +1,2 @@
+runpod>=1.7,<2
+sentence-transformers>=3,<4
