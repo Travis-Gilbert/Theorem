@@ -1,6 +1,6 @@
 # Composed Agent Lane B: Next Execution Plan
 
-Status: LB-1 pure registry, LB-2 deterministic fake-head loop, and LB-3 fake invocation seam implemented locally; runtime/provider execution, learned/router policy, and remaining app affordances remain open.
+Status: LB-1 pure registry, LB-2 deterministic fake-head loop, and LB-3 fake invocation seam implemented locally; runtime/provider execution is wired for API-backed heads. North Star binding stages 1-3 are landed in the deterministic loop: scratchpad DAG/relation edges, per-capability reliability routing, and synthesis verification receipts. Charter-surface reintegration and remaining live app affordances remain open.
 
 Source plan: `implementation-plan.md`, Lane B checklist CA-B1 through CA-B4.
 
@@ -17,7 +17,7 @@ Lane B has local slices implemented and validated:
 - `theorem-harness-core::head_invocation` adds the fake-first invocation seam: `HeadInvoker`, `HeadInvocationRequest`, `HeadInvocationReceipt`, and `FakeHeadInvoker`. The loop now consumes invocation receipts rather than inline fake payloads.
 - Connector registration/invocation surfaces have started landing separately; do not collapse that work into the binding loop.
 
-The remaining Lane B work is the model-bearing layer: connect resolved heads to runtime/provider adapters, add learned/router policy, and expose the remaining Theseus app abilities through native affordances or `theorem_grpc`.
+The remaining Lane B work is the model-bearing layer: finish charter-surface reintegration and expose the remaining Theseus app abilities through native affordances or `theorem_grpc`.
 
 ## Execution Order
 
@@ -55,7 +55,7 @@ cd rustyredcore_THG && cargo clippy -p theorem-harness-runtime --all-targets --n
 
 Goal: build the loop shape without provider calls first, so the binding state machine, budget guard, scratchpad revisions, critic consensus, and strict grounding contract can be tested deterministically.
 
-Local state: implemented in `theorem-harness-core/src/intra_agent_loop.rs` as `run_fake_intra_agent_loop`. The scaffold is fake-head-only: it does not call providers, connectors, or tools. It consumes the LB-1 registry, appends scratchpad revisions, records proposal/critique/synthesis contributions, and drives the lifecycle through publication and close.
+Local state: implemented in `theorem-harness-core/src/intra_agent_loop.rs` as `run_fake_intra_agent_loop`. The scaffold is fake-head-only: it does not call providers, connectors, or tools. It consumes the LB-1 registry, appends DAG-linked scratchpad revisions, records proposal/critique/synthesis contributions, routes roles through per-capability reliability, records synthesis verification receipts, and drives the lifecycle through publication and close.
 
 Loop events:
 
@@ -83,7 +83,7 @@ Acceptance criteria:
 - Done locally: `POLICY.CHECKED` payload includes grounded `claims: [{ text, provenance }]`.
 - Done locally: claimless or ungrounded publications fail loudly through the existing strict grounding guard.
 - Open: replace fake-head receipts with runtime model invocation receipts.
-- Open: add learned/router moderation on top of the deterministic scaffold.
+- Done locally: learned/router moderation now selects proposal, critique, synthesis, and verification heads by per-capability reliability while keeping the deterministic scaffold replayable.
 
 Validation:
 
@@ -160,4 +160,4 @@ cd rustyredcore_THG && cargo clippy -p rustyred-thg-affordances --all-targets --
 
 ## First Implementation Slice
 
-Current implementation slice landed the runtime/provider adapter behind the `HeadInvoker` contract: `ProviderHeadInvoker` keeps real provider calls explicit and outside `theorem-harness-core`, resolves credential references only at call time, and keeps credential values out of GraphStore-backed binding state. Next slices are learned/router policy, charter-surface reintegration, or LB-4 app affordance wrapping.
+Current implementation slice landed the runtime/provider adapter behind the `HeadInvoker` contract: `ProviderHeadInvoker` keeps real provider calls explicit and outside `theorem-harness-core`, resolves credential references only at call time, and keeps credential values out of GraphStore-backed binding state. The next slices are charter-surface reintegration or LB-4 app affordance wrapping.

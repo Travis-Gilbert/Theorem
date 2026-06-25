@@ -1,9 +1,9 @@
 use crate::alignment::evaluate_publication;
-use crate::budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
+use crate::budget::{BindingBudgetState, apply_contribution_charge, check_contribution_budget};
 use crate::state_hash::stable_value_hash;
-use crate::types::{now_string, prefixed_id, GuardViolation, Payload};
+use crate::types::{GuardViolation, Payload, now_string, prefixed_id};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
@@ -79,6 +79,7 @@ pub enum HeadKind {
     ReasoningCore,
     SkillPlugin,
     SpecializedCoder,
+    Verifier,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,6 +110,8 @@ pub struct HeadReliabilityProfile {
     pub median_latency_ms: u64,
     #[serde(default)]
     pub last_outcome_hash: String,
+    #[serde(default)]
+    pub capability_scores: Vec<HeadCapabilityReliability>,
 }
 
 impl Default for HeadReliabilityProfile {
@@ -117,8 +120,111 @@ impl Default for HeadReliabilityProfile {
             success_rate: 0.0,
             median_latency_ms: 0,
             last_outcome_hash: String::new(),
+            capability_scores: Vec::new(),
         }
     }
+}
+
+impl HeadReliabilityProfile {
+    pub fn reliability_for(&self, capability: &str, domain: &str) -> f32 {
+        let capability = capability.trim();
+        let domain = domain.trim();
+        let mut best: Option<(u8, f32)> = None;
+        for score in &self.capability_scores {
+            if score.capability.trim() != capability {
+                continue;
+            }
+            let score_domain = score.domain.trim();
+            let rank = if !domain.is_empty() && score_domain == domain {
+                3
+            } else if score_domain.is_empty() || score_domain == "general" {
+                2
+            } else {
+                1
+            };
+            let rate = score.posterior_success_rate();
+            if best.is_none_or(|(best_rank, best_rate)| {
+                rank > best_rank || (rank == best_rank && rate > best_rate)
+            }) {
+                best = Some((rank, rate));
+            }
+        }
+        best.map(|(_, rate)| rate).unwrap_or_else(|| {
+            if self.success_rate > 0.0 {
+                self.success_rate
+            } else {
+                0.5
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeadCapabilityReliability {
+    pub capability: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub successes: u64,
+    #[serde(default)]
+    pub failures: u64,
+    #[serde(default)]
+    pub last_outcome_hash: String,
+}
+
+impl HeadCapabilityReliability {
+    pub fn new(
+        capability: impl Into<String>,
+        domain: impl Into<String>,
+        successes: u64,
+        failures: u64,
+    ) -> Self {
+        Self {
+            capability: capability.into(),
+            domain: domain.into(),
+            successes,
+            failures,
+            last_outcome_hash: String::new(),
+        }
+    }
+
+    pub fn posterior_success_rate(&self) -> f32 {
+        ((self.successes + 1) as f32) / ((self.successes + self.failures + 2) as f32)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BindingSubtask {
+    pub subtask_id: String,
+    pub capability: String,
+    #[serde(default)]
+    pub domain: String,
+}
+
+impl BindingSubtask {
+    pub fn new(
+        subtask_id: impl Into<String>,
+        capability: impl Into<String>,
+        domain: impl Into<String>,
+    ) -> Self {
+        Self {
+            subtask_id: subtask_id.into(),
+            capability: capability.into(),
+            domain: domain.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingRoutingDecision {
+    pub subtask_id: String,
+    pub capability: String,
+    #[serde(default)]
+    pub domain: String,
+    pub head_id: String,
+    pub posterior_success_rate: f32,
+    #[serde(default)]
+    pub explored: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -198,6 +304,8 @@ pub struct ScratchpadDocument {
     pub version: u64,
     #[serde(default)]
     pub revisions: Vec<ScratchpadRevision>,
+    #[serde(default)]
+    pub relations: Vec<ScratchpadRevisionRelation>,
 }
 
 impl ScratchpadDocument {
@@ -206,6 +314,7 @@ impl ScratchpadDocument {
             document_id: document_id.into(),
             version: 0,
             revisions: Vec::new(),
+            relations: Vec::new(),
         }
     }
 
@@ -217,23 +326,88 @@ impl ScratchpadDocument {
         payload: Payload,
         created_at: impl Into<String>,
     ) -> ScratchpadRevision {
+        self.append_with_links(
+            actor_head_id,
+            summary,
+            content_hash,
+            payload,
+            Vec::new(),
+            Vec::new(),
+            created_at,
+        )
+    }
+
+    pub fn append_with_parents(
+        &mut self,
+        actor_head_id: impl Into<String>,
+        summary: impl Into<String>,
+        content_hash: impl Into<String>,
+        payload: Payload,
+        parent_revision_ids: Vec<String>,
+        created_at: impl Into<String>,
+    ) -> ScratchpadRevision {
+        self.append_with_links(
+            actor_head_id,
+            summary,
+            content_hash,
+            payload,
+            parent_revision_ids,
+            Vec::new(),
+            created_at,
+        )
+    }
+
+    pub fn append_with_links(
+        &mut self,
+        actor_head_id: impl Into<String>,
+        summary: impl Into<String>,
+        content_hash: impl Into<String>,
+        payload: Payload,
+        parent_revision_ids: Vec<String>,
+        links: Vec<ScratchpadRevisionLink>,
+        created_at: impl Into<String>,
+    ) -> ScratchpadRevision {
+        let parent_revision_ids = if parent_revision_ids.is_empty() {
+            self.revisions
+                .last()
+                .map(|revision| vec![revision.revision_id.clone()])
+                .unwrap_or_default()
+        } else {
+            clean_strings_preserve_order(parent_revision_ids)
+        };
         let parent_revision_id = self
             .revisions
             .last()
-            .map(|revision| revision.revision_id.clone())
+            .and_then(|_| parent_revision_ids.first().cloned())
             .unwrap_or_default();
         self.version += 1;
+        let revision_id = prefixed_id("scratchrev");
+        let actor_head_id = actor_head_id.into();
+        let created_at = created_at.into();
         let revision = ScratchpadRevision {
-            revision_id: prefixed_id("scratchrev"),
+            revision_id: revision_id.clone(),
             parent_revision_id,
+            parent_revision_ids,
             seq: self.version,
-            actor_head_id: actor_head_id.into(),
+            actor_head_id: actor_head_id.clone(),
             summary: summary.into(),
             content_hash: content_hash.into(),
             payload,
-            created_at: created_at.into(),
+            created_at: created_at.clone(),
         };
         self.revisions.push(revision.clone());
+        for link in links {
+            self.relations.push(ScratchpadRevisionRelation {
+                relation_id: prefixed_id("scratchrel"),
+                from_revision_id: revision_id.clone(),
+                to_revision_id: link.to_revision_id,
+                relation_kind: link.relation_kind,
+                actor_head_id: actor_head_id.clone(),
+                summary: link.summary,
+                payload: link.payload,
+                created_at: created_at.clone(),
+            });
+        }
         revision
     }
 }
@@ -243,6 +417,8 @@ pub struct ScratchpadRevision {
     pub revision_id: String,
     #[serde(default)]
     pub parent_revision_id: String,
+    #[serde(default)]
+    pub parent_revision_ids: Vec<String>,
     pub seq: u64,
     pub actor_head_id: String,
     pub summary: String,
@@ -251,6 +427,71 @@ pub struct ScratchpadRevision {
     pub payload: Payload,
     #[serde(default = "now_string")]
     pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScratchpadRelationKind {
+    Forks,
+    Annotates,
+    Supersedes,
+    Supports,
+    Contradicts,
+    Undercuts,
+}
+
+impl ScratchpadRelationKind {
+    pub fn edge_type(self) -> &'static str {
+        match self {
+            Self::Forks => "HARNESS_SCRATCHPAD_FORKS",
+            Self::Annotates => "HARNESS_SCRATCHPAD_ANNOTATES",
+            Self::Supersedes => "HARNESS_SCRATCHPAD_SUPERSEDES",
+            Self::Supports => "HARNESS_SCRATCHPAD_SUPPORTS",
+            Self::Contradicts => "HARNESS_SCRATCHPAD_CONTRADICTS",
+            Self::Undercuts => "HARNESS_SCRATCHPAD_UNDERCUTS",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScratchpadRevisionRelation {
+    pub relation_id: String,
+    pub from_revision_id: String,
+    pub to_revision_id: String,
+    pub relation_kind: ScratchpadRelationKind,
+    pub actor_head_id: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub payload: Payload,
+    #[serde(default = "now_string")]
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScratchpadRevisionLink {
+    pub to_revision_id: String,
+    pub relation_kind: ScratchpadRelationKind,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub payload: Payload,
+}
+
+impl ScratchpadRevisionLink {
+    pub fn new(
+        to_revision_id: impl Into<String>,
+        relation_kind: ScratchpadRelationKind,
+        summary: impl Into<String>,
+        payload: Payload,
+    ) -> Self {
+        Self {
+            to_revision_id: to_revision_id.into(),
+            relation_kind,
+            summary: summary.into(),
+            payload,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -381,6 +622,8 @@ pub struct BindingTraceScope {
     pub contributions: Vec<HeadContributionRecord>,
     #[serde(default)]
     pub synthesis_heads: Vec<String>,
+    #[serde(default)]
+    pub verification_receipts: Vec<BindingVerificationReceipt>,
 }
 
 impl BindingTraceScope {
@@ -391,6 +634,7 @@ impl BindingTraceScope {
             receipts_required: true,
             contributions: Vec::new(),
             synthesis_heads: Vec::new(),
+            verification_receipts: Vec::new(),
         }
     }
 }
@@ -406,6 +650,31 @@ pub struct HeadContributionRecord {
     pub receipt_hash: String,
     #[serde(default = "now_string")]
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingVerificationReceipt {
+    pub verification_id: String,
+    pub synthesis_id: String,
+    pub verifier_head_id: String,
+    pub target_revision_id: String,
+    pub outcome: BindingVerificationOutcome,
+    #[serde(default)]
+    pub attempted_failure_modes: Vec<String>,
+    #[serde(default)]
+    pub commands_run: Vec<String>,
+    #[serde(default)]
+    pub receipt_hash: String,
+    #[serde(default = "now_string")]
+    pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingVerificationOutcome {
+    Accepted,
+    DefectFound,
+    Rejected,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -503,6 +772,55 @@ impl AgentBinding {
             .collect()
     }
 
+    pub fn routeable_head_ids(&self) -> Vec<String> {
+        let active = self.active_head_ids();
+        self.composition
+            .heads
+            .iter()
+            .filter(|head| active.contains(&head.head_id))
+            .filter(|head| head.kind != HeadKind::SkillPlugin)
+            .map(|head| head.head_id.clone())
+            .collect()
+    }
+
+    pub fn route_subtask(
+        &self,
+        subtask: &BindingSubtask,
+        explore_token: u32,
+    ) -> Option<BindingRoutingDecision> {
+        self.route_subtask_from_candidates(subtask, &self.routeable_head_ids(), explore_token)
+    }
+
+    pub fn route_subtask_from_candidates(
+        &self,
+        subtask: &BindingSubtask,
+        candidate_head_ids: &[String],
+        explore_token: u32,
+    ) -> Option<BindingRoutingDecision> {
+        let active = self.active_head_ids();
+        let candidates = clean_strings(candidate_head_ids.to_vec())
+            .into_iter()
+            .filter_map(|head_id| self.head(&head_id))
+            .filter(|head| active.contains(&head.head_id))
+            .filter(|head| head.kind != HeadKind::SkillPlugin)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        if explore_token < 150 {
+            let head = candidates[(explore_token as usize) % candidates.len()];
+            return Some(routing_decision_for(head, subtask, true));
+        }
+
+        let mut best = candidates[0];
+        for head in candidates.iter().skip(1) {
+            if routing_candidate_is_better(head, best, subtask) {
+                best = head;
+            }
+        }
+        Some(routing_decision_for(best, subtask, false))
+    }
+
     pub fn append_scratchpad_revision(
         &mut self,
         actor_head_id: &str,
@@ -511,6 +829,68 @@ impl AgentBinding {
         payload: Payload,
         created_at: impl Into<String>,
     ) -> Result<ScratchpadRevision, BindingError> {
+        self.append_scratchpad_revision_with_links(
+            actor_head_id,
+            summary,
+            content_hash,
+            payload,
+            Vec::new(),
+            Vec::new(),
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_scratchpad_revision_with_links(
+        &mut self,
+        actor_head_id: &str,
+        summary: impl Into<String>,
+        content_hash: impl Into<String>,
+        payload: Payload,
+        parent_revision_ids: Vec<String>,
+        links: Vec<ScratchpadRevisionLink>,
+        created_at: impl Into<String>,
+    ) -> Result<ScratchpadRevision, BindingError> {
+        self.ensure_scratchpad_actor(actor_head_id)?;
+        self.ensure_known_revisions("unknown_scratchpad_parent", &parent_revision_ids)?;
+        let link_targets = links
+            .iter()
+            .map(|link| link.to_revision_id.clone())
+            .collect::<Vec<_>>();
+        self.ensure_known_revisions("unknown_scratchpad_relation_target", &link_targets)?;
+        Ok(self.working_memory_scope.scratchpad.append_with_links(
+            actor_head_id,
+            summary,
+            content_hash,
+            payload,
+            parent_revision_ids,
+            links,
+            created_at,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_scratchpad_revision_with_parents(
+        &mut self,
+        actor_head_id: &str,
+        summary: impl Into<String>,
+        content_hash: impl Into<String>,
+        payload: Payload,
+        parent_revision_ids: Vec<String>,
+        created_at: impl Into<String>,
+    ) -> Result<ScratchpadRevision, BindingError> {
+        self.append_scratchpad_revision_with_links(
+            actor_head_id,
+            summary,
+            content_hash,
+            payload,
+            parent_revision_ids,
+            Vec::new(),
+            created_at,
+        )
+    }
+
+    fn ensure_scratchpad_actor(&self, actor_head_id: &str) -> Result<(), BindingError> {
         let head = self.head(actor_head_id).ok_or_else(|| {
             guard_violation(
                 "unknown_binding_head",
@@ -535,18 +915,46 @@ impl AgentBinding {
             return Err(guard_violation(
                 "scratchpad_plugin_denied",
                 "skill plugins are tools, not scratchpad-sharing reasoning heads",
-                "reasoning_core_or_specialized_coder",
+                "reasoning_core_or_specialized_coder_or_verifier",
                 "skill_plugin",
                 Vec::new(),
                 Payload::new(),
             ));
         }
-        Ok(self.working_memory_scope.scratchpad.append(
-            actor_head_id,
-            summary,
-            content_hash,
-            payload,
-            created_at,
+        Ok(())
+    }
+
+    fn ensure_known_revisions(
+        &self,
+        code: &str,
+        revision_ids: &[String],
+    ) -> Result<(), BindingError> {
+        let known = self
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .map(|revision| revision.revision_id.clone())
+            .collect::<BTreeSet<_>>();
+        let unknown = clean_strings(revision_ids.to_vec())
+            .into_iter()
+            .filter(|revision_id| !known.contains(revision_id))
+            .collect::<Vec<_>>();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let mut details = Payload::new();
+        details.insert(
+            "revision_ids".to_string(),
+            Value::Array(unknown.iter().cloned().map(Value::String).collect()),
+        );
+        Err(guard_violation(
+            code,
+            "scratchpad revision relation references unknown revision ids",
+            "known_scratchpad_revision",
+            "unknown_scratchpad_revision",
+            unknown,
+            details,
         ))
     }
 }
@@ -862,6 +1270,32 @@ fn apply_binding_payload(
             binding.trace_scope.synthesis_heads =
                 payload_array_strings(transition.payload.get("contributing_heads"));
         }
+        "SYNTHESIS.VERIFIED" => {
+            let verifier_head_id = payload_to_string(transition.payload.get("verifier_head_id"));
+            binding
+                .trace_scope
+                .verification_receipts
+                .push(BindingVerificationReceipt {
+                    verification_id: payload_to_string(transition.payload.get("verification_id")),
+                    synthesis_id: payload_to_string(transition.payload.get("synthesis_id")),
+                    verifier_head_id: verifier_head_id.clone(),
+                    target_revision_id: payload_to_string(
+                        transition.payload.get("target_revision_id"),
+                    ),
+                    outcome: payload_verification_outcome(transition.payload.get("outcome")),
+                    attempted_failure_modes: payload_array_strings(
+                        transition.payload.get("attempted_failure_modes"),
+                    ),
+                    commands_run: payload_array_strings(transition.payload.get("commands_run")),
+                    receipt_hash: payload_to_string(transition.payload.get("receipt_hash")),
+                    created_at: transition.created_at.clone(),
+                });
+            apply_contribution_charge(
+                &mut binding.budget_state,
+                &verifier_head_id,
+                payload_f64(transition.payload.get("cost_units")),
+            );
+        }
         _ => {}
     }
     Ok(())
@@ -939,6 +1373,90 @@ fn apply_binding_guard(
                     binding.lifecycle.status.clone(),
                     unknown,
                     details,
+                ));
+            }
+        }
+        "SYNTHESIS.VERIFIED" => {
+            let verifier_head_id = payload_to_string(transition.payload.get("verifier_head_id"));
+            let head = binding.head(&verifier_head_id).ok_or_else(|| {
+                guard_violation(
+                    "unknown_verifier_head",
+                    format!("verifier head {verifier_head_id} is not registered"),
+                    "",
+                    binding.lifecycle.status.clone(),
+                    Vec::new(),
+                    Payload::new(),
+                )
+            })?;
+            if !binding.active_head_ids().contains(&verifier_head_id) {
+                return Err(guard_violation(
+                    "inactive_verifier_head",
+                    format!("verifier head {verifier_head_id} is not active in this binding"),
+                    "",
+                    binding.lifecycle.status.clone(),
+                    Vec::new(),
+                    Payload::new(),
+                ));
+            }
+            if head.kind == HeadKind::SkillPlugin {
+                return Err(guard_violation(
+                    "verification_plugin_denied",
+                    "skill plugins cannot verify binding synthesis",
+                    "reasoning_core_or_specialized_coder_or_verifier",
+                    "skill_plugin",
+                    Vec::new(),
+                    Payload::new(),
+                ));
+            }
+            if payload_array_strings(transition.payload.get("attempted_failure_modes")).is_empty() {
+                return Err(guard_violation(
+                    "synthesis_verification_missing_falsification",
+                    "SYNTHESIS.VERIFIED requires at least one attempted failure mode",
+                    "falsification_attempt",
+                    "lgtm",
+                    Vec::new(),
+                    Payload::new(),
+                ));
+            }
+            let target_revision_id =
+                payload_to_string(transition.payload.get("target_revision_id"));
+            let known = binding
+                .working_memory_scope
+                .scratchpad
+                .revisions
+                .iter()
+                .any(|revision| revision.revision_id == target_revision_id);
+            if !known {
+                return Err(guard_violation(
+                    "unknown_synthesis_revision",
+                    "SYNTHESIS.VERIFIED references an unknown scratchpad revision",
+                    "known_scratchpad_revision",
+                    "unknown_scratchpad_revision",
+                    vec!["target_revision_id".to_string()],
+                    Payload::new(),
+                ));
+            }
+            check_contribution_budget(
+                &binding.budget_scope,
+                &binding.budget_state,
+                &verifier_head_id,
+                payload_f64(transition.payload.get("cost_units")),
+            )?;
+        }
+        "PUBLICATION.PROPOSED" if binding.lifecycle.status == "synthesis_verified" => {
+            let accepted = binding
+                .trace_scope
+                .verification_receipts
+                .last()
+                .is_some_and(|receipt| receipt.outcome == BindingVerificationOutcome::Accepted);
+            if !accepted {
+                return Err(guard_violation(
+                    "synthesis_verification_failed",
+                    "publication requires the latest synthesis verification to accept the draft",
+                    "accepted_verification",
+                    "unaccepted_verification",
+                    Vec::new(),
+                    Payload::new(),
                 ));
             }
         }
@@ -1057,6 +1575,14 @@ fn binding_transition_requirements(event: &str) -> &'static [&'static str] {
         "PRIVATE_WORK.OPENED" => &["scratchpad_revision_id"],
         "HEADS.CONTRIBUTE" => &["head_id", "contribution_id", "contribution_kind"],
         "DRAFTS.SYNTHESIZED" => &["synthesis_id", "contributing_heads"],
+        "SYNTHESIS.VERIFIED" => &[
+            "verification_id",
+            "synthesis_id",
+            "verifier_head_id",
+            "target_revision_id",
+            "outcome",
+            "attempted_failure_modes",
+        ],
         "PUBLICATION.PROPOSED" => &["publication_id", "draft_hash"],
         "POLICY.CHECKED" => &["policy_receipt_id", "allowed"],
         "PUBLISHED_TO_SUBSTRATE" => &["publication_id", "substrate_receipt_id"],
@@ -1079,7 +1605,12 @@ fn binding_allowed_previous_statuses(event: &str) -> &'static [&'static str] {
         "PRIVATE_WORK.OPENED" => &["run_started", "private_work_opened"],
         "HEADS.CONTRIBUTE" => &["private_work_opened", "heads_contribute"],
         "DRAFTS.SYNTHESIZED" => &["heads_contribute", "drafts_synthesized"],
-        "PUBLICATION.PROPOSED" => &["drafts_synthesized", "publication_proposed"],
+        "SYNTHESIS.VERIFIED" => &["drafts_synthesized", "synthesis_verified"],
+        "PUBLICATION.PROPOSED" => &[
+            "drafts_synthesized",
+            "synthesis_verified",
+            "publication_proposed",
+        ],
         "POLICY.CHECKED" => &["publication_proposed", "policy_checked"],
         "PUBLISHED_TO_SUBSTRATE" => &["policy_checked", "published_to_substrate"],
         "OUTCOME.RECORDED" => &["published_to_substrate", "outcome_recorded"],
@@ -1101,6 +1632,7 @@ fn binding_target_status(event: &str) -> &'static str {
         "PRIVATE_WORK.OPENED" => "private_work_opened",
         "HEADS.CONTRIBUTE" => "heads_contribute",
         "DRAFTS.SYNTHESIZED" => "drafts_synthesized",
+        "SYNTHESIS.VERIFIED" => "synthesis_verified",
         "PUBLICATION.PROPOSED" => "publication_proposed",
         "POLICY.CHECKED" => "policy_checked",
         "PUBLISHED_TO_SUBSTRATE" => "published_to_substrate",
@@ -1140,6 +1672,66 @@ fn payload_to_string(value: Option<&Value>) -> String {
     }
 }
 
+fn routing_decision_for(
+    head: &AgentHead,
+    subtask: &BindingSubtask,
+    explored: bool,
+) -> BindingRoutingDecision {
+    BindingRoutingDecision {
+        subtask_id: subtask.subtask_id.clone(),
+        capability: subtask.capability.clone(),
+        domain: subtask.domain.clone(),
+        head_id: head.head_id.clone(),
+        posterior_success_rate: head
+            .reliability_profile
+            .reliability_for(&subtask.capability, &subtask.domain),
+        explored,
+    }
+}
+
+fn routing_candidate_is_better(
+    candidate: &AgentHead,
+    incumbent: &AgentHead,
+    subtask: &BindingSubtask,
+) -> bool {
+    let candidate_score = candidate
+        .reliability_profile
+        .reliability_for(&subtask.capability, &subtask.domain);
+    let incumbent_score = incumbent
+        .reliability_profile
+        .reliability_for(&subtask.capability, &subtask.domain);
+    if candidate_score > incumbent_score {
+        return true;
+    }
+    if candidate_score < incumbent_score {
+        return false;
+    }
+
+    let candidate_cost =
+        candidate.cost_profile.input_unit_cost + candidate.cost_profile.output_unit_cost;
+    let incumbent_cost =
+        incumbent.cost_profile.input_unit_cost + incumbent.cost_profile.output_unit_cost;
+    if candidate_cost < incumbent_cost {
+        return true;
+    }
+    if candidate_cost > incumbent_cost {
+        return false;
+    }
+
+    if candidate.reliability_profile.median_latency_ms
+        < incumbent.reliability_profile.median_latency_ms
+    {
+        return true;
+    }
+    if candidate.reliability_profile.median_latency_ms
+        > incumbent.reliability_profile.median_latency_ms
+    {
+        return false;
+    }
+
+    candidate.head_id < incumbent.head_id
+}
+
 fn payload_array_strings(value: Option<&Value>) -> Vec<String> {
     match value {
         Some(Value::Array(items)) => clean_strings(
@@ -1157,6 +1749,14 @@ fn payload_bool(value: Option<&Value>) -> bool {
         Some(Value::Bool(value)) => *value,
         Some(Value::String(value)) => value == "true",
         _ => false,
+    }
+}
+
+fn payload_verification_outcome(value: Option<&Value>) -> BindingVerificationOutcome {
+    match payload_to_string(value).as_str() {
+        "accepted" => BindingVerificationOutcome::Accepted,
+        "defect_found" => BindingVerificationOutcome::DefectFound,
+        _ => BindingVerificationOutcome::Rejected,
     }
 }
 
@@ -1199,6 +1799,19 @@ fn clean_strings(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn clean_strings_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut cleaned = Vec::new();
+    for value in values {
+        let value = value.trim().to_string();
+        if value.is_empty() || !seen.insert(value.clone()) {
+            continue;
+        }
+        cleaned.push(value);
+    }
+    cleaned
+}
+
 fn sorted_strings(values: &[String]) -> Vec<String> {
     clean_strings(values.to_vec())
 }
@@ -1226,7 +1839,7 @@ fn binding_event_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     #[test]
     fn composition_hash_changes_when_active_roster_changes() {
@@ -1482,6 +2095,161 @@ mod tests {
     }
 
     #[test]
+    fn scratchpad_revision_can_merge_and_annotate_prior_work_as_a_dag() {
+        let mut binding = fixture_binding();
+        let proposal = binding
+            .append_scratchpad_revision(
+                "claude",
+                "proposal",
+                "hash:proposal",
+                object_payload(json!({ "kind": "proposal" })),
+                "2026-06-02T00:00:00Z",
+            )
+            .unwrap();
+        let critique = binding
+            .append_scratchpad_revision(
+                "deepseek",
+                "critique",
+                "hash:critique",
+                object_payload(json!({ "kind": "critique" })),
+                "2026-06-02T00:00:01Z",
+            )
+            .unwrap();
+        let synthesis = binding
+            .append_scratchpad_revision_with_links(
+                "claude",
+                "synthesis",
+                "hash:synthesis",
+                object_payload(json!({ "kind": "synthesis" })),
+                vec![proposal.revision_id.clone(), critique.revision_id.clone()],
+                vec![
+                    ScratchpadRevisionLink::new(
+                        proposal.revision_id.clone(),
+                        ScratchpadRelationKind::Supersedes,
+                        "synthesis supersedes proposal",
+                        Payload::new(),
+                    ),
+                    ScratchpadRevisionLink::new(
+                        critique.revision_id.clone(),
+                        ScratchpadRelationKind::Supports,
+                        "critique supported synthesis",
+                        Payload::new(),
+                    ),
+                ],
+                "2026-06-02T00:00:02Z",
+            )
+            .unwrap();
+
+        assert_eq!(
+            synthesis.parent_revision_ids,
+            vec![proposal.revision_id, critique.revision_id]
+        );
+        assert_eq!(binding.working_memory_scope.scratchpad.relations.len(), 2);
+        assert_eq!(
+            binding.working_memory_scope.scratchpad.relations[0].relation_kind,
+            ScratchpadRelationKind::Supersedes
+        );
+    }
+
+    #[test]
+    fn routing_uses_per_capability_reliability_before_static_head_order() {
+        let mut binding = fixture_binding();
+        binding
+            .composition
+            .heads
+            .iter_mut()
+            .find(|head| head.head_id == "deepseek")
+            .unwrap()
+            .reliability_profile
+            .capability_scores
+            .push(HeadCapabilityReliability::new("rust_impl", "harness", 9, 1));
+        binding
+            .composition
+            .heads
+            .iter_mut()
+            .find(|head| head.head_id == "claude")
+            .unwrap()
+            .reliability_profile
+            .capability_scores
+            .push(HeadCapabilityReliability::new("rust_impl", "harness", 1, 9));
+
+        let decision = binding
+            .route_subtask(&BindingSubtask::new("task:1", "rust_impl", "harness"), 999)
+            .unwrap();
+
+        assert_eq!(decision.head_id, "deepseek");
+        assert!(decision.posterior_success_rate > 0.8);
+        assert!(!decision.explored);
+    }
+
+    #[test]
+    fn synthesis_verification_requires_falsification_before_publication() {
+        let mut binding = ready_for_synthesis_verification();
+        let synthesis_revision = binding
+            .append_scratchpad_revision(
+                "claude",
+                "synthesis",
+                "hash:synthesis",
+                object_payload(json!({ "kind": "synthesis" })),
+                "2026-06-02T00:00:00Z",
+            )
+            .unwrap();
+        let error = apply_binding_transition(
+            binding,
+            transition(
+                "SYNTHESIS.VERIFIED",
+                json!({
+                    "verification_id": "verify:1",
+                    "synthesis_id": "synth:1",
+                    "verifier_head_id": "deepseek",
+                    "target_revision_id": synthesis_revision.revision_id,
+                    "outcome": "accepted",
+                    "attempted_failure_modes": [""]
+                }),
+            ),
+        )
+        .unwrap_err();
+
+        assert_guard(error, "synthesis_verification_missing_falsification");
+    }
+
+    #[test]
+    fn accepted_synthesis_verification_is_recorded_on_the_trace() {
+        let mut binding = ready_for_synthesis_verification();
+        let synthesis_revision = binding
+            .append_scratchpad_revision(
+                "claude",
+                "synthesis",
+                "hash:synthesis",
+                object_payload(json!({ "kind": "synthesis" })),
+                "2026-06-02T00:00:00Z",
+            )
+            .unwrap();
+        let verified = apply(
+            binding,
+            "SYNTHESIS.VERIFIED",
+            json!({
+                "verification_id": "verify:1",
+                "synthesis_id": "synth:1",
+                "verifier_head_id": "deepseek",
+                "target_revision_id": synthesis_revision.revision_id,
+                "outcome": "accepted",
+                "attempted_failure_modes": ["counterexample pass"],
+                "commands_run": ["cargo test -p theorem-harness-core"],
+                "cost_units": 1.0
+            }),
+        );
+
+        assert_eq!(verified.binding.lifecycle.status, "synthesis_verified");
+        assert_eq!(verified.binding.trace_scope.verification_receipts.len(), 1);
+        assert_eq!(
+            verified.binding.trace_scope.verification_receipts[0].outcome,
+            BindingVerificationOutcome::Accepted
+        );
+        assert_eq!(verified.binding.budget_state.spent_total, 1.0);
+    }
+
+    #[test]
     fn policy_denial_blocks_publication_path() {
         let error = apply_binding_transition(
             ready_for_publication(),
@@ -1661,6 +2429,18 @@ mod tests {
 
     fn ready_for_publication() -> AgentBinding {
         let binding = apply(
+            ready_for_synthesis_verification(),
+            "PUBLICATION.PROPOSED",
+            json!({
+                "publication_id": "pub:1",
+                "draft_hash": "draft:1"
+            }),
+        );
+        binding.binding
+    }
+
+    fn ready_for_synthesis_verification() -> AgentBinding {
+        let binding = apply(
             ready_for_contribution(),
             "HEADS.CONTRIBUTE",
             json!({
@@ -1677,15 +2457,7 @@ mod tests {
                 "contributing_heads": ["claude", "deepseek"]
             }),
         );
-        apply(
-            binding.binding,
-            "PUBLICATION.PROPOSED",
-            json!({
-                "publication_id": "pub:1",
-                "draft_hash": "draft:1"
-            }),
-        )
-        .binding
+        binding.binding
     }
 
     fn fixture_binding() -> AgentBinding {

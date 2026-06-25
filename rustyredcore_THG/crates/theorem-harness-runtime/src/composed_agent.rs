@@ -1,18 +1,18 @@
-use crate::binding_store::{load_binding, persist_binding_run_result, BindingRuntimeError};
+use crate::binding_store::{BindingRuntimeError, load_binding, persist_binding_run_result};
 use rustyred_thg_core::GraphStore;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::error::Error;
 use std::fmt;
 use theorem_harness_core::state_hash::stable_value_hash;
 use theorem_harness_core::{
-    apply_binding_transition, composition_hash, run_intra_agent_loop_with_invoker, AgentBinding,
-    AgentHead, AgentHeadRegistry, BindingBudgetScope, BindingComposition, BindingError,
-    BindingEventState, BindingIdentity, BindingTransitionInput, Constitution,
+    AgentBinding, AgentHead, AgentHeadRegistry, BindingBudgetScope, BindingComposition,
+    BindingError, BindingEventState, BindingIdentity, BindingTransitionInput, Constitution,
     FakeIntraAgentLoopInput, FakeIntraAgentLoopResult, GroundedClaim, HeadCostProfile,
     HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
     HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError,
-    ResolvedAgentHead, ScratchpadRevision, TraceTier,
+    ResolvedAgentHead, ScratchpadRevision, TraceTier, apply_binding_transition, composition_hash,
+    run_intra_agent_loop_with_invoker,
 };
 
 pub const DEFAULT_BINDING_ID: &str = "agent:theorem";
@@ -107,7 +107,9 @@ pub fn run_composed_agent_with_claims<S: GraphStore>(
     };
     let mut input = FakeIntraAgentLoopInput::new(task, claims);
     input.budget_units = composed_agent_budget_units()?;
-    input.max_parallel_heads = input.max_parallel_heads.max(binding.reasoning_core_ids().len());
+    input.max_parallel_heads = input
+        .max_parallel_heads
+        .max(binding.reasoning_core_ids().len());
     let result = run_intra_agent_loop_with_invoker(binding, input, invoker)?;
     persist_binding_run_result(store, &result.binding, &result.events)?;
     let policy_event = result
@@ -174,7 +176,9 @@ pub fn run_configured_composed_agent_with_claims<S: GraphStore>(
     let binding = binding_with_available_runtime_heads(binding)?;
     let mut input = FakeIntraAgentLoopInput::new(task, claims);
     input.budget_units = composed_agent_budget_units()?;
-    input.max_parallel_heads = input.max_parallel_heads.max(binding.reasoning_core_ids().len());
+    input.max_parallel_heads = input
+        .max_parallel_heads
+        .max(binding.reasoning_core_ids().len());
 
     let registry = AgentHeadRegistry::from_binding(&binding)
         .map_err(|error| ComposedAgentRuntimeError::Loop(IntraAgentLoopError::Registry(error)))?;
@@ -542,7 +546,9 @@ fn run_single_head_agent<I: HeadInvoker>(
         invocation_receipts,
         primary_head_id: head.head_id.clone(),
         critic_head_id: head.head_id.clone(),
-        synthesis_head_id: head.head_id,
+        synthesis_head_id: head.head_id.clone(),
+        verifier_head_id: head.head_id,
+        routing_decisions: Vec::new(),
     })
 }
 
@@ -948,10 +954,12 @@ mod tests {
 
         assert!(binding.head("claude").is_none());
         assert!(binding.head("deepseek").is_some());
-        assert!(binding
-            .identity
-            .active_head_set
-            .contains(&"deepseek".to_string()));
+        assert!(
+            binding
+                .identity
+                .active_head_set
+                .contains(&"deepseek".to_string())
+        );
     }
 
     #[test]
@@ -1000,10 +1008,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.consensus_head_set, vec!["deepseek", "mistral"]);
-        assert_eq!(result.invocation_receipts.len(), 3);
+        assert_eq!(result.invocation_receipts.len(), 4);
         assert_eq!(result.invocation_receipts[0].head_id, "deepseek");
         assert_eq!(result.invocation_receipts[1].head_id, "mistral");
         assert_eq!(result.invocation_receipts[2].head_id, "deepseek");
+        assert_eq!(result.invocation_receipts[3].head_id, "mistral");
         assert_eq!(
             result
                 .alignment_verdict
@@ -1059,10 +1068,12 @@ mod tests {
         .unwrap();
 
         assert!(result.invocation_receipts.len() >= 3);
-        assert!(result
-            .events
-            .iter()
-            .any(|event| event.event_type == "POLICY.CHECKED"));
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| event.event_type == "POLICY.CHECKED")
+        );
         if verdict_allowed(&result.alignment_verdict) {
             assert!(!result.published_claims.is_empty());
         } else {

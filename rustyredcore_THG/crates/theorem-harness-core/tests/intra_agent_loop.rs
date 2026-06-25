@@ -2,11 +2,11 @@ use std::cell::RefCell;
 
 use serde_json::json;
 use theorem_harness_core::{
-    default_authority_order, run_fake_intra_agent_loop, AgentBinding, AgentHead,
-    BindingBudgetScope, BindingComposition, BindingError, BindingIdentity, FakeIntraAgentLoopInput,
-    GroundedClaim, HeadCostProfile, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
-    HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport,
-    IntraAgentLoopError, TraceTier,
+    AgentBinding, AgentHead, BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
+    FakeIntraAgentLoopInput, GroundedClaim, HeadCapabilityReliability, HeadCostProfile,
+    HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
+    HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError,
+    ScratchpadRelationKind, TraceTier, default_authority_order, run_fake_intra_agent_loop,
 };
 
 #[test]
@@ -22,8 +22,8 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
     let result = run_fake_intra_agent_loop(fixture_binding(), input).unwrap();
 
     assert_eq!(result.binding.lifecycle.status, "closed");
-    assert_eq!(result.events.len(), 17);
-    assert_eq!(result.invocation_receipts.len(), 3);
+    assert_eq!(result.events.len(), 18);
+    assert_eq!(result.invocation_receipts.len(), 4);
     assert_eq!(
         result
             .invocation_receipts
@@ -33,7 +33,8 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
         vec![
             HeadInvocationKind::Proposal,
             HeadInvocationKind::Critique,
-            HeadInvocationKind::Synthesis
+            HeadInvocationKind::Synthesis,
+            HeadInvocationKind::Verification
         ]
     );
     assert_eq!(result.events[0].event_type, "BINDING.RESOLVED");
@@ -42,9 +43,10 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
     assert_eq!(result.events[9].event_type, "HEADS.CONTRIBUTE");
     assert_eq!(result.events[10].event_type, "HEADS.CONTRIBUTE");
     assert_eq!(result.events[11].event_type, "DRAFTS.SYNTHESIZED");
-    assert_eq!(result.events[13].event_type, "POLICY.CHECKED");
-    assert_eq!(result.events[16].event_type, "RUN.CLOSED");
-    let policy_decision = result.events[13]
+    assert_eq!(result.events[12].event_type, "SYNTHESIS.VERIFIED");
+    assert_eq!(result.events[14].event_type, "POLICY.CHECKED");
+    assert_eq!(result.events[17].event_type, "RUN.CLOSED");
+    let policy_decision = result.events[14]
         .payload
         .get("policy_decision")
         .and_then(serde_json::Value::as_object)
@@ -53,7 +55,7 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
         policy_decision.get("authority_order").unwrap(),
         &json!(default_authority_order())
     );
-    assert_eq!(result.scratchpad_revisions.len(), 4);
+    assert_eq!(result.scratchpad_revisions.len(), 5);
     assert_eq!(
         result
             .scratchpad_revisions
@@ -64,12 +66,22 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
             "private work opened",
             "fake primary proposal",
             "fake critic review",
-            "fake synthesis"
+            "fake synthesis",
+            "fake verification"
         ]
     );
     assert_eq!(
         result.scratchpad_revisions[1].content_hash,
         result.invocation_receipts[0].content_hash
+    );
+    assert!(
+        result
+            .binding
+            .working_memory_scope
+            .scratchpad
+            .relations
+            .iter()
+            .any(|relation| relation.relation_kind == ScratchpadRelationKind::Supports)
     );
 }
 
@@ -82,7 +94,7 @@ fn fake_loop_charges_head_contributions_through_budget_guard() {
     .unwrap();
 
     assert_eq!(result.binding.trace_scope.contributions.len(), 3);
-    assert_eq!(result.binding.budget_state.spent_total, 3.0);
+    assert_eq!(result.binding.budget_state.spent_total, 4.0);
 }
 
 #[test]
@@ -122,14 +134,18 @@ fn synthesis_receives_proposal_and_critique_context() {
         synthesis.prior_context[1].kind,
         HeadInvocationKind::Critique
     );
-    assert!(synthesis.prior_context[0]
-        .payload
-        .get("task")
-        .and_then(serde_json::Value::as_str)
-        .is_some());
-    assert!(requests
-        .iter()
-        .all(|request| request.policy_decision.is_some()));
+    assert!(
+        synthesis.prior_context[0]
+            .payload
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.policy_decision.is_some())
+    );
     assert!(requests.iter().all(|request| {
         request
             .policy_decision
@@ -137,6 +153,44 @@ fn synthesis_receives_proposal_and_critique_context() {
             .map(|decision| decision.authority_order == default_authority_order())
             .unwrap_or(false)
     }));
+}
+
+#[test]
+fn fake_loop_routes_roles_by_learned_capability_reliability() {
+    let mut binding = fixture_binding();
+    binding
+        .composition
+        .heads
+        .iter_mut()
+        .find(|head| head.head_id == "deepseek")
+        .unwrap()
+        .reliability_profile
+        .capability_scores
+        .push(HeadCapabilityReliability::new("proposal", "rust", 8, 1));
+    binding
+        .composition
+        .heads
+        .iter_mut()
+        .find(|head| head.head_id == "claude")
+        .unwrap()
+        .reliability_profile
+        .capability_scores
+        .push(HeadCapabilityReliability::new("critique", "rust", 8, 1));
+    let mut input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    input.domain = "rust".to_string();
+
+    let result = run_fake_intra_agent_loop(binding, input).unwrap();
+
+    assert_eq!(result.primary_head_id, "deepseek");
+    assert_eq!(result.critic_head_id, "claude");
+    assert_eq!(result.routing_decisions.len(), 4);
+    assert!(
+        result
+            .routing_decisions
+            .iter()
+            .any(|decision| decision.capability == "proposal" && decision.head_id == "deepseek")
+    );
 }
 
 #[test]
@@ -273,6 +327,7 @@ impl HeadInvoker for RecordingInvoker {
             HeadInvocationKind::Proposal => "recorded proposal",
             HeadInvocationKind::Critique => "recorded critique",
             HeadInvocationKind::Synthesis => "recorded synthesis",
+            HeadInvocationKind::Verification => "recorded verification",
         };
         let mut payload = serde_json::Map::new();
         payload.insert("kind".to_string(), json!(request.kind.as_str()));

@@ -7,8 +7,9 @@
 //! only place that enforces budget, consensus, action-tier, and grounding rules.
 
 use crate::agent_binding::{
-    apply_binding_transition, AgentBinding, BindingError, BindingEventState,
-    BindingTransitionInput, BindingTransitionResult, HeadKind, ScratchpadRevision,
+    AgentBinding, BindingError, BindingEventState, BindingRoutingDecision, BindingSubtask,
+    BindingTransitionInput, BindingTransitionResult, HeadKind, ScratchpadRelationKind,
+    ScratchpadRevision, ScratchpadRevisionLink, apply_binding_transition,
 };
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
 use crate::constitution::Constitution;
@@ -19,7 +20,7 @@ use crate::head_invocation::{
 use crate::state_hash::stable_value_hash;
 use crate::types::Payload;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::error::Error;
 use std::fmt;
 
@@ -83,6 +84,10 @@ pub struct FakeIntraAgentLoopInput {
     pub outcome_id: String,
     #[serde(default)]
     pub claims: Vec<GroundedClaim>,
+    #[serde(default = "default_domain")]
+    pub domain: String,
+    #[serde(default = "default_routing_explore_token")]
+    pub routing_explore_token: u32,
     pub started_at: String,
     pub closed_by: String,
 }
@@ -103,6 +108,8 @@ impl FakeIntraAgentLoopInput {
             substrate_receipt_id: "substrate:fake-loop".to_string(),
             outcome_id: "outcome:fake-loop".to_string(),
             claims,
+            domain: default_domain(),
+            routing_explore_token: default_routing_explore_token(),
             started_at: "2026-06-02T00:00:00Z".to_string(),
             closed_by: "fake-loop".to_string(),
         }
@@ -118,6 +125,9 @@ pub struct FakeIntraAgentLoopResult {
     pub primary_head_id: String,
     pub critic_head_id: String,
     pub synthesis_head_id: String,
+    pub verifier_head_id: String,
+    #[serde(default)]
+    pub routing_decisions: Vec<BindingRoutingDecision>,
 }
 
 pub fn run_fake_intra_agent_loop(
@@ -140,13 +150,56 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         });
     }
 
-    let primary = heads[0].clone();
-    let critic = heads[1].clone();
-    let synthesis = heads.get(2).cloned().unwrap_or_else(|| primary.clone());
+    let primary_route = route_head(
+        &binding,
+        &heads,
+        HeadInvocationKind::Proposal,
+        &input.domain,
+        &[],
+        input.routing_explore_token,
+    )?;
+    let primary = primary_route.0;
+    let primary_decision = primary_route.1;
+    let critic_route = route_head(
+        &binding,
+        &heads,
+        HeadInvocationKind::Critique,
+        &input.domain,
+        &[primary.head_id.clone()],
+        input.routing_explore_token,
+    )?;
+    let critic = critic_route.0;
+    let critic_decision = critic_route.1;
+    let synthesis_route = route_head(
+        &binding,
+        &heads,
+        HeadInvocationKind::Synthesis,
+        &input.domain,
+        &[],
+        input.routing_explore_token,
+    )?;
+    let synthesis = synthesis_route.0;
+    let synthesis_decision = synthesis_route.1;
+    let verifier_route = route_head(
+        &binding,
+        &heads,
+        HeadInvocationKind::Verification,
+        &input.domain,
+        &[synthesis.head_id.clone()],
+        input.routing_explore_token,
+    )?;
+    let verifier = verifier_route.0;
+    let verifier_decision = verifier_route.1;
     let mut binding = binding;
     let mut events = Vec::new();
     let mut revisions = Vec::new();
     let mut invocation_receipts = Vec::new();
+    let routing_decisions = vec![
+        primary_decision,
+        critic_decision,
+        synthesis_decision,
+        verifier_decision,
+    ];
 
     binding = apply_step(
         binding,
@@ -266,7 +319,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &revisions,
         &constitution,
     )?;
-    let proposal = append_invocation_revision(&mut binding, &proposal_receipt)?;
+    let proposal = append_invocation_revision(&mut binding, &proposal_receipt, &revisions)?;
     binding = contribute_from_receipt(binding, &proposal_receipt, &input.started_at, &mut events)?;
     revisions.push(proposal);
     invocation_receipts.push(proposal_receipt);
@@ -280,7 +333,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &revisions,
         &constitution,
     )?;
-    let critique = append_invocation_revision(&mut binding, &critique_receipt)?;
+    let critique = append_invocation_revision(&mut binding, &critique_receipt, &revisions)?;
     binding = contribute_from_receipt(binding, &critique_receipt, &input.started_at, &mut events)?;
     revisions.push(critique);
     invocation_receipts.push(critique_receipt);
@@ -294,22 +347,77 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &revisions,
         &constitution,
     )?;
-    let synthesis_revision = append_invocation_revision(&mut binding, &synthesis_receipt)?;
+    let synthesis_revision =
+        append_invocation_revision(&mut binding, &synthesis_receipt, &revisions)?;
+    let synthesis_revision_id = synthesis_revision.revision_id.clone();
     binding = contribute_from_receipt(binding, &synthesis_receipt, &input.started_at, &mut events)?;
     revisions.push(synthesis_revision);
     invocation_receipts.push(synthesis_receipt);
 
+    let synthesis_id = "synthesis:fake-loop";
     binding = apply_step(
         binding,
         "DRAFTS.SYNTHESIZED",
         object_payload(json!({
-            "synthesis_id": "synthesis:fake-loop",
+            "synthesis_id": synthesis_id,
+            "synthesis_revision_id": synthesis_revision_id,
             "contributing_heads": [primary.head_id.clone(), critic.head_id.clone()]
         })),
         &input.started_at,
         &mut events,
     )?
     .binding;
+
+    let verification_receipt = invoke_head(
+        invoker,
+        verifier.clone(),
+        HeadInvocationKind::Verification,
+        &binding,
+        &input,
+        &revisions,
+        &constitution,
+    )?;
+    let verification_revision =
+        append_invocation_revision(&mut binding, &verification_receipt, &revisions)?;
+    let verification_attempts = payload_array(
+        verification_receipt.payload.get("attempted_failure_modes"),
+        vec![
+            "grounding gap".to_string(),
+            "counterexample search".to_string(),
+        ],
+    );
+    let verification_commands = payload_array(
+        verification_receipt.payload.get("commands_run"),
+        vec!["binding synthesis verification".to_string()],
+    );
+    let verification_outcome = payload_string(
+        verification_receipt.payload.get("outcome"),
+        "accepted".to_string(),
+    );
+    let verification_id = format!("verification:{}", verification_receipt.invocation_id);
+    let verification_head_id = verification_receipt.head_id.clone();
+    let verification_receipt_hash = verification_receipt.receipt_hash.clone();
+    let verification_cost_units = verification_receipt.cost_units;
+    revisions.push(verification_revision);
+    binding = apply_step(
+        binding,
+        "SYNTHESIS.VERIFIED",
+        object_payload(json!({
+            "verification_id": verification_id,
+            "synthesis_id": synthesis_id,
+            "verifier_head_id": verification_head_id,
+            "target_revision_id": synthesis_revision_id,
+            "outcome": verification_outcome,
+            "attempted_failure_modes": verification_attempts,
+            "commands_run": verification_commands,
+            "receipt_hash": verification_receipt_hash,
+            "cost_units": verification_cost_units
+        })),
+        &input.started_at,
+        &mut events,
+    )?
+    .binding;
+    invocation_receipts.push(verification_receipt);
 
     binding = apply_step(
         binding,
@@ -383,6 +491,8 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         primary_head_id: primary.head_id.clone(),
         critic_head_id: critic.head_id.clone(),
         synthesis_head_id: synthesis.head_id.clone(),
+        verifier_head_id: verifier.head_id.clone(),
+        routing_decisions,
     })
 }
 
@@ -392,6 +502,42 @@ fn reasoning_heads(registry: &AgentHeadRegistry) -> Vec<ResolvedAgentHead> {
         .into_iter()
         .filter(|head| head.kind != HeadKind::SkillPlugin)
         .collect()
+}
+
+fn route_head(
+    binding: &AgentBinding,
+    heads: &[ResolvedAgentHead],
+    kind: HeadInvocationKind,
+    domain: &str,
+    exclude_head_ids: &[String],
+    explore_token: u32,
+) -> Result<(ResolvedAgentHead, BindingRoutingDecision), IntraAgentLoopError> {
+    let mut candidates = heads
+        .iter()
+        .filter(|head| !exclude_head_ids.contains(&head.head_id))
+        .map(|head| head.head_id.clone())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = heads.iter().map(|head| head.head_id.clone()).collect();
+    }
+    let subtask = BindingSubtask::new(
+        format!("binding:{}", kind.as_str()),
+        kind.as_str(),
+        domain.to_string(),
+    );
+    let decision = binding
+        .route_subtask_from_candidates(&subtask, &candidates, explore_token)
+        .ok_or(IntraAgentLoopError::NotEnoughReasoningHeads {
+            available: heads.len(),
+        })?;
+    let head = heads
+        .iter()
+        .find(|head| head.head_id == decision.head_id)
+        .cloned()
+        .ok_or(IntraAgentLoopError::NotEnoughReasoningHeads {
+            available: heads.len(),
+        })?;
+    Ok((head, decision))
 }
 
 fn invoke_head<I: HeadInvoker>(
@@ -444,6 +590,7 @@ fn parse_invocation_kind(kind: &str) -> Option<HeadInvocationKind> {
         "proposal" => Some(HeadInvocationKind::Proposal),
         "critique" => Some(HeadInvocationKind::Critique),
         "synthesis" => Some(HeadInvocationKind::Synthesis),
+        "verification" => Some(HeadInvocationKind::Verification),
         _ => None,
     }
 }
@@ -474,16 +621,126 @@ fn contribute_from_receipt(
 fn append_invocation_revision(
     binding: &mut AgentBinding,
     receipt: &HeadInvocationReceipt,
+    prior_revisions: &[ScratchpadRevision],
 ) -> Result<ScratchpadRevision, IntraAgentLoopError> {
+    let parent_revision_ids = parent_revision_ids_for(receipt, prior_revisions);
+    let links = revision_links_for(receipt, prior_revisions);
     binding
-        .append_scratchpad_revision(
+        .append_scratchpad_revision_with_links(
             &receipt.head_id,
             &receipt.output_summary,
             receipt.content_hash.clone(),
             receipt.payload.clone(),
+            parent_revision_ids,
+            links,
             &receipt.created_at,
         )
         .map_err(IntraAgentLoopError::Binding)
+}
+
+fn parent_revision_ids_for(
+    receipt: &HeadInvocationReceipt,
+    prior_revisions: &[ScratchpadRevision],
+) -> Vec<String> {
+    match receipt.kind {
+        HeadInvocationKind::Synthesis => prior_revisions
+            .iter()
+            .filter(|revision| {
+                revision
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "proposal" || kind == "critique")
+            })
+            .map(|revision| revision.revision_id.clone())
+            .collect(),
+        HeadInvocationKind::Verification => prior_revisions
+            .iter()
+            .rev()
+            .find(|revision| {
+                revision
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "synthesis")
+            })
+            .map(|revision| vec![revision.revision_id.clone()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn revision_links_for(
+    receipt: &HeadInvocationReceipt,
+    prior_revisions: &[ScratchpadRevision],
+) -> Vec<ScratchpadRevisionLink> {
+    match receipt.kind {
+        HeadInvocationKind::Critique => prior_revisions
+            .iter()
+            .rev()
+            .find(|revision| {
+                revision
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "proposal")
+            })
+            .map(|revision| {
+                vec![ScratchpadRevisionLink::new(
+                    revision.revision_id.clone(),
+                    ScratchpadRelationKind::Annotates,
+                    "critique annotates proposal",
+                    Payload::new(),
+                )]
+            })
+            .unwrap_or_default(),
+        HeadInvocationKind::Synthesis => prior_revisions
+            .iter()
+            .filter(|revision| {
+                revision
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "proposal" || kind == "critique")
+            })
+            .map(|revision| {
+                ScratchpadRevisionLink::new(
+                    revision.revision_id.clone(),
+                    ScratchpadRelationKind::Supersedes,
+                    "synthesis supersedes prior partial work",
+                    Payload::new(),
+                )
+            })
+            .collect(),
+        HeadInvocationKind::Verification => prior_revisions
+            .iter()
+            .rev()
+            .find(|revision| {
+                revision
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "synthesis")
+            })
+            .map(|revision| {
+                let relation_kind =
+                    if payload_string(receipt.payload.get("outcome"), "accepted".to_string())
+                        == "defect_found"
+                    {
+                        ScratchpadRelationKind::Undercuts
+                    } else {
+                        ScratchpadRelationKind::Supports
+                    };
+                vec![ScratchpadRevisionLink::new(
+                    revision.revision_id.clone(),
+                    relation_kind,
+                    "verification checks synthesis",
+                    Payload::new(),
+                )]
+            })
+            .unwrap_or_default(),
+        HeadInvocationKind::Proposal => Vec::new(),
+    }
 }
 
 fn append_revision(
@@ -518,4 +775,33 @@ fn object_payload(value: Value) -> Payload {
         Value::Object(map) => map,
         _ => Payload::new(),
     }
+}
+
+fn payload_array(value: Option<&Value>, fallback: Vec<String>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => {
+            let values = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if values.is_empty() { fallback } else { values }
+        }
+        _ => fallback,
+    }
+}
+
+fn payload_string(value: Option<&Value>, fallback: String) -> String {
+    value
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or(fallback)
+}
+
+fn default_domain() -> String {
+    "general".to_string()
+}
+
+fn default_routing_explore_token() -> u32 {
+    999
 }

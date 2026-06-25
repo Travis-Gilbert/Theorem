@@ -12,7 +12,7 @@ use crate::agent_binding::{
 };
 use crate::types::Payload;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -154,6 +154,7 @@ impl AgentHeadRegistry {
                 HeadKind::ReasoningCore => summary.reasoning_cores.push(head.head_id.clone()),
                 HeadKind::SkillPlugin => summary.skill_plugins.push(head.head_id.clone()),
                 HeadKind::SpecializedCoder => summary.specialized_coders.push(head.head_id.clone()),
+                HeadKind::Verifier => summary.verifiers.push(head.head_id.clone()),
             }
         }
         summary
@@ -323,6 +324,8 @@ pub struct AgentHeadKindSummary {
     pub skill_plugins: Vec<String>,
     #[serde(default)]
     pub specialized_coders: Vec<String>,
+    #[serde(default)]
+    pub verifiers: Vec<String>,
 }
 
 fn reject_credential_material(

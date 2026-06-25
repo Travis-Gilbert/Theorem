@@ -10,7 +10,7 @@ use crate::agent_head_registry::ResolvedAgentHead;
 use crate::state_hash::stable_value_hash;
 use crate::types::{Payload, PolicyDecision};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::error::Error;
 use std::fmt;
 
@@ -27,6 +27,7 @@ pub enum HeadInvocationKind {
     Proposal,
     Critique,
     Synthesis,
+    Verification,
 }
 
 impl HeadInvocationKind {
@@ -35,6 +36,7 @@ impl HeadInvocationKind {
             Self::Proposal => "proposal",
             Self::Critique => "critique",
             Self::Synthesis => "synthesis",
+            Self::Verification => "verification",
         }
     }
 }
@@ -300,8 +302,9 @@ impl HeadInvoker for FakeHeadInvoker {
             HeadInvocationKind::Proposal => "fake primary proposal",
             HeadInvocationKind::Critique => "fake critic review",
             HeadInvocationKind::Synthesis => "fake synthesis",
+            HeadInvocationKind::Verification => "fake verification",
         };
-        let payload = object_payload(json!({
+        let mut payload = object_payload(json!({
             "fake": true,
             "kind": request.kind.as_str(),
             "head_id": request.head.head_id,
@@ -311,6 +314,17 @@ impl HeadInvoker for FakeHeadInvoker {
             "prior_context": request.prior_context,
             "claims": request.claims,
         }));
+        if request.kind == HeadInvocationKind::Verification {
+            payload.insert(
+                "attempted_failure_modes".to_string(),
+                json!(["grounding gap", "counterexample search"]),
+            );
+            payload.insert(
+                "commands_run".to_string(),
+                json!(["binding synthesis verification"]),
+            );
+            payload.insert("outcome".to_string(), json!("accepted"));
+        }
 
         Ok(HeadInvocationReceipt::from_request(
             &request,

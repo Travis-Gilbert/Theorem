@@ -1,9 +1,9 @@
 use crate::head_invoker::{
-    object_payload, prompt_for_request, provider_send_error, provider_summary, truncate_detail,
-    CredentialResolver, EndpointMap,
+    CredentialResolver, EndpointMap, object_payload, prompt_for_request, provider_send_error,
+    provider_summary, truncate_detail,
 };
 use reqwest::blocking::{Client, RequestBuilder};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use theorem_harness_core::{
     HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
     HeadTransport,
@@ -163,6 +163,7 @@ pub fn mcp_tool_name(request: &HeadInvocationRequest) -> String {
         ("deepseek", HeadInvocationKind::Proposal) => "deepseek_reason".to_string(),
         ("deepseek", HeadInvocationKind::Critique) => "deepseek_critique".to_string(),
         ("deepseek", HeadInvocationKind::Synthesis) => "deepseek_synthesize".to_string(),
+        ("deepseek", HeadInvocationKind::Verification) => "deepseek_critique".to_string(),
         _ => format!("{}_{}", provider, request.kind.as_str()),
     }
 }

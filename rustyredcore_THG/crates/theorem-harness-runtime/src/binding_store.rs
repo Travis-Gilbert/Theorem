@@ -18,12 +18,13 @@ use crate::writing_style;
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use theorem_harness_core::{
-    apply_binding_transition, AgentBinding, BindingError, BindingEventState,
-    BindingTransitionInput, BindingTransitionResult, ScratchpadRevision,
+    AgentBinding, BindingError, BindingEventState, BindingTransitionInput, BindingTransitionResult,
+    ScratchpadRevision, ScratchpadRevisionRelation, apply_binding_transition,
 };
 
 pub type BindingRuntimeResult<T> = Result<T, BindingRuntimeError>;
@@ -197,18 +198,45 @@ fn persist_scratchpad_revisions<S: GraphStore>(
 ) -> BindingRuntimeResult<()> {
     let document_id = &binding.working_memory_scope.scratchpad.document_id;
     let run_id = &binding.lifecycle.run_id;
+    let revision_seq_by_id = binding
+        .working_memory_scope
+        .scratchpad
+        .revisions
+        .iter()
+        .map(|revision| (revision.revision_id.clone(), revision.seq))
+        .collect::<BTreeMap<_, _>>();
     for revision in &binding.working_memory_scope.scratchpad.revisions {
         upsert_node_if_changed(store, scratchpad_revision_node(document_id, revision)?)?;
         upsert_edge_if_changed(
             store,
             scratchpad_revision_of_edge(document_id, run_id, revision),
         )?;
+        for parent_revision_id in scratchpad_parent_revision_ids(revision) {
+            if let Some(parent_seq) = revision_seq_by_id.get(&parent_revision_id) {
+                upsert_edge_if_changed(
+                    store,
+                    scratchpad_revision_parent_edge(document_id, *parent_seq, revision),
+                )?;
+            }
+        }
         if revision.seq > 1 {
             upsert_edge_if_changed(
                 store,
                 previous_scratchpad_revision_edge(document_id, revision),
             )?;
         }
+    }
+    for relation in &binding.working_memory_scope.scratchpad.relations {
+        let Some(from_seq) = revision_seq_by_id.get(&relation.from_revision_id) else {
+            continue;
+        };
+        let Some(to_seq) = revision_seq_by_id.get(&relation.to_revision_id) else {
+            continue;
+        };
+        upsert_edge_if_changed(
+            store,
+            scratchpad_revision_relation_edge(document_id, relation, *from_seq, *to_seq),
+        )?;
     }
     Ok(())
 }
@@ -393,6 +421,65 @@ fn previous_scratchpad_revision_edge(
     )
 }
 
+fn scratchpad_revision_parent_edge(
+    document_id: &str,
+    parent_seq: u64,
+    revision: &ScratchpadRevision,
+) -> EdgeRecord {
+    EdgeRecord::new(
+        format!(
+            "harness:edge:scratchrev-parent:{}:{:020}:{:020}",
+            document_id, parent_seq, revision.seq
+        ),
+        scratchpad_revision_node_id(document_id, parent_seq),
+        "HARNESS_SCRATCHPAD_REVISION_PARENT",
+        scratchpad_revision_node_id(document_id, revision.seq),
+        json!({
+            "document_id": document_id,
+            "from_seq": parent_seq,
+            "to_seq": revision.seq,
+            "child_revision_id": revision.revision_id,
+        }),
+    )
+}
+
+fn scratchpad_revision_relation_edge(
+    document_id: &str,
+    relation: &ScratchpadRevisionRelation,
+    from_seq: u64,
+    to_seq: u64,
+) -> EdgeRecord {
+    EdgeRecord::new(
+        format!(
+            "harness:edge:scratchrel:{}:{}",
+            document_id, relation.relation_id
+        ),
+        scratchpad_revision_node_id(document_id, from_seq),
+        relation.relation_kind.edge_type(),
+        scratchpad_revision_node_id(document_id, to_seq),
+        json!({
+            "document_id": document_id,
+            "relation_id": relation.relation_id,
+            "from_revision_id": relation.from_revision_id,
+            "to_revision_id": relation.to_revision_id,
+            "relation_kind": relation.relation_kind,
+            "actor_head_id": relation.actor_head_id,
+            "summary": relation.summary,
+            "created_at": relation.created_at,
+        }),
+    )
+}
+
+fn scratchpad_parent_revision_ids(revision: &ScratchpadRevision) -> Vec<String> {
+    if !revision.parent_revision_ids.is_empty() {
+        return revision.parent_revision_ids.clone();
+    }
+    if !revision.parent_revision_id.is_empty() {
+        return vec![revision.parent_revision_id.clone()];
+    }
+    Vec::new()
+}
+
 fn ensure_binding_append_position<S: GraphStore>(
     store: &S,
     event: &BindingEventState,
@@ -467,12 +554,13 @@ fn upsert_edge_if_changed<S: GraphStore>(store: &mut S, edge: EdgeRecord) -> Gra
 mod tests {
     use super::*;
     use rustyred_thg_core::{InMemoryGraphStore, RedCoreGraphStore, RedCoreOptions};
-    use serde_json::{json, Map};
+    use serde_json::{Map, json};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use theorem_harness_core::{
-        hash_agent_binding, AgentHead, BindingBudgetScope, BindingComposition, BindingIdentity,
-        HeadCostProfile, HeadKind, HeadReliabilityProfile, HeadTransport, Payload, TraceTier,
+        AgentHead, BindingBudgetScope, BindingComposition, BindingIdentity, HeadCostProfile,
+        HeadKind, HeadReliabilityProfile, HeadTransport, Payload, ScratchpadRelationKind,
+        ScratchpadRevisionLink, TraceTier, hash_agent_binding,
     };
 
     const TS: &str = "2026-06-02T00:00:00Z";
@@ -505,15 +593,19 @@ mod tests {
         assert!(store.get_node(&binding_node_id(&run_id)).is_some());
         assert!(store.get_node(&binding_event_node_id(&run_id, 1)).is_some());
         assert!(store.get_node(&binding_event_node_id(&run_id, 2)).is_some());
-        assert!(store
-            .get_edge(&format!("harness:edge:binding-event-of:{run_id}:{:020}", 2))
-            .is_some());
-        assert!(store
-            .get_edge(&format!(
-                "harness:edge:binding-event-next:{run_id}:{:020}",
-                2
-            ))
-            .is_some());
+        assert!(
+            store
+                .get_edge(&format!("harness:edge:binding-event-of:{run_id}:{:020}", 2))
+                .is_some()
+        );
+        assert!(
+            store
+                .get_edge(&format!(
+                    "harness:edge:binding-event-next:{run_id}:{:020}",
+                    2
+                ))
+                .is_some()
+        );
 
         let events = load_binding_events(&store, &run_id).unwrap();
         assert_eq!(events.len(), 2);
@@ -609,18 +701,77 @@ mod tests {
         assert_eq!(revisions[0].seq, 1);
         assert_eq!(revisions[1].seq, 2);
         assert_eq!(revisions[1].parent_revision_id, revisions[0].revision_id);
-        assert!(store
+        assert!(
+            store
+                .get_edge(&format!(
+                    "harness:edge:scratchrev-next:{document_id}:{:020}",
+                    2
+                ))
+                .is_some()
+        );
+        assert!(
+            store
+                .get_edge(&format!(
+                    "harness:edge:scratchrev-of:{document_id}:{:020}",
+                    1
+                ))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn scratchpad_dag_relations_persist_as_edges() {
+        let mut store = InMemoryGraphStore::new();
+        let mut binding = fixture_binding();
+        let document_id = binding.working_memory_scope.scratchpad.document_id.clone();
+        let proposal = binding
+            .append_scratchpad_revision("claude", "proposal", "hash:1", Payload::new(), TS)
+            .unwrap();
+        let critique = binding
+            .append_scratchpad_revision("deepseek", "critique", "hash:2", Payload::new(), TS)
+            .unwrap();
+        binding
+            .append_scratchpad_revision_with_links(
+                "claude",
+                "synthesis",
+                "hash:3",
+                Payload::new(),
+                vec![proposal.revision_id.clone(), critique.revision_id.clone()],
+                vec![ScratchpadRevisionLink::new(
+                    critique.revision_id,
+                    ScratchpadRelationKind::Undercuts,
+                    "critique undercuts proposal",
+                    Payload::new(),
+                )],
+                TS,
+            )
+            .unwrap();
+
+        persist_binding(&mut store, &binding, &hash_agent_binding(&binding)).unwrap();
+
+        assert!(
+            store
+                .get_edge(&format!(
+                    "harness:edge:scratchrev-parent:{document_id}:{:020}:{:020}",
+                    1, 3
+                ))
+                .is_some()
+        );
+        assert!(
+            store
+                .get_edge(&format!(
+                    "harness:edge:scratchrev-parent:{document_id}:{:020}:{:020}",
+                    2, 3
+                ))
+                .is_some()
+        );
+        let relation_id = &binding.working_memory_scope.scratchpad.relations[0].relation_id;
+        let relation_edge = store
             .get_edge(&format!(
-                "harness:edge:scratchrev-next:{document_id}:{:020}",
-                2
+                "harness:edge:scratchrel:{document_id}:{relation_id}"
             ))
-            .is_some());
-        assert!(store
-            .get_edge(&format!(
-                "harness:edge:scratchrev-of:{document_id}:{:020}",
-                1
-            ))
-            .is_some());
+            .unwrap();
+        assert_eq!(relation_edge.edge_type, "HARNESS_SCRATCHPAD_UNDERCUTS");
     }
 
     #[test]

@@ -2,7 +2,7 @@ pub mod api;
 pub mod credentials;
 pub mod mcp;
 
-pub use api::{api_provider_profile, default_api_profiles, ApiProviderProfile, ApiRequestShape};
+pub use api::{ApiProviderProfile, ApiRequestShape, api_provider_profile, default_api_profiles};
 pub use credentials::{CredentialResolutionError, CredentialResolver};
 pub use mcp::mcp_tool_name;
 
@@ -210,6 +210,9 @@ pub(crate) fn system_instruction_for_kind(kind: HeadInvocationKind) -> &'static 
         }
         HeadInvocationKind::Synthesis => {
             "Merge the proposal and critique into one final grounded answer."
+        }
+        HeadInvocationKind::Verification => {
+            "Verify the prior synthesis by trying to falsify it. Name attempted failure modes and whether the synthesis survives."
         }
     }
 }
