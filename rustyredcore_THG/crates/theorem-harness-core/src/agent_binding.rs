@@ -1,9 +1,9 @@
 use crate::alignment::evaluate_publication;
-use crate::budget::{BindingBudgetState, apply_contribution_charge, check_contribution_budget};
+use crate::budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
 use crate::state_hash::stable_value_hash;
-use crate::types::{GuardViolation, Payload, now_string, prefixed_id};
+use crate::types::{now_string, prefixed_id, GuardViolation, Payload};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
@@ -157,6 +157,45 @@ impl HeadReliabilityProfile {
             }
         })
     }
+
+    pub fn record_capability_outcome(
+        &mut self,
+        capability: impl Into<String>,
+        domain: impl Into<String>,
+        accepted: bool,
+        outcome_hash: impl Into<String>,
+    ) {
+        let capability = capability.into();
+        let domain = domain.into();
+        let outcome_hash = outcome_hash.into();
+        let score = self
+            .capability_scores
+            .iter_mut()
+            .find(|score| score.capability == capability && score.domain == domain);
+        match score {
+            Some(score) => score.record_outcome(accepted, outcome_hash.clone()),
+            None => {
+                let mut score = HeadCapabilityReliability::new(capability, domain, 0, 0);
+                score.record_outcome(accepted, outcome_hash.clone());
+                self.capability_scores.push(score);
+            }
+        }
+        self.last_outcome_hash = outcome_hash;
+        let successes = self
+            .capability_scores
+            .iter()
+            .map(|score| score.successes)
+            .sum::<u64>();
+        let failures = self
+            .capability_scores
+            .iter()
+            .map(|score| score.failures)
+            .sum::<u64>();
+        let total = successes + failures;
+        if total > 0 {
+            self.success_rate = successes as f32 / total as f32;
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,6 +229,15 @@ impl HeadCapabilityReliability {
 
     pub fn posterior_success_rate(&self) -> f32 {
         ((self.successes + 1) as f32) / ((self.successes + self.failures + 2) as f32)
+    }
+
+    pub fn record_outcome(&mut self, accepted: bool, outcome_hash: impl Into<String>) {
+        if accepted {
+            self.successes += 1;
+        } else {
+            self.failures += 1;
+        }
+        self.last_outcome_hash = outcome_hash.into();
     }
 }
 
@@ -225,6 +273,63 @@ pub struct BindingRoutingDecision {
     pub posterior_success_rate: f32,
     #[serde(default)]
     pub explored: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingBudgetDecision {
+    pub subtask_id: String,
+    pub capability: String,
+    #[serde(default)]
+    pub domain: String,
+    pub head_id: String,
+    #[serde(default)]
+    pub round_index: u32,
+    #[serde(default)]
+    pub posterior_success_rate: f32,
+    #[serde(default)]
+    pub current_confidence: f32,
+    #[serde(default)]
+    pub expected_value_units: f64,
+    #[serde(default)]
+    pub expected_cost_units: f64,
+    #[serde(default)]
+    pub marginal_expected_value_units: f64,
+    #[serde(default)]
+    pub remaining_budget_units: f64,
+    #[serde(default)]
+    pub should_invoke: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingHeadOutcome {
+    pub head_id: String,
+    pub capability: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub accepted: bool,
+    #[serde(default)]
+    pub outcome_hash: String,
+}
+
+impl BindingHeadOutcome {
+    pub fn new(
+        head_id: impl Into<String>,
+        capability: impl Into<String>,
+        domain: impl Into<String>,
+        accepted: bool,
+        outcome_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            head_id: head_id.into(),
+            capability: capability.into(),
+            domain: domain.into(),
+            accepted,
+            outcome_hash: outcome_hash.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -761,6 +866,13 @@ impl AgentBinding {
             .find(|head| head.head_id == head_id)
     }
 
+    pub fn head_mut(&mut self, head_id: &str) -> Option<&mut AgentHead> {
+        self.composition
+            .heads
+            .iter_mut()
+            .find(|head| head.head_id == head_id)
+    }
+
     pub fn reasoning_core_ids(&self) -> Vec<String> {
         let active = self.active_head_ids();
         self.composition
@@ -819,6 +931,95 @@ impl AgentBinding {
             }
         }
         Some(routing_decision_for(best, subtask, false))
+    }
+
+    pub fn value_aware_budget_decision(
+        &self,
+        subtask: &BindingSubtask,
+        head_id: &str,
+        round_index: u32,
+        current_confidence: f32,
+        expected_value_units: f64,
+        expected_cost_units: f64,
+    ) -> Option<BindingBudgetDecision> {
+        let head = self.head(head_id)?;
+        if !self.active_head_ids().contains(head_id) || head.kind == HeadKind::SkillPlugin {
+            return None;
+        }
+        let posterior_success_rate = head
+            .reliability_profile
+            .reliability_for(&subtask.capability, &subtask.domain);
+        let current_confidence = current_confidence.clamp(0.0, 1.0);
+        let remaining_budget_units =
+            remaining_run_budget_units(&self.budget_scope, &self.budget_state);
+        let marginal_expected_value_units = (1.0 - f64::from(current_confidence))
+            * f64::from(posterior_success_rate)
+            * expected_value_units.max(0.0);
+        let expected_cost_units = expected_cost_units.max(0.0);
+        let round_index = round_index.max(1);
+        let budget_available = expected_cost_units <= remaining_budget_units;
+        let should_invoke = budget_available
+            && (round_index == 1
+                || marginal_expected_value_units >= expected_cost_units
+                || expected_cost_units == 0.0);
+        let reason = if !budget_available {
+            "budget_exhausted"
+        } else if round_index == 1 {
+            "initial_round"
+        } else if marginal_expected_value_units >= expected_cost_units {
+            "marginal_value_positive"
+        } else if expected_cost_units == 0.0 {
+            "zero_cost_check"
+        } else {
+            "marginal_value_below_cost"
+        };
+
+        Some(BindingBudgetDecision {
+            subtask_id: subtask.subtask_id.clone(),
+            capability: subtask.capability.clone(),
+            domain: subtask.domain.clone(),
+            head_id: head.head_id.clone(),
+            round_index,
+            posterior_success_rate,
+            current_confidence,
+            expected_value_units: expected_value_units.max(0.0),
+            expected_cost_units,
+            marginal_expected_value_units,
+            remaining_budget_units,
+            should_invoke,
+            reason: reason.to_string(),
+        })
+    }
+
+    pub fn record_head_outcomes(
+        &mut self,
+        outcomes: Vec<BindingHeadOutcome>,
+    ) -> Result<(), BindingError> {
+        for outcome in outcomes {
+            self.record_head_outcome(outcome)?;
+        }
+        self.identity.composition_hash = composition_hash(self);
+        Ok(())
+    }
+
+    fn record_head_outcome(&mut self, outcome: BindingHeadOutcome) -> Result<(), BindingError> {
+        let head = self.head_mut(&outcome.head_id).ok_or_else(|| {
+            guard_violation(
+                "unknown_outcome_head",
+                format!("outcome references unregistered head {}", outcome.head_id),
+                "registered_head",
+                "unknown_head",
+                vec!["head_id".to_string()],
+                Payload::new(),
+            )
+        })?;
+        head.reliability_profile.record_capability_outcome(
+            outcome.capability,
+            outcome.domain,
+            outcome.accepted,
+            outcome.outcome_hash,
+        );
+        Ok(())
     }
 
     pub fn append_scratchpad_revision(
@@ -1296,6 +1497,12 @@ fn apply_binding_payload(
                 payload_f64(transition.payload.get("cost_units")),
             );
         }
+        "OUTCOME.RECORDED" => {
+            let outcomes = payload_head_outcomes(transition.payload.get("head_outcomes"));
+            if !outcomes.is_empty() {
+                binding.record_head_outcomes(outcomes)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1732,6 +1939,15 @@ fn routing_candidate_is_better(
     candidate.head_id < incumbent.head_id
 }
 
+fn remaining_run_budget_units(scope: &BindingBudgetScope, state: &BindingBudgetState) -> f64 {
+    let run_cap = if scope.allocated_run_budget_units > 0.0 {
+        scope.allocated_run_budget_units
+    } else {
+        scope.shared_budget_units
+    };
+    (run_cap - state.spent_total).max(0.0)
+}
+
 fn payload_array_strings(value: Option<&Value>) -> Vec<String> {
     match value {
         Some(Value::Array(items)) => clean_strings(
@@ -1757,6 +1973,35 @@ fn payload_verification_outcome(value: Option<&Value>) -> BindingVerificationOut
         "accepted" => BindingVerificationOutcome::Accepted,
         "defect_found" => BindingVerificationOutcome::DefectFound,
         _ => BindingVerificationOutcome::Rejected,
+    }
+}
+
+fn payload_head_outcomes(value: Option<&Value>) -> Vec<BindingHeadOutcome> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                let map = item.as_object()?;
+                let head_id = payload_to_string(map.get("head_id"));
+                let capability = payload_to_string(map.get("capability"));
+                if head_id.trim().is_empty() || capability.trim().is_empty() {
+                    return None;
+                }
+                let outcome_hash = payload_to_string(map.get("outcome_hash"));
+                Some(BindingHeadOutcome::new(
+                    head_id,
+                    capability,
+                    payload_to_string(map.get("domain")),
+                    payload_bool(map.get("accepted")),
+                    if outcome_hash.is_empty() {
+                        stable_value_hash(item)
+                    } else {
+                        outcome_hash
+                    },
+                ))
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1839,7 +2084,7 @@ fn binding_event_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Map, Value, json};
+    use serde_json::{json, Map, Value};
 
     #[test]
     fn composition_hash_changes_when_active_roster_changes() {
@@ -2183,6 +2428,82 @@ mod tests {
     }
 
     #[test]
+    fn value_aware_budget_abstains_when_marginal_value_is_below_cost() {
+        let mut binding = ready_for_contribution();
+        binding
+            .composition
+            .heads
+            .iter_mut()
+            .find(|head| head.head_id == "claude")
+            .unwrap()
+            .reliability_profile
+            .capability_scores
+            .push(HeadCapabilityReliability::new("verification", "rust", 1, 9));
+
+        let decision = binding
+            .value_aware_budget_decision(
+                &BindingSubtask::new("round:2:verification", "verification", "rust"),
+                "claude",
+                2,
+                0.95,
+                10.0,
+                1.0,
+            )
+            .unwrap();
+
+        assert!(!decision.should_invoke);
+        assert_eq!(decision.reason, "marginal_value_below_cost");
+    }
+
+    #[test]
+    fn outcome_recorded_compounds_per_head_capability_reliability() {
+        let binding = apply(
+            ready_for_outcome_recorded(),
+            "OUTCOME.RECORDED",
+            json!({
+                "outcome_id": "outcome:1",
+                "accepted": true,
+                "summary": "published",
+                "head_outcomes": [{
+                    "head_id": "claude",
+                    "capability": "proposal",
+                    "domain": "rust",
+                    "accepted": true,
+                    "outcome_hash": "hash:proposal:accepted"
+                }, {
+                    "head_id": "deepseek",
+                    "capability": "synthesis",
+                    "domain": "rust",
+                    "accepted": false,
+                    "outcome_hash": "hash:synthesis:defect"
+                }]
+            }),
+        )
+        .binding;
+
+        let claude = binding.head("claude").unwrap();
+        assert_eq!(claude.reliability_profile.success_rate, 1.0);
+        assert_eq!(
+            claude
+                .reliability_profile
+                .reliability_for("proposal", "rust"),
+            2.0_f32 / 3.0
+        );
+        let deepseek = binding.head("deepseek").unwrap();
+        assert_eq!(deepseek.reliability_profile.success_rate, 0.0);
+        assert_eq!(
+            deepseek
+                .reliability_profile
+                .reliability_for("synthesis", "rust"),
+            1.0_f32 / 3.0
+        );
+        assert_eq!(
+            binding.identity.composition_hash,
+            composition_hash(&binding)
+        );
+    }
+
+    #[test]
     fn synthesis_verification_requires_falsification_before_publication() {
         let mut binding = ready_for_synthesis_verification();
         let synthesis_revision = binding
@@ -2437,6 +2758,27 @@ mod tests {
             }),
         );
         binding.binding
+    }
+
+    fn ready_for_outcome_recorded() -> AgentBinding {
+        let binding = apply(
+            ready_for_publication(),
+            "POLICY.CHECKED",
+            json!({
+                "policy_receipt_id": "policy:1",
+                "allowed": true,
+                "claims": [{ "text": "grounded", "provenance": "source:1" }]
+            }),
+        );
+        apply(
+            binding.binding,
+            "PUBLISHED_TO_SUBSTRATE",
+            json!({
+                "publication_id": "pub:1",
+                "substrate_receipt_id": "substrate:1"
+            }),
+        )
+        .binding
     }
 
     fn ready_for_synthesis_verification() -> AgentBinding {

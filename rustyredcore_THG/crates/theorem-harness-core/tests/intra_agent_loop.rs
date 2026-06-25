@@ -2,11 +2,12 @@ use std::cell::RefCell;
 
 use serde_json::json;
 use theorem_harness_core::{
-    AgentBinding, AgentHead, BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
-    FakeIntraAgentLoopInput, GroundedClaim, HeadCapabilityReliability, HeadCostProfile,
-    HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
-    HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError,
-    ScratchpadRelationKind, TraceTier, default_authority_order, run_fake_intra_agent_loop,
+    default_authority_order, run_fake_intra_agent_loop, AgentBinding, AgentHead,
+    BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
+    BindingVerificationOutcome, FakeIntraAgentLoopInput, GroundedClaim, HeadCapabilityReliability,
+    HeadCostProfile, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
+    HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport,
+    IntraAgentLoopError, ScratchpadRelationKind, TraceTier,
 };
 
 #[test]
@@ -74,15 +75,13 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
         result.scratchpad_revisions[1].content_hash,
         result.invocation_receipts[0].content_hash
     );
-    assert!(
-        result
-            .binding
-            .working_memory_scope
-            .scratchpad
-            .relations
-            .iter()
-            .any(|relation| relation.relation_kind == ScratchpadRelationKind::Supports)
-    );
+    assert!(result
+        .binding
+        .working_memory_scope
+        .scratchpad
+        .relations
+        .iter()
+        .any(|relation| relation.relation_kind == ScratchpadRelationKind::Supports));
 }
 
 #[test]
@@ -134,18 +133,14 @@ fn synthesis_receives_proposal_and_critique_context() {
         synthesis.prior_context[1].kind,
         HeadInvocationKind::Critique
     );
-    assert!(
-        synthesis.prior_context[0]
-            .payload
-            .get("task")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-    );
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.policy_decision.is_some())
-    );
+    assert!(synthesis.prior_context[0]
+        .payload
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    assert!(requests
+        .iter()
+        .all(|request| request.policy_decision.is_some()));
     assert!(requests.iter().all(|request| {
         request
             .policy_decision
@@ -185,11 +180,85 @@ fn fake_loop_routes_roles_by_learned_capability_reliability() {
     assert_eq!(result.primary_head_id, "deepseek");
     assert_eq!(result.critic_head_id, "claude");
     assert_eq!(result.routing_decisions.len(), 4);
+    assert!(result
+        .routing_decisions
+        .iter()
+        .any(|decision| decision.capability == "proposal" && decision.head_id == "deepseek"));
+}
+
+#[test]
+fn fake_loop_iterates_after_defective_verification_until_accepted() {
+    let invoker = DefectThenAcceptedVerifier::default();
+    let mut input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    input.max_rounds = 2;
+    input.budget_units = 20.0;
+
+    let result =
+        theorem_harness_core::run_intra_agent_loop_with_invoker(fixture_binding(), input, &invoker)
+            .unwrap();
+
+    assert_eq!(result.rounds.len(), 2);
+    assert_eq!(
+        result.rounds[0].verification_outcome,
+        BindingVerificationOutcome::DefectFound
+    );
+    assert_eq!(result.rounds[0].stop_reason, "continue");
+    assert_eq!(
+        result.rounds[1].verification_outcome,
+        BindingVerificationOutcome::Accepted
+    );
+    assert_eq!(result.rounds[1].stop_reason, "verified_converged");
+    assert_eq!(result.invocation_receipts.len(), 8);
+    assert_eq!(result.events.len(), 22);
+    assert!(result
+        .binding
+        .working_memory_scope
+        .scratchpad
+        .relations
+        .iter()
+        .any(|relation| relation.relation_kind == ScratchpadRelationKind::Undercuts));
+    assert!(result
+        .binding
+        .working_memory_scope
+        .scratchpad
+        .relations
+        .iter()
+        .any(|relation| relation.relation_kind == ScratchpadRelationKind::Supports));
+}
+
+#[test]
+fn fake_loop_compounds_outcome_reliability_for_later_routing() {
+    let result = run_fake_intra_agent_loop(
+        fixture_binding(),
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]),
+    )
+    .unwrap();
+
+    let primary = result.binding.head(&result.primary_head_id).unwrap();
+    assert!(
+        primary
+            .reliability_profile
+            .reliability_for("proposal", "general")
+            > 0.5
+    );
+    assert!(!primary.reliability_profile.last_outcome_hash.is_empty());
+    let routed_head_id = result
+        .binding
+        .route_subtask(
+            &theorem_harness_core::BindingSubtask::new("next", "proposal", "general"),
+            999,
+        )
+        .unwrap()
+        .head_id;
     assert!(
         result
-            .routing_decisions
-            .iter()
-            .any(|decision| decision.capability == "proposal" && decision.head_id == "deepseek")
+            .binding
+            .head(&routed_head_id)
+            .unwrap()
+            .reliability_profile
+            .reliability_for("proposal", "general")
+            > 0.5
     );
 }
 
@@ -333,6 +402,55 @@ impl HeadInvoker for RecordingInvoker {
         payload.insert("kind".to_string(), json!(request.kind.as_str()));
         payload.insert("task".to_string(), json!(request.task));
         payload.insert("prior_context".to_string(), json!(request.prior_context));
+        Ok(HeadInvocationReceipt::from_request(
+            &request,
+            output_summary,
+            payload,
+            1.0,
+        ))
+    }
+}
+
+#[derive(Default)]
+struct DefectThenAcceptedVerifier {
+    verification_calls: RefCell<u32>,
+}
+
+impl HeadInvoker for DefectThenAcceptedVerifier {
+    fn invoke(
+        &self,
+        request: HeadInvocationRequest,
+    ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
+        let output_summary = match request.kind {
+            HeadInvocationKind::Proposal => "iterated proposal",
+            HeadInvocationKind::Critique => "iterated critique",
+            HeadInvocationKind::Synthesis => "iterated synthesis",
+            HeadInvocationKind::Verification => "iterated verification",
+        };
+        let mut payload = serde_json::Map::new();
+        payload.insert("kind".to_string(), json!(request.kind.as_str()));
+        payload.insert("task".to_string(), json!(request.task));
+        payload.insert("prior_context".to_string(), json!(request.prior_context));
+        if request.kind == HeadInvocationKind::Verification {
+            let mut calls = self.verification_calls.borrow_mut();
+            *calls += 1;
+            payload.insert(
+                "attempted_failure_modes".to_string(),
+                json!(["grounding gap", "counterexample search"]),
+            );
+            payload.insert(
+                "commands_run".to_string(),
+                json!(["binding synthesis verification"]),
+            );
+            payload.insert(
+                "outcome".to_string(),
+                json!(if *calls == 1 {
+                    "defect_found"
+                } else {
+                    "accepted"
+                }),
+            );
+        }
         Ok(HeadInvocationReceipt::from_request(
             &request,
             output_summary,

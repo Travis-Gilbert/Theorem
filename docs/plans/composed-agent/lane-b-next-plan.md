@@ -1,6 +1,6 @@
 # Composed Agent Lane B: Next Execution Plan
 
-Status: LB-1 pure registry, LB-2 deterministic fake-head loop, and LB-3 fake invocation seam implemented locally; runtime/provider execution is wired for API-backed heads. North Star binding stages 1-3 are landed in the deterministic loop: scratchpad DAG/relation edges, per-capability reliability routing, and synthesis verification receipts. Charter-surface reintegration and remaining live app affordances remain open.
+Status: LB-1 pure registry, LB-2 deterministic fake-head loop, and LB-3 fake invocation seam implemented locally; runtime/provider execution is wired for API-backed heads. North Star binding stages 1-6 are landed in the deterministic loop: scratchpad DAG/relation edges, per-capability reliability routing, synthesis verification receipts, marginal-value budget decisions, bounded convergence rounds, and outcome-fed reliability compounding. Charter-surface reintegration and remaining live app affordances remain open.
 
 Source plan: `implementation-plan.md`, Lane B checklist CA-B1 through CA-B4.
 
@@ -13,7 +13,7 @@ Lane B has local slices implemented and validated:
 - `rustyred-thg-affordances::compile_binding_charter(_from_store)` compiles per-binding charters for `CHARTER.COMPILED` and `CAPABILITIES.SELECTED`.
 - Builtin reasoning-engine affordances are registered as graph nodes through `register_builtin_affordances`.
 - `theorem-harness-core::AgentHeadRegistry` resolves active heads to fake api/mcp/local/hosted endpoints, emits `HEADS.PROBED` payloads, preserves credential references only, and rejects inactive/unknown heads before invocation.
-- `theorem-harness-core::run_fake_intra_agent_loop` runs a deterministic fake-head loop over the existing binding state machine, appends proposal/critique/synthesis scratchpad revisions, records separate `HEADS.CONTRIBUTE` receipts, charges budget, and relies on strict grounding guards.
+- `theorem-harness-core::run_fake_intra_agent_loop` runs a deterministic fake-head loop over the existing binding state machine, appends proposal/critique/synthesis/verification scratchpad revisions across bounded rounds, records separate `HEADS.CONTRIBUTE` receipts, charges budget through marginal-value decisions plus hard guards, and relies on strict grounding guards.
 - `theorem-harness-core::head_invocation` adds the fake-first invocation seam: `HeadInvoker`, `HeadInvocationRequest`, `HeadInvocationReceipt`, and `FakeHeadInvoker`. The loop now consumes invocation receipts rather than inline fake payloads.
 - Connector registration/invocation surfaces have started landing separately; do not collapse that work into the binding loop.
 
@@ -55,7 +55,7 @@ cd rustyredcore_THG && cargo clippy -p theorem-harness-runtime --all-targets --n
 
 Goal: build the loop shape without provider calls first, so the binding state machine, budget guard, scratchpad revisions, critic consensus, and strict grounding contract can be tested deterministically.
 
-Local state: implemented in `theorem-harness-core/src/intra_agent_loop.rs` as `run_fake_intra_agent_loop`. The scaffold is fake-head-only: it does not call providers, connectors, or tools. It consumes the LB-1 registry, appends DAG-linked scratchpad revisions, records proposal/critique/synthesis contributions, routes roles through per-capability reliability, records synthesis verification receipts, and drives the lifecycle through publication and close.
+Local state: implemented in `theorem-harness-core/src/intra_agent_loop.rs` as `run_fake_intra_agent_loop`. The scaffold is fake-head-only: it does not call providers, connectors, or tools. It consumes the LB-1 registry, appends DAG-linked scratchpad revisions, records proposal/critique/synthesis contributions, routes roles through per-capability reliability, records synthesis verification receipts, runs bounded value-aware rounds, writes per-head/domain outcomes back into reliability profiles, and drives the lifecycle through publication and close.
 
 Loop events:
 
@@ -84,6 +84,9 @@ Acceptance criteria:
 - Done locally: claimless or ungrounded publications fail loudly through the existing strict grounding guard.
 - Open: replace fake-head receipts with runtime model invocation receipts.
 - Done locally: learned/router moderation now selects proposal, critique, synthesis, and verification heads by per-capability reliability while keeping the deterministic scaffold replayable.
+- Done locally: value-aware budget decisions estimate marginal value for each role and for continuing another round before the hard budget guard charges spend.
+- Done locally: iterative rounds continue after a verifier defect and stop on convergence, budget/value stop, or `max_rounds`.
+- Done locally: `OUTCOME.RECORDED` carries `head_outcomes` so accepted/defective rounds update per-head, per-domain capability reliability for later routing.
 
 Validation:
 

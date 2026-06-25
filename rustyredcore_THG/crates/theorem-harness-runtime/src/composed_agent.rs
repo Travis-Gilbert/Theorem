@@ -1,18 +1,18 @@
-use crate::binding_store::{BindingRuntimeError, load_binding, persist_binding_run_result};
+use crate::binding_store::{load_binding, persist_binding_run_result, BindingRuntimeError};
 use rustyred_thg_core::GraphStore;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::error::Error;
 use std::fmt;
 use theorem_harness_core::state_hash::stable_value_hash;
 use theorem_harness_core::{
-    AgentBinding, AgentHead, AgentHeadRegistry, BindingBudgetScope, BindingComposition,
-    BindingError, BindingEventState, BindingIdentity, BindingTransitionInput, Constitution,
+    apply_binding_transition, composition_hash, run_intra_agent_loop_with_invoker, AgentBinding,
+    AgentHead, AgentHeadRegistry, BindingBudgetScope, BindingComposition, BindingError,
+    BindingEventState, BindingIdentity, BindingTransitionInput, Constitution,
     FakeIntraAgentLoopInput, FakeIntraAgentLoopResult, GroundedClaim, HeadCostProfile,
     HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
     HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError,
-    ResolvedAgentHead, ScratchpadRevision, TraceTier, apply_binding_transition, composition_hash,
-    run_intra_agent_loop_with_invoker,
+    ResolvedAgentHead, ScratchpadRevision, TraceTier,
 };
 
 pub const DEFAULT_BINDING_ID: &str = "agent:theorem";
@@ -549,6 +549,8 @@ fn run_single_head_agent<I: HeadInvoker>(
         synthesis_head_id: head.head_id.clone(),
         verifier_head_id: head.head_id,
         routing_decisions: Vec::new(),
+        budget_decisions: Vec::new(),
+        rounds: Vec::new(),
     })
 }
 
@@ -954,12 +956,10 @@ mod tests {
 
         assert!(binding.head("claude").is_none());
         assert!(binding.head("deepseek").is_some());
-        assert!(
-            binding
-                .identity
-                .active_head_set
-                .contains(&"deepseek".to_string())
-        );
+        assert!(binding
+            .identity
+            .active_head_set
+            .contains(&"deepseek".to_string()));
     }
 
     #[test]
@@ -1068,12 +1068,10 @@ mod tests {
         .unwrap();
 
         assert!(result.invocation_receipts.len() >= 3);
-        assert!(
-            result
-                .events
-                .iter()
-                .any(|event| event.event_type == "POLICY.CHECKED")
-        );
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event.event_type == "POLICY.CHECKED"));
         if verdict_allowed(&result.alignment_verdict) {
             assert!(!result.published_claims.is_empty());
         } else {
