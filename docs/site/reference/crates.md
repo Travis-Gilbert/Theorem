@@ -23,14 +23,17 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `rustyred-thg-core` | Theorem HotGraph core command executor and state machine, including graph/vector indexes whose vector designation rebuilds when dimensions change, plus RedCore AOF/snapshot durability with logical `NodeDelete` replay for durable node removal. |
 | `rustyred-thg-fractal` | Native Rust fractal expansion pipeline over RustyRed and RustyWeb. |
 | `rustyred-thg-geotemporal` | Tenant-scoped geotemporal composition over THG H3 spatial indexes. |
+| `rustyred-thg-intake` | CommonPlace source intake: the ingestion-spoke framework (SourceSpoke), the scoped incremental sync driver, curated + MappedSpoke sources, and the NeedsYou-residue -> delegation act seam. |
 | `rustyred-thg-mcp` | Model Context Protocol adapter for the Theorem HotGraph graph database. |
 | `rustyred-thg-memory` | Graph-native memory recall, consolidation, decay, and validity plugin for RustyRedCore-THG. |
+| `rustyred-thg-ml` | Shared graph tensor and message-passing primitives for RustyRedCore-THG learned organs. |
 | `rustyred-thg-pg-server` | Postgres wire protocol server for RustyRedCore-THG native views. |
 | `rustyred-thg-resp-server` | RESP protocol server for RustyRedCore-THG ordered-index commands. |
 | `rustyred-thg-server` | Product HTTP/gRPC/MCP surface over RustyRedCore-THG: tenant graph routes, query/Cypher APIs, harness coordination, browser actions, fractal expansion, and TTL sweeping. |
 | `rustyred-web` | RustyWeb graph-native crawler and search kernel for Theorem/Theseus. |
 | `scene-os-core` | Rust SceneOS atom, catalog, selection, and package compiler contracts for Theorem. |
 | `scene-os-web` | Theorem SceneOS renderer bundle (Lane B): embeds the self-contained canvas renderer and serves a scene-package-v2 as one HTML asset, the SERP injection pattern. |
+| `theorem-acp` | CommonPlace ACP host: subprocess JSON-RPC, harness MCP injection, scoped file review, PTY command approval, and copresence registration. |
 | `theorem-agentd` | Local Theorem assistant daemon: OpenAI-compatible model loop, MCP tool host, receiver sidecar, and compute-offload ledger. |
 | `theorem-browser-agent` | Rust-native Theorem browser-use perceive/govern/afford contracts and kernels. |
 | `theorem-copresence` | Headless co-presence peer and surface-adapter seam over the RustyRed substrate. Includes note/text adapters plus the W5 code-surface adapter for file-position presence, edit footprints, and git-only code content strategy. |

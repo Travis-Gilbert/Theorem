@@ -1,0 +1,21 @@
+[package]
+name = "theorem-acp"
+version = "0.1.0"
+edition = "2021"
+description = "CommonPlace ACP host: subprocess JSON-RPC, harness MCP injection, scoped file review, PTY command approval, and copresence registration."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+portable-pty = "0.9"
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+theorem-copresence = { path = "../theorem-copresence" }
+theorem-dispatch = { path = "../theorem-dispatch" }
+theorem-receiver = { path = "../theorem-receiver" }
+thiserror = "1.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.10"

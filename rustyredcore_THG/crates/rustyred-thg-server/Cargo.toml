@@ -10,7 +10,7 @@ ed25519-dalek = "2"
 hex = "0.4"
 reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 http = "1"
 pest = "2.7"
 pest_derive = "2.7"
@@ -22,6 +22,7 @@ rustyred-thg-core = { path = "../rustyred-thg-core", features = ["redis-store"] 
 theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }
 theorem-dispatch = { path = "../theorem-dispatch" }
+theorem-acp = { path = "../theorem-acp" }
 theorem-browser-agent = { path = "../theorem-browser-agent" }
 rustyred-thg-adapters = { path = "../rustyred-thg-adapters", features = ["pairformer-burn-cubecl"] }
 rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }

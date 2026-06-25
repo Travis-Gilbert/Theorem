@@ -1,6 +1,9 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, Request, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, Request, State,
+    },
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -16,6 +19,7 @@ use axum::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyred_hipporag::HippoQuery;
@@ -62,6 +66,9 @@ use rustyred_web::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use theorem_acp::{
+    AcpAgentCommand, AcpHost, AcpSessionHandle, FrontendInbound, FrontendOutbound,
+};
 use theorem_browser_agent::{
     browsing_run_receipt, build_action_rail, default_browser_playbooks, perceive_with_graph,
     resolve_context_command, BrowserSurface, ContextCommandRequest, ObservedElement,
@@ -447,6 +454,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/.well-known/mcp/rustyred_thg.json", get(mcp_well_known))
         .route("/.well-known/agent.json", get(agent_well_known))
         .route("/mcp", post(mcp_post))
+        .route("/v1/commonplace/acp/ws", get(commonplace_acp_ws))
         .route("/v1/rustyweb/search", post(rustyweb_search))
         .route("/v1/coordination/events", get(coordination_events))
         .route(
@@ -659,6 +667,258 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(cors)
         .with_state(state)
+}
+
+async fn commonplace_acp_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(commonplace_acp_socket)
+}
+
+async fn commonplace_acp_socket(mut socket: WebSocket) {
+    let mut host = AcpHost::new();
+    let mut sessions: BTreeMap<String, AcpSessionHandle> = BTreeMap::new();
+
+    while let Some(message) = socket.recv().await {
+        let text = match message {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        let inbound = match serde_json::from_str::<FrontendInbound>(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                send_commonplace_acp(
+                    &mut socket,
+                    FrontendOutbound::Error {
+                        session_id: None,
+                        agent_id: None,
+                        message: format!("invalid ACP frontend message: {error}"),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+
+        match inbound {
+            FrontendInbound::StartSession { agent_id, cwd } => {
+                let cwd = if cwd.trim().is_empty() {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                } else {
+                    PathBuf::from(cwd)
+                };
+                match host.spawn_session(AcpAgentCommand::configured(&agent_id), &cwd) {
+                    Ok(handle) => {
+                        let session_id = handle.local_session_id.clone();
+                        send_commonplace_acp(
+                            &mut socket,
+                            FrontendOutbound::SessionStarted {
+                                session_id: session_id.clone(),
+                                agent_id: agent_id.clone(),
+                            },
+                        )
+                        .await;
+                        sessions.insert(session_id, handle);
+                    }
+                    Err(error) => {
+                        send_commonplace_acp(
+                            &mut socket,
+                            FrontendOutbound::Error {
+                                session_id: None,
+                                agent_id: Some(agent_id),
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            FrontendInbound::Prompt { session_id, text } => {
+                let rpc_id = json!(host.next_rpc_id());
+                match sessions.get_mut(&session_id) {
+                    Some(session) => {
+                        if let Err(error) = session.send_prompt(rpc_id, &session_id, &text) {
+                            send_commonplace_acp(
+                                &mut socket,
+                                FrontendOutbound::Error {
+                                    session_id: Some(session_id),
+                                    agent_id: Some(session.agent_id.clone()),
+                                    message: error.to_string(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    None => {
+                        send_commonplace_acp(
+                            &mut socket,
+                            FrontendOutbound::Error {
+                                session_id: Some(session_id),
+                                agent_id: None,
+                                message: "unknown ACP session".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            FrontendInbound::ApproveFileWrite {
+                session_id,
+                request_id,
+            } => match sessions.get_mut(&session_id) {
+                Some(session) => match session.fs.approve_write(&request_id) {
+                    Ok(review) => {
+                        send_commonplace_acp(
+                            &mut socket,
+                            FrontendOutbound::SessionUpdate {
+                                session_id,
+                                agent_id: session.agent_id.clone(),
+                                update: json!({
+                                    "sessionUpdate": "file_write_approved",
+                                    "requestId": review.request_id,
+                                    "path": review.path,
+                                }),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        send_commonplace_acp(
+                            &mut socket,
+                            FrontendOutbound::Error {
+                                session_id: Some(session_id),
+                                agent_id: Some(session.agent_id.clone()),
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                },
+                None => {
+                    send_commonplace_acp(
+                        &mut socket,
+                        FrontendOutbound::Error {
+                            session_id: Some(session_id),
+                            agent_id: None,
+                            message: "unknown ACP session".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            },
+            FrontendInbound::DenyFileWrite {
+                session_id,
+                request_id,
+            } => match sessions.get_mut(&session_id) {
+                Some(session) => {
+                    let _ = session.fs.deny_write(&request_id);
+                    send_commonplace_acp(
+                        &mut socket,
+                        FrontendOutbound::SessionUpdate {
+                            session_id,
+                            agent_id: session.agent_id.clone(),
+                            update: json!({
+                                "sessionUpdate": "file_write_denied",
+                                "requestId": request_id,
+                            }),
+                        },
+                    )
+                    .await;
+                }
+                None => {
+                    send_commonplace_acp(
+                        &mut socket,
+                        FrontendOutbound::Error {
+                            session_id: Some(session_id),
+                            agent_id: None,
+                            message: "unknown ACP session".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            },
+            FrontendInbound::ApproveCommand {
+                session_id,
+                terminal_id,
+            } => match sessions.get_mut(&session_id) {
+                Some(session) => match session.terminal.approve(&terminal_id) {
+                    Ok(output) => {
+                        send_commonplace_acp(
+                            &mut socket,
+                            FrontendOutbound::CommandOutput {
+                                session_id,
+                                agent_id: session.agent_id.clone(),
+                                output: serde_json::to_value(output).unwrap_or_else(|error| {
+                                    json!({ "terminal_id": terminal_id, "error": error.to_string() })
+                                }),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        send_commonplace_acp(
+                            &mut socket,
+                            FrontendOutbound::Error {
+                                session_id: Some(session_id),
+                                agent_id: Some(session.agent_id.clone()),
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                },
+                None => {
+                    send_commonplace_acp(
+                        &mut socket,
+                        FrontendOutbound::Error {
+                            session_id: Some(session_id),
+                            agent_id: None,
+                            message: "unknown ACP session".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            },
+            FrontendInbound::DenyCommand {
+                session_id,
+                terminal_id,
+            } => match sessions.get_mut(&session_id) {
+                Some(session) => {
+                    let _ = session.terminal.deny(&terminal_id);
+                    send_commonplace_acp(
+                        &mut socket,
+                        FrontendOutbound::SessionUpdate {
+                            session_id,
+                            agent_id: session.agent_id.clone(),
+                            update: json!({
+                                "sessionUpdate": "command_denied",
+                                "terminalId": terminal_id,
+                            }),
+                        },
+                    )
+                    .await;
+                }
+                None => {
+                    send_commonplace_acp(
+                        &mut socket,
+                        FrontendOutbound::Error {
+                            session_id: Some(session_id),
+                            agent_id: None,
+                            message: "unknown ACP session".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            },
+        }
+    }
+}
+
+async fn send_commonplace_acp(socket: &mut WebSocket, event: FrontendOutbound) {
+    let Ok(text) = serde_json::to_string(&event) else {
+        return;
+    };
+    let _ = socket.send(Message::Text(text)).await;
 }
 
 async fn enforce_path_tenant_auth(

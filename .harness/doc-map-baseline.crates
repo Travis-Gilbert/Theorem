@@ -20,12 +20,14 @@ rustyred-thg-geotemporal
 rustyred-thg-intake
 rustyred-thg-mcp
 rustyred-thg-memory
+rustyred-thg-ml
 rustyred-thg-pg-server
 rustyred-thg-resp-server
 rustyred-thg-server
 rustyred-web
 scene-os-core
 scene-os-web
+theorem-acp
 theorem-agentd
 theorem-browser-agent
 theorem-copresence

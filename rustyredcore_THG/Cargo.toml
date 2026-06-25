@@ -36,6 +36,7 @@ members = [
     "crates/theorem-dispatch",
     "crates/theorem-browser-agent",
     "crates/theorem-agentd",
+    "crates/theorem-acp",
     "crates/theorem-receiver",
     "crates/rustyred-thg-affordances",
     "crates/rustyred-thg-connectors",
