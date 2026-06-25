@@ -2424,11 +2424,7 @@ fn indexed_fulltext_seed_scores<S: MemoryGraphStore>(
     seed_limit: usize,
 ) -> MemoryResult<Vec<(String, f64)>> {
     let mut results = Vec::new();
-    for label in [
-        Some("MemoryAtom"),
-        Some("MemoryDocument"),
-        Some("MemoryNode"),
-    ] {
+    for label in [Some("MemoryAtom")] {
         match store.memory_fulltext_search(label, "search_text", query, seed_limit) {
             Ok(hits) => results.extend(
                 hits.into_iter()

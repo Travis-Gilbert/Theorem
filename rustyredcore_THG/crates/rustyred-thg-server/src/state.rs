@@ -45,6 +45,8 @@ use crate::ttl_sweep::TtlSweepState;
 
 const GRAPH_TRANSACTION_TTL_MS: u64 = 5 * 60 * 1000;
 const DISPATCH_DATABASE_URL_ENV: &str = "THEOREM_DISPATCH_DATABASE_URL";
+const MEMORY_FULLTEXT_PROPERTY: &str = "search_text";
+const MEMORY_FULLTEXT_LABELS: [&str; 3] = ["MemoryAtom", "MemoryDocument", "MemoryNode"];
 
 #[derive(Clone, Debug)]
 struct GraphTransactionContext {
@@ -285,6 +287,26 @@ impl AppState {
                 .iter()
                 .any(|label| tenant_map.contains_key(&((*label).to_string(), property.to_string())))
         })
+    }
+
+    pub fn ensure_memory_fulltext_index(
+        &self,
+        tenant_id: &str,
+        label: &str,
+    ) -> Result<(), StoreAccessError> {
+        if !is_memory_fulltext_label(label) {
+            return Ok(());
+        }
+        if !self.has_fulltext_designation(tenant_id, &[label], MEMORY_FULLTEXT_PROPERTY) {
+            self.designate_fulltext_property(tenant_id, label, MEMORY_FULLTEXT_PROPERTY)?;
+            tracing::info!(
+                tenant_id = %tenant_id,
+                label,
+                property = MEMORY_FULLTEXT_PROPERTY,
+                "memory fulltext index warmed from persisted graph store"
+            );
+        }
+        Ok(())
     }
 
     // ===== Phase 8: spatial designation + indexing =====
@@ -2363,6 +2385,14 @@ impl McpGraphBackend for ProductMcpBackend {
         query: &str,
         k: usize,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
+        if property == MEMORY_FULLTEXT_PROPERTY
+            && label.map(is_memory_fulltext_label).unwrap_or(true)
+        {
+            let label_to_warm = label.unwrap_or("MemoryAtom");
+            self.state
+                .ensure_memory_fulltext_index(&self.tenant_id, label_to_warm)
+                .map_err(|error| GraphStoreError::new(error.code, error.message))?;
+        }
         self.state
             .fulltext_search(&self.tenant_id, label, property, query, k)
             .map_err(|error| GraphStoreError::new(error.code, error.message))
@@ -2523,6 +2553,10 @@ impl McpGraphBackend for ProductMcpBackend {
         .join()
         .map_err(|_| McpError::internal("dispatch thread panicked"))?
     }
+}
+
+fn is_memory_fulltext_label(label: &str) -> bool {
+    MEMORY_FULLTEXT_LABELS.contains(&label)
 }
 
 fn theorem_app_affordance_grpc_endpoint() -> Result<String, McpError> {

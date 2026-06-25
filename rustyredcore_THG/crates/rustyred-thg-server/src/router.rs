@@ -1170,46 +1170,19 @@ fn maybe_handle_cold_memory_recall_mcp(
         &config.default_tenant,
     )
     .ok()?;
-    if state.has_fulltext_designation(
+    if !state.has_fulltext_designation(
         &tenant,
         &["MemoryAtom", "MemoryDocument", "MemoryNode"],
         "search_text",
     ) {
-        return None;
+        tracing::info!(
+            tenant = %tenant,
+            tool = name,
+            "cold memory fulltext index will be warmed by the MCP backend"
+        );
     }
 
-    let id = payload.get("id").cloned().unwrap_or(Value::Null);
-    let result = match name {
-        "recall" => mcp_tool_result(json!({
-            "tenant": tenant,
-            "results": [],
-            "count": 0,
-            "rank_signals": ["cold_memory_fulltext_index"]
-        })),
-        "observe" => {
-            let actor_id = argument_text_any(&arguments, &["actor", "actor_id", "actorId"])
-                .unwrap_or_default();
-            let room_id = argument_text_any(&arguments, &["room", "room_id", "roomId"])
-                .unwrap_or_else(|| "default".to_string());
-            mcp_tool_result(json!({
-                "actor": { "actor_id": actor_id },
-                "tenant": { "slug": tenant },
-                "coordination_room": { "tenant_slug": tenant, "room_id": room_id },
-                "pending_mentions": [],
-                "continuity_pack": {},
-                "orchestrate_notes": [],
-                "recall_results": [],
-                "rank_signals": ["cold_memory_fulltext_index"]
-            }))
-        }
-        _ => return None,
-    };
-
-    Some(json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result
-    }))
+    None
 }
 
 async fn maybe_handle_composed_agent_mcp(
@@ -9856,8 +9829,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_recall_cold_fulltext_index_returns_fast_empty_scan() {
+    async fn mcp_recall_cold_fulltext_index_warms_from_persisted_memory() {
         let state = memory_product_state();
+        {
+            let mut store = state
+                .tenant_graph_store("Travis-Gilbert")
+                .expect("tenant store opens");
+            store
+                .upsert_node(NodeRecord::new(
+                    "memory:doc:cold-index",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "Travis-Gilbert",
+                        "doc_id": "cold-index",
+                        "kind": "insight",
+                        "title": "Recall tiering durable row",
+                        "summary": "Recall tiering should survive a cold in-process index.",
+                        "content": "Recall tiering persisted memory must be discoverable after restart.",
+                        "status": "active",
+                        "search_text": "Recall tiering durable persisted memory"
+                    }),
+                ))
+                .expect("memory node persists without a warmed fulltext index");
+        }
         let app = build_router(state);
 
         let response = app
@@ -9891,11 +9885,16 @@ mod tests {
         let payload = response_payload_json(response).await;
         let structured = &payload["result"]["structuredContent"];
         assert_eq!(structured["tenant"], "Travis-Gilbert");
-        assert_eq!(structured["count"], 0);
-        assert_eq!(structured["results"].as_array().unwrap().len(), 0);
-        assert!(structured["rank_signals"]
+        assert_eq!(structured["count"], 1);
+        let results = structured["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["id"], "cold-index");
+        assert_eq!(results[0]["title"], "Recall tiering durable row");
+        let rank_signals = structured["rank_signals"]
             .as_array()
-            .unwrap()
+            .cloned()
+            .unwrap_or_default();
+        assert!(!rank_signals
             .iter()
             .any(|signal| signal == "cold_memory_fulltext_index"));
     }
