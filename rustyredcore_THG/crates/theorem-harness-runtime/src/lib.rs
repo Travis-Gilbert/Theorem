@@ -20,7 +20,7 @@
 //!   `THEOREM_AGENT_HEADS=deepseek,mistral,minimax` with
 //!   `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, and `MINIMAX_API_KEY` for the
 //!   API-backed binding. Current defaults avoid deprecated provider models:
-//!   `DEEPSEEK_MODEL=deepseek-v4-flash`,
+//!   `DEEPSEEK_MODEL=deepseek-v4-pro`,
 //!   `MISTRAL_MODEL=mistral-large-latest`, and `MINIMAX_MODEL=MiniMax-M3`
 //!   unless explicitly overridden. `THEOREM_HEAD_INVOKER=real` enables the live
 //!   MCP call site, while `HeadTransport::Local` and `HeadTransport::Hosted`

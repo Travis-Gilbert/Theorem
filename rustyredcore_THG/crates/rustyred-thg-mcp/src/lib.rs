@@ -18690,7 +18690,7 @@ mod tests {
             ("MISTRAL_API_KEY", "mistral-test-secret".to_string()),
             ("DEEPSEEK_API_KEY", "deepseek-test-secret".to_string()),
             ("MISTRAL_MODEL", "mistral-large-latest".to_string()),
-            ("DEEPSEEK_MODEL", "deepseek-v4-flash".to_string()),
+            ("DEEPSEEK_MODEL", "deepseek-v4-pro".to_string()),
             ("THEOREM_PROVIDER_HEAD_COST_UNITS", "1.0".to_string()),
         ]);
         let provider = FixtureProvider(Rc::new(RefCell::new(InMemoryGraphStore::new())));

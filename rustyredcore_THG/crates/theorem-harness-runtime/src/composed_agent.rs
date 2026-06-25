@@ -180,7 +180,7 @@ fn legacy_default_heads() -> (Vec<String>, Vec<AgentHead>) {
             head(
                 "deepseek",
                 "deepseek",
-                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string()),
+                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string()),
                 "env:DEEPSEEK_API_KEY",
                 HeadTransport::Api,
             ),
@@ -295,7 +295,7 @@ fn normalize_provider(value: &str) -> String {
 fn default_model_for_provider(provider: &str) -> String {
     match normalize_provider(provider).as_str() {
         "anthropic" | "claude" => "claude-3-5-sonnet-latest".to_string(),
-        "deepseek" => "deepseek-v4-flash".to_string(),
+        "deepseek" => "deepseek-v4-pro".to_string(),
         "gemma" => "gemma3:latest".to_string(),
         "minimax" => "MiniMax-M3".to_string(),
         "mistral" => "mistral-large-latest".to_string(),
@@ -451,7 +451,7 @@ mod tests {
             ("MISTRAL_MODEL", "mistral-small-latest"),
             ("OPENAI_MODEL", "gpt-4.1-mini"),
             ("MINIMAX_MODEL", "MiniMax-M3"),
-            ("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+            ("DEEPSEEK_MODEL", "deepseek-v4-pro"),
         ]);
 
         let binding = default_theorem_binding("agent:env").unwrap();
@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(minimax.model, "MiniMax-M3");
         assert_eq!(minimax.credential_ref, "env:MINIMAX_API_KEY");
         let deepseek = binding.head("deepseek").unwrap();
-        assert_eq!(deepseek.model, "deepseek-v4-flash");
+        assert_eq!(deepseek.model, "deepseek-v4-pro");
         assert_eq!(deepseek.transport, HeadTransport::Api);
     }
 

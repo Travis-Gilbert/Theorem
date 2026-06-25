@@ -499,7 +499,7 @@ base_url = "http://litellm.internal:4000"
 api_key_env = "LITELLM_API_KEY"
 
 [provider_seam.models]
-deepseek = "deepseek-v4-flash"
+deepseek = "deepseek-v4-pro"
 
 [model_backends.codex_single]
 kind = "single"
