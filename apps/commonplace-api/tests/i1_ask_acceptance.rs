@@ -190,3 +190,34 @@ async fn ask_requires_a_valid_key() {
         "ask with an invalid key is rejected"
     );
 }
+
+#[tokio::test]
+async fn theorem_agent_is_exposed_through_graphql_auth_and_validates_task_before_provider() {
+    let schema = instance("good");
+    let query = r#"query {
+        theoremAgent(task: "   ", bindingId: "agent:test") {
+            answer
+            answerKind
+            bindingId
+        }
+    }"#;
+
+    let response = schema.execute(Request::new(query)).await;
+    assert!(
+        !response.errors.is_empty(),
+        "theoremAgent without a key is rejected"
+    );
+
+    let response = schema
+        .execute(Request::new(query).data(ApiKeyToken("good".to_string())))
+        .await;
+    assert!(
+        !response.errors.is_empty(),
+        "empty task is rejected before provider invocation"
+    );
+    assert!(
+        response.errors[0].message.contains("requires a task"),
+        "unexpected error: {:?}",
+        response.errors
+    );
+}

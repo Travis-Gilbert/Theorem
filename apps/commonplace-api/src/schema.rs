@@ -15,13 +15,20 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use async_graphql::{
-    Context, EmptySubscription, Enum, Error, InputObject, Object, Result, Schema, SimpleObject,
+    Context, EmptySubscription, Enum, Error, InputObject, Json as GqlJson, Object, Result, Schema,
+    SimpleObject,
 };
 use commonplace::{
     BlobStore, Collection, Commonplace, EmbeddingGraphStore, InMemoryBlobStore, IngestInput,
     IngestPipeline, Item, ItemBody, ItemKind, Residency, COLLECTION_LABEL,
 };
 use rustyred_thg_core::{DiskObjectStore, InMemoryGraphStore, NodeQuery, RedCoreGraphStore};
+use serde_json::Value;
+use theorem_harness_core::GroundedClaim;
+use theorem_harness_runtime::{
+    run_configured_composed_agent, run_configured_composed_agent_with_claims,
+    ComposedAgentRunResult, ProviderHeadInvoker, DEFAULT_BINDING_ID,
+};
 
 use crate::auth::{ApiKeyRegistry, ApiKeyToken, Principal};
 use crate::briefing::{briefing as run_briefing, Briefing, BriefingConfig, ConnectedItem};
@@ -208,6 +215,124 @@ impl From<AskResult> for AskResultGql {
                 .map(ProvenanceGql::from)
                 .collect(),
         }
+    }
+}
+
+/// Evidence handed to the composed Theorem agent.
+#[derive(Clone, InputObject)]
+pub struct TheoremAgentClaimInput {
+    pub text: String,
+    pub provenance: String,
+}
+
+/// A published claim from the composed Theorem agent.
+#[derive(Clone, SimpleObject)]
+pub struct TheoremAgentClaimGql {
+    pub text: String,
+    pub provenance: String,
+}
+
+impl From<GroundedClaim> for TheoremAgentClaimGql {
+    fn from(claim: GroundedClaim) -> Self {
+        Self {
+            text: claim.text,
+            provenance: claim.provenance,
+        }
+    }
+}
+
+/// A composed Theorem agent run over the configured API heads.
+#[derive(SimpleObject)]
+pub struct TheoremAgentRunGql {
+    pub answer: String,
+    pub answer_kind: AnswerKindGql,
+    pub binding_id: String,
+    pub run_id: String,
+    pub heads: Vec<String>,
+    pub claims: Vec<TheoremAgentClaimGql>,
+    pub alignment_verdict: GqlJson<Value>,
+    pub evidence_count: i32,
+}
+
+impl TheoremAgentRunGql {
+    fn from_composed(result: ComposedAgentRunResult, evidence_count: i32) -> Self {
+        let claims: Vec<TheoremAgentClaimGql> = result
+            .published_claims
+            .iter()
+            .cloned()
+            .map(TheoremAgentClaimGql::from)
+            .collect();
+        let answer = theorem_agent_answer(&result, &claims);
+        Self {
+            answer_kind: if answer.is_empty() {
+                AnswerKindGql::Empty
+            } else {
+                AnswerKindGql::Model
+            },
+            answer,
+            binding_id: result.binding_id,
+            run_id: result.run_id,
+            heads: result.consensus_head_set,
+            claims,
+            alignment_verdict: GqlJson(result.alignment_verdict),
+            evidence_count,
+        }
+    }
+}
+
+fn normalize_theorem_agent_claims(claims: Vec<TheoremAgentClaimInput>) -> Vec<GroundedClaim> {
+    claims
+        .into_iter()
+        .filter_map(|claim| {
+            let text = claim.text.trim();
+            let provenance = claim.provenance.trim();
+            if text.is_empty() || provenance.is_empty() {
+                None
+            } else {
+                Some(GroundedClaim::new(text, provenance))
+            }
+        })
+        .collect()
+}
+
+fn theorem_agent_answer(
+    result: &ComposedAgentRunResult,
+    claims: &[TheoremAgentClaimGql],
+) -> String {
+    if !claims.is_empty() {
+        return claims
+            .iter()
+            .map(|claim| claim.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .trim()
+            .to_string();
+    }
+
+    let Some(receipt) = result.invocation_receipts.last() else {
+        return String::new();
+    };
+    if let Some(text) = receipt.payload.get("text").and_then(Value::as_str) {
+        let text = strip_claims_json(text);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    strip_claims_json(&receipt.output_summary)
+}
+
+fn strip_claims_json(value: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    match lowered.find("claims json:") {
+        Some(marker) => {
+            let prefix = value[..marker].trim();
+            if prefix.is_empty() {
+                value.trim().to_string()
+            } else {
+                prefix.to_string()
+            }
+        }
+        None => value.trim().to_string(),
     }
 }
 
@@ -421,7 +546,11 @@ impl From<OrganizedToday> for OrganizedTodayGql {
     fn from(today: OrganizedToday) -> Self {
         Self {
             most_recent: today.most_recent.map(OrganizeFiledGql::from),
-            groups: today.groups.into_iter().map(OrganizeGroupGql::from).collect(),
+            groups: today
+                .groups
+                .into_iter()
+                .map(OrganizeGroupGql::from)
+                .collect(),
             total_count: today.total_count as i32,
         }
     }
@@ -628,6 +757,59 @@ where
         };
         let result = answer_from_provenance(model.as_ref(), &question, provenance);
         Ok(AskResultGql::from(result))
+    }
+
+    /// Run the composed Theorem API agent through the CommonPlace GraphQL edge.
+    /// The browser sends the user turn here; the resolver calls provider APIs
+    /// server-side and the agent runtime reaches MCP tools internally.
+    async fn theorem_agent(
+        &self,
+        ctx: &Context<'_>,
+        task: String,
+        claims: Option<Vec<TheoremAgentClaimInput>>,
+        binding_id: Option<String>,
+        mode: Option<String>,
+        tenant: Option<String>,
+    ) -> Result<TheoremAgentRunGql> {
+        principal(ctx)?;
+        let task = task.trim().to_string();
+        if task.is_empty() {
+            return Err(Error::new("Theorem agent requires a task."));
+        }
+        let _ = mode;
+        let _ = tenant;
+
+        let binding_id = binding_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_BINDING_ID.to_string());
+        let claims = normalize_theorem_agent_claims(claims.unwrap_or_default());
+        let evidence_count = claims.len() as i32;
+        let store = shared::<S, B>(ctx)?.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
+            let invoker = ProviderHeadInvoker::from_env().map_err(|error| error.to_string())?;
+            let mut cp = store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?;
+            if claims.is_empty() {
+                run_configured_composed_agent(cp.store_mut(), &binding_id, &task, &invoker)
+            } else {
+                run_configured_composed_agent_with_claims(
+                    cp.store_mut(),
+                    &binding_id,
+                    &task,
+                    claims,
+                    &invoker,
+                )
+            }
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| Error::new(format!("Theorem agent task join failed: {error}")))?
+        .map_err(Error::new)?;
+
+        Ok(TheoremAgentRunGql::from_composed(result, evidence_count))
     }
 
     /// Proactive briefing: recent, newly-connected, and open-thread items

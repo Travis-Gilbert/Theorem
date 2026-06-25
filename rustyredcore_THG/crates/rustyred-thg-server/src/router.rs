@@ -66,9 +66,7 @@ use rustyred_web::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use theorem_acp::{
-    AcpAgentCommand, AcpHost, AcpSessionHandle, FrontendInbound, FrontendOutbound,
-};
+use theorem_acp::{AcpAgentCommand, AcpHost, AcpSessionHandle, FrontendInbound, FrontendOutbound};
 use theorem_browser_agent::{
     browsing_run_receipt, build_action_rail, default_browser_playbooks, perceive_with_graph,
     resolve_context_command, BrowserSurface, ContextCommandRequest, ObservedElement,
@@ -455,6 +453,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/.well-known/agent.json", get(agent_well_known))
         .route("/mcp", post(mcp_post))
         .route("/v1/commonplace/acp/ws", get(commonplace_acp_ws))
+        .route("/v1/theorem/agent/run", post(theorem_agent_run))
         .route("/v1/rustyweb/search", post(rustyweb_search))
         .route("/v1/coordination/events", get(coordination_events))
         .route(
@@ -1107,6 +1106,53 @@ async fn rustyweb_search(
     match execute_live_search_acquisition(&state, &job).await {
         Ok(payload) => Json(payload).into_response(),
         Err(payload) => (StatusCode::BAD_GATEWAY, Json(payload)).into_response(),
+    }
+}
+
+async fn theorem_agent_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(arguments): Json<Value>,
+) -> impl IntoResponse {
+    let config = state.mcp_config();
+    let tenant = match resolve_tenant_id(
+        argument_text_any(&arguments, &["tenant", "tenant_id", "tenant_slug"]).as_deref(),
+        &config.default_tenant,
+    ) {
+        Ok(tenant) => tenant,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(error.payload())).into_response(),
+    };
+    if let Err(status) = require_scope_for_tenant(
+        &headers,
+        &state.config.api_tokens,
+        "graph:write",
+        state.config.require_auth,
+        &tenant,
+    ) {
+        return status.into_response();
+    }
+    if config.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "theorem_agent_read_only",
+                "message": "Theorem agent runs are unavailable while write surfaces are read-only."
+            })),
+        )
+            .into_response();
+    }
+
+    match composed_agent_run_payload(state, &config, &arguments).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(payload) => (theorem_agent_error_status(&payload), Json(payload)).into_response(),
+    }
+}
+
+fn theorem_agent_error_status(payload: &Value) -> StatusCode {
+    match payload.get("error").and_then(Value::as_str) {
+        Some("invalid_composed_agent_run") | Some("invalid_tenant_id") => StatusCode::BAD_REQUEST,
+        Some("store_unavailable") => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -9357,6 +9403,68 @@ mod tests {
             response["result"]["structuredContent"]["error"],
             "mcp_read_only"
         );
+    }
+
+    #[tokio::test]
+    async fn product_theorem_agent_route_read_only_blocks_provider_invocation_without_mcp_envelope()
+    {
+        let state = memory_product_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/theorem/agent/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant": "Travis-Gilbert",
+                            "binding_id": "agent:test",
+                            "task": "publish a grounded answer"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let payload = response_payload_json(response).await;
+        assert!(payload.get("jsonrpc").is_none());
+        assert!(payload.get("result").is_none());
+        assert_eq!(payload["error"], "theorem_agent_read_only");
+    }
+
+    #[tokio::test]
+    async fn product_theorem_agent_route_invalid_request_returns_plain_json_without_mcp_envelope() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/theorem/agent/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant": "Travis-Gilbert",
+                            "binding_id": "agent:test"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_payload_json(response).await;
+        assert!(payload.get("jsonrpc").is_none());
+        assert!(payload.get("result").is_none());
+        assert_eq!(payload["error"], "invalid_composed_agent_run");
     }
 
     #[tokio::test]
