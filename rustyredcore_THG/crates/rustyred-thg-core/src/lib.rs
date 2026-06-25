@@ -28,6 +28,7 @@ pub mod plugin;
 pub mod ppr_cache;
 pub mod ranking;
 pub mod relational;
+pub mod saturation;
 pub mod spatial;
 #[cfg(feature = "s2")]
 pub mod spatial_s2;
@@ -140,6 +141,16 @@ pub use relational::{
     ColumnSchema, NativeAuthPrincipalRecord, NativeBillingAccountRecord, NativeCatalog,
     NativeProjectRecord, NativeTenantRecord, Relation, RelationSchema, RelationalRow,
     RelationalStore,
+};
+pub use saturation::{
+    coalesce_by_subgraph, differential_check, facts_from_payload, facts_from_subgraph,
+    materialize_closure, run_saturation, saturation_handler, saturation_hook_registration,
+    validate_egglog_program, DifferentialReport, SaturationBackend, SaturationClosure,
+    SaturationConfig, SaturationContributor, SaturationDerivedStatement,
+    SaturationEquivalenceClass, SaturationFacts, SaturationPlugin, SaturationProgram,
+    SaturationReport, SaturationRevisionReport, SATURATION_DERIVED_STATEMENT_LABEL,
+    SATURATION_DERIVES_EDGE, SATURATION_ENGINE, SATURATION_ENGINE_VERSION,
+    SATURATION_SHARED_RULE_IDS,
 };
 pub use spatial::{
     make_spatial_backend, make_spatial_backend_from_value, SpatialBackend, SpatialDesignation,
