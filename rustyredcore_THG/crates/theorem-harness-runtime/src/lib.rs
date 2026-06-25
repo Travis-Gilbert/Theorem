@@ -74,6 +74,7 @@ pub use canonical_write::{
 };
 pub use composed_agent::{
     default_theorem_binding, run_composed_agent, run_composed_agent_with_claims,
+    run_configured_composed_agent, run_configured_composed_agent_with_claims,
     ComposedAgentRunResult, ComposedAgentRuntimeError, ComposedAgentRuntimeResult,
     DEFAULT_BINDING_ID,
 };

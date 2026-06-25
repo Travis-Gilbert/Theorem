@@ -33,9 +33,8 @@ use theorem_harness_core::{
     TransitionResult,
 };
 use theorem_harness_runtime::{
-    append_transition_from_store, load_events, load_run, run_composed_agent,
-    run_composed_agent_with_claims, ComposedAgentRuntimeError, HarnessRuntimeError, JobNoteInput,
-    ProviderHeadInvoker,
+    append_transition_from_store, load_events, load_run, ComposedAgentRuntimeError,
+    HarnessRuntimeError, JobNoteInput, ProviderHeadInvoker,
 };
 
 use crate::browser_pool::{BrowserLiveSessionRecord, LiveBrowserPool, RemoteBrowserPool};
@@ -2204,9 +2203,20 @@ impl McpGraphBackend for ProductMcpBackend {
         let mut runtime_store = RuntimeTenantMirrorGraphStore::new(&mut self.store)?;
         let invoker = ProviderHeadInvoker::from_env().map_err(mcp_head_invocation_error)?;
         let result = if claims.is_empty() {
-            run_composed_agent(&mut runtime_store, &binding_id, &task, &invoker)
+            theorem_harness_runtime::run_configured_composed_agent(
+                &mut runtime_store,
+                &binding_id,
+                &task,
+                &invoker,
+            )
         } else {
-            run_composed_agent_with_claims(&mut runtime_store, &binding_id, &task, claims, &invoker)
+            theorem_harness_runtime::run_configured_composed_agent_with_claims(
+                &mut runtime_store,
+                &binding_id,
+                &task,
+                claims,
+                &invoker,
+            )
         }
         .map_err(mcp_composed_agent_runtime_error)?;
         serde_json::to_value(result).map_err(|error| {

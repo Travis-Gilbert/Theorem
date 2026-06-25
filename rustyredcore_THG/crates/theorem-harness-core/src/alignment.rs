@@ -8,9 +8,11 @@
 //! a verdict the kernel guard applies AFTER the head's assertion, so the binding
 //! can only ever make publication HARDER, never easier:
 //!
-//! 1. Critic consensus (Part 5.3): a publication requires at least
+//! 1. Critic consensus (Part 5.3): a normal publication requires at least
 //!    `MIN_CONSENSUS_HEADS` distinct heads recorded at `DRAFTS.SYNTHESIZED`, so
-//!    heterogeneous review demonstrably happened.
+//!    heterogeneous review demonstrably happened. A payload may explicitly mark
+//!    `single_head_mode` when only one runtime-configured head exists; that mode
+//!    is allowed but remains visible in the policy receipt.
 //! 2. Action tier (Part 5.4): when the payload names an `action_tier` that the
 //!    binding marks as requiring human authorization, `human_authorized` must be
 //!    true; autonomy is bounded inversely to irreversibility.
@@ -46,13 +48,22 @@ pub fn evaluate_publication(
         .map(|head| head.trim())
         .filter(|head| !head.is_empty())
         .collect();
-    if distinct.len() < MIN_CONSENSUS_HEADS {
+    let required_heads = if payload
+        .get("single_head_mode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        1
+    } else {
+        MIN_CONSENSUS_HEADS
+    };
+    if distinct.len() < required_heads {
         return Err(guard(
             "consensus_below_threshold",
             "publication requires heterogeneous critic consensus",
             json!({
                 "distinct_synthesis_heads": distinct.len(),
-                "required": MIN_CONSENSUS_HEADS,
+                "required": required_heads,
             }),
         ));
     }
@@ -159,6 +170,20 @@ mod tests {
         let heads = vec!["claude".to_string(), "claude".to_string()];
         let error = evaluate_publication(&heads, &tiers(), &payload(json!({}))).unwrap_err();
         assert_eq!(err_code(error), "consensus_below_threshold");
+    }
+
+    #[test]
+    fn explicit_single_head_mode_lowers_consensus_threshold() {
+        let heads = vec!["deepseek".to_string()];
+        evaluate_publication(
+            &heads,
+            &tiers(),
+            &payload(json!({
+                "single_head_mode": true,
+                "claims": [{ "text": "x", "provenance": "src:1" }]
+            })),
+        )
+        .unwrap();
     }
 
     #[test]

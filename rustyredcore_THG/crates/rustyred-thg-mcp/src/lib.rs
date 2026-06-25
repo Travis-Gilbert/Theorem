@@ -9873,7 +9873,13 @@ fn composed_agent_run_to_store<S: GraphStore>(
     let result = match configured_composed_agent_invoker_mode()? {
         ComposedAgentInvokerMode::Real => {
             let invoker = ProviderHeadInvoker::from_env().map_err(mcp_head_invocation_error)?;
-            run_composed_agent_with_selected_invoker(store, &binding_id, &task, claims, &invoker)
+            run_configured_composed_agent_with_selected_invoker(
+                store,
+                &binding_id,
+                &task,
+                claims,
+                &invoker,
+            )
         }
         ComposedAgentInvokerMode::Fake => {
             let invoker = FakeHeadInvoker::default();
@@ -9897,6 +9903,24 @@ fn run_composed_agent_with_selected_invoker<S: GraphStore, I: HeadInvoker>(
         theorem_harness_runtime::run_composed_agent(store, binding_id, task, invoker)
     } else {
         theorem_harness_runtime::run_composed_agent_with_claims(
+            store, binding_id, task, claims, invoker,
+        )
+    }
+}
+
+fn run_configured_composed_agent_with_selected_invoker<S: GraphStore, I: HeadInvoker>(
+    store: &mut S,
+    binding_id: &str,
+    task: &str,
+    claims: Vec<GroundedClaim>,
+    invoker: &I,
+) -> theorem_harness_runtime::ComposedAgentRuntimeResult<
+    theorem_harness_runtime::ComposedAgentRunResult,
+> {
+    if claims.is_empty() {
+        theorem_harness_runtime::run_configured_composed_agent(store, binding_id, task, invoker)
+    } else {
+        theorem_harness_runtime::run_configured_composed_agent_with_claims(
             store, binding_id, task, claims, invoker,
         )
     }
