@@ -202,7 +202,11 @@ impl MemoryQuery {
         detail_top_k: Option<i32>,
         detail_ids: Option<Vec<ID>>,
     ) -> GqlResult<Vec<MemoryDoc>> {
-        let mut args = json!({ "limit": limit, "include_low_fitness": include_low_fitness });
+        let mut args = json!({
+            "limit": limit,
+            "include_low_fitness": include_low_fitness,
+            "record_recall_metadata": false
+        });
         let obj = args.as_object_mut().expect("json object");
         if let Some(query) = query {
             obj.insert("query".to_string(), json!(query));

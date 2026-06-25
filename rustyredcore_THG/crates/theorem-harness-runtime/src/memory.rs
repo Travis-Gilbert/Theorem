@@ -203,6 +203,8 @@ pub struct RecallMemoryInput {
     #[serde(default)]
     pub consume_handoffs: bool,
     #[serde(default)]
+    pub suppress_recall_metadata_updates: bool,
+    #[serde(default)]
     pub query_time: String,
     #[serde(default)]
     pub overall_state: bool,
@@ -833,8 +835,10 @@ pub fn recall_memory<S: MemoryGraphStore>(
     results.retain(|item| item.score > 0.0 || query.is_empty() || broad_query);
     results.sort_by(compare_recall_items);
     results.truncate(limit);
-    bump_recalled_compound_fitness(store, &tenant_slug, &results)?;
-    bump_recall_salience(store, &tenant_slug, &results, &query_time)?;
+    if !input.suppress_recall_metadata_updates {
+        bump_recalled_compound_fitness(store, &tenant_slug, &results)?;
+        bump_recall_salience(store, &tenant_slug, &results, &query_time)?;
+    }
 
     if input.consume_handoffs && kind_filter == "handoff" {
         for item in &results {

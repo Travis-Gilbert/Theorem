@@ -5668,6 +5668,7 @@ fn harness_prepare_payload(
                 limit: memory_limit,
                 include_low_fitness: false,
                 include_consolidation_sources: false,
+                suppress_recall_metadata_updates: true,
                 detail: "overview".to_string(),
                 detail_top_k: memory_limit.max(1),
                 ..RecallMemoryInput::default()
@@ -6195,6 +6196,11 @@ fn recall_memory_payload(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         consume_handoffs,
+        suppress_recall_metadata_updates: !arguments
+            .get("record_recall_metadata")
+            .or_else(|| arguments.get("recordRecallMetadata"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         query_time: argument_text(arguments, &["query_time", "queryTime"]).unwrap_or_default(),
         overall_state: arguments
             .get("overall_state")
@@ -6539,6 +6545,7 @@ fn observe_payload(
                     .or_else(|| arguments.get("includeConsolidationSources"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                suppress_recall_metadata_updates: true,
                 hydrate: arguments
                     .get("hydrate")
                     .or_else(|| arguments.get("include_content"))
@@ -11443,6 +11450,8 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "limit": { "type": "integer", "default": 10 },
                     "include_low_fitness": { "type": "boolean", "default": false },
                     "include_consolidation_sources": { "type": "boolean", "default": false },
+                    "record_recall_metadata": { "type": "boolean", "default": false, "description": "Persist salience/rehearsal metadata for returned items. Disabled by default on MCP read surfaces to keep recall latency bounded." },
+                    "recordRecallMetadata": { "type": "boolean", "default": false },
                     "consume_handoffs": { "type": "boolean", "default": false },
                     "query_time": { "type": "string", "description": "RFC3339 valid-time cutoff. Defaults to now." },
                     "queryTime": { "type": "string" },
@@ -16410,6 +16419,17 @@ mod tests {
             );
             assert_eq!(item["served_tier"], "abstract");
         }
+        let recalled_first = theorem_harness_runtime::load_memory_document(
+            &*provider.0.borrow(),
+            "smoke",
+            &first_doc_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            recalled_first.metadata.get("salience").is_none(),
+            "MCP recall is a read surface and should not synchronously write salience metadata"
+        );
 
         let overview = call_tool_json(
             &provider,
