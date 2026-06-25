@@ -2,7 +2,7 @@ pub mod api;
 pub mod credentials;
 pub mod mcp;
 
-pub use api::{ApiProviderProfile, ApiRequestShape, api_provider_profile, default_api_profiles};
+pub use api::{api_provider_profile, default_api_profiles, ApiProviderProfile, ApiRequestShape};
 pub use credentials::{CredentialResolutionError, CredentialResolver};
 pub use mcp::mcp_tool_name;
 
@@ -10,8 +10,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use theorem_harness_core::{
-    HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
-    HeadInvoker, HeadKind, HeadTransport,
+    default_head_system_prompt, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
+    HeadInvocationRequest, HeadInvoker, HeadKind, HeadTransport,
 };
 
 const DEFAULT_PROVIDER_HEAD_COST_UNITS: f64 = 1.0;
@@ -173,6 +173,37 @@ pub type ProviderHeadInvoker = RealHeadInvoker;
 
 pub(crate) fn prompt_for_request(request: &HeadInvocationRequest) -> String {
     let mut prompt = format!("Task:\n{}\n", request.task);
+    prompt.push_str("\nShared CRDT scratchpad:\n");
+    prompt.push_str(&format!(
+        "- kind: {:?}\n- graph_root_id: {}\n- yrs_doc_id: {}\n- stream_topic: {}\n- awareness_log_id: {}\n",
+        request.scratchpad_crdt.kind,
+        request.scratchpad_crdt.graph_root_id,
+        request.scratchpad_crdt.yrs_doc_id,
+        request.scratchpad_crdt.stream_topic,
+        request.scratchpad_crdt.awareness_log_id
+    ));
+    if !request.scratchpad_crdt.text_regions.is_empty() {
+        prompt.push_str("- text_regions:\n");
+        for region in &request.scratchpad_crdt.text_regions {
+            prompt.push_str(&format!(
+                "  - {}: {}\n",
+                region.region_id, region.description
+            ));
+        }
+    }
+    if !request.context_membrane.is_empty() {
+        prompt.push_str("\nContext membrane primes:\n");
+        for prime in &request.context_membrane {
+            prompt.push_str(&format!(
+                "- {} ({}, confidence {:.2}): {}",
+                prime.artifact_id, prime.label, prime.confidence, prime.summary
+            ));
+            if !prime.source.trim().is_empty() {
+                prompt.push_str(&format!(" [{}]", prime.source));
+            }
+            prompt.push('\n');
+        }
+    }
     if !request.prior_context.is_empty() {
         prompt.push_str("\nPrior revisions:\n");
         for context in &request.prior_context {
@@ -200,20 +231,11 @@ pub(crate) fn prompt_for_request(request: &HeadInvocationRequest) -> String {
     prompt
 }
 
-pub(crate) fn system_instruction_for_kind(kind: HeadInvocationKind) -> &'static str {
-    match kind {
-        HeadInvocationKind::Proposal => {
-            "Produce a grounded answer to the task. List only the claims you assert."
-        }
-        HeadInvocationKind::Critique => {
-            "Review the prior proposal(s) in the user context. Name errors, gaps, and unsupported claims; do not restate, improve."
-        }
-        HeadInvocationKind::Synthesis => {
-            "Merge the proposal and critique into one final grounded answer."
-        }
-        HeadInvocationKind::Verification => {
-            "Verify the prior synthesis by trying to falsify it. Name attempted failure modes and whether the synthesis survives."
-        }
+pub(crate) fn system_instruction_for_request(request: &HeadInvocationRequest) -> String {
+    if request.head_system_prompt.trim().is_empty() {
+        default_head_system_prompt(&request.head, request.kind)
+    } else {
+        request.head_system_prompt.clone()
     }
 }
 
@@ -365,8 +387,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use theorem_harness_core::{
-        AgentHeadEndpoint, HeadCostProfile, HeadKind, HeadReliabilityProfile, ResolvedAgentHead,
-        TraceTier,
+        AgentHeadEndpoint, ContextMembranePrime, HeadCostProfile, HeadKind, HeadReliabilityProfile,
+        ResolvedAgentHead, TraceTier,
     };
 
     #[test]
@@ -414,12 +436,23 @@ mod tests {
             }],
             Vec::new(),
             "2026-06-08T00:00:00Z",
-        );
+        )
+        .with_context_membrane(vec![ContextMembranePrime::new(
+            "context:ambient",
+            "ambient intelligence",
+            "scope was primed at run start",
+            "test:prompt",
+            0.75,
+        )]);
 
         let prompt = prompt_for_request(&request);
 
         assert!(prompt.contains("scratchrev:1"));
         assert!(prompt.contains("proposal body"));
+        assert!(prompt.contains("Shared CRDT scratchpad"));
+        assert!(prompt.contains("scratchpad.crdt.scratchpad_default"));
+        assert!(prompt.contains("Context membrane primes"));
+        assert!(prompt.contains("context:ambient"));
     }
 
     fn head(provider: &str, transport: HeadTransport) -> ResolvedAgentHead {

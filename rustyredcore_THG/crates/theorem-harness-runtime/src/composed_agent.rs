@@ -429,7 +429,8 @@ fn run_single_head_agent<I: HeadInvoker>(
         object_payload(json!({
             "task": input.task,
             "kind": "orientation",
-            "mode": "single_head"
+            "mode": "single_head",
+            "context_membrane": input.context_membrane
         })),
         &input.started_at,
     )?;
@@ -463,7 +464,9 @@ fn run_single_head_agent<I: HeadInvoker>(
                 input.claims.clone(),
                 input.started_at.clone(),
             )
-            .with_policy_decision(policy_decision),
+            .with_policy_decision(policy_decision)
+            .with_scratchpad_crdt(binding.working_memory_scope.scratchpad.crdt.clone())
+            .with_context_membrane(input.context_membrane.clone()),
         )
         .map_err(|error| ComposedAgentRuntimeError::Loop(IntraAgentLoopError::Invocation(error)))?;
     let proposal = append_invocation_revision(&mut binding, &receipt)?;

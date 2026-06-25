@@ -66,8 +66,9 @@ pub use agent_binding::{
     BindingTraceScope, BindingTransitionInput, BindingTransitionResult, BindingVerificationOutcome,
     BindingVerificationReceipt, HeadBudgetLimit, HeadCapabilityReliability, HeadContributionRecord,
     HeadCostProfile, HeadKind, HeadReliabilityProfile, HeadTransport, MemoryZone, MemoryZoneKind,
-    PublishedScope, ScratchpadDocument, ScratchpadRelationKind, ScratchpadRevision,
-    ScratchpadRevisionLink, ScratchpadRevisionRelation, TraceTier,
+    PublishedScope, ScratchpadAwarenessEntry, ScratchpadCrdtBacking, ScratchpadCrdtKind,
+    ScratchpadCrdtOperation, ScratchpadDocument, ScratchpadRelationKind, ScratchpadRevision,
+    ScratchpadRevisionLink, ScratchpadRevisionRelation, ScratchpadTextRegion, TraceTier,
 };
 pub use agent_head_registry::{
     AgentHeadEndpoint, AgentHeadKindSummary, AgentHeadRegistry, AgentHeadRegistryError,
@@ -111,8 +112,9 @@ pub use federated_signals::{
 };
 pub use head_fitness::{FitnessCounter, HeadFitness, NodeResult, RoutingPolicy};
 pub use head_invocation::{
-    FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
-    HeadInvocationRequest, HeadInvoker, RevisionContext,
+    default_head_system_prompt, ContextMembranePrime, FakeHeadInvoker, GroundedClaim,
+    HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
+    HeadInvoker, RevisionContext,
 };
 pub use improvement_rate::{
     composite_point, composite_points_from_metrics, compute_improvement_rate,

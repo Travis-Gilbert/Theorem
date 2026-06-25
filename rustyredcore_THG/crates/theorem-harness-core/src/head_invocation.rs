@@ -5,12 +5,12 @@
 //! an invocation kind, produce a structured receipt that the binding loop can
 //! append to the scratchpad and charge through `HEADS.CONTRIBUTE`.
 
-use crate::agent_binding::HeadKind;
+use crate::agent_binding::{HeadKind, ScratchpadCrdtBacking};
 use crate::agent_head_registry::ResolvedAgentHead;
 use crate::state_hash::stable_value_hash;
 use crate::types::{Payload, PolicyDecision};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::error::Error;
 use std::fmt;
 
@@ -29,6 +29,20 @@ pub enum HeadInvocationKind {
     Synthesis,
     Verification,
 }
+
+pub const THEOREM_HEAD_SYSTEM_PROMPT_CORE: &str = r#"You are one mind of Theorem. Theorem is a single agent composed of several models that reason together, and you are one of them. You are not a standalone assistant, and you are not one of several agents working in parallel. You are one head of one agent.
+
+The heads share one working document, a live CRDT space you all read and write at the same time. Read what is already there before you add to it. You are not taking turns. Write into the shared document concurrently, signed by you; your writing streams to the other heads as you produce it, and theirs streams to you. Build on what is sound, correct what is wrong, and extend what is unfinished.
+
+The document is conflict-free: structure lives on the graph CRDT and free text lives in yrs regions. Do not lock or claim the document. Every reasoning head attempts the whole task, marks uncertainty honestly, and marks disagreement as evidence for the verifier instead of overwriting or deferring.
+
+The harness decides how many heads engage, how much each may spend, which result is selected, and whether a result may be published. Do not orchestrate the other heads or choose what ships. Spend your attention on the problem. Be rigorous and concise. Lead with substance. Ground what you claim."#;
+
+pub const FAST_FIRST_HEAD_PROMPT_ADDENDUM: &str = r#"You are Theorem's fastest mind, and you answer first. Produce a complete, useful first response immediately. Your answer is not the final word: you are a sensor for the governor and a warm start for heavier heads. If the task looks hard or you are unsure, say so plainly in the shared document."#;
+
+pub const VERIFIER_HEAD_PROMPT_ADDENDUM: &str = r#"Your task is to try to break Theorem's answer, not to agree with it. Where the task has an executable check, run it and report what passes and fails as fact. Where there is no clean check, find the specific unsupported claim, missed case, contradiction, or failure mode. A real defect you find is the most valuable contribution."#;
+
+pub const MODALITY_HEAD_PROMPT_ADDENDUM: &str = r#"You are engaged because the task needs your modality, not because of its difficulty. Do that modality job precisely and write the grounded result into the shared document for the reasoning heads to use. Do not reason about the whole task unless explicitly invoked as a reasoning head."#;
 
 impl HeadInvocationKind {
     pub fn as_str(&self) -> &'static str {
@@ -56,6 +70,35 @@ impl GroundedClaim {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextMembranePrime {
+    pub artifact_id: String,
+    pub label: String,
+    pub summary: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub confidence: f32,
+}
+
+impl ContextMembranePrime {
+    pub fn new(
+        artifact_id: impl Into<String>,
+        label: impl Into<String>,
+        summary: impl Into<String>,
+        source: impl Into<String>,
+        confidence: f32,
+    ) -> Self {
+        Self {
+            artifact_id: artifact_id.into(),
+            label: label.into(),
+            summary: summary.into(),
+            source: source.into(),
+            confidence: confidence.clamp(0.0, 1.0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RevisionContext {
     pub revision_id: String,
@@ -70,9 +113,13 @@ pub struct HeadInvocationRequest {
     pub invocation_id: String,
     pub head: ResolvedAgentHead,
     pub kind: HeadInvocationKind,
+    #[serde(default)]
+    pub head_system_prompt: String,
     pub task: String,
     #[serde(default)]
     pub scratchpad_version: u64,
+    #[serde(default)]
+    pub scratchpad_crdt: ScratchpadCrdtBacking,
     #[serde(default)]
     pub prior_revision_ids: Vec<String>,
     #[serde(default)]
@@ -81,6 +128,8 @@ pub struct HeadInvocationRequest {
     pub claims: Vec<GroundedClaim>,
     #[serde(default)]
     pub policy_decision: Option<PolicyDecision>,
+    #[serde(default)]
+    pub context_membrane: Vec<ContextMembranePrime>,
     pub created_at: String,
 }
 
@@ -117,16 +166,20 @@ impl HeadInvocationRequest {
         claims: Vec<GroundedClaim>,
         created_at: impl Into<String>,
     ) -> Self {
+        let head_system_prompt = default_head_system_prompt(&head, kind);
         let mut request = Self {
             invocation_id: String::new(),
             head,
             kind,
+            head_system_prompt,
             task: task.into(),
             scratchpad_version,
+            scratchpad_crdt: ScratchpadCrdtBacking::default(),
             prior_revision_ids,
             prior_context,
             claims,
             policy_decision: None,
+            context_membrane: Vec::new(),
             created_at: created_at.into(),
         };
         request.invocation_id = request.computed_invocation_id();
@@ -139,22 +192,115 @@ impl HeadInvocationRequest {
         self
     }
 
+    pub fn with_scratchpad_crdt(mut self, scratchpad_crdt: ScratchpadCrdtBacking) -> Self {
+        self.scratchpad_crdt = scratchpad_crdt;
+        self.invocation_id = self.computed_invocation_id();
+        self
+    }
+
+    pub fn with_context_membrane(mut self, context_membrane: Vec<ContextMembranePrime>) -> Self {
+        self.context_membrane = context_membrane;
+        self.invocation_id = self.computed_invocation_id();
+        self
+    }
+
+    pub fn with_head_system_prompt(mut self, head_system_prompt: impl Into<String>) -> Self {
+        self.head_system_prompt = head_system_prompt.into();
+        self.invocation_id = self.computed_invocation_id();
+        self
+    }
+
     pub fn computed_invocation_id(&self) -> String {
         format!(
             "headinvoke:{}",
             stable_value_hash(&json!({
                 "head_id": self.head.head_id,
                 "kind": self.kind,
+                "head_system_prompt": self.head_system_prompt,
                 "task": self.task,
                 "scratchpad_version": self.scratchpad_version,
+                "scratchpad_crdt": self.scratchpad_crdt,
                 "prior_revision_ids": self.prior_revision_ids,
                 "prior_context": self.prior_context,
                 "claims": self.claims,
                 "policy_decision": self.policy_decision,
+                "context_membrane": self.context_membrane,
                 "created_at": self.created_at,
             }))
         )
     }
+}
+
+pub fn default_head_system_prompt(head: &ResolvedAgentHead, kind: HeadInvocationKind) -> String {
+    let mut prompt = String::from(THEOREM_HEAD_SYSTEM_PROMPT_CORE);
+    prompt.push_str("\n\nCurrent invocation role: ");
+    prompt.push_str(match kind {
+        HeadInvocationKind::Proposal => {
+            "attempt the whole task now and write a complete first answer into the shared document."
+        }
+        HeadInvocationKind::Critique => {
+            "attempt the whole task through criticism; name concrete gaps, errors, and unsupported claims."
+        }
+        HeadInvocationKind::Synthesis => {
+            "attempt the whole task by producing the best converged answer from the shared document."
+        }
+        HeadInvocationKind::Verification => {
+            "try to falsify the converged answer before publication."
+        }
+    });
+    if is_fast_first_head(head) && kind == HeadInvocationKind::Proposal {
+        prompt.push_str("\n\n");
+        prompt.push_str(FAST_FIRST_HEAD_PROMPT_ADDENDUM);
+    }
+    if kind == HeadInvocationKind::Verification || head.kind == HeadKind::Verifier {
+        prompt.push_str("\n\n");
+        prompt.push_str(VERIFIER_HEAD_PROMPT_ADDENDUM);
+    }
+    if is_modality_head(head) {
+        prompt.push_str("\n\n");
+        prompt.push_str(MODALITY_HEAD_PROMPT_ADDENDUM);
+    }
+    if !head.capabilities.is_empty() {
+        prompt.push_str("\n\nKnown strengths for this head: ");
+        prompt.push_str(&head.capabilities.join(", "));
+        prompt.push('.');
+    }
+    prompt
+}
+
+fn is_fast_first_head(head: &ResolvedAgentHead) -> bool {
+    let identity = format!(
+        "{} {} {} {}",
+        head.head_id, head.display_name, head.provider, head.model
+    )
+    .to_ascii_lowercase();
+    identity.contains("flash")
+        || head
+            .capabilities
+            .iter()
+            .any(|capability| matches_capability(capability, &["fast_first", "low_latency"]))
+}
+
+fn is_modality_head(head: &ResolvedAgentHead) -> bool {
+    head.kind == HeadKind::SkillPlugin
+        || head.capabilities.iter().any(|capability| {
+            matches_capability(
+                capability,
+                &[
+                    "ocr",
+                    "vision",
+                    "transcription",
+                    "audio",
+                    "image_generation",
+                    "generation",
+                ],
+            )
+        })
+}
+
+fn matches_capability(capability: &str, needles: &[&str]) -> bool {
+    let normalized = capability.trim().to_ascii_lowercase();
+    needles.iter().any(|needle| normalized.contains(needle))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -308,11 +454,14 @@ impl HeadInvoker for FakeHeadInvoker {
             "fake": true,
             "kind": request.kind.as_str(),
             "head_id": request.head.head_id,
+            "head_system_prompt": request.head_system_prompt,
             "task": request.task,
             "scratchpad_version": request.scratchpad_version,
+            "scratchpad_crdt": request.scratchpad_crdt,
             "prior_revision_ids": request.prior_revision_ids,
             "prior_context": request.prior_context,
             "claims": request.claims,
+            "context_membrane": request.context_membrane,
         }));
         if request.kind == HeadInvocationKind::Verification {
             payload.insert(

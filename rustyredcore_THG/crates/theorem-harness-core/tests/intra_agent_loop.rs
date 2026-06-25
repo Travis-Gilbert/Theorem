@@ -4,10 +4,10 @@ use serde_json::json;
 use theorem_harness_core::{
     default_authority_order, run_fake_intra_agent_loop, AgentBinding, AgentHead,
     BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
-    BindingVerificationOutcome, FakeIntraAgentLoopInput, GroundedClaim, HeadCapabilityReliability,
-    HeadCostProfile, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
-    HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport,
-    IntraAgentLoopError, ScratchpadRelationKind, TraceTier,
+    BindingVerificationOutcome, ContextMembranePrime, FakeIntraAgentLoopInput, GroundedClaim,
+    HeadCapabilityReliability, HeadCostProfile, HeadInvocationError, HeadInvocationKind,
+    HeadInvocationReceipt, HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile,
+    HeadTransport, IntraAgentLoopError, ScratchpadRelationKind, TraceTier,
 };
 
 #[test]
@@ -57,6 +57,8 @@ fn fake_loop_runs_full_lifecycle_with_scratchpad_revisions() {
         &json!(default_authority_order())
     );
     assert_eq!(result.scratchpad_revisions.len(), 5);
+    assert_eq!(result.rounds[0].escalation_signal, "verified_converged");
+    assert_eq!(result.rounds[0].disagreement_count, 0);
     assert_eq!(
         result
             .scratchpad_revisions
@@ -113,8 +115,15 @@ fn fake_loop_records_two_distinct_synthesis_heads() {
 #[test]
 fn synthesis_receives_proposal_and_critique_context() {
     let invoker = RecordingInvoker::default();
-    let input =
+    let mut input =
         FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    input.context_membrane = vec![ContextMembranePrime::new(
+        "context:repo",
+        "repo state",
+        "ambient intelligence loaded at run start",
+        "harness:recall",
+        0.9,
+    )];
 
     theorem_harness_core::run_intra_agent_loop_with_invoker(fixture_binding(), input, &invoker)
         .unwrap();
@@ -141,6 +150,17 @@ fn synthesis_receives_proposal_and_critique_context() {
     assert!(requests
         .iter()
         .all(|request| request.policy_decision.is_some()));
+    assert!(requests.iter().all(|request| {
+        request.scratchpad_crdt.graph_root_id == "crdtgraph:scratchpad_theorem"
+            && request.scratchpad_crdt.stream_topic == "scratchpad.crdt.scratchpad_theorem"
+    }));
+    assert!(requests.iter().all(|request| {
+        request.context_membrane.len() == 1
+            && request.context_membrane[0].artifact_id == "context:repo"
+    }));
+    assert!(requests
+        .iter()
+        .all(|request| request.head_system_prompt.contains("one mind of Theorem")));
     assert!(requests.iter().all(|request| {
         request
             .policy_decision
@@ -203,11 +223,14 @@ fn fake_loop_iterates_after_defective_verification_until_accepted() {
         result.rounds[0].verification_outcome,
         BindingVerificationOutcome::DefectFound
     );
+    assert_eq!(result.rounds[0].escalation_signal, "verification_defect");
+    assert_eq!(result.rounds[0].disagreement_count, 1);
     assert_eq!(result.rounds[0].stop_reason, "continue");
     assert_eq!(
         result.rounds[1].verification_outcome,
         BindingVerificationOutcome::Accepted
     );
+    assert_eq!(result.rounds[1].escalation_signal, "verified_converged");
     assert_eq!(result.rounds[1].stop_reason, "verified_converged");
     assert_eq!(result.invocation_receipts.len(), 8);
     assert_eq!(result.events.len(), 22);

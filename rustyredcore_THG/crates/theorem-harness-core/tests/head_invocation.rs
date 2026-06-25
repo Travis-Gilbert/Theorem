@@ -1,9 +1,9 @@
 use serde_json::{json, Map};
 use theorem_harness_core::{
     AgentBinding, AgentHead, AgentHeadRegistry, BindingBudgetScope, BindingComposition,
-    BindingIdentity, FakeHeadInvoker, GroundedClaim, HeadCostProfile, HeadInvocationError,
-    HeadInvocationKind, HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile,
-    HeadTransport, RevisionContext, TraceTier,
+    BindingIdentity, ContextMembranePrime, FakeHeadInvoker, GroundedClaim, HeadCostProfile,
+    HeadInvocationError, HeadInvocationKind, HeadInvocationRequest, HeadInvoker, HeadKind,
+    HeadReliabilityProfile, HeadTransport, RevisionContext, ScratchpadCrdtKind, TraceTier,
 };
 
 #[test]
@@ -34,6 +34,21 @@ fn fake_invoker_produces_content_addressed_receipt() {
         .chars()
         .all(|character| character.is_ascii_hexdigit()));
     assert_eq!(receipt.payload.get("fake").unwrap(), true);
+    assert!(receipt.payload["head_system_prompt"]
+        .as_str()
+        .unwrap()
+        .contains("one mind of Theorem"));
+    assert_eq!(
+        receipt.payload["scratchpad_crdt"]["stream_topic"],
+        "scratchpad.crdt.scratchpad_default"
+    );
+    assert_eq!(
+        receipt.payload["context_membrane"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -73,6 +88,52 @@ fn invocation_request_carries_prior_revision_context() {
     assert_eq!(prior_context.len(), 2);
     assert_eq!(prior_context[0]["output_summary"], "proposal summary");
     assert_eq!(prior_context[1]["kind"], "critique");
+}
+
+#[test]
+fn invocation_request_carries_crdt_prompt_and_context_membrane() {
+    let registry = AgentHeadRegistry::from_binding(&fixture_binding()).unwrap();
+    let mut head = registry.resolve("claude", HeadTransport::Api).unwrap();
+    head.head_id = "deepseek_flash".to_string();
+    head.display_name = "DeepSeek Flash".to_string();
+    head.provider = "deepseek".to_string();
+    head.model = "deepseek-flash".to_string();
+    head.capabilities = vec!["fast_first".to_string(), "low_latency".to_string()];
+    let request = HeadInvocationRequest::new(
+        head,
+        HeadInvocationKind::Proposal,
+        "stream the first answer",
+        7,
+        Vec::new(),
+        vec![GroundedClaim::new("grounded claim", "source:1")],
+        "2026-06-03T00:00:00Z",
+    )
+    .with_context_membrane(vec![ContextMembranePrime::new(
+        "context:repo",
+        "repo state",
+        "dirty tree is path-scoped",
+        "harness:recall",
+        0.82,
+    )]);
+
+    assert_eq!(
+        request.scratchpad_crdt.kind,
+        ScratchpadCrdtKind::GraphCrdtYrsRegions
+    );
+    assert!(request.head_system_prompt.contains("one mind of Theorem"));
+    assert!(request.head_system_prompt.contains("fastest mind"));
+    assert_eq!(request.context_membrane.len(), 1);
+    assert_eq!(request.invocation_id, request.computed_invocation_id());
+
+    let receipt = FakeHeadInvoker::default().invoke(request).unwrap();
+    assert_eq!(
+        receipt.payload["context_membrane"][0]["artifact_id"],
+        "context:repo"
+    );
+    assert_eq!(
+        receipt.payload["scratchpad_crdt"]["kind"],
+        "graph_crdt_yrs_regions"
+    );
 }
 
 #[test]

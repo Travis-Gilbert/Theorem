@@ -1,6 +1,6 @@
 use crate::head_invoker::{
     object_payload, prompt_for_request, provider_send_error, provider_summary,
-    system_instruction_for_kind, truncate_detail, CredentialResolver, EndpointMap,
+    system_instruction_for_request, truncate_detail, CredentialResolver, EndpointMap,
 };
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
@@ -144,6 +144,7 @@ fn invoke_anthropic_messages(
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
     let prompt = prompt_for_request(&request);
+    let system_instruction = system_instruction_for_request(&request);
     let response = http
         .post(endpoint)
         .header("x-api-key", api_key)
@@ -152,7 +153,7 @@ fn invoke_anthropic_messages(
             "model": request.head.model,
             "max_tokens": 1024,
             "temperature": 0.2,
-            "system": system_instruction_for_kind(request.kind),
+            "system": system_instruction,
             "messages": [{ "role": "user", "content": prompt }]
         }))
         .send()
@@ -213,6 +214,7 @@ pub(crate) fn invoke_openai_chat_completions(
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
     let prompt = prompt_for_request(&request);
+    let system_instruction = system_instruction_for_request(&request);
     let mut builder = http.post(endpoint);
     if let Some(api_key) = api_key
         .as_deref()
@@ -225,7 +227,7 @@ pub(crate) fn invoke_openai_chat_completions(
         .json(&json!({
             "model": request.head.model,
             "messages": [
-                { "role": "system", "content": system_instruction_for_kind(request.kind) },
+                { "role": "system", "content": system_instruction },
                 { "role": "user", "content": prompt }
             ],
             "temperature": 0.2,

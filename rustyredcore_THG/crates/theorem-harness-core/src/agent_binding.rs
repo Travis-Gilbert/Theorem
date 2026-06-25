@@ -406,20 +406,30 @@ pub enum MemoryZoneKind {
 pub struct ScratchpadDocument {
     pub document_id: String,
     #[serde(default)]
+    pub crdt: ScratchpadCrdtBacking,
+    #[serde(default)]
     pub version: u64,
     #[serde(default)]
     pub revisions: Vec<ScratchpadRevision>,
     #[serde(default)]
     pub relations: Vec<ScratchpadRevisionRelation>,
+    #[serde(default)]
+    pub crdt_ops: Vec<ScratchpadCrdtOperation>,
+    #[serde(default)]
+    pub awareness: Vec<ScratchpadAwarenessEntry>,
 }
 
 impl ScratchpadDocument {
     pub fn new(document_id: impl Into<String>) -> Self {
+        let document_id = document_id.into();
         Self {
-            document_id: document_id.into(),
+            crdt: ScratchpadCrdtBacking::for_document(&document_id),
+            document_id,
             version: 0,
             revisions: Vec::new(),
             relations: Vec::new(),
+            crdt_ops: Vec::new(),
+            awareness: Vec::new(),
         }
     }
 
@@ -501,6 +511,25 @@ impl ScratchpadDocument {
             created_at: created_at.clone(),
         };
         self.revisions.push(revision.clone());
+        self.crdt_ops.push(ScratchpadCrdtOperation {
+            op_id: prefixed_id("scratchop"),
+            actor_head_id: actor_head_id.clone(),
+            revision_id: revision_id.clone(),
+            op_kind: "upsert_revision".to_string(),
+            graph_element_id: revision_id.clone(),
+            text_region_id: scratchpad_region_for_payload(&revision.payload),
+            content_hash: revision.content_hash.clone(),
+            payload_hash: stable_value_hash(&Value::Object(revision.payload.clone())),
+            created_at: created_at.clone(),
+        });
+        self.awareness.push(ScratchpadAwarenessEntry {
+            actor_head_id: actor_head_id.clone(),
+            region_id: scratchpad_region_for_payload(&revision.payload),
+            revision_id: revision_id.clone(),
+            status: "writing".to_string(),
+            cursor: self.version,
+            updated_at: created_at.clone(),
+        });
         for link in links {
             self.relations.push(ScratchpadRevisionRelation {
                 relation_id: prefixed_id("scratchrel"),
@@ -515,6 +544,96 @@ impl ScratchpadDocument {
         }
         revision
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScratchpadCrdtKind {
+    GraphCrdtYrsRegions,
+}
+
+impl Default for ScratchpadCrdtKind {
+    fn default() -> Self {
+        Self::GraphCrdtYrsRegions
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScratchpadCrdtBacking {
+    #[serde(default)]
+    pub kind: ScratchpadCrdtKind,
+    pub graph_root_id: String,
+    pub yrs_doc_id: String,
+    pub stream_topic: String,
+    pub awareness_log_id: String,
+    #[serde(default)]
+    pub text_regions: Vec<ScratchpadTextRegion>,
+}
+
+impl Default for ScratchpadCrdtBacking {
+    fn default() -> Self {
+        Self::for_document("scratchpad:default")
+    }
+}
+
+impl ScratchpadCrdtBacking {
+    pub fn for_document(document_id: &str) -> Self {
+        let suffix = document_id.replace(':', "_");
+        Self {
+            kind: ScratchpadCrdtKind::GraphCrdtYrsRegions,
+            graph_root_id: format!("crdtgraph:{suffix}"),
+            yrs_doc_id: format!("yrs:{suffix}"),
+            stream_topic: format!("scratchpad.crdt.{suffix}"),
+            awareness_log_id: format!("awareness:{suffix}"),
+            text_regions: vec![
+                ScratchpadTextRegion::new("orientation", "run/task and context membrane"),
+                ScratchpadTextRegion::new("proposal", "streamed complete attempts"),
+                ScratchpadTextRegion::new("critique", "streamed disagreement and gaps"),
+                ScratchpadTextRegion::new("synthesis", "shared converging answer"),
+                ScratchpadTextRegion::new("verification", "falsification receipts"),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScratchpadTextRegion {
+    pub region_id: String,
+    pub description: String,
+}
+
+impl ScratchpadTextRegion {
+    pub fn new(region_id: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            region_id: region_id.into(),
+            description: description.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScratchpadCrdtOperation {
+    pub op_id: String,
+    pub actor_head_id: String,
+    pub revision_id: String,
+    pub op_kind: String,
+    pub graph_element_id: String,
+    pub text_region_id: String,
+    pub content_hash: String,
+    pub payload_hash: String,
+    #[serde(default = "now_string")]
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScratchpadAwarenessEntry {
+    pub actor_head_id: String,
+    pub region_id: String,
+    pub revision_id: String,
+    pub status: String,
+    pub cursor: u64,
+    #[serde(default = "now_string")]
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2003,6 +2122,18 @@ fn payload_head_outcomes(value: Option<&Value>) -> Vec<BindingHeadOutcome> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn scratchpad_region_for_payload(payload: &Payload) -> String {
+    match payload.get("kind").and_then(Value::as_str) {
+        Some("proposal") => "proposal",
+        Some("critique") => "critique",
+        Some("synthesis") => "synthesis",
+        Some("verification") => "verification",
+        Some("orientation") => "orientation",
+        _ => "synthesis",
+    }
+    .to_string()
 }
 
 fn payload_f64(value: Option<&Value>) -> f64 {

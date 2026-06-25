@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use theorem_harness_core::{
-    AgentHeadEndpoint, GroundedClaim, HeadCostProfile, HeadInvocationError, HeadInvocationKind,
-    HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport,
-    ResolvedAgentHead, TraceTier,
+    AgentHeadEndpoint, ContextMembranePrime, GroundedClaim, HeadCostProfile, HeadInvocationError,
+    HeadInvocationKind, HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile,
+    HeadTransport, ResolvedAgentHead, TraceTier,
 };
 use theorem_harness_runtime::{CredentialResolver, EndpointMap, ProviderHeadInvoker};
 
@@ -188,12 +188,20 @@ Claims JSON:
     assert!(requests[0].body["messages"][0]["content"]
         .as_str()
         .unwrap()
-        .contains("Review the prior proposal"));
+        .contains("one mind of Theorem"));
     assert_eq!(requests[0].body["messages"][1]["role"], json!("user"));
     assert!(requests[0].body["messages"][1]["content"]
         .as_str()
         .unwrap()
         .contains("Seed grounding claims"));
+    assert!(requests[0].body["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Shared CRDT scratchpad"));
+    assert!(requests[0].body["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Context membrane primes"));
 }
 
 #[test]
@@ -359,6 +367,13 @@ fn request_with_transport(
         vec![GroundedClaim::new("seed claim", "seed:claim")],
         "2026-06-19T00:00:00Z",
     )
+    .with_context_membrane(vec![ContextMembranePrime::new(
+        "context:test",
+        "provider test",
+        "provider prompt should receive run-start context",
+        "test:provider_invoker",
+        1.0,
+    )])
 }
 
 fn head(

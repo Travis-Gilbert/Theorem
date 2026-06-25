@@ -15,8 +15,8 @@ use crate::agent_binding::{
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
 use crate::constitution::Constitution;
 use crate::head_invocation::{
-    FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
-    HeadInvocationRequest, HeadInvoker, RevisionContext,
+    ContextMembranePrime, FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind,
+    HeadInvocationReceipt, HeadInvocationRequest, HeadInvoker, RevisionContext,
 };
 use crate::state_hash::stable_value_hash;
 use crate::types::Payload;
@@ -86,6 +86,8 @@ pub struct FakeIntraAgentLoopInput {
     pub outcome_id: String,
     #[serde(default)]
     pub claims: Vec<GroundedClaim>,
+    #[serde(default)]
+    pub context_membrane: Vec<ContextMembranePrime>,
     #[serde(default = "default_domain")]
     pub domain: String,
     #[serde(default = "default_routing_explore_token")]
@@ -94,6 +96,8 @@ pub struct FakeIntraAgentLoopInput {
     pub max_rounds: u32,
     #[serde(default = "default_convergence_confidence_threshold")]
     pub convergence_confidence_threshold: f32,
+    #[serde(default = "default_uncertainty_escalation_threshold")]
+    pub uncertainty_escalation_threshold: f32,
     #[serde(default = "default_expected_value_units")]
     pub expected_value_units: f64,
     #[serde(default = "default_expected_invocation_cost_units")]
@@ -118,10 +122,12 @@ impl FakeIntraAgentLoopInput {
             substrate_receipt_id: "substrate:fake-loop".to_string(),
             outcome_id: "outcome:fake-loop".to_string(),
             claims,
+            context_membrane: Vec::new(),
             domain: default_domain(),
             routing_explore_token: default_routing_explore_token(),
             max_rounds: default_max_rounds(),
             convergence_confidence_threshold: default_convergence_confidence_threshold(),
+            uncertainty_escalation_threshold: default_uncertainty_escalation_threshold(),
             expected_value_units: default_expected_value_units(),
             expected_invocation_cost_units: default_expected_invocation_cost_units(),
             started_at: "2026-06-02T00:00:00Z".to_string(),
@@ -141,6 +147,9 @@ pub struct BindingLoopRound {
     pub verification_revision_id: String,
     pub verification_outcome: BindingVerificationOutcome,
     pub confidence: f32,
+    pub uncertainty: f32,
+    pub disagreement_count: usize,
+    pub escalation_signal: String,
     pub stop_reason: String,
 }
 
@@ -284,7 +293,8 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         "private work opened",
         object_payload(json!({
             "task": input.task,
-            "kind": "orientation"
+            "kind": "orientation",
+            "context_membrane": input.context_membrane
         })),
         &input.started_at,
     )?;
@@ -464,6 +474,15 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             ],
         );
         current_confidence = confidence;
+        let uncertainty = 1.0 - confidence;
+        let disagreement_count =
+            current_round_disagreement_count(&binding, &verification_revision_id);
+        let escalation_signal = governor_escalation_signal(
+            verification_outcome,
+            uncertainty,
+            disagreement_count,
+            input.uncertainty_escalation_threshold,
+        );
         revisions.push(verification_revision);
 
         final_synthesis_id = format!("synthesis:fake-loop:{round_index}");
@@ -474,7 +493,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         synthesis_head_id = synthesis.head_id.clone();
         verifier_head_id = verifier.head_id.clone();
 
-        let stop_reason = if verification_outcome == BindingVerificationOutcome::Accepted
+        let stop_reason = if escalation_signal == "verified_converged"
             && confidence >= input.convergence_confidence_threshold
         {
             "verified_converged".to_string()
@@ -509,6 +528,9 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             verification_revision_id,
             verification_outcome,
             confidence,
+            uncertainty,
+            disagreement_count,
+            escalation_signal,
             stop_reason: if should_continue {
                 "continue".to_string()
             } else {
@@ -790,6 +812,42 @@ fn round_confidence(
     }
 }
 
+fn current_round_disagreement_count(
+    binding: &AgentBinding,
+    verification_revision_id: &str,
+) -> usize {
+    binding
+        .working_memory_scope
+        .scratchpad
+        .relations
+        .iter()
+        .filter(|relation| relation.from_revision_id == verification_revision_id)
+        .filter(|relation| {
+            matches!(
+                relation.relation_kind,
+                ScratchpadRelationKind::Contradicts | ScratchpadRelationKind::Undercuts
+            )
+        })
+        .count()
+}
+
+fn governor_escalation_signal(
+    verification_outcome: BindingVerificationOutcome,
+    uncertainty: f32,
+    disagreement_count: usize,
+    uncertainty_threshold: f32,
+) -> String {
+    if verification_outcome != BindingVerificationOutcome::Accepted {
+        "verification_defect".to_string()
+    } else if uncertainty >= uncertainty_threshold {
+        "uncertainty".to_string()
+    } else if disagreement_count > 0 {
+        "disagreement".to_string()
+    } else {
+        "verified_converged".to_string()
+    }
+}
+
 fn head_outcomes_for_rounds(
     rounds: &[BindingLoopRound],
     domain: &str,
@@ -878,7 +936,9 @@ fn invoke_head<I: HeadInvoker>(
         input.claims.clone(),
         input.started_at.clone(),
     )
-    .with_policy_decision(policy_decision);
+    .with_policy_decision(policy_decision)
+    .with_scratchpad_crdt(binding.working_memory_scope.scratchpad.crdt.clone())
+    .with_context_membrane(input.context_membrane.clone());
     invoker
         .invoke(request)
         .map_err(IntraAgentLoopError::Invocation)
@@ -1129,6 +1189,10 @@ fn default_max_rounds() -> u32 {
 
 fn default_convergence_confidence_threshold() -> f32 {
     0.5
+}
+
+fn default_uncertainty_escalation_threshold() -> f32 {
+    0.6
 }
 
 fn default_expected_value_units() -> f64 {

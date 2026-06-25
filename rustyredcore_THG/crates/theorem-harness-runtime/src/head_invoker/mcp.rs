@@ -1,9 +1,9 @@
 use crate::head_invoker::{
-    CredentialResolver, EndpointMap, object_payload, prompt_for_request, provider_send_error,
-    provider_summary, truncate_detail,
+    object_payload, prompt_for_request, provider_send_error, provider_summary, truncate_detail,
+    CredentialResolver, EndpointMap,
 };
 use reqwest::blocking::{Client, RequestBuilder};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use theorem_harness_core::{
     HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
     HeadTransport,
@@ -27,8 +27,11 @@ pub fn invoke_mcp_head(
             "name": tool_name,
             "arguments": {
                 "prompt": prompt,
+                "system_prompt": request.head_system_prompt,
                 "task": request.task,
                 "kind": request.kind.as_str(),
+                "scratchpad_crdt": request.scratchpad_crdt,
+                "context_membrane": request.context_membrane,
                 "prior_context": request.prior_context
             }
         }
