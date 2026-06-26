@@ -4761,6 +4761,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6257,7 +6266,9 @@ version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
+ "flate2",
  "memchr",
+ "ruzstd",
 ]
 
 [[package]]
@@ -8057,6 +8068,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-binformat"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "object",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "rustyred-thg-catalog"
 version = "0.1.0"
 dependencies = [
@@ -8134,6 +8157,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-disasm"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "rustyred-thg-binformat",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-fractal"
 version = "0.5.0"
 dependencies = [
@@ -8183,6 +8217,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-lift"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-binformat",
+ "rustyred-thg-core",
+ "rustyred-thg-disasm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-mcp"
 version = "0.5.0"
 dependencies = [
@@ -8194,6 +8239,7 @@ dependencies = [
  "rustyred-thg-connectors",
  "rustyred-thg-core",
  "rustyred-thg-ml",
+ "rustyred-thg-reconstruct-harness",
  "serde",
  "serde_json",
  "theorem-harness-core",
@@ -8237,6 +8283,35 @@ dependencies = [
  "sqlparser",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "rustyred-thg-reconstruct"
+version = "0.1.0"
+dependencies = [
+ "datafrog",
+ "egg",
+ "petgraph 0.8.3",
+ "rustyred-thg-binformat",
+ "rustyred-thg-core",
+ "rustyred-thg-disasm",
+ "rustyred-thg-lift",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustyred-thg-reconstruct-harness"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rustyred-thg-binformat",
+ "rustyred-thg-core",
+ "rustyred-thg-disasm",
+ "rustyred-thg-lift",
+ "rustyred-thg-reconstruct",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -8329,6 +8404,15 @@ dependencies = [
  "rustyred-thg-core",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -10536,6 +10620,12 @@ dependencies = [
  "rayon",
  "statrs",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "tynm"

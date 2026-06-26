@@ -48,11 +48,12 @@ use rustyred_thg_core::{
     FusionPolicy, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore,
     GraphStoreError, GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
     HybridScoringConfig, InMemoryGraphStore, ModalityResolver, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, QueryIr, RankOutcome, RankedRow, RedCoreGraphStore, RelationalStore,
-    SessionDelta, StreamEvent, StreamLog, StreamUrgency, UserSubgraph, VectorDesignation,
-    VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS, HAS_EPISTEMIC_SHADOW, SAME_ECLASS,
-    UNDERCUTS,
+    NodeQuery, NodeRecord, PluginRegistry, QueryIr, RankOutcome, RankedRow, RedCoreGraphStore,
+    RelationalStore, SessionDelta, StreamEvent, StreamLog, StreamUrgency, UserSubgraph,
+    VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
+    HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
+use rustyred_thg_reconstruct_harness::{ReconstructionHarnessPlugin, RECONSTRUCT_CAPABILITY_PACK};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{
@@ -397,6 +398,59 @@ pub trait McpGraphBackend {
         operation: &str,
     ) -> Result<Value, McpError> {
         let affordance_id = format!("theorem_grpc.code_search.{operation}");
+        let actor = arguments
+            .get("actor")
+            .or_else(|| arguments.get("actor_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("theorem-harness-mcp")
+            .to_string();
+        let timeout_ms = arguments
+            .get("timeout_ms")
+            .or_else(|| arguments.get("timeoutMs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let dry_run = arguments
+            .get("dry_run")
+            .or_else(|| arguments.get("dryRun"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let confirmed = app_affordance_confirmed(arguments);
+        let mut request = arguments.clone();
+        if let Some(object) = request.as_object_mut() {
+            object.remove("operation");
+            object.remove("mode");
+            object.remove("verb");
+            object.remove("tenant");
+            object.remove("tenant_slug");
+            object.remove("timeout_ms");
+            object.remove("timeoutMs");
+            object.remove("dry_run");
+            object.remove("dryRun");
+            remove_app_affordance_confirmation_controls(object);
+        }
+        let response = self.invoke_app_affordance(AppAffordanceInvocation {
+            tenant_id: tenant.to_string(),
+            affordance_id: affordance_id.clone(),
+            actor,
+            request,
+            dry_run,
+            confirmed,
+            timeout_ms,
+        })?;
+        Ok(json!({
+            "tenant": tenant,
+            "operation": operation,
+            "affordance_id": affordance_id,
+            "app_affordance": response,
+        }))
+    }
+    fn invoke_reconstruct_binary(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        let affordance_id = format!("theorem_grpc.reconstruct_binary.{operation}");
         let actor = arguments
             .get("actor")
             .or_else(|| arguments.get("actor_id"))
@@ -796,6 +850,16 @@ impl<S: McpGraphBackend> McpGraphBackend for SharedStore<S> {
         self.0
             .borrow_mut()
             .invoke_code_search(tenant, arguments, operation)
+    }
+    fn invoke_reconstruct_binary(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        self.0
+            .borrow_mut()
+            .invoke_reconstruct_binary(tenant, arguments, operation)
     }
     fn put_cold_document_bytes(&mut self, body: &[u8]) -> GraphStoreResult<Option<String>> {
         self.0.borrow_mut().put_cold_document_bytes(body)
@@ -1918,6 +1982,16 @@ fn call_tool<P: McpGraphProvider>(
                 })));
             }
             code_search_payload(&tenant, &mut backend, &arguments, &operation)?
+        }
+        "reconstruct_binary" | "theorem_harness_reconstruct_binary" => {
+            let operation = reconstruct_binary_operation(&arguments)?;
+            if reconstruct_binary_writes_graph(&operation) && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Binary reconstruction graph writes are unavailable while read-only mode is active."
+                })));
+            }
+            reconstruct_binary_payload(&tenant, &mut backend, &arguments, &operation)?
         }
         "remember" | "theorem_harness_remember" => {
             if config.read_only {
@@ -6465,6 +6539,76 @@ fn code_search_payload(
     backend.invoke_code_search(tenant, &normalized, operation)
 }
 
+fn reconstruct_binary_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    let normalized = normalize_reconstruct_binary_arguments(arguments, operation);
+    backend.invoke_reconstruct_binary(tenant, &normalized, operation)
+}
+
+fn normalize_reconstruct_binary_arguments(arguments: &Value, operation: &str) -> Value {
+    let mut normalized = arguments.clone();
+    let Some(object) = normalized.as_object_mut() else {
+        return normalized;
+    };
+    object
+        .entry("operation".to_string())
+        .or_insert_with(|| Value::String(operation.to_string()));
+    normalized
+}
+
+fn reconstruct_binary_operation(arguments: &Value) -> Result<String, McpError> {
+    let raw = arguments
+        .get("operation")
+        .or_else(|| arguments.get("mode"))
+        .or_else(|| arguments.get("verb"))
+        .and_then(Value::as_str)
+        .unwrap_or("analyze")
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.'], "_");
+    match raw.as_str() {
+        "load" => Ok("load".to_string()),
+        "analyze" | "analysis" => Ok("analyze".to_string()),
+        "lift" => Ok("lift".to_string()),
+        "graph_write" | "write_graph" | "write" => Ok("graph_write".to_string()),
+        "components_recover" | "recover_components" | "components" => {
+            Ok("components_recover".to_string())
+        }
+        "plan_compile" | "compile_plan" | "plan" | "compile" => Ok("plan_compile".to_string()),
+        "instruction_get" | "get_instruction" | "instruction" | "get" => {
+            Ok("instruction_get".to_string())
+        }
+        "validate" => Ok("validate".to_string()),
+        "receipt_write" | "write_receipt" | "receipt" => Ok("receipt_write".to_string()),
+        _ => Err(McpError::invalid_params(format!(
+            "unsupported reconstruct_binary operation `{raw}`"
+        ))),
+    }
+}
+
+fn reconstruct_binary_writes_graph(operation: &str) -> bool {
+    !matches!(operation, "instruction_get")
+}
+
+fn reconstruct_binary_command(operation: &str) -> &'static str {
+    match operation {
+        "load" => "reconstruct.load",
+        "analyze" => "reconstruct.analyze",
+        "lift" => "reconstruct.lift",
+        "graph_write" => "reconstruct.graph.write",
+        "components_recover" => "reconstruct.components.recover",
+        "plan_compile" => "reconstruct.plan.compile",
+        "instruction_get" => "reconstruct.instruction.get",
+        "validate" => "reconstruct.validate",
+        "receipt_write" => "reconstruct.receipt.write",
+        _ => "reconstruct.analyze",
+    }
+}
+
 fn normalize_code_arguments(arguments: &Value, operation: &str) -> Value {
     let mut normalized = arguments.clone();
     let Some(object) = normalized.as_object_mut() else {
@@ -6556,6 +6700,31 @@ fn code_plugin_response(output: rustyred_thg_code::CodePluginExecutionOutput) ->
     })
 }
 
+fn reconstruct_binary_error(error: GraphStoreError) -> McpError {
+    let message = format!("{}: {}", error.code, error.message);
+    if error.code.starts_with("invalid_") || error.code.starts_with("missing_") {
+        McpError::invalid_params(message)
+    } else {
+        McpError::internal(message)
+    }
+}
+
+fn reconstruct_binary_response(
+    output: rustyred_thg_core::PluginExecutionOutput,
+    operation: &str,
+) -> Value {
+    json!({
+        "tenant": output.tenant_id,
+        "operation": operation,
+        "command": output.command,
+        "writes_graph": output.writes_graph,
+        "affordance_id": format!("rustyred_thg_reconstruct.{operation}"),
+        "engine": "rustyred_thg_reconstruct",
+        "capability_pack": RECONSTRUCT_CAPABILITY_PACK,
+        "result": output.result,
+    })
+}
+
 fn redcore_code_search_payload(
     store: &mut RedCoreGraphStore,
     tenant: &str,
@@ -6582,6 +6751,25 @@ fn redcore_code_search_payload(
     )
     .map_err(code_index_error)?;
     Ok(code_plugin_response(output))
+}
+
+fn redcore_reconstruct_binary_payload(
+    store: &mut RedCoreGraphStore,
+    tenant: &str,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    let mut registry = PluginRegistry::new();
+    registry.register(ReconstructionHarnessPlugin);
+    let output = registry
+        .execute(
+            store,
+            tenant,
+            reconstruct_binary_command(operation),
+            arguments.clone(),
+        )
+        .map_err(reconstruct_binary_error)?;
+    Ok(reconstruct_binary_response(output, operation))
 }
 
 fn remember_memory_payload(
@@ -10195,7 +10383,9 @@ fn tool_result_budget_for(config: &McpServerConfig, tool_name: &str) -> usize {
 fn tool_result_family(tool_name: &str) -> &'static str {
     match tool_name {
         "compute_code" | "rustyred_thg_compute_code" | "theorem_harness_compute_code" => "code",
+        "reconstruct_binary" | "theorem_harness_reconstruct_binary" => "reconstruct",
         name if name.contains("code") => "code",
+        name if name.contains("reconstruct") => "reconstruct",
         name if name.contains("fractal") => "fractal",
         "recall"
         | "theorem_harness_recall"
@@ -11809,6 +11999,31 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                 }
             }),
         ),
+        tool_write(
+            "reconstruct_binary",
+            "Native binary reconstruction compiler: load/analyze/lift an artifact into GraphStore and emit bounded reconstruction instructions for agents.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant_slug": { "type": "string" },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["load", "analyze", "lift", "graph_write", "components_recover", "plan_compile", "instruction_get", "validate", "receipt_write"],
+                        "default": "analyze"
+                    },
+                    "artifact_name": { "type": "string", "default": "artifact.bin" },
+                    "bytes_hex": { "type": "string", "description": "Hex-encoded binary bytes for load/analyze/lift/plan operations." },
+                    "instruction_id": { "type": "string" },
+                    "limit": { "type": "integer", "default": 1 },
+                    "instruction": { "type": "object" },
+                    "observed": {},
+                    "actor": { "type": "string" },
+                    "timeout_ms": { "type": "integer" },
+                    "dry_run": { "type": "boolean", "default": false },
+                    "confirmed": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
         tool(
             "harness_prepare",
             "Compose a native Theorem Context Brief from Ensemble selection plus tenant memory recall.",
@@ -13198,6 +13413,7 @@ fn epistemic_enrich_apply_tool() -> Value {
 fn output_schema_for_tool(name: &str) -> Value {
     match name {
         "code_search" | "compute_code" | "code_ingest" => code_search_output_schema(),
+        "reconstruct_binary" => reconstruct_binary_output_schema(),
         "harness_prepare" => harness_prepare_output_schema(),
         "web_consume" => web_consume_output_schema(),
         "browse_with_me" | "browse_for_me" => browsing_run_output_schema(),
@@ -13282,6 +13498,26 @@ fn code_search_output_schema() -> Value {
             "symbols": { "type": "array", "items": { "type": "object" } },
             "context": { "type": "object" },
             "receipt": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn reconstruct_binary_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "operation": { "type": "string" },
+            "command": { "type": "string" },
+            "writes_graph": { "type": "boolean" },
+            "affordance_id": { "type": "string" },
+            "engine": { "type": "string" },
+            "capability_pack": { "type": "string" },
+            "result": { "type": "object" },
+            "app_affordance": { "type": "object" },
             "error": { "type": "string" },
             "message": { "type": "string" }
         },
@@ -13679,6 +13915,15 @@ impl McpGraphBackend for RedCoreGraphStore {
         operation: &str,
     ) -> Result<Value, McpError> {
         redcore_code_search_payload(self, tenant, arguments, operation)
+    }
+
+    fn invoke_reconstruct_binary(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        redcore_reconstruct_binary_payload(self, tenant, arguments, operation)
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -15639,6 +15884,7 @@ mod tests {
         assert!(!has_tool(tools, "code_search"));
         assert!(has_tool(tools, "compute_code"));
         assert!(has_tool(tools, "code_ingest"));
+        assert!(has_tool(tools, "reconstruct_binary"));
         assert!(has_tool(tools, "harness_prepare"));
         assert_eq!(
             tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo"]["type"],
@@ -15726,6 +15972,35 @@ mod tests {
             "native_code_search"
         );
         assert_eq!(routed["app_affordance"]["request"]["repo_id"], "repo:test");
+        assert!(routed["app_affordance"]["request"]
+            .get("operation")
+            .is_none());
+    }
+
+    #[test]
+    fn reconstruct_binary_routes_named_harness_verb_to_app_affordance() {
+        let (provider, config) = fixture();
+        let routed = call_tool_json(
+            &provider,
+            &config,
+            "reconstruct_binary",
+            json!({
+                "tenant": "smoke",
+                "operation": "instruction_get",
+                "limit": 1,
+                "actor": "codex",
+            }),
+        );
+
+        assert_eq!(routed["operation"], "instruction_get");
+        assert_eq!(
+            routed["affordance_id"],
+            "theorem_grpc.reconstruct_binary.instruction_get"
+        );
+        assert_eq!(
+            routed["app_affordance"]["affordance_id"],
+            "theorem_grpc.reconstruct_binary.instruction_get"
+        );
         assert!(routed["app_affordance"]["request"]
             .get("operation")
             .is_none());
@@ -15914,6 +16189,41 @@ mod tests {
     }
 
     #[test]
+    fn redcore_reconstruct_binary_instruction_get_runs_in_process() {
+        let mut store = RedCoreGraphStore::memory();
+        RedCoreGraphStore::upsert_node(
+            &mut store,
+            NodeRecord::new(
+                "recon:instr:test",
+                ["ReconstructionInstruction"],
+                json!({"source_artifact": "sha256:test"}),
+            ),
+        )
+        .unwrap();
+
+        let output = super::reconstruct_binary_payload(
+            "smoke",
+            &mut store,
+            &json!({
+                "operation": "instruction_get",
+                "limit": 1,
+            }),
+            "instruction_get",
+        )
+        .unwrap();
+
+        assert_eq!(output["engine"], "rustyred_thg_reconstruct");
+        assert_eq!(
+            output["capability_pack"],
+            rustyred_thg_reconstruct_harness::RECONSTRUCT_CAPABILITY_PACK
+        );
+        assert_eq!(
+            output["result"]["instructions"][0]["id"],
+            "recon:instr:test"
+        );
+    }
+
+    #[test]
     fn code_search_write_operations_are_read_only_gated() {
         let (provider, mut config) = fixture();
         config.read_only = true;
@@ -15925,6 +16235,24 @@ mod tests {
                 "tenant": "smoke",
                 "repo_path": "/tmp/theorem-fixture",
                 "actor": "codex",
+            }),
+        );
+
+        assert_eq!(gated["error"], "mcp_read_only");
+    }
+
+    #[test]
+    fn reconstruct_binary_write_operations_are_read_only_gated() {
+        let (provider, mut config) = fixture();
+        config.read_only = true;
+        let gated = call_tool_json(
+            &provider,
+            &config,
+            "reconstruct_binary",
+            json!({
+                "tenant": "smoke",
+                "operation": "analyze",
+                "bytes_hex": "90c3",
             }),
         );
 

@@ -48,6 +48,11 @@ members = [
     "crates/commonplace",
     "crates/rustyred-thg-intake",
     "crates/theorem-copresence",
+    "crates/rustyred-thg-binformat",
+    "crates/rustyred-thg-disasm",
+    "crates/rustyred-thg-lift",
+    "crates/rustyred-thg-reconstruct",
+    "crates/rustyred-thg-reconstruct-harness",
 ]
 resolver = "2"
 

@@ -1,0 +1,14 @@
+[package]
+name = "rustyred-thg-disasm"
+version = "0.1.0"
+edition = "2021"
+description = "Instruction fact decoder for Theorem reconstruction."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+iced-x86 = "1.21"
+rustyred-thg-binformat = { path = "../rustyred-thg-binformat" }
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
