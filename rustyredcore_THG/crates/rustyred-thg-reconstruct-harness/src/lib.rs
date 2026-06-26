@@ -11,8 +11,8 @@ use rustyred_thg_disasm::{
 };
 use rustyred_thg_lift::{lift_to_thir, write_thir_in_store, ThirProgram};
 use rustyred_thg_reconstruct::{
-    compile_reconstruction_analysis, validate_instruction, write_reconstruction_analysis_in_store,
-    write_reconstruction_analysis_in_store_for_tenant,
+    compile_reconstruction_analysis, tenant_scoped_reconstruction_id, validate_instruction,
+    write_reconstruction_analysis_in_store, write_reconstruction_analysis_in_store_for_tenant,
     write_validation_receipt_in_store_for_tenant, ReconstructionAnalysis,
     ReconstructionInstruction, ReconstructionPlan, RECONSTRUCTION_INSTRUCTION_LABEL,
 };
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const RECONSTRUCT_CAPABILITY_PACK: &str = "theorem.reconstruct.binary";
+const MAX_RECONSTRUCTION_INSTRUCTION_LIMIT: u64 = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReconstructToolSpec {
@@ -343,12 +344,15 @@ fn instruction_get_handler(
         .get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(1)
-        .max(1) as usize;
+        .clamp(1, MAX_RECONSTRUCTION_INSTRUCTION_LIMIT) as usize;
     let nodes = if let Some(instruction_id) = instruction_id {
-        GraphStore::get_node_record(context.store, &instruction_id)
-            .into_iter()
-            .filter(|node| is_reconstruction_instruction_for_tenant(node, context.tenant_id))
-            .collect::<Vec<_>>()
+        find_reconstruction_instruction_for_tenant(
+            context.store,
+            context.tenant_id,
+            &instruction_id,
+        )
+        .into_iter()
+        .collect::<Vec<_>>()
     } else {
         GraphStore::query_nodes(
             context.store,
@@ -381,9 +385,43 @@ fn validate_handler(
             )
         })?;
     let observed = arguments.get("observed").cloned().unwrap_or(Value::Null);
+    find_reconstruction_instruction_for_tenant(context.store, context.tenant_id, &instruction.id)
+        .ok_or_else(|| {
+        GraphStoreError::new(
+            "missing_instruction",
+            format!(
+                "instruction {} is not available for this tenant",
+                instruction.id
+            ),
+        )
+    })?;
     let receipt = validate_instruction(&instruction, observed);
     write_validation_receipt_in_store_for_tenant(context.store, &receipt, context.tenant_id)?;
     Ok(json!(receipt))
+}
+
+fn find_reconstruction_instruction_for_tenant<S: GraphStore>(
+    store: &S,
+    tenant_id: &str,
+    instruction_id: &str,
+) -> Option<NodeRecord> {
+    let scoped_instruction_id = tenant_scoped_reconstruction_id(tenant_id, instruction_id);
+    for candidate_id in [instruction_id, scoped_instruction_id.as_str()] {
+        if let Some(node) = GraphStore::get_node_record(store, candidate_id) {
+            if is_reconstruction_instruction_for_tenant(&node, tenant_id) {
+                return Some(node);
+            }
+        }
+    }
+    GraphStore::query_nodes(
+        store,
+        NodeQuery::label(RECONSTRUCTION_INSTRUCTION_LABEL)
+            .with_property("tenant_id", json!(tenant_id))
+            .with_property("original_id", json!(instruction_id))
+            .with_limit(1),
+    )
+    .into_iter()
+    .next()
 }
 
 fn is_reconstruction_instruction_for_tenant(node: &NodeRecord, tenant_id: &str) -> bool {
@@ -485,11 +523,17 @@ mod tests {
         let mut registry = PluginRegistry::new();
         registry.register(ReconstructionHarnessPlugin);
         let mut store = RedCoreGraphStore::memory();
+        let stored_instruction_id =
+            tenant_scoped_reconstruction_id("Travis-Gilbert", "recon:instr:test");
         store
             .upsert_node(NodeRecord::new(
-                "recon:instr:test",
+                &stored_instruction_id,
                 [RECONSTRUCTION_INSTRUCTION_LABEL],
-                json!({"source_artifact": "sha256:test"}),
+                json!({
+                    "tenant_id": "Travis-Gilbert",
+                    "original_id": "recon:instr:test",
+                    "source_artifact": "sha256:test"
+                }),
             ))
             .unwrap();
         let output = registry
@@ -504,7 +548,26 @@ mod tests {
     }
 
     #[test]
-    fn instruction_get_filters_by_tenant_and_id_before_limit() {
+    fn validate_rejects_instruction_from_another_tenant() {
+        let instruction = ReconstructionInstruction {
+            id: "recon:instr:other".to_string(),
+            source_artifact: "sha256:other".to_string(),
+            target: rustyred_thg_reconstruct::ReconstructionTarget {
+                kind: "component".to_string(),
+                id: "component:other".to_string(),
+                language: "rust".to_string(),
+                runtime: "axum".to_string(),
+            },
+            action: rustyred_thg_reconstruct::ReconstructionAction::ImplementComponent,
+            requirements: Vec::new(),
+            validators: vec![rustyred_thg_reconstruct::ValidatorSpec::GoldenFixture {
+                input: "ping".to_string(),
+                expected: "pong".to_string(),
+            }],
+            evidence: Vec::new(),
+            confidence: 0.8,
+            uncertainty: Vec::new(),
+        };
         let mut registry = PluginRegistry::new();
         registry.register(ReconstructionHarnessPlugin);
         let mut store = RedCoreGraphStore::memory();
@@ -518,12 +581,45 @@ mod tests {
                 }),
             ))
             .unwrap();
+
+        let error = registry
+            .execute(
+                &mut store,
+                "Travis-Gilbert",
+                "reconstruct.validate",
+                json!({"instruction": instruction, "observed": "pong"}),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "missing_instruction");
+    }
+
+    #[test]
+    fn instruction_get_filters_by_tenant_and_id_before_limit() {
+        let mut registry = PluginRegistry::new();
+        registry.register(ReconstructionHarnessPlugin);
+        let mut store = RedCoreGraphStore::memory();
+        let other_instruction_id =
+            tenant_scoped_reconstruction_id("Other-Tenant", "recon:instr:other");
+        let target_instruction_id =
+            tenant_scoped_reconstruction_id("Travis-Gilbert", "recon:instr:target");
         store
             .upsert_node(NodeRecord::new(
-                "recon:instr:target",
+                &other_instruction_id,
+                [RECONSTRUCTION_INSTRUCTION_LABEL],
+                json!({
+                    "tenant_id": "Other-Tenant",
+                    "original_id": "recon:instr:other",
+                    "source_artifact": "sha256:other"
+                }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                &target_instruction_id,
                 [RECONSTRUCTION_INSTRUCTION_LABEL],
                 json!({
                     "tenant_id": "Travis-Gilbert",
+                    "original_id": "recon:instr:target",
                     "source_artifact": "sha256:target"
                 }),
             ))
@@ -540,7 +636,7 @@ mod tests {
         assert_eq!(by_id.result["instructions"].as_array().unwrap().len(), 1);
         assert_eq!(
             by_id.result["instructions"][0]["id"],
-            json!("recon:instr:target")
+            json!(&target_instruction_id)
         );
 
         let tenant_page = registry
@@ -548,11 +644,11 @@ mod tests {
                 &mut store,
                 "Travis-Gilbert",
                 "reconstruct.instruction.get",
-                json!({"limit": 10}),
+                json!({"limit": u64::MAX}),
             )
             .unwrap();
         let instructions = tenant_page.result["instructions"].as_array().unwrap();
         assert_eq!(instructions.len(), 1);
-        assert_eq!(instructions[0]["id"], json!("recon:instr:target"));
+        assert_eq!(instructions[0]["id"], json!(&target_instruction_id));
     }
 }

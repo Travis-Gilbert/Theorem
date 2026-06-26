@@ -67,9 +67,22 @@ pub fn decode_section(
     let mut formatter = NasmFormatter::new();
     let mut facts = Vec::new();
     while decoder.can_decode() {
+        let position_before = decoder.position();
+        let ip_before = decoder.ip();
         let instruction = decoder.decode();
         if instruction.is_invalid() {
-            break;
+            if decoder.position() == position_before {
+                decoder
+                    .set_position(position_before.saturating_add(1))
+                    .map_err(|error| {
+                        GraphStoreError::new(
+                            "invalid_instruction_skip_failed",
+                            format!("failed to skip invalid instruction byte: {error}"),
+                        )
+                    })?;
+                decoder.set_ip(ip_before.saturating_add(1));
+            }
+            continue;
         }
         let fact = instruction_fact(artifact_id, section, &instruction, &mut formatter)?;
         facts.push(fact);
@@ -278,6 +291,18 @@ mod tests {
         assert_eq!(report.instructions.len(), 3);
         assert_eq!(report.instructions[0].mnemonic, "nop");
         assert_eq!(report.instructions[2].effects, vec!["returns"]);
+    }
+
+    #[test]
+    fn skips_invalid_bytes_and_keeps_later_instructions() {
+        let mut load = fixture_load_report();
+        load.sections[0].bytes = vec![0x90, 0xf0, 0x90, 0xc3];
+        load.sections[0].size = load.sections[0].bytes.len() as u64;
+
+        let report = decode_instructions(&load).unwrap();
+
+        assert_eq!(report.instructions.first().unwrap().mnemonic, "nop");
+        assert_eq!(report.instructions.last().unwrap().mnemonic, "ret");
     }
 
     #[test]

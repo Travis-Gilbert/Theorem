@@ -5,7 +5,7 @@
 //! and printable strings. Downstream crates decode, lift, infer, and compile
 //! reconstruction obligations from these facts.
 
-use object::{Object, ObjectSection, ObjectSymbol};
+use object::{Object, ObjectSection, ObjectSymbol, Relocation, RelocationTarget};
 use rustyred_thg_core::{
     stable_hash, EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, NodeRecord,
 };
@@ -174,6 +174,7 @@ pub fn load_binary(name: impl Into<String>, bytes: &[u8]) -> GraphStoreResult<Bi
             value,
         })
         .collect::<Vec<_>>();
+    let relocations = collect_relocations(&parsed, &artifact_id, &artifact.sha256);
 
     let entrypoints = if artifact.entrypoint > 0 {
         vec![BinaryEntrypoint {
@@ -201,7 +202,7 @@ pub fn load_binary(name: impl Into<String>, bytes: &[u8]) -> GraphStoreResult<Bi
         sections,
         symbols,
         strings,
-        relocations: Vec::new(),
+        relocations,
         entrypoints,
     })
 }
@@ -290,6 +291,107 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+fn collect_relocations<'data, O: Object<'data>>(
+    parsed: &O,
+    artifact_id: &str,
+    artifact_sha256: &str,
+) -> Vec<BinaryRelocation> {
+    let mut relocations = Vec::new();
+    for section in parsed.sections() {
+        let section_index = section.index().0;
+        for (offset, relocation) in section.relocations() {
+            relocations.push(binary_relocation(
+                artifact_id,
+                artifact_sha256,
+                section_index,
+                offset,
+                &relocation,
+                parsed,
+                false,
+            ));
+        }
+    }
+    if let Some(dynamic_relocations) = parsed.dynamic_relocations() {
+        for (address, relocation) in dynamic_relocations {
+            let section_index = section_index_for_address(parsed, address).unwrap_or(usize::MAX);
+            relocations.push(binary_relocation(
+                artifact_id,
+                artifact_sha256,
+                section_index,
+                address,
+                &relocation,
+                parsed,
+                true,
+            ));
+        }
+    }
+    relocations
+}
+
+fn binary_relocation<'data, O: Object<'data>>(
+    artifact_id: &str,
+    artifact_sha256: &str,
+    section_index: usize,
+    offset: u64,
+    relocation: &Relocation,
+    parsed: &O,
+    dynamic: bool,
+) -> BinaryRelocation {
+    let kind = if dynamic {
+        format!("Dynamic:{:?}", relocation.kind())
+    } else {
+        format!("{:?}", relocation.kind())
+    };
+    let target = relocation_target_name(parsed, relocation.target());
+    BinaryRelocation {
+        relocation_id: format!(
+            "bin:relocation:{}",
+            stable_hash(json!([
+                artifact_sha256,
+                section_index,
+                offset,
+                &kind,
+                &target,
+                relocation.addend()
+            ]))
+        ),
+        artifact_id: artifact_id.to_string(),
+        section_index,
+        offset,
+        kind,
+        target,
+    }
+}
+
+fn section_index_for_address<'data, O: Object<'data>>(parsed: &O, address: u64) -> Option<usize> {
+    parsed.sections().find_map(|section| {
+        let start = section.address();
+        let end = start.saturating_add(section.size());
+        (address >= start && address < end).then_some(section.index().0)
+    })
+}
+
+fn relocation_target_name<'data, O: Object<'data>>(parsed: &O, target: RelocationTarget) -> String {
+    match target {
+        RelocationTarget::Symbol(index) => parsed
+            .symbol_by_index(index)
+            .ok()
+            .and_then(|symbol| symbol.name().ok().map(str::to_string))
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("symbol:{name}"))
+            .unwrap_or_else(|| format!("symbol:{}", index.0)),
+        RelocationTarget::Section(index) => parsed
+            .section_by_index(index)
+            .ok()
+            .and_then(|section| section.name().ok().map(str::to_string))
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("section:{name}"))
+            .unwrap_or_else(|| format!("section:{}", index.0)),
+        RelocationTarget::Absolute => "absolute".to_string(),
+        _ => format!("{target:?}"),
+    }
 }
 
 fn artifact_node(artifact: &BinaryArtifact) -> NodeRecord {
@@ -458,7 +560,14 @@ mod tests {
             }],
             symbols: Vec::new(),
             strings: Vec::new(),
-            relocations: Vec::new(),
+            relocations: vec![BinaryRelocation {
+                relocation_id: "relocation:1".to_string(),
+                artifact_id: "sha256:test".to_string(),
+                section_index: 0,
+                offset: 1,
+                kind: "Relative".to_string(),
+                target: "symbol:target".to_string(),
+            }],
             entrypoints: Vec::new(),
         };
         let mut store = InMemoryGraphStore::new();
@@ -472,6 +581,12 @@ mod tests {
         assert_eq!(
             store
                 .query_nodes(NodeQuery::label(BINARY_SECTION_LABEL))
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_nodes(NodeQuery::label(BINARY_RELOCATION_LABEL))
                 .len(),
             1
         );

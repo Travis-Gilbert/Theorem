@@ -30,6 +30,15 @@ pub const RECEIPT_VALIDATES_INSTRUCTION: &str = "RECEIPT_VALIDATES_INSTRUCTION";
 pub const RECONSTRUCT_SOURCE: &str = "rustyred-thg-reconstruct";
 pub const RECONSTRUCT_VERSION: &str = "rustyred-thg-reconstruct-v0";
 
+pub fn tenant_scoped_reconstruction_id(tenant_id: &str, id: &str) -> String {
+    let prefix = tenant_id_prefix(tenant_id);
+    if id.starts_with(&prefix) {
+        id.to_string()
+    } else {
+        format!("{prefix}{id}")
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticRoleKind {
@@ -326,18 +335,24 @@ fn write_reconstruction_analysis_in_store_scoped<S: GraphStore>(
     tenant_id: Option<&str>,
 ) -> GraphStoreResult<()> {
     for role in &analysis.roles {
+        let role_id = graph_id(&role.role_id, tenant_id);
         store.upsert_node(role_node(role, tenant_id))?;
         store.upsert_edge(EdgeRecord::new(
-            edge_id(&role.function_id, FUNCTION_HAS_SEMANTIC_ROLE, &role.role_id),
+            graph_edge_id(
+                &role.function_id,
+                FUNCTION_HAS_SEMANTIC_ROLE,
+                &role_id,
+                tenant_id,
+            ),
             &role.function_id,
             FUNCTION_HAS_SEMANTIC_ROLE,
-            &role.role_id,
+            &role_id,
             provenance_props(&role.authority, tenant_id),
         ))?;
         for evidence_id in &role.evidence {
             store.upsert_edge(EdgeRecord::new(
-                edge_id(&role.role_id, ROLE_EVIDENCED_BY, evidence_id),
-                &role.role_id,
+                graph_edge_id(&role_id, ROLE_EVIDENCED_BY, evidence_id, tenant_id),
+                &role_id,
                 ROLE_EVIDENCED_BY,
                 evidence_id,
                 provenance_props(&role.authority, tenant_id),
@@ -345,46 +360,52 @@ fn write_reconstruction_analysis_in_store_scoped<S: GraphStore>(
         }
     }
     for component in &analysis.components {
+        let component_id = graph_id(&component.component_id, tenant_id);
         store.upsert_node(component_node(component, tenant_id))?;
         for function_id in &component.function_ids {
             store.upsert_edge(EdgeRecord::new(
-                edge_id(function_id, BELONGS_TO_COMPONENT, &component.component_id),
+                graph_edge_id(function_id, BELONGS_TO_COMPONENT, &component_id, tenant_id),
                 function_id,
                 BELONGS_TO_COMPONENT,
-                &component.component_id,
+                &component_id,
                 provenance_props(&component.authority, tenant_id),
             ))?;
         }
     }
+    let plan_id = graph_id(&analysis.plan.plan_id, tenant_id);
     store.upsert_node(plan_node(&analysis.plan, tenant_id))?;
     for instruction in &analysis.plan.instructions {
+        let instruction_id = graph_id(&instruction.id, tenant_id);
+        let target_id = graph_id(&instruction.target.id, tenant_id);
         store.upsert_node(instruction_node(instruction, tenant_id))?;
         store.upsert_edge(EdgeRecord::new(
-            edge_id(
-                &analysis.plan.plan_id,
-                PLAN_HAS_INSTRUCTION,
-                &instruction.id,
-            ),
-            &analysis.plan.plan_id,
+            graph_edge_id(&plan_id, PLAN_HAS_INSTRUCTION, &instruction_id, tenant_id),
+            &plan_id,
             PLAN_HAS_INSTRUCTION,
-            &instruction.id,
+            &instruction_id,
             provenance_props("instruction", tenant_id),
         ))?;
         store.upsert_edge(EdgeRecord::new(
-            edge_id(
-                &instruction.id,
+            graph_edge_id(
+                &instruction_id,
                 INSTRUCTION_TARGETS_COMPONENT,
-                &instruction.target.id,
+                &target_id,
+                tenant_id,
             ),
-            &instruction.id,
+            &instruction_id,
             INSTRUCTION_TARGETS_COMPONENT,
-            &instruction.target.id,
+            &target_id,
             provenance_props("instruction", tenant_id),
         ))?;
         for evidence_id in &instruction.evidence {
             store.upsert_edge(EdgeRecord::new(
-                edge_id(&instruction.id, INSTRUCTION_EVIDENCED_BY, evidence_id),
-                &instruction.id,
+                graph_edge_id(
+                    &instruction_id,
+                    INSTRUCTION_EVIDENCED_BY,
+                    evidence_id,
+                    tenant_id,
+                ),
+                &instruction_id,
                 INSTRUCTION_EVIDENCED_BY,
                 evidence_id,
                 provenance_props("instruction", tenant_id),
@@ -414,16 +435,19 @@ fn write_validation_receipt_in_store_scoped<S: GraphStore>(
     receipt: &ValidationReceipt,
     tenant_id: Option<&str>,
 ) -> GraphStoreResult<()> {
+    let receipt_id = graph_id(&receipt.receipt_id, tenant_id);
+    let instruction_id = graph_id(&receipt.instruction_id, tenant_id);
     store.upsert_node(receipt_node(receipt, tenant_id))?;
     store.upsert_edge(EdgeRecord::new(
-        edge_id(
-            &receipt.receipt_id,
+        graph_edge_id(
+            &receipt_id,
             RECEIPT_VALIDATES_INSTRUCTION,
-            &receipt.instruction_id,
+            &instruction_id,
+            tenant_id,
         ),
-        &receipt.receipt_id,
+        &receipt_id,
         RECEIPT_VALIDATES_INSTRUCTION,
-        &receipt.instruction_id,
+        &instruction_id,
         provenance_props(
             if receipt.passed {
                 "validated_instruction"
@@ -440,36 +464,129 @@ pub fn validate_instruction(
     instruction: &ReconstructionInstruction,
     observed: Value,
 ) -> ValidationReceipt {
-    let expected = instruction
+    let mut notes = Vec::new();
+    let expected_items = instruction
         .validators
-        .first()
-        .map(|validator| match validator {
-            ValidatorSpec::GoldenFixture { expected, .. } => json!(expected),
-            ValidatorSpec::BranchCoverage { branch_count } => json!(branch_count),
-            ValidatorSpec::EvidencePresence { evidence } => json!(evidence),
+        .iter()
+        .enumerate()
+        .map(|(index, validator)| {
+            let validator_type = validator_type(validator);
+            let expected = expected_for_validator(validator);
+            let observed_value =
+                observed_for_validator(&observed, validator_type, instruction.validators.len());
+            let validator_passed = validator_passes(validator, &observed_value);
+            if !validator_passed {
+                notes.push(format!(
+                    "{validator_type} validator at index {index} did not pass"
+                ));
+            }
+            json!({
+                "type": validator_type,
+                "expected": expected,
+                "passed": validator_passed,
+            })
         })
-        .unwrap_or(Value::Null);
-    let passed = observed == expected;
+        .collect::<Vec<_>>();
+    let expected = if instruction.validators.len() == 1 {
+        expected_for_validator(&instruction.validators[0])
+    } else if instruction.validators.is_empty() {
+        Value::Null
+    } else {
+        json!(expected_items)
+    };
+    if instruction.validators.is_empty() {
+        notes.push("No validators were provided.".to_string());
+    }
+    let passed = !instruction.validators.is_empty()
+        && expected_items.iter().all(|item| item["passed"] == true);
     ValidationReceipt {
         receipt_id: format!(
             "recon:receipt:{}",
-            stable_hash(json!([&instruction.id, &observed, &expected]))
+            stable_hash(json!([&instruction.id, &observed, &expected, passed]))
         ),
         instruction_id: instruction.id.clone(),
-        validator_type: instruction
-            .validators
-            .first()
-            .map(|validator| match validator {
-                ValidatorSpec::GoldenFixture { .. } => "GoldenFixture",
-                ValidatorSpec::BranchCoverage { .. } => "BranchCoverage",
-                ValidatorSpec::EvidencePresence { .. } => "EvidencePresence",
-            })
-            .unwrap_or("None")
-            .to_string(),
+        validator_type: validator_summary(&instruction.validators),
         passed,
         observed,
         expected,
-        notes: Vec::new(),
+        notes,
+    }
+}
+
+fn validator_type(validator: &ValidatorSpec) -> &'static str {
+    match validator {
+        ValidatorSpec::GoldenFixture { .. } => "GoldenFixture",
+        ValidatorSpec::BranchCoverage { .. } => "BranchCoverage",
+        ValidatorSpec::EvidencePresence { .. } => "EvidencePresence",
+    }
+}
+
+fn validator_summary(validators: &[ValidatorSpec]) -> String {
+    if validators.is_empty() {
+        return "None".to_string();
+    }
+    validators
+        .iter()
+        .map(validator_type)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn expected_for_validator(validator: &ValidatorSpec) -> Value {
+    match validator {
+        ValidatorSpec::GoldenFixture { expected, .. } => json!(expected),
+        ValidatorSpec::BranchCoverage { branch_count } => json!(branch_count),
+        ValidatorSpec::EvidencePresence { evidence } => json!(evidence),
+    }
+}
+
+fn observed_for_validator(observed: &Value, validator_type: &str, validator_count: usize) -> Value {
+    if validator_count == 1 {
+        return observed.clone();
+    }
+    let lower_type = validator_type.to_ascii_lowercase();
+    let snake_type = snake_case_validator_type(validator_type);
+    observed
+        .get(validator_type)
+        .or_else(|| observed.get(lower_type.as_str()))
+        .or_else(|| observed.get(snake_type.as_str()))
+        .or_else(|| {
+            observed
+                .get("validators")
+                .and_then(|validators| validators.get(validator_type))
+        })
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn snake_case_validator_type(validator_type: &str) -> String {
+    match validator_type {
+        "GoldenFixture" => "golden_fixture".to_string(),
+        "BranchCoverage" => "branch_coverage".to_string(),
+        "EvidencePresence" => "evidence_presence".to_string(),
+        _ => validator_type.to_string(),
+    }
+}
+
+fn validator_passes(validator: &ValidatorSpec, observed: &Value) -> bool {
+    match validator {
+        ValidatorSpec::GoldenFixture { expected, .. } => observed == &json!(expected),
+        ValidatorSpec::BranchCoverage { branch_count } => observed
+            .as_u64()
+            .map(|observed| observed >= *branch_count as u64)
+            .unwrap_or(false),
+        ValidatorSpec::EvidencePresence { evidence } => {
+            let Some(observed) = observed.as_array() else {
+                return false;
+            };
+            let observed = observed
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>();
+            evidence
+                .iter()
+                .all(|evidence_id| observed.contains(evidence_id.as_str()))
+        }
     }
 }
 
@@ -738,10 +855,11 @@ fn uncertainty_for_roles(roles: &[&SemanticRole]) -> Vec<String> {
 }
 
 fn role_node(role: &SemanticRole, tenant_id: Option<&str>) -> NodeRecord {
+    let node_id = graph_id(&role.role_id, tenant_id);
     NodeRecord::new(
-        &role.role_id,
+        &node_id,
         [SEMANTIC_ROLE_LABEL],
-        stamp_tenant(
+        stamp_scoped_record(
             json!({
             "function_id": &role.function_id,
             "role": &role.role,
@@ -751,36 +869,45 @@ fn role_node(role: &SemanticRole, tenant_id: Option<&str>) -> NodeRecord {
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
             }),
+            &role.role_id,
             tenant_id,
         ),
     )
 }
 
 fn component_node(component: &ComponentHypothesis, tenant_id: Option<&str>) -> NodeRecord {
+    let node_id = graph_id(&component.component_id, tenant_id);
+    let role_ids = component
+        .role_ids
+        .iter()
+        .map(|role_id| graph_id(role_id, tenant_id))
+        .collect::<Vec<_>>();
     NodeRecord::new(
-        &component.component_id,
+        &node_id,
         [COMPONENT_HYPOTHESIS_LABEL],
-        stamp_tenant(
+        stamp_scoped_record(
             json!({
             "artifact_id": &component.artifact_id,
             "name": &component.name,
             "function_ids": &component.function_ids,
-            "role_ids": &component.role_ids,
+            "role_ids": role_ids,
             "confidence": component.confidence,
             "authority": &component.authority,
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
             }),
+            &component.component_id,
             tenant_id,
         ),
     )
 }
 
 fn plan_node(plan: &ReconstructionPlan, tenant_id: Option<&str>) -> NodeRecord {
+    let node_id = graph_id(&plan.plan_id, tenant_id);
     NodeRecord::new(
-        &plan.plan_id,
+        &node_id,
         [RECONSTRUCTION_PLAN_LABEL],
-        stamp_tenant(
+        stamp_scoped_record(
             json!({
             "source_artifact": &plan.source_artifact,
             "instruction_count": plan.instructions.len(),
@@ -789,6 +916,7 @@ fn plan_node(plan: &ReconstructionPlan, tenant_id: Option<&str>) -> NodeRecord {
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
             }),
+            &plan.plan_id,
             tenant_id,
         ),
     )
@@ -798,13 +926,16 @@ fn instruction_node(
     instruction: &ReconstructionInstruction,
     tenant_id: Option<&str>,
 ) -> NodeRecord {
+    let node_id = graph_id(&instruction.id, tenant_id);
+    let mut target = instruction.target.clone();
+    target.id = graph_id(&target.id, tenant_id);
     NodeRecord::new(
-        &instruction.id,
+        &node_id,
         [RECONSTRUCTION_INSTRUCTION_LABEL],
-        stamp_tenant(
+        stamp_scoped_record(
             json!({
             "source_artifact": &instruction.source_artifact,
-            "target": &instruction.target,
+            "target": target,
             "action": &instruction.action,
             "requirements": &instruction.requirements,
             "validators": &instruction.validators,
@@ -815,18 +946,21 @@ fn instruction_node(
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
             }),
+            &instruction.id,
             tenant_id,
         ),
     )
 }
 
 fn receipt_node(receipt: &ValidationReceipt, tenant_id: Option<&str>) -> NodeRecord {
+    let node_id = graph_id(&receipt.receipt_id, tenant_id);
+    let instruction_id = graph_id(&receipt.instruction_id, tenant_id);
     NodeRecord::new(
-        &receipt.receipt_id,
+        &node_id,
         [VALIDATION_RECEIPT_LABEL],
-        stamp_tenant(
+        stamp_scoped_record(
             json!({
-            "instruction_id": &receipt.instruction_id,
+            "instruction_id": instruction_id,
             "validator_type": &receipt.validator_type,
             "passed": receipt.passed,
             "observed": &receipt.observed,
@@ -836,6 +970,7 @@ fn receipt_node(receipt: &ValidationReceipt, tenant_id: Option<&str>) -> NodeRec
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
             }),
+            &receipt.receipt_id,
             tenant_id,
         ),
     )
@@ -857,6 +992,28 @@ fn stamp_tenant(mut properties: Value, tenant_id: Option<&str>) -> Value {
         map.insert("tenant_id".to_string(), json!(tenant_id));
     }
     properties
+}
+
+fn stamp_scoped_record(properties: Value, original_id: &str, tenant_id: Option<&str>) -> Value {
+    let mut properties = stamp_tenant(properties, tenant_id);
+    if let (Some(_), Value::Object(map)) = (tenant_id, &mut properties) {
+        map.insert("original_id".to_string(), json!(original_id));
+    }
+    properties
+}
+
+fn graph_id(id: &str, tenant_id: Option<&str>) -> String {
+    tenant_id
+        .map(|tenant_id| tenant_scoped_reconstruction_id(tenant_id, id))
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn graph_edge_id(from: &str, edge_type: &str, to: &str, tenant_id: Option<&str>) -> String {
+    graph_id(&edge_id(from, edge_type, to), tenant_id)
+}
+
+fn tenant_id_prefix(tenant_id: &str) -> String {
+    format!("tenant:{}:", stable_hash(json!(tenant_id)))
 }
 
 fn edge_id(from: &str, edge_type: &str, to: &str) -> String {
@@ -992,6 +1149,8 @@ mod tests {
 
         write_reconstruction_analysis_in_store_for_tenant(&mut store, &analysis, "Travis-Gilbert")
             .unwrap();
+        write_reconstruction_analysis_in_store_for_tenant(&mut store, &analysis, "Other-Tenant")
+            .unwrap();
 
         assert_eq!(
             store
@@ -1002,12 +1161,23 @@ mod tests {
                 .len(),
             1
         );
-        assert!(store
-            .query_nodes(
-                NodeQuery::label(RECONSTRUCTION_INSTRUCTION_LABEL)
-                    .with_property("tenant_id", json!("Other-Tenant")),
-            )
-            .is_empty());
+        assert_eq!(
+            store
+                .query_nodes(
+                    NodeQuery::label(RECONSTRUCTION_INSTRUCTION_LABEL)
+                        .with_property("tenant_id", json!("Other-Tenant")),
+                )
+                .len(),
+            1
+        );
+        let all_instructions =
+            store.query_nodes(NodeQuery::label(RECONSTRUCTION_INSTRUCTION_LABEL));
+        assert_eq!(all_instructions.len(), 2);
+        assert_ne!(all_instructions[0].id, all_instructions[1].id);
+        assert!(all_instructions
+            .iter()
+            .all(|node| node.properties["original_id"].as_str()
+                == Some(analysis.plan.instructions[0].id.as_str())));
     }
 
     #[test]
@@ -1052,7 +1222,55 @@ mod tests {
         let program = lift_to_thir(&load, &disasm);
         let analysis = compile_reconstruction_analysis(&load, &program);
         let instruction = &analysis.plan.instructions[0];
-        let receipt = validate_instruction(instruction, json!(instruction.evidence));
+        let receipt = validate_instruction(
+            instruction,
+            json!({
+                "EvidencePresence": instruction.evidence,
+                "BranchCoverage": 0
+            }),
+        );
         assert!(receipt.passed);
+    }
+
+    #[test]
+    fn validation_receipt_requires_every_validator_to_pass() {
+        let instruction = ReconstructionInstruction {
+            id: "recon:instr:test".to_string(),
+            source_artifact: "sha256:test".to_string(),
+            target: ReconstructionTarget {
+                kind: "component".to_string(),
+                id: "component:test".to_string(),
+                language: "rust".to_string(),
+                runtime: "axum".to_string(),
+            },
+            action: ReconstructionAction::ImplementComponent,
+            requirements: Vec::new(),
+            validators: vec![
+                ValidatorSpec::EvidencePresence {
+                    evidence: vec!["func:0x1000".to_string()],
+                },
+                ValidatorSpec::BranchCoverage { branch_count: 2 },
+            ],
+            evidence: vec!["func:0x1000".to_string()],
+            confidence: 0.8,
+            uncertainty: Vec::new(),
+        };
+
+        let missing_branch =
+            validate_instruction(&instruction, json!({"EvidencePresence": ["func:0x1000"]}));
+        assert!(!missing_branch.passed);
+        assert_eq!(
+            missing_branch.validator_type,
+            "EvidencePresence+BranchCoverage"
+        );
+
+        let complete = validate_instruction(
+            &instruction,
+            json!({
+                "EvidencePresence": ["func:0x1000", "func:0x2000"],
+                "BranchCoverage": 2
+            }),
+        );
+        assert!(complete.passed);
     }
 }

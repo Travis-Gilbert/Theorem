@@ -323,7 +323,8 @@ fn lift_statement(instruction: &InstructionFact) -> ThirStmt {
             condition: (instruction.flow_control == "ConditionalBranch")
                 .then(|| instruction.mnemonic.clone()),
             target: instruction.branch_target,
-            fallthrough: Some(instruction.address + instruction.size as u64),
+            fallthrough: (instruction.flow_control == "ConditionalBranch")
+                .then_some(instruction.address + instruction.size as u64),
             text: instruction.text.clone(),
         }
     } else if instruction.effects.iter().any(|effect| effect == "returns") {
@@ -514,5 +515,22 @@ mod tests {
 
         assert!(successors.contains(&0x1002));
         assert!(successors.contains(&0x1003));
+    }
+
+    #[test]
+    fn unconditional_branch_statement_has_no_fallthrough() {
+        let load = fixture_load_report_with_bytes(vec![0xeb, 0x01, 0x90, 0xc3]);
+        let disasm = decode_instructions(&load).unwrap();
+        let program = lift_to_thir(&load, &disasm);
+        let block = &program.functions[0].blocks[0];
+
+        assert_eq!(block.successors, vec![0x1003]);
+        assert!(matches!(
+            block.statements.last().unwrap(),
+            ThirStmt::Branch {
+                fallthrough: None,
+                ..
+            }
+        ));
     }
 }
