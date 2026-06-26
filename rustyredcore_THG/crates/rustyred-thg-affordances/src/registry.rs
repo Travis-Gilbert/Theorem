@@ -13,8 +13,8 @@ use theorem_harness_core::default_affordance_registry;
 use crate::types::{
     connector_node_id, edge_with_affordance_provenance, tenant_node_id, thg_error_from_store,
     Affordance, AffordanceGraphStore, AffordanceUpsertResult, ConnectorManifest,
-    ConnectorRegisterResult, ToolManifest, CONNECTOR_LABEL, DEFAULT_HALF_LIFE_DAYS, OFFERS,
-    TENANT_LABEL, THG_AFFORDANCE_SOURCE,
+    ConnectorRegisterResult, ToolManifest, CONNECTOR_FAMILY, CONNECTOR_LABEL,
+    DEFAULT_HALF_LIFE_DAYS, OFFERS, TENANT_LABEL, THG_AFFORDANCE_SOURCE,
 };
 
 pub const THEOREM_GRPC_SERVER_ID: &str = "theorem_grpc";
@@ -495,10 +495,11 @@ impl TheseusAppAffordanceSpec {
 }
 
 fn family_from_tool(tool: &ToolManifest) -> String {
-    if tool.tags.iter().any(|tag| tag == "content_extraction") {
-        "content_extraction".to_string()
+    let family = tool.family.trim();
+    if family.is_empty() {
+        CONNECTOR_FAMILY.to_string()
     } else {
-        "connector".to_string()
+        family.to_string()
     }
 }
 

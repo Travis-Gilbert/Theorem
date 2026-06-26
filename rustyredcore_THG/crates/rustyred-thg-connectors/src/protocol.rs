@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use rustyred_thg_affordances::{ConnectorManifest, ToolManifest};
+use rustyred_thg_affordances::{ConnectorManifest, ToolManifest, CONNECTOR_FAMILY};
 
 use crate::{ConnectorError, ConnectorResult};
 
@@ -139,6 +139,7 @@ pub fn tool_manifest_from_descriptor(descriptor: &ToolDescriptor) -> ToolManifes
         name: descriptor.name.clone(),
         label: descriptor.name.clone(),
         description: descriptor.description.clone(),
+        family: CONNECTOR_FAMILY.to_string(),
         input_schema: descriptor.input_schema.clone(),
         permissions: Vec::new(),
         cost: json!({}),
@@ -173,8 +174,7 @@ pub fn writeback_policy_from_hints(
 }
 
 /// Assemble a `ConnectorManifest` (the contract boundary into the affordance
-/// registry) from a server's tool catalog. No change to the affordances crate:
-/// this produces exactly what `register_connector` already consumes.
+/// registry) from a server's tool catalog.
 pub fn connector_manifest(
     tenant_id: &str,
     server_id: &str,
@@ -220,31 +220,23 @@ fn enrich_content_core_tool(tool: &mut ToolManifest) {
     match tool.name.as_str() {
         "extract_content" => {
             tool.label = "Extract content".to_string();
+            tool.family = CONTENT_EXTRACTION_FAMILY.to_string();
             tool.writeback_policy = "read-only".to_string();
             append_description(
                 tool,
                 "Harness use: call this when a URL or non-text file appears and its content is needed. Do not use it for plain text or Markdown the head can already read. Images and screenshots stay on the vision spine.",
             );
-            add_tags(
-                tool,
-                &[
-                    "content_extraction",
-                    "extract",
-                    "url",
-                    "document",
-                    "media",
-                    "read",
-                ],
-            );
+            add_tags(tool, &["extract", "url", "document", "media", "read"]);
         }
         "summarize_content" => {
             tool.label = "Summarize extracted content".to_string();
+            tool.family = CONTENT_EXTRACTION_FAMILY.to_string();
             tool.writeback_policy = "read-only".to_string();
             append_description(
                 tool,
                 "Harness use: call this only when content-core's configured summarizer is explicitly desired. Prefer the harness model path for ordinary reasoning summaries.",
             );
-            add_tags(tool, &["content_extraction", "summarize", "read"]);
+            add_tags(tool, &["summarize", "read"]);
         }
         _ => {}
     }

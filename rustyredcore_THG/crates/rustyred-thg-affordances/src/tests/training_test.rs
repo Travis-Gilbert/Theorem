@@ -10,7 +10,7 @@ use crate::types::affordance_node_id;
 use crate::{
     export_affordance_training_view, pairformer_validation_gate, record_invocation,
     register_connector, register_pairformer_artifact, ConnectorManifest, InvocationRecordRequest,
-    PairformerArtifactInput, ToolManifest, EVALUATED_BY, TRAINED_ON,
+    PairformerArtifactInput, ToolManifest, CONNECTOR_FAMILY, EVALUATED_BY, TRAINED_ON,
 };
 
 fn manifest() -> ConnectorManifest {
@@ -23,6 +23,7 @@ fn manifest() -> ConnectorManifest {
                 name: "create_issue".to_string(),
                 label: String::new(),
                 description: "open an issue".to_string(),
+                family: CONNECTOR_FAMILY.to_string(),
                 input_schema: json!({}),
                 permissions: vec![],
                 cost: json!({}),
@@ -34,6 +35,7 @@ fn manifest() -> ConnectorManifest {
                 name: "search_code".to_string(),
                 label: String::new(),
                 description: "search code".to_string(),
+                family: CONNECTOR_FAMILY.to_string(),
                 input_schema: json!({}),
                 permissions: vec![],
                 cost: json!({}),

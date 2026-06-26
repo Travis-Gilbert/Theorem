@@ -8855,7 +8855,7 @@ mod tests {
         state::AppState,
     };
     use rustyred_thg_affordances::registry::register_connector_with_target;
-    use rustyred_thg_affordances::{ConnectorManifest, ToolManifest};
+    use rustyred_thg_affordances::{ConnectorManifest, ToolManifest, CONNECTOR_FAMILY};
     use rustyred_thg_connectors::{ConnectionTarget, ConnectorAuth};
     use rustyred_thg_core::{EdgeRecord, NodeRecord, RedCoreDurability};
     use rustyred_thg_mcp::{handle_mcp_request_with_context, McpRequestContext};
@@ -10131,6 +10131,7 @@ mod tests {
                         name: "get_issue".to_string(),
                         label: "Get issue".to_string(),
                         description: "Read one issue.".to_string(),
+                        family: CONNECTOR_FAMILY.to_string(),
                         input_schema: json!({
                             "type": "object",
                             "properties": {

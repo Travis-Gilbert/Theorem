@@ -510,7 +510,9 @@ fn collect_string_refs(value: &Value, refs: &mut std::collections::BTreeSet<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyred_thg_affordances::{register_connector, ConnectorManifest, ToolManifest};
+    use rustyred_thg_affordances::{
+        register_connector, ConnectorManifest, ToolManifest, CONNECTOR_FAMILY,
+    };
     use rustyred_thg_core::InMemoryGraphStore;
 
     fn skill_spec() -> Value {
@@ -547,6 +549,7 @@ mod tests {
                 name: "search_code".to_string(),
                 label: String::new(),
                 description: "search code".to_string(),
+                family: CONNECTOR_FAMILY.to_string(),
                 input_schema: json!({}),
                 permissions: vec![],
                 cost: json!({}),

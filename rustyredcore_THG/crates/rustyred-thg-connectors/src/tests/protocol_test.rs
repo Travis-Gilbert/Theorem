@@ -1,5 +1,7 @@
 use serde_json::json;
 
+use rustyred_thg_affordances::CONNECTOR_FAMILY;
+
 use crate::protocol::{
     connector_manifest, parse_initialize, parse_tool_call_result, parse_tools_list,
     tool_manifest_from_descriptor, ToolDescriptor, CONTENT_EXTRACTION_FAMILY,
@@ -48,6 +50,7 @@ fn descriptor_maps_to_tool_manifest_with_no_embedding() {
     assert_eq!(manifest.name, "search");
     assert_eq!(manifest.label, "search");
     assert_eq!(manifest.description, "Search");
+    assert_eq!(manifest.family, CONNECTOR_FAMILY);
     assert_eq!(manifest.input_schema, json!({ "type": "object" }));
     assert!(manifest.description_embedding.is_none());
     assert!(manifest.permissions.is_empty());
@@ -130,12 +133,17 @@ fn content_core_manifest_surfaces_content_extraction_family_and_guidance() {
         .tools
         .iter()
         .all(|tool| tool.writeback_policy == "read-only"));
+    assert!(manifest
+        .tools
+        .iter()
+        .all(|tool| tool.family == CONTENT_EXTRACTION_FAMILY));
     let extract = manifest
         .tools
         .iter()
         .find(|tool| tool.name == "extract_content")
         .expect("extract tool");
-    assert!(extract
+    assert_eq!(extract.family, CONTENT_EXTRACTION_FAMILY);
+    assert!(!extract
         .tags
         .contains(&CONTENT_EXTRACTION_FAMILY.to_string()));
     assert!(extract.tags.contains(&"document".to_string()));
