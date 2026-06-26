@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::context_view::{FreshnessStatus, HydrationHandle};
@@ -81,6 +83,22 @@ pub struct MapArtifact {
     pub sections: Vec<MapSection>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MapArtifactDiff {
+    pub from_map_id: String,
+    pub to_map_id: String,
+    pub from_version: u64,
+    pub to_version: u64,
+    #[serde(default)]
+    pub added_section_ids: Vec<String>,
+    #[serde(default)]
+    pub removed_section_ids: Vec<String>,
+    #[serde(default)]
+    pub changed_section_ids: Vec<String>,
+    #[serde(default)]
+    pub stale_section_ids: Vec<String>,
+}
+
 impl MapArtifact {
     pub fn new(
         id: impl Into<String>,
@@ -123,4 +141,93 @@ impl MapArtifact {
             self.reuse_score = total_score as f64;
         }
     }
+
+    pub fn diff_against(&self, next: &MapArtifact) -> MapArtifactDiff {
+        let current = sections_by_id(&self.sections);
+        let regenerated = sections_by_id(&next.sections);
+        let current_ids = current.keys().cloned().collect::<BTreeSet<_>>();
+        let regenerated_ids = regenerated.keys().cloned().collect::<BTreeSet<_>>();
+
+        let mut added_section_ids = regenerated_ids
+            .difference(&current_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_section_ids = current_ids
+            .difference(&regenerated_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut changed_section_ids = current_ids
+            .intersection(&regenerated_ids)
+            .filter_map(|id| {
+                let left = current.get(id)?;
+                let right = regenerated.get(id)?;
+                section_content_changed(left, right).then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut stale_section_ids = self
+            .sections
+            .iter()
+            .filter(|section| section.freshness_status != FreshnessStatus::Fresh)
+            .map(|section| section.id.clone())
+            .collect::<Vec<_>>();
+
+        added_section_ids.sort();
+        removed_section_ids.sort();
+        changed_section_ids.sort();
+        stale_section_ids.sort();
+
+        MapArtifactDiff {
+            from_map_id: self.id.clone(),
+            to_map_id: next.id.clone(),
+            from_version: self.version,
+            to_version: next.version,
+            added_section_ids,
+            removed_section_ids,
+            changed_section_ids,
+            stale_section_ids,
+        }
+    }
+
+    pub fn mark_stale_if_graph_version_behind(&mut self, current_graph_version: u64) -> bool {
+        if self.graph_version >= current_graph_version {
+            return false;
+        }
+        self.freshness_status = FreshnessStatus::NeedsRebuild;
+        for section in &mut self.sections {
+            if section
+                .hydration_handles
+                .iter()
+                .any(|handle| handle.graph_version < current_graph_version)
+            {
+                section.freshness_status = FreshnessStatus::Stale;
+            }
+        }
+        true
+    }
+
+    pub fn refresh_from(&mut self, mut regenerated: MapArtifact) -> MapArtifactDiff {
+        regenerated.id = self.id.clone();
+        regenerated.version = self.version.saturating_add(1);
+        regenerated.freshness_status = FreshnessStatus::Fresh;
+        for section in &mut regenerated.sections {
+            section.freshness_status = FreshnessStatus::Fresh;
+        }
+        let diff = self.diff_against(&regenerated);
+        *self = regenerated;
+        diff
+    }
+}
+
+fn sections_by_id(sections: &[MapSection]) -> BTreeMap<String, &MapSection> {
+    sections
+        .iter()
+        .map(|section| (section.id.clone(), section))
+        .collect()
+}
+
+fn section_content_changed(left: &MapSection, right: &MapSection) -> bool {
+    left.title != right.title
+        || left.summary != right.summary
+        || left.hydration_handles != right.hydration_handles
+        || left.source_atom_ids != right.source_atom_ids
 }

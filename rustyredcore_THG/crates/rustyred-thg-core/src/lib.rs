@@ -5,6 +5,7 @@
 //! executor.
 
 pub mod access_method;
+pub mod adaptive_index;
 pub mod cold_fragments;
 pub mod cold_index;
 pub mod commands;
@@ -59,6 +60,11 @@ pub use access_method::{
     ModalityResolver, NoModalityResolver, OrderedAccessMethod, Predicate, PredicateMode,
     RankOutcome, RankedRow, RankingAccessMethod, RankingRegistry, RegionRef, RelationId, RowChange,
     RowChangeKind, RowId, RowIdStream, ScalarBound, ScalarValue, TimeSeriesAccessMethod,
+};
+pub use adaptive_index::{
+    reconstruct_temporal_context, scalar_i64, ColdFragmentSkipMetadata, ColdSkipIndexDefinition,
+    GraphStructuralIndexDefinition, GraphStructuralIndexKind, GraphStructuralIndexReceipt,
+    SpatialIndexBackend, SpatialIndexDefinition, TemporalContextSlice, TemporalIndexDefinition,
 };
 pub use cold_fragments::{
     ColdFragment, ColdFragmentStore, CompressionFilter, FragmentColumn, FragmentRangeResult,
@@ -142,7 +148,10 @@ pub use identity_index::{
     IdentityIndex, IdentityIndexDefinition, IdentityIndexKey, IdentityInsertOutcome,
     IdentityProblemRecord, IdentityTarget,
 };
-pub use index_advisor::{IndexAdvisor, IndexAdvisorConfig, IndexPainSignal};
+pub use index_advisor::{
+    IndexAdvisor, IndexAdvisorConfig, IndexPainKind, IndexPainSignal, ReceiptCluster,
+    ShadowValidationReport,
+};
 pub use index_manifest::{
     IndexBackend, IndexBuildStatus, IndexCreatedBy, IndexKind, IndexManifest, IndexScope,
 };
@@ -158,7 +167,7 @@ pub use labeled_training_run::{
     LabeledTrainingRun, TrainingExportStatus, TrainingLabel, TrainingLabelFamily, TrainingOutcome,
     TrainingTaskType, ValidatorResult,
 };
-pub use map_artifact::{MapArtifact, MapArtifactType, MapSection};
+pub use map_artifact::{MapArtifact, MapArtifactDiff, MapArtifactType, MapSection};
 pub use object_store::{ColdObjectStore, DiskObjectStore, InMemoryObjectStore};
 pub use ordered::{
     EvictionFrontier, OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember,

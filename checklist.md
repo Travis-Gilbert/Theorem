@@ -30,7 +30,7 @@ Scope: solo Codex implementation pass for `rustyredcore_THG`, starting with Phas
 - [x] Enforce ambiguous identity collisions as explicit problem records.
 - [x] Add scoped ordered index manifest metadata over existing `OrderedIndex`.
 - [x] Prove frontier and training queues pop without scanning.
-- [ ] Prove TTL queue pop behavior through the Phase 1 scoped queue surface.
+- [x] Prove TTL queue pop behavior through the Phase 1 scoped queue surface.
 - [x] Add acceptance tests for URL re-ingest, run replay, symbol identity, and collision handling.
 
 ## Phase 2: Composite, Partial, Covering
@@ -62,19 +62,19 @@ Scope: solo Codex implementation pass for `rustyredcore_THG`, starting with Phas
 
 ## Phase 6: Structural, Temporal, Spatial, Cold
 
-- [ ] Add graph structural manifest support for adjacency, PPR, motifs, support/attack, bridge indexes.
-- [ ] Add temporal/bitemporal manifest support and past-context reconstruction tests.
-- [ ] Add H3-first spatial manifests; keep S2 optional.
-- [ ] Add cold fragment skip metadata and no-false-negative tests.
+- [x] Add graph structural manifest support for adjacency, PPR, motifs, support/attack, bridge indexes.
+- [x] Add temporal/bitemporal manifest support and past-context reconstruction tests.
+- [x] Add H3-first spatial manifests; keep S2 optional.
+- [x] Add cold fragment skip metadata and no-false-negative tests.
 
 ## Phase 7: Index Advisor
 
 - [x] First slice: add `index_advisor.rs` with repeated full-scan pain detection and proposal construction.
-- [ ] Cluster query receipts by signature/task/scope/access path.
-- [ ] Detect pain: scans, latency, candidate waste, token cost, poor recall, cold reads.
-- [ ] Generate proposals with cost/risk estimates and shadow validation plans.
-- [ ] Promote only after replay validation and EXPLAIN evidence.
-- [ ] Retire unused/harmful indexes.
+- [x] Cluster query receipts by signature/task/scope/access path.
+- [x] Detect pain: scans, latency, candidate waste, token cost, poor recall, cold reads.
+- [x] Generate proposals with cost/risk estimates and shadow validation plans.
+- [x] Promote only after replay validation and EXPLAIN evidence.
+- [x] Retire unused/harmful indexes.
 
 ## Phase 8: Context Views, Maps, Training Runs
 
@@ -82,22 +82,22 @@ Scope: solo Codex implementation pass for `rustyredcore_THG`, starting with Phas
 - [x] Add `map_artifact.rs` with stable section IDs, hydration handles, freshness, usage/outcome labels.
 - [x] Add `labeled_training_run.rs` with positive and negative labels for context/tool/adapter/validator/memory/map/artifact outcomes.
 - [x] Add `training_export.rs` JSONL export helpers with graph version, redaction status, and atom/map identity.
-- [ ] Add map diffs and refresh/regeneration behavior.
+- [x] Add map diffs and refresh/regeneration behavior.
 
 ## Phase 9: Inspection Surface
 
-- [ ] Add product-server routes for index manifests, receipts, advisor proposals, context views, maps, training runs, and export validation.
+- [x] Add product-server routes for index manifests, receipts, advisor proposals, context views, maps, training runs, and export validation.
 - [ ] Add dashboard/explorer surfaces after core APIs are stable.
 
 ## Verification Matrix
 
-- [ ] Index lookup equals scan baseline.
+- [x] Index lookup equals scan baseline.
 - [x] TurboVec recall measured against exact.
 - [x] Multi-vector rerank preserves source identity.
-- [ ] Graph version/predicate/TTL/tombstone invalidation works.
+- [x] Graph version/predicate/TTL/tombstone invalidation works.
 - [x] Repeated full scan produces an advisor proposal.
-- [ ] Bad proposal is rejected.
+- [x] Bad proposal is rejected.
 - [x] Included/cited atoms become positive labels.
 - [x] Dismissed/wasted atoms become negative labels.
 - [x] Scope and policy filters cannot be bypassed.
-- [ ] Redaction blocks unsafe exports.
+- [x] Redaction blocks unsafe exports.

@@ -1,6 +1,7 @@
 use rustyred_thg_core::{
     AccessPathTrace, IndexAdvisor, IndexAdvisorConfig, IndexBackend, IndexCreatedBy, IndexKind,
-    IndexManifest, IndexScope, PlanTrace, QueryKind, QueryReceipt, ReceiptScope,
+    IndexManifest, IndexPainKind, IndexProposalStatus, IndexScope, PlanTrace, QueryKind,
+    QueryReceipt, ReceiptScope, ShadowValidationReport,
 };
 
 fn scope() -> ReceiptScope {
@@ -107,4 +108,137 @@ fn advisor_detects_repeated_full_scan_pain_and_builds_proposal() {
     assert!(proposal
         .shadow_validation_plan
         .contains("replay supporting receipts"));
+}
+
+#[test]
+fn advisor_clusters_receipts_and_detects_candidate_token_recall_and_cold_pain() {
+    let trace = trace_with_method("full_scan", 0);
+    let mut first = QueryReceipt::from_plan_trace(
+        "qr:pain:1",
+        QueryKind::ContextCompile,
+        scope(),
+        &trace,
+        2,
+        123,
+    );
+    first
+        .latency_by_stage_ms
+        .insert("vector".to_string(), 750.0);
+    first
+        .candidate_counts_by_stage
+        .insert("candidate_set".to_string(), 50);
+    first
+        .candidate_counts_by_stage
+        .insert("cold_reads".to_string(), 2);
+    first
+        .candidate_counts_by_stage
+        .insert("recall_missing".to_string(), 1);
+    first.token_cost = Some(1_500);
+
+    let mut second = first.clone();
+    second.id = "qr:pain:2".to_string();
+
+    let advisor = IndexAdvisor::new(IndexAdvisorConfig {
+        min_repeated_receipts: 1,
+        min_total_full_scans: 1,
+        min_total_latency_ms: 500.0,
+        min_candidate_waste_ratio: 4.0,
+        min_token_cost: 1_000,
+        min_recall_missing: 1,
+        min_cold_reads: 1,
+    });
+    let clusters = advisor.cluster_receipts([&first, &second]);
+    assert_eq!(clusters.len(), 1);
+    assert_eq!(clusters[0].receipt_ids, vec!["qr:pain:1", "qr:pain:2"]);
+
+    let signals = advisor.detect_pain([&first, &second]);
+    let kinds = signals
+        .iter()
+        .map(|signal| signal.pain_kind.clone())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&IndexPainKind::Latency));
+    assert!(kinds.contains(&IndexPainKind::CandidateWaste));
+    assert!(kinds.contains(&IndexPainKind::TokenCost));
+    assert!(kinds.contains(&IndexPainKind::PoorRecall));
+    assert!(kinds.contains(&IndexPainKind::ColdRead));
+}
+
+#[test]
+fn advisor_promotes_only_after_shadow_validation_and_rejects_bad_proposals() {
+    let advisor = IndexAdvisor::new(IndexAdvisorConfig::default());
+    let draft = IndexManifest::new(
+        "idx:context-shadow",
+        "Context shadow",
+        IndexKind::Vector,
+        IndexBackend::AdvisorShadow,
+        IndexScope::Project,
+        "ContextAtom",
+        IndexCreatedBy::Advisor,
+    );
+    let pain = rustyred_thg_core::IndexPainSignal {
+        pain_kind: IndexPainKind::Latency,
+        query_signature: "sig:context".to_string(),
+        supporting_receipts: vec!["qr:1".to_string()],
+        total_full_scans: 0,
+        total_results: 2,
+        total_candidate_count: 50,
+        total_latency_ms: 900.0,
+        total_token_cost: 0,
+        total_cold_reads: 0,
+        recall_missing_count: 0,
+        reason: "slow context compile".to_string(),
+    };
+    let mut bad = advisor.proposal_for_pain("proposal:bad", draft.clone(), &pain);
+    let rejected = advisor.apply_shadow_validation(
+        &mut bad,
+        &ShadowValidationReport {
+            replayed_receipts: vec!["qr:1".to_string()],
+            latency_saved_ms: 0.0,
+            scan_reduction: 0.0,
+            recall_drop: 1.0,
+            write_amplification: 3.0,
+            scope_policy_ttl_tombstone_filters_enforced: false,
+            explain_manifest_id: None,
+        },
+    );
+    assert!(!rejected);
+    assert_eq!(bad.status, IndexProposalStatus::Rejected);
+
+    let mut good = advisor.proposal_for_pain("proposal:good", draft, &pain);
+    let promoted = advisor.apply_shadow_validation(
+        &mut good,
+        &ShadowValidationReport {
+            replayed_receipts: vec!["qr:1".to_string()],
+            latency_saved_ms: 10.0,
+            scan_reduction: 2.0,
+            recall_drop: 0.0,
+            write_amplification: 1.0,
+            scope_policy_ttl_tombstone_filters_enforced: true,
+            explain_manifest_id: Some("idx:context-shadow".to_string()),
+        },
+    );
+    assert!(promoted);
+    assert_eq!(good.status, IndexProposalStatus::Promoted);
+}
+
+#[test]
+fn advisor_retires_unused_or_harmful_indexes() {
+    let advisor = IndexAdvisor::new(IndexAdvisorConfig::default());
+    let mut manifest = IndexManifest::new(
+        "idx:harmful",
+        "Harmful index",
+        IndexKind::Composite,
+        IndexBackend::RustyredCore,
+        IndexScope::Project,
+        "ContextArtifact",
+        IndexCreatedBy::Advisor,
+    );
+    manifest.record_miss(20.0);
+    manifest.record_miss(22.0);
+
+    assert!(advisor.retire_unused_or_harmful(&mut manifest, 2));
+    assert_eq!(
+        manifest.retirement_reason.as_deref(),
+        Some("advisor_retired_unused_or_harmful_index")
+    );
 }

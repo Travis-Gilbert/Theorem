@@ -73,6 +73,84 @@ fn composite_index_serves_scope_first_exact_and_left_prefix_queries() {
 }
 
 #[test]
+fn composite_index_lookup_matches_manual_scan_baseline() {
+    let definition = CompositeIndexDefinition::new(
+        "composite:artifact-list",
+        "ContextArtifact",
+        ["tenant", "project"],
+        ["tenant", "project", "artifact_type", "updated_at"],
+    );
+    let mut index = CompositeIndex::new();
+    index.register_definition(definition).unwrap();
+
+    let scope = tenant_scope();
+    let nodes = vec![
+        node(
+            "artifact:1",
+            "ContextArtifact",
+            7,
+            json!({
+                "artifact_type": "postmortem",
+                "updated_at": "2026-06-26T12:00:00Z"
+            }),
+        ),
+        node(
+            "artifact:2",
+            "ContextArtifact",
+            8,
+            json!({
+                "artifact_type": "runbook",
+                "updated_at": "2026-06-26T13:00:00Z"
+            }),
+        ),
+        node(
+            "artifact:3",
+            "ContextArtifact",
+            9,
+            json!({
+                "artifact_type": "postmortem",
+                "updated_at": "2026-06-26T14:00:00Z"
+            }),
+        ),
+    ];
+    for node in &nodes {
+        index
+            .upsert_node("composite:artifact-list", node, &scope)
+            .unwrap();
+    }
+
+    let prefix = CompositeIndexKey::from_properties(
+        "composite:artifact-list",
+        &[
+            "tenant".to_string(),
+            "project".to_string(),
+            "artifact_type".to_string(),
+        ],
+        &json!({
+            "tenant": "Travis-Gilbert",
+            "project": "Theorem",
+            "artifact_type": "postmortem"
+        }),
+    )
+    .unwrap();
+    let mut indexed = index
+        .query_left_prefix(&prefix)
+        .into_iter()
+        .map(|entry| entry.node_id)
+        .collect::<Vec<_>>();
+    indexed.sort();
+
+    let mut scanned = nodes
+        .iter()
+        .filter(|node| node.properties["artifact_type"] == "postmortem")
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    scanned.sort();
+
+    assert_eq!(indexed, scanned);
+}
+
+#[test]
 fn composite_index_moves_updated_nodes_and_removes_tombstones() {
     let definition = CompositeIndexDefinition::new(
         "composite:artifact-list",

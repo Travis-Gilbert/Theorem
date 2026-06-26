@@ -528,6 +528,38 @@ pub fn build_router(state: AppState) -> Router {
             post(graph_neighbors),
         )
         .route("/v1/tenants/:tenant_id/graph/stats", get(graph_stats))
+        .route(
+            "/v1/tenants/:tenant_id/inspection",
+            get(inspection_overview),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/inspection/index-manifests",
+            get(inspection_index_manifests),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/inspection/query-receipts",
+            get(inspection_query_receipts),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/inspection/advisor-proposals",
+            get(inspection_advisor_proposals),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/inspection/context-views",
+            get(inspection_context_views),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/inspection/maps",
+            get(inspection_maps),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/inspection/training-runs",
+            get(inspection_training_runs),
+        )
+        .route(
+            "/v1/tenants/:tenant_id/inspection/export-validation",
+            get(inspection_export_validation),
+        )
         .route("/v1/tenants/:tenant_id/memory/docs", get(memory_docs_list))
         .route("/v1/tenants/:tenant_id/connectors", get(connectors_list))
         .route(
@@ -6190,6 +6222,217 @@ async fn graph_stats(
     }
 }
 
+async fn inspection_overview(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let labels = [
+        ("index_manifests", "IndexManifest"),
+        ("query_receipts", "QueryReceipt"),
+        ("advisor_proposals", "IndexProposal"),
+        ("context_views", "ContextView"),
+        ("maps", "MapArtifact"),
+        ("training_runs", "LabeledTrainingRun"),
+        ("training_exports", "TrainingExportRecord"),
+    ];
+    let store = match inspection_store(&state, &tenant_id, &headers) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let mut counts = Map::new();
+    for (key, label) in labels {
+        let nodes = match store.query_nodes(NodeQuery::label(label).with_limit(10_000)) {
+            Ok(nodes) => nodes,
+            Err(error) => return graph_store_error_response(error),
+        };
+        counts.insert(key.to_string(), json!(nodes.len()));
+    }
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "counts": counts,
+        "routes": {
+            "index_manifests": "inspection/index-manifests",
+            "query_receipts": "inspection/query-receipts",
+            "advisor_proposals": "inspection/advisor-proposals",
+            "context_views": "inspection/context-views",
+            "maps": "inspection/maps",
+            "training_runs": "inspection/training-runs",
+            "export_validation": "inspection/export-validation"
+        }
+    }))
+    .into_response()
+}
+
+async fn inspection_index_manifests(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    inspection_nodes_response(
+        state,
+        tenant_id,
+        headers,
+        "IndexManifest",
+        "index_manifests",
+    )
+}
+
+async fn inspection_query_receipts(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    inspection_nodes_response(state, tenant_id, headers, "QueryReceipt", "query_receipts")
+}
+
+async fn inspection_advisor_proposals(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    inspection_nodes_response(
+        state,
+        tenant_id,
+        headers,
+        "IndexProposal",
+        "advisor_proposals",
+    )
+}
+
+async fn inspection_context_views(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    inspection_nodes_response(state, tenant_id, headers, "ContextView", "context_views")
+}
+
+async fn inspection_maps(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    inspection_nodes_response(state, tenant_id, headers, "MapArtifact", "maps")
+}
+
+async fn inspection_training_runs(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    inspection_nodes_response(
+        state,
+        tenant_id,
+        headers,
+        "LabeledTrainingRun",
+        "training_runs",
+    )
+}
+
+async fn inspection_export_validation(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let store = match inspection_store(&state, &tenant_id, &headers) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let nodes = match inspection_nodes(&store, "TrainingExportRecord") {
+        Ok(nodes) => nodes,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut blocked_record_ids = Vec::new();
+    for node in &nodes {
+        let status = node
+            .properties
+            .get("redaction_status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+            .to_string();
+        *status_counts.entry(status.clone()).or_default() += 1;
+        if status == "blocked" {
+            blocked_record_ids.push(node.id.clone());
+        }
+    }
+    blocked_record_ids.sort();
+    Json(json!({
+        "ok": blocked_record_ids.is_empty(),
+        "tenant": tenant_id,
+        "count": nodes.len(),
+        "status_counts": status_counts,
+        "blocked_record_ids": blocked_record_ids,
+        "records": nodes.into_iter().map(inspection_node_payload).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+fn inspection_nodes_response(
+    state: AppState,
+    tenant_id: String,
+    headers: HeaderMap,
+    label: &'static str,
+    key: &'static str,
+) -> axum::response::Response {
+    let store = match inspection_store(&state, &tenant_id, &headers) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let nodes = match inspection_nodes(&store, label) {
+        Ok(nodes) => nodes,
+        Err(error) => return graph_store_error_response(error),
+    };
+    let items = nodes
+        .into_iter()
+        .map(inspection_node_payload)
+        .collect::<Vec<_>>();
+    Json(json!({
+        "ok": true,
+        "tenant": tenant_id,
+        "label": label,
+        "count": items.len(),
+        key: items,
+    }))
+    .into_response()
+}
+
+fn inspection_store(
+    state: &AppState,
+    tenant_id: &str,
+    headers: &HeaderMap,
+) -> Result<TenantGraphStore, axum::response::Response> {
+    if let Err(status) = require_scope(
+        headers,
+        &state.config.api_tokens,
+        "graph:read",
+        state.config.require_auth,
+    ) {
+        return Err(status.into_response());
+    }
+    state
+        .tenant_graph_store(tenant_id)
+        .map_err(store_unavailable_response)
+}
+
+fn inspection_nodes(store: &TenantGraphStore, label: &str) -> GraphStoreResult<Vec<NodeRecord>> {
+    let mut nodes = store.query_nodes(NodeQuery::label(label).with_limit(10_000))?;
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(nodes)
+}
+
+fn inspection_node_payload(node: NodeRecord) -> Value {
+    json!({
+        "node_id": node.id,
+        "labels": node.labels,
+        "version": node.version,
+        "tombstone": node.tombstone,
+        "properties": node.properties,
+    })
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct MemoryDocsQuery {
     #[serde(default)]
@@ -8823,7 +9066,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::body::{to_bytes, Body};
-    use axum::extract::{Query, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use axum::Json;
@@ -8837,6 +9080,7 @@ mod tests {
         execute_tenant_command, graph_algorithm_communities, graph_algorithm_components,
         graph_algorithm_pagerank, graph_algorithm_ppr, graph_bulk_edges, graph_bulk_nodes,
         graph_error_status, graph_fulltext_search, graph_vector_hybrid, graph_vector_search,
+        inspection_export_validation, inspection_index_manifests, inspection_overview,
         instant_kg_explain_edge, instant_kg_impact, instant_kg_ppr, instant_kg_search,
         is_adapter_command, is_cache_command, is_graph_command, live_search_budget,
         live_search_is_sparse, maybe_handle_browser_use_mcp, maybe_handle_composed_agent_mcp,
@@ -10400,6 +10644,76 @@ mod tests {
         assert_eq!(rebuild.status, "ok");
         assert_eq!(rebuild.payload["report"]["before"]["ok"], true);
         assert_eq!(rebuild.payload["report"]["after"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn inspection_routes_expose_index_and_training_export_surfaces() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("tenant-inspect").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "idx:manifest:1",
+                    ["IndexManifest"],
+                    json!({
+                        "id": "idx:manifest:1",
+                        "kind": "composite",
+                        "build_status": "active"
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "qr:1",
+                    ["QueryReceipt"],
+                    json!({ "query_signature": "sig:1", "outcome_label": "success" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "export:blocked",
+                    ["TrainingExportRecord"],
+                    json!({
+                        "export_kind": "memory_recall",
+                        "redaction_status": "blocked",
+                        "source_run_id": "run:1"
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let overview = inspection_overview(
+            State(state.clone()),
+            Path("tenant-inspect".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        let overview = response_payload_json(overview).await;
+        assert_eq!(overview["ok"], true);
+        assert_eq!(overview["counts"]["index_manifests"], 1);
+        assert_eq!(overview["counts"]["query_receipts"], 1);
+        assert_eq!(overview["counts"]["training_exports"], 1);
+
+        let manifests = inspection_index_manifests(
+            State(state.clone()),
+            Path("tenant-inspect".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        let manifests = response_payload_json(manifests).await;
+        assert_eq!(manifests["count"], 1);
+        assert_eq!(manifests["index_manifests"][0]["node_id"], "idx:manifest:1");
+
+        let export_validation = inspection_export_validation(
+            State(state),
+            Path("tenant-inspect".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        let export_validation = response_payload_json(export_validation).await;
+        assert_eq!(export_validation["ok"], false);
+        assert_eq!(export_validation["status_counts"]["blocked"], 1);
+        assert_eq!(export_validation["blocked_record_ids"][0], "export:blocked");
     }
 
     #[test]
