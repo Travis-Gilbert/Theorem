@@ -303,6 +303,23 @@
         ],
         "type": "object"
       },
+      "RegisterContentCoreConnectorBody": {
+        "properties": {
+          "label": {
+            "description": "Defaults to Content Core.",
+            "type": "string"
+          },
+          "tenant": {
+            "example": "Travis-Gilbert",
+            "type": "string"
+          },
+          "tenant_slug": {
+            "example": "Travis-Gilbert",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "RoomMessageEvent": {
         "additionalProperties": true,
         "description": "A coordination room message event (also the SSE payload).",
@@ -480,6 +497,75 @@
           }
         },
         "summary": "Connect to an MCP server and register its tools as affordances",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/connectors/register/content-core": {
+      "post": {
+        "description": "Uses the configured content-core stdio target (default `uvx content-core mcp`) and persists it as the `content-core` connector. The registered tools surface in the content_extraction affordance family.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterContentCoreConnectorBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "affordance_ids": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "server": {
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "protocol": {
+                          "type": "string"
+                        },
+                        "version": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "server_id": {
+                      "example": "content-core",
+                      "type": "string"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The content-core server info and registered affordance ids."
+          },
+          "400": {
+            "description": "Missing tenant."
+          },
+          "502": {
+            "description": "content-core MCP handshake failed."
+          }
+        },
+        "summary": "Register the content-core MCP server",
         "tags": [
           "connectors"
         ]

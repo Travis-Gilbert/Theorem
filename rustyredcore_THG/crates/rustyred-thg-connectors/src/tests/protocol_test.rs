@@ -1,8 +1,10 @@
 use serde_json::json;
 
+use rustyred_thg_affordances::CONNECTOR_FAMILY;
+
 use crate::protocol::{
     connector_manifest, parse_initialize, parse_tool_call_result, parse_tools_list,
-    tool_manifest_from_descriptor, ToolDescriptor,
+    tool_manifest_from_descriptor, ToolDescriptor, CONTENT_EXTRACTION_FAMILY,
 };
 
 #[test]
@@ -48,6 +50,7 @@ fn descriptor_maps_to_tool_manifest_with_no_embedding() {
     assert_eq!(manifest.name, "search");
     assert_eq!(manifest.label, "search");
     assert_eq!(manifest.description, "Search");
+    assert_eq!(manifest.family, CONNECTOR_FAMILY);
     assert_eq!(manifest.input_schema, json!({ "type": "object" }));
     assert!(manifest.description_embedding.is_none());
     assert!(manifest.permissions.is_empty());
@@ -106,6 +109,48 @@ fn connector_manifest_assembles_full_catalog() {
     assert_eq!(manifest.server_id, "websearch");
     assert_eq!(manifest.label, "Web Search");
     assert_eq!(manifest.tools.len(), 2);
+}
+
+#[test]
+fn content_core_manifest_surfaces_content_extraction_family_and_guidance() {
+    let descriptors = vec![
+        ToolDescriptor {
+            name: "extract_content".into(),
+            description: "Extract content from a URL or file.".into(),
+            input_schema: json!({ "type": "object" }),
+            ..Default::default()
+        },
+        ToolDescriptor {
+            name: "summarize_content".into(),
+            description: "Summarize content.".into(),
+            input_schema: json!({ "type": "object" }),
+            ..Default::default()
+        },
+    ];
+    let manifest = connector_manifest("acme", "content-core", "Content Core", &descriptors);
+    assert_eq!(manifest.tools.len(), 2);
+    assert!(manifest
+        .tools
+        .iter()
+        .all(|tool| tool.writeback_policy == "read-only"));
+    assert!(manifest
+        .tools
+        .iter()
+        .all(|tool| tool.family == CONTENT_EXTRACTION_FAMILY));
+    let extract = manifest
+        .tools
+        .iter()
+        .find(|tool| tool.name == "extract_content")
+        .expect("extract tool");
+    assert_eq!(extract.family, CONTENT_EXTRACTION_FAMILY);
+    assert!(!extract
+        .tags
+        .contains(&CONTENT_EXTRACTION_FAMILY.to_string()));
+    assert!(extract.tags.contains(&"document".to_string()));
+    assert!(extract.tags.contains(&"media".to_string()));
+    assert!(extract
+        .description
+        .contains("Images and screenshots stay on the vision spine"));
 }
 
 #[test]

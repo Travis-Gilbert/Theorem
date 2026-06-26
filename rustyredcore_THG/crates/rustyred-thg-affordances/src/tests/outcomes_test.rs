@@ -6,7 +6,8 @@ use theorem_harness_core::AffordanceReceipt;
 use crate::types::affordance_node_id;
 use crate::{
     record_invocation, register_connector, ConnectorManifest, InvocationRecordRequest,
-    ToolManifest, DEFAULT_BASE_FITNESS, PRODUCED_OUTCOME, SEQUENCED_WITH, SERVED_TASK,
+    ToolManifest, CONNECTOR_FAMILY, DEFAULT_BASE_FITNESS, PRODUCED_OUTCOME, SEQUENCED_WITH,
+    SERVED_TASK,
 };
 
 fn manifest() -> ConnectorManifest {
@@ -19,6 +20,7 @@ fn manifest() -> ConnectorManifest {
                 name: "create_issue".to_string(),
                 label: String::new(),
                 description: "open an issue".to_string(),
+                family: CONNECTOR_FAMILY.to_string(),
                 input_schema: json!({}),
                 permissions: vec![],
                 cost: json!({}),
@@ -30,6 +32,7 @@ fn manifest() -> ConnectorManifest {
                 name: "search_code".to_string(),
                 label: String::new(),
                 description: "search code".to_string(),
+                family: CONNECTOR_FAMILY.to_string(),
                 input_schema: json!({}),
                 permissions: vec![],
                 cost: json!({}),

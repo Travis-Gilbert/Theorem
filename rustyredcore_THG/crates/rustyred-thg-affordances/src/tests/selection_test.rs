@@ -6,7 +6,7 @@ use crate::types::CapabilityScope;
 use crate::{
     record_invocation, register_connector, register_theseus_app_affordances, select_affordances,
     select_affordances_by_embedding, ConnectorManifest, InvocationRecordRequest, SelectionRequest,
-    ToolManifest,
+    ToolManifest, CONNECTOR_FAMILY,
 };
 
 fn tool(name: &str, embedding: Option<Vec<f32>>) -> ToolManifest {
@@ -14,6 +14,7 @@ fn tool(name: &str, embedding: Option<Vec<f32>>) -> ToolManifest {
         name: name.to_string(),
         label: String::new(),
         description: format!("the {name} tool"),
+        family: CONNECTOR_FAMILY.to_string(),
         input_schema: json!({}),
         permissions: vec![],
         cost: json!({}),
