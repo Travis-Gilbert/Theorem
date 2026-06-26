@@ -498,6 +498,7 @@
   .cpw-brand-row,
   .cpw-nav-item,
   .cpw-tree-row,
+  .cpw-file-tree-leaf,
   .cpw-engine-status,
   .cpw-capability-chip,
   .cpw-toolbox-summary,
@@ -763,6 +764,88 @@
 
   .cpw-tree-row svg {
     color: var(--cp-gold);
+  }
+
+  .cpw-sidebar-file-tree {
+    display: grid;
+    gap: calc(var(--cp-space-1) / 2);
+  }
+
+  .cpw-files-tree-root {
+    width: 100%;
+    color: var(--cp-sidebar-text);
+    background: transparent;
+    border: 0;
+    border-radius: var(--cp-space-1);
+    text-align: left;
+    transition: background-color var(--cp-transition-base), color var(--cp-transition-base);
+  }
+
+  .cpw-files-tree-root:hover {
+    background: var(--cp-sidebar-surface-hover);
+  }
+
+  .cpw-files-tree-root > span {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .cpw-file-chevron {
+    flex: none;
+    color: var(--cp-sidebar-text-muted) !important;
+    transition: transform var(--cp-transition-base) ease;
+  }
+
+  .cpw-file-chevron[data-open="true"] {
+    transform: rotate(90deg);
+  }
+
+  .cpw-file-tree-count {
+    color: var(--cp-sidebar-text-faint);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .cpw-file-tree-children {
+    display: flex;
+    max-height: 0;
+    flex-direction: column;
+    opacity: 0;
+    overflow: hidden;
+    transition: max-height var(--cp-transition-base) ease, opacity var(--cp-transition-base) ease;
+  }
+
+  .cpw-sidebar-file-tree[data-open="true"] .cpw-file-tree-children {
+    max-height: 72px;
+    opacity: 1;
+  }
+
+  .cpw-file-tree-leaf {
+    min-height: var(--cp-space-8);
+    justify-content: flex-start;
+    margin-left: var(--cp-space-8);
+    padding: var(--cp-space-1) var(--cp-space-3);
+    color: var(--cp-sidebar-text-muted);
+    background: transparent;
+    border: 0;
+    border-left: 1px solid var(--cp-sidebar-border);
+    font-family: var(--cp-font-mono);
+    font-size: 12px;
+    text-align: left;
+  }
+
+  .cpw-file-tree-leaf:hover {
+    color: var(--cp-sidebar-text);
+  }
+
+  .cpw-file-tree-leaf span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .cpw-tree-action {

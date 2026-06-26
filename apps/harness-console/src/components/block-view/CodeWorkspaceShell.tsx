@@ -6,12 +6,14 @@ import {
   Boxes,
   Bell,
   ChevronLeft,
+  ChevronRight,
   Clock3,
   Code2,
   Command,
   Cpu,
   Database,
   Folder,
+  FolderPlus,
   GitBranch,
   Globe,
   Gauge,
@@ -193,7 +195,11 @@ function CommonPlacePreviewSidebar() {
 
         <NavSection label="Data" />
         {COMMONPLACE_DATA_VIEWS.map((item) => (
-          <NavItem key={item.id} item={item} icon={DATA_VIEW_ICONS[item.id] ?? Database} />
+          item.id === "files" ? (
+            <FilesTreeNavItem key={item.id} item={item} />
+          ) : (
+            <NavItem key={item.id} item={item} icon={DATA_VIEW_ICONS[item.id] ?? Database} />
+          )
         ))}
 
         <ToolboxPreview groups={COMMONPLACE_TOOLBOX} />
@@ -261,6 +267,36 @@ function NavItem({ item, icon: Icon, active }: { item: CommonplaceIaItem; icon: 
       {active ? <span className="cpw-nav-marker" /> : null}
       {item.count ? <span className="cpw-nav-count">{item.count}</span> : null}
     </button>
+  );
+}
+
+function FilesTreeNavItem({ item }: { item: CommonplaceIaItem }) {
+  const [open, setOpen] = React.useState(false);
+
+  return (
+    <div className="cpw-sidebar-file-tree" data-open={open ? "true" : "false"}>
+      <button
+        className="cpw-tree-row cpw-files-tree-root"
+        type="button"
+        title={item.description}
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ChevronRight size={15} className="cpw-file-chevron" data-open={open ? "true" : "false"} />
+        <Folder size={19} />
+        <span>{item.label}</span>
+        {item.count ? <small className="cpw-file-tree-count">{item.count}</small> : null}
+        <FolderPlus size={16} className="cpw-tree-action" aria-hidden />
+      </button>
+      <div className="cpw-file-tree-children" aria-hidden={!open}>
+        <button className="cpw-file-tree-leaf" type="button">
+          <span>Specs</span>
+        </button>
+        <button className="cpw-file-tree-leaf" type="button">
+          <span>Uploads</span>
+        </button>
+      </div>
+    </div>
   );
 }
 
