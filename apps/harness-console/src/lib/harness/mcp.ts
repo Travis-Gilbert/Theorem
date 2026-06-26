@@ -14,7 +14,7 @@
  */
 import { type HarnessClient, HARNESS_URL, HARNESS_MCP_PATH, installSnippet } from "./client";
 import { mockClient } from "./mock";
-import type { ClientKind } from "./types";
+import type { ChatMessage, ClientKind, TraceEntry } from "./types";
 
 interface JsonRpcResult {
   result?: unknown;
@@ -60,19 +60,30 @@ export const liveClient: HarnessClient = {
   ...mockClient,
 
   async runAgent(prompt, scope) {
-    const result = await callTool("composed_agent_run", {
-      bindingId: "agent:theorem",
-      task: prompt,
-      scope,
+    const response = await fetch("/api/theorem/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenant: "Travis-Gilbert",
+        binding_id: "agent:theorem",
+        task: prompt,
+        scope: scope ?? [],
+      }),
     });
-    const text = typeof result === "string" ? result : JSON.stringify(result);
+    const payload = (await response.json().catch(() => ({}))) as unknown;
+    if (!response.ok) {
+      throw new Error(agentPayloadText(payload) || `Theorem agent API returned ${response.status}.`);
+    }
+    const text = agentPayloadText(payload) || "Theorem API agent returned an empty response.";
+    const trace = agentPayloadTrace(payload);
     return {
       id: `msg_${Date.now()}`,
       role: "assistant",
       content: text,
       at: new Date().toISOString(),
-      verdict: "pending",
-    };
+      verdict: agentPayloadVerdict(payload),
+      trace: trace.length ? trace : undefined,
+    } satisfies ChatMessage;
   },
 
   async saveAtom(atom) {
@@ -116,3 +127,104 @@ export const liveClient: HarnessClient = {
     return installSnippet(client, prefix);
   },
 };
+
+function agentPayloadText(payload: unknown): string {
+  if (typeof payload === "string") return payload;
+  const result = unwrapAgentResult(payload);
+  if (!isRecord(result)) return "";
+  if ("error" in result) {
+    return [result.error, result.message].filter((part) => typeof part === "string").join(": ");
+  }
+
+  const direct = stringProp(result, "message", "content", "text", "answer", "output", "summary");
+  if (direct) return direct;
+
+  const receipts = Array.isArray(result.invocation_receipts) ? result.invocation_receipts : [];
+  for (const receipt of [...receipts].reverse()) {
+    if (!isRecord(receipt)) continue;
+    const payloadText = agentPayloadText(receipt.payload);
+    if (payloadText) return payloadText;
+    const summary = stringProp(receipt, "output_summary", "summary");
+    if (summary) return summary;
+  }
+
+  const publishedClaims = Array.isArray(result.published_claims)
+    ? result.published_claims
+        .map((claim) => (isRecord(claim) ? stringProp(claim, "text") : ""))
+        .filter(Boolean)
+    : [];
+  if (publishedClaims.length) return publishedClaims.join("; ");
+
+  return compactJson(result);
+}
+
+function agentPayloadVerdict(payload: unknown): ChatMessage["verdict"] {
+  const result = unwrapAgentResult(payload);
+  if (!isRecord(result) || !isRecord(result.alignment_verdict)) return "pending";
+  const allowed = result.alignment_verdict.allowed;
+  if (allowed === true) return "aligned";
+  if (allowed === false) return "blocked";
+  return "pending";
+}
+
+function agentPayloadTrace(payload: unknown): TraceEntry[] {
+  const result = unwrapAgentResult(payload);
+  if (!isRecord(result)) return [];
+  const at = new Date().toISOString();
+  const events = Array.isArray(result.events) ? result.events : [];
+  const receipts = Array.isArray(result.invocation_receipts) ? result.invocation_receipts : [];
+
+  const eventEntries: TraceEntry[] = events.slice(-8).map((event, index) => {
+    const record = isRecord(event) ? event : {};
+    const kind = stringProp(record, "event_type", "kind", "type") || "event";
+    return {
+      id: stringProp(record, "event_id", "id") || `event_${index}`,
+      role: "system",
+      content: kind,
+      at: stringProp(record, "created_at", "at", "timestamp") || at,
+    };
+  });
+
+  const receiptEntries: TraceEntry[] = receipts.slice(-6).map((receipt, index) => {
+    const record = isRecord(receipt) ? receipt : {};
+    return {
+      id: stringProp(record, "invocation_id", "id") || `receipt_${index}`,
+      role: "head",
+      head: stringProp(record, "head_id"),
+      content: stringProp(record, "output_summary", "summary") || agentPayloadText(record.payload) || compactJson(record),
+      at: stringProp(record, "created_at", "at", "timestamp") || at,
+    };
+  });
+
+  return [...eventEntries, ...receiptEntries];
+}
+
+function unwrapAgentResult(payload: unknown): unknown {
+  let current = payload;
+  for (let i = 0; i < 4; i += 1) {
+    if (!isRecord(current) || "error" in current || !("result" in current)) return current;
+    current = current.result;
+  }
+  return current;
+}
+
+function stringProp(record: Record<string, unknown>, ...keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function compactJson(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}

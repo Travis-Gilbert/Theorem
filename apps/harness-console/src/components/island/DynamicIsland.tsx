@@ -9,6 +9,7 @@ import {
   Command as CommandIcon,
   Paperclip,
   ArrowUp,
+  Loader2,
   List,
   Network,
   Hash,
@@ -17,7 +18,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useConsole } from "./console-context";
-import { harness, type SearchResult } from "@/lib/harness";
+import { harness, type ChatMessage, type SearchResult } from "@/lib/harness";
 import { cn } from "@/lib/utils";
 import {
   omnibarIconButtonClass,
@@ -87,6 +88,11 @@ function ProgressRing({ progress }: { progress: number }) {
 }
 
 type Mode = "ambient" | "expanded" | "search" | "command";
+type AgentTurnState =
+  | { status: "idle" }
+  | { status: "running"; prompt: string }
+  | { status: "done"; prompt: string; message: ChatMessage }
+  | { status: "error"; prompt: string; message: string };
 
 export function DynamicIsland() {
   const router = useRouter();
@@ -109,6 +115,7 @@ export function DynamicIsland() {
   const [results, setResults] = React.useState<SearchResult[]>([]);
   const [resultView, setResultView] = React.useState<"list" | "graph">("list");
   const [activeIndex, setActiveIndex] = React.useState(0);
+  const [agentTurn, setAgentTurn] = React.useState<AgentTurnState>({ status: "idle" });
   const inputRef = React.useRef<HTMLInputElement>(null);
 
   // Onboarding routes hide the island; it belongs to the authed console.
@@ -122,11 +129,37 @@ export function DynamicIsland() {
     }
   }, [mode]);
 
+  const runAgentFromOmnibar = React.useCallback(
+    async (prompt: string) => {
+      const trimmed = prompt.trim();
+      if (!trimmed) return;
+
+      setPaletteOpen(true);
+      setSearchOn(false);
+      setAgentTurn({ status: "running", prompt: trimmed });
+      try {
+        const message = await harness.runAgent(trimmed);
+        setAgentTurn({ status: "done", prompt: trimmed, message });
+      } catch (error) {
+        setAgentTurn({
+          status: "error",
+          prompt: trimmed,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    [setPaletteOpen, setSearchOn],
+  );
+
   // Resolve typed input three ways for the palette, plus RustyWeb search.
   const runQuery = React.useCallback(
     async (q: string) => {
       setQuery(q);
-      if (!q.trim()) {
+      const trimmed = q.trim();
+      setAgentTurn((current) =>
+        current.status !== "idle" && current.prompt !== trimmed ? { status: "idle" } : current,
+      );
+      if (!trimmed) {
         setResults([]);
         return;
       }
@@ -164,19 +197,39 @@ export function DynamicIsland() {
         const hits = await harness.search(q, "fulltext");
         setResults([
           ...hits,
-          { id: "ask", kind: "action", title: `Ask the Theorem agent: "${q}"`, href: `/agent?prompt=${encodeURIComponent(q)}` },
+          {
+            id: "ask",
+            kind: "action",
+            title: `Ask the Theorem agent: "${q}"`,
+            subtitle: "Run agent:theorem from the Omnibar",
+          },
         ]);
       }
     },
     [mode],
   );
 
-  function choose(r: SearchResult) {
+  async function choose(r: SearchResult) {
+    if (r.id === "ask") {
+      await runAgentFromOmnibar(query);
+      return;
+    }
     if (r.href) router.push(r.href);
     setPaletteOpen(false);
     setSearchOn(false);
     setQuery("");
     setResults([]);
+  }
+
+  async function submitOmnibar() {
+    const r = results[activeIndex] ?? results[0];
+    if (r) {
+      await choose(r);
+      return;
+    }
+    if (mode === "command" && query.trim()) {
+      await runAgentFromOmnibar(query);
+    }
   }
 
   if (hidden) return null;
@@ -227,7 +280,17 @@ export function DynamicIsland() {
               {mode === "search" ? (
                 <SearchPanel results={results} activeIndex={activeIndex} view={resultView} setView={setResultView} onChoose={choose} />
               ) : (
-                <CommandPanel query={query} results={results} activeIndex={activeIndex} expandList={expandList} surfaceMode={surfaceMode} onChoose={choose} setPaletteOpen={setPaletteOpen} />
+                <CommandPanel
+                  query={query}
+                  results={results}
+                  activeIndex={activeIndex}
+                  expandList={expandList}
+                  surfaceMode={surfaceMode}
+                  agentTurn={agentTurn}
+                  onChoose={choose}
+                  onOpenAgent={(prompt) => router.push(`/agent?prompt=${encodeURIComponent(prompt)}`)}
+                  setPaletteOpen={setPaletteOpen}
+                />
               )}
             </motion.div>
           )}
@@ -279,8 +342,7 @@ export function DynamicIsland() {
                     setActiveIndex((i) => Math.max(i - 1, 0));
                   } else if (e.key === "Enter") {
                     e.preventDefault();
-                    const r = results[activeIndex] ?? results[0];
-                    if (r) choose(r);
+                    void submitOmnibar();
                   }
                 }}
                 role="combobox"
@@ -297,12 +359,10 @@ export function DynamicIsland() {
               <button
                 className={omnibarSendButtonClass()}
                 aria-label="Submit"
-                onClick={() => {
-                  const r = results[activeIndex] ?? results[0];
-                  if (r) choose(r);
-                }}
+                disabled={agentTurn.status === "running"}
+                onClick={() => void submitOmnibar()}
               >
-                <ArrowUp size={15} />
+                {agentTurn.status === "running" ? <Loader2 size={15} className="animate-spin" /> : <ArrowUp size={15} />}
               </button>
             </>
           )}
@@ -405,7 +465,9 @@ function CommandPanel({
   activeIndex,
   expandList,
   surfaceMode,
+  agentTurn,
   onChoose,
+  onOpenAgent,
   setPaletteOpen,
 }: {
   query: string;
@@ -413,7 +475,9 @@ function CommandPanel({
   activeIndex: number;
   expandList: { id: string; title: string }[];
   surfaceMode: string;
+  agentTurn: AgentTurnState;
   onChoose: (r: SearchResult) => void;
+  onOpenAgent: (prompt: string) => void;
   setPaletteOpen: (v: boolean) => void;
 }) {
   // No query yet: show the TOC (content) or cluster list (memory) as the
@@ -450,25 +514,74 @@ function CommandPanel({
     );
   }
   return (
-    <ul id="di-results" role="listbox" aria-label="Results" className="p-2">
-      {results.map((r, i) => (
-        <li key={r.id}>
-          <button
-            id={`di-opt-${i}`}
-            role="option"
-            aria-selected={i === activeIndex}
-            onClick={() => onChoose(r)}
-            className={cn(
-              "flex w-full flex-col gap-0.5 rounded px-2 py-2 text-left hover:bg-surface-2",
-              i === activeIndex && "bg-surface-2",
-            )}
-          >
-            <span className="truncate text-body text-ink">{r.title}</span>
-            {r.subtitle && <span className="truncate text-label text-muted-foreground">{r.subtitle}</span>}
-          </button>
-        </li>
-      ))}
-      {!results.length && <li className="px-2 py-6 text-center text-label text-muted-foreground">No matches.</li>}
-    </ul>
+    <div className="p-2">
+      {agentTurn.status !== "idle" && (
+        <AgentRunPanel turn={agentTurn} onOpenAgent={onOpenAgent} />
+      )}
+      <ul id="di-results" role="listbox" aria-label="Results" className="mt-1">
+        {results.map((r, i) => (
+          <li key={r.id}>
+            <button
+              id={`di-opt-${i}`}
+              role="option"
+              aria-selected={i === activeIndex}
+              onClick={() => onChoose(r)}
+              className={cn(
+                "flex w-full flex-col gap-0.5 rounded px-2 py-2 text-left hover:bg-surface-2",
+                i === activeIndex && "bg-surface-2",
+              )}
+            >
+              <span className="truncate text-body text-ink">{r.title}</span>
+              {r.subtitle && <span className="truncate text-label text-muted-foreground">{r.subtitle}</span>}
+            </button>
+          </li>
+        ))}
+        {!results.length && <li className="px-2 py-6 text-center text-label text-muted-foreground">No matches.</li>}
+      </ul>
+    </div>
+  );
+}
+
+function AgentRunPanel({
+  turn,
+  onOpenAgent,
+}: {
+  turn: Exclude<AgentTurnState, { status: "idle" }>;
+  onOpenAgent: (prompt: string) => void;
+}) {
+  const traceCount = turn.status === "done" ? (turn.message.trace?.length ?? 0) : 0;
+  const verdict = turn.status === "done" ? (turn.message.verdict ?? "pending") : turn.status;
+  const body =
+    turn.status === "done"
+      ? turn.message.content
+      : turn.status === "error"
+        ? turn.message
+        : "Starting agent:theorem...";
+
+  return (
+    <section className="mb-2 rounded-md border border-line bg-surface px-2 py-2">
+      <div className="mb-1 flex items-center gap-2">
+        <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-surface-2 text-ox">
+          {turn.status === "running" ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="truncate font-mono text-[11px] text-muted-foreground">{turn.prompt}</p>
+          <p className="font-title text-label text-ink">agent:theorem {verdict}</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => onOpenAgent(turn.prompt)}
+          className="rounded px-2 py-1 font-mono text-[11px] text-muted-foreground hover:bg-surface-2 hover:text-ink"
+        >
+          Open
+        </button>
+      </div>
+      <p className="max-h-28 overflow-y-auto whitespace-pre-wrap text-label text-muted-foreground">
+        {body}
+      </p>
+      {traceCount > 0 && (
+        <p className="mt-1 font-mono text-[11px] text-faint">{traceCount} trace events</p>
+      )}
+    </section>
   );
 }
