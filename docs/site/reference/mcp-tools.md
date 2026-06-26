@@ -114,6 +114,7 @@ Read and compute over the graph store.
 | `rustyred_thg_graph_explain` | Explain a bounded query plan. |
 | `rustyred_thg_graph_schema` | Labels, edge types, stats, capabilities. |
 | `rustyred_thg_graph_index_status` | Index health and drift. |
+| `rustyred_thg_index_spine` | Inspect adaptive-index manifests, query receipts, advisor proposals, context views, map artifacts, training runs, and export redaction validation. |
 | `rustyred_thg_epistemic_neighbors` | Traverse confidence-weighted edges (supports/contradicts/refines/cites). |
 | `rustyred_thg_algorithm_ppr` / `_pagerank` | Personalized and global PageRank. |
 | `rustyred_thg_algorithm_components` | Connected components. |

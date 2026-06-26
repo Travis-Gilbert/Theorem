@@ -43,6 +43,10 @@
 //!   `graphSchema` / `vectorSearch` / `vectorHybrid` / `fulltextSearch` /
 //!   `spatialRadius` / `spatialBbox` / the symbolic reads; mutations
 //!   `designate*` / `bulk*`.
+//! - index spine: `indexSpineOverview` / `indexSpineRecords` plus named record
+//!   fields for manifests, receipts, advisor proposals, context views, maps,
+//!   training runs, and redaction/export validation. Wraps
+//!   `rustyred_thg_index_spine`.
 //! - coordination (core): `coordinationRoom` / `coordinationStream` / `workGraph`
 //!   / `nextTaskNode`; mutations `writeCoordinationIntent` /
 //!   `writeCoordinationRecord` / `publishCoordinationEvent` /
@@ -86,6 +90,7 @@ mod coordination;
 mod coordination_v2;
 mod epistemic;
 mod graph;
+mod index_spine;
 mod items;
 mod kg;
 mod memory;
@@ -164,6 +169,9 @@ pub(crate) trait GraphqlInvoker {
     fn skill(&self, operation: &str, args: Value) -> Result<Value, McpError>;
     fn ensemble(&self, operation: &str, args: Value) -> Result<Value, McpError>;
     fn job(&self, operation: &str, args: Value) -> Result<Value, McpError>;
+    // Adaptive index spine: read-only inspection over bounded graph-native
+    // manifest, receipt, context-view, map, and export-validation records.
+    fn index_spine(&self, args: Value) -> Result<Value, McpError>;
     // Item domain (SPEC-2): enumerate nodes by the projected labels, and fetch a
     // single node by id, for the projection. Wraps query_nodes / get_node.
     fn items_nodes(&self, labels: &[&str], limit: usize) -> Result<Vec<NodeRecord>, McpError>;
@@ -460,6 +468,9 @@ impl<B: McpGraphBackend> GraphqlInvoker for DispatchInvoker<B> {
             _ => Err(McpError::invalid_params("unknown job operation")),
         }
     }
+    fn index_spine(&self, args: Value) -> Result<Value, McpError> {
+        crate::index_spine_payload(&self.tenant, &*self.backend.borrow(), &args)
+    }
     fn items_nodes(&self, labels: &[&str], limit: usize) -> Result<Vec<NodeRecord>, McpError> {
         let backend = self.backend.borrow();
         let mut out = Vec::new();
@@ -547,6 +558,7 @@ pub(crate) struct QueryRoot(
     code::CodeQuery,
     kg::HarnessKgQuery,
     clusters::ClustersQuery,
+    index_spine::IndexSpineQuery,
     items::ItemQuery,
 );
 
@@ -634,7 +646,7 @@ pub(crate) fn graphql_tool_definitions(include_mutations: bool) -> Vec<Value> {
     let mut tools = vec![
         crate::tool(
             "graphql_query",
-            "Run a GraphQL QUERY (read) over the typed Harness schema: Items (items, itemsByKind, item), Memory domain, Graph domain (graphAlgorithm, graphNode, neighbors, graphSchema, vectorSearch, vectorHybrid, fulltextSearch, spatialRadius, spatialBbox, and symbolic fields), and Coordination domain (coordinationRoom, coordinationStream, workGraph, nextTaskNode). Read-only: mutation operations are refused (use graphql_mutate). Tenant is the connection tenant, not a field argument.",
+            "Run a GraphQL QUERY (read) over the typed Harness schema: Items, Memory, Graph, Adaptive Index Spine, Coordination, Epistemic, Code, KG, and cluster domains. Read-only: mutation operations are refused (use graphql_mutate). Tenant is the connection tenant, not a field argument.",
             graphql_input_schema(),
         ),
         crate::tool(

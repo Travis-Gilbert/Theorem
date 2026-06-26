@@ -26,7 +26,7 @@ pub use graphql::projection::{
 };
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -1289,6 +1289,9 @@ fn call_tool<P: McpGraphProvider>(
         "rustyred_thg_graph_neighbors" => graph_neighbors_payload(&tenant, &backend, &arguments)?,
         "rustyred_thg_graph_schema" => schema_payload(&tenant, &backend)?,
         "rustyred_thg_graph_index_status" => index_status_payload(&tenant, &backend)?,
+        "rustyred_thg_index_spine" | "index_spine" => {
+            index_spine_payload(&tenant, &backend, &arguments)?
+        }
         "rustyred_thg_graph_explain" => explain_payload(&tenant, &arguments),
         "rustyred_thg_graph_query" => query_payload(&tenant, &backend, &arguments)?,
         "rustyred_thg_relational_query" | "rustyred_relational_query" => {
@@ -2657,6 +2660,267 @@ fn index_status_payload(tenant: &str, backend: &impl McpGraphBackend) -> Result<
         "stats": verify.stats,
         "problems": verify.problems
     }))
+}
+
+const INDEX_SPINE_DEFAULT_LIMIT: usize = 100;
+const INDEX_SPINE_MAX_LIMIT: usize = 10_000;
+
+const INDEX_SPINE_SURFACES: &[(&str, &str, &str)] = &[
+    ("index_manifests", "IndexManifest", "index_manifests"),
+    ("query_receipts", "QueryReceipt", "query_receipts"),
+    ("advisor_proposals", "IndexProposal", "advisor_proposals"),
+    ("context_views", "ContextView", "context_views"),
+    ("maps", "MapArtifact", "maps"),
+    ("training_runs", "LabeledTrainingRun", "training_runs"),
+    (
+        "training_exports",
+        "TrainingExportRecord",
+        "training_exports",
+    ),
+];
+
+pub(crate) fn index_spine_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let surface = argument_text(arguments, &["surface", "view", "kind"])
+        .unwrap_or_else(|| "overview".to_string());
+    let surface = normalize_index_spine_surface(&surface);
+    let limit = index_spine_limit(arguments);
+    let include_records = arguments
+        .get("include_records")
+        .or_else(|| arguments.get("includeRecords"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    if surface == "overview" {
+        return index_spine_overview_payload(tenant, backend, limit);
+    }
+    if surface == "export_validation" {
+        return index_spine_export_validation_payload(tenant, backend, limit, include_records);
+    }
+
+    let Some((_, label, key)) = index_spine_surface(&surface) else {
+        return Err(McpError::invalid_params(format!(
+            "unknown index spine surface {surface}; expected overview, export_validation, or one of {}",
+            INDEX_SPINE_SURFACES
+                .iter()
+                .map(|(surface, _, _)| *surface)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    };
+    let records = index_spine_records(backend, label, arguments, limit)?;
+    Ok(json!({
+        "tenant": tenant,
+        "surface": surface,
+        "label": label,
+        "count": records.len(),
+        "limit": limit,
+        key: records
+    }))
+}
+
+fn index_spine_overview_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    limit: usize,
+) -> Result<Value, McpError> {
+    let mut counts = Map::new();
+    for (surface, label, _) in INDEX_SPINE_SURFACES {
+        let count = backend
+            .query_nodes(NodeQuery::label(*label).with_limit(limit))?
+            .len();
+        counts.insert((*surface).to_string(), json!(count));
+    }
+
+    let manifests = backend.query_nodes(NodeQuery::label("IndexManifest").with_limit(limit))?;
+    let degraded_indexes = manifests
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.properties
+                    .get("build_status")
+                    .or_else(|| node.properties.get("status"))
+                    .and_then(Value::as_str),
+                Some("degraded" | "failed" | "retired")
+            )
+        })
+        .count();
+    let stale_indexes = manifests
+        .iter()
+        .filter(|node| node.properties.get("stale").and_then(Value::as_bool) == Some(true))
+        .count();
+    let context_views = backend.query_nodes(NodeQuery::label("ContextView").with_limit(limit))?;
+    let stale_context_views = context_views
+        .iter()
+        .filter(|node| {
+            node.properties
+                .get("freshness_status")
+                .or_else(|| node.properties.get("freshness"))
+                .and_then(Value::as_str)
+                .map(|status| status != "fresh")
+                .unwrap_or(false)
+        })
+        .count();
+    let maps = backend.query_nodes(NodeQuery::label("MapArtifact").with_limit(limit))?;
+    let stale_maps = maps
+        .iter()
+        .filter(|node| {
+            node.properties
+                .get("freshness_status")
+                .or_else(|| node.properties.get("freshness"))
+                .and_then(Value::as_str)
+                .map(|status| status != "fresh")
+                .unwrap_or(false)
+        })
+        .count();
+    let training_exports =
+        backend.query_nodes(NodeQuery::label("TrainingExportRecord").with_limit(limit))?;
+    let blocked_training_exports = training_exports
+        .iter()
+        .filter(|node| {
+            node.properties
+                .get("redaction_status")
+                .and_then(Value::as_str)
+                == Some("blocked")
+        })
+        .count();
+
+    Ok(json!({
+        "ok": blocked_training_exports == 0,
+        "tenant": tenant,
+        "surface": "overview",
+        "limit": limit,
+        "counts": counts,
+        "reliability": {
+            "blocked_training_exports": blocked_training_exports,
+            "degraded_indexes": degraded_indexes,
+            "stale_indexes": stale_indexes,
+            "stale_context_views": stale_context_views,
+            "stale_maps": stale_maps
+        },
+        "routes": {
+            "index_manifests": "index_manifests",
+            "query_receipts": "query_receipts",
+            "advisor_proposals": "advisor_proposals",
+            "context_views": "context_views",
+            "maps": "maps",
+            "training_runs": "training_runs",
+            "training_exports": "training_exports",
+            "export_validation": "export_validation"
+        }
+    }))
+}
+
+fn index_spine_export_validation_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    limit: usize,
+    include_records: bool,
+) -> Result<Value, McpError> {
+    let records = index_spine_records(
+        backend,
+        "TrainingExportRecord",
+        &json!({ "surface": "training_exports" }),
+        limit,
+    )?;
+    let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut blocked_record_ids = Vec::new();
+    for record in &records {
+        let status = record
+            .get("properties")
+            .and_then(|props| props.get("redaction_status"))
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+            .to_string();
+        *status_counts.entry(status.clone()).or_default() += 1;
+        if status == "blocked" {
+            if let Some(id) = record.get("node_id").and_then(Value::as_str) {
+                blocked_record_ids.push(id.to_string());
+            }
+        }
+    }
+    let mut payload = json!({
+        "ok": blocked_record_ids.is_empty(),
+        "tenant": tenant,
+        "surface": "export_validation",
+        "total_records": records.len(),
+        "limit": limit,
+        "status_counts": status_counts,
+        "blocked_record_ids": blocked_record_ids,
+    });
+    if include_records {
+        payload["training_exports"] = json!(records);
+    }
+    Ok(payload)
+}
+
+fn index_spine_records(
+    backend: &impl McpGraphBackend,
+    label: &str,
+    arguments: &Value,
+    limit: usize,
+) -> Result<Vec<Value>, McpError> {
+    let mut query = NodeQuery::label(label).with_limit(limit);
+    for (key, value) in argument_object(arguments, "properties") {
+        query = query.with_property(key, value);
+    }
+    let id_prefix = argument_text(arguments, &["id_prefix", "idPrefix"]);
+    let records = backend
+        .query_nodes(query)?
+        .into_iter()
+        .filter(|node| {
+            id_prefix
+                .as_deref()
+                .map(|prefix| node.id.starts_with(prefix))
+                .unwrap_or(true)
+        })
+        .map(index_spine_node_payload)
+        .collect();
+    Ok(records)
+}
+
+fn index_spine_node_payload(node: NodeRecord) -> Value {
+    json!({
+        "node_id": node.id,
+        "labels": node.labels,
+        "version": node.version,
+        "properties": node.properties
+    })
+}
+
+fn index_spine_limit(arguments: &Value) -> usize {
+    argument_u64(arguments, &["limit", "max_records", "maxRecords"])
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(INDEX_SPINE_MAX_LIMIT))
+        .unwrap_or(INDEX_SPINE_DEFAULT_LIMIT)
+}
+
+fn normalize_index_spine_surface(surface: &str) -> String {
+    let normalized = surface.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "manifest" | "manifests" | "index_manifest" | "index_manifest_list" => "index_manifests",
+        "receipt" | "receipts" | "query_receipt" | "query_receipt_list" => "query_receipts",
+        "proposal" | "proposals" | "advisor" | "advisor_proposal" => "advisor_proposals",
+        "context" | "context_view" | "context_view_list" => "context_views",
+        "map" | "map_artifact" | "map_artifact_list" => "maps",
+        "training" | "training_run" | "training_run_list" => "training_runs",
+        "export" | "exports" | "training_export" | "training_export_record" => "training_exports",
+        "redaction" | "redaction_validation" | "training_export_validation" => "export_validation",
+        "" => "overview",
+        _ => normalized.as_str(),
+    }
+    .to_string()
+}
+
+fn index_spine_surface(surface: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    INDEX_SPINE_SURFACES
+        .iter()
+        .copied()
+        .find(|(candidate, _, _)| *candidate == surface)
 }
 
 fn explain_payload(tenant: &str, arguments: &Value) -> Value {
@@ -10994,6 +11258,8 @@ const GRAPHQL_COVERED_FLAT_TOOLS: &[&str] = &[
     "harness_kg_impact",
     "harness_kg_related_objects",
     "harness_kg_explain_edge",
+    // adaptive index spine inspection
+    "rustyred_thg_index_spine",
     // clusters: skills / ensemble / jobs / harness-run
     "skill_list",
     "skill_get",
@@ -11170,6 +11436,38 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": { "tenant": { "type": "string" } }
+            }),
+        ),
+        tool(
+            "rustyred_thg_index_spine",
+            "Inspect the adaptive index spine: manifests, query receipts, advisor proposals, context views, map artifacts, training runs, and redaction-safe export validation.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "surface": {
+                        "type": "string",
+                        "enum": [
+                            "overview",
+                            "index_manifests",
+                            "query_receipts",
+                            "advisor_proposals",
+                            "context_views",
+                            "maps",
+                            "training_runs",
+                            "training_exports",
+                            "export_validation"
+                        ],
+                        "default": "overview"
+                    },
+                    "limit": { "type": "integer", "default": INDEX_SPINE_DEFAULT_LIMIT },
+                    "include_records": { "type": "boolean", "default": true },
+                    "properties": {
+                        "type": "object",
+                        "description": "Optional exact property filters for record-list surfaces."
+                    },
+                    "id_prefix": { "type": "string" }
+                }
             }),
         ),
         tool(
@@ -14408,6 +14706,97 @@ mod tests {
         response["result"]["structuredContent"].clone()
     }
 
+    fn seed_index_spine_records(provider: &FixtureProvider) {
+        let mut store = provider.0.borrow_mut();
+        store
+            .upsert_node(NodeRecord::new(
+                "idx:manifest:1",
+                ["IndexManifest"],
+                json!({
+                    "id": "idx:manifest:1",
+                    "kind": "composite",
+                    "build_status": "active"
+                }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "qr:1",
+                ["QueryReceipt"],
+                json!({
+                    "query_signature": "sig:artifact-list",
+                    "outcome_label": "success",
+                    "token_cost": 42
+                }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "proposal:1",
+                ["IndexProposal"],
+                json!({
+                    "status": "shadow",
+                    "reason": "candidate waste"
+                }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "export:blocked",
+                ["TrainingExportRecord"],
+                json!({
+                    "export_kind": "memory_recall",
+                    "redaction_status": "blocked",
+                    "source_run_id": "run:1"
+                }),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn index_spine_tool_exposes_bounded_records_and_export_validation() {
+        let (provider, config) = fixture();
+        seed_index_spine_records(&provider);
+
+        let overview = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_index_spine",
+            json!({ "tenant": "smoke", "surface": "overview" }),
+        );
+        assert_eq!(overview["counts"]["index_manifests"], 1);
+        assert_eq!(overview["counts"]["query_receipts"], 1);
+        assert_eq!(
+            overview["reliability"]["blocked_training_exports"],
+            json!(1),
+            "overview should surface redaction blockers: {overview}"
+        );
+
+        let manifests = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_index_spine",
+            json!({
+                "tenant": "smoke",
+                "surface": "index_manifests",
+                "properties": { "build_status": "active" },
+                "limit": 5
+            }),
+        );
+        assert_eq!(manifests["count"], 1);
+        assert_eq!(manifests["index_manifests"][0]["node_id"], "idx:manifest:1");
+
+        let validation = call_tool_json(
+            &provider,
+            &config,
+            "rustyred_thg_index_spine",
+            json!({ "tenant": "smoke", "surface": "export_validation" }),
+        );
+        assert_eq!(validation["ok"], false);
+        assert_eq!(validation["status_counts"]["blocked"], 1);
+        assert_eq!(validation["blocked_record_ids"][0], "export:blocked");
+    }
+
     #[derive(Debug)]
     struct CapturedProviderRequest {
         headers: String,
@@ -17412,6 +17801,48 @@ mod tests {
         assert!(
             response.get("error").is_some(),
             "an empty connection tenant must be rejected, not defaulted: {response}"
+        );
+    }
+
+    // AC5: the adaptive index spine rides GraphQL as a bounded read-only surface
+    // over the same payload as the flat `rustyred_thg_index_spine` tool.
+    #[test]
+    fn graphql_index_spine_exposes_records_and_export_validation() {
+        let (provider, config) = fixture();
+        seed_index_spine_records(&provider);
+
+        let response = graphql_tool_call(
+            &provider,
+            &config,
+            "graphql_query",
+            "query {
+                indexSpineOverview { ok counts reliability }
+                indexManifests(limit: 5) { nodeId labels properties }
+                queryReceipts(limit: 5) { nodeId properties }
+                trainingExportValidation(limit: 5) {
+                    ok
+                    totalRecords
+                    statusCounts
+                    blockedRecordIds
+                }
+            }",
+            Value::Null,
+        );
+        assert_no_graphql_errors(&response);
+        assert_eq!(response["data"]["indexSpineOverview"]["ok"], false);
+        assert_eq!(
+            response["data"]["indexSpineOverview"]["counts"]["index_manifests"],
+            1
+        );
+        assert_eq!(
+            response["data"]["indexManifests"][0]["nodeId"],
+            "idx:manifest:1"
+        );
+        assert_eq!(response["data"]["queryReceipts"][0]["nodeId"], "qr:1");
+        assert_eq!(response["data"]["trainingExportValidation"]["ok"], false);
+        assert_eq!(
+            response["data"]["trainingExportValidation"]["blockedRecordIds"][0],
+            "export:blocked"
         );
     }
 
