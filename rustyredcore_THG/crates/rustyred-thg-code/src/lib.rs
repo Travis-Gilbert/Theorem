@@ -138,12 +138,13 @@ pub struct CodeIndexRuntime {
     worker_started: Arc<std::sync::Once>,
     store_lock_metrics: Arc<CodeStoreLockMetrics>,
     recovered_runnable_jobs: Arc<AtomicU64>,
+    recovery: Arc<CodeIndexRecoveryState>,
     credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
     map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
     // Kept alive for the runtime's lifetime so the hook worker keeps draining;
     // `None` unless graph-level code-KG hooks are enabled (see THEOREM_CODE_HOOKS).
     #[allow(dead_code)]
-    hook_dispatcher: Option<Arc<HookDispatcher>>,
+    hook_dispatcher: Arc<Mutex<Option<Arc<HookDispatcher>>>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -218,6 +219,7 @@ pub struct CodeIndexDiagnostics {
     pub store_status: RedCoreStatus,
     pub lock_stats: CodeStoreLockStats,
     pub recovered_runnable_jobs: u64,
+    pub recovery: CodeIndexRecoverySnapshot,
 }
 
 impl CodeIndexDiagnostics {
@@ -232,7 +234,102 @@ impl CodeIndexDiagnostics {
                 "hold_max_ms": self.lock_stats.hold_max_ms,
             },
             "recovered_runnable_jobs": self.recovered_runnable_jobs,
+            "recovery": self.recovery.to_json(),
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeIndexRecoverySnapshot {
+    pub phase: String,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl CodeIndexRecoverySnapshot {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "phase": self.phase,
+            "started_at_ms": self.started_at_ms,
+            "finished_at_ms": self.finished_at_ms,
+            "error": self.error,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CodeIndexRecoveryState {
+    inner: Mutex<CodeIndexRecoverySnapshot>,
+}
+
+impl CodeIndexRecoveryState {
+    fn ready() -> Self {
+        let now = now_ms().max(0) as u64;
+        Self {
+            inner: Mutex::new(CodeIndexRecoverySnapshot {
+                phase: "ready".to_string(),
+                started_at_ms: now,
+                finished_at_ms: Some(now),
+                error: None,
+            }),
+        }
+    }
+
+    fn recovering() -> Self {
+        Self {
+            inner: Mutex::new(CodeIndexRecoverySnapshot {
+                phase: "recovering".to_string(),
+                started_at_ms: now_ms().max(0) as u64,
+                finished_at_ms: None,
+                error: None,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> CodeIndexRecoverySnapshot {
+        self.inner
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_else(|_| CodeIndexRecoverySnapshot {
+                phase: "failed".to_string(),
+                started_at_ms: 0,
+                finished_at_ms: Some(now_ms().max(0) as u64),
+                error: Some("code index recovery state lock poisoned".to_string()),
+            })
+    }
+
+    fn mark_ready(&self) {
+        if let Ok(mut snapshot) = self.inner.lock() {
+            snapshot.phase = "ready".to_string();
+            snapshot.finished_at_ms = Some(now_ms().max(0) as u64);
+            snapshot.error = None;
+        }
+    }
+
+    fn mark_failed(&self, error: impl Into<String>) {
+        if let Ok(mut snapshot) = self.inner.lock() {
+            snapshot.phase = "failed".to_string();
+            snapshot.finished_at_ms = Some(now_ms().max(0) as u64);
+            snapshot.error = Some(error.into());
+        }
+    }
+
+    fn readiness_error(&self) -> Option<CodeIndexError> {
+        let snapshot = self.snapshot();
+        match snapshot.phase.as_str() {
+            "ready" => None,
+            "failed" => Some(CodeIndexError {
+                code: "code_index_recovery_failed".to_string(),
+                message: snapshot
+                    .error
+                    .unwrap_or_else(|| "code index recovery failed".to_string()),
+            }),
+            _ => Some(CodeIndexError {
+                code: "code_index_recovering".to_string(),
+                message: "code index RedCore store is still recovering".to_string(),
+            }),
+        }
     }
 }
 
@@ -584,6 +681,94 @@ impl CodeIndexRuntime {
         Self::try_new_at(code_index_data_dir(), code_index_options())
     }
 
+    pub fn recovering() -> Result<Self, CodeIndexError> {
+        Self::recovering_at(code_index_data_dir(), code_index_options())
+    }
+
+    pub fn recovering_at(
+        data_dir: impl AsRef<Path>,
+        options: RedCoreOptions,
+    ) -> Result<Self, CodeIndexError> {
+        Self::recovering_at_with_integrations(data_dir, options, None, None)
+    }
+
+    pub fn recovering_at_with_integrations(
+        data_dir: impl AsRef<Path>,
+        options: RedCoreOptions,
+        credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
+        map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
+    ) -> Result<Self, CodeIndexError> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let store = Arc::new(Mutex::new(RedCoreGraphStore::memory()));
+        let jobs = Arc::new(IngestJobRegistry::with_persistence(Arc::downgrade(&store)));
+        let store_lock_metrics = Arc::new(CodeStoreLockMetrics::default());
+        let recovered_runnable_jobs = Arc::new(AtomicU64::new(0));
+        let recovery = Arc::new(CodeIndexRecoveryState::recovering());
+        let hook_dispatcher = Arc::new(Mutex::new(None));
+        let worker_started = Arc::new(std::sync::Once::new());
+        let runtime = Self {
+            store: Arc::clone(&store),
+            jobs: Arc::clone(&jobs),
+            worker_started: Arc::clone(&worker_started),
+            store_lock_metrics,
+            recovered_runnable_jobs: Arc::clone(&recovered_runnable_jobs),
+            recovery: Arc::clone(&recovery),
+            credential_resolver: credential_resolver.clone(),
+            map_projection_sink: map_projection_sink.clone(),
+            hook_dispatcher: Arc::clone(&hook_dispatcher),
+        };
+        let with_hooks = code_hooks_enabled();
+        std::thread::Builder::new()
+            .name("code-index-redcore-recovery".to_string())
+            .spawn(move || {
+                match RedCoreGraphStore::open(&data_dir, options)
+                    .map_err(CodeIndexError::from_store)
+                {
+                    Ok(recovered_store) => {
+                        match store.lock() {
+                            Ok(mut guard) => {
+                                *guard = recovered_store;
+                            }
+                            Err(_) => {
+                                recovery.mark_failed("code index RedCore store lock poisoned");
+                                return;
+                            }
+                        }
+                        if with_hooks {
+                            let dispatcher = Arc::new(start_code_kg_dispatcher(Arc::clone(&store)));
+                            if let Ok(mut slot) = hook_dispatcher.lock() {
+                                *slot = Some(dispatcher);
+                            }
+                        }
+                        let runnable = match store.lock() {
+                            Ok(guard) => jobs.recover_from_store(&guard),
+                            Err(_) => {
+                                recovery.mark_failed("code index RedCore store lock poisoned");
+                                return;
+                            }
+                        };
+                        recovered_runnable_jobs.store(runnable as u64, Ordering::Relaxed);
+                        recovery.mark_ready();
+                        if runnable > 0 {
+                            spawn_ingest_worker_once(
+                                &worker_started,
+                                &store,
+                                &jobs,
+                                credential_resolver,
+                                map_projection_sink,
+                            );
+                        }
+                    }
+                    Err(error) => recovery.mark_failed(error.to_string()),
+                }
+            })
+            .map_err(|err| CodeIndexError {
+                code: "code_index_recovery_spawn_failed".to_string(),
+                message: format!("spawn code index recovery thread failed: {err}"),
+            })?;
+        Ok(runtime)
+    }
+
     pub fn try_new_with_credential_resolver(
         credential_resolver: Arc<dyn GitCredentialResolver>,
     ) -> Result<Self, CodeIndexError> {
@@ -670,6 +855,7 @@ impl CodeIndexRuntime {
         let jobs = Arc::new(IngestJobRegistry::with_persistence(Arc::downgrade(&store)));
         let store_lock_metrics = Arc::new(CodeStoreLockMetrics::default());
         let recovered_runnable_jobs = Arc::new(AtomicU64::new(0));
+        let recovery = Arc::new(CodeIndexRecoveryState::ready());
         // Start the hook dispatcher before recovery so any re-enqueued ingest's
         // commits are observed. No-op for stores without hooks enabled.
         let hook_dispatcher = if with_hooks {
@@ -683,9 +869,10 @@ impl CodeIndexRuntime {
             worker_started: Arc::new(std::sync::Once::new()),
             store_lock_metrics,
             recovered_runnable_jobs,
+            recovery,
             credential_resolver,
             map_projection_sink,
-            hook_dispatcher,
+            hook_dispatcher: Arc::new(Mutex::new(hook_dispatcher)),
         };
         // D-jobs: recover durably-mirrored ingest jobs. Terminal jobs become
         // queryable again; jobs interrupted mid-flight (queued/running at the
@@ -792,9 +979,17 @@ impl CodeIndexRuntime {
     /// (with `job_id`) immediately. The heavy path runs on a dedicated worker
     /// thread; watch it with `wait_ingest_job_events` (streaming) or poll
     /// `ingest_job_status`.
-    pub fn submit_ingest_job(&self, request: IngestJobRequest) -> IngestJobStatus {
+    pub fn submit_ingest_job(
+        &self,
+        request: IngestJobRequest,
+    ) -> Result<IngestJobStatus, CodeIndexError> {
+        self.ensure_ready()?;
         self.ensure_ingest_worker();
-        self.jobs.submit(request)
+        Ok(self.jobs.submit(request))
+    }
+
+    pub fn ensure_ready(&self) -> Result<(), CodeIndexError> {
+        self.recovery.readiness_error().map_or(Ok(()), Err)
     }
 
     pub fn ingest_job_status(&self, job_id: &str) -> Option<IngestJobStatus> {
@@ -818,27 +1013,13 @@ impl CodeIndexRuntime {
     }
 
     fn ensure_ingest_worker(&self) {
-        let store = Arc::downgrade(&self.store);
-        let registry = Arc::clone(&self.jobs);
-        let credential_resolver = self.credential_resolver.clone();
-        let map_projection_sink = self.map_projection_sink.clone();
-        self.worker_started.call_once(move || {
-            if let Err(error) = std::thread::Builder::new()
-                .name("code-ingest-worker".to_string())
-                .spawn(move || {
-                    ingest_jobs::ingest_worker_loop(
-                        store,
-                        registry,
-                        credential_resolver,
-                        map_projection_sink,
-                    )
-                })
-            {
-                // The registry stays usable; submitted jobs will sit queued.
-                // A second runtime clone cannot retry (Once), so surface it.
-                eprintln!("code-ingest-worker spawn failed: {error}");
-            }
-        });
+        spawn_ingest_worker_once(
+            &self.worker_started,
+            &self.store,
+            &self.jobs,
+            self.credential_resolver.clone(),
+            self.map_projection_sink.clone(),
+        );
     }
 
     pub fn search_code(&self, input: SearchCodeInput) -> Result<SearchCodeOutput, CodeIndexError> {
@@ -952,15 +1133,20 @@ impl CodeIndexRuntime {
     }
 
     pub fn diagnostics(&self) -> Result<CodeIndexDiagnostics, CodeIndexError> {
-        let store = self.lock_store()?;
+        let store = self.store.lock().map_err(|_| CodeIndexError {
+            code: "code_index_lock_poisoned".to_string(),
+            message: "code index RedCore store lock poisoned".to_string(),
+        })?;
         Ok(CodeIndexDiagnostics {
             store_status: store.status(),
             lock_stats: self.store_lock_metrics.snapshot(),
             recovered_runnable_jobs: self.recovered_runnable_jobs.load(Ordering::Relaxed),
+            recovery: self.recovery.snapshot(),
         })
     }
 
     pub(crate) fn lock_store(&self) -> Result<CodeStoreGuard<'_>, CodeIndexError> {
+        self.ensure_ready()?;
         let wait_started = Instant::now();
         let guard = self.store.lock().map_err(|_| CodeIndexError {
             code: "code_index_lock_poisoned".to_string(),
@@ -974,6 +1160,34 @@ impl CodeIndexRuntime {
             acquired_at: Instant::now(),
         })
     }
+}
+
+fn spawn_ingest_worker_once(
+    worker_started: &Arc<std::sync::Once>,
+    store: &Arc<Mutex<RedCoreGraphStore>>,
+    jobs: &Arc<IngestJobRegistry>,
+    credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
+    map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
+) {
+    let store = Arc::downgrade(store);
+    let registry = Arc::clone(jobs);
+    worker_started.call_once(move || {
+        if let Err(error) = std::thread::Builder::new()
+            .name("code-ingest-worker".to_string())
+            .spawn(move || {
+                ingest_jobs::ingest_worker_loop(
+                    store,
+                    registry,
+                    credential_resolver,
+                    map_projection_sink,
+                )
+            })
+        {
+            // The registry stays usable; submitted jobs will sit queued.
+            // A second runtime clone cannot retry (Once), so surface it.
+            eprintln!("code-ingest-worker spawn failed: {error}");
+        }
+    });
 }
 
 pub fn ingest_codebase_in_store(
@@ -6206,6 +6420,32 @@ mod tests {
     }
 
     #[test]
+    fn recovering_runtime_reports_failed_recovery_without_blocking_constructor() {
+        let runtime = CodeIndexRuntime::recovering_at(
+            unique_dir("recovering-runtime-fails"),
+            RedCoreOptions {
+                durability: RedCoreDurability::AofEverysec,
+                snapshot_interval_writes: 1,
+                strict_acid: true,
+            },
+        )
+        .unwrap();
+
+        let mut diagnostics = runtime.diagnostics().unwrap();
+        for _ in 0..100 {
+            if diagnostics.recovery.phase == "failed" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            diagnostics = runtime.diagnostics().unwrap();
+        }
+
+        assert_eq!(diagnostics.recovery.phase, "failed");
+        let error = runtime.ensure_ready().unwrap_err();
+        assert_eq!(error.code, "code_index_recovery_failed");
+    }
+
+    #[test]
     fn ingest_returns_instant_epistemic_readout_with_drift_and_bounded_pairs() {
         let repo_dir = write_epistemic_fixture_repo();
         let mut store = RedCoreGraphStore::memory();
@@ -7778,17 +8018,19 @@ pub fn caller() -> usize { helper_len("abc") }
         let (repo_dir, store_dir) = write_fixture_repo();
         let runtime = CodeIndexRuntime::try_new_at(&store_dir, test_options()).unwrap();
         let pause = std::sync::Arc::new(TestIngestPause::default());
-        let submitted = runtime.submit_ingest_job(IngestJobRequest {
-            input: IngestCodebaseInput {
-                tenant_id: "theorem".to_string(),
-                repo_path: repo_dir.display().to_string(),
-                repo_id: "repo:job-fixture".to_string(),
+        let submitted = runtime
+            .submit_ingest_job(IngestJobRequest {
+                input: IngestCodebaseInput {
+                    tenant_id: "theorem".to_string(),
+                    repo_path: repo_dir.display().to_string(),
+                    repo_id: "repo:job-fixture".to_string(),
+                    ..Default::default()
+                },
+                operation: "ingest".to_string(),
+                test_pause: Some(std::sync::Arc::clone(&pause)),
                 ..Default::default()
-            },
-            operation: "ingest".to_string(),
-            test_pause: Some(std::sync::Arc::clone(&pause)),
-            ..Default::default()
-        });
+            })
+            .unwrap();
         assert_eq!(submitted.state, IngestJobState::Queued);
         assert!(!submitted.job_id.is_empty());
 
@@ -7884,16 +8126,18 @@ pub fn caller() -> usize { helper_len("abc") }
         let (repo_dir, store_dir) = write_fixture_repo();
         // First runtime: submit a job and let it finish.
         let first = CodeIndexRuntime::try_new_at(&store_dir, test_options()).unwrap();
-        let submitted = first.submit_ingest_job(IngestJobRequest {
-            input: IngestCodebaseInput {
-                tenant_id: "theorem".to_string(),
-                repo_path: repo_dir.display().to_string(),
-                repo_id: "repo:durable-finished".to_string(),
+        let submitted = first
+            .submit_ingest_job(IngestJobRequest {
+                input: IngestCodebaseInput {
+                    tenant_id: "theorem".to_string(),
+                    repo_path: repo_dir.display().to_string(),
+                    repo_id: "repo:durable-finished".to_string(),
+                    ..Default::default()
+                },
+                operation: "ingest".to_string(),
                 ..Default::default()
-            },
-            operation: "ingest".to_string(),
-            ..Default::default()
-        });
+            })
+            .unwrap();
         let job_id = submitted.job_id.clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -7933,19 +8177,21 @@ pub fn caller() -> usize { helper_len("abc") }
     fn authed_job_request_persists_installation_id_but_no_token() {
         let (repo_dir, store_dir) = write_fixture_repo();
         let runtime = CodeIndexRuntime::try_new_at(&store_dir, test_options()).unwrap();
-        let submitted = runtime.submit_ingest_job(IngestJobRequest {
-            input: IngestCodebaseInput {
-                tenant_id: "theorem".to_string(),
-                repo_id: "repo:private".to_string(),
+        let submitted = runtime
+            .submit_ingest_job(IngestJobRequest {
+                input: IngestCodebaseInput {
+                    tenant_id: "theorem".to_string(),
+                    repo_id: "repo:private".to_string(),
+                    ..Default::default()
+                },
+                operation: "reindex".to_string(),
+                repo_url: "https://github.com/example/private.git".to_string(),
+                installation_id: Some(42),
+                caps: RepoFetchCaps::default(),
+                parse_budget_ms: None,
                 ..Default::default()
-            },
-            operation: "reindex".to_string(),
-            repo_url: "https://github.com/example/private.git".to_string(),
-            installation_id: Some(42),
-            caps: RepoFetchCaps::default(),
-            parse_budget_ms: None,
-            ..Default::default()
-        });
+            })
+            .unwrap();
 
         let store = runtime.lock_store().unwrap();
         let node = GraphStore::get_node(&*store, &submitted.job_id).expect("job mirror node");

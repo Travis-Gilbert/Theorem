@@ -39,16 +39,21 @@ impl TheoremCodeCrawlerService {
         input: IngestCodebaseInput,
         repo_url: String,
         operation: &str,
-    ) -> IngestJobStatus {
+    ) -> Result<IngestJobStatus, Status> {
+        self.runtime
+            .ensure_ready()
+            .map_err(status_from_code_error)?;
         let caps = RepoFetchCaps::from_requested(input.max_total_bytes);
-        self.runtime.submit_ingest_job(IngestJobRequest {
-            input,
-            operation: operation.to_string(),
-            repo_url,
-            caps,
-            parse_budget_ms: None,
-            ..Default::default()
-        })
+        self.runtime
+            .submit_ingest_job(IngestJobRequest {
+                input,
+                operation: operation.to_string(),
+                repo_url,
+                caps,
+                parse_budget_ms: None,
+                ..Default::default()
+            })
+            .map_err(status_from_code_error)
     }
 }
 
@@ -60,7 +65,7 @@ impl pb::CodeCrawlerService for TheoremCodeCrawlerService {
     ) -> Result<Response<pb::IngestCodebaseResponse>, Status> {
         let req = request.into_inner();
         let repo_url = req.repo_url.clone();
-        let submitted = self.submit(input_from_ingest(req), repo_url, "ingest");
+        let submitted = self.submit(input_from_ingest(req), repo_url, "ingest")?;
         Ok(Response::new(submission_ack(submitted)))
     }
 
@@ -70,7 +75,7 @@ impl pb::CodeCrawlerService for TheoremCodeCrawlerService {
     ) -> Result<Response<pb::IngestCodebaseResponse>, Status> {
         let req = request.into_inner();
         let repo_url = req.repo_url.clone();
-        let submitted = self.submit(input_from_reindex(req), repo_url, "reindex");
+        let submitted = self.submit(input_from_reindex(req), repo_url, "reindex")?;
         Ok(Response::new(submission_ack(submitted)))
     }
 
@@ -82,6 +87,9 @@ impl pb::CodeCrawlerService for TheoremCodeCrawlerService {
         request: Request<pb::code::WatchIngestRequest>,
     ) -> Result<Response<Self::WatchIngestStream>, Status> {
         let req = request.into_inner();
+        self.runtime
+            .ensure_ready()
+            .map_err(status_from_code_error)?;
         let job_id = req.job_id.trim().to_string();
         let registry = self.runtime.ingest_jobs();
         let Some(status) = registry.status(&job_id) else {
@@ -127,6 +135,9 @@ impl pb::CodeCrawlerService for TheoremCodeCrawlerService {
         request: Request<pb::code::GetIngestStatusRequest>,
     ) -> Result<Response<pb::code::IngestStatus>, Status> {
         let req = request.into_inner();
+        self.runtime
+            .ensure_ready()
+            .map_err(status_from_code_error)?;
         let job_id = req.job_id.trim();
         let status = self
             .runtime
@@ -530,6 +541,9 @@ fn status_from_code_error(error: CodeIndexError) -> Status {
         "invalid_code_index_request" => Status::invalid_argument(error.message),
         "code_index_io_error" | "code_index_cwd_error" => {
             Status::failed_precondition(error.message)
+        }
+        "code_index_recovering" | "code_index_recovery_failed" => {
+            Status::unavailable(error.message)
         }
         _ => Status::internal(error.to_string()),
     }

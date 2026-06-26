@@ -1,11 +1,12 @@
 //! Theorem's first gRPC server.
 //!
-//! Serves theseus_search.v1.SearchService over the RustyRed substrate. Pure
-//! gRPC (no HTTP surface): the smaller server. Binds [::]:$PORT (IPv6
-//! dual-stack) so Railway's private network (IPv6) reaches it via
-//! theorem-grpc.railway.internal, and IPv4 healthchecks work too. The
-//! civic-atlas-server dials this by setting THEOREM_SEARCH_URL (or the legacy
-//! THESEUS_BRIDGE_URL).
+//! Serves theseus_search.v1.SearchService over the RustyRed substrate. gRPC is
+//! merged with tiny HTTP `/health` and `/ready` routes on the same listener so
+//! deploys can distinguish "process is alive" from "RedCore is still
+//! recovering". Binds [::]:$PORT (IPv6 dual-stack) so Railway's private network
+//! reaches it via theorem-grpc.railway.internal, and IPv4 healthchecks work too.
+//! The civic-atlas-server dials this by setting THEOREM_SEARCH_URL (or the
+//! legacy THESEUS_BRIDGE_URL).
 
 mod app_affordance;
 mod code_index;
@@ -21,12 +22,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use app_affordance::TheoremAppAffordanceService;
+use axum::{extract::State, http::StatusCode, routing::get, Json};
 use code_index::CodeIndexRuntime;
 use code_service::TheoremCodeCrawlerService;
 use engine::Engine;
 use pb::{AppAffordanceServiceServer, CodeCrawlerServiceServer, SearchServiceServer};
+use serde_json::{json, Value};
 use service::TheoremSearchService;
+use tokio::net::TcpListener;
 use valkey_cache::ValkeyCache;
+
+#[derive(Clone)]
+struct ReadinessState {
+    code_index: CodeIndexRuntime,
+    app_affordance: TheoremAppAffordanceService,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,36 +61,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(None) => tracing::info!("THEOREM_GRPC_VALKEY_DISABLED"),
         Err(error) => tracing::warn!("THEOREM_GRPC_VALKEY_UNREACHABLE {}", error),
     }
-    // ONE code store for the whole service: this CodeIndexRuntime (RedCore at
-    // code_index_data_dir()) is shared by BOTH CodeCrawlerService and
-    // AppAffordanceService below. The harness MCP `compute_code` reaches it
-    // through ProductMcpBackend's default `invoke_code_search`, which wraps
-    // the call as a `theorem_grpc.code_search.*` app affordance and dials this
-    // server, so MCP ingest writes and MCP search reads land on the same
-    // store the gRPC verbs use. (The in-process plugin MCP path writes its
-    // own tenant store directly; both routes keep ingest and search on one
-    // store.)
-    let code_index = CodeIndexRuntime::try_new().map_err(std::io::Error::other)?;
+    // ONE code store for the whole service. It starts in "recovering" mode so
+    // the socket can bind before RedCore replays /data. Code calls return
+    // UNAVAILABLE until the background recovery swaps in the durable store.
+    let code_index = CodeIndexRuntime::recovering().map_err(std::io::Error::other)?;
+    let app_affordance = TheoremAppAffordanceService::recovering_with_code_index_and_cache(
+        code_index.clone(),
+        valkey_cache.clone(),
+    )
+    .map_err(std::io::Error::other)?;
+    let readiness = ReadinessState {
+        code_index: code_index.clone(),
+        app_affordance: app_affordance.clone(),
+    };
     let search_svc =
         SearchServiceServer::new(TheoremSearchService::new(engine, valkey_cache.clone()));
     let code_svc =
         CodeCrawlerServiceServer::new(TheoremCodeCrawlerService::new(code_index.clone()));
-    let app_affordance_svc = AppAffordanceServiceServer::new(
-        TheoremAppAffordanceService::try_new_with_code_index_and_cache(code_index, valkey_cache)
-            .map_err(std::io::Error::other)?,
-    );
+    let app_affordance_svc = AppAffordanceServiceServer::new(app_affordance);
 
-    tracing::info!("THEOREM_GRPC_READY {}", addr);
-
-    tonic::transport::Server::builder()
+    let grpc = tonic::transport::Server::builder()
         .add_service(search_svc)
         .add_service(code_svc)
-        .add_service(app_affordance_svc)
-        .serve_with_shutdown(addr, shutdown_signal())
+        .add_service(app_affordance_svc);
+    #[allow(deprecated)]
+    let grpc = grpc.into_router();
+    let app = axum::Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .with_state(readiness)
+        .merge(grpc);
+
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("THEOREM_GRPC_BOUND {}", addr);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     tracing::info!("theorem-grpc server stopped");
     Ok(())
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({ "ok": true, "status": "alive" }))
+}
+
+async fn ready(State(state): State<ReadinessState>) -> (StatusCode, Json<Value>) {
+    let code_index = state.code_index.diagnostics();
+    let app_affordance = state.app_affordance.recovery_snapshot();
+    let code_phase = code_index
+        .as_ref()
+        .map(|diagnostics| diagnostics.recovery.phase.as_str())
+        .unwrap_or("failed");
+    let app_phase = app_affordance.phase.as_str();
+    let ready = code_phase == "ready" && app_phase == "ready";
+    let failed = code_phase == "failed" || app_phase == "failed" || code_index.is_err();
+    let status = if ready {
+        "ready"
+    } else if failed {
+        "failed"
+    } else {
+        "recovering"
+    };
+    let status_code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let code_index_json = match code_index {
+        Ok(diagnostics) => diagnostics.to_json(),
+        Err(error) => json!({
+            "recovery": {
+                "phase": "failed",
+                "error": error.to_string(),
+            }
+        }),
+    };
+    (
+        status_code,
+        Json(json!({
+            "ok": ready,
+            "status": status,
+            "code_index": code_index_json,
+            "app_affordance": app_affordance.to_json(),
+        })),
+    )
 }
 
 /// Wait for SIGTERM (production / Docker / Railway) or Ctrl-C (dev). First

@@ -6,10 +6,8 @@
 # backend then dials this service by setting THEOREM_SEARCH_URL to its
 # internal/public gRPC URL (e.g. http://theorem-grpc.railway.internal:8080).
 #
-# No healthcheckPath: this is a pure-gRPC server with no HTTP route, so an HTTP
-# healthcheck would fail the deploy. Railway falls back to "process is up". If a
-# healthcheck is later wanted, add grpc-health-probe or a tiny axum /ready on
-# the same listener (the HTTP+gRPC merge pattern rustyred-thg-server uses).
+# `/health` is liveness and stays 200 during RedCore recovery; `/ready` is
+# readiness and returns 503 until the durable code/app stores finish replay.
 
 [build]
 builder = "DOCKERFILE"
@@ -17,5 +15,7 @@ dockerfilePath = "apps/theorem-grpc/Dockerfile"
 
 [deploy]
 startCommand = "theorem-grpc-server"
+healthcheckPath = "/health"
+healthcheckTimeout = 600
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3

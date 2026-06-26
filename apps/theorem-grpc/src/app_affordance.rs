@@ -18,7 +18,9 @@ use rustyred_thg_affordances::{
     CapabilityScope, InvocationRecordRequest, InvocationRecordResult, SelectionRequest,
     THEOREM_GRPC_MAX_TIMEOUT_MS,
 };
-use rustyred_thg_core::{stable_hash, RedCoreDurability, RedCoreGraphStore, RedCoreOptions};
+use rustyred_thg_core::{
+    now_ms, stable_hash, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+};
 use serde_json::{json, Map, Value};
 use theorem_harness_core::{AffordanceReceipt, ProviderHeadExecutionContext};
 use tonic::{Request, Response, Status};
@@ -55,6 +57,19 @@ impl TheoremAppAffordanceService {
         })
     }
 
+    pub fn recovering_with_code_index_and_cache(
+        code_index: CodeIndexRuntime,
+        cache: ValkeyCache,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            runtime: AppAffordanceRuntime::recovering(code_index, cache)?,
+        })
+    }
+
+    pub fn recovery_snapshot(&self) -> AppStoreRecoverySnapshot {
+        self.runtime.recovery_snapshot()
+    }
+
     pub fn new() -> Self {
         Self::try_new().expect("theorem_grpc RedCore app affordance runtime must open")
     }
@@ -77,8 +92,98 @@ impl pb::AppAffordanceService for TheoremAppAffordanceService {
         let response = self
             .runtime
             .invoke(req, started)
-            .map_err(Status::internal)?;
+            .map_err(status_from_app_error)?;
         Ok(Response::new(response))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppStoreRecoverySnapshot {
+    pub phase: String,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl AppStoreRecoverySnapshot {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "phase": &self.phase,
+            "started_at_ms": self.started_at_ms,
+            "finished_at_ms": self.finished_at_ms,
+            "error": &self.error,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AppStoreRecoveryState {
+    inner: Mutex<AppStoreRecoverySnapshot>,
+}
+
+impl AppStoreRecoveryState {
+    fn ready() -> Self {
+        let now = now_ms().max(0) as u64;
+        Self {
+            inner: Mutex::new(AppStoreRecoverySnapshot {
+                phase: "ready".to_string(),
+                started_at_ms: now,
+                finished_at_ms: Some(now),
+                error: None,
+            }),
+        }
+    }
+
+    fn recovering() -> Self {
+        Self {
+            inner: Mutex::new(AppStoreRecoverySnapshot {
+                phase: "recovering".to_string(),
+                started_at_ms: now_ms().max(0) as u64,
+                finished_at_ms: None,
+                error: None,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> AppStoreRecoverySnapshot {
+        self.inner
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_else(|_| AppStoreRecoverySnapshot {
+                phase: "failed".to_string(),
+                started_at_ms: 0,
+                finished_at_ms: Some(now_ms().max(0) as u64),
+                error: Some("app affordance recovery state lock poisoned".to_string()),
+            })
+    }
+
+    fn mark_ready(&self) {
+        if let Ok(mut snapshot) = self.inner.lock() {
+            snapshot.phase = "ready".to_string();
+            snapshot.finished_at_ms = Some(now_ms().max(0) as u64);
+            snapshot.error = None;
+        }
+    }
+
+    fn mark_failed(&self, error: impl Into<String>) {
+        if let Ok(mut snapshot) = self.inner.lock() {
+            snapshot.phase = "failed".to_string();
+            snapshot.finished_at_ms = Some(now_ms().max(0) as u64);
+            snapshot.error = Some(error.into());
+        }
+    }
+
+    fn readiness_error(&self) -> Option<String> {
+        let snapshot = self.snapshot();
+        match snapshot.phase.as_str() {
+            "ready" => None,
+            "failed" => Some(
+                snapshot
+                    .error
+                    .unwrap_or_else(|| "app affordance RedCore recovery failed".to_string()),
+            ),
+            _ => Some("app affordance RedCore store is still recovering".to_string()),
+        }
     }
 }
 
@@ -89,6 +194,7 @@ struct AppAffordanceRuntime {
     code_index: CodeIndexRuntime,
     session_kg: code_kg::SessionKgCache,
     cache: ValkeyCache,
+    recovery: Arc<AppStoreRecoveryState>,
 }
 
 impl AppAffordanceRuntime {
@@ -100,6 +206,48 @@ impl AppAffordanceRuntime {
             code_index,
             cache,
         )
+    }
+
+    fn recovering(code_index: CodeIndexRuntime, cache: ValkeyCache) -> Result<Self, String> {
+        let data_dir = redcore_data_dir();
+        let options = redcore_options();
+        let adapter = TheseusAppAdapter::from_env();
+        let store = Arc::new(Mutex::new(RedCoreGraphStore::memory()));
+        let recovery = Arc::new(AppStoreRecoveryState::recovering());
+        let runtime = Self {
+            store: Arc::clone(&store),
+            adapter,
+            code_index,
+            session_kg: code_kg::SessionKgCache::new(),
+            cache,
+            recovery: Arc::clone(&recovery),
+        };
+        std::thread::Builder::new()
+            .name("theorem-grpc-app-redcore-recovery".to_string())
+            .spawn(move || {
+                let recovered = (|| {
+                    let mut store = RedCoreGraphStore::open(&data_dir, options).map_err(|err| {
+                        format!("open theorem_grpc RedCore store failed: {err:?}")
+                    })?;
+                    register_theseus_app_affordances(&mut store, "theorem", Some("theorem-grpc"))
+                        .map_err(|err| {
+                            format!("register theorem_grpc affordances failed: {err:?}")
+                        })?;
+                    Ok::<_, String>(store)
+                })();
+                match recovered {
+                    Ok(recovered_store) => match store.lock() {
+                        Ok(mut guard) => {
+                            *guard = recovered_store;
+                            recovery.mark_ready();
+                        }
+                        Err(_) => recovery.mark_failed("app affordance graph store lock poisoned"),
+                    },
+                    Err(error) => recovery.mark_failed(error),
+                }
+            })
+            .map_err(|err| format!("spawn theorem_grpc app recovery thread failed: {err}"))?;
+        Ok(runtime)
     }
 
     fn try_new_at(
@@ -119,7 +267,12 @@ impl AppAffordanceRuntime {
             code_index,
             session_kg: code_kg::SessionKgCache::new(),
             cache,
+            recovery: Arc::new(AppStoreRecoveryState::ready()),
         })
+    }
+
+    fn recovery_snapshot(&self) -> AppStoreRecoverySnapshot {
+        self.recovery.snapshot()
     }
 
     fn invoke(
@@ -127,6 +280,9 @@ impl AppAffordanceRuntime {
         req: pb::InvokeAffordanceRequest,
         started: Instant,
     ) -> Result<pb::InvokeAffordanceResponse, String> {
+        if let Some(error) = self.recovery.readiness_error() {
+            return Err(error);
+        }
         let mut store = self
             .store
             .lock()
@@ -140,6 +296,14 @@ impl AppAffordanceRuntime {
             req,
             started,
         ))
+    }
+}
+
+fn status_from_app_error(error: String) -> Status {
+    if error.contains("recovering") || error.contains("recovery failed") {
+        Status::unavailable(error)
+    } else {
+        Status::internal(error)
     }
 }
 
@@ -644,17 +808,57 @@ fn code_ingest_handler(
     // D1: submit and return immediately. The heavy path runs on the
     // code-index worker with no client deadline; callers poll
     // `code_search.ingest_status` (or stream WatchIngest over gRPC).
+    if let Err(err) = code_index.ensure_ready() {
+        let error_code = err.code;
+        let message = err.message;
+        return HandlerOutcome {
+            status: "failed".to_string(),
+            executed: false,
+            output: merge_json(
+                base,
+                json!({
+                    "code_index_error": message,
+                    "code_index_error_code": error_code,
+                }),
+            ),
+            error_code,
+            message,
+            outcome_value: 0.0,
+            outcome_label: "code_ingest_unavailable".to_string(),
+        };
+    }
     let operation = if reindex { "reindex" } else { "ingest" };
     let caps = RepoFetchCaps::from_requested(input.max_total_bytes);
     let parse_budget_ms = request_u64(request, "parse_budget_ms");
-    let submitted = code_index.submit_ingest_job(IngestJobRequest {
+    let submitted = match code_index.submit_ingest_job(IngestJobRequest {
         input,
         operation: operation.to_string(),
         repo_url,
         caps,
         parse_budget_ms,
         ..Default::default()
-    });
+    }) {
+        Ok(status) => status,
+        Err(err) => {
+            let error_code = err.code;
+            let message = err.message;
+            return HandlerOutcome {
+                status: "failed".to_string(),
+                executed: false,
+                output: merge_json(
+                    base,
+                    json!({
+                        "code_index_error": message,
+                        "code_index_error_code": error_code,
+                    }),
+                ),
+                error_code,
+                message,
+                outcome_value: 0.0,
+                outcome_label: "code_ingest_unavailable".to_string(),
+            };
+        }
+    };
     HandlerOutcome {
         status: "ok".to_string(),
         executed: true,
@@ -1218,10 +1422,7 @@ impl TheseusAppAdapter {
     }
 
     fn new(endpoint: Option<String>, bearer_token: Option<String>) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(THEOREM_GRPC_MAX_TIMEOUT_MS))
-            .build()
-            .expect("reqwest blocking client should build");
+        let client = build_blocking_http_client();
         Self {
             endpoint,
             bearer_token,
@@ -1344,6 +1545,26 @@ impl TheseusAppAdapter {
                 "theseus_adapter_failed".to_string()
             },
         }
+    }
+}
+
+fn build_blocking_http_client() -> reqwest::blocking::Client {
+    fn build() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(THEOREM_GRPC_MAX_TIMEOUT_MS))
+            .build()
+            .expect("reqwest blocking client should build")
+    }
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::Builder::new()
+            .name("theorem-grpc-reqwest-client-init".to_string())
+            .spawn(build)
+            .expect("reqwest blocking client init thread should spawn")
+            .join()
+            .expect("reqwest blocking client init thread should not panic")
+    } else {
+        build()
     }
 }
 

@@ -169,7 +169,10 @@ pub async fn process_event(
             parse_budget_ms: None,
             ..Default::default()
         };
-        let submitted = state.code_index.submit_ingest_job(request);
+        let submitted = state
+            .code_index
+            .submit_ingest_job(request)
+            .map_err(|err| err.to_string())?;
         job = Some(submitted.to_json());
     }
 
