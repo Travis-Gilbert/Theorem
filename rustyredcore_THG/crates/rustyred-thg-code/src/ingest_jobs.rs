@@ -38,6 +38,10 @@ pub const CODE_INGEST_JOB_LABEL: &str = "CodeIngestJob";
 /// so the mirror does not grow without bound. Queued/running jobs are never
 /// pruned.
 const MAX_PERSISTED_TERMINAL_JOBS: usize = 256;
+const RECOVERY_JOB_QUERY_LIMIT_PER_STATE: usize = 1_024;
+const TERMINAL_PRUNE_QUERY_LIMIT_PER_STATE: usize = MAX_PERSISTED_TERMINAL_JOBS + MAX_RETAINED_JOBS;
+const ALL_JOB_STATES: &[&str] = &["queued", "running", "finished", "failed", "budget_exceeded"];
+const TERMINAL_JOB_STATES: &[&str] = &["finished", "failed", "budget_exceeded"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IngestJobState {
@@ -611,9 +615,8 @@ impl IngestJobRegistry {
     /// that never committed or re-commits a fresh, superseding generation).
     /// Returns the number of re-enqueued (runnable) jobs.
     pub(crate) fn recover_from_store(&self, store: &RedCoreGraphStore) -> usize {
-        let nodes = store
-            .query_nodes(NodeQuery::label(CODE_INGEST_JOB_LABEL).with_limit(100_000))
-            .unwrap_or_default();
+        let nodes =
+            query_job_nodes_by_state(store, ALL_JOB_STATES, RECOVERY_JOB_QUERY_LIMIT_PER_STATE);
         let mut recovered: Vec<(u64, String, IngestJobRecord, bool)> = Vec::new();
         for node in nodes {
             if let Some((record, runnable)) = job_record_from_node(&node) {
@@ -776,10 +779,11 @@ fn job_record_from_node(node: &NodeRecord) -> Option<(IngestJobRecord, bool)> {
 /// TTL-expire durable terminal jobs beyond the cap so the mirror stays bounded.
 /// Queued/running jobs are never expired. Runs on submit (bounded frequency).
 fn prune_persisted_terminal_jobs(store: &mut RedCoreGraphStore) {
-    let Ok(nodes) = store.query_nodes(NodeQuery::label(CODE_INGEST_JOB_LABEL).with_limit(100_000))
-    else {
-        return;
-    };
+    let nodes = query_job_nodes_by_state(
+        store,
+        TERMINAL_JOB_STATES,
+        TERMINAL_PRUNE_QUERY_LIMIT_PER_STATE,
+    );
     let mut terminal: Vec<(u64, String)> = nodes
         .into_iter()
         .filter(|node| {
@@ -816,6 +820,27 @@ fn prune_persisted_terminal_jobs(store: &mut RedCoreGraphStore) {
     if expired_any {
         let _ = store.purge_expired_nodes();
     }
+}
+
+fn query_job_nodes_by_state(
+    store: &RedCoreGraphStore,
+    states: &[&str],
+    per_state_limit: usize,
+) -> Vec<NodeRecord> {
+    let mut by_id: BTreeMap<String, NodeRecord> = BTreeMap::new();
+    for state in states {
+        let Ok(nodes) = store.query_nodes(
+            NodeQuery::label(CODE_INGEST_JOB_LABEL)
+                .with_property("state", json!(*state))
+                .with_limit(per_state_limit),
+        ) else {
+            continue;
+        };
+        for node in nodes {
+            by_id.insert(node.id.clone(), node);
+        }
+    }
+    by_id.into_values().collect()
 }
 
 /// Serialize a job request for the durable mirror. The `#[cfg(test)]` pause

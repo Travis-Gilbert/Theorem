@@ -32,10 +32,10 @@ use serde_json::{json, Value};
 use crate::ensure::{ensure_repo_kg_in_store, RepoKgStatus};
 use crate::repo_fetch::{is_fetchable_repo_url, RepoFetchCaps};
 use crate::{
-    bounded_limit, compiler_ambient_readout_in_store, hit_from_node, latest_repo_generations,
-    normalize_tenant, property_string, property_u64, record_receipt, search_code_with_store,
-    CodeHitRecord, CodeIndexError, SearchCodeInput, CALLS_SYMBOL, CENTRALITY_PROPERTY,
-    CODE_SYMBOL_LABEL, DEFAULT_LIMIT, DEPENDS_ON_SYMBOL,
+    bounded_limit, compiler_ambient_readout_in_store, hit_from_node,
+    latest_repo_generations_for_tenant, normalize_tenant, property_string, property_u64,
+    record_receipt, search_code_with_store, CodeHitRecord, CodeIndexError, SearchCodeInput,
+    CALLS_SYMBOL, CENTRALITY_PROPERTY, CODE_SYMBOL_LABEL, DEFAULT_LIMIT, DEPENDS_ON_SYMBOL,
 };
 
 pub const DEFAULT_CONTEXT_PACK_BUDGET_TOKENS: usize = 2_000;
@@ -782,13 +782,15 @@ fn centrality_seed_hits(
     limit: usize,
     already_seen: &BTreeSet<String>,
 ) -> Result<Vec<CodeHitRecord>, CodeIndexError> {
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, tenant_id)?;
     let normalized_kinds = kinds
         .iter()
         .map(|kind| kind.trim().to_ascii_lowercase())
         .filter(|kind| !kind.is_empty())
         .collect::<BTreeSet<_>>();
-    let mut query = NodeQuery::label(CODE_SYMBOL_LABEL).with_limit(100_000);
+    let mut query = NodeQuery::label(CODE_SYMBOL_LABEL)
+        .with_property("tenant_id", json!(tenant_id))
+        .with_limit(100_000);
     if !repo_id.trim().is_empty() {
         query = query.with_property("repo_id", json!(repo_id.trim()));
     }
@@ -797,7 +799,6 @@ fn centrality_seed_hits(
         .map_err(CodeIndexError::from_store)?
         .into_iter()
         .filter(|node| !already_seen.contains(&node.id))
-        .filter(|node| node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_id))
         .filter(|node| match property_string(&node.properties, "repo_id") {
             Some(repo_id) => latest
                 .get(&repo_id)

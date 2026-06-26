@@ -7,8 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -18,7 +20,7 @@ use rustyred_thg_core::{
     HookDispatcherConfig, HookRegistration, NeighborQuery, NodeQuery, NodeRecord, PluginCapability,
     PluginCapabilityKind, PluginExecutionOutput, PluginOperationContext,
     PluginOperationRegistration, PluginRegistry, RedCoreDurability, RedCoreGraphStore,
-    RedCoreOptions, RustyRedPlugin, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
+    RedCoreOptions, RedCoreStatus, RustyRedPlugin, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
     HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
 use serde_json::{json, Value};
@@ -134,12 +136,114 @@ pub struct CodeIndexRuntime {
     store: Arc<Mutex<RedCoreGraphStore>>,
     jobs: Arc<IngestJobRegistry>,
     worker_started: Arc<std::sync::Once>,
+    store_lock_metrics: Arc<CodeStoreLockMetrics>,
+    recovered_runnable_jobs: Arc<AtomicU64>,
     credential_resolver: Option<Arc<dyn GitCredentialResolver>>,
     map_projection_sink: Option<Arc<dyn CodebaseMapProjectionSink>>,
     // Kept alive for the runtime's lifetime so the hook worker keeps draining;
     // `None` unless graph-level code-KG hooks are enabled (see THEOREM_CODE_HOOKS).
     #[allow(dead_code)]
     hook_dispatcher: Option<Arc<HookDispatcher>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CodeStoreLockStats {
+    pub acquisitions: u64,
+    pub wait_total_ms: u64,
+    pub wait_max_ms: u64,
+    pub hold_total_ms: u64,
+    pub hold_max_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct CodeStoreLockMetrics {
+    acquisitions: AtomicU64,
+    wait_total_ms: AtomicU64,
+    wait_max_ms: AtomicU64,
+    hold_total_ms: AtomicU64,
+    hold_max_ms: AtomicU64,
+}
+
+impl CodeStoreLockMetrics {
+    fn record_wait(&self, wait_ms: u64) {
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.wait_total_ms.fetch_add(wait_ms, Ordering::Relaxed);
+        record_atomic_max(&self.wait_max_ms, wait_ms);
+    }
+
+    fn record_hold(&self, hold_ms: u64) {
+        self.hold_total_ms.fetch_add(hold_ms, Ordering::Relaxed);
+        record_atomic_max(&self.hold_max_ms, hold_ms);
+    }
+
+    fn snapshot(&self) -> CodeStoreLockStats {
+        CodeStoreLockStats {
+            acquisitions: self.acquisitions.load(Ordering::Relaxed),
+            wait_total_ms: self.wait_total_ms.load(Ordering::Relaxed),
+            wait_max_ms: self.wait_max_ms.load(Ordering::Relaxed),
+            hold_total_ms: self.hold_total_ms.load(Ordering::Relaxed),
+            hold_max_ms: self.hold_max_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) struct CodeStoreGuard<'a> {
+    guard: MutexGuard<'a, RedCoreGraphStore>,
+    metrics: Arc<CodeStoreLockMetrics>,
+    acquired_at: Instant,
+}
+
+impl Deref for CodeStoreGuard<'_> {
+    type Target = RedCoreGraphStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for CodeStoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for CodeStoreGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.record_hold(elapsed_ms(self.acquired_at));
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeIndexDiagnostics {
+    pub store_status: RedCoreStatus,
+    pub lock_stats: CodeStoreLockStats,
+    pub recovered_runnable_jobs: u64,
+}
+
+impl CodeIndexDiagnostics {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "store_status": &self.store_status,
+            "lock_stats": {
+                "acquisitions": self.lock_stats.acquisitions,
+                "wait_total_ms": self.lock_stats.wait_total_ms,
+                "wait_max_ms": self.lock_stats.wait_max_ms,
+                "hold_total_ms": self.lock_stats.hold_total_ms,
+                "hold_max_ms": self.lock_stats.hold_max_ms,
+            },
+            "recovered_runnable_jobs": self.recovered_runnable_jobs,
+        })
+    }
+}
+
+fn record_atomic_max(slot: &AtomicU64, value: u64) {
+    let mut current = slot.load(Ordering::Relaxed);
+    while value > current {
+        match slot.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Build and start a graph-level hook dispatcher for the code KG over `store`,
@@ -564,6 +668,8 @@ impl CodeIndexRuntime {
     ) -> Result<Self, CodeIndexError> {
         let store = Arc::new(Mutex::new(store));
         let jobs = Arc::new(IngestJobRegistry::with_persistence(Arc::downgrade(&store)));
+        let store_lock_metrics = Arc::new(CodeStoreLockMetrics::default());
+        let recovered_runnable_jobs = Arc::new(AtomicU64::new(0));
         // Start the hook dispatcher before recovery so any re-enqueued ingest's
         // commits are observed. No-op for stores without hooks enabled.
         let hook_dispatcher = if with_hooks {
@@ -575,6 +681,8 @@ impl CodeIndexRuntime {
             store,
             jobs,
             worker_started: Arc::new(std::sync::Once::new()),
+            store_lock_metrics,
+            recovered_runnable_jobs,
             credential_resolver,
             map_projection_sink,
             hook_dispatcher,
@@ -586,6 +694,9 @@ impl CodeIndexRuntime {
             let store = runtime.lock_store()?;
             runtime.jobs.recover_from_store(&store)
         };
+        runtime
+            .recovered_runnable_jobs
+            .store(runnable as u64, Ordering::Relaxed);
         if runnable > 0 {
             runtime.ensure_ingest_worker();
         }
@@ -840,10 +951,27 @@ impl CodeIndexRuntime {
         record_use_receipt_with_store(&mut store, input)
     }
 
-    fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, RedCoreGraphStore>, CodeIndexError> {
-        self.store.lock().map_err(|_| CodeIndexError {
+    pub fn diagnostics(&self) -> Result<CodeIndexDiagnostics, CodeIndexError> {
+        let store = self.lock_store()?;
+        Ok(CodeIndexDiagnostics {
+            store_status: store.status(),
+            lock_stats: self.store_lock_metrics.snapshot(),
+            recovered_runnable_jobs: self.recovered_runnable_jobs.load(Ordering::Relaxed),
+        })
+    }
+
+    pub(crate) fn lock_store(&self) -> Result<CodeStoreGuard<'_>, CodeIndexError> {
+        let wait_started = Instant::now();
+        let guard = self.store.lock().map_err(|_| CodeIndexError {
             code: "code_index_lock_poisoned".to_string(),
             message: "code index RedCore store lock poisoned".to_string(),
+        })?;
+        self.store_lock_metrics
+            .record_wait(elapsed_ms(wait_started));
+        Ok(CodeStoreGuard {
+            guard,
+            metrics: Arc::clone(&self.store_lock_metrics),
+            acquired_at: Instant::now(),
         })
     }
 }
@@ -980,13 +1108,14 @@ pub fn list_repos_in_store(
     let tenant_id = normalize_tenant(&input.tenant_id);
 
     let repo_nodes = store
-        .query_nodes(NodeQuery::label(CODE_REPO_LABEL).with_limit(100_000))
+        .query_nodes(
+            NodeQuery::label(CODE_REPO_LABEL)
+                .with_property("tenant_id", json!(tenant_id.as_str()))
+                .with_limit(10_000),
+        )
         .map_err(CodeIndexError::from_store)?;
     let mut summaries: HashMap<String, RepoSummary> = HashMap::new();
     for node in repo_nodes {
-        if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id.as_str()) {
-            continue;
-        }
         let Some(repo_id) = property_string(&node.properties, "repo_id") else {
             continue;
         };
@@ -1049,13 +1178,14 @@ fn count_code_nodes_by_repo(
     latest: &HashMap<String, u64>,
 ) -> Result<HashMap<String, u64>, CodeIndexError> {
     let nodes = store
-        .query_nodes(NodeQuery::label(label).with_limit(100_000))
+        .query_nodes(
+            NodeQuery::label(label)
+                .with_property("tenant_id", json!(tenant_id))
+                .with_limit(100_000),
+        )
         .map_err(CodeIndexError::from_store)?;
     let mut counts: HashMap<String, u64> = HashMap::new();
     for node in nodes {
-        if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id) {
-            continue;
-        }
         let Some(repo_id) = property_string(&node.properties, "repo_id") else {
             continue;
         };
@@ -1184,6 +1314,7 @@ pub fn code_kg_status_in_store(
         latest_generation,
         indexed_at_ms,
         indexed: repo_node.is_some(),
+        redcore_status: Some(store.status()),
     }
 }
 
@@ -1910,6 +2041,7 @@ pub struct CodeKgStatusOutput {
     pub latest_generation: u64,
     pub indexed_at_ms: u64,
     pub indexed: bool,
+    pub redcore_status: Option<RedCoreStatus>,
 }
 
 impl CodeKgStatusOutput {
@@ -1923,6 +2055,7 @@ impl CodeKgStatusOutput {
             "base_graph_hash": self.base_graph_hash,
             "latest_generation": self.latest_generation,
             "indexed_at_ms": self.indexed_at_ms,
+            "redcore_status": self.redcore_status.as_ref(),
             "manifest": {
                 "tenant_id": self.tenant_id,
                 "repo_id": self.repo_id,
@@ -3110,9 +3243,11 @@ fn search_code_with_store(
     let query = input.query.trim().to_string();
     let limit = bounded_limit(input.limit);
     let kinds = normalize_set(input.kinds);
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, &tenant_id)?;
 
-    let mut node_query = NodeQuery::label(CODE_SYMBOL_LABEL).with_limit(100_000);
+    let mut node_query = NodeQuery::label(CODE_SYMBOL_LABEL)
+        .with_property("tenant_id", json!(tenant_id.as_str()))
+        .with_limit(100_000);
     if !input.repo_id.trim().is_empty() {
         node_query = node_query.with_property("repo_id", json!(input.repo_id.trim()));
     }
@@ -3127,9 +3262,6 @@ fn search_code_with_store(
         let Some(hit) = hit_from_node(&node) else {
             continue;
         };
-        if node.properties.get("tenant_id").and_then(Value::as_str) != Some(tenant_id.as_str()) {
-            continue;
-        }
         if let Some(generation) = latest.get(&hit.repo_id) {
             if property_u64(&node.properties, "generation") != Some(*generation) {
                 continue;
@@ -3190,7 +3322,7 @@ fn code_context_with_store(
     input: CodeContextInput,
 ) -> Result<CodeContextOutput, CodeIndexError> {
     let tenant_id = normalize_tenant(&input.tenant_id);
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, &tenant_id)?;
     let node_id = input.node_id.trim();
 
     let (symbol_id, file_id, target_line) = if node_id.is_empty() {
@@ -3350,7 +3482,7 @@ fn explore_code_with_store(
     } else {
         input.max_depth.min(4) as usize
     };
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, &tenant_id)?;
     let mut edges = Vec::new();
     let mut related_ids = BTreeSet::new();
     expand_symbol_edges(
@@ -3429,7 +3561,7 @@ fn explain_code_with_store(
     };
     let mut symbol = symbol_record_from_node(&focus_node)
         .ok_or_else(|| CodeIndexError::invalid("resolved code node is missing symbol metadata"))?;
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, &tenant_id)?;
     enrich_symbol_graph(store, &mut symbol, &latest)?;
     let context = code_context_with_store(
         store,
@@ -5125,12 +5257,33 @@ fn insert_path_tail_name(path: &syn::Path, out: &mut BTreeSet<String>) {
     }
 }
 
+#[cfg(test)]
 fn latest_repo_generations(
     store: &RedCoreGraphStore,
 ) -> Result<HashMap<String, u64>, CodeIndexError> {
     let repos = store
         .query_nodes(NodeQuery::label(CODE_REPO_LABEL).with_limit(100_000))
         .map_err(CodeIndexError::from_store)?;
+    latest_repo_generations_from_nodes(repos)
+}
+
+fn latest_repo_generations_for_tenant(
+    store: &RedCoreGraphStore,
+    tenant_id: &str,
+) -> Result<HashMap<String, u64>, CodeIndexError> {
+    let repos = store
+        .query_nodes(
+            NodeQuery::label(CODE_REPO_LABEL)
+                .with_property("tenant_id", json!(tenant_id))
+                .with_limit(10_000),
+        )
+        .map_err(CodeIndexError::from_store)?;
+    latest_repo_generations_from_nodes(repos)
+}
+
+fn latest_repo_generations_from_nodes(
+    repos: Vec<NodeRecord>,
+) -> Result<HashMap<String, u64>, CodeIndexError> {
     Ok(repos
         .into_iter()
         .filter_map(|node| {
@@ -5215,7 +5368,7 @@ fn recognize_indexed_symbols(
     if !input.file_path.trim().is_empty() {
         query = query.with_property("file_path", json!(input.file_path.trim()));
     }
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, tenant_id)?;
     let mut out = store
         .query_nodes(query)
         .map_err(CodeIndexError::from_store)?
@@ -5260,17 +5413,18 @@ fn resolve_symbol_node(
     if query.trim().is_empty() {
         return Ok(None);
     }
-    let mut node_query = NodeQuery::label(CODE_SYMBOL_LABEL).with_limit(100_000);
+    let mut node_query = NodeQuery::label(CODE_SYMBOL_LABEL)
+        .with_property("tenant_id", json!(tenant_id))
+        .with_limit(100_000);
     if !repo_id.trim().is_empty() {
         node_query = node_query.with_property("repo_id", json!(repo_id.trim()));
     }
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, tenant_id)?;
     let query_terms = query_terms(query);
     let mut scored = store
         .query_nodes(node_query)
         .map_err(CodeIndexError::from_store)?
         .into_iter()
-        .filter(|node| node.properties.get("tenant_id").and_then(Value::as_str) == Some(tenant_id))
         .filter(|node| match property_string(&node.properties, "repo_id") {
             Some(repo_id) => latest
                 .get(&repo_id)
@@ -6035,6 +6189,20 @@ mod tests {
         )
         .unwrap();
         repo_dir
+    }
+
+    #[test]
+    fn runtime_diagnostics_reports_store_status_and_lock_activity() {
+        let runtime = CodeIndexRuntime::try_new_with_store(RedCoreGraphStore::memory()).unwrap();
+        let before = runtime.diagnostics().unwrap();
+
+        runtime.graph_snapshot().unwrap();
+
+        let after = runtime.diagnostics().unwrap();
+        assert_eq!(after.store_status.mode, "memory");
+        assert!(after.lock_stats.acquisitions >= before.lock_stats.acquisitions + 2);
+        assert_eq!(after.recovered_runnable_jobs, 0);
+        assert!(after.to_json()["store_status"]["mode"].as_str() == Some("memory"));
     }
 
     #[test]

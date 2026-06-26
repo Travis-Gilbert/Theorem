@@ -21,8 +21,8 @@ use crate::code_embed_hook::{
     symbol_embedding_text,
 };
 use crate::{
-    latest_repo_generations, normalize_tenant, property_string, property_u64, CALLS_SYMBOL,
-    CODE_SYMBOL_LABEL, DECLARES_SYMBOL, DEPENDS_ON_SYMBOL, EMBEDDING_PROPERTY,
+    latest_repo_generations_for_tenant, normalize_tenant, property_string, property_u64,
+    CALLS_SYMBOL, CODE_SYMBOL_LABEL, DECLARES_SYMBOL, DEPENDS_ON_SYMBOL, EMBEDDING_PROPERTY,
 };
 
 pub const CODE_EPISTEMIC_ENGINE: &str = "rustyred-thg-code.instant_structural_epistemic";
@@ -128,7 +128,7 @@ pub fn run_code_epistemic_pass_for_repo(
     }
     ensure_embedding_designation(store)
         .map_err(|err| crate::CodeIndexError::invalid(err.to_string()))?;
-    let latest = latest_repo_generations(store)?;
+    let latest = latest_repo_generations_for_tenant(store, &tenant)?;
     let generation = generation
         .or_else(|| latest.get(repo_id).copied())
         .unwrap_or(0);

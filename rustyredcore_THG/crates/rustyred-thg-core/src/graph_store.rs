@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -2307,7 +2307,14 @@ pub struct RedCoreStatus {
     pub graph_version: u64,
     pub last_txn_id: u64,
     pub snapshot_txn_id: u64,
+    pub txn_lag_since_snapshot: u64,
     pub recovered_frames: u64,
+    pub skipped_aof_frames: u64,
+    pub aof_size_bytes: u64,
+    pub aof_replay_bytes: u64,
+    pub recovery_duration_ms: u64,
+    pub truncated_aof_tail: bool,
+    pub last_fsync_unix_ms: Option<u128>,
     pub last_recovery_ok: bool,
     pub strict_acid: bool,
 }
@@ -2398,6 +2405,11 @@ pub struct RedCoreGraphStore {
     last_txn_id: u64,
     snapshot_txn_id: u64,
     recovered_frames: u64,
+    skipped_aof_frames: u64,
+    aof_size_bytes: u64,
+    aof_replay_bytes: u64,
+    recovery_duration_ms: u64,
+    truncated_aof_tail: bool,
     last_recovery_ok: bool,
     last_fsync: Option<SystemTime>,
     transient_ordered_indexes: HashMap<String, OrderedIndex>,
@@ -2451,6 +2463,11 @@ impl RedCoreGraphStore {
             last_txn_id: 0,
             snapshot_txn_id: 0,
             recovered_frames: 0,
+            skipped_aof_frames: 0,
+            aof_size_bytes: 0,
+            aof_replay_bytes: 0,
+            recovery_duration_ms: 0,
+            truncated_aof_tail: false,
             last_recovery_ok: true,
             last_fsync: None,
             transient_ordered_indexes: HashMap::new(),
@@ -2475,6 +2492,11 @@ impl RedCoreGraphStore {
             last_txn_id: 0,
             snapshot_txn_id: 0,
             recovered_frames: 0,
+            skipped_aof_frames: 0,
+            aof_size_bytes: 0,
+            aof_replay_bytes: 0,
+            recovery_duration_ms: 0,
+            truncated_aof_tail: false,
             last_recovery_ok: false,
             last_fsync: None,
             transient_ordered_indexes: HashMap::new(),
@@ -2483,7 +2505,10 @@ impl RedCoreGraphStore {
             hook_tenant: String::new(),
             recorded_committed_mutations: None,
         };
+        let recovery_started = Instant::now();
         engine.recover()?;
+        engine.recovery_duration_ms =
+            recovery_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         engine.last_recovery_ok = true;
         engine.write_manifest()?;
         Ok(engine)
@@ -2557,7 +2582,14 @@ impl RedCoreGraphStore {
             graph_version: self.store.stats().version,
             last_txn_id: self.last_txn_id,
             snapshot_txn_id: self.snapshot_txn_id,
+            txn_lag_since_snapshot: self.last_txn_id.saturating_sub(self.snapshot_txn_id),
             recovered_frames: self.recovered_frames,
+            skipped_aof_frames: self.skipped_aof_frames,
+            aof_size_bytes: self.aof_size_bytes,
+            aof_replay_bytes: self.aof_replay_bytes,
+            recovery_duration_ms: self.recovery_duration_ms,
+            truncated_aof_tail: self.truncated_aof_tail,
+            last_fsync_unix_ms: self.last_fsync.and_then(system_time_unix_ms),
             last_recovery_ok: self.last_recovery_ok,
             strict_acid: self.options.strict_acid,
         }
@@ -3523,6 +3555,10 @@ impl RedCoreGraphStore {
             .write(true)
             .open(&path)
             .map_err(|err| GraphStoreError::io("open RedCore AOF", err))?;
+        self.aof_size_bytes = file
+            .metadata()
+            .map_err(|err| GraphStoreError::io("stat RedCore AOF", err))?
+            .len();
         let read_file = file
             .try_clone()
             .map_err(|err| GraphStoreError::io("clone RedCore AOF reader", err))?;
@@ -3539,10 +3575,13 @@ impl RedCoreGraphStore {
             let frame_end = frame_start + bytes_read as u64;
             if line.trim().is_empty() {
                 frame_start = frame_end;
+                self.aof_replay_bytes = frame_end;
                 continue;
             }
             if !line.ends_with('\n') {
                 truncate_aof_tail(&file, data_dir, frame_start)?;
+                self.truncated_aof_tail = true;
+                self.aof_replay_bytes = frame_start;
                 break;
             }
             let raw = line.trim_end_matches(['\r', '\n']);
@@ -3550,17 +3589,22 @@ impl RedCoreGraphStore {
                 Ok(frame) => frame,
                 Err(_) => {
                     truncate_aof_tail(&file, data_dir, frame_start)?;
+                    self.truncated_aof_tail = true;
+                    self.aof_replay_bytes = frame_start;
                     break;
                 }
             };
             if frame.txn_id <= self.snapshot_txn_id {
                 frame_start = frame_end;
+                self.skipped_aof_frames += 1;
+                self.aof_replay_bytes = frame_end;
                 continue;
             }
             self.apply_recovered_mutation(frame.mutation)?;
             self.last_txn_id = self.last_txn_id.max(frame.txn_id);
             self.recovered_frames += 1;
             frame_start = frame_end;
+            self.aof_replay_bytes = frame_end;
         }
         Ok(())
     }
@@ -4127,6 +4171,12 @@ pub fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+fn system_time_unix_ms(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
 }
 
 #[cfg(feature = "redis-store")]
@@ -6135,7 +6185,16 @@ mod tests {
             store.neighbors(NeighborQuery::out("node:a")).unwrap()[0].node_id,
             "node:b"
         );
-        assert_eq!(store.status().recovered_frames, 3);
+        let status = store.status();
+        assert_eq!(status.recovered_frames, 3);
+        assert_eq!(status.skipped_aof_frames, 0);
+        assert!(status.aof_replay_bytes > 0);
+        assert!(status.aof_size_bytes >= status.aof_replay_bytes);
+        assert_eq!(
+            status.txn_lag_since_snapshot,
+            status.last_txn_id.saturating_sub(status.snapshot_txn_id)
+        );
+        assert_eq!(status.truncated_aof_tail, false);
         assert_eq!(store.verify().unwrap().ok, true);
 
         std::fs::remove_dir_all(data_dir).ok();

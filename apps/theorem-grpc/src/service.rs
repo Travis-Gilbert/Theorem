@@ -223,7 +223,7 @@ impl pb::SearchService for TheoremSearchService {
 /// fabrication. Kept private to the service module.
 mod map {
     use super::*;
-    use rustyred_thg_core::{InMemoryGraphStore, NodeQuery};
+    use rustyred_thg_core::InMemoryGraphStore;
     use rustyred_web::{SearchHit, LABEL_PAGE};
 
     /// Map a finished substrate search onto the wire SearchResponse.
@@ -343,14 +343,9 @@ mod map {
     /// Build a single-node ProvenanceGraph if `result_id` resolves to a Page
     /// node in the store, else an empty graph rooted at the requested id.
     pub fn provenance_for(store: &InMemoryGraphStore, result_id: &str) -> pb::ProvenanceGraph {
-        // Resolve by scanning Page nodes for a matching id. Bounded scan is fine
-        // for slice 1 (small substrate); a future enrichment can index by id.
-        let pages = store.query_nodes(NodeQuery::label(LABEL_PAGE));
-        let found = pages.into_iter().find(|p| p.id == result_id);
-
-        match found {
-            Some(node) => {
-                let label = title_from_node(&node);
+        match store.get_node(result_id) {
+            Some(node) if node.labels.iter().any(|label| label == LABEL_PAGE) => {
+                let label = title_from_node(node);
                 pb::ProvenanceGraph {
                     nodes: vec![pb::ProvenanceNode {
                         node_id: result_id.to_string(),
@@ -362,7 +357,7 @@ mod map {
                     root_result_id: result_id.to_string(),
                 }
             }
-            None => pb::ProvenanceGraph {
+            _ => pb::ProvenanceGraph {
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 root_result_id: result_id.to_string(),
@@ -391,5 +386,37 @@ mod map {
             Some(seg) if !seg.is_empty() => seg.to_string(),
             _ => url.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyred_thg_core::{InMemoryGraphStore, NodeRecord};
+    use rustyred_web::LABEL_PAGE;
+    use serde_json::json;
+
+    #[test]
+    fn provenance_uses_direct_page_lookup_and_rejects_other_labels() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(NodeRecord::new(
+                "page:1",
+                [LABEL_PAGE],
+                json!({ "url": "https://example.test/docs/intro" }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new("node:other", ["Other"], json!({})))
+            .unwrap();
+
+        let graph = map::provenance_for(&store, "page:1");
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].node_id, "page:1");
+        assert_eq!(graph.nodes[0].label, "intro");
+
+        let wrong_label = map::provenance_for(&store, "node:other");
+        assert!(wrong_label.nodes.is_empty());
+        assert_eq!(wrong_label.root_result_id, "node:other");
     }
 }
