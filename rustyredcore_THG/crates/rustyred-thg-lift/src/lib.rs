@@ -279,6 +279,9 @@ fn lift_block(
             if let Some(target) = instruction.branch_target {
                 successors.insert(target);
             }
+            if instruction.flow_control == "ConditionalBranch" {
+                successors.insert(instruction.address + instruction.size as u64);
+            }
             lift_statement(instruction)
         })
         .collect();
@@ -458,6 +461,14 @@ mod tests {
         }
     }
 
+    fn fixture_load_report_with_bytes(bytes: Vec<u8>) -> BinaryLoadReport {
+        let mut load = fixture_load_report();
+        load.artifact.byte_len = bytes.len();
+        load.sections[0].size = bytes.len() as u64;
+        load.sections[0].bytes = bytes;
+        load
+    }
+
     #[test]
     fn lifts_instruction_facts_to_thir() {
         let load = fixture_load_report();
@@ -492,5 +503,16 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn conditional_branch_block_records_target_and_fallthrough_successors() {
+        let load = fixture_load_report_with_bytes(vec![0x74, 0x01, 0x90, 0xc3]);
+        let disasm = decode_instructions(&load).unwrap();
+        let program = lift_to_thir(&load, &disasm);
+        let successors = &program.functions[0].blocks[0].successors;
+
+        assert!(successors.contains(&0x1002));
+        assert!(successors.contains(&0x1003));
     }
 }

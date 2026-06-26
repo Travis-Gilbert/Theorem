@@ -16196,7 +16196,7 @@ mod tests {
             NodeRecord::new(
                 "recon:instr:test",
                 ["ReconstructionInstruction"],
-                json!({"source_artifact": "sha256:test"}),
+                json!({"tenant_id": "smoke", "source_artifact": "sha256:test"}),
             ),
         )
         .unwrap();

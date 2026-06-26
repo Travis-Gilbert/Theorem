@@ -161,7 +161,7 @@ pub fn compile_reconstruction_analysis(
 }
 
 pub fn derive_semantic_roles(load: &BinaryLoadReport, program: &ThirProgram) -> Vec<SemanticRole> {
-    let evidence_by_role = evidence_by_role(load);
+    let evidence_by_function = evidence_by_function_and_role(load, program);
     let mut roles = Vec::new();
     for function in &program.functions {
         if is_entry_function(load, function) {
@@ -173,14 +173,16 @@ pub fn derive_semantic_roles(load: &BinaryLoadReport, program: &ThirProgram) -> 
                 "derived_fact",
             ));
         }
-        for (role, evidence) in &evidence_by_role {
-            roles.push(role_for(
-                function,
-                role.clone(),
-                role_confidence(role, evidence.len()),
-                evidence.clone(),
-                "hypothesis",
-            ));
+        if let Some(evidence_by_role) = evidence_by_function.get(&function.function_id) {
+            for (role, evidence) in evidence_by_role {
+                roles.push(role_for(
+                    function,
+                    role.clone(),
+                    role_confidence(role, evidence.len()),
+                    evidence.clone(),
+                    "hypothesis",
+                ));
+            }
         }
     }
     roles.sort_by(|left, right| left.role_id.cmp(&right.role_id));
@@ -307,14 +309,30 @@ pub fn write_reconstruction_analysis_in_store<S: GraphStore>(
     store: &mut S,
     analysis: &ReconstructionAnalysis,
 ) -> GraphStoreResult<()> {
+    write_reconstruction_analysis_in_store_scoped(store, analysis, None)
+}
+
+pub fn write_reconstruction_analysis_in_store_for_tenant<S: GraphStore>(
+    store: &mut S,
+    analysis: &ReconstructionAnalysis,
+    tenant_id: &str,
+) -> GraphStoreResult<()> {
+    write_reconstruction_analysis_in_store_scoped(store, analysis, Some(tenant_id))
+}
+
+fn write_reconstruction_analysis_in_store_scoped<S: GraphStore>(
+    store: &mut S,
+    analysis: &ReconstructionAnalysis,
+    tenant_id: Option<&str>,
+) -> GraphStoreResult<()> {
     for role in &analysis.roles {
-        store.upsert_node(role_node(role))?;
+        store.upsert_node(role_node(role, tenant_id))?;
         store.upsert_edge(EdgeRecord::new(
             edge_id(&role.function_id, FUNCTION_HAS_SEMANTIC_ROLE, &role.role_id),
             &role.function_id,
             FUNCTION_HAS_SEMANTIC_ROLE,
             &role.role_id,
-            json!({"authority": role.authority, "source": RECONSTRUCT_SOURCE, "version": RECONSTRUCT_VERSION}),
+            provenance_props(&role.authority, tenant_id),
         ))?;
         for evidence_id in &role.evidence {
             store.upsert_edge(EdgeRecord::new(
@@ -322,38 +340,46 @@ pub fn write_reconstruction_analysis_in_store<S: GraphStore>(
                 &role.role_id,
                 ROLE_EVIDENCED_BY,
                 evidence_id,
-                json!({"authority": role.authority, "source": RECONSTRUCT_SOURCE, "version": RECONSTRUCT_VERSION}),
+                provenance_props(&role.authority, tenant_id),
             ))?;
         }
     }
     for component in &analysis.components {
-        store.upsert_node(component_node(component))?;
+        store.upsert_node(component_node(component, tenant_id))?;
         for function_id in &component.function_ids {
             store.upsert_edge(EdgeRecord::new(
                 edge_id(function_id, BELONGS_TO_COMPONENT, &component.component_id),
                 function_id,
                 BELONGS_TO_COMPONENT,
                 &component.component_id,
-                json!({"authority": component.authority, "source": RECONSTRUCT_SOURCE, "version": RECONSTRUCT_VERSION}),
+                provenance_props(&component.authority, tenant_id),
             ))?;
         }
     }
-    store.upsert_node(plan_node(&analysis.plan))?;
+    store.upsert_node(plan_node(&analysis.plan, tenant_id))?;
     for instruction in &analysis.plan.instructions {
-        store.upsert_node(instruction_node(instruction))?;
+        store.upsert_node(instruction_node(instruction, tenant_id))?;
         store.upsert_edge(EdgeRecord::new(
-            edge_id(&analysis.plan.plan_id, PLAN_HAS_INSTRUCTION, &instruction.id),
+            edge_id(
+                &analysis.plan.plan_id,
+                PLAN_HAS_INSTRUCTION,
+                &instruction.id,
+            ),
             &analysis.plan.plan_id,
             PLAN_HAS_INSTRUCTION,
             &instruction.id,
-            json!({"authority": "instruction", "source": RECONSTRUCT_SOURCE, "version": RECONSTRUCT_VERSION}),
+            provenance_props("instruction", tenant_id),
         ))?;
         store.upsert_edge(EdgeRecord::new(
-            edge_id(&instruction.id, INSTRUCTION_TARGETS_COMPONENT, &instruction.target.id),
+            edge_id(
+                &instruction.id,
+                INSTRUCTION_TARGETS_COMPONENT,
+                &instruction.target.id,
+            ),
             &instruction.id,
             INSTRUCTION_TARGETS_COMPONENT,
             &instruction.target.id,
-            json!({"authority": "instruction", "source": RECONSTRUCT_SOURCE, "version": RECONSTRUCT_VERSION}),
+            provenance_props("instruction", tenant_id),
         ))?;
         for evidence_id in &instruction.evidence {
             store.upsert_edge(EdgeRecord::new(
@@ -361,7 +387,7 @@ pub fn write_reconstruction_analysis_in_store<S: GraphStore>(
                 &instruction.id,
                 INSTRUCTION_EVIDENCED_BY,
                 evidence_id,
-                json!({"authority": "instruction", "source": RECONSTRUCT_SOURCE, "version": RECONSTRUCT_VERSION}),
+                provenance_props("instruction", tenant_id),
             ))?;
         }
     }
@@ -372,7 +398,23 @@ pub fn write_validation_receipt_in_store<S: GraphStore>(
     store: &mut S,
     receipt: &ValidationReceipt,
 ) -> GraphStoreResult<()> {
-    store.upsert_node(receipt_node(receipt))?;
+    write_validation_receipt_in_store_scoped(store, receipt, None)
+}
+
+pub fn write_validation_receipt_in_store_for_tenant<S: GraphStore>(
+    store: &mut S,
+    receipt: &ValidationReceipt,
+    tenant_id: &str,
+) -> GraphStoreResult<()> {
+    write_validation_receipt_in_store_scoped(store, receipt, Some(tenant_id))
+}
+
+fn write_validation_receipt_in_store_scoped<S: GraphStore>(
+    store: &mut S,
+    receipt: &ValidationReceipt,
+    tenant_id: Option<&str>,
+) -> GraphStoreResult<()> {
+    store.upsert_node(receipt_node(receipt, tenant_id))?;
     store.upsert_edge(EdgeRecord::new(
         edge_id(
             &receipt.receipt_id,
@@ -382,11 +424,14 @@ pub fn write_validation_receipt_in_store<S: GraphStore>(
         &receipt.receipt_id,
         RECEIPT_VALIDATES_INSTRUCTION,
         &receipt.instruction_id,
-        json!({
-            "authority": if receipt.passed { "validated_instruction" } else { "instruction" },
-            "source": RECONSTRUCT_SOURCE,
-            "version": RECONSTRUCT_VERSION,
-        }),
+        provenance_props(
+            if receipt.passed {
+                "validated_instruction"
+            } else {
+                "instruction"
+            },
+            tenant_id,
+        ),
     ))?;
     Ok(())
 }
@@ -428,14 +473,20 @@ pub fn validate_instruction(
     }
 }
 
-fn evidence_by_role(load: &BinaryLoadReport) -> BTreeMap<SemanticRoleKind, Vec<String>> {
-    let mut map = BTreeMap::<String, (SemanticRoleKind, BTreeSet<String>)>::new();
+fn evidence_by_function_and_role(
+    load: &BinaryLoadReport,
+    program: &ThirProgram,
+) -> BTreeMap<String, BTreeMap<SemanticRoleKind, Vec<String>>> {
+    let mut map = BTreeMap::<String, BTreeMap<SemanticRoleKind, BTreeSet<String>>>::new();
     for string in &load.strings {
-        for role in roles_for_string(string) {
-            map.entry(format!("{role:?}"))
-                .or_insert((role, BTreeSet::new()))
-                .1
-                .insert(string.string_id.clone());
+        if let Some(function) = single_function_owner(program) {
+            for role in roles_for_string(string) {
+                map.entry(function.function_id.clone())
+                    .or_default()
+                    .entry(role)
+                    .or_default()
+                    .insert(string.string_id.clone());
+            }
         }
     }
     for symbol in &load.symbols {
@@ -449,15 +500,23 @@ fn evidence_by_role(load: &BinaryLoadReport) -> BTreeMap<SemanticRoleKind, Vec<S
         } else {
             None
         };
-        if let Some(role) = role {
-            map.entry(format!("{role:?}"))
-                .or_insert((role, BTreeSet::new()))
-                .1
+        if let (Some(role), Some(function)) = (role, function_for_address(program, symbol.address))
+        {
+            map.entry(function.function_id.clone())
+                .or_default()
+                .entry(role)
+                .or_default()
                 .insert(symbol.symbol_id.clone());
         }
     }
-    map.into_values()
-        .map(|(role, evidence)| (role, evidence.into_iter().collect()))
+    map.into_iter()
+        .map(|(function_id, evidence_by_role)| {
+            let evidence_by_role = evidence_by_role
+                .into_iter()
+                .map(|(role, evidence)| (role, evidence.into_iter().collect()))
+                .collect();
+            (function_id, evidence_by_role)
+        })
         .collect()
 }
 
@@ -523,6 +582,28 @@ fn function_by_address<'a>(program: &'a ThirProgram, address: u64) -> Option<&'a
         .functions
         .iter()
         .find(|function| function.address == address)
+}
+
+fn single_function_owner(program: &ThirProgram) -> Option<&ThirFunction> {
+    (program.functions.len() == 1).then(|| &program.functions[0])
+}
+
+fn function_for_address(program: &ThirProgram, address: u64) -> Option<&ThirFunction> {
+    if address == 0 {
+        return None;
+    }
+    let mut functions = program.functions.iter().collect::<Vec<_>>();
+    functions.sort_by_key(|function| function.address);
+    for (index, function) in functions.iter().enumerate() {
+        let next_address = functions
+            .get(index + 1)
+            .map(|next_function| next_function.address)
+            .unwrap_or(u64::MAX);
+        if address >= function.address && address < next_address {
+            return Some(*function);
+        }
+    }
+    None
 }
 
 fn component_name(function: &ThirFunction, roles: &[&SemanticRole]) -> String {
@@ -656,11 +737,12 @@ fn uncertainty_for_roles(roles: &[&SemanticRole]) -> Vec<String> {
     uncertainty
 }
 
-fn role_node(role: &SemanticRole) -> NodeRecord {
+fn role_node(role: &SemanticRole, tenant_id: Option<&str>) -> NodeRecord {
     NodeRecord::new(
         &role.role_id,
         [SEMANTIC_ROLE_LABEL],
-        json!({
+        stamp_tenant(
+            json!({
             "function_id": &role.function_id,
             "role": &role.role,
             "confidence": role.confidence,
@@ -668,15 +750,18 @@ fn role_node(role: &SemanticRole) -> NodeRecord {
             "authority": &role.authority,
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
-        }),
+            }),
+            tenant_id,
+        ),
     )
 }
 
-fn component_node(component: &ComponentHypothesis) -> NodeRecord {
+fn component_node(component: &ComponentHypothesis, tenant_id: Option<&str>) -> NodeRecord {
     NodeRecord::new(
         &component.component_id,
         [COMPONENT_HYPOTHESIS_LABEL],
-        json!({
+        stamp_tenant(
+            json!({
             "artifact_id": &component.artifact_id,
             "name": &component.name,
             "function_ids": &component.function_ids,
@@ -685,30 +770,39 @@ fn component_node(component: &ComponentHypothesis) -> NodeRecord {
             "authority": &component.authority,
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
-        }),
+            }),
+            tenant_id,
+        ),
     )
 }
 
-fn plan_node(plan: &ReconstructionPlan) -> NodeRecord {
+fn plan_node(plan: &ReconstructionPlan, tenant_id: Option<&str>) -> NodeRecord {
     NodeRecord::new(
         &plan.plan_id,
         [RECONSTRUCTION_PLAN_LABEL],
-        json!({
+        stamp_tenant(
+            json!({
             "source_artifact": &plan.source_artifact,
             "instruction_count": plan.instructions.len(),
             "confidence": plan.confidence,
             "authority": "instruction",
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
-        }),
+            }),
+            tenant_id,
+        ),
     )
 }
 
-fn instruction_node(instruction: &ReconstructionInstruction) -> NodeRecord {
+fn instruction_node(
+    instruction: &ReconstructionInstruction,
+    tenant_id: Option<&str>,
+) -> NodeRecord {
     NodeRecord::new(
         &instruction.id,
         [RECONSTRUCTION_INSTRUCTION_LABEL],
-        json!({
+        stamp_tenant(
+            json!({
             "source_artifact": &instruction.source_artifact,
             "target": &instruction.target,
             "action": &instruction.action,
@@ -720,15 +814,18 @@ fn instruction_node(instruction: &ReconstructionInstruction) -> NodeRecord {
             "authority": "instruction",
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
-        }),
+            }),
+            tenant_id,
+        ),
     )
 }
 
-fn receipt_node(receipt: &ValidationReceipt) -> NodeRecord {
+fn receipt_node(receipt: &ValidationReceipt, tenant_id: Option<&str>) -> NodeRecord {
     NodeRecord::new(
         &receipt.receipt_id,
         [VALIDATION_RECEIPT_LABEL],
-        json!({
+        stamp_tenant(
+            json!({
             "instruction_id": &receipt.instruction_id,
             "validator_type": &receipt.validator_type,
             "passed": receipt.passed,
@@ -738,8 +835,28 @@ fn receipt_node(receipt: &ValidationReceipt) -> NodeRecord {
             "authority": if receipt.passed { "validated_instruction" } else { "instruction" },
             "source": RECONSTRUCT_SOURCE,
             "version": RECONSTRUCT_VERSION,
-        }),
+            }),
+            tenant_id,
+        ),
     )
+}
+
+fn provenance_props(authority: &str, tenant_id: Option<&str>) -> Value {
+    stamp_tenant(
+        json!({
+            "authority": authority,
+            "source": RECONSTRUCT_SOURCE,
+            "version": RECONSTRUCT_VERSION,
+        }),
+        tenant_id,
+    )
+}
+
+fn stamp_tenant(mut properties: Value, tenant_id: Option<&str>) -> Value {
+    if let (Some(tenant_id), Value::Object(map)) = (tenant_id, &mut properties) {
+        map.insert("tenant_id".to_string(), json!(tenant_id));
+    }
+    properties
 }
 
 fn edge_id(from: &str, edge_type: &str, to: &str) -> String {
@@ -751,7 +868,7 @@ mod tests {
     use super::*;
     use rustyred_thg_binformat::{
         write_binary_facts_in_store, BinaryArtifact, BinaryEntrypoint, BinaryLoadReport,
-        BinarySection, BinaryString,
+        BinarySection, BinaryString, BinarySymbol,
     };
     use rustyred_thg_core::{InMemoryGraphStore, NodeQuery};
     use rustyred_thg_disasm::{decode_instructions, write_instruction_facts_in_store};
@@ -805,6 +922,17 @@ mod tests {
         }
     }
 
+    fn thir_function(address: u64) -> ThirFunction {
+        ThirFunction {
+            function_id: format!("thir:function:sha256:test:{address:x}"),
+            artifact_id: "sha256:test".to_string(),
+            address,
+            name: None,
+            confidence: 0.8,
+            blocks: Vec::new(),
+        }
+    }
+
     #[test]
     fn compiles_evidence_backed_instructions() {
         let load = fixture_load_report();
@@ -849,6 +977,72 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn tenant_scoped_writer_stamps_reconstruction_instruction_nodes() {
+        let load = fixture_load_report();
+        let disasm = decode_instructions(&load).unwrap();
+        let program = lift_to_thir(&load, &disasm);
+        let analysis = compile_reconstruction_analysis(&load, &program);
+        let mut store = InMemoryGraphStore::new();
+        write_binary_facts_in_store(&mut store, &load).unwrap();
+        write_instruction_facts_in_store(&mut store, &disasm).unwrap();
+        write_thir_in_store(&mut store, &program).unwrap();
+
+        write_reconstruction_analysis_in_store_for_tenant(&mut store, &analysis, "Travis-Gilbert")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .query_nodes(
+                    NodeQuery::label(RECONSTRUCTION_INSTRUCTION_LABEL)
+                        .with_property("tenant_id", json!("Travis-Gilbert")),
+                )
+                .len(),
+            1
+        );
+        assert!(store
+            .query_nodes(
+                NodeQuery::label(RECONSTRUCTION_INSTRUCTION_LABEL)
+                    .with_property("tenant_id", json!("Other-Tenant")),
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn global_string_evidence_does_not_attach_roles_to_every_function() {
+        let mut load = fixture_load_report();
+        load.symbols = vec![BinarySymbol {
+            symbol_id: "symbol:db".to_string(),
+            artifact_id: "sha256:test".to_string(),
+            index: 0,
+            name: "sqlite3_prepare_v2".to_string(),
+            address: 0x2000,
+            size: 12,
+            kind: "Text".to_string(),
+            scope: "Dynamic".to_string(),
+            is_definition: false,
+        }];
+        let program = ThirProgram {
+            artifact_id: "sha256:test".to_string(),
+            functions: vec![thir_function(0x1000), thir_function(0x2000)],
+        };
+
+        let roles = derive_semantic_roles(&load, &program);
+
+        assert!(!roles.iter().any(|role| matches!(
+            role.role,
+            SemanticRoleKind::HttpRoute | SemanticRoleKind::AuthCheck
+        )));
+        assert!(roles.iter().any(|role| {
+            role.function_id == "thir:function:sha256:test:2000"
+                && role.role == SemanticRoleKind::DatabaseAccess
+        }));
+        assert!(!roles.iter().any(|role| {
+            role.function_id == "thir:function:sha256:test:1000"
+                && role.role == SemanticRoleKind::DatabaseAccess
+        }));
     }
 
     #[test]
