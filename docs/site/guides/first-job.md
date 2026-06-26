@@ -87,6 +87,16 @@ curl -s localhost:50080/connectors/register \
 
 The server spawns the target, performs the MCP handshake, lists its tools, and registers each as an affordance. List them back with `GET /connectors?tenant=Travis-Gilbert`.
 
+For the built-in content extraction lane, register content-core without hand-writing the target:
+
+```bash
+curl -s localhost:50080/connectors/register/content-core \
+  -H 'content-type: application/json' \
+  -d '{ "tenant": "Travis-Gilbert" }'
+```
+
+That persists the `content-core` connector and exposes its extraction tools through the `content_extraction` affordance family.
+
 ## A reminder on auth
 
 This server does not authenticate requests. The examples above work because the tenant is just a string. Before exposing the server beyond a trusted network, front it with an authenticating proxy — the write endpoints (`/harness/jobs`, `/connectors/register`, room messages) are otherwise open.

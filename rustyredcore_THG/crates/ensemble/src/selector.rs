@@ -666,7 +666,9 @@ fn edge_outcome_weight(edge: &EdgeRecord) -> f64 {
 mod tests {
     use super::*;
     use crate::registry::{register_pack, PackExposure};
-    use rustyred_thg_affordances::{register_connector, ConnectorManifest, ToolManifest};
+    use rustyred_thg_affordances::{
+        register_connector, ConnectorManifest, ToolManifest, CONNECTOR_FAMILY,
+    };
     use rustyred_thg_core::InMemoryGraphStore;
     use serde_json::json;
 
@@ -708,6 +710,7 @@ mod tests {
                 name: "search_code".to_string(),
                 label: "Search code".to_string(),
                 description: "search code".to_string(),
+                family: CONNECTOR_FAMILY.to_string(),
                 input_schema: json!({}),
                 permissions: vec![],
                 cost: json!({}),

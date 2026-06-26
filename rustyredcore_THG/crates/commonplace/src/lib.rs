@@ -25,6 +25,7 @@
 pub mod blob;
 pub mod block_view;
 pub mod collection;
+pub mod content_core;
 pub mod ingest;
 pub mod item;
 pub mod organize;
@@ -44,11 +45,17 @@ pub use block_view::{
     DEFAULT_RECORD_POLL_INTERVAL_MS,
 };
 pub use collection::{Collection, CollectionKind};
+pub use content_core::{
+    content_core_extract, content_core_extract_with_config, ContentCoreCommand,
+    ContentCoreExtractionConfig, ContentCoreExtractionError, ExtractedDoc, CCORE_ENV_KEYS,
+    CONTENT_CORE_ARGS_ENV, CONTENT_CORE_COMMAND_ENV, CONTENT_CORE_ENABLED_ENV,
+    CONTENT_CORE_TIMEOUT_MS_ENV, DEFAULT_CONTENT_CORE_TIMEOUT_MS,
+};
 pub use ingest::{
     classify_item_ranking, Classification, ClassificationRank, DeterministicEmbedder, Embedder,
-    EmbeddingGraphStore, IngestBody, IngestInput, IngestPipeline, IngestReceipt, ResolvedEntity,
-    SimilarityLink, TaskFields, COLLECTION_EMBEDDING_PROPERTY, DEFAULT_SOURCE_PRIOR_BOOST,
-    ENTITY_LABEL, ITEM_EMBEDDING_PROPERTY, MENTIONS_ENTITY_EDGE,
+    EmbeddingGraphStore, IngestBody, IngestExtractionReceipt, IngestInput, IngestPipeline,
+    IngestReceipt, ResolvedEntity, SimilarityLink, TaskFields, COLLECTION_EMBEDDING_PROPERTY,
+    DEFAULT_SOURCE_PRIOR_BOOST, ENTITY_LABEL, ITEM_EMBEDDING_PROPERTY, MENTIONS_ENTITY_EDGE,
 };
 pub use item::{Item, ItemBody, ItemKind, Residency, SourceRef};
 pub use organize::{decide, route, NeedsYouReason, OrganizeDecision, OrganizePolicy, RoutingRule};

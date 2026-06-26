@@ -13935,7 +13935,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rustyred_thg_affordances::registry::register_connector_with_target;
-    use rustyred_thg_affordances::{ConnectorManifest, ToolManifest};
+    use rustyred_thg_affordances::{ConnectorManifest, ToolManifest, CONNECTOR_FAMILY};
     use rustyred_thg_connectors::ConnectionTarget;
     use rustyred_thg_core::{
         EdgeRecord, EpistemicType, GraphSnapshot, GraphStats, GraphStoreResult,
@@ -14325,6 +14325,7 @@ mod tests {
                     name: "create_issue".to_string(),
                     label: "Create issue".to_string(),
                     description: "Create a GitHub issue in a repository.".to_string(),
+                    family: CONNECTOR_FAMILY.to_string(),
                     input_schema: json!({
                         "type": "object",
                         "properties": {
@@ -14344,6 +14345,7 @@ mod tests {
                     name: "get_issue".to_string(),
                     label: "Get issue".to_string(),
                     description: "Read one GitHub issue.".to_string(),
+                    family: CONNECTOR_FAMILY.to_string(),
                     input_schema: json!({
                         "type": "object",
                         "properties": {

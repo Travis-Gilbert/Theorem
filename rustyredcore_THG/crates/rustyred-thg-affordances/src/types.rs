@@ -38,6 +38,7 @@ pub const PRODUCED_OUTCOME: &str = "PRODUCED_OUTCOME";
 pub const SEQUENCED_WITH: &str = "SEQUENCED_WITH";
 
 pub const THG_AFFORDANCE_SOURCE: &str = "thg-affordances";
+pub const CONNECTOR_FAMILY: &str = "connector";
 
 // --- Tuning constants (mirror the adapter catalog) --------------------------
 
@@ -457,6 +458,8 @@ pub struct ToolManifest {
     pub label: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_tool_family")]
+    pub family: String,
     #[serde(default)]
     pub input_schema: Value,
     #[serde(default)]
@@ -470,6 +473,10 @@ pub struct ToolManifest {
     /// Caller-supplied semantic embedding of `description`.
     #[serde(default)]
     pub description_embedding: Option<Vec<f32>>,
+}
+
+fn default_tool_family() -> String {
+    CONNECTOR_FAMILY.to_string()
 }
 
 // --- Request / result structs -----------------------------------------------

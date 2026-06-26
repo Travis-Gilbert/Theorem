@@ -6,8 +6,9 @@ use crate::types::{affordance_node_id, Affordance};
 use crate::{
     record_invocation, register_builtin_affordances, register_connector,
     register_theseus_app_affordances, ConnectorManifest, InvocationRecordRequest, ToolManifest,
-    AFFORDANCE_LABEL, DEFAULT_BASE_FITNESS, OFFERS, THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS,
-    THEOREM_GRPC_MAX_TIMEOUT_MS, THEOREM_GRPC_SERVER_ID, THEOREM_GRPC_TIMEOUT_MS,
+    AFFORDANCE_LABEL, CONNECTOR_FAMILY, DEFAULT_BASE_FITNESS, OFFERS,
+    THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS, THEOREM_GRPC_MAX_TIMEOUT_MS, THEOREM_GRPC_SERVER_ID,
+    THEOREM_GRPC_TIMEOUT_MS,
 };
 
 fn tool(name: &str, policy: &str, tags: &[&str]) -> ToolManifest {
@@ -15,6 +16,7 @@ fn tool(name: &str, policy: &str, tags: &[&str]) -> ToolManifest {
         name: name.to_string(),
         label: String::new(),
         description: format!("the {name} tool"),
+        family: CONNECTOR_FAMILY.to_string(),
         input_schema: json!({ "type": "object" }),
         permissions: vec!["repo_read".to_string()],
         cost: json!({ "latency_class": "fast" }),
@@ -56,6 +58,38 @@ fn register_connector_creates_one_node_per_tool() {
     assert!(result
         .affordance_node_ids
         .contains(&affordance_node_id("theorem", "github.create_issue")));
+}
+
+#[test]
+fn register_connector_uses_tool_manifest_family() {
+    let mut store = InMemoryGraphStore::new();
+    let manifest = ConnectorManifest {
+        tenant_id: "theorem".to_string(),
+        server_id: "content-core".to_string(),
+        label: "Content Core".to_string(),
+        tools: vec![ToolManifest {
+            name: "extract_content".to_string(),
+            label: "Extract content".to_string(),
+            description: "Extract content from a URL or non-text file.".to_string(),
+            family: "content_extraction".to_string(),
+            input_schema: json!({}),
+            permissions: vec![],
+            cost: json!({}),
+            writeback_policy: "read-only".to_string(),
+            tags: vec!["document".to_string()],
+            description_embedding: None,
+        }],
+    };
+
+    register_connector(&mut store, manifest, Some("test")).unwrap();
+    let node = store
+        .get_node(&affordance_node_id(
+            "theorem",
+            "content-core.extract_content",
+        ))
+        .expect("affordance node");
+    let affordance = Affordance::from_node_record(node).expect("affordance");
+    assert_eq!(affordance.family, "content_extraction");
 }
 
 #[test]

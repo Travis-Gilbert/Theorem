@@ -44,6 +44,20 @@ curl -s localhost:50080/connectors/register \
 
 The harness spawns the target, runs the MCP handshake, lists its tools, and registers each as an affordance under `(tenant, server_id)`. List them back with `GET /connectors?tenant=Travis-Gilbert`. Over time the system learns which affordance to reach for from invocation outcomes. See the [first-job guide](first-job.md) for the full connector flow.
 
+### Register content-core extraction
+
+The harness has a shortcut for the content-core MCP server. Local/dev defaults to `uvx content-core mcp`; hosted deployments should set `THEOREM_CONTENT_CORE_MCP_COMMAND` or the shared `THEOREM_CONTENT_CORE_COMMAND` to the pinned venv/tool-install binary.
+
+```bash
+curl -s localhost:50080/connectors/register/content-core \
+  -H 'content-type: application/json' \
+  -d '{ "tenant": "Travis-Gilbert" }'
+```
+
+The registered `extract_content` and `summarize_content` tools surface through `tool_search` in the `content_extraction` family. Reach for `extract_content` when a URL or non-text file appears and its content is needed. Plain text and Markdown that the head can already read should stay on the native path; images and screenshots stay on the vision spine.
+
+The CommonPlace ingest pass uses the same installed package through the content-core CLI. Configure extraction with `THEOREM_CONTENT_CORE_COMMAND` for the pinned CLI binary, `THEOREM_CONTENT_CORE_ENABLED=false` to disable the additive step, and `THEOREM_CONTENT_CORE_TIMEOUT_MS` for the subprocess deadline. content-core engine settings are passed through the standard `CCORE_URL_ENGINE`, `CCORE_DOCUMENT_ENGINE`, `CCORE_STT_PROVIDER`, `CCORE_STT_MODEL`, and `CCORE_AUDIO_CONCURRENCY` env vars.
+
 ## Which surface should I use?
 
 - **MCP** (this page) — an agent client with tools wired in. The default.
