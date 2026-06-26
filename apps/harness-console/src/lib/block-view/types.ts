@@ -256,10 +256,22 @@ export interface ViewRenderProps {
   readonly host: BlockHost;
 }
 
+export type ViewSourceMode = "vendor" | "reskin" | "wrap" | "fork" | "bespoke";
+export type ViewSourceRegime = "css-vars" | "ant-tokens" | "scene";
+
+export interface ViewSource {
+  readonly package: string;
+  readonly component: string;
+  readonly mode: ViewSourceMode;
+  readonly regime: ViewSourceRegime;
+  readonly allowedBespokeReason?: string;
+}
+
 export interface ViewDescriptor {
   readonly id: string;
   readonly name: string;
   readonly accepts: ObjectShapeMatch;
   readonly emits: readonly ActionKind[];
+  readonly source: ViewSource;
   readonly render: React.ComponentType<ViewRenderProps>;
 }

@@ -13,6 +13,10 @@ const cssSpacingDeclaration =
   /\b(?:margin(?:-(?:top|right|bottom|left|inline|block))?|padding(?:-(?:top|right|bottom|left|inline|block))?|gap|row-gap|column-gap)\s*:\s*[^;]*\d(?:\.\d+)?px[^;]*;/g;
 const jsSpacingProperty =
   /\b(?:margin|marginTop|marginRight|marginBottom|marginLeft|padding|paddingTop|paddingRight|paddingBottom|paddingLeft|gap|rowGap|columnGap)\s*:\s*["'`][^"'`]*\d(?:\.\d+)?px/g;
+const arbitraryRawColorClass =
+  /\b(?:bg|text|border|fill|stroke|ring|from|via|to)-\[#(?:[0-9a-fA-F]{3,8})\]/g;
+const jsRawColorProperty =
+  /\b(?:color|background|backgroundColor|borderColor|fill|stroke)\s*:\s*["'`]#[0-9a-fA-F]{3,8}["'`]/g;
 
 const violations = [];
 
@@ -21,14 +25,14 @@ for (const source of SOURCES) {
 }
 
 if (violations.length > 0) {
-  console.error("Design math lint failed: raw px spacing found in margin/padding/gap.");
+  console.error("Design math lint failed: raw spacing or color values found.");
   for (const violation of violations) {
     console.error(`- ${violation}`);
   }
   process.exit(1);
 }
 
-console.log("Design math lint passed: spacing uses tokens or Tailwind scale classes.");
+console.log("Design math lint passed: spacing and token checks clean.");
 
 function walk(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -55,6 +59,8 @@ function checkFile(file) {
       ...line.matchAll(arbitrarySpacingClass),
       ...line.matchAll(cssSpacingDeclaration),
       ...line.matchAll(jsSpacingProperty),
+      ...line.matchAll(arbitraryRawColorClass),
+      ...line.matchAll(jsRawColorProperty),
     ];
     for (const match of matches) {
       violations.push(`${rel}:${index + 1}: ${match[0].trim()}`);
