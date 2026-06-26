@@ -2,104 +2,176 @@
 
 import * as React from "react";
 import {
-  AlertTriangle,
-  Archive,
+  ArrowUp,
   Boxes,
-  Brain,
+  Bell,
   ChevronLeft,
-  ChevronRight,
   Clock3,
+  Code2,
+  Command,
+  Cpu,
+  Database,
   Folder,
   GitBranch,
   Globe,
-  Grid3X3,
-  Library,
+  Gauge,
+  Inbox,
+  Layers3,
   Map,
+  MessageSquareText,
+  MonitorCog,
   Paperclip,
   PenLine,
+  Plus,
   Search,
-  Send,
   SlidersHorizontal,
+  Settings,
+  Scissors,
   Sparkles,
+  SquareTerminal,
+  Table2,
+  UserCircle,
   WandSparkles,
 } from "lucide-react";
-import { HARNESS_OBJECT_SETS, mockBlockHost } from "@/lib/block-view/harness-fixtures";
-import { HARNESS_VIEW_DESCRIPTORS } from "@/lib/block-view/harness-registry";
-import { ViewRegistry } from "@/lib/block-view";
-import type { ObjectSet, ViewDescriptor } from "@/lib/block-view";
+import {
+  AssistantRuntimeProvider,
+  ComposerPrimitive,
+  MessagePartPrimitive,
+  MessagePrimitive,
+  ThreadPrimitive,
+  useExternalStoreRuntime,
+  type AppendMessage,
+  type MessageState,
+  type ThreadAssistantMessagePart,
+  type ThreadMessage,
+  type ThreadUserMessagePart,
+} from "@assistant-ui/react";
+import CodeMirrorMerge from "react-codemirror-merge";
+import { DotMatrix } from "@/components/assistant-ui/dot-matrix";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  omnibarIconButtonClass,
+  omnibarRowClass,
+  omnibarSendButtonClass,
+  omnibarSurfaceClass,
+} from "@/components/island/OmnibarChrome";
+import {
+  COMMONPLACE_ACCOUNT_ITEMS,
+  COMMONPLACE_DATA_VIEWS,
+  COMMONPLACE_OMNIBAR_CAPABILITIES,
+  COMMONPLACE_TOOLBOX,
+  COMMONPLACE_WORK_PAGES,
+  type CommonplaceIaItem,
+  type CommonplaceToolboxGroup,
+} from "@/lib/commonplace/information-architecture";
+import {
+  dotStateForApiModelState,
+  type ApiModelState,
+  type CodeAgentModelStatus,
+  type CodeDiffArtifact,
+} from "@/lib/commonplace/code-agent-contract";
+import {
+  CODE_AGENT_TRANSPORTS,
+  runCodeAgentTurn,
+  type CodeAgentTransportId,
+} from "@/lib/commonplace/code-agent-transport";
+import { createMersenneBinaryGlyphs } from "@/lib/commonplace/mersenne-pattern";
+import {
+  commonplaceCodeExtensions,
+  commonplaceCodeMirrorTheme,
+  readOnlyExtensions,
+} from "./commonplace-code-theme";
 
-const registry = new ViewRegistry(HARNESS_VIEW_DESCRIPTORS);
+const MergeOriginal = CodeMirrorMerge.Original;
+const MergeModified = CodeMirrorMerge.Modified;
+type SidebarIcon = React.ComponentType<{ size?: number; className?: string }>;
+
+const INITIAL_ASSISTANT_ID = "code-agent:assistant:intro";
+const INITIAL_DATE = new Date("2026-06-25T00:00:00.000Z");
+
+const DEFAULT_MODEL_STATUSES: readonly CodeAgentModelStatus[] = [
+  { id: "router", label: "Router", state: "idle" },
+  { id: "planner", label: "Planner", state: "idle" },
+  { id: "editor", label: "Editor", state: "idle" },
+  { id: "reviewer", label: "Reviewer", state: "idle" },
+] as const;
+
+const WORK_ICONS: Record<string, SidebarIcon> = {
+  index: Inbox,
+  threads: MessageSquareText,
+  write: PenLine,
+  code: Code2,
+  artifacts: WandSparkles,
+};
+
+const DATA_VIEW_ICONS: Record<string, SidebarIcon> = {
+  files: Folder,
+  graph: GitBranch,
+  table: Table2,
+  map: Map,
+  timeline: Clock3,
+  clips: Scissors,
+};
+
+const CAPABILITY_ICONS: Record<string, SidebarIcon> = {
+  "instant-kg": Layers3,
+  web: Globe,
+  attach: Paperclip,
+  tier: Gauge,
+  "git-aware": GitBranch,
+  deepen: Sparkles,
+};
+
+const TOOLBOX_ICONS: Record<string, SidebarIcon> = {
+  terminal: SquareTerminal,
+  cluster: Boxes,
+  timeline: Clock3,
+  note: PenLine,
+  task: Plus,
+  reminder: Bell,
+  project: GitBranch,
+};
+
+const ACCOUNT_ICONS: Record<string, SidebarIcon> = {
+  account: UserCircle,
+  agents: Sparkles,
+  engine: Cpu,
+  desktop: MonitorCog,
+  settings: Settings,
+};
 
 export function CodeWorkspaceShell() {
   return (
-    <main className="commonplace-workspace-theme cpw-shell">
-      <CommonPlaceSidebar />
-
-      <section className="cpw-stage" aria-label="CommonPlace block workspace">
-        <aside className="cpw-sources-column" aria-label="Sources">
-          <SectionLabel label="Sources" />
-          <SourceRows />
-          <div className="cpw-sidebar-block">
-            <BlockSlot viewId="file-tree" set={HARNESS_OBJECT_SETS.files} />
-          </div>
-          <div className="cpw-sidebar-block cpw-terminal-slot">
-            <BlockSlot viewId="terminal" set={HARNESS_OBJECT_SETS.terminal} />
-          </div>
-          <ProgressFooter />
-        </aside>
-
-        <section className="cpw-center-column" aria-label="Needs you">
-          <header className="cpw-day-header">
-            <div className="cpw-day-label">
-              <span className="cpw-pulse-dot" />
-              <span>Thursday, June 25</span>
-            </div>
-            <p>Harness object blocks are ready for review inside the CommonPlace surface.</p>
-          </header>
-
-          <section className="cpw-review-area">
-            <div className="cpw-toolbar-row">
-              <div>
-                <SectionLabel label="Needs You" />
-                <p>Items below the confidence line, ready for one action.</p>
-              </div>
-              <span className="cpw-count-pill">2</span>
-            </div>
-
-            <div className="cpw-primary-grid">
-              <BlockSlot viewId="code-editor" set={HARNESS_OBJECT_SETS.files} />
-              <BlockSlot viewId="patch-review" set={HARNESS_OBJECT_SETS.patch} />
-            </div>
-
-            <BlockSlot viewId="agent-run-board" set={HARNESS_OBJECT_SETS.runs} />
-          </section>
-        </section>
-
-        <aside className="cpw-organized-column" aria-label="Organized today">
-          <div className="cpw-proof-head">
-            <SectionLabel label="Organized Today" />
-            <p>Automatic filing, recent routes, and where the engine is putting things.</p>
-          </div>
-
-          <div className="cpw-proof-stack">
-            <BlockSlot viewId="agent-thread" set={HARNESS_OBJECT_SETS.thread} />
-            <BlockSlot viewId="run-trace" set={HARNESS_OBJECT_SETS.trace} />
-            <div className="cpw-side-grid">
-              <BlockSlot viewId="tool-activity" set={HARNESS_OBJECT_SETS.tools} />
-              <BlockSlot viewId="context-artifact" set={HARNESS_OBJECT_SETS.context} />
-            </div>
-          </div>
-
-          <AgentDock />
-        </aside>
-      </section>
+    <main className="commonplace-workspace-theme cpw-shell" data-merge-scope="preview-route">
+      <CommonPlacePreviewSidebar />
+      <CodeWorkspaceStage />
     </main>
   );
 }
 
-function CommonPlaceSidebar() {
+// Production CommonPlace should compose this stage inside its own app shell.
+// The preview-only sidebar above exists only for this Theorem test route.
+export function CodeWorkspaceStage() {
   return (
-    <aside className="cpw-sidebar" aria-label="CommonPlace navigation">
+    <section className="cpw-stage cpw-code-agent-stage" aria-label="CommonPlace code workspace">
+      <MersenneBinaryField />
+      <CodeAgentRuntime />
+    </section>
+  );
+}
+
+// Preview-only IA fixture for this Theorem test route.
+// Do not move this component into the production CommonPlace app shell; only the
+// plain IA data in `lib/commonplace/information-architecture.ts` is intended to
+// survive the real merge.
+function CommonPlacePreviewSidebar() {
+  return (
+    <aside className="cpw-sidebar" aria-label="CommonPlace preview navigation" data-merge-scope="preview-only">
       <div className="cpw-sidebar-glow" aria-hidden />
       <div className="cpw-brand-row">
         <div className="cpw-brand">
@@ -111,35 +183,25 @@ function CommonPlaceSidebar() {
         </button>
       </div>
 
-      <label className="cpw-search">
-        <Search size={17} />
-        <span>Search, capture, or / for commands</span>
-      </label>
+      <OmnibarPreview />
 
       <nav className="cpw-nav" aria-label="CommonPlace sections">
-        <NavItem icon={Archive} label="Auto Organize" active section="capture" />
-        <NavItem icon={Grid3X3} label="Library" section="capture" />
-        <NavItem icon={Brain} label="Models" section="capture" count=">" />
-        <NavItem icon={WandSparkles} label="Artifacts" active section="capture" marker />
-        <NavItem icon={PenLine} label="Compose" section="capture" />
-        <div className="cpw-tree-row">
-          <ChevronRight size={14} />
-          <Folder size={18} />
-          <span>Files</span>
-          <Boxes size={16} className="cpw-tree-action" />
-        </div>
-
-        <NavSection label="Views" />
-        <NavItem icon={Clock3} label="Timeline" section="views" count="3" />
-        <NavItem icon={Map} label="Map" section="views" />
-
         <NavSection label="Work" />
-        <NavItem icon={Library} label="Notebooks" section="work" count="1" />
-        <NavItem icon={GitBranch} label="Projects" section="work" count="0" />
+        {COMMONPLACE_WORK_PAGES.map((item) => (
+          <NavItem key={item.id} item={item} icon={WORK_ICONS[item.id] ?? Folder} active={item.id === "code"} />
+        ))}
 
-        <NavSection label="System" />
-        <NavItem icon={Sparkles} label="Agents" section="system" count="4" />
-        <NavItem icon={SlidersHorizontal} label="Desktop" section="system" count="3" />
+        <NavSection label="Data" />
+        {COMMONPLACE_DATA_VIEWS.map((item) => (
+          <NavItem key={item.id} item={item} icon={DATA_VIEW_ICONS[item.id] ?? Database} />
+        ))}
+
+        <ToolboxPreview groups={COMMONPLACE_TOOLBOX} />
+
+        <NavSection label="Account" />
+        {COMMONPLACE_ACCOUNT_ITEMS.map((item) => (
+          <NavItem key={item.id} item={item} icon={ACCOUNT_ICONS[item.id] ?? SlidersHorizontal} />
+        ))}
       </nav>
 
       <button className="cpw-engine-status" type="button">
@@ -147,6 +209,31 @@ function CommonPlaceSidebar() {
         <span>Engine</span>
       </button>
     </aside>
+  );
+}
+
+function OmnibarPreview() {
+  return (
+    <section className="cpw-omnibar-preview" aria-label="Agent omnibar">
+      <button className="cpw-search" type="button" aria-label="Ask the Theorem agent">
+        <Search size={17} />
+        <span>Ask the Theorem agent</span>
+        <small>
+          <Command size={10} /> K
+        </small>
+      </button>
+      <div className="cpw-capability-strip" aria-label="Agent capabilities">
+        {COMMONPLACE_OMNIBAR_CAPABILITIES.map((capability) => {
+          const Icon = CAPABILITY_ICONS[capability.id] ?? Sparkles;
+          return (
+            <button key={capability.id} className="cpw-capability-chip" type="button" title={capability.description}>
+              <Icon size={12} />
+              <span>{capability.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -159,121 +246,425 @@ function NavSection({ label }: { label: string }) {
   );
 }
 
-function NavItem({
-  icon: Icon,
-  label,
-  active,
-  marker,
-  count,
-  section,
-}: {
-  icon: React.ComponentType<{ size?: number; className?: string }>;
-  label: string;
-  active?: boolean;
-  marker?: boolean;
-  count?: string;
-  section: "capture" | "views" | "work" | "system";
-}) {
+function NavItem({ item, icon: Icon, active }: { item: CommonplaceIaItem; icon: SidebarIcon; active?: boolean }) {
   return (
-    <button className="cpw-nav-item" data-active={active ? "true" : "false"} data-section={section} type="button">
+    <button
+      className="cpw-nav-item"
+      data-active={active ? "true" : "false"}
+      data-placement={item.placement}
+      type="button"
+      title={item.description}
+      aria-current={active ? "page" : undefined}
+    >
       <Icon size={17} />
-      <span>{label}</span>
-      {marker ? <span className="cpw-nav-marker" /> : null}
-      {count ? <span className="cpw-nav-count">{count}</span> : null}
+      <span>{item.label}</span>
+      {active ? <span className="cpw-nav-marker" /> : null}
+      {item.count ? <span className="cpw-nav-count">{item.count}</span> : null}
     </button>
   );
 }
 
-function SectionLabel({ label }: { label: string }) {
+function ToolboxPreview({ groups }: { groups: readonly CommonplaceToolboxGroup[] }) {
   return (
-    <div className="cpw-section-label">
-      <span />
-      <strong>{label}</strong>
+    <details className="cpw-toolbox">
+      <summary className="cpw-toolbox-summary">Toolbox</summary>
+      <div className="cpw-toolbox-groups">
+        {groups.map((group) => (
+          <div key={group.id} className="cpw-toolbox-group">
+            <span>{group.label}</span>
+            <div>
+              {group.items.map((item) => {
+                const Icon = TOOLBOX_ICONS[item.id] ?? Plus;
+                return (
+                  <button key={item.id} className="cpw-toolbox-action" type="button" title={item.description}>
+                    <Icon size={13} />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function CodeAgentRuntime() {
+  const [transport, setTransport] = React.useState<CodeAgentTransportId>("api");
+  const [messages, setMessages] = React.useState<readonly ThreadMessage[]>(() => [
+    assistantMessage({
+      id: INITIAL_ASSISTANT_ID,
+      text: "Ready.",
+      createdAt: INITIAL_DATE,
+    }),
+  ]);
+  const [isRunning, setIsRunning] = React.useState(false);
+  const [modelStatuses, setModelStatuses] =
+    React.useState<readonly CodeAgentModelStatus[]>(DEFAULT_MODEL_STATUSES);
+  const [diffsByMessageId, setDiffsByMessageId] = React.useState<Record<string, readonly CodeDiffArtifact[]>>({});
+
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages,
+    isRunning,
+    setMessages,
+    onNew: async (message) => {
+      const prompt = textFromAppendMessage(message);
+      const userId = `code-agent:user:${Date.now()}`;
+      const assistantId = `code-agent:assistant:${Date.now()}`;
+
+      setMessages((current) => [...current, userMessageFromAppend(message, userId)]);
+      setIsRunning(true);
+      setModelStatuses(statusesWith({ router: "routing", planner: "queued", editor: "idle", reviewer: "idle" }));
+
+      try {
+        const result = await runCodeAgentTurn({
+          prompt,
+          transport,
+          onProgress: (progress) => {
+            if (progress.states) setModelStatuses(statusesWith(progress.states));
+          },
+        });
+        if (result.diffs.length > 0) {
+          setDiffsByMessageId((current) => ({ ...current, [assistantId]: result.diffs }));
+        }
+        setMessages((current) => [
+          ...current,
+          assistantMessage({
+            id: assistantId,
+            text: result.text,
+            createdAt: new Date(),
+          }),
+        ]);
+        setModelStatuses(statusesWith({ router: "success", planner: "success", editor: "success", reviewer: "success" }));
+      } catch (error) {
+        setMessages((current) => [
+          ...current,
+          assistantMessage({
+            id: assistantId,
+            text: `The agent run failed: ${error instanceof Error ? error.message : String(error)}`,
+            createdAt: new Date(),
+          }),
+        ]);
+        setModelStatuses(statusesWith({ router: "error", planner: "error", editor: "idle", reviewer: "error" }));
+      } finally {
+        setIsRunning(false);
+      }
+    },
+    onEdit: async (message) => {
+      if (!message.sourceId) return;
+      setMessages((current) =>
+        current.map((item) => (item.id === message.sourceId ? userMessageFromAppend(message, message.sourceId) : item)),
+      );
+    },
+    onReload: async () => {
+      const assistantId = `code-agent:assistant:reload:${Date.now()}`;
+      setIsRunning(true);
+      setModelStatuses(statusesWith({ router: "routing", planner: "thinking", editor: "idle", reviewer: "idle" }));
+      await sleep(360);
+      setMessages((current) => [
+        ...current,
+        assistantMessage({
+          id: assistantId,
+          text: "Rechecked the last turn.",
+          createdAt: new Date(),
+        }),
+      ]);
+      setModelStatuses(statusesWith({ router: "success", planner: "success", editor: "idle", reviewer: "success" }));
+      setIsRunning(false);
+    },
+    onCancel: async () => {
+      setModelStatuses(statusesWith({ router: "stopped", planner: "stopped", editor: "stopped", reviewer: "stopped" }));
+      setIsRunning(false);
+    },
+  });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <ThreadPrimitive.Root className="cpw-code-agent-root">
+        <ModelStatusRail statuses={modelStatuses} />
+        <ThreadPrimitive.Viewport className="cpw-code-agent-thread" autoScroll>
+          <ThreadPrimitive.Empty>
+            <div className="cpw-code-agent-empty">Ask the Theorem agent</div>
+          </ThreadPrimitive.Empty>
+          <ThreadPrimitive.Messages>
+            {({ message }) => (
+              <CodeAgentMessage
+                key={message.id}
+                message={message}
+                diffs={diffsByMessageId[message.id] ?? []}
+              />
+            )}
+          </ThreadPrimitive.Messages>
+        </ThreadPrimitive.Viewport>
+        <div className="cpw-code-agent-footer">
+          <CommonPlaceAgentComposer
+            transport={transport}
+            onTransportChange={setTransport}
+            isRunning={isRunning}
+          />
+        </div>
+      </ThreadPrimitive.Root>
+    </AssistantRuntimeProvider>
+  );
+}
+
+function ModelStatusRail({ statuses }: { statuses: readonly CodeAgentModelStatus[] }) {
+  return (
+    <div className="cpw-code-agent-models" aria-label="API model states">
+      {statuses.map((model) => {
+        const dotState = dotStateForApiModelState(model.state);
+        return (
+          <div key={model.id} className="cpw-code-agent-model" data-state={model.state}>
+            <DotMatrix state={dotState} label={`${model.label} ${model.state}`} />
+            <span>{model.label}</span>
+            <small>{model.state.replaceAll("_", " ")}</small>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function SourceRows() {
+function CodeAgentMessage({
+  message,
+  diffs,
+}: {
+  message: MessageState;
+  diffs: readonly CodeDiffArtifact[];
+}) {
+  if (message.role === "system") return null;
+
   return (
-    <div className="cpw-source-list" aria-label="Source groups">
-      {[
-        ["Emails", "0", "blue"],
-        ["Notes", "0", "gold"],
-        ["Files", "4", "teal"],
-        ["Tasks", "1", "orange"],
-      ].map(([label, count, tone]) => (
-        <button className="cpw-source-row" data-tone={tone} key={label} type="button">
-          <span className="cpw-source-dot" />
-          <span>{label}</span>
-          <small>{count}</small>
-        </button>
+    <MessagePrimitive.Root className="cpw-code-agent-message" data-role={message.role}>
+      <div className="cpw-code-agent-bubble">
+        <MessagePrimitive.Parts
+          components={{
+            Text: message.role === "user" ? UserTextPart : AssistantTextPart,
+          }}
+        />
+        {message.role === "assistant" ? <AssistantDiffStack diffs={diffs} /> : null}
+      </div>
+    </MessagePrimitive.Root>
+  );
+}
+
+function UserTextPart() {
+  return <MessagePartPrimitive.Text component="p" className="cpw-code-agent-text" smooth={false} />;
+}
+
+function AssistantTextPart() {
+  return <MessagePartPrimitive.Text component="p" className="cpw-code-agent-text" />;
+}
+
+function AssistantDiffStack({ diffs }: { diffs: readonly CodeDiffArtifact[] }) {
+  if (diffs.length === 0) return null;
+
+  return (
+    <div className="cpw-code-agent-diffs">
+      {diffs.map((diff) => (
+        <CollapsedDiffArtifact key={diff.id} diff={diff} />
       ))}
     </div>
   );
 }
 
-function ProgressFooter() {
+function CollapsedDiffArtifact({ diff }: { diff: CodeDiffArtifact }) {
+  const [open, setOpen] = React.useState(false);
+
   return (
-    <div className="cpw-progress-footer">
-      <div className="cpw-progress-rule" />
-      <div className="cpw-progress-meta">
-        <span>Progress</span>
-        <strong>0 of 2 done</strong>
+    <details
+      className="cpw-code-agent-diff"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span>{diff.title}</span>
+        <small>
+          {diff.path} +{diff.additions} -{diff.deletions}
+        </small>
+      </summary>
+      {open ? (
+        <div className="cpw-code-agent-diff-viewer">
+          <CodeMirrorMerge
+            theme={commonplaceCodeMirrorTheme}
+            orientation="a-b"
+            highlightChanges
+            gutter
+            collapseUnchanged={{ margin: 2, minSize: 4 }}
+            className="cpw-merge-view"
+          >
+            <MergeOriginal
+              value={diff.before}
+              extensions={[...commonplaceCodeExtensions("typescript"), ...readOnlyExtensions]}
+            />
+            <MergeModified
+              value={diff.after}
+              extensions={[...commonplaceCodeExtensions("typescript"), ...readOnlyExtensions]}
+            />
+          </CodeMirrorMerge>
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
+function CommonPlaceAgentComposer({
+  transport,
+  onTransportChange,
+  isRunning,
+}: {
+  transport: CodeAgentTransportId;
+  onTransportChange: (transport: CodeAgentTransportId) => void;
+  isRunning: boolean;
+}) {
+  return (
+    <ComposerPrimitive.Root className={omnibarSurfaceClass("ambient", "cpw-code-agent-omnibar")}>
+      <ComposerPrimitive.Input
+        className="cpw-code-agent-input"
+        placeholder="Ask the Theorem agent"
+        submitMode="enter"
+        minRows={1}
+        maxRows={5}
+      />
+      <div className={omnibarRowClass("cpw-code-agent-omnibar-row")}>
+        <div className="cpw-code-agent-tool-icons">
+          <button className={omnibarIconButtonClass(false, "cpw-code-agent-tool-button")} type="button" aria-label="Attach context" title="Attach context">
+            <Paperclip size={21} />
+          </button>
+          <button className={omnibarIconButtonClass(false, "cpw-code-agent-tool-button")} type="button" aria-label="Web context" title="Web context">
+            <Globe size={21} />
+          </button>
+          <AgentTransportMenu transport={transport} onTransportChange={onTransportChange} />
+          <button className={omnibarIconButtonClass(false, "cpw-code-agent-tool-button")} type="button" aria-label="Graph context" title="Graph context">
+            <GitBranch size={21} />
+          </button>
+        </div>
+        <ComposerPrimitive.Send
+          className={omnibarSendButtonClass("cpw-code-agent-send")}
+          aria-label={isRunning ? "Agent is running" : "Send message"}
+        >
+          <ArrowUp size={20} />
+        </ComposerPrimitive.Send>
       </div>
-      <div className="cpw-progress-track">
-        <span />
-      </div>
-      <div className="cpw-segmented">
-        <button type="button" data-active="true">Day</button>
-        <button type="button">Week</button>
-        <button type="button">Month</button>
-      </div>
+    </ComposerPrimitive.Root>
+  );
+}
+
+function AgentTransportMenu({
+  transport,
+  onTransportChange,
+}: {
+  transport: CodeAgentTransportId;
+  onTransportChange: (transport: CodeAgentTransportId) => void;
+}) {
+  const label = transportLabel(transport);
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className={omnibarIconButtonClass(transport !== "api", "cpw-code-agent-tool-button")}
+          type="button"
+          aria-label={`Agent transport: ${label}`}
+          title={`Agent transport: ${label}`}
+        >
+          <Sparkles size={21} />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start">
+        {CODE_AGENT_TRANSPORTS.map((item) => (
+          <DropdownMenuItem
+            key={item.id}
+            onSelect={() => onTransportChange(item.id)}
+            className={item.id === transport ? "text-ox" : undefined}
+          >
+            <span className="font-mono text-[11px]">{item.label}</span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function MersenneBinaryField() {
+  const glyphs = React.useMemo(() => createMersenneBinaryGlyphs(), []);
+
+  return (
+    <div className="cpw-mersenne-field" aria-hidden>
+      {glyphs.map((glyph) => {
+        const style = {
+          "--mt-row": glyph.row,
+          "--mt-column": glyph.column,
+          "--mt-opacity": glyph.opacity,
+          "--mt-delay": `${glyph.delay}ms`,
+        } as React.CSSProperties;
+        return (
+          <span key={glyph.id} style={style}>
+            {glyph.value}
+          </span>
+        );
+      })}
     </div>
   );
 }
 
-function AgentDock() {
-  return (
-    <form className="cpw-agent-dock" aria-label="Ask the Theorem agent">
-      <label htmlFor="cpw-agent-input">Ask the Theorem agent</label>
-      <input id="cpw-agent-input" aria-label="Ask the Theorem agent" />
-      <div className="cpw-agent-tools">
-        <button type="button" aria-label="Attach file">
-          <Paperclip size={21} />
-        </button>
-        <button type="button" aria-label="Search the web">
-          <Globe size={21} />
-        </button>
-        <button type="button" aria-label="Use agent tools">
-          <Sparkles size={21} />
-        </button>
-        <button type="button" aria-label="Open graph context">
-          <GitBranch size={21} />
-        </button>
-        <button className="cpw-send-button" type="submit" aria-label="Send">
-          <Send size={20} />
-        </button>
-      </div>
-    </form>
-  );
+function userMessageFromAppend(message: AppendMessage, id: string): ThreadMessage {
+  return {
+    id,
+    role: "user",
+    createdAt: new Date(),
+    content: message.content as readonly ThreadUserMessagePart[],
+    attachments: message.attachments ?? [],
+    metadata: { custom: {} },
+  };
 }
 
-function BlockSlot({ viewId, set }: { viewId: string; set: ObjectSet }) {
-  const view = React.useMemo(() => pickView(viewId, set), [set, viewId]);
+function assistantMessage({
+  id,
+  text,
+  createdAt,
+}: {
+  id: string;
+  text: string;
+  createdAt: Date;
+}): ThreadMessage {
+  const content: readonly ThreadAssistantMessagePart[] = [{ type: "text", text }];
 
-  if (!view) {
-    return (
-      <div className="cpw-missing-block">
-        <AlertTriangle size={14} className="mr-2" />
-        No descriptor matched {viewId}
-      </div>
-    );
-  }
-
-  const View = view.render;
-  return <View set={set} host={mockBlockHost} />;
+  return {
+    id,
+    role: "assistant",
+    createdAt,
+    content,
+    status: { type: "complete", reason: "stop" },
+    metadata: {
+      unstable_state: null,
+      unstable_annotations: [],
+      unstable_data: [],
+      steps: [],
+      custom: {},
+    },
+  };
 }
 
-function pickView(viewId: string, set: ObjectSet): ViewDescriptor | undefined {
-  return registry.viewsFor(set.shape).find((view) => view.id === viewId);
+function textFromAppendMessage(message: AppendMessage) {
+  return message.content
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("\n")
+    .trim();
+}
+
+function statusesWith(states: Partial<Record<CodeAgentModelStatus["id"], ApiModelState>>) {
+  return DEFAULT_MODEL_STATUSES.map((model) => ({
+    ...model,
+    state: states[model.id] ?? model.state,
+  }));
+}
+
+function transportLabel(transport: CodeAgentTransportId) {
+  return CODE_AGENT_TRANSPORTS.find((item) => item.id === transport)?.label ?? transport;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }

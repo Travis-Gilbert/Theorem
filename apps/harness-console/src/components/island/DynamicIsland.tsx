@@ -19,6 +19,12 @@ import {
 import { useConsole } from "./console-context";
 import { harness, type SearchResult } from "@/lib/harness";
 import { cn } from "@/lib/utils";
+import {
+  omnibarIconButtonClass,
+  omnibarRowClass,
+  omnibarSendButtonClass,
+  omnibarSurfaceClass,
+} from "./OmnibarChrome";
 
 /**
  * The Dynamic Island TOC + omnibar. One element, bottom-center, permanent in the
@@ -207,10 +213,7 @@ export function DynamicIsland() {
       <motion.div
         layout={!reduced}
         transition={reduced ? { duration: 0 } : { type: "spring", stiffness: 380, damping: 32 }}
-        className={cn(
-          "pointer-events-auto w-full max-w-2xl overflow-hidden rounded-2xl border border-line bg-bg",
-          mode === "ambient" ? "elev-2" : "elev-3",
-        )}
+        className={omnibarSurfaceClass(mode === "ambient" ? "ambient" : "active")}
       >
         {/* Expanded panel content (TOC / cluster list / command results) */}
         <AnimatePresence initial={false}>
@@ -231,7 +234,7 @@ export function DynamicIsland() {
         </AnimatePresence>
 
         {/* The pill row, always present */}
-        <div className="flex items-center gap-2 px-3 py-2">
+        <div className={omnibarRowClass()}>
           {mode === "ambient" ? (
             <button
               className="flex flex-1 items-center gap-3 rounded-xl px-2 py-1 text-left hover:bg-surface-2"
@@ -249,7 +252,7 @@ export function DynamicIsland() {
           ) : (
             <>
               <button
-                className={cn("rounded-lg p-1.5 transition-colors", searchOn ? "text-ox" : "text-muted-foreground hover:text-ink")}
+                className={omnibarIconButtonClass(searchOn)}
                 onClick={() => {
                   setSearchOn(!searchOn);
                   setPaletteOpen(false);
@@ -288,11 +291,11 @@ export function DynamicIsland() {
                 placeholder={mode === "search" ? "Search RustyWeb..." : "Type a command, > verb, @ nav, # tag, or ask..."}
                 className="flex-1 bg-transparent font-mono text-body text-ink outline-none placeholder:text-faint"
               />
-              <button className="rounded-lg p-1.5 text-muted-foreground hover:text-ink" aria-label="Attach context">
+              <button className={omnibarIconButtonClass()} aria-label="Attach context">
                 <Paperclip size={15} />
               </button>
               <button
-                className="rounded-lg bg-ox p-1.5 text-white hover:bg-ox-hover"
+                className={omnibarSendButtonClass()}
                 aria-label="Submit"
                 onClick={() => {
                   const r = results[activeIndex] ?? results[0];
@@ -306,7 +309,7 @@ export function DynamicIsland() {
           {mode === "ambient" && (
             <div className="flex items-center gap-1">
               <button
-                className="rounded-lg p-1.5 text-muted-foreground hover:bg-surface-2 hover:text-ox"
+                className={omnibarIconButtonClass(false, "hover:bg-surface-2 hover:text-ox")}
                 onClick={() => {
                   setSearchOn(true);
                   setPaletteOpen(false);

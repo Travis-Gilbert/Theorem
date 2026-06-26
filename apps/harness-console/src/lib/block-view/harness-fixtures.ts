@@ -100,7 +100,26 @@ export const HARNESS_OBJECT_SETS = {
   ]),
   context: makeSet([
     artifact("context:block-contract", "Block/view contract", "Stable four-method host plus ObjectQuery/ObjectAction/ViewDescriptor shapes."),
-    artifact("context:ui-ux", "UI/UX North Star", "NocoBase for structured records, native RustyRed blocks for the harness and graph moat."),
+    artifact("context:ui-ux", "UI/UX North Star", "Structured records, native RustyRed blocks, and graph-backed harness context."),
+  ]),
+  pmRecords: makeSet([
+    pmRecord("pm:adapter-contract", "Descriptor source audit", "running", "high"),
+    pmRecord("pm:assistant-thread", "Thread runtime adapter", "queued", "normal"),
+    pmRecord("pm:sceneos-openui", "Scene preview seam", "done", "high"),
+  ]),
+  scene: makeSet([
+    {
+      id: "scene:workspace-map",
+      type: "scene_artifact",
+      properties: {
+        title: "Workspace routing scene",
+        scene_id: "scene:workspace-map",
+        summary: "Scene preview constrained to CommonPlace-skinned components and artifact-safe object data.",
+        atoms: "18",
+      },
+      relations: {},
+      axes: { embeddable: true },
+    },
   ]),
   terminal: makeSet([
     {
@@ -229,6 +248,16 @@ function run(id: string, title: string, status: string, summary: string): Object
     type: "agent_run",
     properties: { title, status, summary },
     relations: { ABOUT: ["patch:block-contract"] },
+    axes: { valid: { from_ms: 1782420000000 }, embeddable: true },
+  };
+}
+
+function pmRecord(id: string, title: string, status: string, priority: string): ObjectRef {
+  return {
+    id,
+    type: "pm_record",
+    properties: { title, status, priority },
+    relations: {},
     axes: { valid: { from_ms: 1782420000000 }, embeddable: true },
   };
 }

@@ -6,8 +6,10 @@ import {
   CodeEditorPanel,
   ContextArtifactDrawer,
   FileTreePanel,
+  PMObjectPanel,
   PatchReviewPanel,
   RunTraceTimeline,
+  SceneArtifactPreviewPanel,
   TerminalPanel,
   ToolActivityPanel,
 } from "@/components/block-view/harness-panels";
@@ -22,6 +24,12 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       required_edge: { edge: "CONTAINS", dir: "out" },
     },
     emits: ["open", "select"],
+    source: {
+      package: "react-arborist",
+      component: "Tree",
+      mode: "reskin",
+      regime: "css-vars",
+    },
     render: FileTreePanel,
   },
   {
@@ -33,6 +41,12 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["open", "update"],
+    source: {
+      package: "@uiw/react-codemirror",
+      component: "CodeMirror",
+      mode: "reskin",
+      regime: "css-vars",
+    },
     render: CodeEditorPanel,
   },
   {
@@ -43,6 +57,12 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "one",
     },
     emits: ["dispatch", "run_agent", "open"],
+    source: {
+      package: "react-codemirror-merge",
+      component: "CodeMirrorMerge",
+      mode: "wrap",
+      regime: "css-vars",
+    },
     render: PatchReviewPanel,
   },
   {
@@ -54,6 +74,12 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["run_agent", "open"],
+    source: {
+      package: "@assistant-ui/react",
+      component: "ExternalThread adapter",
+      mode: "wrap",
+      regime: "css-vars",
+    },
     render: AgentThreadPanel,
   },
   {
@@ -66,6 +92,13 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["open"],
+    source: {
+      package: "@/components/ui",
+      component: "shadcn timeline primitives",
+      mode: "bespoke",
+      regime: "css-vars",
+      allowedBespokeReason: "Run lifecycle and validation handoffs are Theorem-specific semantics.",
+    },
     render: RunTraceTimeline,
   },
   {
@@ -77,6 +110,12 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["invoke_tool", "open"],
+    source: {
+      package: "@assistant-ui/react",
+      component: "Tool call adapter",
+      mode: "wrap",
+      regime: "css-vars",
+    },
     render: ToolActivityPanel,
   },
   {
@@ -88,6 +127,13 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["open", "select"],
+    source: {
+      package: "@/components/ui",
+      component: "shadcn Sheet/Table primitives",
+      mode: "bespoke",
+      regime: "css-vars",
+      allowedBespokeReason: "Included atoms, token ledger, and provenance are Theseus context semantics.",
+    },
     render: ContextArtifactDrawer,
   },
   {
@@ -99,7 +145,47 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "one",
     },
     emits: ["dispatch", "open"],
+    source: {
+      package: "@xterm/xterm",
+      component: "Terminal",
+      mode: "vendor",
+      regime: "css-vars",
+    },
     render: TerminalPanel,
+  },
+  {
+    id: "pm-object",
+    name: "PMObjectPanel",
+    accepts: {
+      required_types: ["pm_record"],
+      required_fields: ["status"],
+      cardinality: "many",
+    },
+    emits: ["open", "select", "update"],
+    source: {
+      package: "@tanstack/react-table",
+      component: "useReactTable",
+      mode: "wrap",
+      regime: "css-vars",
+    },
+    render: PMObjectPanel,
+  },
+  {
+    id: "scene-artifact-preview",
+    name: "SceneArtifactPreview",
+    accepts: {
+      required_types: ["scene_artifact"],
+      required_fields: ["scene_id"],
+      cardinality: "one",
+    },
+    emits: ["open"],
+    source: {
+      package: "@openuidev/react-lang",
+      component: "Renderer with registered SceneArtifactPreview component",
+      mode: "wrap",
+      regime: "scene",
+    },
+    render: SceneArtifactPreviewPanel,
   },
   {
     id: "agent-run-board",
@@ -111,6 +197,13 @@ export const HARNESS_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["run_agent", "dispatch", "open"],
+    source: {
+      package: "@dnd-kit/core",
+      component: "DndContext plus shadcn Card/Badge primitives",
+      mode: "bespoke",
+      regime: "css-vars",
+      allowedBespokeReason: "Agent run status, dependency, and worktree lifecycle are Theorem-specific semantics.",
+    },
     render: AgentRunBoard,
   },
 ] as const;
