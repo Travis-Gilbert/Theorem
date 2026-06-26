@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use imbl::{HashMap as ImHashMap, OrdMap};
 use serde::{Deserialize, Serialize};
 
+use crate::context_view::HydrationHandle;
 use crate::graph_store::{GraphStoreError, GraphStoreResult};
 
 pub type OrderedMember = Vec<u8>;
@@ -247,6 +248,266 @@ impl OrderedIndexRegistry {
     pub fn index(&self, name: &str) -> Option<&OrderedIndex> {
         self.indexes.get(name)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScopedOrderedIndexManifest {
+    pub id: String,
+    pub name: String,
+    pub scope_key: String,
+    pub score_expression: String,
+    pub hydration_label: String,
+    pub mode: OrderedMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_id: Option<String>,
+}
+
+impl ScopedOrderedIndexManifest {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        scope_key: impl Into<String>,
+        score_expression: impl Into<String>,
+        hydration_label: impl Into<String>,
+        mode: OrderedMode,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            scope_key: scope_key.into(),
+            score_expression: score_expression.into(),
+            hydration_label: hydration_label.into(),
+            mode,
+            manifest_id: None,
+        }
+    }
+
+    pub fn with_manifest_id(mut self, manifest_id: impl Into<String>) -> Self {
+        self.manifest_id = Some(manifest_id.into());
+        self
+    }
+
+    fn validate(&self) -> GraphStoreResult<()> {
+        if self.id.trim().is_empty() {
+            return Err(GraphStoreError::new(
+                "invalid_scoped_ordered_index",
+                "scoped ordered index id is required",
+            ));
+        }
+        if self.scope_key.trim().is_empty() {
+            return Err(GraphStoreError::new(
+                "invalid_scoped_ordered_index",
+                "scoped ordered index scope key is required",
+            ));
+        }
+        if self.score_expression.trim().is_empty() {
+            return Err(GraphStoreError::new(
+                "invalid_scoped_ordered_index",
+                "scoped ordered index score expression is required",
+            ));
+        }
+        if self.hydration_label.trim().is_empty() {
+            return Err(GraphStoreError::new(
+                "invalid_scoped_ordered_index",
+                "scoped ordered index hydration label is required",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScopedOrderedEntry {
+    pub id: String,
+    pub score: OrderedScore,
+    pub hydration_handle: HydrationHandle,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ScopedOrderedIndex {
+    manifest: ScopedOrderedIndexManifest,
+    scopes: BTreeMap<String, OrderedIndex>,
+    handles: BTreeMap<(String, String), HydrationHandle>,
+    ops: usize,
+}
+
+impl ScopedOrderedIndex {
+    pub fn new(manifest: ScopedOrderedIndexManifest) -> GraphStoreResult<Self> {
+        manifest.validate()?;
+        Ok(Self {
+            manifest,
+            scopes: BTreeMap::new(),
+            handles: BTreeMap::new(),
+            ops: 0,
+        })
+    }
+
+    pub fn manifest(&self) -> &ScopedOrderedIndexManifest {
+        &self.manifest
+    }
+
+    pub fn add_or_update(
+        &mut self,
+        scope: &str,
+        id: &str,
+        score: f64,
+        graph_version: u64,
+    ) -> GraphStoreResult<bool> {
+        let scope = clean_non_empty("scope", scope)?;
+        let id = clean_non_empty("id", id)?;
+        let inserted = self
+            .scopes
+            .entry(scope.clone())
+            .or_insert_with(|| OrderedIndex::new(self.manifest.mode))
+            .zadd(id.as_bytes().to_vec(), score)?;
+        self.handles.insert(
+            (scope, id.clone()),
+            HydrationHandle::new(
+                id.clone(),
+                self.manifest.hydration_label.clone(),
+                graph_version,
+                format!("graph://{}/{}", self.manifest.hydration_label, id),
+            ),
+        );
+        self.ops = self.ops.saturating_add(1);
+        Ok(inserted)
+    }
+
+    pub fn pop_min(&mut self, scope: &str) -> Option<ScopedOrderedEntry> {
+        self.pop_with(scope, OrderedIndex::zpop_min)
+    }
+
+    pub fn pop_max(&mut self, scope: &str) -> Option<ScopedOrderedEntry> {
+        self.pop_with(scope, OrderedIndex::zpop_max)
+    }
+
+    pub fn range_by_score(
+        &mut self,
+        scope: &str,
+        min: f64,
+        max: f64,
+        limit: Option<usize>,
+    ) -> GraphStoreResult<Vec<ScopedOrderedEntry>> {
+        self.ops = self.ops.saturating_add(1);
+        let Some(index) = self.scopes.get(scope) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for (member, score) in index.zrange_by_score(min, max, limit)? {
+            if let Some(entry) = self.entry_for_member(scope, member, score)? {
+                out.push(entry);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn remove(&mut self, scope: &str, id: &str) -> bool {
+        self.ops = self.ops.saturating_add(1);
+        self.handles.remove(&(scope.to_string(), id.to_string()));
+        self.scopes
+            .get_mut(scope)
+            .map(|index| index.zrem(id.as_bytes()))
+            .unwrap_or(false)
+    }
+
+    pub fn rank(&self, scope: &str, id: &str) -> Option<usize> {
+        self.scopes
+            .get(scope)
+            .and_then(|index| index.zrank(id.as_bytes()))
+    }
+
+    pub fn cardinality(&self, scope: &str) -> usize {
+        self.scopes.get(scope).map(OrderedIndex::zcard).unwrap_or(0)
+    }
+
+    pub fn ops(&self) -> usize {
+        self.ops
+    }
+
+    pub fn reset_ops(&mut self) {
+        self.ops = 0;
+    }
+
+    fn pop_with(
+        &mut self,
+        scope: &str,
+        pop: fn(&mut OrderedIndex) -> Option<(OrderedMember, f64)>,
+    ) -> Option<ScopedOrderedEntry> {
+        self.ops = self.ops.saturating_add(1);
+        let (member, score) = pop(self.scopes.get_mut(scope)?)?;
+        let id = String::from_utf8(member).ok()?;
+        let hydration_handle = self.handles.remove(&(scope.to_string(), id.clone()))?;
+        Some(ScopedOrderedEntry {
+            id,
+            score: OrderedScore::new(score).ok()?,
+            hydration_handle,
+        })
+    }
+
+    fn entry_for_member(
+        &self,
+        scope: &str,
+        member: OrderedMember,
+        score: f64,
+    ) -> GraphStoreResult<Option<ScopedOrderedEntry>> {
+        let id = String::from_utf8(member).map_err(|err| {
+            GraphStoreError::new(
+                "invalid_scoped_ordered_member",
+                format!("ordered member is not valid utf-8: {err}"),
+            )
+        })?;
+        let Some(hydration_handle) = self.handles.get(&(scope.to_string(), id.clone())).cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ScopedOrderedEntry {
+            id,
+            score: OrderedScore::new(score)?,
+            hydration_handle,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ScopedOrderedIndexRegistry {
+    indexes: BTreeMap<String, ScopedOrderedIndex>,
+}
+
+impl ScopedOrderedIndexRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, index: ScopedOrderedIndex) -> GraphStoreResult<()> {
+        let id = index.manifest.id.clone();
+        if self.indexes.contains_key(&id) {
+            return Err(GraphStoreError::new(
+                "scoped_ordered_index_exists",
+                format!("scoped ordered index {id} is already registered"),
+            ));
+        }
+        self.indexes.insert(id, index);
+        Ok(())
+    }
+
+    pub fn get(&self, id: &str) -> Option<&ScopedOrderedIndex> {
+        self.indexes.get(id)
+    }
+
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut ScopedOrderedIndex> {
+        self.indexes.get_mut(id)
+    }
+}
+
+fn clean_non_empty(field: &str, value: &str) -> GraphStoreResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(GraphStoreError::new(
+            "invalid_scoped_ordered_index",
+            format!("scoped ordered {field} is required"),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 /// The eviction frontier (storage spine, cut 6): a persistent, per-scope

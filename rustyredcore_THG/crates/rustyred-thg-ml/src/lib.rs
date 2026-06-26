@@ -19,9 +19,10 @@ pub use benchmark::{
 pub use multivector::{
     binary_hamming_maxsim_score, binary_projection_bytes, exact_f16_bytes, exact_f32_bytes,
     exact_maxsim_score, quantize_sign_bits, rank_binary_hamming_maxsim, rank_exact_maxsim,
-    recall_against_exact_top_k, rerank_exact_maxsim_bounded, storage_costs, BinaryMultiVectorSet,
-    MaxSimAggregation, MaxSimScorer, MultiVectorEmbeddingSet, MultiVectorManifest,
-    MultiVectorRecallReport, MultiVectorScore, MultiVectorStorageCost,
+    recall_against_exact_top_k, rerank_exact_maxsim_bounded, rerank_exact_maxsim_with_provenance,
+    storage_costs, BinaryMultiVectorSet, MaxSimAggregation, MaxSimScorer, MultiVectorEmbeddingSet,
+    MultiVectorManifest, MultiVectorRecallReport, MultiVectorRerankHit, MultiVectorRerankReceipt,
+    MultiVectorScore, MultiVectorSourceRegion, MultiVectorStorageCost,
 };
 pub use producer::{
     project_multivector_tiers, HashingMultiVectorProducer, MultiVectorEncodeRequest,

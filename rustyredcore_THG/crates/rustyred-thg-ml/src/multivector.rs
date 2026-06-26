@@ -149,6 +149,35 @@ pub struct MultiVectorRecallReport {
     pub missing_content_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MultiVectorSourceRegion {
+    pub region_id: String,
+    pub atom_id: String,
+    pub source_ref: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub vector_index: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MultiVectorRerankHit {
+    pub score: MultiVectorScore,
+    pub source_regions: Vec<MultiVectorSourceRegion>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MultiVectorRerankReceipt {
+    pub query_vector_count: usize,
+    pub candidate_count: usize,
+    pub hydrated_count: usize,
+    pub output_count: usize,
+    pub scorer: MaxSimScorer,
+    pub aggregation: MaxSimAggregation,
+    pub hits: Vec<MultiVectorRerankHit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<MultiVectorRecallReport>,
+}
+
 pub fn exact_f32_bytes(vector_count: usize, dim: usize) -> usize {
     vector_count.saturating_mul(dim).saturating_mul(4)
 }
@@ -378,6 +407,55 @@ where
 
     sort_and_truncate(&mut reranked, output_limit);
     Ok(reranked)
+}
+
+pub fn rerank_exact_maxsim_with_provenance<F, G>(
+    query_vectors: &[Vec<f32>],
+    candidates: &[MultiVectorScore],
+    hydrate_limit: usize,
+    output_limit: usize,
+    aggregation: MaxSimAggregation,
+    hydrate_exact: F,
+    mut source_regions: G,
+    exact_ranked_for_recall: Option<&[MultiVectorScore]>,
+) -> ThgResult<MultiVectorRerankReceipt>
+where
+    F: FnMut(&MultiVectorScore) -> ThgResult<MultiVectorEmbeddingSet>,
+    G: FnMut(&MultiVectorScore) -> Vec<MultiVectorSourceRegion>,
+{
+    let reranked = rerank_exact_maxsim_bounded(
+        query_vectors,
+        candidates,
+        hydrate_limit,
+        output_limit,
+        aggregation,
+        hydrate_exact,
+    )?;
+    let hydrated_count = if hydrate_limit == 0 || output_limit == 0 {
+        0
+    } else {
+        candidates.len().min(hydrate_limit)
+    };
+    let hits = reranked
+        .into_iter()
+        .map(|score| MultiVectorRerankHit {
+            source_regions: source_regions(&score),
+            score,
+        })
+        .collect::<Vec<_>>();
+    let recall = exact_ranked_for_recall
+        .map(|exact| recall_against_exact_top_k(exact, candidates, output_limit, hydrate_limit));
+
+    Ok(MultiVectorRerankReceipt {
+        query_vector_count: query_vectors.len(),
+        candidate_count: candidates.len(),
+        hydrated_count,
+        output_count: hits.len(),
+        scorer: MaxSimScorer::ExactFloat,
+        aggregation,
+        hits,
+        recall,
+    })
 }
 
 fn validate_vector_matrix(name: &str, vectors: &[Vec<f32>]) -> ThgResult<usize> {
@@ -674,6 +752,65 @@ mod tests {
         assert_eq!(reranked.len(), 1);
         assert_eq!(reranked[0].content_id, "doc:b");
         assert_eq!(reranked[0].scorer, MaxSimScorer::ExactFloat);
+    }
+
+    #[test]
+    fn exact_rerank_receipt_preserves_source_regions_and_recall() {
+        let query = vec![vec![1.0, 0.0]];
+        let candidate_a = MultiVectorScore {
+            content_id: "doc:a".to_string(),
+            embedding_set_id: "mv:a".to_string(),
+            score: 0.9,
+            scorer: MaxSimScorer::BinaryHamming,
+            vector_count: 1,
+        };
+        let candidate_b = MultiVectorScore {
+            content_id: "doc:b".to_string(),
+            embedding_set_id: "mv:b".to_string(),
+            score: 0.8,
+            scorer: MaxSimScorer::BinaryHamming,
+            vector_count: 1,
+        };
+        let exact_oracle = vec![candidate_b.clone(), candidate_a.clone()];
+
+        let receipt = rerank_exact_maxsim_with_provenance(
+            &query,
+            &[candidate_a, candidate_b],
+            2,
+            1,
+            MaxSimAggregation::Mean,
+            |candidate| {
+                let vector = if candidate.content_id == "doc:b" {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                };
+                Ok(set(
+                    &candidate.embedding_set_id,
+                    &candidate.content_id,
+                    vec![vector],
+                ))
+            },
+            |score| {
+                vec![MultiVectorSourceRegion {
+                    region_id: format!("region:{}", score.content_id),
+                    atom_id: format!("atom:{}", score.content_id),
+                    source_ref: "graph://ContextAtom/source".to_string(),
+                    start_offset: 12,
+                    end_offset: 40,
+                    vector_index: 0,
+                }]
+            },
+            Some(&exact_oracle),
+        )
+        .expect("rerank receipt");
+
+        assert_eq!(receipt.hydrated_count, 2);
+        assert_eq!(receipt.output_count, 1);
+        assert_eq!(receipt.scorer, MaxSimScorer::ExactFloat);
+        assert_eq!(receipt.hits[0].score.content_id, "doc:b");
+        assert_eq!(receipt.hits[0].source_regions[0].atom_id, "atom:doc:b");
+        assert_eq!(receipt.recall.unwrap().recall, 1.0);
     }
 
     #[test]

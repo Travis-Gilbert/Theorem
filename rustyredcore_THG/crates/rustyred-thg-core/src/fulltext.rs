@@ -9,9 +9,13 @@
 //!
 //! Scoring is BM25 with k1 = 1.2, b = 0.75 (standard defaults).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
+
+use crate::index_manifest::{
+    IndexBackend, IndexBuildStatus, IndexCreatedBy, IndexKind, IndexManifest, IndexScope,
+};
 
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
@@ -27,6 +31,61 @@ pub(crate) const FULLTEXT_BACKEND_TANTIVY: &str = "tantivy";
 pub struct FullTextDesignation {
     pub label: String,
     pub property: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullTextSearchBackend {
+    Bm25,
+    Tantivy,
+}
+
+impl FullTextSearchBackend {
+    fn index_backend(self) -> IndexBackend {
+        match self {
+            Self::Bm25 => IndexBackend::Bm25,
+            Self::Tantivy => IndexBackend::Tantivy,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FieldedFullTextDefinition {
+    pub manifest_id: String,
+    pub target_label: String,
+    pub fields: Vec<String>,
+    pub backend: FullTextSearchBackend,
+}
+
+impl FieldedFullTextDefinition {
+    pub fn bm25(
+        manifest_id: impl Into<String>,
+        target_label: impl Into<String>,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            manifest_id: manifest_id.into(),
+            target_label: target_label.into(),
+            fields: fields.into_iter().map(Into::into).collect(),
+            backend: FullTextSearchBackend::Bm25,
+        }
+    }
+
+    pub fn to_manifest(&self, scope: IndexScope, created_by: IndexCreatedBy) -> IndexManifest {
+        let mut manifest = IndexManifest::new(
+            self.manifest_id.clone(),
+            format!("{} fielded full-text", self.target_label),
+            IndexKind::FullText,
+            self.backend.index_backend(),
+            scope,
+            self.target_label.clone(),
+            created_by,
+        )
+        .with_target_properties(self.fields.clone());
+        manifest.build_status = IndexBuildStatus::Active;
+        manifest.refresh_hashes();
+        manifest
+    }
 }
 
 /// §P5-A pa5.1 + cross-cutting cc.3: the full-text designation is now a
@@ -62,6 +121,235 @@ pub trait FullTextBackend: Send + Sync + std::fmt::Debug {
     fn designation(&self) -> &FullTextDesignation;
     /// Number of documents currently indexed.
     fn doc_count(&self) -> usize;
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct FieldedFullTextDocument {
+    pub doc_id: String,
+    pub fields: BTreeMap<String, String>,
+}
+
+impl FieldedFullTextDocument {
+    pub fn new(doc_id: impl Into<String>) -> Self {
+        Self {
+            doc_id: doc_id.into(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_field(mut self, field: impl Into<String>, text: impl Into<String>) -> Self {
+        self.fields.insert(field.into(), text.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FullTextSnippet {
+    pub field: String,
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FieldedFullTextHit {
+    pub doc_id: String,
+    pub score: f32,
+    pub field_scores: BTreeMap<String, f32>,
+    pub snippets: Vec<FullTextSnippet>,
+}
+
+#[derive(Debug)]
+pub struct FieldedFullTextIndex {
+    designation_label: String,
+    field_indexes: BTreeMap<String, FullTextIndex>,
+    field_boosts: BTreeMap<String, f32>,
+    raw_fields: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl FieldedFullTextIndex {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            designation_label: label.into(),
+            field_indexes: BTreeMap::new(),
+            field_boosts: BTreeMap::new(),
+            raw_fields: BTreeMap::new(),
+        }
+    }
+
+    pub fn set_field_boost(&mut self, field: impl Into<String>, boost: f32) {
+        self.field_boosts.insert(field.into(), boost.max(0.0));
+    }
+
+    pub fn upsert(&mut self, document: FieldedFullTextDocument) {
+        let doc_id = document.doc_id.clone();
+        let designation_label = self.designation_label.clone();
+        self.remove(&doc_id);
+        for (field, text) in &document.fields {
+            let index_text = if is_code_field(field) {
+                code_aware_terms(text).join(" ")
+            } else {
+                text.clone()
+            };
+            self.field_indexes
+                .entry(field.clone())
+                .or_insert_with(|| {
+                    FullTextIndex::for_designation(FullTextDesignation {
+                        label: designation_label.clone(),
+                        property: field.clone(),
+                    })
+                })
+                .upsert(&doc_id, &index_text);
+        }
+        self.raw_fields.insert(doc_id, document.fields);
+    }
+
+    pub fn remove(&mut self, doc_id: &str) {
+        for index in self.field_indexes.values_mut() {
+            index.remove(doc_id);
+        }
+        self.raw_fields.remove(doc_id);
+    }
+
+    pub fn search(&self, query: &str, k: usize) -> Vec<FieldedFullTextHit> {
+        let mut scores: BTreeMap<String, FieldedFullTextHit> = BTreeMap::new();
+        for (field, index) in &self.field_indexes {
+            let boost = self.field_boosts.get(field).copied().unwrap_or(1.0);
+            for (doc_id, score) in index.search(query, k.saturating_mul(4).max(k)) {
+                let weighted = score * boost;
+                let hit = scores
+                    .entry(doc_id.clone())
+                    .or_insert_with(|| FieldedFullTextHit {
+                        doc_id: doc_id.clone(),
+                        score: 0.0,
+                        field_scores: BTreeMap::new(),
+                        snippets: Vec::new(),
+                    });
+                hit.score += weighted;
+                hit.field_scores.insert(field.clone(), weighted);
+            }
+        }
+        let mut hits = scores.into_values().collect::<Vec<_>>();
+        for hit in &mut hits {
+            hit.snippets = self.snippets(&hit.doc_id, query, 2);
+        }
+        sort_fulltext_hits(&mut hits, k);
+        hits
+    }
+
+    pub fn phrase_search(&self, phrase: &str, k: usize) -> Vec<FieldedFullTextHit> {
+        self.literal_scan(phrase, k, LiteralMode::Phrase)
+    }
+
+    pub fn prefix_search(&self, prefix: &str, k: usize) -> Vec<FieldedFullTextHit> {
+        self.literal_scan(prefix, k, LiteralMode::Prefix)
+    }
+
+    pub fn fuzzy_search(
+        &self,
+        term: &str,
+        max_distance: usize,
+        k: usize,
+    ) -> Vec<FieldedFullTextHit> {
+        let query = term.to_ascii_lowercase();
+        let mut hits = Vec::new();
+        for (doc_id, fields) in &self.raw_fields {
+            let mut score = 0.0;
+            let mut field_scores = BTreeMap::new();
+            for (field, text) in fields {
+                let matched = tokenize(text)
+                    .into_iter()
+                    .chain(code_aware_terms(text))
+                    .any(|token| edit_distance(&token, &query) <= max_distance);
+                if matched {
+                    let boosted = self.field_boosts.get(field).copied().unwrap_or(1.0);
+                    score += boosted;
+                    field_scores.insert(field.clone(), boosted);
+                }
+            }
+            if score > 0.0 {
+                hits.push(FieldedFullTextHit {
+                    doc_id: doc_id.clone(),
+                    score,
+                    field_scores,
+                    snippets: self.snippets(doc_id, term, 2),
+                });
+            }
+        }
+        sort_fulltext_hits(&mut hits, k);
+        hits
+    }
+
+    fn literal_scan(&self, needle: &str, k: usize, mode: LiteralMode) -> Vec<FieldedFullTextHit> {
+        let needle = needle.to_ascii_lowercase();
+        let mut hits = Vec::new();
+        for (doc_id, fields) in &self.raw_fields {
+            let mut score = 0.0;
+            let mut field_scores = BTreeMap::new();
+            for (field, text) in fields {
+                let matched = match mode {
+                    LiteralMode::Phrase => text.to_ascii_lowercase().contains(&needle),
+                    LiteralMode::Prefix => tokenize(text)
+                        .into_iter()
+                        .chain(code_aware_terms(text))
+                        .any(|token| token.starts_with(&needle)),
+                };
+                if matched {
+                    let boosted = self.field_boosts.get(field).copied().unwrap_or(1.0);
+                    score += boosted;
+                    field_scores.insert(field.clone(), boosted);
+                }
+            }
+            if score > 0.0 {
+                hits.push(FieldedFullTextHit {
+                    doc_id: doc_id.clone(),
+                    score,
+                    field_scores,
+                    snippets: self.snippets(doc_id, &needle, 2),
+                });
+            }
+        }
+        sort_fulltext_hits(&mut hits, k);
+        hits
+    }
+
+    fn snippets(&self, doc_id: &str, query: &str, limit: usize) -> Vec<FullTextSnippet> {
+        let mut snippets = Vec::new();
+        let Some(fields) = self.raw_fields.get(doc_id) else {
+            return snippets;
+        };
+        let terms = tokenize(query);
+        for (field, text) in fields {
+            let lower = text.to_ascii_lowercase();
+            let hit = terms
+                .iter()
+                .find_map(|term| lower.find(term).map(|start| (start, term.len())))
+                .or_else(|| {
+                    let needle = query.to_ascii_lowercase();
+                    lower.find(&needle).map(|start| (start, needle.len()))
+                });
+            if let Some((start, len)) = hit {
+                let snippet_start = clamp_to_char_boundary(text, start.saturating_sub(40));
+                let snippet_end = clamp_to_char_boundary(text, (start + len + 40).min(text.len()));
+                snippets.push(FullTextSnippet {
+                    field: field.clone(),
+                    start,
+                    end: start + len,
+                    text: text[snippet_start..snippet_end].to_string(),
+                });
+                if snippets.len() >= limit {
+                    break;
+                }
+            }
+        }
+        snippets
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiteralMode {
+    Phrase,
+    Prefix,
 }
 
 impl FullTextIndex {
@@ -176,11 +464,72 @@ const STOP_WORDS: &[&str] = &[
 ];
 
 fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|s| !s.is_empty())
         .map(|s| s.to_lowercase())
         .filter(|s| !STOP_WORDS.contains(&s.as_str()))
         .collect()
+}
+
+fn is_code_field(field: &str) -> bool {
+    matches!(
+        field,
+        "name" | "symbol" | "symbol_path" | "path" | "file_path" | "body" | "docstring"
+    )
+}
+
+fn code_aware_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in text.split_whitespace() {
+        let trimmed = raw.trim_matches(|c: char| {
+            !(c.is_alphanumeric() || matches!(c, '_' | ':' | '.' | '/' | '-'))
+        });
+        if trimmed.is_empty() {
+            continue;
+        }
+        terms.push(trimmed.to_ascii_lowercase());
+        terms.extend(
+            trimmed
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_ascii_lowercase()),
+        );
+    }
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn sort_fulltext_hits(hits: &mut Vec<FieldedFullTextHit>, k: usize) {
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    hits.truncate(k);
+}
+
+fn clamp_to_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut prev = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut cur = vec![0; right_chars.len() + 1];
+    for (i, left_ch) in left.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, right_ch) in right_chars.iter().enumerate() {
+            let cost = usize::from(left_ch != *right_ch);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[right_chars.len()]
 }
 
 #[cfg(test)]

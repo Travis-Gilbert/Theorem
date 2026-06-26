@@ -8,6 +8,7 @@ pub mod access_method;
 pub mod cold_fragments;
 pub mod cold_index;
 pub mod commands;
+pub mod context_view;
 pub mod crdt;
 pub mod doc_tree;
 pub mod epistemic;
@@ -21,13 +22,22 @@ pub mod graph;
 pub mod graph_csr;
 pub mod graph_store;
 pub mod hooks;
+pub mod identity_index;
+pub mod index_advisor;
+pub mod index_manifest;
+pub mod index_proposal;
+pub mod index_registry;
 pub mod instant_kg;
+pub mod labeled_training_run;
+pub mod map_artifact;
 pub mod object_store;
 pub mod ordered;
 pub mod planner;
 pub mod plugin;
 pub mod ppr_cache;
+pub mod query_receipt;
 pub mod ranking;
+pub mod read_model_index;
 pub mod relational;
 pub mod saturation;
 pub mod spatial;
@@ -38,6 +48,8 @@ pub mod statement;
 pub mod store;
 pub mod stream;
 pub mod symbolic;
+pub mod training_export;
+pub mod vector_eval;
 pub mod versioned_graph;
 pub mod working_log;
 pub mod zerocopy;
@@ -57,6 +69,7 @@ pub use cold_index::{
     OrderedColdIndex,
 };
 pub use commands::{ThgCommand, ThgRequest, ThgResponse};
+pub use context_view::{ContextView, ContextViewType, FreshnessStatus, HydrationHandle};
 pub use crdt::{
     diff_since, join_delta, ActorId, Hlc, HlcClock, JoinReport, StampedBatch, StampedMutation,
     VersionVector,
@@ -96,8 +109,10 @@ pub use feature_dsl::{
     DEFAULT_MAX_STEPS, DEFAULT_MAX_TRAVERSAL_DEPTH, DEFAULT_MAX_TRAVERSAL_NODES,
 };
 pub use fulltext::{
-    make_fulltext_backend, make_fulltext_backend_from_value, FullTextBackend, FullTextBackendError,
-    FullTextDesignation, FullTextIndex, RUSTY_RED_FULLTEXT_BACKEND_ENV,
+    make_fulltext_backend, make_fulltext_backend_from_value, FieldedFullTextDefinition,
+    FieldedFullTextDocument, FieldedFullTextHit, FieldedFullTextIndex, FullTextBackend,
+    FullTextBackendError, FullTextDesignation, FullTextIndex, FullTextSearchBackend,
+    FullTextSnippet, RUSTY_RED_FULLTEXT_BACKEND_ENV,
 };
 #[allow(deprecated)]
 pub use graph::louvain_communities;
@@ -123,16 +138,32 @@ pub use hooks::{
     HookDispatcherStats, HookEmitter, HookError, HookHandler, HookOutcome, HookRegistration,
     HookStoreAccess, MutationEvent, MutationKind, MutationMatcher,
 };
+pub use identity_index::{
+    IdentityIndex, IdentityIndexDefinition, IdentityIndexKey, IdentityInsertOutcome,
+    IdentityProblemRecord, IdentityTarget,
+};
+pub use index_advisor::{IndexAdvisor, IndexAdvisorConfig, IndexPainSignal};
+pub use index_manifest::{
+    IndexBackend, IndexBuildStatus, IndexCreatedBy, IndexKind, IndexManifest, IndexScope,
+};
+pub use index_proposal::{IndexProposal, IndexProposalStatus, IndexRiskLevel, PromotionThreshold};
+pub use index_registry::IndexRegistry;
 pub use instant_kg::{
     instant_kg_payload_delta, instant_kg_payload_manifest, instant_kg_status_payload,
     CodeKgEncodedFile, CodeKgManifest, EdgeExplanation, HarnessInstantKg, ImpactResult,
     InstantKgStatus, PprResult, SearchResult, SessionDelta, INSTANT_KG_DEFAULT_ENCODER_VERSION,
     INSTANT_KG_DEFAULT_INGEST_VERSION, INSTANT_KG_PROTOCOL_VERSION,
 };
+pub use labeled_training_run::{
+    LabeledTrainingRun, TrainingExportStatus, TrainingLabel, TrainingLabelFamily, TrainingOutcome,
+    TrainingTaskType, ValidatorResult,
+};
+pub use map_artifact::{MapArtifact, MapArtifactType, MapSection};
 pub use object_store::{ColdObjectStore, DiskObjectStore, InMemoryObjectStore};
 pub use ordered::{
     EvictionFrontier, OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember,
-    OrderedMode, OrderedScore,
+    OrderedMode, OrderedScore, ScopedOrderedEntry, ScopedOrderedIndex, ScopedOrderedIndexManifest,
+    ScopedOrderedIndexRegistry,
 };
 pub use planner::{
     compile_graphql_selection, execute_query, execute_query_with_resolver, AccessPathTrace,
@@ -148,10 +179,18 @@ pub use ppr_cache::{
     cached_personalized_pagerank, cached_single_seed_personalized_pagerank, clear_scoped_ppr_cache,
     merge_ppr_scores, scoped_ppr_cache_len,
 };
+pub use query_receipt::{
+    AccessPathReceipt, QueryExplain, QueryKind, QueryOutcomeLabel, QueryReceipt, ReceiptScope,
+};
 pub use ranking::{
     apply_cascade, apply_feature_scores, compute_term_match, CascadeOutcome, EpistemicGate,
     ExpandRankingMethod, FeatureRankingConfig, QueryContext, RankCandidate, RankedCandidate,
     RankingRule, TermMatch, TextRankingMethod, TypoConfig, VectorRankingMethod,
+};
+pub use read_model_index::{
+    CompositeIndex, CompositeIndexDefinition, CompositeIndexEntry, CompositeIndexKey,
+    CoveringIndex, CoveringIndexDefinition, CoveringRow, PartialIndex, PartialIndexDefinition,
+    PartialIndexEntry, PartialPredicateClause, PartialPredicateOp,
 };
 pub use relational::{
     ColumnSchema, NativeAuthPrincipalRecord, NativeBillingAccountRecord, NativeCatalog,
@@ -194,6 +233,13 @@ pub use symbolic::{
     probabilistic_expected_value_from_json, probabilistic_source_reliability,
     probabilistic_source_reliability_from_json, stable_hash_json, stable_hash_value,
     DATALOG_RULE_IDS,
+};
+pub use training_export::{
+    export_records_jsonl, RedactionStatus, TrainingExportKind, TrainingExportRecord,
+};
+pub use vector_eval::{
+    filter_vector_candidates, vector_recall_against_exact, VectorFilterPolicy,
+    VectorIndexDefinition, VectorRecallReport, VectorSearchBackend, VectorSearchCandidate,
 };
 pub use versioned_graph::{
     apply_graph_mutation_batch, build_prolly_tree, build_prolly_tree_from_entries,
