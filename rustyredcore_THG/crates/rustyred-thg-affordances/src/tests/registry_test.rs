@@ -59,6 +59,37 @@ fn register_connector_creates_one_node_per_tool() {
 }
 
 #[test]
+fn register_connector_promotes_content_extraction_tag_to_family() {
+    let mut store = InMemoryGraphStore::new();
+    let manifest = ConnectorManifest {
+        tenant_id: "theorem".to_string(),
+        server_id: "content-core".to_string(),
+        label: "Content Core".to_string(),
+        tools: vec![ToolManifest {
+            name: "extract_content".to_string(),
+            label: "Extract content".to_string(),
+            description: "Extract content from a URL or non-text file.".to_string(),
+            input_schema: json!({}),
+            permissions: vec![],
+            cost: json!({}),
+            writeback_policy: "read-only".to_string(),
+            tags: vec!["content_extraction".to_string(), "document".to_string()],
+            description_embedding: None,
+        }],
+    };
+
+    register_connector(&mut store, manifest, Some("test")).unwrap();
+    let node = store
+        .get_node(&affordance_node_id(
+            "theorem",
+            "content-core.extract_content",
+        ))
+        .expect("affordance node");
+    let affordance = Affordance::from_node_record(node).expect("affordance");
+    assert_eq!(affordance.family, "content_extraction");
+}
+
+#[test]
 fn re_registration_is_idempotent_and_preserves_learned_fitness() {
     let mut store = InMemoryGraphStore::new();
     register_connector(&mut store, github_manifest(), Some("test")).unwrap();

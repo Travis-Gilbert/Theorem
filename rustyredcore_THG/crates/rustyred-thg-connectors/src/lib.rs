@@ -31,8 +31,10 @@ pub use protocol::{
     InitializeInfo, ToolCallOutcome, ToolDescriptor,
 };
 pub use transport::{
-    connect_http, connect_transport, spawn_stdio, ConnectedTransport, ConnectionTarget,
-    ConnectorAuth, HttpTransport, McpTransport, StdioTransport,
+    connect_http, connect_transport, content_core_mcp_target_from_env, spawn_stdio,
+    ConnectedTransport, ConnectionTarget, ConnectorAuth, HttpTransport, McpTransport,
+    StdioTransport, CCORE_ENV_KEYS, CONTENT_CORE_ARGS_ENV, CONTENT_CORE_COMMAND_ENV,
+    CONTENT_CORE_MCP_ARGS_ENV, CONTENT_CORE_MCP_COMMAND_ENV, CONTENT_CORE_SERVER_ID,
 };
 
 use std::fmt;

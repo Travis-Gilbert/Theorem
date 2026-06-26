@@ -446,6 +446,36 @@ pub fn openapi_document() -> Value {
                     }
                 }
             },
+            "/connectors/register/content-core": {
+                "post": {
+                    "tags": ["connectors"],
+                    "summary": "Register the content-core MCP server",
+                    "description": "Uses the configured content-core stdio target (default `uvx content-core mcp`) and persists it as the `content-core` connector. The registered tools surface in the content_extraction affordance family.",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegisterContentCoreConnectorBody" } } }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "The content-core server info and registered affordance ids.",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "server": { "type": "object", "properties": {
+                                        "name": { "type": "string" }, "version": { "type": "string" }, "protocol": { "type": "string" }
+                                    } },
+                                    "tenant": { "type": "string" },
+                                    "server_id": { "type": "string", "example": "content-core" },
+                                    "affordance_ids": { "type": "array", "items": { "type": "string" } },
+                                    "count": { "type": "integer" }
+                                }
+                            } } }
+                        },
+                        "400": { "description": "Missing tenant." },
+                        "502": { "description": "content-core MCP handshake failed." }
+                    }
+                }
+            },
             "/github/webhook": {
                 "post": {
                     "tags": ["operations"],
@@ -607,6 +637,14 @@ pub fn openapi_document() -> Value {
                         "label": { "type": "string", "description": "Defaults to server_id if empty." },
                         "target": { "$ref": "#/components/schemas/ConnectionTarget" }
                     }
+                },
+                "RegisterContentCoreConnectorBody": {
+                    "type": "object",
+                    "properties": {
+                        "tenant": { "type": "string", "example": "Travis-Gilbert" },
+                        "tenant_slug": { "type": "string", "example": "Travis-Gilbert" },
+                        "label": { "type": "string", "description": "Defaults to Content Core." }
+                    }
                 }
             }
         }
@@ -634,6 +672,7 @@ mod tests {
             "/harness/jobs",
             "/connectors",
             "/connectors/register",
+            "/connectors/register/content-core",
         ] {
             assert!(paths.contains_key(path), "missing documented path: {path}");
         }

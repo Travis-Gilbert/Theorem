@@ -35,8 +35,9 @@ use axum::{
 use rustyred_thg_affordances::registry::register_connector_with_target;
 use rustyred_thg_code::{CodeIndexRuntime, CodebaseMapProjectionSink, GitCredentialResolver};
 use rustyred_thg_connectors::{
-    connect_transport, connector_manifest, initialize_params, parse_initialize, parse_tools_list,
-    tools_list_params, ConnectionTarget, McpTransport,
+    connect_transport, connector_manifest, content_core_mcp_target_from_env, initialize_params,
+    parse_initialize, parse_tools_list, tools_list_params, ConnectionTarget, McpTransport,
+    CONTENT_CORE_SERVER_ID,
 };
 use rustyred_thg_core::{RedCoreGraphStore, RedCoreOptions};
 use serde::Deserialize;
@@ -226,6 +227,10 @@ async fn main() {
         )
         .route("/connectors", get(list_connectors))
         .route("/connectors/register", post(register_connector_route))
+        .route(
+            "/connectors/register/content-core",
+            post(register_content_core_connector_route),
+        )
         .with_state(state.clone())
         .merge(push)
         .merge(jobs);
@@ -569,6 +574,16 @@ struct RegisterConnectorBody {
     target: ConnectionTarget,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RegisterContentCoreConnectorBody {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    tenant_slug: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
 /// `GET /connectors?tenant=...` -> the registered connectors + tool affordances.
 /// Read-only and fast; no server is contacted.
 async fn list_connectors(
@@ -603,6 +618,41 @@ async fn register_connector_route(
     };
     let target = body.target;
 
+    register_connector_target(store, tenant, server_id, label, target, "operator").await
+}
+
+async fn register_content_core_connector_route(
+    State(store): State<SharedStore>,
+    Json(body): Json<RegisterContentCoreConnectorBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = request_tenant_slug(body.tenant_slug.as_deref(), body.tenant.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let label = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or("Content Core")
+        .to_string();
+    register_connector_target(
+        store,
+        tenant,
+        CONTENT_CORE_SERVER_ID.to_string(),
+        label,
+        content_core_mcp_target_from_env(),
+        "operator",
+    )
+    .await
+}
+
+async fn register_connector_target(
+    store: SharedStore,
+    tenant: String,
+    server_id: String,
+    label: String,
+    target: ConnectionTarget,
+    actor: &'static str,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let outcome = tokio::task::spawn_blocking(move || -> Result<Value, String> {
         // Network OUTSIDE the store lock: spawn the server and run the handshake.
         let mut transport = connect_transport(&target).map_err(|e| e.to_string())?;
@@ -624,13 +674,9 @@ async fn register_connector_route(
         let mut store = store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        let registration = register_connector_with_target(
-            &mut *store,
-            manifest,
-            Some(target_value),
-            Some("operator"),
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        let registration =
+            register_connector_with_target(&mut *store, manifest, Some(target_value), Some(actor))
+                .map_err(|e| format!("{e:?}"))?;
         Ok(json!({
             "server": {
                 "name": server_info.server_name,

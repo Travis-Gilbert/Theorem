@@ -12,6 +12,7 @@ use crate::{ConnectorError, ConnectorResult};
 
 /// The MCP protocol version this client advertises in `initialize`.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+pub const CONTENT_EXTRACTION_FAMILY: &str = "content_extraction";
 
 /// `initialize` request params (our client identity + capabilities).
 pub fn initialize_params() -> Value {
@@ -180,15 +181,88 @@ pub fn connector_manifest(
     label: &str,
     descriptors: &[ToolDescriptor],
 ) -> ConnectorManifest {
+    let content_core = is_content_core_connector(server_id, label);
     ConnectorManifest {
         tenant_id: tenant_id.to_string(),
         server_id: server_id.to_string(),
         label: label.to_string(),
         tools: descriptors
             .iter()
-            .map(tool_manifest_from_descriptor)
+            .map(|descriptor| {
+                let mut tool = tool_manifest_from_descriptor(descriptor);
+                if content_core {
+                    enrich_content_core_tool(&mut tool);
+                }
+                tool
+            })
             .collect(),
     }
+}
+
+fn is_content_core_connector(server_id: &str, label: &str) -> bool {
+    let server = normalize_connector_name(server_id);
+    let label = normalize_connector_name(label);
+    matches!(server.as_str(), "content-core" | "contentcore")
+        || matches!(label.as_str(), "content-core" | "contentcore")
+}
+
+fn normalize_connector_name(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn enrich_content_core_tool(tool: &mut ToolManifest) {
+    match tool.name.as_str() {
+        "extract_content" => {
+            tool.label = "Extract content".to_string();
+            tool.writeback_policy = "read-only".to_string();
+            append_description(
+                tool,
+                "Harness use: call this when a URL or non-text file appears and its content is needed. Do not use it for plain text or Markdown the head can already read. Images and screenshots stay on the vision spine.",
+            );
+            add_tags(
+                tool,
+                &[
+                    "content_extraction",
+                    "extract",
+                    "url",
+                    "document",
+                    "media",
+                    "read",
+                ],
+            );
+        }
+        "summarize_content" => {
+            tool.label = "Summarize extracted content".to_string();
+            tool.writeback_policy = "read-only".to_string();
+            append_description(
+                tool,
+                "Harness use: call this only when content-core's configured summarizer is explicitly desired. Prefer the harness model path for ordinary reasoning summaries.",
+            );
+            add_tags(tool, &["content_extraction", "summarize", "read"]);
+        }
+        _ => {}
+    }
+}
+
+fn append_description(tool: &mut ToolManifest, guidance: &str) {
+    if tool.description.trim().is_empty() {
+        tool.description = guidance.to_string();
+    } else if !tool.description.contains(guidance) {
+        tool.description.push_str("\n\n");
+        tool.description.push_str(guidance);
+    }
+}
+
+fn add_tags(tool: &mut ToolManifest, tags: &[&str]) {
+    tool.tags.extend(tags.iter().map(|tag| (*tag).to_string()));
+    tool.tags.sort();
+    tool.tags.dedup();
 }
 
 /// Outcome of a `tools/call` (used by the deferred invoke slice). Concatenates

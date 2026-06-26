@@ -14,6 +14,18 @@ use serde_json::{json, Value};
 use crate::{ConnectorError, ConnectorResult};
 
 pub const JSONRPC_VERSION: &str = "2.0";
+pub const CONTENT_CORE_SERVER_ID: &str = "content-core";
+pub const CONTENT_CORE_MCP_COMMAND_ENV: &str = "THEOREM_CONTENT_CORE_MCP_COMMAND";
+pub const CONTENT_CORE_MCP_ARGS_ENV: &str = "THEOREM_CONTENT_CORE_MCP_ARGS";
+pub const CONTENT_CORE_COMMAND_ENV: &str = "THEOREM_CONTENT_CORE_COMMAND";
+pub const CONTENT_CORE_ARGS_ENV: &str = "THEOREM_CONTENT_CORE_ARGS";
+pub const CCORE_ENV_KEYS: &[&str] = &[
+    "CCORE_URL_ENGINE",
+    "CCORE_DOCUMENT_ENGINE",
+    "CCORE_STT_PROVIDER",
+    "CCORE_STT_MODEL",
+    "CCORE_AUDIO_CONCURRENCY",
+];
 
 /// How to reach an external MCP server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +45,73 @@ pub enum ConnectionTarget {
         #[serde(default)]
         auth: Option<ConnectorAuth>,
     },
+}
+
+/// Canonical persisted target for the content-core MCP server.
+///
+/// Defaults to `uvx content-core mcp` for local/dev zero-install. Hosted
+/// deployments should set `THEOREM_CONTENT_CORE_MCP_COMMAND` (or the shared
+/// `THEOREM_CONTENT_CORE_COMMAND`) to the pinned venv/tool-install binary so
+/// ingest and MCP invocation hit the same installed package.
+pub fn content_core_mcp_target_from_env() -> ConnectionTarget {
+    let (command, mut args) = content_core_command_parts();
+    if args.last().map(|arg| arg.as_str()) != Some("mcp") {
+        args.push("mcp".to_string());
+    }
+    ConnectionTarget::Stdio {
+        command,
+        args,
+        env: content_core_engine_env(),
+    }
+}
+
+fn content_core_command_parts() -> (String, Vec<String>) {
+    if let Some(parts) =
+        command_parts_from_env(CONTENT_CORE_MCP_COMMAND_ENV, CONTENT_CORE_MCP_ARGS_ENV)
+    {
+        return parts;
+    }
+    if let Some(parts) = command_parts_from_env(CONTENT_CORE_COMMAND_ENV, CONTENT_CORE_ARGS_ENV) {
+        return parts;
+    }
+    ("uvx".to_string(), vec!["content-core".to_string()])
+}
+
+fn command_parts_from_env(command_env: &str, args_env: &str) -> Option<(String, Vec<String>)> {
+    let raw = std::env::var(command_env).ok()?;
+    let mut parts = split_words(&raw);
+    if parts.is_empty() {
+        return None;
+    }
+    let command = parts.remove(0);
+    parts.extend(
+        std::env::var(args_env)
+            .ok()
+            .map(|value| split_words(&value))
+            .unwrap_or_default(),
+    );
+    Some((command, parts))
+}
+
+fn content_core_engine_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for key in CCORE_ENV_KEYS {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                env.insert((*key).to_string(), value);
+            }
+        }
+    }
+    env
+}
+
+fn split_words(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

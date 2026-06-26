@@ -28,6 +28,7 @@ pub const THEOREM_GRPC_TIMEOUT_MS: u64 = 30_000;
 ///   parse runs server-side under `THEOREM_CODE_INGEST_PARSE_BUDGET_MS`
 ///   (default 120s), committing partial progress with a `budget_exceeded`
 ///   status instead of surfacing a transport `Cancelled`.
+///
 /// This constant remains the RPC ceiling for the submission round-trip and
 /// for `code_search.ingest_status` polls, both of which are sub-second.
 pub const THEOREM_GRPC_CODE_INGEST_TIMEOUT_MS: u64 = 120_000;
@@ -392,7 +393,7 @@ fn affordance_from_tool(tenant_id: &str, server_id: &str, tool: &ToolManifest) -
         tenant_id: tenant_id.to_string(),
         server_id: server_id.to_string(),
         tool_name,
-        family: "connector".to_string(),
+        family: family_from_tool(tool),
         label: if tool.label.trim().is_empty() {
             tool.name.trim().to_string()
         } else {
@@ -490,6 +491,14 @@ impl TheseusAppAffordanceSpec {
             manifest_version: 1,
         }
         .normalized()
+    }
+}
+
+fn family_from_tool(tool: &ToolManifest) -> String {
+    if tool.tags.iter().any(|tag| tag == "content_extraction") {
+        "content_extraction".to_string()
+    } else {
+        "connector".to_string()
     }
 }
 
