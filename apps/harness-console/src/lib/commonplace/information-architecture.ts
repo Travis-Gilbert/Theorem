@@ -15,6 +15,28 @@ export interface CommonplaceToolboxGroup {
   items: readonly CommonplaceIaItem[];
 }
 
+export interface CommonplaceDataViewDescriptor {
+  id: string;
+  label: string;
+  viewDescriptorId: string;
+  objectTypes: readonly string[];
+  renderers: readonly string[];
+  actions: readonly string[];
+  query: {
+    types: readonly string[];
+    live: boolean;
+    rank?: readonly string[];
+    slice?: readonly string[];
+  };
+}
+
+export interface CommonplaceSceneRenderer {
+  id: string;
+  label: string;
+  capability: string;
+  status: "registered" | "planned";
+}
+
 export const COMMONPLACE_IA_RULES: readonly { placement: CommonplacePlacement; test: string }[] = [
   { placement: "page", test: "Do I dwell here to work?" },
   { placement: "omnibar-capability", test: "Is this a setting on the agent, not a room?" },
@@ -141,6 +163,84 @@ export const COMMONPLACE_DATA_VIEWS: readonly CommonplaceIaItem[] = [
     label: "Clips",
     placement: "data-view",
     description: "Clipped web and media content.",
+  },
+] as const;
+
+export const COMMONPLACE_DATA_VIEW_DESCRIPTORS: readonly CommonplaceDataViewDescriptor[] = [
+  {
+    id: "files",
+    label: "Files",
+    viewDescriptorId: "file-tree",
+    objectTypes: ["file", "folder"],
+    renderers: ["react-arborist", "@uiw/react-codemirror"],
+    actions: ["open", "attach", "route", "inspect provenance"],
+    query: { types: ["file"], live: true, rank: ["recent", "graph"], slice: ["space"] },
+  },
+  {
+    id: "graph",
+    label: "Graph",
+    viewDescriptorId: "graph",
+    objectTypes: ["node", "edge", "cluster"],
+    renderers: ["cosmos.gl", "React Flow for close workflow graphs"],
+    actions: ["snapshot", "diff", "branch", "restore"],
+    query: { types: ["graph_node", "graph_edge"], live: true, rank: ["ppr", "bm25"] },
+  },
+  {
+    id: "table",
+    label: "Table",
+    viewDescriptorId: "table",
+    objectTypes: ["record", "task", "project", "schema"],
+    renderers: ["@tanstack/react-table", "shadcn form primitives"],
+    actions: ["sort", "filter", "inline edit", "promote schema"],
+    query: { types: ["record", "task", "project"], live: true, rank: ["field"] },
+  },
+  {
+    id: "map",
+    label: "Map",
+    viewDescriptorId: "map",
+    objectTypes: ["place", "event", "asset"],
+    renderers: ["deck.gl", "MapLibre"],
+    actions: ["cluster", "route", "open related graph"],
+    query: { types: ["place", "event"], live: true, slice: ["space"], rank: ["geo"] },
+  },
+  {
+    id: "timeline",
+    label: "Timeline",
+    viewDescriptorId: "timeline",
+    objectTypes: ["event", "task", "thread", "artifact"],
+    renderers: ["shadcn timeline primitives"],
+    actions: ["jump", "filter", "open related object"],
+    query: { types: ["event", "task", "thread", "artifact"], live: true, slice: ["valid_time"], rank: ["time"] },
+  },
+  {
+    id: "clips",
+    label: "Clips",
+    viewDescriptorId: "clips",
+    objectTypes: ["clip", "web_capture", "media"],
+    renderers: ["shadcn list primitives", "OpenUI evidence cards"],
+    actions: ["open source", "attach", "summarize"],
+    query: { types: ["clip", "web_capture"], live: true, rank: ["bm25", "recent"] },
+  },
+] as const;
+
+export const COMMONPLACE_SCENE_RENDERERS: readonly CommonplaceSceneRenderer[] = [
+  {
+    id: "scene-artifact-preview",
+    label: "SceneArtifactPreview",
+    capability: "Mount a saved ScenePackage or generated interface preview.",
+    status: "registered",
+  },
+  {
+    id: "scene-package-card",
+    label: "ScenePackageCard",
+    capability: "Show manifest, provenance, datasets, traces, and fallback status.",
+    status: "planned",
+  },
+  {
+    id: "scene-control-strip",
+    label: "SceneControlStrip",
+    capability: "Replay, inspect, fork, and confirm generated scene patches.",
+    status: "planned",
   },
 ] as const;
 

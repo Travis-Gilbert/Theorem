@@ -3,28 +3,37 @@
 import * as React from "react";
 import {
   ArrowUp,
+  BookOpen,
   Boxes,
   Bell,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  CircleDot,
   Clock3,
   Code2,
   Command,
+  CreditCard,
   Cpu,
   Database,
+  FileText,
   Folder,
   FolderPlus,
   GitBranch,
   Globe,
   Gauge,
+  History,
   Inbox,
   Layers3,
+  Link2,
+  ListChecks,
   Map,
   MessageSquareText,
   MonitorCog,
   Paperclip,
   PenLine,
   Plus,
+  Route,
   Search,
   SlidersHorizontal,
   Settings,
@@ -32,8 +41,10 @@ import {
   Sparkles,
   SquareTerminal,
   Table2,
+  Upload,
   UserCircle,
   WandSparkles,
+  Workflow,
 } from "lucide-react";
 import {
   AssistantRuntimeProvider,
@@ -64,11 +75,14 @@ import {
 } from "@/components/island/OmnibarChrome";
 import {
   COMMONPLACE_ACCOUNT_ITEMS,
+  COMMONPLACE_DATA_VIEW_DESCRIPTORS,
   COMMONPLACE_DATA_VIEWS,
   COMMONPLACE_OMNIBAR_CAPABILITIES,
+  COMMONPLACE_SCENE_RENDERERS,
   COMMONPLACE_TOOLBOX,
   COMMONPLACE_WORK_PAGES,
   type CommonplaceIaItem,
+  type CommonplaceDataViewDescriptor,
   type CommonplaceToolboxGroup,
 } from "@/lib/commonplace/information-architecture";
 import {
@@ -92,9 +106,27 @@ import {
 const MergeOriginal = CodeMirrorMerge.Original;
 const MergeModified = CodeMirrorMerge.Modified;
 type SidebarIcon = React.ComponentType<{ size?: number; className?: string }>;
+type CommonPlaceSurfaceId =
+  | "index"
+  | "threads"
+  | "write"
+  | "code"
+  | "artifacts"
+  | "files"
+  | "graph"
+  | "table"
+  | "map"
+  | "timeline"
+  | "clips"
+  | "account"
+  | "agents"
+  | "engine"
+  | "desktop"
+  | "settings";
 
 const INITIAL_ASSISTANT_ID = "code-agent:assistant:intro";
 const INITIAL_DATE = new Date("2026-06-25T00:00:00.000Z");
+const DEFAULT_COMMONPLACE_SURFACE: CommonPlaceSurfaceId = "index";
 
 const DEFAULT_MODEL_STATUSES: readonly CodeAgentModelStatus[] = [
   { id: "router", label: "Router", state: "idle" },
@@ -147,11 +179,110 @@ const ACCOUNT_ICONS: Record<string, SidebarIcon> = {
   settings: Settings,
 };
 
+const QUICK_ACTION_ICONS: Record<string, SidebarIcon> = {
+  terminal: SquareTerminal,
+  cluster: Boxes,
+  timeline: Clock3,
+  note: PenLine,
+  task: ListChecks,
+  reminder: Bell,
+  project: GitBranch,
+};
+
+const SURFACE_LABELS: Record<CommonPlaceSurfaceId, string> = {
+  index: "Index",
+  threads: "Threads",
+  write: "Write",
+  code: "Code",
+  artifacts: "Artifacts",
+  files: "Files",
+  graph: "Graph",
+  table: "Table",
+  map: "Map",
+  timeline: "Timeline",
+  clips: "Clips",
+  account: "Account",
+  agents: "Agents",
+  engine: "Engine",
+  desktop: "Desktop",
+  settings: "Settings",
+};
+
+const DATA_VIEW_IDS = new Set(COMMONPLACE_DATA_VIEWS.map((item) => item.id));
+const ACCOUNT_SURFACE_IDS = new Set(COMMONPLACE_ACCOUNT_ITEMS.map((item) => item.id));
+const COMMONPLACE_SURFACE_IDS = new Set<CommonPlaceSurfaceId>([
+  "index",
+  "threads",
+  "write",
+  "code",
+  "artifacts",
+  "files",
+  "graph",
+  "table",
+  "map",
+  "timeline",
+  "clips",
+  "account",
+  "agents",
+  "engine",
+  "desktop",
+  "settings",
+]);
+
+function surfaceFromHash(hash: string): CommonPlaceSurfaceId | null {
+  const candidate = hash.replace(/^#\/?/, "").trim().toLowerCase();
+  return COMMONPLACE_SURFACE_IDS.has(candidate as CommonPlaceSurfaceId) ? (candidate as CommonPlaceSurfaceId) : null;
+}
+
 export function CodeWorkspaceShell() {
+  const [activeSurface, setActiveSurface] = React.useState<CommonPlaceSurfaceId>(DEFAULT_COMMONPLACE_SURFACE);
+  const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const selectSurface = React.useCallback((surface: CommonPlaceSurfaceId) => {
+    setActiveSurface(surface);
+    if (typeof window !== "undefined") {
+      window.history.replaceState(null, "", `#${surface}`);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((current) => !current);
+      }
+      if (event.key === "Escape") {
+        setPaletteOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  React.useEffect(() => {
+    const syncSurfaceFromHash = () => {
+      const surface = surfaceFromHash(window.location.hash);
+      if (surface) setActiveSurface(surface);
+    };
+
+    syncSurfaceFromHash();
+    window.addEventListener("hashchange", syncSurfaceFromHash);
+    return () => window.removeEventListener("hashchange", syncSurfaceFromHash);
+  }, []);
+
   return (
     <main className="commonplace-workspace-theme cpw-shell" data-merge-scope="preview-route">
-      <CommonPlacePreviewSidebar />
-      <CodeWorkspaceStage />
+      <CommonPlacePreviewSidebar
+        activeSurface={activeSurface}
+        onSelectSurface={selectSurface}
+        onOpenPalette={() => setPaletteOpen(true)}
+      />
+      <CommonPlacePreviewStage
+        activeSurface={activeSurface}
+        onSelectSurface={selectSurface}
+        paletteOpen={paletteOpen}
+        onClosePalette={() => setPaletteOpen(false)}
+      />
     </main>
   );
 }
@@ -167,11 +298,51 @@ export function CodeWorkspaceStage() {
   );
 }
 
+function CommonPlacePreviewStage({
+  activeSurface,
+  onSelectSurface,
+  paletteOpen,
+  onClosePalette,
+}: {
+  activeSurface: CommonPlaceSurfaceId;
+  onSelectSurface: (surface: CommonPlaceSurfaceId) => void;
+  paletteOpen: boolean;
+  onClosePalette: () => void;
+}) {
+  const isCode = activeSurface === "code";
+
+  return (
+    <section
+      className={`cpw-stage ${isCode ? "cpw-code-agent-stage" : "cpw-ia-stage"}`}
+      aria-label={`CommonPlace ${SURFACE_LABELS[activeSurface]} workspace`}
+    >
+      <MersenneBinaryField />
+      {isCode ? (
+        <CodeAgentRuntime />
+      ) : (
+        <>
+          <CommonPlaceSurface surface={activeSurface} onSelectSurface={onSelectSurface} />
+          <CommonPlaceAmbientOmnibar surface={activeSurface} onSelectSurface={onSelectSurface} />
+        </>
+      )}
+      {paletteOpen ? <CommandPalettePreview onSelectSurface={onSelectSurface} onClose={onClosePalette} /> : null}
+    </section>
+  );
+}
+
 // Preview-only IA fixture for this Theorem test route.
 // Do not move this component into the production CommonPlace app shell; only the
 // plain IA data in `lib/commonplace/information-architecture.ts` is intended to
 // survive the real merge.
-function CommonPlacePreviewSidebar() {
+function CommonPlacePreviewSidebar({
+  activeSurface,
+  onSelectSurface,
+  onOpenPalette,
+}: {
+  activeSurface: CommonPlaceSurfaceId;
+  onSelectSurface: (surface: CommonPlaceSurfaceId) => void;
+  onOpenPalette: () => void;
+}) {
   return (
     <aside className="cpw-sidebar" aria-label="CommonPlace preview navigation" data-merge-scope="preview-only">
       <div className="cpw-sidebar-glow" aria-hidden />
@@ -185,20 +356,37 @@ function CommonPlacePreviewSidebar() {
         </button>
       </div>
 
-      <OmnibarPreview />
+      <OmnibarPreview onOpenPalette={onOpenPalette} />
 
       <nav className="cpw-nav" aria-label="CommonPlace sections">
         <NavSection label="Work" />
         {COMMONPLACE_WORK_PAGES.map((item) => (
-          <NavItem key={item.id} item={item} icon={WORK_ICONS[item.id] ?? Folder} active={item.id === "code"} />
+          <NavItem
+            key={item.id}
+            item={item}
+            icon={WORK_ICONS[item.id] ?? Folder}
+            active={activeSurface === item.id}
+            onSelect={() => onSelectSurface(item.id as CommonPlaceSurfaceId)}
+          />
         ))}
 
         <NavSection label="Data" />
         {COMMONPLACE_DATA_VIEWS.map((item) => (
           item.id === "files" ? (
-            <FilesTreeNavItem key={item.id} item={item} />
+            <FilesTreeNavItem
+              key={item.id}
+              item={item}
+              active={activeSurface === item.id}
+              onSelect={() => onSelectSurface(item.id as CommonPlaceSurfaceId)}
+            />
           ) : (
-            <NavItem key={item.id} item={item} icon={DATA_VIEW_ICONS[item.id] ?? Database} />
+            <NavItem
+              key={item.id}
+              item={item}
+              icon={DATA_VIEW_ICONS[item.id] ?? Database}
+              active={activeSurface === item.id}
+              onSelect={() => onSelectSurface(item.id as CommonPlaceSurfaceId)}
+            />
           )
         ))}
 
@@ -206,7 +394,13 @@ function CommonPlacePreviewSidebar() {
 
         <NavSection label="Account" />
         {COMMONPLACE_ACCOUNT_ITEMS.map((item) => (
-          <NavItem key={item.id} item={item} icon={ACCOUNT_ICONS[item.id] ?? SlidersHorizontal} />
+          <NavItem
+            key={item.id}
+            item={item}
+            icon={ACCOUNT_ICONS[item.id] ?? SlidersHorizontal}
+            active={activeSurface === item.id}
+            onSelect={() => onSelectSurface(item.id as CommonPlaceSurfaceId)}
+          />
         ))}
       </nav>
 
@@ -218,10 +412,10 @@ function CommonPlacePreviewSidebar() {
   );
 }
 
-function OmnibarPreview() {
+function OmnibarPreview({ onOpenPalette }: { onOpenPalette: () => void }) {
   return (
     <section className="cpw-omnibar-preview" aria-label="Agent omnibar">
-      <button className="cpw-search" type="button" aria-label="Ask the Theorem agent">
+      <button className="cpw-search" type="button" aria-label="Ask the Theorem agent" onClick={onOpenPalette}>
         <Search size={17} />
         <span>Ask the Theorem agent</span>
         <small>
@@ -252,7 +446,17 @@ function NavSection({ label }: { label: string }) {
   );
 }
 
-function NavItem({ item, icon: Icon, active }: { item: CommonplaceIaItem; icon: SidebarIcon; active?: boolean }) {
+function NavItem({
+  item,
+  icon: Icon,
+  active,
+  onSelect,
+}: {
+  item: CommonplaceIaItem;
+  icon: SidebarIcon;
+  active?: boolean;
+  onSelect?: () => void;
+}) {
   return (
     <button
       className="cpw-nav-item"
@@ -261,6 +465,7 @@ function NavItem({ item, icon: Icon, active }: { item: CommonplaceIaItem; icon: 
       type="button"
       title={item.description}
       aria-current={active ? "page" : undefined}
+      onClick={onSelect}
     >
       <Icon size={17} />
       <span>{item.label}</span>
@@ -270,29 +475,48 @@ function NavItem({ item, icon: Icon, active }: { item: CommonplaceIaItem; icon: 
   );
 }
 
-function FilesTreeNavItem({ item }: { item: CommonplaceIaItem }) {
+function FilesTreeNavItem({
+  item,
+  active,
+  onSelect,
+}: {
+  item: CommonplaceIaItem;
+  active?: boolean;
+  onSelect: () => void;
+}) {
   const [open, setOpen] = React.useState(false);
 
   return (
-    <div className="cpw-sidebar-file-tree" data-open={open ? "true" : "false"}>
+    <div className="cpw-sidebar-file-tree" data-open={open ? "true" : "false"} data-active={active ? "true" : "false"}>
       <button
         className="cpw-tree-row cpw-files-tree-root"
         type="button"
         title={item.description}
         aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          onSelect();
+          setOpen(true);
+        }}
       >
-        <ChevronRight size={15} className="cpw-file-chevron" data-open={open ? "true" : "false"} />
+        <ChevronRight
+          size={15}
+          className="cpw-file-chevron"
+          data-open={open ? "true" : "false"}
+          onClick={(event) => {
+            event.stopPropagation();
+            setOpen((current) => !current);
+          }}
+        />
         <Folder size={19} />
         <span>{item.label}</span>
         {item.count ? <small className="cpw-file-tree-count">{item.count}</small> : null}
         <FolderPlus size={16} className="cpw-tree-action" aria-hidden />
       </button>
       <div className="cpw-file-tree-children" aria-hidden={!open}>
-        <button className="cpw-file-tree-leaf" type="button">
+        <button className="cpw-file-tree-leaf" type="button" onClick={onSelect}>
           <span>Specs</span>
         </button>
-        <button className="cpw-file-tree-leaf" type="button">
+        <button className="cpw-file-tree-leaf" type="button" onClick={onSelect}>
           <span>Uploads</span>
         </button>
       </div>
@@ -324,6 +548,625 @@ function ToolboxPreview({ groups }: { groups: readonly CommonplaceToolboxGroup[]
       </div>
     </details>
   );
+}
+
+function CommonPlaceSurface({
+  surface,
+  onSelectSurface,
+}: {
+  surface: CommonPlaceSurfaceId;
+  onSelectSurface: (surface: CommonPlaceSurfaceId) => void;
+}) {
+  if (surface === "index") return <IndexSurface onSelectSurface={onSelectSurface} />;
+  if (surface === "threads") return <ThreadsSurface />;
+  if (surface === "write") return <WriteSurface />;
+  if (surface === "artifacts") return <ArtifactsSurface />;
+  if (DATA_VIEW_IDS.has(surface)) return <DataLensSurface viewId={surface} onSelectSurface={onSelectSurface} />;
+  if (ACCOUNT_SURFACE_IDS.has(surface)) return <SystemSurface surface={surface} />;
+
+  return <IndexSurface onSelectSurface={onSelectSurface} />;
+}
+
+function SurfaceFrame({
+  eyebrow,
+  title,
+  description,
+  children,
+  rail,
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  children: React.ReactNode;
+  rail?: React.ReactNode;
+}) {
+  return (
+    <div className="cpw-ia-scroll">
+      <div className="cpw-ia-surface">
+        <header className="cpw-ia-header">
+          <div>
+            <span>{eyebrow}</span>
+            <h1>{title}</h1>
+            <p>{description}</p>
+          </div>
+          {rail ? <div className="cpw-ia-header-rail">{rail}</div> : null}
+        </header>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function IndexSurface({ onSelectSurface }: { onSelectSurface: (surface: CommonPlaceSurfaceId) => void }) {
+  const sources = [
+    { label: "Emails", count: "0", tone: "blue" },
+    { label: "Notes", count: "0", tone: "gold" },
+    { label: "Files", count: "4", tone: "teal" },
+    { label: "Tasks", count: "1", tone: "orange" },
+  ];
+  const organized = [
+    { title: "Spec bundle", target: "Files / Specs", state: "routed" },
+    { title: "Code harness notes", target: "Threads", state: "linked" },
+    { title: "Scene package proof", target: "Artifacts", state: "draft" },
+  ];
+
+  return (
+    <SurfaceFrame
+      eyebrow="Thursday, June 25"
+      title="Index"
+      description="Daily triage, confidence-line decisions, and automatic filing stay here. The name remains Index, not Inbox."
+      rail={<DaySegment />}
+    >
+      <div className="cpw-ia-grid cpw-index-grid">
+        <section className="cpw-ia-panel">
+          <PanelTitle icon={Inbox} eyebrow="Sources" title="Current intake" />
+          <div className="cpw-source-list">
+            {sources.map((source) => (
+              <button
+                key={source.label}
+                className="cpw-source-row"
+                data-tone={source.tone}
+                type="button"
+                onClick={() => source.label === "Files" && onSelectSurface("files")}
+              >
+                <span className="cpw-source-dot" />
+                <span>{source.label}</span>
+                <small>{source.count}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+        <section className="cpw-ia-panel cpw-index-decision">
+          <PanelTitle icon={Route} eyebrow="Needs you" title="Confidence line" />
+          <div className="cpw-empty-dashed">
+            <span>All clear. Nothing is waiting on a routing decision.</span>
+          </div>
+          <div className="cpw-ia-action-row">
+            <button type="button" onClick={() => onSelectSurface("threads")}>
+              Open work thread
+            </button>
+            <button type="button" onClick={() => onSelectSurface("code")}>
+              Start code agent
+            </button>
+          </div>
+        </section>
+        <section className="cpw-ia-panel">
+          <PanelTitle icon={CheckCircle2} eyebrow="Organized today" title="Recent routes" />
+          <div className="cpw-object-list">
+            {organized.map((item) => (
+              <article key={item.title} className="cpw-object-row">
+                <div>
+                  <strong>{item.title}</strong>
+                  <span>{item.target}</span>
+                </div>
+                <small>{item.state}</small>
+              </article>
+            ))}
+          </div>
+        </section>
+      </div>
+    </SurfaceFrame>
+  );
+}
+
+function ThreadsSurface() {
+  const threads = [
+    { title: "Coding harness IA", objects: "7 objects", trace: "agent run + diff review", state: "active" },
+    { title: "SceneOS renderer contract", objects: "3 artifacts", trace: "OpenUI guardrail", state: "review" },
+    { title: "RustyRed data lenses", objects: "12 records", trace: "descriptor registry", state: "stored" },
+  ];
+
+  return (
+    <SurfaceFrame
+      eyebrow="Work record"
+      title="Threads"
+      description="Persistent agent conversations are tied to the work, objects, artifacts, and run traces they produced."
+    >
+      <div className="cpw-ia-grid cpw-two-column">
+        <section className="cpw-ia-panel">
+          <PanelTitle icon={MessageSquareText} eyebrow="Threads" title="Work conversations" />
+          <div className="cpw-object-list">
+            {threads.map((thread) => (
+              <article key={thread.title} className="cpw-thread-row">
+                <CircleDot size={13} />
+                <div>
+                  <strong>{thread.title}</strong>
+                  <span>{thread.objects}</span>
+                </div>
+                <small>{thread.state}</small>
+              </article>
+            ))}
+          </div>
+        </section>
+        <section className="cpw-ia-panel">
+          <PanelTitle icon={Workflow} eyebrow="Context" title="Thread returns to its work" />
+          <div className="cpw-thread-context">
+            {threads.map((thread) => (
+              <div key={thread.trace}>
+                <span>{thread.trace}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+    </SurfaceFrame>
+  );
+}
+
+function WriteSurface() {
+  const commands = ["/note", "/task", "/cite", "/deepen", "/scene"];
+
+  return (
+    <SurfaceFrame
+      eyebrow="Writing"
+      title="Write"
+      description="Notebooks and notes live here. Compose is the editor state, not a separate page."
+    >
+      <div className="cpw-ia-grid cpw-write-grid">
+        <section className="cpw-ia-panel">
+          <PanelTitle icon={BookOpen} eyebrow="Notebooks" title="Writing containers" />
+          <div className="cpw-object-list">
+            {["Research", "Project notes", "Drafts"].map((notebook) => (
+              <article key={notebook} className="cpw-object-row">
+                <div>
+                  <strong>{notebook}</strong>
+                  <span>yrs synced editor scope</span>
+                </div>
+                <small>open</small>
+              </article>
+            ))}
+          </div>
+        </section>
+        <section className="cpw-ia-panel cpw-write-editor">
+          <PanelTitle icon={PenLine} eyebrow="Compose" title="Block editor destination" />
+          <div className="cpw-editor-paper">
+            <h2>Untitled note</h2>
+            <p>Use the omnibar to attach context, deepen a paragraph, or turn selected notes into a scene package.</p>
+            <div className="cpw-slash-row">
+              {commands.map((command) => (
+                <button key={command} type="button">
+                  {command}
+                </button>
+              ))}
+            </div>
+          </div>
+        </section>
+      </div>
+    </SurfaceFrame>
+  );
+}
+
+function DataLensSurface({
+  viewId,
+  onSelectSurface,
+}: {
+  viewId: CommonPlaceSurfaceId;
+  onSelectSurface: (surface: CommonPlaceSurfaceId) => void;
+}) {
+  const descriptor = descriptorForView(viewId);
+  const Icon = DATA_VIEW_ICONS[viewId] ?? Database;
+
+  return (
+    <SurfaceFrame
+      eyebrow="RustyRed data"
+      title={descriptor.label}
+      description="Data views are modular lenses over objects. The active lens declares query shape, renderer family, and emitted actions."
+      rail={<LensTabs active={viewId} onSelectSurface={onSelectSurface} />}
+    >
+      <div className="cpw-ia-grid cpw-data-grid">
+        <section className="cpw-ia-panel cpw-data-main">
+          <PanelTitle icon={Icon} eyebrow="View" title={`${descriptor.label} lens`} />
+          <DataVisualization descriptor={descriptor} />
+        </section>
+        <section className="cpw-ia-panel">
+          <PanelTitle icon={Database} eyebrow="ViewDescriptor" title={descriptor.viewDescriptorId} />
+          <DescriptorList descriptor={descriptor} />
+        </section>
+      </div>
+    </SurfaceFrame>
+  );
+}
+
+function ArtifactsSurface() {
+  return (
+    <SurfaceFrame
+      eyebrow="Generated work"
+      title="Artifacts"
+      description="Saved outputs and full-canvas interactive scenes relaunch here. SceneOS is the engine; Artifacts is the home."
+    >
+      <div className="cpw-ia-grid cpw-artifact-grid">
+        <section className="cpw-ia-panel">
+          <PanelTitle icon={WandSparkles} eyebrow="SceneOS + OpenUI" title="Registered renderers" />
+          <div className="cpw-object-list">
+            {COMMONPLACE_SCENE_RENDERERS.map((renderer) => (
+              <article key={renderer.id} className="cpw-object-row">
+                <div>
+                  <strong>{renderer.label}</strong>
+                  <span>{renderer.capability}</span>
+                </div>
+                <small>{renderer.status}</small>
+              </article>
+            ))}
+          </div>
+        </section>
+        <section className="cpw-ia-panel cpw-scene-proof">
+          <PanelTitle icon={Sparkles} eyebrow="Artifact" title="Scene package preview" />
+          <div className="cpw-scene-card">
+            <div className="cpw-scene-map">
+              <span />
+              <span />
+              <span />
+            </div>
+            <div>
+              <strong>CommonPlace coding harness</strong>
+              <p>Manifest, datasets, traces, actions, provenance, renderer capabilities, and fallbacks are preserved before save.</p>
+              <button type="button">Confirm artifact</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </SurfaceFrame>
+  );
+}
+
+function SystemSurface({ surface }: { surface: CommonPlaceSurfaceId }) {
+  const rows: Record<string, readonly { label: string; value: string; icon: SidebarIcon }[]> = {
+    account: [
+      { label: "Profile", value: "Travis-Gilbert", icon: UserCircle },
+      { label: "Billing", value: "workspace account", icon: CreditCard },
+    ],
+    agents: [
+      { label: "Heads", value: "Router, Planner, Editor, Reviewer", icon: Sparkles },
+      { label: "ACP", value: "bring your own agent", icon: Link2 },
+    ],
+    engine: [
+      { label: "Substrate", value: "RustyRed ready", icon: Cpu },
+      { label: "Instant KG", value: "tenant scoped", icon: Layers3 },
+    ],
+    desktop: [
+      { label: "Desktop app", value: "local engine bridge", icon: MonitorCog },
+      { label: "Connectors", value: "outside tools", icon: Upload },
+    ],
+    settings: [
+      { label: "Preferences", value: "app-level behavior", icon: Settings },
+      { label: "Command palette", value: "shared quick actions", icon: Command },
+    ],
+  };
+
+  return (
+    <SurfaceFrame
+      eyebrow="Configuration"
+      title={SURFACE_LABELS[surface]}
+      description="Account and system configuration stays below the work surfaces."
+    >
+      <section className="cpw-ia-panel">
+        <div className="cpw-system-grid">
+          {(rows[surface] ?? rows.settings).map((row) => {
+            const Icon = row.icon;
+            return (
+              <article key={row.label} className="cpw-system-row">
+                <Icon size={18} />
+                <div>
+                  <strong>{row.label}</strong>
+                  <span>{row.value}</span>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
+    </SurfaceFrame>
+  );
+}
+
+function CommonPlaceAmbientOmnibar({
+  surface,
+  onSelectSurface,
+}: {
+  surface: CommonPlaceSurfaceId;
+  onSelectSurface: (surface: CommonPlaceSurfaceId) => void;
+}) {
+  return (
+    <div className="cpw-code-agent-footer cpw-ambient-agent-footer">
+      <form
+        className={omnibarSurfaceClass("ambient", "cpw-code-agent-omnibar cpw-ambient-omnibar")}
+        onSubmit={(event) => event.preventDefault()}
+      >
+        <textarea
+          className="cpw-code-agent-input"
+          placeholder={`Ask the Theorem agent about ${SURFACE_LABELS[surface]}`}
+          rows={1}
+          suppressHydrationWarning
+        />
+        <div className={omnibarRowClass("cpw-code-agent-omnibar-row")}>
+          <div className="cpw-code-agent-tool-icons">
+            <button className={omnibarIconButtonClass(false, "cpw-code-agent-tool-button")} type="button" aria-label="Attach context" title="Attach context" onClick={() => onSelectSurface("files")}>
+              <Paperclip size={18} />
+            </button>
+            <button className={omnibarIconButtonClass(false, "cpw-code-agent-tool-button")} type="button" aria-label="Web context" title="Web context">
+              <Globe size={18} />
+            </button>
+            <button className={omnibarIconButtonClass(false, "cpw-code-agent-tool-button")} type="button" aria-label="Instant KG" title="Instant KG" onClick={() => onSelectSurface("graph")}>
+              <Layers3 size={18} />
+            </button>
+            <button className={omnibarIconButtonClass(false, "cpw-code-agent-tool-button")} type="button" aria-label="Git-aware" title="Git-aware" onClick={() => onSelectSurface("code")}>
+              <GitBranch size={18} />
+            </button>
+          </div>
+          <button className={omnibarSendButtonClass("cpw-code-agent-send")} type="submit" aria-label="Send message">
+            <ArrowUp size={18} />
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function CommandPalettePreview({
+  onSelectSurface,
+  onClose,
+}: {
+  onSelectSurface: (surface: CommonPlaceSurfaceId) => void;
+  onClose: () => void;
+}) {
+  const quickActions = COMMONPLACE_TOOLBOX.flatMap((group) => group.items.map((item) => ({ ...item, group: group.label })));
+  const destinations = [
+    ...COMMONPLACE_WORK_PAGES,
+    ...COMMONPLACE_DATA_VIEWS,
+    ...COMMONPLACE_ACCOUNT_ITEMS,
+  ];
+
+  return (
+    <div className="cpw-command-backdrop" role="presentation" onClick={onClose}>
+      <div className="cpw-command-palette" role="dialog" aria-label="CommonPlace command palette" onClick={(event) => event.stopPropagation()}>
+        <div className="cpw-command-input">
+          <Command size={16} />
+          <span>Command palette</span>
+          <small>Cmd K</small>
+        </div>
+        <div className="cpw-command-columns">
+          <div>
+            <span className="cpw-command-section">Go</span>
+            {destinations.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  onSelectSurface(item.id as CommonPlaceSurfaceId);
+                  onClose();
+                }}
+              >
+                <span>{item.label}</span>
+                <small>{item.placement}</small>
+              </button>
+            ))}
+          </div>
+          <div>
+            <span className="cpw-command-section">Quick actions</span>
+            {quickActions.map((item) => {
+              const Icon = QUICK_ACTION_ICONS[item.id] ?? Plus;
+              return (
+                <button key={`${item.group}-${item.id}`} type="button" onClick={onClose}>
+                  <Icon size={14} />
+                  <span>{item.label}</span>
+                  <small>{item.group}</small>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PanelTitle({ icon: Icon, eyebrow, title }: { icon: SidebarIcon; eyebrow: string; title: string }) {
+  return (
+    <div className="cpw-panel-title">
+      <Icon size={16} />
+      <div>
+        <span>{eyebrow}</span>
+        <strong>{title}</strong>
+      </div>
+    </div>
+  );
+}
+
+function DaySegment() {
+  return (
+    <div className="cpw-segmented cpw-ia-segmented">
+      <button type="button" data-active="true">
+        Day
+      </button>
+      <button type="button">Week</button>
+      <button type="button">Month</button>
+    </div>
+  );
+}
+
+function LensTabs({
+  active,
+  onSelectSurface,
+}: {
+  active: CommonPlaceSurfaceId;
+  onSelectSurface: (surface: CommonPlaceSurfaceId) => void;
+}) {
+  return (
+    <div className="cpw-lens-tabs" aria-label="Data lenses">
+      {COMMONPLACE_DATA_VIEWS.map((view) => {
+        const Icon = DATA_VIEW_ICONS[view.id] ?? Database;
+        return (
+          <button
+            key={view.id}
+            type="button"
+            data-active={active === view.id}
+            onClick={() => onSelectSurface(view.id as CommonPlaceSurfaceId)}
+          >
+            <Icon size={14} />
+            <span>{view.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function DescriptorList({ descriptor }: { descriptor: CommonplaceDataViewDescriptor }) {
+  const rows = [
+    ["Objects", descriptor.objectTypes.join(", ")],
+    ["Renderers", descriptor.renderers.join(", ")],
+    ["Actions", descriptor.actions.join(", ")],
+    ["Query", descriptor.query.types.join(", ")],
+    ["Rank", descriptor.query.rank?.join(", ") ?? "none"],
+    ["Slice", descriptor.query.slice?.join(", ") ?? "none"],
+  ];
+
+  return (
+    <dl className="cpw-descriptor-list">
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function DataVisualization({ descriptor }: { descriptor: CommonplaceDataViewDescriptor }) {
+  if (descriptor.id === "graph") return <GraphLens />;
+  if (descriptor.id === "table") return <TableLens />;
+  if (descriptor.id === "map") return <MapLens />;
+  if (descriptor.id === "timeline") return <TimelineLens />;
+  if (descriptor.id === "clips") return <ClipsLens />;
+  return <FilesLens />;
+}
+
+function FilesLens() {
+  return (
+    <div className="cpw-files-lens">
+      {["/Specs/commonplace-ia.md", "/Uploads/reference-screenshot.png", "/Artifacts/scene-package.json", "/Code/agent-contract.ts"].map((path) => (
+        <div key={path} className="cpw-file-row" data-kind={path.endsWith(".md") ? "directory" : "file"}>
+          <FileText size={13} />
+          <span>{path}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function GraphLens() {
+  return (
+    <div className="cpw-graph-lens">
+      <div className="cpw-history-actions">
+        {["snapshot", "diff", "branch", "restore"].map((action) => (
+          <button key={action} type="button">
+            <History size={13} />
+            {action}
+          </button>
+        ))}
+      </div>
+      <div className="cpw-graph-map" aria-label="Graph preview">
+        <span className="cpw-graph-node cpw-graph-node-a">Index</span>
+        <span className="cpw-graph-node cpw-graph-node-b">Code</span>
+        <span className="cpw-graph-node cpw-graph-node-c">Scene</span>
+        <span className="cpw-graph-edge cpw-graph-edge-a" />
+        <span className="cpw-graph-edge cpw-graph-edge-b" />
+      </div>
+    </div>
+  );
+}
+
+function TableLens() {
+  const rows = [
+    ["Coding harness", "active", "high"],
+    ["Scene renderer", "review", "normal"],
+    ["Desktop connector", "queued", "normal"],
+  ];
+
+  return (
+    <table className="cpw-object-table">
+      <thead>
+        <tr>
+          <th>Object</th>
+          <th>Status</th>
+          <th>Priority</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map(([title, status, priority]) => (
+          <tr key={title}>
+            <td>{title}</td>
+            <td>{status}</td>
+            <td>{priority}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function MapLens() {
+  return (
+    <div className="cpw-map-lens" aria-label="Map preview">
+      <span style={{ "--x": "24%", "--y": "34%" } as React.CSSProperties}>A</span>
+      <span style={{ "--x": "58%", "--y": "48%" } as React.CSSProperties}>B</span>
+      <span style={{ "--x": "72%", "--y": "26%" } as React.CSSProperties}>C</span>
+    </div>
+  );
+}
+
+function TimelineLens() {
+  return (
+    <ol className="cpw-timeline-lens">
+      {["Captured reference", "Routed to Files", "Generated code workspace", "Saved artifact"].map((event) => (
+        <li key={event}>
+          <Clock3 size={13} />
+          <span>{event}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function ClipsLens() {
+  return (
+    <div className="cpw-object-list">
+      {["21st.dev AI input", "assistant-ui primitives", "OpenUI renderer"].map((clip) => (
+        <article key={clip} className="cpw-object-row">
+          <div>
+            <strong>{clip}</strong>
+            <span>clipped source with provenance</span>
+          </div>
+          <small>clip</small>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function descriptorForView(viewId: CommonPlaceSurfaceId): CommonplaceDataViewDescriptor {
+  return COMMONPLACE_DATA_VIEW_DESCRIPTORS.find((descriptor) => descriptor.id === viewId) ?? COMMONPLACE_DATA_VIEW_DESCRIPTORS[0];
 }
 
 function CodeAgentRuntime() {
@@ -562,6 +1405,7 @@ function CommonPlaceAgentComposer({
         submitMode="enter"
         minRows={1}
         maxRows={5}
+        suppressHydrationWarning
       />
       <div className={omnibarRowClass("cpw-code-agent-omnibar-row")}>
         <div className="cpw-code-agent-tool-icons">
