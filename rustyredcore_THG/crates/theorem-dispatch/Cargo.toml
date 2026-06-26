@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Postgres hot execution queue for Theorem Dispatch v2."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/theorem-dispatch"
+readme = "README.md"
 rust-version = "1.85"
 
 [lib]
@@ -16,7 +19,7 @@ serde_json = "1.0"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "time", "json"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
-theorem-harness-core = { path = "../theorem-harness-core" }
+theorem-harness-core = { version = "0.1.0", path = "../theorem-harness-core" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

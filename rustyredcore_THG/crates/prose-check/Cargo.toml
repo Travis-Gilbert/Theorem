@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Deterministic writing-engineering style checker for Theorem harness receipts."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/prose-check"
+readme = "README.md"
 rust-version = "1.85"
 
 [dependencies]

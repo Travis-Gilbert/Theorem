@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Dispatch-queue receiver: an outbound-only claim loop against the cloud harness that spawns the locally-installed claude/codex CLI in a mapped worktree. No engine state, no inbound port, no stored tokens."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/theorem-receiver"
+readme = "README.md"
 rust-version = "1.85"
 
 # Buildable two ways (per the dispatch-queue HANDOFF):
@@ -24,6 +27,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
-theorem-dispatch = { path = "../theorem-dispatch" }
-theorem-harness-core = { path = "../theorem-harness-core" }
+theorem-dispatch = { version = "0.1.0", path = "../theorem-dispatch" }
+theorem-harness-core = { version = "0.1.0", path = "../theorem-harness-core" }
 tokio = { version = "1", features = ["rt", "time"] }

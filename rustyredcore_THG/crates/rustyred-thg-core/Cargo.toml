@@ -4,6 +4,9 @@ version = "0.5.0"
 edition = "2021"
 description = "Theorem HotGraph core command executor and state machine."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/rustyred-thg-core"
+readme = "README.md"
 rust-version = "1.85"
 
 [features]
@@ -38,4 +41,4 @@ turbovec = { version = "0.8.0", optional = true }
 zstd = "0.13"
 
 [dev-dependencies]
-theorem-harness-core = { path = "../theorem-harness-core" }
+theorem-harness-core = { version = "0.1.0", path = "../theorem-harness-core" }

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust-native Theorem harness run controller: state transitions, guards, hashes, and replay/fork contracts."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/theorem-harness-core"
+readme = "README.md"
 rust-version = "1.85"
 
 [dependencies]

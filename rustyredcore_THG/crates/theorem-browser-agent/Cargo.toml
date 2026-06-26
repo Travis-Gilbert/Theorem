@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust-native Theorem browser-use perceive/govern/afford contracts and kernels."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/theorem-browser-agent"
+readme = "README.md"
 rust-version = "1.85"
 
 [dependencies]
-rustyred-thg-core = { path = "../rustyred-thg-core" }
+rustyred-thg-core = { version = "0.5.0", path = "../rustyred-thg-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

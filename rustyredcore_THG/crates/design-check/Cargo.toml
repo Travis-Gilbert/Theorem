@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Static design-engineering checker and skill-pack payload for Theorem harness design systems."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/design-check"
+readme = "README.md"
 rust-version = "1.85"
 
 [dependencies]

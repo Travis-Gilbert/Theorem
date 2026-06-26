@@ -3,6 +3,11 @@ name = "rustyred-thg-server"
 version = "0.5.0"
 edition = "2021"
 description = "Product HTTP/gRPC/MCP surface over RustyRedCore-THG: tenant graph routes, query/Cypher APIs, harness coordination, browser actions, fractal expansion, and TTL sweeping."
+license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/rustyred-thg-server"
+readme = "README.md"
+rust-version = "1.85"
 build = "build.rs"
 
 [dependencies]
@@ -18,21 +23,21 @@ prost = "0.13"
 redis = "0.27"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rustyred-thg-core = { path = "../rustyred-thg-core", features = ["redis-store"] }
-theorem-harness-core = { path = "../theorem-harness-core" }
-theorem-harness-runtime = { path = "../theorem-harness-runtime" }
-theorem-dispatch = { path = "../theorem-dispatch" }
-theorem-acp = { path = "../theorem-acp" }
-theorem-browser-agent = { path = "../theorem-browser-agent" }
-rustyred-thg-adapters = { path = "../rustyred-thg-adapters", features = ["pairformer-burn-cubecl"] }
-rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
-rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
-rustyred-thg-mcp = { path = "../rustyred-thg-mcp", features = ["redis-store"] }
-rustyred-thg-fractal = { path = "../rustyred-thg-fractal" }
-rustyred-web = { path = "../rustyred-web" }
-rustyred-hipporag = { path = "../rustyred-hipporag" }
-rustyred-membrane = { path = "../rustyred-membrane", features = ["graph-store"] }
-rustyred-rerank = { path = "../rustyred-rerank" }
+rustyred-thg-core = { version = "0.5.0", path = "../rustyred-thg-core", features = ["redis-store"] }
+theorem-harness-core = { version = "0.1.0", path = "../theorem-harness-core" }
+theorem-harness-runtime = { version = "0.1.0", path = "../theorem-harness-runtime" }
+theorem-dispatch = { version = "0.1.0", path = "../theorem-dispatch" }
+theorem-acp = { version = "0.1.0", path = "../theorem-acp" }
+theorem-browser-agent = { version = "0.1.0", path = "../theorem-browser-agent" }
+rustyred-thg-adapters = { version = "0.5.0", path = "../rustyred-thg-adapters", features = ["pairformer-burn-cubecl"] }
+rustyred-thg-affordances = { version = "0.1.0", path = "../rustyred-thg-affordances" }
+rustyred-thg-connectors = { version = "0.1.0", path = "../rustyred-thg-connectors" }
+rustyred-thg-mcp = { version = "0.5.0", path = "../rustyred-thg-mcp", features = ["redis-store"] }
+rustyred-thg-fractal = { version = "0.5.0", path = "../rustyred-thg-fractal" }
+rustyred-web = { version = "0.1.0", path = "../rustyred-web" }
+rustyred-hipporag = { version = "0.1.0", path = "../rustyred-hipporag" }
+rustyred-membrane = { version = "0.1.0", path = "../rustyred-membrane", features = ["graph-store"] }
+rustyred-rerank = { version = "0.1.0", path = "../rustyred-rerank" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = "0.12"
