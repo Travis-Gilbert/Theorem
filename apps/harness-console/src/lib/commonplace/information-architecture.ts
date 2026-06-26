@@ -19,6 +19,8 @@ export interface CommonplaceDataViewDescriptor {
   id: string;
   label: string;
   viewDescriptorId: string;
+  status?: "enabled" | "deferred";
+  deferredReason?: string;
   objectTypes: readonly string[];
   renderers: readonly string[];
   actions: readonly string[];
@@ -146,12 +148,6 @@ export const COMMONPLACE_DATA_VIEWS: readonly CommonplaceIaItem[] = [
     description: "Structured records and no-code database display.",
   },
   {
-    id: "map",
-    label: "Map",
-    placement: "data-view",
-    description: "Geospatial objects.",
-  },
-  {
     id: "timeline",
     label: "Timeline",
     placement: "data-view",
@@ -181,7 +177,7 @@ export const COMMONPLACE_DATA_VIEW_DESCRIPTORS: readonly CommonplaceDataViewDesc
     label: "Graph",
     viewDescriptorId: "graph",
     objectTypes: ["node", "edge", "cluster"],
-    renderers: ["cosmos.gl", "React Flow for close workflow graphs"],
+    renderers: ["@cosmos.gl/graph", "React Flow for close workflow graphs"],
     actions: ["snapshot", "diff", "branch", "restore"],
     query: { types: ["graph_node", "graph_edge"], live: true, rank: ["ppr", "bm25"] },
   },
@@ -190,7 +186,7 @@ export const COMMONPLACE_DATA_VIEW_DESCRIPTORS: readonly CommonplaceDataViewDesc
     label: "Table",
     viewDescriptorId: "table",
     objectTypes: ["record", "task", "project", "schema"],
-    renderers: ["@tanstack/react-table", "shadcn form primitives"],
+    renderers: ["@tanstack/react-table", "@nocobase/client isolated app bridge", "shadcn form primitives"],
     actions: ["sort", "filter", "inline edit", "promote schema"],
     query: { types: ["record", "task", "project"], live: true, rank: ["field"] },
   },
@@ -198,8 +194,10 @@ export const COMMONPLACE_DATA_VIEW_DESCRIPTORS: readonly CommonplaceDataViewDesc
     id: "map",
     label: "Map",
     viewDescriptorId: "map",
+    status: "deferred",
+    deferredReason: "Map surface deferred; Deck.gl contract is installed for future coordinate layers and MapLibre is intentionally skipped.",
     objectTypes: ["place", "event", "asset"],
-    renderers: ["deck.gl", "MapLibre"],
+    renderers: ["@deck.gl/react", "@deck.gl/layers"],
     actions: ["cluster", "route", "open related graph"],
     query: { types: ["place", "event"], live: true, slice: ["space"], rank: ["geo"] },
   },

@@ -1303,6 +1303,10 @@
     line-height: 1.4;
   }
 
+  .cpw-data-contract-list {
+    border-top: 1px solid var(--cp-border-faint);
+  }
+
   .cpw-history-actions {
     display: flex;
     flex-wrap: wrap;
@@ -1326,6 +1330,46 @@
       var(--cp-term);
     border: 1px solid var(--cp-border-faint);
     border-radius: var(--cp-space-2);
+  }
+
+  .cpw-cosmos-graph {
+    min-height: 360px;
+  }
+
+  .cpw-graph-legend {
+    position: absolute;
+    right: var(--cp-space-3);
+    bottom: var(--cp-space-3);
+    display: grid;
+    gap: calc(var(--cp-space-1) / 2);
+    max-width: min(320px, 70%);
+    padding: var(--cp-space-2) var(--cp-space-3);
+    color: var(--cp-text-muted);
+    background: color-mix(in srgb, var(--cp-card) 88%, transparent);
+    border: 1px solid var(--cp-border-faint);
+    border-radius: var(--cp-space-1);
+    box-shadow: var(--cp-shadow);
+    pointer-events: none;
+  }
+
+  .cpw-graph-legend strong {
+    color: var(--cp-text);
+    font-family: var(--cp-font-title);
+    font-size: 14px;
+  }
+
+  .cpw-graph-legend span {
+    color: var(--cp-text-faint);
+    font-size: 12px;
+  }
+
+  .cpw-data-empty {
+    display: grid;
+    min-height: 360px;
+    place-items: center;
+    padding: var(--cp-space-5);
+    color: var(--cp-text-muted);
+    text-align: center;
   }
 
   .cpw-graph-node,
@@ -1395,7 +1439,28 @@
     border-radius: var(--cp-space-2);
   }
 
-  .cpw-map-lens span {
+  .cpw-deferred-lens {
+    display: grid;
+    align-content: center;
+    gap: var(--cp-space-2);
+    padding: var(--cp-space-5);
+    color: var(--cp-text-muted);
+  }
+
+  .cpw-deferred-lens strong {
+    color: var(--cp-text);
+    font-family: var(--cp-font-title);
+    font-size: 24px;
+  }
+
+  .cpw-deferred-lens small {
+    color: var(--cp-text-faint);
+    font-family: var(--cp-font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+  }
+
+  .cpw-map-lens:not(.cpw-deferred-lens) span {
     position: absolute;
     top: var(--y);
     left: var(--x);
@@ -1430,6 +1495,13 @@
 
   .cpw-timeline-lens svg {
     color: var(--cp-teal);
+  }
+
+  .cpw-timeline-lens small {
+    margin-left: auto;
+    color: var(--cp-text-faint);
+    font-family: var(--cp-font-mono);
+    font-size: 11px;
   }
 
   .cpw-scene-card {
@@ -2583,6 +2655,45 @@
   .cpw-object-table td:first-child {
     color: var(--cp-text);
     font-weight: 600;
+  }
+
+  .cpw-table-lens {
+    display: grid;
+    gap: var(--cp-space-3);
+    padding: var(--cp-space-3);
+  }
+
+  .cpw-nocobase-bridge {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--cp-space-2);
+    padding: var(--cp-space-2) var(--cp-space-3);
+    color: var(--cp-text-muted);
+    background: color-mix(in srgb, var(--cp-bg) 36%, transparent);
+    border: 1px solid var(--cp-border-faint);
+    border-radius: var(--cp-space-1);
+  }
+
+  .cpw-nocobase-bridge strong {
+    color: var(--cp-text);
+    font-family: var(--cp-font-title);
+    font-size: 14px;
+  }
+
+  .cpw-nocobase-bridge span {
+    color: var(--cp-text-faint);
+    font-size: 12px;
+  }
+
+  .cpw-deck-preview {
+    position: relative;
+    min-height: 320px;
+    overflow: hidden;
+    background: var(--cp-term);
+    border: 1px solid var(--cp-border-faint);
+    border-radius: var(--cp-space-2);
   }
 
   .cpw-scene-preview {

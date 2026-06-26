@@ -61,6 +61,7 @@ import {
 } from "@assistant-ui/react";
 import CodeMirrorMerge from "react-codemirror-merge";
 import { DotMatrix } from "@/components/assistant-ui/dot-matrix";
+import { CosmosGraph } from "@/components/graph/CosmosGraph";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -96,6 +97,11 @@ import {
   runCodeAgentTurn,
   type CodeAgentTransportId,
 } from "@/lib/commonplace/code-agent-transport";
+import {
+  normalizeCommonplaceRustyRedViewId,
+  type CommonplaceRustyRedDataPayload,
+} from "@/lib/commonplace/rustyred-data-contract";
+import { useCommonplaceRustyRedData } from "@/lib/commonplace/rustyred-data-client";
 import { createMersenneBinaryGlyphs } from "@/lib/commonplace/mersenne-pattern";
 import {
   commonplaceCodeExtensions,
@@ -765,6 +771,8 @@ function DataLensSurface({
 }) {
   const descriptor = descriptorForView(viewId);
   const Icon = DATA_VIEW_ICONS[viewId] ?? Database;
+  const dataViewId = normalizeCommonplaceRustyRedViewId(viewId);
+  const data = useCommonplaceRustyRedData(dataViewId);
 
   return (
     <SurfaceFrame
@@ -776,11 +784,12 @@ function DataLensSurface({
       <div className="cpw-ia-grid cpw-data-grid">
         <section className="cpw-ia-panel cpw-data-main">
           <PanelTitle icon={Icon} eyebrow="View" title={`${descriptor.label} lens`} />
-          <DataVisualization descriptor={descriptor} />
+          <DataVisualization descriptor={descriptor} payload={data.payload} isLoading={data.isLoading} />
         </section>
         <section className="cpw-ia-panel">
           <PanelTitle icon={Database} eyebrow="ViewDescriptor" title={descriptor.viewDescriptorId} />
           <DescriptorList descriptor={descriptor} />
+          <DataContractSummary payload={data.payload} isLoading={data.isLoading} error={data.error} />
         </section>
       </div>
     </SurfaceFrame>
@@ -1033,12 +1042,14 @@ function LensTabs({
 
 function DescriptorList({ descriptor }: { descriptor: CommonplaceDataViewDescriptor }) {
   const rows = [
+    ["Status", descriptor.status ?? "enabled"],
     ["Objects", descriptor.objectTypes.join(", ")],
     ["Renderers", descriptor.renderers.join(", ")],
     ["Actions", descriptor.actions.join(", ")],
     ["Query", descriptor.query.types.join(", ")],
     ["Rank", descriptor.query.rank?.join(", ") ?? "none"],
     ["Slice", descriptor.query.slice?.join(", ") ?? "none"],
+    ...(descriptor.deferredReason ? [["Deferred", descriptor.deferredReason]] : []),
   ];
 
   return (
@@ -1053,29 +1064,100 @@ function DescriptorList({ descriptor }: { descriptor: CommonplaceDataViewDescrip
   );
 }
 
-function DataVisualization({ descriptor }: { descriptor: CommonplaceDataViewDescriptor }) {
-  if (descriptor.id === "graph") return <GraphLens />;
-  if (descriptor.id === "table") return <TableLens />;
-  if (descriptor.id === "map") return <MapLens />;
-  if (descriptor.id === "timeline") return <TimelineLens />;
-  if (descriptor.id === "clips") return <ClipsLens />;
-  return <FilesLens />;
-}
+function DataContractSummary({
+  payload,
+  isLoading,
+  error,
+}: {
+  payload: CommonplaceRustyRedDataPayload;
+  isLoading: boolean;
+  error?: string;
+}) {
+  const rows = [
+    ["Contract", payload.version],
+    ["Source", isLoading ? "loading" : payload.source.mode],
+    ["Endpoint", payload.source.endpoint ?? "not configured"],
+    ["Objects", String(payload.objectSet.objects.length)],
+    ["Graph links", String(payload.graph.links.length)],
+    ["NocoBase", `${payload.nocobase.packageName} ${payload.nocobase.status}`],
+    ["Deck", payload.geo.note],
+    ...(payload.source.message ? [["Message", payload.source.message]] : []),
+    ...(error ? [["Client", error]] : []),
+  ];
 
-function FilesLens() {
   return (
-    <div className="cpw-files-lens">
-      {["/Specs/commonplace-ia.md", "/Uploads/reference-screenshot.png", "/Artifacts/scene-package.json", "/Code/agent-contract.ts"].map((path) => (
-        <div key={path} className="cpw-file-row" data-kind={path.endsWith(".md") ? "directory" : "file"}>
-          <FileText size={13} />
-          <span>{path}</span>
+    <dl className="cpw-descriptor-list cpw-data-contract-list">
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
         </div>
       ))}
+    </dl>
+  );
+}
+
+function DataVisualization({
+  descriptor,
+  payload,
+  isLoading,
+}: {
+  descriptor: CommonplaceDataViewDescriptor;
+  payload: CommonplaceRustyRedDataPayload;
+  isLoading: boolean;
+}) {
+  if (descriptor.status === "deferred") return <MapLens payload={payload} />;
+  if (descriptor.id === "graph") return <GraphLens payload={payload} isLoading={isLoading} />;
+  if (descriptor.id === "table") return <TableLens payload={payload} />;
+  if (descriptor.id === "timeline") return <TimelineLens payload={payload} />;
+  if (descriptor.id === "clips") return <ClipsLens payload={payload} />;
+  return <FilesLens payload={payload} />;
+}
+
+function FilesLens({ payload }: { payload: CommonplaceRustyRedDataPayload }) {
+  const files = payload.items.length
+    ? payload.items.map((item) => ({ id: item.id, path: item.path ?? undefined, title: item.title }))
+    : payload.objectSet.objects
+        .filter((object) => object.type === "file")
+        .map((object) => ({
+          id: object.id,
+          path: typeof object.properties.path === "string" ? object.properties.path : undefined,
+          title: String(object.properties.title ?? object.id),
+        }));
+
+  return (
+    <div className="cpw-files-lens">
+      {files.map((item) => {
+        const label = item.path || item.title;
+        return (
+          <div key={item.id} className="cpw-file-row" data-kind={item.path ? "file" : "directory"}>
+            {item.path ? <FileText size={13} /> : <Folder size={13} />}
+            <span>{label}</span>
+          </div>
+        );
+      })}
+      {!files.length && (
+        <div className="cpw-file-row" data-kind="directory">
+          <FileText size={13} />
+          <span>No RustyRed file objects matched this view.</span>
+        </div>
+      )}
     </div>
   );
 }
 
-function GraphLens() {
+function GraphLens({ payload, isLoading }: { payload: CommonplaceRustyRedDataPayload; isLoading: boolean }) {
+  const nodes = payload.graph.nodes.map((node) => ({
+    id: node.id,
+    x: node.x,
+    y: node.y,
+    color: node.color,
+    size: node.size,
+    label: node.label,
+    meta: node.meta,
+  }));
+  const links = payload.graph.links.map((link) => ({ source: link.source, target: link.target }));
+
   return (
     <div className="cpw-graph-lens">
       <div className="cpw-history-actions">
@@ -1087,80 +1169,112 @@ function GraphLens() {
         ))}
       </div>
       <div className="cpw-graph-map" aria-label="Graph preview">
-        <span className="cpw-graph-node cpw-graph-node-a">Index</span>
-        <span className="cpw-graph-node cpw-graph-node-b">Code</span>
-        <span className="cpw-graph-node cpw-graph-node-c">Scene</span>
-        <span className="cpw-graph-edge cpw-graph-edge-a" />
-        <span className="cpw-graph-edge cpw-graph-edge-b" />
+        {nodes.length ? (
+          <>
+            <CosmosGraph className="cpw-cosmos-graph" nodes={nodes} links={links} />
+            <div className="cpw-graph-legend">
+              <strong>{isLoading ? "Loading RustyRed graph" : `${nodes.length} objects`}</strong>
+              <span>{links.length} relations via collections, discovery, and briefing</span>
+            </div>
+          </>
+        ) : (
+          <div className="cpw-data-empty">No RustyRed graph objects matched this view.</div>
+        )}
       </div>
     </div>
   );
 }
 
-function TableLens() {
-  const rows = [
-    ["Coding harness", "active", "high"],
-    ["Scene renderer", "review", "normal"],
-    ["Desktop connector", "queued", "normal"],
-  ];
-
+function TableLens({ payload }: { payload: CommonplaceRustyRedDataPayload }) {
   return (
-    <table className="cpw-object-table">
-      <thead>
-        <tr>
-          <th>Object</th>
-          <th>Status</th>
-          <th>Priority</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map(([title, status, priority]) => (
-          <tr key={title}>
-            <td>{title}</td>
-            <td>{status}</td>
-            <td>{priority}</td>
+    <div className="cpw-table-lens">
+      <table className="cpw-object-table">
+        <thead>
+          <tr>
+            <th>Object</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Source</th>
+            <th>Updated</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-function MapLens() {
-  return (
-    <div className="cpw-map-lens" aria-label="Map preview">
-      <span style={{ "--x": "24%", "--y": "34%" } as React.CSSProperties}>A</span>
-      <span style={{ "--x": "58%", "--y": "48%" } as React.CSSProperties}>B</span>
-      <span style={{ "--x": "72%", "--y": "26%" } as React.CSSProperties}>C</span>
+        </thead>
+        <tbody>
+          {payload.table.rows.map((row) => (
+            <tr key={row.id}>
+              <td>{row.title}</td>
+              <td>{row.type}</td>
+              <td>{row.status}</td>
+              <td>{row.source}</td>
+              <td>{row.updatedAt}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="cpw-nocobase-bridge">
+        <strong>{payload.nocobase.packageName}</strong>
+        <span>{payload.nocobase.mode} over {payload.nocobase.dataSource}</span>
+      </div>
     </div>
   );
 }
 
-function TimelineLens() {
+function MapLens({ payload }: { payload: CommonplaceRustyRedDataPayload }) {
+  return (
+    <div className="cpw-map-lens cpw-deferred-lens" aria-label="Map preview">
+      <strong>Map is deferred.</strong>
+      <span>{payload.geo.note}</span>
+      <small>{payload.geo.points.length} coordinate objects are available for the future Deck.gl layer.</small>
+    </div>
+  );
+}
+
+function TimelineLens({ payload }: { payload: CommonplaceRustyRedDataPayload }) {
+  const events = payload.items.length
+    ? payload.items.map((event) => ({
+      id: event.id,
+      title: event.title,
+      updatedAt: new Date(event.updatedAtMs).toLocaleDateString(),
+    }))
+    : payload.table.rows.map((event) => ({
+      id: event.id,
+      title: event.title,
+      updatedAt: event.updatedAt,
+    }));
+
   return (
     <ol className="cpw-timeline-lens">
-      {["Captured reference", "Routed to Files", "Generated code workspace", "Saved artifact"].map((event) => (
-        <li key={event}>
+      {events.map((event) => (
+        <li key={event.id}>
           <Clock3 size={13} />
-          <span>{event}</span>
+          <span>{event.title}</span>
+          <small>{event.updatedAt}</small>
         </li>
       ))}
     </ol>
   );
 }
 
-function ClipsLens() {
+function ClipsLens({ payload }: { payload: CommonplaceRustyRedDataPayload }) {
   return (
     <div className="cpw-object-list">
-      {["21st.dev AI input", "assistant-ui primitives", "OpenUI renderer"].map((clip) => (
-        <article key={clip} className="cpw-object-row">
+      {payload.items.map((clip) => (
+        <article key={clip.id} className="cpw-object-row">
           <div>
-            <strong>{clip}</strong>
-            <span>clipped source with provenance</span>
+            <strong>{clip.title}</strong>
+            <span>{clip.source ?? clip.path ?? "clipped source with provenance"}</span>
           </div>
-          <small>clip</small>
+          <small>{clip.kind}</small>
         </article>
       ))}
+      {!payload.items.length && (
+        <article className="cpw-object-row">
+          <div>
+            <strong>No RustyRed clips matched this view.</strong>
+            <span>Clip-like objects will appear here once the CommonPlace GraphQL edge has them.</span>
+          </div>
+          <small>clips</small>
+        </article>
+      )}
     </div>
   );
 }
