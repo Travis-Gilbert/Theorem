@@ -33,13 +33,13 @@ export function WorkspaceBlockFrame({
   children: React.ReactNode;
 }) {
   return (
-    <section className={cn("flex min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-surface", className)}>
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-3">
-        <span className="rail-group-label">{eyebrow ?? "block"}</span>
-        <h2 className="min-w-0 flex-1 truncate font-title text-subhead text-ink">{title}</h2>
+    <section className={cn("cpw-block", className)}>
+      <div className="cpw-block-header">
+        <span className="cpw-block-eyebrow">{eyebrow ?? "block"}</span>
+        <h2>{title}</h2>
         {action}
       </div>
-      <div className="min-h-0 flex-1 overflow-auto">{children}</div>
+      <div className="cpw-block-body">{children}</div>
     </section>
   );
 }
@@ -59,16 +59,14 @@ export function FileTreePanel({ set, host }: ViewRenderProps) {
               <button
                 type="button"
                 onClick={() => void host.emit({ kind: "open", id: file.id, view: "code-editor" })}
-                className={cn(
-                  "flex min-h-8 w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left font-mono text-label transition-colors",
-                  active ? "bg-ox-tint text-ox" : "text-ink hover:bg-surface-2",
-                )}
-                style={{ paddingLeft: `calc(var(--space-2) + ${depth} * var(--space-4))` }}
+                className="cpw-file-row"
+                data-active={active ? "true" : "false"}
+                style={{ "--cpw-depth": depth } as React.CSSProperties}
               >
                 {depth === 0 ? (
-                  <FolderOpen size={13} className="shrink-0 text-faint" />
+                  <FolderOpen size={13} />
                 ) : (
-                  <FileCode2 size={13} className="shrink-0 text-faint" />
+                  <FileCode2 size={13} />
                 )}
                 <span className="truncate">{path.split("/").pop()}</span>
               </button>
@@ -102,13 +100,15 @@ export function PatchReviewPanel({ set, host }: ViewRenderProps) {
           <Button
             size="sm"
             variant="outline"
+            className="cpw-action-button"
             onClick={() => void host.emit({ kind: "run_agent", target: { id: patch.id, type: "patch" }, tier: "difficult" })}
           >
-            <Bot size={13} /> Review
+            <Bot size={13} /> <span className="cpw-action-copy">Review</span>
           </Button>
           <Button
             size="sm"
             variant="primary"
+            className="cpw-action-button cpw-action-button-primary"
             onClick={() =>
               void host.emit({
                 kind: "dispatch",
@@ -116,25 +116,25 @@ export function PatchReviewPanel({ set, host }: ViewRenderProps) {
               })
             }
           >
-            <CheckCircle2 size={13} /> Apply
+            <CheckCircle2 size={13} /> <span className="cpw-action-copy">Apply</span>
           </Button>
         </div>
       }
     >
-      <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-2">
+      <div className="cpw-diff-grid">
         {["before", "after"].map((side) => (
-          <div key={side} className="min-h-0 overflow-auto border-b border-line lg:border-b-0 lg:border-r">
-            <div className="sticky top-0 border-b border-line bg-bg px-3 py-2 font-mono text-label text-muted-foreground">
+          <div key={side} className="cpw-diff-pane">
+            <div className="cpw-diff-label">
               {side}
             </div>
-            <pre className="min-h-full whitespace-pre-wrap p-3 font-mono text-label leading-relaxed text-ink">
+            <pre className="cpw-code-surface">
               {stringProp(patch, side) ?? fallbackDiff(side)}
             </pre>
           </div>
         ))}
       </div>
-      <div className="border-t border-line bg-bg px-3 py-2">
-        <div className="flex flex-wrap gap-1.5">
+      <div className="cpw-hunk-bar">
+        <div className="cpw-badge-row">
           {hunks.map((hunk) => (
             <Badge key={String(hunk)} tone="neutral">
               {String(hunk)}
@@ -155,20 +155,21 @@ export function AgentThreadPanel({ set, host }: ViewRenderProps) {
         <Button
           size="sm"
           variant="outline"
+          className="cpw-action-button"
           onClick={() => void host.emit({ kind: "run_agent", target: set.objects[0] ? { id: set.objects[0].id, type: set.objects[0].type } : { id: "workspace" }, tier: "simple" })}
         >
           <Play size={13} /> Run
         </Button>
       }
     >
-      <div className="space-y-3 p-3">
+      <div className="cpw-message-stack">
         {set.objects.map((message) => (
-          <article key={message.id} className="rounded-md border border-line bg-bg p-3">
-            <div className="mb-1 flex items-center gap-2">
-              <Bot size={13} className="text-ox" />
-              <span className="font-mono text-label text-muted-foreground">{stringProp(message, "role") ?? "assistant"}</span>
+          <article key={message.id} className="cpw-message-card">
+            <div className="cpw-message-meta">
+              <Bot size={13} />
+              <span>{stringProp(message, "role") ?? "assistant"}</span>
             </div>
-            <p className="text-body leading-relaxed text-ink">{stringProp(message, "content")}</p>
+            <p>{stringProp(message, "content")}</p>
           </article>
         ))}
       </div>
@@ -179,19 +180,19 @@ export function AgentThreadPanel({ set, host }: ViewRenderProps) {
 export function RunTraceTimeline({ set }: ViewRenderProps) {
   return (
     <WorkspaceBlockFrame title="Run trace" eyebrow="RunTraceTimeline">
-      <ol className="relative p-3">
-        <span aria-hidden className="absolute bottom-4 left-[19px] top-4 w-px bg-line" />
+      <ol className="cpw-trace-list">
+        <span aria-hidden className="cpw-trace-line" />
         {set.objects.map((step) => (
-          <li key={step.id} className="relative flex gap-3 py-2">
-            <span className="relative z-[1] mt-1 grid h-4 w-4 place-items-center rounded-full border border-line bg-bg text-ox">
+          <li key={step.id}>
+            <span className="cpw-trace-node">
               <CircleDot size={9} />
             </span>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="font-mono text-label text-ink">{stringProp(step, "kind")}</span>
+            <div className="cpw-trace-copy">
+              <div className="cpw-trace-title">
+                <span>{stringProp(step, "kind")}</span>
                 <Badge tone={stringProp(step, "status") === "blocked" ? "warn" : "neutral"}>{stringProp(step, "status")}</Badge>
               </div>
-              <p className="mt-1 text-label leading-relaxed text-muted-foreground">{stringProp(step, "summary")}</p>
+              <p>{stringProp(step, "summary")}</p>
             </div>
           </li>
         ))}
@@ -203,11 +204,11 @@ export function RunTraceTimeline({ set }: ViewRenderProps) {
 export function ToolActivityPanel({ set }: ViewRenderProps) {
   return (
     <WorkspaceBlockFrame title="Tools" eyebrow="ToolActivityPanel">
-      <div className="grid gap-2 p-3">
+      <div className="cpw-tool-list">
         {set.objects.map((tool) => (
-          <div key={tool.id} className="flex items-center gap-2 rounded-md border border-line bg-bg px-3 py-2">
-            <Wrench size={13} className="text-faint" />
-            <span className="min-w-0 flex-1 truncate font-mono text-label text-ink">{stringProp(tool, "name")}</span>
+          <div key={tool.id} className="cpw-tool-row">
+            <Wrench size={13} />
+            <span>{stringProp(tool, "name")}</span>
             <Badge tone={stringProp(tool, "status") === "ok" ? "live" : "neutral"}>{stringProp(tool, "status")}</Badge>
           </div>
         ))}
@@ -219,14 +220,14 @@ export function ToolActivityPanel({ set }: ViewRenderProps) {
 export function ContextArtifactDrawer({ set }: ViewRenderProps) {
   return (
     <WorkspaceBlockFrame title="Context" eyebrow="ContextArtifactDrawer">
-      <div className="space-y-3 p-3">
+      <div className="cpw-message-stack">
         {set.objects.map((artifact) => (
-          <article key={artifact.id} className="rounded-md border border-line bg-bg p-3">
-            <div className="mb-2 flex items-center gap-2">
-              <Braces size={13} className="text-faint" />
-              <span className="font-mono text-label text-ink">{stringProp(artifact, "title")}</span>
+          <article key={artifact.id} className="cpw-context-card">
+            <div className="cpw-message-meta">
+              <Braces size={13} />
+              <span>{stringProp(artifact, "title")}</span>
             </div>
-            <p className="text-label leading-relaxed text-muted-foreground">{stringProp(artifact, "summary")}</p>
+            <p>{stringProp(artifact, "summary")}</p>
           </article>
         ))}
       </div>
@@ -240,12 +241,12 @@ export function TerminalPanel({ set }: ViewRenderProps) {
 
   return (
     <WorkspaceBlockFrame title="Terminal" eyebrow="TerminalPanel">
-      <div className="h-full bg-ink p-3 font-mono text-label text-bg">
-        <div className="mb-2 flex items-center gap-2 text-bg/80">
+      <div className="cpw-terminal">
+        <div className="cpw-terminal-command">
           <SquareTerminal size={13} />
           <span>$ {command}</span>
         </div>
-        <pre className="whitespace-pre-wrap leading-relaxed">{output}</pre>
+        <pre>{output}</pre>
       </div>
     </WorkspaceBlockFrame>
   );
@@ -256,23 +257,23 @@ export function AgentRunBoard({ set }: ViewRenderProps) {
 
   return (
     <WorkspaceBlockFrame title="Agent runs" eyebrow="AgentRunBoard">
-      <div className="grid h-full grid-cols-1 gap-3 p-3 md:grid-cols-4">
+      <div className="cpw-run-grid">
         {columns.map((status) => {
           const runs = set.objects.filter((run) => stringProp(run, "status") === status);
           return (
-            <div key={status} className="min-h-0 rounded-md border border-line bg-bg">
-              <div className="flex items-center justify-between border-b border-line px-3 py-2">
-                <span className="rail-group-label">{status}</span>
-                <span className="font-mono text-label text-faint">{runs.length}</span>
+            <div key={status} className="cpw-run-column">
+              <div className="cpw-run-column-head">
+                <span>{status}</span>
+                <strong>{runs.length}</strong>
               </div>
-              <div className="space-y-2 p-2">
+              <div className="cpw-run-card-list">
                 {runs.map((run) => (
-                  <article key={run.id} className="rounded-md border border-line bg-surface p-2">
-                    <div className="mb-1 flex items-center gap-2">
-                      <TimerReset size={13} className="text-faint" />
-                      <span className="font-mono text-label text-ink">{stringProp(run, "title")}</span>
+                  <article key={run.id} className="cpw-run-card">
+                    <div className="cpw-run-title">
+                      <TimerReset size={13} />
+                      <span>{stringProp(run, "title")}</span>
                     </div>
-                    <p className="text-label text-muted-foreground">{stringProp(run, "summary")}</p>
+                    <p>{stringProp(run, "summary")}</p>
                   </article>
                 ))}
               </div>
@@ -297,7 +298,7 @@ export function CodeEditorPanel({ set }: ViewRenderProps) {
         </Badge>
       }
     >
-      <pre className="min-h-full overflow-auto bg-bg p-4 font-mono text-label leading-relaxed text-ink">
+      <pre className="cpw-editor-surface">
         {stringProp(file, "content") ?? ""}
       </pre>
     </WorkspaceBlockFrame>
