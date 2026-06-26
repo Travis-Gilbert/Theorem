@@ -74,6 +74,20 @@ Deploy: its own Railway service (`railway.toml` + `Dockerfile`, build context =
 Theorem repo root). Binds `0.0.0.0:$PORT` (Railway injects `PORT`; default
 `50071` locally).
 
+Operational HTTP probes share the gRPC listener:
+
+- `GET /health`: process liveness; stays up while RedCore stores recover.
+- `GET /ready`: code/app RedCore readiness; returns non-200 until stores are
+  usable.
+- `GET /.well-known/theorems-harness/doctor.json`: remote-doctor manifest.
+- `GET /diagnostics/queue`: async work contract for agent runs, code indexing,
+  recall hydration, graph compilation, and provider calls.
+- `GET /diagnostics/dependencies`: isolated status for DeepSeek, Valkey,
+  RustyRed recovery, and recall-index readiness.
+- `GET /diagnostics/tenants`: current tenant guardrail posture for quotas,
+  concurrency, queue isolation, rate limits, storage namespaces, and noisy
+  neighbor protection.
+
 Search RPCs: `Search` is real graph rank (`prior_knowledge` populated from the
 substrate). `GapWalk` is a real single-round PPR over the existing substrate.
 `SourcePair` returns the honest empty state (no source/web anchoring layer

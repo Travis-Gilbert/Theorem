@@ -1,6 +1,6 @@
 # HTTP API
 
-Theorem exposes two primary HTTP API services. `theorem-grpc` also exposes only operational HTTP probes (`GET /health`, `GET /ready`) on its shared gRPC listener.
+Theorem exposes two primary HTTP API services. `theorem-grpc` also exposes operational HTTP probes on its shared gRPC listener: `GET /health`, `GET /ready`, `GET /.well-known/theorems-harness/doctor.json`, `GET /diagnostics/queue`, `GET /diagnostics/dependencies`, and `GET /diagnostics/tenants`.
 
 | Service | Crate | What it serves | OpenAPI |
 |---|---|---|---|

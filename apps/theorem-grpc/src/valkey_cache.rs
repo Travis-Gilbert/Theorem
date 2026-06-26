@@ -70,6 +70,18 @@ impl ValkeyCache {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.client.is_some()
+    }
+
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl.as_secs()
+    }
+
+    pub fn key_prefix(&self) -> &str {
+        &self.key_prefix
+    }
+
     pub fn cache_key(&self, namespace: &str, input: impl Serialize) -> String {
         let encoded = serde_json::to_value(input).unwrap_or(Value::Null);
         format!(
