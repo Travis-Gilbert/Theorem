@@ -1,6 +1,6 @@
 # rustyred-thg-adapters
 
-LoRA adapter catalog and routing over RustyRedCore-THG graph records, plus the inference organs (Pairformer, HOT temporal, EdgeMPNN), the training substrate/runner, situation search, and grounded-skill output. Stays above `rustyred-thg-core`: it reuses core graph records, stores, and PPR while keeping adapter routing and fitness out of the core executor.
+LoRA adapter catalog and routing over RustyRedCore-THG graph records, plus the inference GNNs (Pairformer, HOT temporal, EdgeMPNN), the training substrate/runner, situation search, and grounded-skill output. Stays above `rustyred-thg-core`: it reuses core graph records, stores, and PPR while keeping adapter routing and fitness out of the core executor.
 
 ## Binary
 
