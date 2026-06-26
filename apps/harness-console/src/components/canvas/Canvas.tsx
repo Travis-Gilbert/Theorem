@@ -223,7 +223,7 @@ function CanvasInner() {
       <Panel position="top-left" className="flex items-center gap-1.5">
         <button
           onClick={addCard}
-          className="inline-flex items-center gap-1.5 rounded-md bg-ox px-2.5 py-1.5 font-mono text-[11px] text-white hover:bg-[#73241f]"
+          className="inline-flex items-center gap-1.5 rounded-md bg-ox px-2.5 py-1.5 font-mono text-[11px] text-white hover:bg-ox-hover"
         >
           <Plus size={13} /> Add card
         </button>

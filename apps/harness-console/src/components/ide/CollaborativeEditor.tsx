@@ -20,8 +20,8 @@ import { useIsClient } from "@/lib/hooks/useIsClient";
  * over this same doc without owning it).
  */
 
-const HUMAN: Participant = { name: "You", color: "#1a1a1d" };
-const AGENT: Participant = { name: "Theorem agent", color: "#a8301e" };
+const HUMAN: Participant = { name: "You", color: "var(--ink)" };
+const AGENT: Participant = { name: "Theorem agent", color: "var(--ox)" };
 
 const cmTheme = EditorView.theme({
   "&": { backgroundColor: "transparent", color: "var(--ink)", fontSize: "13.5px" },

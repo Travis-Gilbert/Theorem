@@ -8,6 +8,7 @@ export const BUILT_IN_SPACE_TYPES: SpaceTypeInstance[] = [
   space("space:auto-organizer", "auto-organizer", "Auto-Organizer", 20),
   space("space:browser", "browser", "Browser", 30),
   space("space:code", "code", "Code", 40),
+  space("space:code:workspace", "code-workspace", "Workspace", 45, "space:code"),
   space("space:notes", "notes", "Notes", 50),
   space("space:canvas", "canvas", "Canvas", 60),
   space("space:accounts", "accounts", "Accounts", 100),

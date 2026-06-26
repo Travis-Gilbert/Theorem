@@ -22,6 +22,12 @@ export const DEFAULT_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["open", "select"],
+    source: {
+      package: "@tanstack/react-table",
+      component: "Table adapter",
+      mode: "wrap",
+      regime: "css-vars",
+    },
     render: EmptyView,
   },
   {
@@ -33,6 +39,12 @@ export const DEFAULT_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["update", "open", "select"],
+    source: {
+      package: "@dnd-kit/core",
+      component: "Drag board adapter",
+      mode: "wrap",
+      regime: "css-vars",
+    },
     render: EmptyView,
   },
   {
@@ -43,6 +55,13 @@ export const DEFAULT_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "any",
     },
     emits: ["open", "select"],
+    source: {
+      package: "@/components/ui",
+      component: "shadcn card primitives",
+      mode: "bespoke",
+      regime: "css-vars",
+      allowedBespokeReason: "Generic fallback cards are shell primitives over object data.",
+    },
     render: EmptyView,
   },
   {
@@ -53,6 +72,13 @@ export const DEFAULT_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["open", "select"],
+    source: {
+      package: "@/components/ui",
+      component: "shadcn timeline primitives",
+      mode: "bespoke",
+      regime: "css-vars",
+      allowedBespokeReason: "Timeline fallback encodes temporal object semantics without a single upstream owner.",
+    },
     render: EmptyView,
   },
   {
@@ -63,6 +89,12 @@ export const DEFAULT_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "many",
     },
     emits: ["link", "unlink", "open"],
+    source: {
+      package: "@xyflow/react",
+      component: "ReactFlow",
+      mode: "reskin",
+      regime: "css-vars",
+    },
     render: EmptyView,
   },
   {
@@ -73,6 +105,12 @@ export const DEFAULT_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       cardinality: "one",
     },
     emits: ["dispatch", "run_agent", "open"],
+    source: {
+      package: "react-codemirror-merge",
+      component: "CodeMirrorMerge",
+      mode: "wrap",
+      regime: "css-vars",
+    },
     render: EmptyView,
   },
   {
@@ -83,6 +121,12 @@ export const DEFAULT_VIEW_DESCRIPTORS: readonly ViewDescriptor[] = [
       required_edge: { edge: "CONTAINS", dir: "out" },
     },
     emits: ["open", "select"],
+    source: {
+      package: "react-arborist",
+      component: "Tree",
+      mode: "reskin",
+      regime: "css-vars",
+    },
     render: EmptyView,
   },
 ] as const;
@@ -91,10 +135,12 @@ export class ViewRegistry {
   #descriptors: ViewDescriptor[];
 
   constructor(descriptors: readonly ViewDescriptor[] = DEFAULT_VIEW_DESCRIPTORS) {
+    assertViewDescriptorSources(descriptors);
     this.#descriptors = [...descriptors];
   }
 
   register(descriptor: ViewDescriptor): void {
+    assertViewDescriptorSources([descriptor]);
     this.#descriptors = this.#descriptors.filter((entry) => entry.id !== descriptor.id);
     this.#descriptors.push(descriptor);
   }
@@ -116,6 +162,23 @@ export function viewsForShape(shape: ObjectShape): ViewDescriptor[] {
 
 export function registerViewDescriptor(descriptor: ViewDescriptor): void {
   defaultViewRegistry.register(descriptor);
+}
+
+export function assertViewDescriptorSources(descriptors: readonly ViewDescriptor[]): void {
+  for (const descriptor of descriptors) {
+    const source = descriptor.source;
+    if (!source.package || !source.component) {
+      throw new Error(`ViewDescriptor ${descriptor.id} must declare an upstream source package and component.`);
+    }
+
+    if (source.mode === "bespoke" && !source.allowedBespokeReason) {
+      throw new Error(`Bespoke ViewDescriptor ${descriptor.id} must explain why bespoke rendering is allowed.`);
+    }
+
+    if (source.mode !== "bespoke" && source.allowedBespokeReason) {
+      throw new Error(`ViewDescriptor ${descriptor.id} has a bespoke reason but mode is ${source.mode}.`);
+    }
+  }
 }
 
 export function shapeMatches(accepts: ObjectShapeMatch, shape: ObjectShape): boolean {

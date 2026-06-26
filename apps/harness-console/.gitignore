@@ -31,3 +31,4 @@ yarn-error.log*
 
 # lockfiles are intentionally NOT ignored for a standalone app:
 # package-lock.json is committed for reproducible Vercel builds.
+.vercel
