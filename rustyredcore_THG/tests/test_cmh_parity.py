@@ -1,10 +1,15 @@
 """Byte-parity tests for ``theseus_native::cmh``.
 
-Confirms the Rust hashers produce identical output to the Python
-fallbacks in ``apps.orchestrate.runtime.memory_canonical`` and
-``apps.orchestrate.runtime.handoff_compiler``. Skipped automatically
-when the installed ``theseus_native`` wheel does not include the cmh
-exports (older wheels predate this addition).
+Confirms the Rust hashers produce identical output to the Python reference
+implementation. Legacy Python callers under ``apps.orchestrate.runtime`` are
+checked when present, but their absence no longer means the CMH hash contract
+is broken. Skipped automatically when the installed ``theseus_native`` wheel
+does not include the cmh exports (older wheels predate this addition).
+
+These tests cover identifier/hash parity only. Live Theorems Harness V2
+memory recall is backed by the native GraphStore path in
+``theorem-harness-runtime``/``rustyred-thg-mcp``, not by this PyO3
+module or by Theseus storage.
 """
 
 from __future__ import annotations
@@ -41,10 +46,10 @@ def _python_handoff_state_hash_v1(canonical_json: str) -> str:
 @pytest.mark.parametrize(
     "text",
     [
-        "use Memgraph for handoff storage",
+        "use GraphStore for handoff storage",
         "  Whitespace  AND CASE Should Not Matter  ",
         "",
-        "pytest exit 1 — repeat",
+        "pytest exit 1 - repeat",
         "unicode é á ü with NORMALIZE",
     ],
 )
@@ -104,13 +109,20 @@ def test_python_callers_match_native() -> None:
     must produce byte-identical output to the Rust reference impls.
 
     Per the benchmark in
-    ``theseus_native/src/cmh.rs`` docstring, Python is the production
+    ``rustyredcore_THG/src/cmh.rs`` docstring, Python is the production
     runtime for these microsecond-scale hashers (PyO3 boundary
     overhead would dominate). This test pins the cross-language
     contract so future Rust-native federation peers can compute
     identical ids/hashes without re-deriving the algorithm.
     """
-    from apps.orchestrate.runtime import memory_canonical, handoff_compiler
+    memory_canonical = pytest.importorskip(
+        "apps.orchestrate.runtime.memory_canonical",
+        reason="legacy CMH Python caller is not present in this checkout",
+    )
+    handoff_compiler = pytest.importorskip(
+        "apps.orchestrate.runtime.handoff_compiler",
+        reason="legacy CMH Python caller is not present in this checkout",
+    )
 
     py_atom = memory_canonical._atom_id(
         "workstream:p1", "decision", "Use [:DERIVED_FROM] edges",

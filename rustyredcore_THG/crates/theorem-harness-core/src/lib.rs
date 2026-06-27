@@ -16,6 +16,8 @@
 //! - [`work_graph`] and [`work_graph_verify`]: the durable multi-head work graph
 //!   and its adversarial-verify contracts.
 //! - [`affordances`]: the contract types learned tool selection ranks over.
+//! - [`cmh`]: pure CMH atom-id and handoff-hash contracts.
+//! - [`bgi`]: deterministic BGI JSON/hash receipt contracts.
 //! - [`agent_binding`], [`memory_contracts`], [`map_artifacts`]: shared contract
 //!   types the runtime and SDK persist.
 //!
@@ -26,7 +28,9 @@ pub mod agent_binding;
 pub mod agent_head_registry;
 pub mod alignment;
 pub mod attribution;
+pub mod bgi;
 pub mod budget;
+pub mod cmh;
 pub mod config_ledger;
 pub mod constitution;
 pub mod context_manager;
@@ -79,6 +83,7 @@ pub use attribution::{
     ConfigAttributionCounter, ConfigAttributionTable, ConfigOutcome, ConfigRunAttribution,
 };
 pub use budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
+pub use cmh::{cmh_atom_id_v1, cmh_body_hash, cmh_handoff_state_hash_v1};
 pub use config_ledger::{
     AppliedConfigDelta, ConfigDelta, ConfigDeltaStatus, ConfigLedger, ConfigLedgerError,
     ConfigState, ConfigValueDelta, RollbackReceipt,
