@@ -661,6 +661,26 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
+version = "0.70.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+dependencies = [
+ "bitflags 2.11.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex",
+ "syn",
+]
+
+[[package]]
+name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
@@ -8148,6 +8168,7 @@ dependencies = [
  "redis",
  "rkyv",
  "roaring",
+ "rustyred-thg-graphblas",
  "s2",
  "serde",
  "serde_json",
@@ -8203,6 +8224,13 @@ dependencies = [
  "rustyred-thg-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rustyred-thg-graphblas"
+version = "0.5.0"
+dependencies = [
+ "bindgen 0.70.1",
 ]
 
 [[package]]
