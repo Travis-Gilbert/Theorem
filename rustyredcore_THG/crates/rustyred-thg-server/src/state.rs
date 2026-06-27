@@ -13,9 +13,9 @@ use rustyred_thg_core::{
     EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
     GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
     GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
-    HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
-    SpatialDesignation, VectorDesignation, VerifyReport,
+    HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, MemoryDocumentQuery, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
+    SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
@@ -1246,6 +1246,13 @@ impl RedCoreTenantExecutor {
         self.with_snapshot(|snapshot| snapshot.query_nodes(query))
     }
 
+    pub fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.with_snapshot(|snapshot| snapshot.memory_documents_by_updated_at(query))
+    }
+
     pub fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
         self.with_snapshot(|snapshot| snapshot.neighbors(query))
     }
@@ -1253,6 +1260,14 @@ impl RedCoreTenantExecutor {
     pub fn stats(&self) -> GraphStoreResult<GraphStats> {
         self.with_snapshot(|snapshot| {
             let mut stats = snapshot.stats();
+            stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
+            stats
+        })
+    }
+
+    pub fn cheap_stats(&self) -> GraphStoreResult<GraphStats> {
+        self.with_snapshot(|snapshot| {
+            let mut stats = snapshot.stats_without_memory_estimate();
             stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
             stats
         })
@@ -1618,6 +1633,60 @@ impl TenantGraphStore {
         match self {
             Self::RedCore(store) => store.query_nodes(query),
             Self::Redis(store) => store.query_nodes(query),
+        }
+    }
+
+    pub fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        match self {
+            Self::RedCore(store) => store.memory_documents_by_updated_at(query),
+            Self::Redis(store) => {
+                let mut node_query = NodeQuery::label("MemoryDocument")
+                    .with_property("tenant_slug", Value::String(query.tenant_slug.clone()))
+                    .with_limit(10_000);
+                if let Some(status) = query.status.clone() {
+                    node_query = node_query.with_property("status", Value::String(status));
+                }
+                let since = query.since.as_deref().map(str::trim).unwrap_or_default();
+                let before = query.before.as_deref().map(str::trim).unwrap_or_default();
+                let mut nodes = store.query_nodes(node_query)?;
+                nodes.retain(|node| {
+                    let status = node
+                        .properties
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !query.include_deleted && status == "deleted" {
+                        return false;
+                    }
+                    let updated_at = node
+                        .properties
+                        .get("updated_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    (since.is_empty() || updated_at >= since)
+                        && (before.is_empty() || updated_at < before)
+                });
+                nodes.sort_by(|left, right| {
+                    let left_updated_at = left
+                        .properties
+                        .get("updated_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let right_updated_at = right
+                        .properties
+                        .get("updated_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    right_updated_at
+                        .cmp(left_updated_at)
+                        .then_with(|| right.id.cmp(&left.id))
+                });
+                nodes.truncate(query.limit.filter(|limit| *limit > 0).unwrap_or(100));
+                Ok(nodes)
+            }
         }
     }
 

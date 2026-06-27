@@ -872,6 +872,92 @@ impl NodeQuery {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryDocumentQuery {
+    pub tenant_slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+impl MemoryDocumentQuery {
+    pub fn tenant(tenant_slug: impl Into<String>) -> Self {
+        Self {
+            tenant_slug: tenant_slug.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_status(mut self, status: impl Into<String>) -> Self {
+        let status = status.into();
+        if !status.trim().is_empty() {
+            self.status = Some(status);
+        }
+        self
+    }
+
+    pub fn with_since(mut self, since: impl Into<String>) -> Self {
+        let since = since.into();
+        if !since.trim().is_empty() {
+            self.since = Some(since);
+        }
+        self
+    }
+
+    pub fn with_before(mut self, before: impl Into<String>) -> Self {
+        let before = before.into();
+        if !before.trim().is_empty() {
+            self.before = Some(before);
+        }
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        if limit > 0 {
+            self.limit = Some(limit);
+        }
+        self
+    }
+
+    fn normalized_tenant_slug(&self) -> String {
+        self.tenant_slug.trim().to_string()
+    }
+
+    fn normalized_status(&self) -> Option<String> {
+        self.status
+            .as_deref()
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+            .map(str::to_string)
+    }
+
+    fn since(&self) -> &str {
+        self.since.as_deref().map(str::trim).unwrap_or_default()
+    }
+
+    fn before(&self) -> &str {
+        self.before.as_deref().map(str::trim).unwrap_or_default()
+    }
+
+    fn bounded_limit(&self) -> usize {
+        self.limit.filter(|limit| *limit > 0).unwrap_or(100)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct MemoryDocumentIndexEntry {
+    updated_at: String,
+    node_id: String,
+    status: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GraphWriteResult {
     pub id: String,
@@ -961,6 +1047,9 @@ pub struct InMemoryGraphStore {
     vector_designations: HashMap<(String, String), usize>,
     vector_indexes: HashMap<(String, String), VectorIndex>,
     ordered_indexes: BTreeMap<(String, String), OrderedIndex>,
+    memory_document_updated_at_index: BTreeMap<String, BTreeSet<MemoryDocumentIndexEntry>>,
+    memory_document_status_updated_at_index:
+        BTreeMap<(String, String), BTreeSet<MemoryDocumentIndexEntry>>,
     /// TTL expiration index: maps `_ttl_expires_at_ms` -> set of node ids
     /// that expire at that timestamp. Updated on every node upsert that
     /// has (or had) a TTL property. Sweep iterates `range(..=now_ms)` to
@@ -983,6 +1072,8 @@ impl Default for InMemoryGraphStore {
             vector_designations: HashMap::new(),
             vector_indexes: HashMap::new(),
             ordered_indexes: BTreeMap::new(),
+            memory_document_updated_at_index: BTreeMap::new(),
+            memory_document_status_updated_at_index: BTreeMap::new(),
             ttl_index: BTreeMap::new(),
         }
     }
@@ -1294,6 +1385,49 @@ impl InMemoryGraphStore {
         }
     }
 
+    pub fn memory_documents_by_updated_at(&self, query: MemoryDocumentQuery) -> Vec<NodeRecord> {
+        let tenant_slug = query.normalized_tenant_slug();
+        if tenant_slug.is_empty() {
+            return Vec::new();
+        }
+        let limit = query.bounded_limit();
+        let entries = match query.normalized_status() {
+            Some(status) => self
+                .memory_document_status_updated_at_index
+                .get(&(tenant_slug.clone(), status))
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                .collect::<Vec<_>>(),
+            None => self
+                .memory_document_updated_at_index
+                .get(&tenant_slug)
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                .collect::<Vec<_>>(),
+        };
+        let since = query.since();
+        let before = query.before();
+        let mut nodes = Vec::with_capacity(limit.min(entries.len()));
+        for entry in entries.into_iter().rev() {
+            if !query.include_deleted && entry.status == "deleted" {
+                continue;
+            }
+            if !since.is_empty() && entry.updated_at.as_str() < since {
+                continue;
+            }
+            if !before.is_empty() && entry.updated_at.as_str() >= before {
+                continue;
+            }
+            if let Some(node) = self.get_node(&entry.node_id).cloned() {
+                nodes.push(node);
+                if nodes.len() >= limit {
+                    break;
+                }
+            }
+        }
+        nodes
+    }
+
     pub fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
         let mut edge_ids = BTreeSet::new();
         let include_expired = query.include_expired;
@@ -1405,6 +1539,12 @@ impl InMemoryGraphStore {
     }
 
     pub fn stats(&self) -> GraphStats {
+        let mut stats = self.stats_without_memory_estimate();
+        stats.memory_bytes = self.estimated_memory_bytes();
+        stats
+    }
+
+    pub fn stats_without_memory_estimate(&self) -> GraphStats {
         GraphStats {
             version: self.version,
             nodes_total: self.nodes.values().filter(|node| !node.tombstone).count(),
@@ -1413,7 +1553,7 @@ impl InMemoryGraphStore {
             edge_types_total: self.edge_type_index.len(),
             property_keys_total: self.property_keys().len(),
             property_indexes_total: self.property_index.len(),
-            memory_bytes: self.estimated_memory_bytes(),
+            memory_bytes: 0,
             memory_quota_bytes: 0,
         }
     }
@@ -1781,6 +1921,43 @@ impl InMemoryGraphStore {
         Ok(())
     }
 
+    fn add_memory_document_index(&mut self, node: &NodeRecord) {
+        let Some((tenant_slug, entry)) = memory_document_index_entry(node) else {
+            return;
+        };
+        self.memory_document_updated_at_index
+            .entry(tenant_slug.clone())
+            .or_default()
+            .insert(entry.clone());
+        self.memory_document_status_updated_at_index
+            .entry((tenant_slug, entry.status.clone()))
+            .or_default()
+            .insert(entry);
+    }
+
+    fn remove_memory_document_index(&mut self, node: &NodeRecord) {
+        let Some((tenant_slug, entry)) = memory_document_index_entry(node) else {
+            return;
+        };
+        if let Some(entries) = self.memory_document_updated_at_index.get_mut(&tenant_slug) {
+            entries.remove(&entry);
+            if entries.is_empty() {
+                self.memory_document_updated_at_index.remove(&tenant_slug);
+            }
+        }
+        let status_key = (tenant_slug, entry.status.clone());
+        if let Some(entries) = self
+            .memory_document_status_updated_at_index
+            .get_mut(&status_key)
+        {
+            entries.remove(&entry);
+            if entries.is_empty() {
+                self.memory_document_status_updated_at_index
+                    .remove(&status_key);
+            }
+        }
+    }
+
     fn estimated_memory_bytes(&self) -> usize {
         let snapshot_bytes = serde_json::to_vec(&self.snapshot())
             .map(|raw| raw.len())
@@ -1792,6 +1969,8 @@ impl InMemoryGraphStore {
             + tuple_index_bytes(&self.in_adjacency)
             + tuple_index_bytes(&self.property_index)
             + ordered_index_bytes(&self.ordered_indexes)
+            + memory_document_index_bytes(&self.memory_document_updated_at_index)
+            + memory_document_status_index_bytes(&self.memory_document_status_updated_at_index)
     }
 
     pub fn verify(&self) -> VerifyReport {
@@ -1812,6 +1991,18 @@ impl InMemoryGraphStore {
                     .entry((key, token))
                     .or_default()
                     .insert(node.id.clone());
+            }
+            if let Some((tenant_slug, entry)) = memory_document_index_entry(node) {
+                expected
+                    .memory_document_updated_at_index
+                    .entry(tenant_slug.clone())
+                    .or_default()
+                    .insert(entry.clone());
+                expected
+                    .memory_document_status_updated_at_index
+                    .entry((tenant_slug, entry.status.clone()))
+                    .or_default()
+                    .insert(entry);
             }
         }
 
@@ -1868,6 +2059,24 @@ impl InMemoryGraphStore {
                 detail: "property index does not match live scalar node properties".to_string(),
             });
         }
+        if self.memory_document_updated_at_index != expected.memory_document_updated_at_index {
+            problems.push(VerifyProblem {
+                kind: "memory_document_updated_at_index_drift".to_string(),
+                id: "memory_document_updated_at_index".to_string(),
+                detail: "memory document updated_at index does not match live documents"
+                    .to_string(),
+            });
+        }
+        if self.memory_document_status_updated_at_index
+            != expected.memory_document_status_updated_at_index
+        {
+            problems.push(VerifyProblem {
+                kind: "memory_document_status_updated_at_index_drift".to_string(),
+                id: "memory_document_status_updated_at_index".to_string(),
+                detail: "memory document status/updated_at index does not match live documents"
+                    .to_string(),
+            });
+        }
         if self.out_adjacency != expected.out_adjacency {
             problems.push(VerifyProblem {
                 kind: "out_adjacency_drift".to_string(),
@@ -1907,6 +2116,8 @@ impl InMemoryGraphStore {
         self.label_index.clear();
         self.edge_type_index.clear();
         self.property_index.clear();
+        self.memory_document_updated_at_index.clear();
+        self.memory_document_status_updated_at_index.clear();
         let ordered_designations = self.ordered_designations();
         self.ordered_indexes.clear();
         for designation in ordered_designations {
@@ -1981,12 +2192,21 @@ impl InMemoryGraphStore {
     /// uses `now_ms()` for the cutoff, scans `ttl_index.range(..=now)`,
     /// drops the node + every index entry.
     pub fn drain_expired_node_ids(&mut self) -> Vec<String> {
-        let now = now_ms();
+        self.drain_expired_node_ids_before(now_ms())
+    }
+
+    pub fn has_expired_nodes_before(&self, expires_at_or_before_ms: i64) -> bool {
+        self.ttl_index
+            .range(..=expires_at_or_before_ms)
+            .any(|(_, ids)| !ids.is_empty())
+    }
+
+    fn drain_expired_node_ids_before(&mut self, expires_at_or_before_ms: i64) -> Vec<String> {
         // Collect ids first to avoid mutable-borrow conflicts on the
         // ttl_index while we mutate the main `nodes` map.
         let expired_ids: Vec<String> = self
             .ttl_index
-            .range(..=now)
+            .range(..=expires_at_or_before_ms)
             .flat_map(|(_, ids)| ids.iter().cloned())
             .collect();
         let mut purged: Vec<String> = Vec::with_capacity(expired_ids.len());
@@ -2159,6 +2379,7 @@ impl InMemoryGraphStore {
                 .or_default()
                 .insert(node.id.clone());
         }
+        self.add_memory_document_index(node);
         self.auto_index_ordered(node).ok();
     }
 
@@ -2188,6 +2409,7 @@ impl InMemoryGraphStore {
                 }
             }
         }
+        self.remove_memory_document_index(node);
         for index in self.ordered_indexes.values_mut() {
             index.zrem(node.id.as_bytes());
         }
@@ -3224,13 +3446,18 @@ impl RedCoreGraphStore {
     /// Returns the count of nodes removed. Returns 0 with no AOF write
     /// when nothing is expired (cheap polling for the background sweep).
     pub fn purge_expired_nodes(&mut self) -> GraphStoreResult<usize> {
+        let cutoff_ms = now_ms();
+        if !self.store.has_expired_nodes_before(cutoff_ms) {
+            return Ok(0);
+        }
+
         // Stage a clone, drain expired ids from the staged copy. Doing
         // the work on the staged copy means a journal failure (disk full,
         // permission error) rolls back cleanly -- the live store is
         // unchanged because we only swap it in after the AOF append
         // succeeds. Matches the commit_batch staging pattern.
         let mut staged = self.store.clone();
-        let purged_ids = staged.drain_expired_node_ids();
+        let purged_ids = staged.drain_expired_node_ids_before(cutoff_ms);
         if purged_ids.is_empty() {
             return Ok(0);
         }
@@ -3311,6 +3538,13 @@ impl RedCoreGraphStore {
 
     pub fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
         Ok(self.store.query_nodes(query))
+    }
+
+    pub fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        Ok(self.store.memory_documents_by_updated_at(query))
     }
 
     pub fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
@@ -5195,6 +5429,9 @@ struct ExpectedIndexes {
     label_index: BTreeMap<String, BTreeSet<String>>,
     edge_type_index: BTreeMap<String, BTreeSet<String>>,
     property_index: BTreeMap<(String, String), BTreeSet<String>>,
+    memory_document_updated_at_index: BTreeMap<String, BTreeSet<MemoryDocumentIndexEntry>>,
+    memory_document_status_updated_at_index:
+        BTreeMap<(String, String), BTreeSet<MemoryDocumentIndexEntry>>,
 }
 
 fn validate_edge_shape(edge: &EdgeRecord) -> GraphStoreResult<()> {
@@ -5297,6 +5534,71 @@ fn ordered_index_bytes(indexes: &BTreeMap<(String, String), OrderedIndex>) -> us
                     .sum::<usize>()
         })
         .sum()
+}
+
+fn memory_document_index_bytes(
+    index: &BTreeMap<String, BTreeSet<MemoryDocumentIndexEntry>>,
+) -> usize {
+    index
+        .iter()
+        .map(|(tenant_slug, entries)| {
+            tenant_slug.len()
+                + entries
+                    .iter()
+                    .map(memory_document_index_entry_bytes)
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn memory_document_status_index_bytes(
+    index: &BTreeMap<(String, String), BTreeSet<MemoryDocumentIndexEntry>>,
+) -> usize {
+    index
+        .iter()
+        .map(|((tenant_slug, status), entries)| {
+            tenant_slug.len()
+                + status.len()
+                + entries
+                    .iter()
+                    .map(memory_document_index_entry_bytes)
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn memory_document_index_entry_bytes(entry: &MemoryDocumentIndexEntry) -> usize {
+    entry.updated_at.len() + entry.node_id.len() + entry.status.len()
+}
+
+fn memory_document_index_entry(node: &NodeRecord) -> Option<(String, MemoryDocumentIndexEntry)> {
+    if !node.labels.iter().any(|label| label == "MemoryDocument") {
+        return None;
+    }
+    let tenant_slug = string_property(&node.properties, "tenant_slug")?;
+    if tenant_slug.is_empty() {
+        return None;
+    }
+    let status = string_property(&node.properties, "status")
+        .filter(|status| !status.is_empty())
+        .unwrap_or_else(|| "active".to_string());
+    let updated_at = string_property(&node.properties, "updated_at").unwrap_or_default();
+    Some((
+        tenant_slug,
+        MemoryDocumentIndexEntry {
+            updated_at,
+            node_id: node.id.clone(),
+            status,
+        },
+    ))
+}
+
+fn string_property(properties: &Value, key: &str) -> Option<String> {
+    properties
+        .get(key)?
+        .as_str()
+        .map(str::trim)
+        .map(str::to_string)
 }
 
 fn merge_candidates(candidates: &mut Option<BTreeSet<String>>, next: Option<BTreeSet<String>>) {
@@ -5672,8 +5974,9 @@ mod tests {
     use super::VectorIndex;
     use super::{
         sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
-        GraphSnapshot, GraphStore, InMemoryGraphStore, NeighborQuery, NodeQuery, NodeRecord,
-        RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCoreSyncMode,
+        GraphSnapshot, GraphStore, InMemoryGraphStore, MemoryDocumentQuery, NeighborQuery,
+        NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+        RedCoreSyncMode,
     };
 
     #[test]
@@ -7704,6 +8007,144 @@ mod tests {
         NodeRecord::new(id, ["MemoryAtom"], json!({ "title": id }))
     }
 
+    fn memory_doc(id: &str, tenant_slug: &str, status: &str, updated_at: &str) -> NodeRecord {
+        NodeRecord::new(
+            format!("memory:document:{tenant_slug}:{id}"),
+            ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+            json!({
+                "tenant_slug": tenant_slug,
+                "doc_id": id,
+                "kind": "note",
+                "title": id,
+                "content": format!("body {id}"),
+                "status": status,
+                "updated_at": updated_at,
+                "created_at": updated_at,
+            }),
+        )
+    }
+
+    #[test]
+    fn memory_documents_by_updated_at_pages_from_tenant_status_index() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(memory_doc(
+                "older-active",
+                "Tenant-A",
+                "active",
+                "2026-06-27T00:00:01Z",
+            ))
+            .unwrap();
+        store
+            .upsert_node(memory_doc(
+                "archived",
+                "Tenant-A",
+                "archived",
+                "2026-06-27T00:00:02Z",
+            ))
+            .unwrap();
+        store
+            .upsert_node(memory_doc(
+                "newer-active",
+                "Tenant-A",
+                "active",
+                "2026-06-27T00:00:03Z",
+            ))
+            .unwrap();
+        store
+            .upsert_node(memory_doc(
+                "deleted",
+                "Tenant-A",
+                "deleted",
+                "2026-06-27T00:00:04Z",
+            ))
+            .unwrap();
+        store
+            .upsert_node(memory_doc(
+                "other-tenant",
+                "Tenant-B",
+                "active",
+                "2026-06-27T00:00:05Z",
+            ))
+            .unwrap();
+
+        let active = store.memory_documents_by_updated_at(
+            MemoryDocumentQuery::tenant("Tenant-A")
+                .with_status("active")
+                .with_limit(10),
+        );
+        let active_ids: Vec<_> = active.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(
+            active_ids,
+            vec![
+                "memory:document:Tenant-A:newer-active",
+                "memory:document:Tenant-A:older-active"
+            ]
+        );
+
+        let include_inactive = store.memory_documents_by_updated_at(
+            MemoryDocumentQuery::tenant("Tenant-A")
+                .with_before("2026-06-27T00:00:03Z")
+                .with_limit(10),
+        );
+        let doc_ids: Vec<_> = include_inactive
+            .iter()
+            .map(|node| node.properties["doc_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(doc_ids, vec!["archived", "older-active"]);
+    }
+
+    #[test]
+    fn memory_document_index_updates_on_upsert_and_rebuild() {
+        let mut store = InMemoryGraphStore::new();
+        store
+            .upsert_node(memory_doc(
+                "note",
+                "Tenant-A",
+                "active",
+                "2026-06-27T00:00:01Z",
+            ))
+            .unwrap();
+        store
+            .upsert_node(memory_doc(
+                "note",
+                "Tenant-A",
+                "archived",
+                "2026-06-27T00:00:03Z",
+            ))
+            .unwrap();
+
+        assert!(store
+            .memory_documents_by_updated_at(
+                MemoryDocumentQuery::tenant("Tenant-A")
+                    .with_status("active")
+                    .with_limit(10),
+            )
+            .is_empty());
+
+        let archived = store.memory_documents_by_updated_at(
+            MemoryDocumentQuery::tenant("Tenant-A")
+                .with_status("archived")
+                .with_limit(10),
+        );
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].properties["doc_id"], json!("note"));
+        assert!(store.verify().ok);
+
+        store.rebuild_indexes().unwrap();
+        let rebuilt = store.memory_documents_by_updated_at(
+            MemoryDocumentQuery::tenant("Tenant-A")
+                .with_status("archived")
+                .with_limit(10),
+        );
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(
+            rebuilt[0].properties["updated_at"],
+            json!("2026-06-27T00:00:03Z")
+        );
+        assert!(store.verify().ok);
+    }
+
     #[test]
     fn node_ttl_property_is_extracted_correctly() {
         let node = ttl_node("atom-1", 12345);
@@ -7979,7 +8420,9 @@ mod tests {
         let future = now_ms() + 60_000;
         store.upsert_node(ttl_node("alive", future)).unwrap();
         store.upsert_node(plain_node("permanent")).unwrap();
+        assert!(!store.has_expired_nodes_before(now_ms()));
         let purged = store.purge_expired_nodes().unwrap();
         assert_eq!(purged, 0);
+        assert_eq!(store.ttl_active_count(), 1);
     }
 }
