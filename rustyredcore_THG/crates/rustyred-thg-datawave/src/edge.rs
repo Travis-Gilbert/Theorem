@@ -9,7 +9,7 @@
 //!   edge-key versioning cache tracks edge-definition versions.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::field::NormalizedField;
 
@@ -148,6 +148,11 @@ fn index_fields(fields: &[NormalizedField]) -> FieldIndex<'_> {
 pub fn derive_edges(defs: &[EdgeDef], fields: &[NormalizedField]) -> Vec<DerivedEdge> {
     let index = index_fields(fields);
     let mut edges = Vec::new();
+    // Repeated equal endpoint values (e.g. a multi-valued field carrying the same
+    // value twice) would otherwise emit duplicate edges; the store keys them
+    // identically and keeps one, so dedup here keeps `edges_written` and the edge
+    // dictionary counts consistent with what is actually persisted.
+    let mut seen = BTreeSet::new();
     for def in defs {
         if !def.condition.eval(&index) {
             continue;
@@ -160,6 +165,18 @@ pub fn derive_edges(defs: &[EdgeDef], fields: &[NormalizedField]) -> Vec<Derived
         for from_value in from_values {
             for to_value in to_values {
                 if def.from_field == def.to_field && from_value == to_value {
+                    continue;
+                }
+                let key = (
+                    def.edge_type.clone(),
+                    def.from_field.clone(),
+                    (*from_value).to_string(),
+                    def.to_field.clone(),
+                    (*to_value).to_string(),
+                    def.version,
+                    def.group.clone(),
+                );
+                if !seen.insert(key) {
                     continue;
                 }
                 edges.push(DerivedEdge {

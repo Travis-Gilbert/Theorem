@@ -199,8 +199,6 @@ struct BatchRequest {
     #[serde(default)]
     edges: Vec<EdgeDef>,
     records: Vec<RawRecord>,
-    #[serde(default)]
-    write_dictionary: bool,
 }
 
 #[derive(Deserialize)]
@@ -240,25 +238,34 @@ fn build_ingest(data_type: &str, helper: HelperSpec, edges: Vec<EdgeDef>, tenant
     ingest
 }
 
-/// Read the matching `FieldFact` nodes' event ids for one value+field predicate.
+/// Scan ceiling for one value+field lookup over persisted FieldFact nodes.
+/// ponytail: a store-level scan bound; unbounded pagination rides the core global
+/// index (docs/plans/reconstruction-retrieval-substrate).
+const MAX_LOOKUP_SCAN: usize = 100_000;
+
+/// Read the distinct event ids whose `FieldFact` matches one value+field predicate
+/// for the active tenant. `limit` is applied to the DEDUPLICATED event set, not to
+/// the node scan, so repeated facts from a single event never consume the quota.
 fn lookup_events(
     context: &mut PluginOperationContext<'_>,
     field: &str,
     value: &str,
-    limit: usize,
+    limit: Option<usize>,
 ) -> GraphStoreResult<BTreeSet<String>> {
     let vf = format!("{field}={value}");
-    // Scope to the active tenant: FieldFact nodes carry `tenant_id`, so without
-    // this filter tenant B's lookup could surface tenant A's event ids.
     let query = NodeQuery::label(FIELD_FACT_LABEL)
         .with_property("vf", json!(vf))
         .with_property("tenant_id", json!(context.tenant_id))
-        .with_limit(limit);
+        .with_limit(MAX_LOOKUP_SCAN);
     let nodes = context.store.query_nodes(query)?;
-    Ok(nodes
+    let mut events: BTreeSet<String> = nodes
         .iter()
         .filter_map(|node| node.properties.get("event_id").and_then(Value::as_str).map(str::to_string))
-        .collect())
+        .collect();
+    if let Some(max) = limit {
+        events = events.into_iter().take(max).collect();
+    }
+    Ok(events)
 }
 
 // ---- handlers ----
@@ -285,26 +292,26 @@ fn record_handler(context: PluginOperationContext<'_>, arguments: Value) -> Grap
 
 fn batch_handler(context: PluginOperationContext<'_>, arguments: Value) -> GraphStoreResult<Value> {
     let request: BatchRequest = parse(arguments)?;
-    let write_dictionary = request.write_dictionary;
     let ingest = build_ingest(&request.data_type, request.helper, request.edges, context.tenant_id);
     let mut stats = IngestStats::new();
     let report = ingest.ingest_batch(context.store, &request.records, &mut stats);
-    let mut result = json!({
+    // No dictionary write here: a request-local IngestStats only sees this batch,
+    // so writing dictionary nodes (keyed stably per field/edge) would overwrite
+    // corpus-wide cardinality/counts with batch-local numbers. Corpus dictionary
+    // generation needs cumulative stats (DatawaveIngest::write_dictionary fed a
+    // long-lived IngestStats) or a from-store rebuild, a named follow-up.
+    Ok(json!({
         "ingested": report.ingested,
         "deduped": report.deduped,
         "skipped": report.skipped,
         "errors": report.errors,
-    });
-    if write_dictionary {
-        let written = ingest.write_dictionary(context.store, &stats).map_err(ingest_error)?;
-        result["dictionary_nodes"] = json!(written);
-    }
-    Ok(result)
+    }))
 }
 
 fn lookup_handler(mut context: PluginOperationContext<'_>, arguments: Value) -> GraphStoreResult<Value> {
     let request: LookupRequest = parse(arguments)?;
-    let events = lookup_events(&mut context, &request.field, &request.value, request.limit.unwrap_or(1000))?;
+    let limit = Some(request.limit.unwrap_or(1000));
+    let events = lookup_events(&mut context, &request.field, &request.value, limit)?;
     Ok(json!({
         "field": request.field,
         "value": request.value,
@@ -317,7 +324,8 @@ fn intersect_handler(mut context: PluginOperationContext<'_>, arguments: Value) 
     let request: IntersectRequest = parse(arguments)?;
     let mut accumulator: Option<BTreeSet<String>> = None;
     for predicate in &request.predicates {
-        let events = lookup_events(&mut context, &predicate.field, &predicate.value, 100_000)?;
+        // No per-predicate cap: intersection needs the full event set per term.
+        let events = lookup_events(&mut context, &predicate.field, &predicate.value, None)?;
         accumulator = Some(match accumulator {
             Some(acc) => acc.intersection(&events).cloned().collect(),
             None => events,

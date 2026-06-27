@@ -16,9 +16,11 @@
 //! - `MarkingsHelper` / `MaskedFieldHelper`: per-field visibility and a masked
 //!   alternate value.
 
+use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::str::FromStr;
 
 /// Per-field index policy. The four DATAWAVE flags decide how a field-fact
 /// participates in retrieval; materialization writes them so the existing graph
@@ -171,11 +173,11 @@ fn normalize_number(raw: &str) -> Result<String, NormalizeError> {
     if is_possibly_encoded(s) {
         return Ok(s.to_string());
     }
-    let n: f64 = s.parse().map_err(|_| NormalizeError::new("number", s))?;
-    if !n.is_finite() {
-        return Err(NormalizeError::new("number", s));
-    }
-    numerical_encode(n).ok_or_else(|| NormalizeError::new("number", s))
+    // Parse to an exact decimal (DATAWAVE uses BigDecimal); never through f64, so
+    // large integers past f64's 53-bit mantissa (e.g. 9007199254740992 vs ...993)
+    // do not collapse to the same encoding.
+    let dec = BigDecimal::from_str(s).map_err(|_| NormalizeError::new("number", s))?;
+    numerical_encode(&dec).ok_or_else(|| NormalizeError::new("number", s))
 }
 
 /// DATAWAVE `isPossiblyEncoded` regex `(!|+)[a-zA-Z][Ee][0-9].?[0-9]*`.
@@ -188,73 +190,80 @@ fn is_possibly_encoded(s: &str) -> bool {
         && b[3].is_ascii_digit()
 }
 
-/// Encode a finite f64 in DATAWAVE's lexicographically-sortable scientific form:
-/// a sign char (`+`/`!`) + an exponent letter + `E` + the mantissa. Returns
+/// Encode an exact decimal in DATAWAVE's lexicographically-sortable scientific
+/// form: a sign char (`+`/`!`) + an exponent letter + `E` + the mantissa. Returns
 /// `None` when the decimal exponent falls outside the encodable [-26, 25] range.
-///
-/// ponytail: f64 plus shortest-round-trip mantissa formatting reproduces every
-/// asserted DATAWAVE NumericalEncoder output (see tests). A very long negative
-/// mantissa could carry f64 subtraction noise that BigDecimal would not; the
-/// `format_mantissa` rounding absorbs the common cases.
-fn numerical_encode(v: f64) -> Option<String> {
-    if v == 0.0 {
-        return Some("+AE0".to_string());
+/// All arithmetic is exact (BigDecimal), so no precision is lost.
+fn numerical_encode(dec: &BigDecimal) -> Option<String> {
+    // value = bigint * 10^-scale; the significant digits are bigint's digits.
+    let (bigint, scale) = dec.as_bigint_and_exponent();
+    let signed = bigint.to_string();
+    let negative = signed.starts_with('-');
+    let digits = signed.trim_start_matches('-').trim_start_matches('0');
+    if digits.is_empty() {
+        return Some("+AE0".to_string()); // zero
     }
-    let negative = v < 0.0;
-    let sci = format!("{:e}", v.abs()); // "1.11e2", "1e0", "2.147483647e9"
-    let (mantissa_str, exp_str) = sci.split_once('e')?;
-    let exp: i32 = exp_str.parse().ok()?;
+    let exp = (digits.len() as i64 - 1 - scale) as i32;
+    let (prefix, letter) = exponent_letter(negative, exp)?;
+    let coeff = coefficient(digits);
+    let mantissa = if negative {
+        // Negative mantissa is 10 - coefficient, computed exactly.
+        let coeff_dec = BigDecimal::from_str(&coeff).ok()?;
+        trim_decimal(&(BigDecimal::from(10) - coeff_dec).to_string())
+    } else {
+        coeff
+    };
+    Some(format!("{prefix}{letter}E{mantissa}"))
+}
 
-    let (prefix, letter) = if negative {
+/// The sign char + exponent letter for a decimal exponent, or `None` if it falls
+/// outside the encodable [-26, 25] range.
+fn exponent_letter(negative: bool, exp: i32) -> Option<(char, char)> {
+    if negative {
         if exp >= 0 {
             // magnitude >= 1: !A..!Z, exp 25 -> A, 0 -> Z.
-            if exp > 25 {
-                return None;
-            }
-            ('!', (b'A' + (25 - exp) as u8) as char)
+            (exp <= 25).then(|| ('!', (b'A' + (25 - exp) as u8) as char))
         } else {
             // magnitude < 1: !a..!z, exp -1 -> a, -26 -> z.
             let idx = -exp - 1;
-            if idx > 25 {
-                return None;
-            }
-            ('!', (b'a' + idx as u8) as char)
+            (idx <= 25).then(|| ('!', (b'a' + idx as u8) as char))
         }
     } else if exp >= 0 {
         // positive magnitude >= 1: +a..+z, exp 0 -> a, 25 -> z.
-        if exp > 25 {
-            return None;
-        }
-        ('+', (b'a' + exp as u8) as char)
+        (exp <= 25).then(|| ('+', (b'a' + exp as u8) as char))
     } else {
         // positive magnitude < 1: +A..+Z, exp -1 -> Z, -26 -> A.
         let idx = exp + 26;
-        if idx < 0 {
-            return None;
-        }
-        ('+', (b'A' + idx as u8) as char)
-    };
-
-    let mantissa_out = if negative {
-        // Negative mantissa is 10 + signed_coefficient (the coefficient is
-        // negative), i.e. 10 - |coefficient|, so order reverses with magnitude.
-        let coeff: f64 = mantissa_str.parse().ok()?;
-        format_mantissa(10.0 - coeff)
-    } else {
-        mantissa_str.to_string()
-    };
-    Some(format!("{prefix}{letter}E{mantissa_out}"))
+        (idx >= 0).then(|| ('+', (b'A' + idx as u8) as char))
+    }
 }
 
-/// Format a mantissa with enough precision to absorb f64 subtraction noise, then
-/// trim trailing zeros (DATAWAVE drops trailing zeros via its `#` DecimalFormat).
-fn format_mantissa(m: f64) -> String {
-    let s = format!("{m:.12}");
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() {
-        "0".to_string()
+/// The leading-digit coefficient (`1.11` for `111`), trailing zeros trimmed, from
+/// a sign-free, leading-zero-free digit string.
+fn coefficient(digits: &str) -> String {
+    if digits.len() == 1 {
+        return digits.to_string();
+    }
+    let (head, tail) = digits.split_at(1);
+    let tail = tail.trim_end_matches('0');
+    if tail.is_empty() {
+        head.to_string()
     } else {
-        trimmed.to_string()
+        format!("{head}.{tail}")
+    }
+}
+
+/// Trim trailing zeros (and a trailing dot) from a decimal string.
+fn trim_decimal(s: &str) -> String {
+    if s.contains('.') {
+        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        s.to_string()
     }
 }
 
@@ -712,6 +721,11 @@ mod tests {
         // Encoded order equals numeric order.
         assert!(FieldType::Number.normalize("-1.0").unwrap() < FieldType::Number.normalize("0").unwrap());
         assert!(FieldType::Number.normalize("0").unwrap() < FieldType::Number.normalize("0.00001").unwrap());
+        // Exact decimal: integers past f64's 53-bit mantissa stay distinct.
+        assert_ne!(
+            FieldType::Number.normalize("9007199254740992").unwrap(),
+            FieldType::Number.normalize("9007199254740993").unwrap()
+        );
         assert!(FieldType::Number.normalize("abc").is_err());
     }
 
@@ -758,7 +772,8 @@ mod tests {
     #[test]
     fn mask_last_keeps_tail() {
         let rule = MaskRule::Last { keep: 4 };
-        assert_eq!(rule.apply("4111111111111234"), "************1234");
+        // Synthetic 16-char token (not a PAN-shaped literal) exercising the tail keep.
+        assert_eq!(rule.apply("MASKMEPLEASE1234"), "************1234");
     }
 
     #[test]

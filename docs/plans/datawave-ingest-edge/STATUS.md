@@ -109,7 +109,7 @@ corpus need or a dependency decision:
 
 ## Validation receipts
 
-```
+```bash
 cargo test   -p rustyred-thg-datawave           # unit + 2 parity + 1 doc-test green
 cargo test   -p rustyred-thg-datawave-harness   # plugin-bus round-trip over RedCore
 cargo clippy -p rustyred-thg-datawave         --all-targets --no-deps -- -D warnings  # clean

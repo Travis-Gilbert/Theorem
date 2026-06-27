@@ -88,25 +88,31 @@ pub fn derive_fields(
         });
     }
 
-    // First normalized value per internal field name, for composite/virtual use.
-    let first_value: BTreeMap<&str, &str> = {
-        let mut map = BTreeMap::new();
-        for field in &fields {
-            map.entry(field.field.as_str()).or_insert(field.normalized.as_str());
-        }
-        map
-    };
+    // All normalized values per internal field name. DATAWAVE composites/virtuals
+    // combine across every value of a multi-valued field, not just the first.
+    let mut values_by_field: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for field in &fields {
+        values_by_field
+            .entry(field.field.as_str())
+            .or_default()
+            .push(field.normalized.as_str());
+    }
 
     let mut derived: Vec<NormalizedField> = Vec::new();
 
+    // Composite: Cartesian product across all sources' values (DATAWAVE
+    // GroupingPolicy.IGNORE_GROUPS), one compound key per combination.
     for composite in config.composites() {
-        let parts: Option<Vec<&str>> = composite
+        let source_values: Option<Vec<&Vec<&str>>> = composite
             .sources
             .iter()
-            .map(|src| first_value.get(src.as_str()).copied())
+            .map(|src| values_by_field.get(src.as_str()))
             .collect();
-        if let Some(parts) = parts {
-            let value = parts.join(&composite.separator);
+        let Some(source_values) = source_values else {
+            continue;
+        };
+        for combo in cartesian(&source_values) {
+            let value = combo.join(&composite.separator);
             derived.push(NormalizedField {
                 field: composite.name.clone(),
                 raw_value: value.clone(),
@@ -121,8 +127,12 @@ pub fn derive_fields(
         }
     }
 
+    // Virtual: transform each of the source field's values.
     for virtual_def in config.virtuals() {
-        if let Some(source_value) = first_value.get(virtual_def.source.as_str()).copied() {
+        let Some(source_values) = values_by_field.get(virtual_def.source.as_str()) else {
+            continue;
+        };
+        for source_value in source_values {
             if let Some(transformed) = virtual_def.transform.apply(source_value) {
                 derived.push(NormalizedField {
                     field: virtual_def.name.clone(),
@@ -141,6 +151,24 @@ pub fn derive_fields(
 
     fields.extend(derived);
     fields
+}
+
+/// Cartesian product of per-source value lists, preserving source order. An empty
+/// list yields no combinations.
+fn cartesian<'a>(lists: &[&Vec<&'a str>]) -> Vec<Vec<&'a str>> {
+    let mut result: Vec<Vec<&str>> = vec![Vec::new()];
+    for list in lists {
+        let mut next = Vec::with_capacity(result.len() * list.len());
+        for prefix in &result {
+            for value in list.iter() {
+                let mut combo = prefix.clone();
+                combo.push(value);
+                next.push(combo);
+            }
+        }
+        result = next;
+    }
+    result
 }
 
 // ---- CSV data-type (warehouse/ingest-csv) ----
@@ -511,5 +539,30 @@ mod tests {
             ("email".to_string(), "A@B.com".to_string()),
             ("first_sku".to_string(), "Z1".to_string()),
         ]);
+    }
+
+    #[test]
+    fn composites_and_virtuals_expand_every_value() {
+        use crate::field::{CompositeDef, FieldType, VirtualDef, VirtualTransform};
+        let cfg = FieldConfig::new()
+            .with_field("tag", FieldType::Text, IndexPolicy::INDEXED)
+            .with_field("env", FieldType::Text, IndexPolicy::INDEXED)
+            .with_virtual(VirtualDef {
+                name: "tag_v".into(),
+                source: "tag".into(),
+                transform: VirtualTransform::Copy,
+                policy: IndexPolicy::INDEXED,
+            })
+            .with_composite(CompositeDef::new("tag_env", ["tag", "env"]).with_separator("|"));
+        let helper = JsonHelper::new("doc", cfg);
+        // tag is multi-valued (array primitives share the key).
+        let record = RawRecord::json("doc", json!({ "tag": ["x", "y"], "env": "prod" }), 0);
+        let fields = helper.event_fields(&record).unwrap();
+
+        let virt: Vec<&str> = fields.iter().filter(|f| f.field == "tag_v").map(|f| f.normalized.as_str()).collect();
+        assert!(virt.contains(&"x") && virt.contains(&"y"), "virtual covers every source value: {virt:?}");
+
+        let comp: Vec<&str> = fields.iter().filter(|f| f.field == "tag_env").map(|f| f.normalized.as_str()).collect();
+        assert!(comp.contains(&"x|prod") && comp.contains(&"y|prod"), "composite is the cross-product: {comp:?}");
     }
 }

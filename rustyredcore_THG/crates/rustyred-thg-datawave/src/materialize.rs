@@ -93,7 +93,7 @@ pub struct IngestStats {
     field_values: BTreeMap<String, BTreeSet<String>>,
     field_policy: BTreeMap<String, IndexPolicy>,
     field_type: BTreeMap<String, FieldType>,
-    edge_counts: BTreeMap<(String, u32), u64>,
+    edge_counts: BTreeMap<(String, String, String, u32), u64>,
 }
 
 impl IngestStats {
@@ -113,7 +113,12 @@ impl IngestStats {
     fn observe_edge(&mut self, edge: &DerivedEdge) {
         *self
             .edge_counts
-            .entry((edge.edge_type.clone(), edge.version))
+            .entry((
+                edge.edge_type.clone(),
+                edge.from_field.clone(),
+                edge.to_field.clone(),
+                edge.version,
+            ))
             .or_default() += 1;
     }
 
@@ -136,11 +141,13 @@ impl IngestStats {
         self.field_type.get(field).copied().unwrap_or_default()
     }
 
-    /// (edge_type, version, count) for every edge kind observed.
-    pub fn edge_kinds(&self) -> Vec<(&str, u32, u64)> {
+    /// (edge_type, from_field, to_field, version, count) for every edge kind.
+    pub fn edge_kinds(&self) -> Vec<(&str, &str, &str, u32, u64)> {
         self.edge_counts
             .iter()
-            .map(|((edge_type, version), count)| (edge_type.as_str(), *version, *count))
+            .map(|((edge_type, from_field, to_field, version), count)| {
+                (edge_type.as_str(), from_field.as_str(), to_field.as_str(), *version, *count)
+            })
             .collect()
     }
 }
@@ -170,8 +177,25 @@ pub fn materialize_event<S: GraphStore>(
     let content = record.body.content_bytes();
     let hash = content_hash(&content);
     let fuzzy = fuzzy_hash(&content);
-    let event_id = graph_id("dw:event", &hash, tenant);
-    let deduped = store.get_node(&event_id).is_some();
+    // Event identity is the source-natural key (data_type + external_id) when an
+    // external id is present, so two distinct events with the same payload do not
+    // collapse into one node; otherwise fall back to the content hash. content_hash
+    // and fuzzy_hash stay separate dedupe/similarity signals on the node. (Mutable
+    // metadata like event_time_ms/visibility is deliberately NOT in the identity,
+    // so an idempotent re-ingest still dedupes.)
+    let identity = match &record.external_id {
+        Some(external_id) => stable_hash((record.data_type.as_str(), external_id.as_str())),
+        None => hash.clone(),
+    };
+    let event_id = graph_id("dw:event", &identity, tenant);
+    // Deduped = identical content already ingested under this identity (a true
+    // idempotent re-ingest). A same-identity record carrying NEW content is an
+    // update, so it falls through and its facts are rewritten below.
+    let deduped = store
+        .get_node(&event_id)
+        .and_then(|node| node.properties.get("content_hash").and_then(Value::as_str))
+        .map(|existing| existing == hash)
+        .unwrap_or(false);
 
     store.upsert_node(NodeRecord::new(
         &event_id,
@@ -210,6 +234,15 @@ pub fn materialize_event<S: GraphStore>(
         )
         .with_provenance(provenance(&config.source, "datawave.datatype")),
     )?;
+
+    // Idempotent re-ingest: the event + data-type nodes are upserted (harmless),
+    // but the field/edge facts already exist, so do not re-walk them or inflate
+    // the write counts and dictionary stats.
+    if deduped {
+        stats.events += 1;
+        stats.deduped += 1;
+        return Ok(IngestOutcome { event_id, fields_written: 0, edges_written: 0, deduped: true });
+    }
 
     let mut fields_written = 0;
     for field in fields {
@@ -280,11 +313,9 @@ pub fn materialize_event<S: GraphStore>(
     }
 
     stats.events += 1;
-    if deduped {
-        stats.deduped += 1;
-    }
 
-    Ok(IngestOutcome { event_id, fields_written, edges_written, deduped })
+    // Reached only on the non-deduped path (the dedupe case returned early above).
+    Ok(IngestOutcome { event_id, fields_written, edges_written, deduped: false })
 }
 
 fn field_fact_props(event_id: &str, field: &NormalizedField, config: &MaterializeConfig) -> Value {
@@ -419,5 +450,29 @@ mod tests {
             );
             assert!(store.get_edge(&edge_id).is_some(), "per-event edge for {ev} preserved");
         }
+    }
+
+    #[test]
+    fn external_id_distinguishes_same_payload_events() {
+        let mut store = InMemoryGraphStore::default();
+        let mut stats = IngestStats::new();
+        let helper = net_helper();
+        let cfg = MaterializeConfig::default();
+        let a = RawRecord::text("net", "1.2.3.4,5.6.7.8", 1000).with_external_id("evt-a");
+        let b = RawRecord::text("net", "1.2.3.4,5.6.7.8", 1000).with_external_id("evt-b");
+        let fields_a = helper.event_fields(&a).unwrap();
+        let fields_b = helper.event_fields(&b).unwrap();
+
+        let oa = materialize_event(&mut store, &a, &fields_a, &[], &cfg, &mut stats).unwrap();
+        let ob = materialize_event(&mut store, &b, &fields_b, &[], &cfg, &mut stats).unwrap();
+        // Same payload, different external_id -> distinct events, neither deduped.
+        assert_ne!(oa.event_id, ob.event_id);
+        assert!(!oa.deduped && !ob.deduped);
+
+        // Re-ingesting the same external_id + same content dedupes with zero writes.
+        let again = materialize_event(&mut store, &a, &fields_a, &[], &cfg, &mut stats).unwrap();
+        assert!(again.deduped);
+        assert_eq!(again.fields_written, 0);
+        assert_eq!(again.edges_written, 0);
     }
 }

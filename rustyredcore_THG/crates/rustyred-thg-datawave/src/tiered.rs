@@ -111,7 +111,10 @@ impl TieredIndex {
         debug_assert!(!self.dirty, "call finalize() before querying the tiered index");
         let key = (field.to_string(), value.to_string());
         let mut events = BTreeSet::new();
-        if self.globally_indexed.contains(field) {
+        // If the global tier is stale (index_event called after finalize, or never
+        // finalized), fall back to the always-correct full scan rather than pruning
+        // against an out-of-date fragment set. Correctness over speed when misused.
+        if !self.dirty && self.globally_indexed.contains(field) {
             if let Some(fragments) = self.global.get(&key) {
                 for fragment in fragments {
                     if let Some(index) = self.fragments.get(fragment) {

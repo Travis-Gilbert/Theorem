@@ -63,8 +63,13 @@ pub fn edge_dictionary(defs: &[EdgeDef], stats: &IngestStats) -> Vec<EdgeDiction
         .map(|def| {
             let count = counts
                 .iter()
-                .find(|(edge_type, version, _)| *edge_type == def.edge_type && *version == def.version)
-                .map(|(_, _, count)| *count)
+                .find(|(edge_type, from_field, to_field, version, _)| {
+                    *edge_type == def.edge_type
+                        && *from_field == def.from_field
+                        && *to_field == def.to_field
+                        && *version == def.version
+                })
+                .map(|(_, _, _, _, count)| *count)
                 .unwrap_or(0);
             EdgeDictionaryEntry {
                 edge_type: def.edge_type.clone(),
@@ -115,7 +120,14 @@ pub fn write_dictionary<S: GraphStore>(
     }
 
     for entry in edges {
-        let key = stable_hash((entry.edge_type.as_str(), entry.version));
+        // Key by the full edge identity so two declared edges that share
+        // (edge_type, version) but differ in endpoints get distinct nodes.
+        let key = stable_hash((
+            entry.edge_type.as_str(),
+            entry.from_field.as_str(),
+            entry.to_field.as_str(),
+            entry.version,
+        ));
         store.upsert_node(NodeRecord::new(
             dict_id("dw:dict:edge", &key, tenant),
             [EDGE_DICT_LABEL],
