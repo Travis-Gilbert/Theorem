@@ -1,7 +1,7 @@
 //! Harness capability pack for binary reconstruction.
 
 use std::io::Read;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use rustyred_thg_binformat::{load_binary, write_binary_facts_in_store, BinaryLoadReport};
@@ -242,8 +242,9 @@ pub fn run_reconstruction_pipeline(
     })
 }
 
-/// Default ceiling for a fetched artifact body. Overridable per call via the
-/// `max_bytes` argument so a large firmware image can opt into a higher limit.
+/// Hard ceiling for a fetched artifact body. A caller may pass a smaller
+/// `max_bytes`, but request input can never raise the effective limit above
+/// this, so a hostile or mis-specified size cannot drive an unbounded download.
 pub const DEFAULT_MAX_FETCH_BYTES: usize = 256 * 1024 * 1024;
 
 /// URL front door for the engine: fetch a binary artifact over http(s) and run
@@ -255,23 +256,35 @@ pub fn run_reconstruction_pipeline_from_url(
     url: &str,
     max_bytes: usize,
 ) -> GraphStoreResult<ReconstructionPipelineOutput> {
-    let clamped_max_bytes = max_bytes.min(DEFAULT_MAX_FETCH_BYTES);
-    let bytes = fetch_binary_bytes(url, clamped_max_bytes)?;
+    let bytes = fetch_binary_bytes(url, max_bytes)?;
     let name = name.unwrap_or_else(|| default_artifact_name_from_url(url));
     run_reconstruction_pipeline(name, &bytes)
 }
 
-/// Download an artifact body over http(s) with a scheme guard, a global timeout,
-/// and a hard size ceiling so a hostile or oversized response cannot exhaust
-/// memory. Also validates target hosts to prevent SSRF attacks.
+/// Download an artifact body over http(s) with a scheme guard, an SSRF host
+/// guard, a global timeout, and a hard size ceiling so a hostile or oversized
+/// response cannot reach internal services or exhaust memory.
 pub fn fetch_binary_bytes(url: &str, max_bytes: usize) -> GraphStoreResult<Vec<u8>> {
+    fetch_binary_bytes_with_policy(url, max_bytes, false)
+}
+
+fn fetch_binary_bytes_with_policy(
+    url: &str,
+    max_bytes: usize,
+    allow_private_hosts: bool,
+) -> GraphStoreResult<Vec<u8>> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(GraphStoreError::new(
             "invalid_url_scheme",
             "url must start with http:// or https://",
         ));
     }
-    validate_url_host_not_private(url)?;
+    if !allow_private_hosts {
+        guard_url_host(url)?;
+    }
+    // Clamp to the hard ceiling so request input cannot raise the limit, and use
+    // saturating arithmetic so the read bound cannot overflow or wrap.
+    let limit = max_bytes.min(DEFAULT_MAX_FETCH_BYTES);
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(120)))
@@ -281,22 +294,18 @@ pub fn fetch_binary_bytes(url: &str, max_bytes: usize) -> GraphStoreResult<Vec<u
         GraphStoreError::new("fetch_failed", format!("url fetch failed: {error}"))
     })?;
     let mut bytes = Vec::new();
-    let read_limit = max_bytes
-        .checked_add(1)
-        .unwrap_or(max_bytes)
-        .min(u64::MAX as usize) as u64;
     response
         .body_mut()
         .as_reader()
-        .take(read_limit)
+        .take((limit as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| {
             GraphStoreError::new("fetch_read_failed", format!("url body read failed: {error}"))
         })?;
-    if bytes.len() > max_bytes {
+    if bytes.len() > limit {
         return Err(GraphStoreError::new(
             "fetch_too_large",
-            format!("fetched artifact exceeds the {max_bytes} byte limit"),
+            format!("fetched artifact exceeds the {limit} byte limit"),
         ));
     }
     if bytes.is_empty() {
@@ -308,93 +317,97 @@ pub fn fetch_binary_bytes(url: &str, max_bytes: usize) -> GraphStoreResult<Vec<u
     Ok(bytes)
 }
 
-/// Validate that a URL does not target private or internal IP ranges to prevent
-/// SSRF attacks. Rejects localhost, RFC1918 private ranges, link-local, and
-/// common metadata endpoints.
-fn validate_url_host_not_private(url: &str) -> GraphStoreResult<()> {
-    let parsed = url::Url::parse(url).map_err(|error| {
-        GraphStoreError::new("invalid_url", format!("url parse failed: {error}"))
-    })?;
-    let host = parsed.host_str().ok_or_else(|| {
-        GraphStoreError::new("invalid_url_host", "url must have a host")
-    })?;
-
-    // Check for localhost variants
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+/// SSRF guard for the agent-facing fetch path: reject URLs whose host is
+/// loopback, private, link-local, carrier-grade-NAT, or otherwise internal,
+/// before any connection is made. Hostnames are resolved so a public name that
+/// points at an internal address (including the cloud metadata endpoint, which
+/// is link-local) is also rejected.
+fn guard_url_host(url: &str) -> GraphStoreResult<()> {
+    let host = url_host(url)
+        .ok_or_else(|| GraphStoreError::new("invalid_url_host", "url has no host"))?;
+    let lowered = host.to_ascii_lowercase();
+    if lowered == "localhost" || lowered.ends_with(".localhost") {
         return Err(GraphStoreError::new(
-            "ssrf_localhost",
-            "url targets localhost, which is not allowed",
+            "blocked_url_host",
+            "refusing to fetch from localhost",
         ));
     }
-
-    // Try to parse as IP address
     if let Ok(ip) = host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(ipv4) => {
-                let octets = ipv4.octets();
-                // 127.0.0.0/8 - loopback
-                if octets[0] == 127 {
-                    return Err(GraphStoreError::new(
-                        "ssrf_loopback",
-                        "url targets loopback range 127.0.0.0/8",
-                    ));
-                }
-                // 10.0.0.0/8 - private
-                if octets[0] == 10 {
-                    return Err(GraphStoreError::new(
-                        "ssrf_private",
-                        "url targets private range 10.0.0.0/8",
-                    ));
-                }
-                // 172.16.0.0/12 - private
-                if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
-                    return Err(GraphStoreError::new(
-                        "ssrf_private",
-                        "url targets private range 172.16.0.0/12",
-                    ));
-                }
-                // 192.168.0.0/16 - private
-                if octets[0] == 192 && octets[1] == 168 {
-                    return Err(GraphStoreError::new(
-                        "ssrf_private",
-                        "url targets private range 192.168.0.0/16",
-                    ));
-                }
-                // 169.254.0.0/16 - link-local
-                if octets[0] == 169 && octets[1] == 254 {
-                    return Err(GraphStoreError::new(
-                        "ssrf_link_local",
-                        "url targets link-local range 169.254.0.0/16",
-                    ));
-                }
-            }
-            IpAddr::V6(ipv6) => {
-                // ::1 - loopback
-                if ipv6 == Ipv6Addr::LOCALHOST {
-                    return Err(GraphStoreError::new(
-                        "ssrf_loopback",
-                        "url targets IPv6 loopback ::1",
-                    ));
-                }
-                // fe80::/10 - link-local
-                if (ipv6.segments()[0] & 0xffc0) == 0xfe80 {
-                    return Err(GraphStoreError::new(
-                        "ssrf_link_local",
-                        "url targets IPv6 link-local range fe80::/10",
-                    ));
-                }
-                // fc00::/7 - unique local
-                if (ipv6.segments()[0] & 0xfe00) == 0xfc00 {
-                    return Err(GraphStoreError::new(
-                        "ssrf_private",
-                        "url targets IPv6 unique local range fc00::/7",
-                    ));
-                }
-            }
+        return reject_internal_ip(&host, ip);
+    }
+    let resolved = (host.as_str(), 0u16).to_socket_addrs().map_err(|error| {
+        GraphStoreError::new(
+            "url_host_unresolved",
+            format!("could not resolve host {host}: {error}"),
+        )
+    })?;
+    let mut any = false;
+    for addr in resolved {
+        any = true;
+        reject_internal_ip(&host, addr.ip())?;
+    }
+    if !any {
+        return Err(GraphStoreError::new(
+            "url_host_unresolved",
+            format!("host {host} resolved to no addresses"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_internal_ip(host: &str, ip: IpAddr) -> GraphStoreResult<()> {
+    if is_internal_ip(ip) {
+        return Err(GraphStoreError::new(
+            "blocked_url_host",
+            format!("refusing to fetch host {host} resolving to internal address {ip}"),
+        ));
+    }
+    Ok(())
+}
+
+fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| is_internal_ip(IpAddr::V4(v4)))
+                    .unwrap_or(false)
         }
     }
+}
 
-    Ok(())
+/// Extract the host from an http(s) URL: strip scheme, path/query/fragment,
+/// userinfo, and port, handling bracketed IPv6 literals.
+fn url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
+    let host_port = authority.rsplit('@').next()?;
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next()?.to_string()
+    } else {
+        host_port.split(':').next()?.to_string()
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 /// Derive a stable artifact name from a URL's last path segment so fetched
@@ -901,7 +914,9 @@ mod tests {
     fn fetch_reads_exact_bytes_over_http() {
         let body: Vec<u8> = (0u8..200).collect();
         let (url, handle) = serve_once(body.clone());
-        let fetched = fetch_binary_bytes(&url, 1 << 20).unwrap();
+        // Loopback is blocked by the SSRF guard on the public path, so the
+        // real-HTTP positive test uses the private-host policy bypass.
+        let fetched = fetch_binary_bytes_with_policy(&url, 1 << 20, true).unwrap();
         handle.join().ok();
         assert_eq!(fetched, body);
     }
@@ -909,7 +924,7 @@ mod tests {
     #[test]
     fn fetch_rejects_oversized_body() {
         let (url, handle) = serve_once(vec![0xabu8; 4096]);
-        let error = fetch_binary_bytes(&url, 1024).unwrap_err();
+        let error = fetch_binary_bytes_with_policy(&url, 1024, true).unwrap_err();
         handle.join().ok();
         assert_eq!(error.code, "fetch_too_large");
     }
@@ -920,11 +935,43 @@ mod tests {
         // fail identically, proving the URL front door fetches then pipes.
         let body = b"theorem-not-an-object-file".to_vec();
         let (url, handle) = serve_once(body.clone());
-        let via_url =
-            run_reconstruction_pipeline_from_url(Some("artifact.bin".to_string()), &url, 1 << 20);
+        let fetched = fetch_binary_bytes_with_policy(&url, 1 << 20, true).unwrap();
         handle.join().ok();
+        let via_url = run_reconstruction_pipeline("artifact.bin", &fetched);
         let via_bytes = run_reconstruction_pipeline("artifact.bin", &body);
         assert_eq!(result_code(&via_url), result_code(&via_bytes));
+    }
+
+    #[test]
+    fn public_fetch_rejects_localhost_name() {
+        let error = fetch_binary_bytes("http://localhost/x", 1024).unwrap_err();
+        assert_eq!(error.code, "blocked_url_host");
+    }
+
+    #[test]
+    fn public_fetch_rejects_internal_hosts() {
+        // Loopback, RFC1918, IPv6 loopback, and the cloud metadata endpoint
+        // (link-local) must all be rejected before any connection is made.
+        for url in [
+            "http://127.0.0.1:9/x",
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/x",
+        ] {
+            assert_eq!(
+                fetch_binary_bytes(url, 1024).unwrap_err().code,
+                "blocked_url_host",
+                "expected {url} to be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_from_url_inherits_ssrf_guard() {
+        let error = run_reconstruction_pipeline_from_url(None, "http://127.0.0.1:9/x", 1 << 20)
+            .unwrap_err();
+        assert_eq!(error.code, "blocked_url_host");
     }
 
     fn result_code(result: &GraphStoreResult<ReconstructionPipelineOutput>) -> String {

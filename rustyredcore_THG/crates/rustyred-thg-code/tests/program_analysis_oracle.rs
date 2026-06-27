@@ -465,6 +465,34 @@ fn generic_ghidra_exporter_emits_jump_table_oracle_contract() {
     assert!(exporter.contains("componentForOffset(structureType"));
 }
 
+#[test]
+fn dedicated_ghidra_exporters_keep_their_oracle_api_contracts() {
+    // Source-contract smoke checks. These exporters only run against a real
+    // Ghidra install (no JSON fixture is produced in CI), so guard against
+    // silent drift of their load-bearing decompiler/FID/SymZ3 API calls.
+    let bsim = include_str!("fixtures/ghidra_oracle/ExportTheoremBSimSignatures.java");
+    assert!(bsim.contains("DecompInterface"));
+    assert!(bsim.contains("generateSignatures"));
+    assert!(bsim.contains("setSignatureSettings"));
+    assert!(bsim.contains("getMajorVersion"));
+
+    let diagnostics =
+        include_str!("fixtures/ghidra_oracle/ExportTheoremDecompilerDiagnostics.java");
+    assert!(diagnostics.contains("decompileFunction"));
+    assert!(diagnostics.contains("decompileCompleted"));
+    assert!(diagnostics.contains("flushCache"));
+    assert!(diagnostics.contains("getErrorMessage"));
+
+    let function_id = include_str!("fixtures/ghidra_oracle/ExportTheoremFunctionId.java");
+    assert!(function_id.contains("FidService"));
+    assert!(function_id.contains("hashFunction"));
+    assert!(function_id.contains("FidHashQuad"));
+
+    let symz3 = include_str!("fixtures/ghidra_oracle/ExportTheoremSymZ3Facts.java");
+    assert!(symz3.contains("summarizeFunction"));
+    assert!(symz3.contains("symbolicSummaries"));
+}
+
 fn assert_exact_normalized_set<'a, Actual, Expected>(actual: Actual, expected: Expected)
 where
     Actual: IntoIterator<Item = &'a str>,
