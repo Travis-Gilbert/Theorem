@@ -1,6 +1,5 @@
 browser
 browser-substrate
-commonplace
 commonplace-api
 commonplace-clipper
 copresence-editor
@@ -22,4 +21,3 @@ theorem-harness-node
 theorem-harness-server
 theorem-harness-swift
 theorem-ios
-web

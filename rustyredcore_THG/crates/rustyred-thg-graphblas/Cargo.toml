@@ -1,0 +1,17 @@
+[package]
+name = "rustyred-thg-graphblas"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+description = "GraphBLAS + LAGraph FFI and safe sparse-linear-algebra layer for RustyRed: matrix/vector/semiring handles, masked mxv/mxm semiring traversal, and LAGraph algorithm bindings. Links SuiteSparse:GraphBLAS (Apache-2.0) and LAGraph (BSD); copies no GPL/CC-BY-NC/SSPL code."
+repository = "https://github.com/Travis-Gilbert/Theseus"
+# Declares the native library this crate links, so Cargo enforces a single
+# GraphBLAS link unit across the dependency graph.
+links = "graphblas"
+
+[dependencies]
+# Leaf crate: no workspace dependencies (integration lives in rustyred-thg-core
+# behind its optional `graphblas` feature, to keep the dependency edge acyclic).
+
+[build-dependencies]
+bindgen = "0.70"
