@@ -8073,6 +8073,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "object",
+ "quick-xml",
  "rustyred-thg-core",
  "serde",
  "serde_json",
@@ -8295,6 +8296,7 @@ dependencies = [
  "egg",
  "petgraph 0.8.3",
  "rustyred-thg-binformat",
+ "rustyred-thg-code",
  "rustyred-thg-core",
  "rustyred-thg-disasm",
  "rustyred-thg-lift",
@@ -8314,6 +8316,7 @@ dependencies = [
  "rustyred-thg-reconstruct",
  "serde",
  "serde_json",
+ "ureq 3.3.0",
 ]
 
 [[package]]

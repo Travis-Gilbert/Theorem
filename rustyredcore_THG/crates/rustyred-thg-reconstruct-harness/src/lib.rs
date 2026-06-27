@@ -1,5 +1,8 @@
 //! Harness capability pack for binary reconstruction.
 
+use std::io::Read;
+use std::time::Duration;
+
 use rustyred_thg_binformat::{load_binary, write_binary_facts_in_store, BinaryLoadReport};
 use rustyred_thg_core::{
     GraphStore, GraphStoreError, GraphStoreResult, NodeQuery, NodeRecord, PluginCapability,
@@ -43,6 +46,7 @@ pub struct ReconstructionPipelineReport {
     pub string_count: usize,
     pub instruction_count: usize,
     pub function_count: usize,
+    pub function_signature_count: usize,
     pub component_count: usize,
     pub instruction_obligation_count: usize,
     pub plan: ReconstructionPlan,
@@ -82,7 +86,7 @@ impl RustyRedPlugin for ReconstructionHarnessPlugin {
                 operation: "reconstruct.load",
                 command: "reconstruct.load",
                 aliases: &["theorem.reconstruct.binary.load"],
-                summary: "Parse binary bytes and write observed artifact facts.",
+                summary: "Parse a binary artifact (from bytes_hex or url) and write observed artifact facts.",
                 writes_graph: true,
                 handler: load_handler,
             },
@@ -161,12 +165,12 @@ pub fn capability_pack() -> ReconstructCapabilityPack {
         tools: vec![
             tool(
                 "reconstruct.load",
-                "Parses binary bytes and stores artifact facts.",
+                "Parses a binary artifact (from bytes_hex or url) and stores artifact facts.",
                 true,
             ),
             tool(
                 "reconstruct.analyze",
-                "Runs loader and decoder recovery.",
+                "Runs loader, decoder, lifting, semantic signatures, and recovery.",
                 true,
             ),
             tool(
@@ -223,6 +227,7 @@ pub fn run_reconstruction_pipeline(
         string_count: load.strings.len(),
         instruction_count: disassembly.instructions.len(),
         function_count: thir.functions.len(),
+        function_signature_count: analysis.signatures.len(),
         component_count: analysis.components.len(),
         instruction_obligation_count: analysis.plan.instructions.len(),
         plan: analysis.plan.clone(),
@@ -234,6 +239,82 @@ pub fn run_reconstruction_pipeline(
         analysis,
         report,
     })
+}
+
+/// Default ceiling for a fetched artifact body. Overridable per call via the
+/// `max_bytes` argument so a large firmware image can opt into a higher limit.
+pub const DEFAULT_MAX_FETCH_BYTES: usize = 256 * 1024 * 1024;
+
+/// URL front door for the engine: fetch a binary artifact over http(s) and run
+/// the full reconstruction pipeline on the fetched bytes. Callers that only have
+/// a URL (the harness reverse-engineer tool) reach reconstruction without
+/// pre-downloading and hex-encoding the artifact first.
+pub fn run_reconstruction_pipeline_from_url(
+    name: Option<String>,
+    url: &str,
+    max_bytes: usize,
+) -> GraphStoreResult<ReconstructionPipelineOutput> {
+    let bytes = fetch_binary_bytes(url, max_bytes)?;
+    let name = name.unwrap_or_else(|| default_artifact_name_from_url(url));
+    run_reconstruction_pipeline(name, &bytes)
+}
+
+/// Download an artifact body over http(s) with a scheme guard, a global timeout,
+/// and a hard size ceiling so a hostile or oversized response cannot exhaust
+/// memory.
+// ponytail: scheme + timeout + size cap are the responsible minimum. SSRF
+// hardening (blocking private/link-local IP ranges) is a named follow-up.
+pub fn fetch_binary_bytes(url: &str, max_bytes: usize) -> GraphStoreResult<Vec<u8>> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(GraphStoreError::new(
+            "invalid_url_scheme",
+            "url must start with http:// or https://",
+        ));
+    }
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(120)))
+            .build(),
+    );
+    let mut response = agent.get(url).call().map_err(|error| {
+        GraphStoreError::new("fetch_failed", format!("url fetch failed: {error}"))
+    })?;
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            GraphStoreError::new("fetch_read_failed", format!("url body read failed: {error}"))
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(GraphStoreError::new(
+            "fetch_too_large",
+            format!("fetched artifact exceeds the {max_bytes} byte limit"),
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(GraphStoreError::new(
+            "fetch_empty",
+            "fetched artifact body was empty",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Derive a stable artifact name from a URL's last path segment so fetched
+/// artifacts get a meaningful identifier without a caller-supplied name.
+fn default_artifact_name_from_url(url: &str) -> String {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("artifact.bin")
+        .to_string()
 }
 
 pub fn write_pipeline_output_in_store<S: GraphStore>(
@@ -277,7 +358,7 @@ fn tool(name: &str, summary: &str, writes_graph: bool) -> ReconstructToolSpec {
 
 fn load_handler(context: PluginOperationContext<'_>, arguments: Value) -> GraphStoreResult<Value> {
     let input = BinaryBytesInput::from_value(arguments)?;
-    let bytes = decode_hex(&input.bytes_hex)?;
+    let bytes = input.resolve_bytes()?;
     let load = load_binary(input.artifact_name, &bytes)?;
     write_binary_facts_in_store(context.store, &load)?;
     Ok(json!({
@@ -293,7 +374,7 @@ fn analyze_handler(
     arguments: Value,
 ) -> GraphStoreResult<Value> {
     let input = BinaryBytesInput::from_value(arguments)?;
-    let bytes = decode_hex(&input.bytes_hex)?;
+    let bytes = input.resolve_bytes()?;
     let output = run_reconstruction_pipeline(input.artifact_name, &bytes)?;
     write_pipeline_output_in_store_for_tenant(context.store, &output, context.tenant_id)?;
     Ok(json!(output.report))
@@ -301,7 +382,7 @@ fn analyze_handler(
 
 fn lift_handler(context: PluginOperationContext<'_>, arguments: Value) -> GraphStoreResult<Value> {
     let input = BinaryBytesInput::from_value(arguments)?;
-    let bytes = decode_hex(&input.bytes_hex)?;
+    let bytes = input.resolve_bytes()?;
     let load = load_binary(input.artifact_name, &bytes)?;
     let disassembly = decode_instructions(&load)?;
     let thir = lift_to_thir(&load, &disassembly);
@@ -321,11 +402,12 @@ fn components_handler(
     arguments: Value,
 ) -> GraphStoreResult<Value> {
     let input = BinaryBytesInput::from_value(arguments)?;
-    let bytes = decode_hex(&input.bytes_hex)?;
+    let bytes = input.resolve_bytes()?;
     let output = run_reconstruction_pipeline(input.artifact_name, &bytes)?;
     write_pipeline_output_in_store_for_tenant(context.store, &output, context.tenant_id)?;
     Ok(json!({
         "artifact_id": output.load.artifact.artifact_id,
+        "function_signature_count": output.analysis.signatures.len(),
         "component_count": output.analysis.components.len(),
         "components": output.analysis.components,
     }))
@@ -443,27 +525,66 @@ fn decode_hex(bytes_hex: &str) -> GraphStoreResult<Vec<u8>> {
 #[derive(Clone, Debug, Deserialize)]
 struct BinaryBytesInput {
     artifact_name: String,
-    bytes_hex: String,
+    bytes_hex: Option<String>,
+    url: Option<String>,
+    max_bytes: Option<usize>,
 }
 
 impl BinaryBytesInput {
     fn from_value(value: Value) -> GraphStoreResult<Self> {
-        let artifact_name = value
-            .get("artifact_name")
-            .or_else(|| value.get("artifactName"))
-            .and_then(Value::as_str)
-            .unwrap_or("artifact.bin")
-            .to_string();
         let bytes_hex = value
             .get("bytes_hex")
             .or_else(|| value.get("bytesHex"))
             .and_then(Value::as_str)
-            .ok_or_else(|| GraphStoreError::new("missing_bytes_hex", "bytes_hex is required"))?
-            .to_string();
+            .map(str::to_string);
+        let url = value
+            .get("url")
+            .or_else(|| value.get("source_url"))
+            .or_else(|| value.get("sourceUrl"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if bytes_hex.is_none() && url.is_none() {
+            return Err(GraphStoreError::new(
+                "missing_binary_source",
+                "one of bytes_hex or url is required",
+            ));
+        }
+        let artifact_name = value
+            .get("artifact_name")
+            .or_else(|| value.get("artifactName"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| match &url {
+                Some(url) => default_artifact_name_from_url(url),
+                None => "artifact.bin".to_string(),
+            });
+        let max_bytes = value
+            .get("max_bytes")
+            .or_else(|| value.get("maxBytes"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
         Ok(Self {
             artifact_name,
             bytes_hex,
+            url,
+            max_bytes,
         })
+    }
+
+    /// Resolve the artifact bytes from whichever source was supplied. Hex bytes
+    /// win when both are present (a caller that already has the bytes never
+    /// triggers a network fetch).
+    fn resolve_bytes(&self) -> GraphStoreResult<Vec<u8>> {
+        if let Some(bytes_hex) = &self.bytes_hex {
+            return decode_hex(bytes_hex);
+        }
+        if let Some(url) = &self.url {
+            return fetch_binary_bytes(url, self.max_bytes.unwrap_or(DEFAULT_MAX_FETCH_BYTES));
+        }
+        Err(GraphStoreError::new(
+            "missing_binary_source",
+            "one of bytes_hex or url is required",
+        ))
     }
 }
 
@@ -650,5 +771,93 @@ mod tests {
         let instructions = tenant_page.result["instructions"].as_array().unwrap();
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0]["id"], json!(&target_instruction_id));
+    }
+
+    #[test]
+    fn fetch_rejects_non_http_scheme() {
+        let error = fetch_binary_bytes("file:///etc/passwd", 1024).unwrap_err();
+        assert_eq!(error.code, "invalid_url_scheme");
+    }
+
+    #[test]
+    fn binary_input_requires_a_source() {
+        let error = BinaryBytesInput::from_value(json!({})).unwrap_err();
+        assert_eq!(error.code, "missing_binary_source");
+    }
+
+    #[test]
+    fn binary_input_prefers_bytes_hex_over_url() {
+        // Both supplied: hex wins, so resolve_bytes never touches the network.
+        let input = BinaryBytesInput::from_value(json!({
+            "bytes_hex": "90c3",
+            "url": "http://127.0.0.1:1/never"
+        }))
+        .unwrap();
+        assert_eq!(input.resolve_bytes().unwrap(), vec![0x90, 0xc3]);
+    }
+
+    #[test]
+    fn binary_input_derives_name_from_url() {
+        let input =
+            BinaryBytesInput::from_value(json!({"url": "https://host/dl/app.elf?v=2"})).unwrap();
+        assert_eq!(input.artifact_name, "app.elf");
+    }
+
+    #[test]
+    fn fetch_reads_exact_bytes_over_http() {
+        let body: Vec<u8> = (0u8..200).collect();
+        let (url, handle) = serve_once(body.clone());
+        let fetched = fetch_binary_bytes(&url, 1 << 20).unwrap();
+        handle.join().ok();
+        assert_eq!(fetched, body);
+    }
+
+    #[test]
+    fn fetch_rejects_oversized_body() {
+        let (url, handle) = serve_once(vec![0xabu8; 4096]);
+        let error = fetch_binary_bytes(&url, 1024).unwrap_err();
+        handle.join().ok();
+        assert_eq!(error.code, "fetch_too_large");
+    }
+
+    #[test]
+    fn pipeline_from_url_matches_direct_bytes() {
+        // Arbitrary (non-object) bytes: both paths must reach load_binary and
+        // fail identically, proving the URL front door fetches then pipes.
+        let body = b"theorem-not-an-object-file".to_vec();
+        let (url, handle) = serve_once(body.clone());
+        let via_url =
+            run_reconstruction_pipeline_from_url(Some("artifact.bin".to_string()), &url, 1 << 20);
+        handle.join().ok();
+        let via_bytes = run_reconstruction_pipeline("artifact.bin", &body);
+        assert_eq!(result_code(&via_url), result_code(&via_bytes));
+    }
+
+    fn result_code(result: &GraphStoreResult<ReconstructionPipelineOutput>) -> String {
+        match result {
+            Ok(output) => format!("ok:{}", output.report.artifact_id),
+            Err(error) => format!("err:{}", error.code),
+        }
+    }
+
+    fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/artifact.bin"), handle)
     }
 }

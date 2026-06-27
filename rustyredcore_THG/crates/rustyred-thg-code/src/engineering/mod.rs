@@ -10,21 +10,76 @@ use crate::SOURCE;
 
 pub mod native_loader;
 pub mod program_analysis;
+mod trace_to_contract;
 pub use native_loader::{
     load_native_binary, NativeLoaderError, NativeLoaderOutput, NATIVE_LOADER_ANALYZER_ID,
 };
 pub use program_analysis::{
     compile_program_analysis_run_in_memory, compile_program_analysis_run_in_store,
-    ghidra_oracle_fixture_to_program_analysis_input, AnalyzerPassReceipt, BinaryArtifact,
-    BinaryImport, BinaryRelocation, BinarySection, BinaryString, BinarySymbol, GhidraOracleFixture,
-    GhidraOracleProgramSummary, InstructionFact, LoaderFact, ProgramAnalysisInput,
-    ProgramAnalysisOutput, ProgramAnalysisRun, ProgramAnalysisStatus, ProgramAnalysisTargetKind,
-    ProgramDataFlowFact, ProgramSemanticHypothesis, TheoremIrFunction, ANALYZER_PASS_RECEIPT_LABEL,
-    ANALYZES_ARTIFACT, BINARY_ARTIFACT_LABEL, DERIVED_FROM_ORACLE, GHIDRA_ORACLE_FIXTURE_LABEL,
+    derive_ghidra_oracle_address_drifts, derive_ghidra_oracle_summary_drifts,
+    derive_reference_recovery_evidence, ghidra_analysis_scheduler_states,
+    ghidra_oracle_export_json_to_program_analysis_input,
+    ghidra_oracle_export_to_program_analysis_input,
+    ghidra_oracle_fixture_to_program_analysis_input, schedule_analysis_work_items,
+    AnalysisAddressRange, AnalysisChangeSet, AnalysisDriftFact, AnalysisDriftKind,
+    AnalysisPassSpec, AnalysisSchedulerState, AnalysisWorkItem, AnalysisWorkStatus,
+    AnalyzerPassReceipt, BinaryArtifact, BinaryImport, BinaryRelocation, BinarySection,
+    BinaryString, BinarySymbol, GhidraOracleAnnotationFact, GhidraOracleCallEdgeFact,
+    GhidraOracleCallStackEffectFact, GhidraOracleDataTypeFact, GhidraOracleDataTypeFieldFact,
+    GhidraOracleDebugSignatureFeature, GhidraOracleDecompilerDiagnosticFact,
+    GhidraOracleEnumValueFact, GhidraOracleEquateFact,
+    GhidraOracleEquateReferenceFact, GhidraOracleExport, GhidraOracleExternalLinkageFact,
+    GhidraOracleExternalThunkLinkFact, GhidraOracleFixture, GhidraOracleFunctionFact,
+    GhidraOracleFunctionIdFact, GhidraOracleFunctionIdMatchFact, GhidraOracleFunctionPrototypeFact,
+    GhidraOracleFunctionPrototypeParameterFact, GhidraOracleHighVariableFact,
+    GhidraOracleHighVariableInstanceFact, GhidraOracleJumpTableCaseFact, GhidraOracleJumpTableFact,
+    GhidraOracleJumpTableLoadTableFact, GhidraOracleMemoryWitnessFact,
+    GhidraOracleParameterMeasureFact, GhidraOraclePcodeOpFact, GhidraOracleProgramSummary,
+    GhidraOracleReferenceFact, GhidraOracleSemanticSignatureFact, GhidraOracleStackFrameFact,
+    GhidraOracleStackFrameVariableFact, GhidraOracleStructureFieldAccessFact,
+    GhidraOracleSymbolicModelBinding, GhidraOracleSymbolicPreconditionFact,
+    GhidraOracleSymbolicSummaryFact, GhidraOracleSymbolicValueFact,
+    GhidraOracleVariableStorageFact, GhidraOracleVariableStoragePieceFact, InstructionFact,
+    LoaderFact, ProgramAnalysisInput, ProgramAnalysisOutput, ProgramAnalysisRun,
+    ProgramAnalysisStatus, ProgramAnalysisTargetKind, ProgramAnalyzerType, ProgramDataFlowFact,
+    ProgramPcodeFact, ProgramSemanticHypothesis, ReferenceRecoveryEvidence, RuntimeTrace,
+    TaintMark, TheoremIrFunction, TraceEventFact, TraceEventKind, TraceScheduleForm,
+    TraceScheduleSource, TraceScheduleSpec, TraceSnapshotFact, ANALYSIS_DRIFT_LABEL,
+    ANALYSIS_PASS_SPEC_LABEL, ANALYSIS_SCHEDULER_STATE_LABEL, ANALYSIS_WORK_ITEM_LABEL,
+    ANALYZER_PASS_RECEIPT_LABEL, ANALYZES_ARTIFACT, BINARY_ARTIFACT_LABEL, DERIVED_FROM_ORACLE,
+    EVENT_HAS_TAINT_MARK, GHIDRA_ORACLE_ANNOTATION_FACT_LABEL, GHIDRA_ORACLE_CALL_EDGE_FACT_LABEL,
+    GHIDRA_ORACLE_CALL_STACK_EFFECT_FACT_LABEL, GHIDRA_ORACLE_DATA_TYPE_FACT_LABEL,
+    GHIDRA_ORACLE_DECOMPILER_DIAGNOSTIC_FACT_LABEL, GHIDRA_ORACLE_EQUATE_FACT_LABEL,
+    GHIDRA_ORACLE_EXTERNAL_LINKAGE_FACT_LABEL, GHIDRA_ORACLE_FIXTURE_LABEL,
+    GHIDRA_ORACLE_FUNCTION_FACT_LABEL, GHIDRA_ORACLE_FUNCTION_ID_FACT_LABEL,
+    GHIDRA_ORACLE_FUNCTION_PROTOTYPE_FACT_LABEL, GHIDRA_ORACLE_HIGH_VARIABLE_FACT_LABEL,
+    GHIDRA_ORACLE_JUMP_TABLE_FACT_LABEL, GHIDRA_ORACLE_PARAMETER_MEASURE_FACT_LABEL,
+    GHIDRA_ORACLE_PCODE_OP_FACT_LABEL, GHIDRA_ORACLE_REFERENCE_FACT_LABEL,
+    GHIDRA_ORACLE_SEMANTIC_SIGNATURE_FACT_LABEL, GHIDRA_ORACLE_STACK_FRAME_FACT_LABEL,
+    GHIDRA_ORACLE_STRUCTURE_FIELD_ACCESS_FACT_LABEL, GHIDRA_ORACLE_SYMBOLIC_SUMMARY_FACT_LABEL,
+    HAS_ANALYSIS_DRIFT, HAS_ANALYSIS_PASS, HAS_ANALYSIS_SCHEDULER_STATE, HAS_ANALYSIS_WORK_ITEM,
     HAS_ANALYZER_RECEIPT, HAS_DATA_FLOW_FACT, HAS_INSTRUCTION_FACT, HAS_LOADER_FACT,
+    HAS_PROGRAM_PCODE_FACT, HAS_REFERENCE_RECOVERY_EVIDENCE, HAS_RUNTIME_TRACE,
     HAS_SEMANTIC_HYPOTHESIS, HAS_THIR_FUNCTION, INSTRUCTION_FACT_LABEL, LOADER_FACT_LABEL,
-    PROGRAM_ANALYSIS_RUN_LABEL, PROGRAM_DATA_FLOW_FACT_LABEL, PROGRAM_SEMANTIC_HYPOTHESIS_LABEL,
-    THEOREM_IR_FUNCTION_LABEL,
+    ORACLE_FIXTURE_HAS_ANNOTATION_FACT, ORACLE_FIXTURE_HAS_CALL_EDGE_FACT,
+    ORACLE_FIXTURE_HAS_CALL_STACK_EFFECT_FACT, ORACLE_FIXTURE_HAS_DATA_TYPE_FACT,
+    ORACLE_FIXTURE_HAS_DECOMPILER_DIAGNOSTIC_FACT,
+    ORACLE_FIXTURE_HAS_EQUATE_FACT, ORACLE_FIXTURE_HAS_EXTERNAL_LINKAGE_FACT,
+    ORACLE_FIXTURE_HAS_FUNCTION_FACT, ORACLE_FIXTURE_HAS_FUNCTION_ID_FACT,
+    ORACLE_FIXTURE_HAS_FUNCTION_PROTOTYPE_FACT, ORACLE_FIXTURE_HAS_HIGH_VARIABLE_FACT,
+    ORACLE_FIXTURE_HAS_JUMP_TABLE_FACT, ORACLE_FIXTURE_HAS_PARAMETER_MEASURE_FACT,
+    ORACLE_FIXTURE_HAS_PCODE_OP_FACT, ORACLE_FIXTURE_HAS_REFERENCE_FACT,
+    ORACLE_FIXTURE_HAS_SEMANTIC_SIGNATURE_FACT, ORACLE_FIXTURE_HAS_STACK_FRAME_FACT,
+    ORACLE_FIXTURE_HAS_STRUCTURE_FIELD_ACCESS_FACT, ORACLE_FIXTURE_HAS_SYMBOLIC_SUMMARY_FACT,
+    PROGRAM_ANALYSIS_RUN_LABEL, PROGRAM_DATA_FLOW_FACT_LABEL, PROGRAM_PCODE_FACT_LABEL,
+    PROGRAM_SEMANTIC_HYPOTHESIS_LABEL, REFERENCE_PRODUCES_RECOVERY_EVIDENCE,
+    REFERENCE_RECOVERY_EVIDENCE_LABEL, RUNTIME_TRACE_LABEL, SCHEDULER_USES_PASS,
+    SNAPSHOT_HAS_EVENT, SNAPSHOT_HAS_TAINT_MARK, TAINT_MARK_LABEL, THEOREM_IR_FUNCTION_LABEL,
+    TRACE_EVENT_LABEL, TRACE_HAS_SNAPSHOT, TRACE_SNAPSHOT_LABEL, WORK_ITEM_USES_PASS,
+};
+pub use trace_to_contract::{
+    compile_program_analysis_trace_engineering_in_memory,
+    program_analysis_trace_to_engineering_input, TraceToEngineeringOptions,
 };
 
 pub const ENGINEERING_COMPILER_VERSION: &str = "0.1.0";
@@ -625,6 +680,7 @@ fn evidence_map_for_input(input: &EngineeringCompileInput, compile_id: &str) -> 
     evidence_map
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_graph_payload(
     input: &EngineeringCompileInput,
     compile_id: &str,

@@ -11,6 +11,7 @@ datafrog = "2.0"
 egg = "0.10"
 petgraph = "0.8"
 rustyred-thg-binformat = { path = "../rustyred-thg-binformat" }
+rustyred-thg-code = { path = "../rustyred-thg-code" }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 rustyred-thg-disasm = { path = "../rustyred-thg-disasm" }
 rustyred-thg-lift = { path = "../rustyred-thg-lift" }
