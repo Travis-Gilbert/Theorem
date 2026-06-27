@@ -10,25 +10,30 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `pilot-core` | Servo-free, Playwright-class browser automation core: locator, actionability + auto-wait, geometry snapshot, coordinate synthesis, and web-first assertions behind a BrowserDriver trait. |
 | `prose-check` | Deterministic writing-engineering style checker for Theorem harness receipts. |
 | `reconstruction-engine` | Procedural reconstruction engine, ported whole into Theorem for the substrate-native browser. |
+| `rustyred-code-embedding` | Shared code embedding seam for RustyRed file and CodeCrawler write paths. |
 | `rustyred-hipporag` | HippoRAG 2 candidate generation with RAPTOR-style graph hubs for RustyRed THG. |
 | `rustyred-membrane` | Shared context admission and eviction membrane for RustyRed graph-backed context. |
-| `rustyred-code-embedding` | Shared code embedding seam for RustyRed file and CodeCrawler write paths, with a deterministic hash default, feature-gated HTTP hosted-encoder path, and feature-gated local Candle/BGE encoder path. |
 | `rustyred-rerank` | Reranker scorer implementations for RustyRed membrane admission. |
 | `rustyred-thg-adapters` | LoRA adapter catalog and routing over RustyRedCore-THG graph records. |
 | `rustyred-thg-affordances` | Connector-as-substrate learning registry: MCP tools as first-class Affordance graph nodes with learned, scoped selection over RustyRedCore-THG. |
+| `rustyred-thg-binformat` | Binary loader facts for Theorem reconstruction. |
 | `rustyred-thg-catalog` | Relational catalog (tenants, projects, billing, auth) and the cold index for the RustyRedCore-THG storage spine, over sqlx/Postgres. |
-| `rustyred-thg-code` | Code parsing plugin/runtime for RustyRedCore-THG tenant graph stores, including opt-in `CodeSymbolName` buckets plus source-file write indexing, touched outgoing/incoming edge rewrite, and W4 shared embedder wiring for CodeSymbol vectors. |
+| `rustyred-thg-code` | Code parsing plugin/runtime for RustyRedCore-THG tenant graph stores. |
 | `rustyred-thg-compat-server` | Standalone HTTP control server for THG-Core. |
 | `rustyred-thg-connectors` | Live MCP connector transport: connect to an external MCP server, list its tools, and register them as learnable Affordance graph nodes via rustyred-thg-affordances. |
-| `rustyred-thg-core` | Theorem HotGraph core command executor and state machine, including graph/vector indexes whose vector designation rebuilds when dimensions change, plus RedCore AOF/snapshot durability with logical `NodeDelete` replay for durable node removal. |
+| `rustyred-thg-core` | Theorem HotGraph core command executor and state machine. |
+| `rustyred-thg-disasm` | Instruction fact decoder for Theorem reconstruction. |
 | `rustyred-thg-fractal` | Native Rust fractal expansion pipeline over RustyRed and RustyWeb. |
-| `rustyred-thg-fuse` | Read-only filesystem/path index over zero-copy RustyRed THG graph archives, with optional fuser mount glue. |
+| `rustyred-thg-fuse` | Read-only FUSE/path index over zero-copy RustyRed THG graph archives. |
 | `rustyred-thg-geotemporal` | Tenant-scoped geotemporal composition over THG H3 spatial indexes. |
 | `rustyred-thg-intake` | CommonPlace source intake: the ingestion-spoke framework (SourceSpoke), the scoped incremental sync driver, curated + MappedSpoke sources, and the NeedsYou-residue -> delegation act seam. |
+| `rustyred-thg-lift` | Minimal THIR lifter for Theorem reconstruction. |
 | `rustyred-thg-mcp` | Model Context Protocol adapter for the Theorem HotGraph graph database. |
 | `rustyred-thg-memory` | Graph-native memory recall, consolidation, decay, and validity plugin for RustyRedCore-THG. |
 | `rustyred-thg-ml` | Shared graph tensor and message-passing primitives for RustyRedCore-THG learned organs. |
 | `rustyred-thg-pg-server` | Postgres wire protocol server for RustyRedCore-THG native views. |
+| `rustyred-thg-reconstruct-harness` | Harness capability pack for Theorem binary reconstruction. |
+| `rustyred-thg-reconstruct` | Semantic graph and reconstruction instruction compiler for binary artifacts. |
 | `rustyred-thg-resp-server` | RESP protocol server for RustyRedCore-THG ordered-index commands. |
 | `rustyred-thg-server` | Product HTTP/gRPC/MCP surface over RustyRedCore-THG: tenant graph routes, query/Cypher APIs, harness coordination, browser actions, fractal expansion, and TTL sweeping. |
 | `rustyred-web` | RustyWeb graph-native crawler and search kernel for Theorem/Theseus. |
@@ -37,9 +42,9 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `theorem-acp` | CommonPlace ACP host: subprocess JSON-RPC, harness MCP injection, scoped file review, PTY command approval, and copresence registration. |
 | `theorem-agentd` | Local Theorem assistant daemon: OpenAI-compatible model loop, MCP tool host, receiver sidecar, and compute-offload ledger. |
 | `theorem-browser-agent` | Rust-native Theorem browser-use perceive/govern/afford contracts and kernels. |
-| `theorem-copresence` | Headless co-presence peer and surface-adapter seam over the RustyRed substrate. Includes note/text adapters plus the W5 code-surface adapter for file-position presence, edit footprints, and git-only code content strategy. |
+| `theorem-copresence` | Headless co-presence peer and surface-adapter seam over the RustyRed substrate. |
 | `theorem-dispatch` | Postgres hot execution queue for Theorem Dispatch v2. |
 | `theorem-harness-core` | Rust-native Theorem harness run controller: state transitions, guards, hashes, and replay/fork contracts. |
 | `theorem-harness-runtime` | Rust-native Theorem harness runtime: GraphStore-backed event log and run persistence. |
 | `theorem-harness` | theorem-harness SDK v2: the idiomatic Rust surface over theorem-harness-core and theorem-harness-runtime. |
-| `theorem-receiver` | Dispatch-queue receiver: an outbound-only claim loop against the cloud harness that spawns the locally-installed claude/codex CLI in a mapped worktree, plus the `SandboxRuntime` execution seam with OpenSandbox and local-process backends, including local-process and execd-stream stdout/stderr events, timeout reporting, and cooperative cancellation. |
+| `theorem-receiver` | Dispatch-queue receiver: an outbound-only claim loop against the cloud harness that spawns the locally-installed claude/codex CLI in a mapped worktree. |

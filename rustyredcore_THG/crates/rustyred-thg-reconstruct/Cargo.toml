@@ -1,0 +1,18 @@
+[package]
+name = "rustyred-thg-reconstruct"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic graph and reconstruction instruction compiler for binary artifacts."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+datafrog = "2.0"
+egg = "0.10"
+petgraph = "0.8"
+rustyred-thg-binformat = { path = "../rustyred-thg-binformat" }
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+rustyred-thg-disasm = { path = "../rustyred-thg-disasm" }
+rustyred-thg-lift = { path = "../rustyred-thg-lift" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

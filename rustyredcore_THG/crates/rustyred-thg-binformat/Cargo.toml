@@ -1,0 +1,15 @@
+[package]
+name = "rustyred-thg-binformat"
+version = "0.1.0"
+edition = "2021"
+description = "Binary loader facts for Theorem reconstruction."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+hex = "0.4"
+object = "0.37.3"
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
