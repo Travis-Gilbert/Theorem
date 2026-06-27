@@ -193,12 +193,13 @@ pub async fn diagnostics_memory(
     let mut tenant_versions = BTreeMap::new();
     let tenant_reports = redcore_tenants
         .iter()
-        .map(|(tenant, executor)| match executor.stats() {
+        .map(|(tenant, executor)| match executor.cheap_stats() {
             Ok(stats) => {
                 tenant_versions.insert(tenant.clone(), stats.version);
                 json!({
                     "tenant": tenant,
                     "stats": stats,
+                    "stats_memory_bytes_estimated": false,
                     "cached_edges": executor.cached_edges_diagnostics(),
                 })
             }

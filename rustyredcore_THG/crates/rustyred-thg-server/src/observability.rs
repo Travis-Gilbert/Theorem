@@ -141,6 +141,7 @@ fn format_bucket_bound(le: f64) -> String {
 struct CounterSet {
     total_requests: AtomicU64,
     errors: AtomicU64,
+    http_error_responses: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     cache_stale: AtomicU64,
@@ -224,6 +225,12 @@ impl Observability {
 
     pub fn record_error(&self) {
         self.counters.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_http_error_response(&self) {
+        self.counters
+            .http_error_responses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -403,8 +410,14 @@ impl Observability {
         write_counter(
             &mut out,
             "rustyred_thg_errors",
-            "Total HTTP requests that returned an error status",
+            "Total operation errors recorded by handlers",
             c.errors.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut out,
+            "rustyred_thg_http_error_responses",
+            "Total HTTP responses with 4xx or 5xx status",
+            c.http_error_responses.load(Ordering::Relaxed),
         );
         write_counter(
             &mut out,

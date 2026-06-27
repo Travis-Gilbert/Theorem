@@ -8,6 +8,25 @@ use serde_json::{json, Value};
 
 use crate::SOURCE;
 
+pub mod native_loader;
+pub mod program_analysis;
+pub use native_loader::{
+    load_native_binary, NativeLoaderError, NativeLoaderOutput, NATIVE_LOADER_ANALYZER_ID,
+};
+pub use program_analysis::{
+    compile_program_analysis_run_in_memory, compile_program_analysis_run_in_store,
+    ghidra_oracle_fixture_to_program_analysis_input, AnalyzerPassReceipt, BinaryArtifact,
+    BinaryImport, BinaryRelocation, BinarySection, BinaryString, BinarySymbol, GhidraOracleFixture,
+    GhidraOracleProgramSummary, InstructionFact, LoaderFact, ProgramAnalysisInput,
+    ProgramAnalysisOutput, ProgramAnalysisRun, ProgramAnalysisStatus, ProgramAnalysisTargetKind,
+    ProgramDataFlowFact, ProgramSemanticHypothesis, TheoremIrFunction, ANALYZER_PASS_RECEIPT_LABEL,
+    ANALYZES_ARTIFACT, BINARY_ARTIFACT_LABEL, DERIVED_FROM_ORACLE, GHIDRA_ORACLE_FIXTURE_LABEL,
+    HAS_ANALYZER_RECEIPT, HAS_DATA_FLOW_FACT, HAS_INSTRUCTION_FACT, HAS_LOADER_FACT,
+    HAS_SEMANTIC_HYPOTHESIS, HAS_THIR_FUNCTION, INSTRUCTION_FACT_LABEL, LOADER_FACT_LABEL,
+    PROGRAM_ANALYSIS_RUN_LABEL, PROGRAM_DATA_FLOW_FACT_LABEL, PROGRAM_SEMANTIC_HYPOTHESIS_LABEL,
+    THEOREM_IR_FUNCTION_LABEL,
+};
+
 pub const ENGINEERING_COMPILER_VERSION: &str = "0.1.0";
 pub const ENGINEERING_COMPILE_LABEL: &str = "EngineeringCompile";
 pub const ENGINEERING_ARCHITECTURE_LABEL: &str = "EngineeringArchitecture";
