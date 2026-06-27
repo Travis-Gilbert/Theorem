@@ -8095,6 +8095,7 @@ name = "rustyred-thg-code"
 version = "0.7.0"
 dependencies = [
  "ignore",
+ "object",
  "rayon",
  "rustyred-code-embedding",
  "rustyred-membrane",
@@ -8102,6 +8103,7 @@ dependencies = [
  "rustyred-thg-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "syn",
  "tree-sitter",
  "tree-sitter-c",

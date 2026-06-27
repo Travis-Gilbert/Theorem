@@ -40,8 +40,9 @@ use rustyred_thg_core::{
     merge_graph_snapshots, stable_hash, update_graph_ref_cas, CodeKgManifest, Direction,
     EdgeRecord, EpistemicType, GraphCompileOptions, GraphMergeOptions, GraphMergeStrategy,
     GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphVersionRepository, GraphWriteResult, HarnessInstantKg, InMemoryGraphStore, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord, SessionDelta, VerifyReport,
+    GraphVersionRepository, GraphWriteResult, HarnessInstantKg, InMemoryGraphStore,
+    MemoryDocumentQuery, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, SessionDelta,
+    VerifyReport,
 };
 use rustyred_thg_fractal::{
     run_fractal_expansion, run_fractal_expansion_with_search_providers, FractalExpansionRequest,
@@ -696,8 +697,25 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             enforce_path_tenant_auth,
         ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_http_request,
+        ))
         .layer(cors)
         .with_state(state)
+}
+
+async fn record_http_request(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    state.observability.record_request();
+    let response = next.run(request).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        state.observability.record_http_error_response();
+    }
+    response
 }
 
 async fn commonplace_acp_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -6438,10 +6456,15 @@ struct MemoryDocsQuery {
     #[serde(default)]
     since: Option<String>,
     #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
     include_inactive: Option<bool>,
     #[serde(default)]
     limit: Option<usize>,
 }
+
+const MEMORY_DOCS_DEFAULT_LIMIT: usize = 500;
+const MEMORY_DOCS_MAX_LIMIT: usize = 1_000;
 
 /// List a tenant's memory documents for the Obsidian sync plugin. Authenticated GET
 /// scoped to `graph:read`; the tenant comes from the path so a token only reads its
@@ -6473,19 +6496,31 @@ async fn memory_docs_list(
     let tenant_slug = normalize_tenant_slug(&tenant_id);
     let since = params.since.unwrap_or_default();
     let since = since.trim();
+    let before = params.before.unwrap_or_default();
+    let before = before.trim();
     let include_inactive = params.include_inactive.unwrap_or(false);
+    let response_limit = params
+        .limit
+        .unwrap_or(MEMORY_DOCS_DEFAULT_LIMIT)
+        .clamp(1, MEMORY_DOCS_MAX_LIMIT);
 
-    let nodes = match store.query_nodes(
-        NodeQuery::label("MemoryDocument")
-            .with_property("tenant_slug", Value::String(tenant_slug.clone()))
-            .with_limit(10_000),
-    ) {
+    let mut query = MemoryDocumentQuery::tenant(tenant_slug.clone())
+        .with_limit(response_limit.saturating_add(1));
+    if !since.is_empty() {
+        query = query.with_since(since);
+    }
+    if !before.is_empty() {
+        query = query.with_before(before);
+    }
+    if !include_inactive {
+        query = query.with_status("active");
+    }
+    let nodes = match store.memory_documents_by_updated_at(query) {
         Ok(nodes) => nodes,
         Err(error) => return graph_store_error_response(error),
     };
 
-    let mut docs: Vec<Value> = Vec::new();
-    let mut max_updated_at = String::new();
+    let mut documents: Vec<MemoryDocumentState> = Vec::new();
     for node in nodes {
         let document: MemoryDocumentState = match serde_json::from_value(node.properties) {
             Ok(document) => document,
@@ -6497,40 +6532,53 @@ async fn memory_docs_list(
         if !include_inactive && document.status != "active" {
             continue;
         }
-        if !since.is_empty() && document.updated_at.as_str() < since {
-            continue;
-        }
-        if document.updated_at > max_updated_at {
-            max_updated_at = document.updated_at.clone();
-        }
-        docs.push(json!({
+        documents.push(document);
+    }
+    let truncated = documents.len() > response_limit;
+    if truncated {
+        documents.truncate(response_limit);
+    }
+    let max_updated_at = documents
+        .iter()
+        .map(|document| document.updated_at.as_str())
+        .max()
+        .unwrap_or_default()
+        .to_string();
+    let next_before = if truncated {
+        documents
+            .last()
+            .map(|document| document.updated_at.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let docs: Vec<Value> = documents
+        .into_iter()
+        .map(|document| {
+            let content_hash = memory_content_hash(&document.content);
+            json!({
             "doc_id": document.doc_id,
             "kind": document.kind,
             "title": document.title,
             "summary": document.summary,
             "content": document.content,
-            "content_hash": memory_content_hash(&document.content),
+            "content_hash": content_hash,
             "status": document.status,
             "tags": document.tags,
             "links": document.links,
             "created_at": document.created_at,
             "updated_at": document.updated_at,
-        }));
-    }
-    docs.sort_by(|left, right| {
-        right["updated_at"]
-            .as_str()
-            .unwrap_or_default()
-            .cmp(left["updated_at"].as_str().unwrap_or_default())
-    });
-    if let Some(limit) = params.limit {
-        docs.truncate(limit);
-    }
+            })
+        })
+        .collect();
 
     Json(json!({
         "ok": true,
         "tenant": tenant_slug,
         "count": docs.len(),
+        "limit": response_limit,
+        "truncated": truncated,
+        "next_before": next_before,
         "max_updated_at": max_updated_at,
         "docs": docs,
     }))
@@ -9216,6 +9264,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_count_http_requests_and_error_responses() {
+        let state = memory_product_state();
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let metrics_response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        let metrics = String::from_utf8(
+            to_bytes(metrics_response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics.contains("rustyred_thg_total_requests 2"));
+        assert!(metrics.contains("rustyred_thg_http_error_responses 1"));
+    }
+
+    #[tokio::test]
     async fn path_tenant_auth_rejects_mismatched_token_before_write() {
         let state = memory_product_auth_state();
         let app = build_router(state.clone());
@@ -10347,6 +10435,54 @@ mod tests {
             source["links"].as_array().unwrap()[0].as_str().unwrap(),
             target_doc_id
         );
+    }
+
+    #[tokio::test]
+    async fn memory_docs_endpoint_caps_response_and_reports_pagination() {
+        let state = memory_product_write_state_with_search_providers(Vec::new());
+        let config = state.mcp_config();
+        let tenant = "obsidian-sync-limit-test";
+
+        for index in 0..3 {
+            handle_mcp_request_with_context(
+                &state,
+                &config,
+                &McpRequestContext::default(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("upsert-note-{index}"),
+                    "method": "tools/call",
+                    "params": {
+                        "name": "upsert_note",
+                        "arguments": {
+                            "tenant": tenant,
+                            "title": format!("Note {index}"),
+                            "content": format!("body {index}")
+                        }
+                    }
+                }),
+            );
+        }
+
+        let response = memory_docs_list(
+            State(state.clone()),
+            axum::extract::Path(tenant.to_string()),
+            HeaderMap::new(),
+            Query(MemoryDocsQuery {
+                limit: Some(1),
+                ..MemoryDocsQuery::default()
+            }),
+        )
+        .await
+        .into_response();
+        let payload = response_payload_json(response).await;
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["count"], 1);
+        assert_eq!(payload["limit"], 1);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["docs"].as_array().unwrap().len(), 1);
+        assert!(payload["next_before"].as_str().unwrap_or_default().len() > 0);
     }
 
     #[tokio::test]

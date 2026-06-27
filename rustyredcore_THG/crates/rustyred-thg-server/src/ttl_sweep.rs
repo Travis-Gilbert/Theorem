@@ -145,7 +145,15 @@ pub async fn run_sweep_loop(state: AppState, interval_ms: u64) {
             break;
         }
         let start = Instant::now();
-        let purged = sweep_all_tenants(&state);
+        let sweep_state = state.clone();
+        let purged =
+            match tokio::task::spawn_blocking(move || sweep_all_tenants(&sweep_state)).await {
+                Ok(purged) => purged,
+                Err(err) => {
+                    tracing::warn!(error = %err, "ttl_sweep blocking task failed");
+                    0
+                }
+            };
         let duration_ms = start.elapsed().as_millis() as u64;
         state.ttl_sweep.record_tick(purged, duration_ms);
         if purged > 0 {
