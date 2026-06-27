@@ -34,10 +34,12 @@ public class ExportTheoremFunctionId extends GhidraScript {
         int maxFunctions = intArg(args, 1, DEFAULT_MAX_FUNCTIONS);
 
         List<Function> functions = new ArrayList<>();
-        for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
-            functions.add(function);
-            if (functions.size() >= maxFunctions) {
-                break;
+        if (maxFunctions > 0) {
+            for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
+                if (functions.size() >= maxFunctions) {
+                    break;
+                }
+                functions.add(function);
             }
         }
 

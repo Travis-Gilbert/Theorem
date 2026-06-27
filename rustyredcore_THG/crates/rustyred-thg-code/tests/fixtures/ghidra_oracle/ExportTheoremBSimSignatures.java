@@ -37,14 +37,16 @@ public class ExportTheoremBSimSignatures extends GhidraScript {
             ? args[0]
             : "theorem-ghidra-bsim-signatures-oracle.json";
         int maxFunctions = intArg(args, 1, DEFAULT_MAX_FUNCTIONS);
-        int timeoutSeconds = intArg(args, 2, DEFAULT_TIMEOUT_SECONDS);
+        int timeoutSeconds = Math.max(1, intArg(args, 2, DEFAULT_TIMEOUT_SECONDS));
         int signatureSettings = intArg(args, 3, DEFAULT_SIGNATURE_SETTINGS);
 
         List<Function> functions = new ArrayList<>();
-        for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
-            functions.add(function);
-            if (functions.size() >= maxFunctions) {
-                break;
+        if (maxFunctions > 0) {
+            for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
+                if (functions.size() >= maxFunctions) {
+                    break;
+                }
+                functions.add(function);
             }
         }
 

@@ -79,10 +79,9 @@ public class ExportTheoremDecompilerDiagnostics extends GhidraScript {
                         message = "";
                     }
                     message = message.trim();
-                    if (message.isEmpty() && result.decompileCompleted() && result.isValid()) {
-                        continue;
+                    if (!message.isEmpty() || !result.decompileCompleted() || !result.isValid()) {
+                        diagnostics.add(functionDiagnostic(function, result, message));
                     }
-                    diagnostics.add(functionDiagnostic(function, result, message));
                     decompiler.flushCache();
                 }
             }

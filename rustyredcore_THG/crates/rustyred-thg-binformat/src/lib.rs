@@ -515,6 +515,14 @@ pub fn write_binary_facts_in_store<S: GraphStore>(
             ProgramManagerKind::Symbol,
             &symbol.symbol_id,
         )?;
+        if !symbol.is_definition {
+            link_manager_fact(
+                store,
+                &program,
+                ProgramManagerKind::External,
+                &symbol.symbol_id,
+            )?;
+        }
     }
     for string in &report.strings {
         store.upsert_node(string_node(string))?;
@@ -543,6 +551,12 @@ pub fn write_binary_facts_in_store<S: GraphStore>(
             store,
             &program,
             ProgramManagerKind::Relocation,
+            &relocation.relocation_id,
+        )?;
+        link_manager_fact(
+            store,
+            &program,
+            ProgramManagerKind::Reference,
             &relocation.relocation_id,
         )?;
     }

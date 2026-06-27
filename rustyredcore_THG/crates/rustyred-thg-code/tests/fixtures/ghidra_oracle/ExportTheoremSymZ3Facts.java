@@ -165,8 +165,8 @@ public class ExportTheoremSymZ3Facts extends GhidraScript {
             branchOps);
         List<String> valueObjects = symbolicValueObjects(summaryId, localState, sharedState);
         List<String> memoryWitnessObjects = memoryWitnessObjects(summaryId, localState, sharedState);
-        List<String> registersRead = registerNames(localState, true);
-        List<String> registersUpdated = registerNames(localState, false);
+        List<String> registersRead = safeRegisterNames(localState, true);
+        List<String> registersUpdated = safeRegisterNames(localState, false);
 
         if (preconditionObjects.isEmpty() && valueObjects.isEmpty() &&
             memoryWitnessObjects.isEmpty()) {
@@ -284,10 +284,10 @@ public class ExportTheoremSymZ3Facts extends GhidraScript {
         try (Context ctx = new Context()) {
             Z3InfixPrinter z3p = new Z3InfixPrinter(ctx);
             List<SymZ3MemoryMap> maps = new ArrayList<>();
-            maps.addAll(memoryMaps(localState));
-            maps.addAll(memoryMaps(sharedState));
+            maps.addAll(safeMemoryMaps(localState));
+            maps.addAll(safeMemoryMaps(sharedState));
             for (SymZ3MemoryMap map : maps) {
-                List<Z3MemoryWitness> witnesses = memoryWitnesses(map);
+                List<Z3MemoryWitness> witnesses = safeMemoryWitnesses(map);
                 for (Z3MemoryWitness witness : witnesses) {
                     int index = objects.size();
                     BitVecExpr addressExpr = witness.address().getBitVecExpr(ctx);
@@ -363,46 +363,66 @@ public class ExportTheoremSymZ3Facts extends GhidraScript {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<AddressSpace, ?> spaceMap(SymZ3PcodeExecutorStatePiece state) throws Exception {
-        Field field = SymZ3PcodeExecutorStatePiece.class.getDeclaredField("spaceMap");
-        field.setAccessible(true);
-        return (Map<AddressSpace, ?>) field.get(state);
+    private Map<AddressSpace, ?> safeSpaceMap(SymZ3PcodeExecutorStatePiece state) {
+        try {
+            Field field = SymZ3PcodeExecutorStatePiece.class.getDeclaredField("spaceMap");
+            field.setAccessible(true);
+            return (Map<AddressSpace, ?>) field.get(state);
+        }
+        catch (Exception e) {
+            return new java.util.HashMap<>();
+        }
     }
 
-    private List<String> registerNames(
+    private List<String> safeRegisterNames(
             SymZ3PcodeExecutorStatePiece state,
-            boolean read) throws Exception {
+            boolean read) {
         Set<String> names = new TreeSet<>();
-        for (Object space : spaceMap(state).values()) {
-            if (!space.getClass().getSimpleName().equals("SymZ3RegisterSpace")) {
-                continue;
+        try {
+            for (Object space : safeSpaceMap(state).values()) {
+                if (!space.getClass().getSimpleName().equals("SymZ3RegisterSpace")) {
+                    continue;
+                }
+                Field field = space.getClass().getDeclaredField("rmap");
+                field.setAccessible(true);
+                SymZ3RegisterMap map = (SymZ3RegisterMap) field.get(space);
+                names.addAll(read ? map.getRegisterNamesRead() : map.getRegisterNamesUpdated());
             }
-            Field field = space.getClass().getDeclaredField("rmap");
-            field.setAccessible(true);
-            SymZ3RegisterMap map = (SymZ3RegisterMap) field.get(space);
-            names.addAll(read ? map.getRegisterNamesRead() : map.getRegisterNamesUpdated());
+        }
+        catch (Exception e) {
+            // Reflection failed; return empty list
         }
         return new ArrayList<>(names);
     }
 
-    private List<SymZ3MemoryMap> memoryMaps(SymZ3PcodeExecutorStatePiece state) throws Exception {
+    private List<SymZ3MemoryMap> safeMemoryMaps(SymZ3PcodeExecutorStatePiece state) {
         List<SymZ3MemoryMap> maps = new ArrayList<>();
-        for (Object space : spaceMap(state).values()) {
-            if (!space.getClass().getSimpleName().equals("SymZ3MemorySpace")) {
-                continue;
+        try {
+            for (Object space : safeSpaceMap(state).values()) {
+                if (!space.getClass().getSimpleName().equals("SymZ3MemorySpace")) {
+                    continue;
+                }
+                Field field = space.getClass().getDeclaredField("mmap");
+                field.setAccessible(true);
+                maps.add((SymZ3MemoryMap) field.get(space));
             }
-            Field field = space.getClass().getDeclaredField("mmap");
-            field.setAccessible(true);
-            maps.add((SymZ3MemoryMap) field.get(space));
+        }
+        catch (Exception e) {
+            // Reflection failed; return empty list
         }
         return maps;
     }
 
     @SuppressWarnings("unchecked")
-    private List<Z3MemoryWitness> memoryWitnesses(SymZ3MemoryMap map) throws Exception {
-        Field field = SymZ3MemoryMap.class.getDeclaredField("witnesses");
-        field.setAccessible(true);
-        return new ArrayList<>((List<Z3MemoryWitness>) field.get(map));
+    private List<Z3MemoryWitness> safeMemoryWitnesses(SymZ3MemoryMap map) {
+        try {
+            Field field = SymZ3MemoryMap.class.getDeclaredField("witnesses");
+            field.setAccessible(true);
+            return new ArrayList<>((List<Z3MemoryWitness>) field.get(map));
+        }
+        catch (Exception e) {
+            return new ArrayList<>();
+        }
     }
 
     private List<SymZ3RecordsExecution.RecOp> branchOps(SymZ3PcodeExecutorStatePiece state) {

@@ -44,7 +44,11 @@ pub fn program_analysis_trace_to_engineering_input(
                 .iter()
                 .flat_map(|trace| evidence_ids(&trace.trace_id, &trace.evidence_ids))
                 .collect(),
-            validator_refs: vec!["trace-schedule-replay".to_string()],
+            validator_refs: analysis
+                .runtime_traces
+                .iter()
+                .map(|trace| trace.trace_id.clone())
+                .collect(),
             unknowns: Vec::new(),
         });
     }
@@ -57,7 +61,11 @@ pub fn program_analysis_trace_to_engineering_input(
                 .iter()
                 .flat_map(|mark| evidence_ids(&mark.taint_id, &mark.evidence_ids))
                 .collect(),
-            validator_refs: vec!["taint-presence".to_string()],
+            validator_refs: analysis
+                .taint_marks
+                .iter()
+                .map(|mark| mark.taint_id.clone())
+                .collect(),
             unknowns: vec![
                 "Taint propagation precision depends on the trace oracle and p-code coverage."
                     .to_string(),

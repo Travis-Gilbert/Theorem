@@ -519,7 +519,7 @@
             "access_kind": "load",
             "structure_type_id": "ghidra:datatype:/fixture/TheoremTinyArgs:2001",
             "structure_name": "TheoremTinyArgs",
-            "root_variable_id": "ghidra:high_symbol:0x0:1",
+            "root_variable_id": "ghidra:highvar:0x0:parameter:1:args",
             "root_variable_name": "args",
             "root_storage": "register:RDI:8",
             "field_id": "ghidra:datatype_field:TheoremTinyArgs:lhs",
