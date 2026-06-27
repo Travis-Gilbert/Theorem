@@ -942,29 +942,12 @@ fn pcode_shape_for_statement(
         ThirStmt::Branch {
             condition,
             target,
-            fallthrough,
             text,
             ..
         } => {
-            let mut inputs = Vec::new();
-            if let Some(condition) = condition {
-                inputs.push(PcodeOperand::Condition {
-                    value: condition.clone(),
-                });
-            }
-            if let Some(target) = target {
-                inputs.push(PcodeOperand::Address { value: *target });
-            }
-            if let Some(fallthrough) = fallthrough {
-                inputs.push(PcodeOperand::Address {
-                    value: *fallthrough,
-                });
-            }
-            if inputs.is_empty() {
-                inputs.push(PcodeOperand::Text {
-                    value: text.clone(),
-                });
-            }
+            // Match Ghidra's branch operand layout: the destination is input0 and
+            // CBRANCH carries the condition as input1. Fallthrough is the implicit
+            // next instruction, not a p-code operand, so it is not emitted.
             let opcode = if condition.is_some() {
                 PcodeOpcode::Cbranch
             } else if target.is_some() {
@@ -972,6 +955,20 @@ fn pcode_shape_for_statement(
             } else {
                 PcodeOpcode::Branchind
             };
+            let mut inputs = Vec::new();
+            if let Some(target) = target {
+                inputs.push(PcodeOperand::Address { value: *target });
+            }
+            if let Some(condition) = condition {
+                inputs.push(PcodeOperand::Condition {
+                    value: condition.clone(),
+                });
+            }
+            if inputs.is_empty() {
+                inputs.push(PcodeOperand::Text {
+                    value: text.clone(),
+                });
+            }
             (opcode, inputs, None, text.clone())
         }
         ThirStmt::Return { text, .. } => (
@@ -1350,8 +1347,13 @@ mod tests {
             ]
         );
         assert_eq!(opcode_ids, vec![7, 8, 5, 4, 6, 10, 0, 9]);
+        // Ghidra CBRANCH order: destination input0, condition input1.
         assert!(matches!(
             facts[2].inputs.first(),
+            Some(PcodeOperand::Address { value }) if *value == 0x1010
+        ));
+        assert!(matches!(
+            facts[2].inputs.get(1),
             Some(PcodeOperand::Condition { value }) if value == "zf == 1"
         ));
         assert_eq!(facts[0].sequence, 0);
