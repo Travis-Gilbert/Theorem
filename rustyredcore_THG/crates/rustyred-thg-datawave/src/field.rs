@@ -343,7 +343,7 @@ fn compact14_to_ms(s: &str) -> Option<i64> {
     let hh: i64 = s.get(8..10)?.parse().ok()?;
     let mi: i64 = s.get(10..12)?.parse().ok()?;
     let ss: i64 = s.get(12..14)?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || hh > 23 || mi > 59 || ss > 59 {
+    if !(1..=12).contains(&mo) || d == 0 || d > days_in_month(y, mo) || hh > 23 || mi > 59 || ss > 59 {
         return None;
     }
     let days = days_from_civil(y, mo, d);
@@ -355,10 +355,31 @@ fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
     let y: i64 = p.next()?.parse().ok()?;
     let mo: u32 = p.next()?.parse().ok()?;
     let d: u32 = p.next()?.parse().ok()?;
-    if p.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+    if p.next().is_some() || !(1..=12).contains(&mo) || d == 0 || d > days_in_month(y, mo) {
         return None;
     }
     Some((y, mo, d))
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Calendar days in a month, so impossible dates (`2024-02-31`, `2023-02-29`)
+/// are rejected rather than silently rolled forward by `days_from_civil`.
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
 }
 
 fn parse_hms(t: &str) -> Option<(i64, i64, i64, i64)> {
@@ -715,6 +736,17 @@ mod tests {
             assert_eq!(FieldType::Date.normalize(raw).unwrap(), want, "date {raw}");
         }
         assert!(FieldType::Date.normalize("not-a-date").is_err());
+    }
+
+    #[test]
+    fn date_rejects_impossible_calendar_dates() {
+        // Silently rolling these into later real dates would index a wrong fact.
+        assert!(FieldType::Date.normalize("2024-02-31").is_err());
+        assert!(FieldType::Date.normalize("2023-04-31").is_err());
+        assert!(FieldType::Date.normalize("2023-02-29").is_err()); // 2023 is not a leap year
+        assert!(FieldType::Date.normalize("20230229000000").is_err()); // compact form too
+        // The real leap day stays valid.
+        assert_eq!(FieldType::Date.normalize("2024-02-29").unwrap(), "2024-02-29T00:00:00.000Z");
     }
 
     #[test]

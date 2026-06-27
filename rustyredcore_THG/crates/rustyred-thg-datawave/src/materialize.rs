@@ -247,7 +247,17 @@ pub fn materialize_event<S: GraphStore>(
                 format!(
                     "dw:edge:{}:{}",
                     edge.edge_type,
-                    stable_hash((from_id.as_str(), edge.edge_type.as_str(), to_id.as_str(), edge.version))
+                    // Include the event id so two records that derive the same
+                    // from/to/type/version edge stay distinct and individually
+                    // traceable (the edge carries this event's id + visibility),
+                    // matching how field-fact ids are scoped by event.
+                    stable_hash((
+                        event_id.as_str(),
+                        from_id.as_str(),
+                        edge.edge_type.as_str(),
+                        to_id.as_str(),
+                        edge.version,
+                    ))
                 ),
                 &from_id,
                 &edge.edge_type,
@@ -375,5 +385,39 @@ mod tests {
         assert!(!first.deduped);
         assert!(second.deduped);
         assert_eq!(stats.deduped, 1);
+    }
+
+    #[test]
+    fn distinct_records_keep_per_event_derived_edges() {
+        let mut store = InMemoryGraphStore::default();
+        let mut stats = IngestStats::new();
+        let helper = net_helper();
+        let defs = [EdgeDef::new("CONNECTS", "src_ip", "dst_ip")];
+        let cfg = MaterializeConfig::default();
+
+        // Different raw content (extra spaces) but the same normalized
+        // src_ip -> dst_ip: two distinct events derive the same logical edge.
+        let r1 = RawRecord::text("net", "1.2.3.4,5.6.7.8", 1000);
+        let r2 = RawRecord::text("net", "1.2.3.4 , 5.6.7.8", 2000);
+        let mut event_ids = Vec::new();
+        for record in [&r1, &r2] {
+            let fields = helper.event_fields(record).unwrap();
+            let edges = crate::edge::derive_edges(&defs, &fields);
+            let outcome = materialize_event(&mut store, record, &fields, &edges, &cfg, &mut stats).unwrap();
+            assert_eq!(outcome.edges_written, 1);
+            event_ids.push(outcome.event_id);
+        }
+        assert_ne!(event_ids[0], event_ids[1], "different content -> different events");
+
+        // Both per-event edges survive (no overwrite); provenance is traceable.
+        let from = entity_id("src_ip", "001.002.003.004", None);
+        let to = entity_id("dst_ip", "005.006.007.008", None);
+        for ev in &event_ids {
+            let edge_id = format!(
+                "dw:edge:CONNECTS:{}",
+                stable_hash((ev.as_str(), from.as_str(), "CONNECTS", to.as_str(), 1u32))
+            );
+            assert!(store.get_edge(&edge_id).is_some(), "per-event edge for {ev} preserved");
+        }
     }
 }

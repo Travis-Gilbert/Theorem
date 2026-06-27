@@ -248,8 +248,11 @@ fn lookup_events(
     limit: usize,
 ) -> GraphStoreResult<BTreeSet<String>> {
     let vf = format!("{field}={value}");
+    // Scope to the active tenant: FieldFact nodes carry `tenant_id`, so without
+    // this filter tenant B's lookup could surface tenant A's event ids.
     let query = NodeQuery::label(FIELD_FACT_LABEL)
         .with_property("vf", json!(vf))
+        .with_property("tenant_id", json!(context.tenant_id))
         .with_limit(limit);
     let nodes = context.store.query_nodes(query)?;
     Ok(nodes
@@ -402,6 +405,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(empty.result["count"], json!(0));
+    }
+
+    #[test]
+    fn lookup_is_tenant_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RedCoreGraphStore::open(dir.path(), RedCoreOptions::default()).unwrap();
+        let registry = registry();
+        let record = json!({
+            "data_type": "doc",
+            "helper": { "kind": "json", "config": { "types": { "k": "lc_text" }, "policies": { "k": { "indexed": true } } } },
+            "record": { "data_type": "doc", "body": { "kind": "json", "data": { "k": "shared" } }, "event_time_ms": 1 }
+        });
+        // tenant-a ingests k=shared.
+        registry.execute(&mut store, "tenant-a", "ingest.record", record).unwrap();
+        // tenant-b must NOT see tenant-a's event ids.
+        let b = registry
+            .execute(&mut store, "tenant-b", "ingest.lookup", json!({ "field": "k", "value": "shared" }))
+            .unwrap();
+        assert_eq!(b.result["count"], json!(0));
+        // tenant-a sees its own.
+        let a = registry
+            .execute(&mut store, "tenant-a", "ingest.lookup", json!({ "field": "k", "value": "shared" }))
+            .unwrap();
+        assert_eq!(a.result["count"], json!(1));
     }
 
     #[test]
