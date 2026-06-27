@@ -1,8 +1,20 @@
 {
-  "fixture_id": "ghidra:oracle:hello-tiny:x86_64-elf-relocatable",
-  "source_uri": "tests/fixtures/ghidra_oracle/hello_tiny.c",
-  "export_script": "tests/fixtures/ghidra_oracle/ExportTheoremFacts.java",
-  "evidence_ids": ["fixture:ghidra:hello-tiny"],
+  "fixture": {
+    "fixture_id": "ghidra:oracle:hello-tiny:x86_64-elf-relocatable",
+    "source_uri": "tests/fixtures/ghidra_oracle/hello_tiny.c",
+    "export_script": "tests/fixtures/ghidra_oracle/ExportTheoremFacts.java",
+    "evidence_ids": ["fixture:ghidra:hello-tiny"],
+    "program_summary": {
+      "ghidra_version": "fixture-ghidra-headless",
+      "language_id": "x86:LE:64:default",
+      "compiler_spec_id": "gcc",
+      "analysis_timeout_occurred": false,
+      "function_count": 2,
+      "import_count": 1,
+      "string_count": 4,
+      "cfg_edge_count": 0
+    }
+  },
   "artifact": {
     "sha256": "ebe5c2e042166b0941bc14869ed7bb85168dc131f06eae04abd409c1be150f33",
     "format": "Elf",
@@ -40,14 +52,602 @@
       "theorem_external"
     ]
   },
-  "program_summary": {
-    "ghidra_version": "fixture-ghidra-headless",
-    "language_id": "x86:LE:64:default",
-    "compiler_spec_id": "gcc",
-    "analysis_timeout_occurred": false,
-    "function_count": 2,
-    "import_count": 1,
-    "string_count": 4,
-    "cfg_edge_count": 0
-  }
+  "functions": [
+    {
+      "function_id": "ghidra:function:0x0",
+      "entry_point": "0x0",
+      "name": "theorem_add",
+      "body_start": "0x0",
+      "body_end": "0xf",
+      "evidence_ids": ["fixture:ghidra:function:theorem_add"]
+    },
+    {
+      "function_id": "ghidra:function:0x10",
+      "entry_point": "0x10",
+      "name": "main",
+      "body_start": "0x10",
+      "body_end": "0x2f",
+      "evidence_ids": ["fixture:ghidra:function:main"]
+    }
+  ],
+  "pcode_ops": [],
+  "references": [],
+  "call_edges": [],
+  "jump_tables": [],
+  "external_linkages": [
+    {
+      "linkage_id": "ghidra:external_linkage:theorem_external",
+      "function_id": null,
+      "local_address": "external:0x1000",
+      "thunked_function_id": null,
+      "thunked_address": null,
+      "recursive_target_function_id": null,
+      "recursive_target_address": null,
+      "external_library": "<UNKNOWN>",
+      "external_library_path": null,
+      "library_ordinal": null,
+      "parent_namespace": "<UNKNOWN>",
+      "external_label": "theorem_external",
+      "original_imported_name": "theorem_external",
+      "external_address": null,
+      "external_space_address": "external:0x1000",
+      "source_type": "IMPORTED",
+      "is_function": true,
+      "data_type": null,
+      "function_signature": "undefined theorem_external()",
+      "thunk_chain": [],
+      "evidence_ids": ["fixture:ghidra:external:theorem_external"]
+    }
+  ],
+  "function_prototypes": [
+    {
+      "prototype_id": "ghidra:prototype:0x0:theorem_add",
+      "function_id": "ghidra:function:0x0",
+      "entry_point": "0x0",
+      "name": "theorem_add",
+      "prototype": "int theorem_add(struct TheoremTinyArgs * args)",
+      "calling_convention": "__cdecl",
+      "return_type": "int",
+      "return_type_id": "ghidra:datatype:/int",
+      "return_type_kind": "primitive",
+      "return_type_byte_len": 4,
+      "return_storage": {
+        "storage": "register:0x0:4",
+        "kind": "register",
+        "byte_len": 4,
+        "pieces": [],
+        "dynamic_storage_required": false,
+        "forced_indirect": false,
+        "auto_parameter_type": null
+      },
+      "parameters": [
+        {
+          "ordinal": 0,
+          "name": "args",
+          "data_type": "struct TheoremTinyArgs *",
+          "data_type_id": "ghidra:datatype:/fixture/TheoremTinyArgs:2001",
+          "data_type_kind": "pointer",
+          "data_type_byte_len": 8,
+          "storage": {
+            "storage": "register:0x38:8",
+            "kind": "register",
+            "byte_len": 8,
+            "pieces": [
+              {
+                "piece_id": "ghidra:storage_piece:prototype:args:rdi",
+                "space": "register",
+                "offset": 56,
+                "byte_len": 8,
+                "register": "RDI",
+                "is_input": true,
+                "is_addr_tied": true,
+                "is_persistent": false,
+                "is_unique": false,
+                "is_constant": false,
+                "is_hash": false,
+                "is_stack": false
+              }
+            ],
+            "dynamic_storage_required": false,
+            "forced_indirect": false,
+            "auto_parameter_type": null
+          },
+          "auto_parameter": false,
+          "auto_parameter_type": null,
+          "forced_indirect": false,
+          "formal_data_type": null,
+          "formal_data_type_id": null,
+          "formal_data_type_kind": null,
+          "formal_data_type_byte_len": null,
+          "comment": "fixture argument pointer",
+          "source_type": "ANALYSIS",
+          "evidence_ids": ["fixture:ghidra:prototype_param:args"]
+        }
+      ],
+      "has_varargs": false,
+      "has_no_return": false,
+      "is_inline": false,
+      "is_thunk": false,
+      "thunked_function_id": null,
+      "thunked_entry_point": null,
+      "has_custom_storage": false,
+      "stack_purge_size": 0,
+      "signature_source": "ANALYSIS",
+      "evidence_ids": ["fixture:ghidra:prototype:theorem_add"]
+    }
+  ],
+  "data_types": [
+    {
+      "type_id": "ghidra:datatype:/fixture/TheoremTinyArgs:2001",
+      "name": "TheoremTinyArgs",
+      "display_name": "struct TheoremTinyArgs",
+      "kind": "structure",
+      "category_path": "/fixture",
+      "path_name": "/fixture/TheoremTinyArgs",
+      "universal_id": "2001",
+      "byte_len": 16,
+      "aligned_byte_len": 16,
+      "component_count": 2,
+      "packing_enabled": true,
+      "packing_value": null,
+      "minimum_alignment": null,
+      "not_yet_defined": false,
+      "zero_length": false,
+      "base_type_id": null,
+      "base_type_name": null,
+      "element_type_id": null,
+      "element_type_name": null,
+      "element_count": null,
+      "element_byte_len": null,
+      "enum_signed": null,
+      "enum_values": [],
+      "fields": [
+        {
+          "field_id": "ghidra:datatype_field:TheoremTinyArgs:lhs",
+          "name": "lhs",
+          "ordinal": 0,
+          "offset": 0,
+          "byte_len": 4,
+          "bit_offset": null,
+          "bit_size": null,
+          "data_type_id": "ghidra:datatype:/int",
+          "data_type_name": "int",
+          "comment": null,
+          "evidence_ids": ["fixture:ghidra:datatype_field:lhs"]
+        },
+        {
+          "field_id": "ghidra:datatype_field:TheoremTinyArgs:rhs",
+          "name": "rhs",
+          "ordinal": 1,
+          "offset": 4,
+          "byte_len": 4,
+          "bit_offset": null,
+          "bit_size": null,
+          "data_type_id": "ghidra:datatype:/int",
+          "data_type_name": "int",
+          "comment": null,
+          "evidence_ids": ["fixture:ghidra:datatype_field:rhs"]
+        }
+      ],
+      "hard_dependency_ids": ["ghidra:datatype:/int"],
+      "soft_dependency_ids": [],
+      "evidence_ids": ["fixture:ghidra:datatype:TheoremTinyArgs"]
+    }
+    ],
+    "high_variables": [
+        {
+            "variable_id": "ghidra:highvar:0x0:parameter:1:args",
+            "function_id": "ghidra:function:0x0",
+            "entry_point": "0x0",
+            "symbol_id": "ghidra:symbol:1",
+            "name": "args",
+            "kind": "parameter",
+            "category_index": 0,
+            "data_type": "struct TheoremTinyArgs *",
+            "data_type_id": "ghidra:datatype:/fixture/TheoremTinyArgs:2001",
+            "storage": {
+                "storage": "register:0x38:8",
+                "kind": "register",
+                "byte_len": 8,
+                "pieces": [
+                    {
+                        "piece_id": "ghidra:storage_piece:args:rdi",
+                        "space": "register",
+                        "offset": 56,
+                        "byte_len": 8,
+                        "register": "RDI",
+                        "is_input": true,
+                        "is_addr_tied": true,
+                        "is_persistent": false,
+                        "is_unique": false,
+                        "is_constant": false,
+                        "is_hash": false,
+                        "is_stack": false
+                    }
+                ],
+                "dynamic_storage_required": false,
+                "forced_indirect": false,
+                "auto_parameter_type": null
+            },
+            "first_use_address": "0x0",
+            "first_use_offset": 0,
+            "name_locked": true,
+            "type_locked": true,
+            "isolated": false,
+            "is_this_pointer": false,
+            "is_hidden_return": false,
+            "mutability": "normal",
+            "high_symbol_offset": null,
+            "instances": [
+                {
+                    "instance_id": "ghidra:highvar_instance:args:rdi",
+                    "storage": {
+                        "storage": "register:0x38:8",
+                        "kind": "register",
+                        "byte_len": 8,
+                        "pieces": [
+                            {
+                                "piece_id": "ghidra:storage_piece:args:rdi:instance",
+                                "space": "register",
+                                "offset": 56,
+                                "byte_len": 8,
+                                "register": "RDI",
+                                "is_input": true,
+                                "is_addr_tied": true,
+                                "is_persistent": false,
+                                "is_unique": false,
+                                "is_constant": false,
+                                "is_hash": false,
+                                "is_stack": false
+                            }
+                        ],
+                        "dynamic_storage_required": false,
+                        "forced_indirect": false,
+                        "auto_parameter_type": null
+                    },
+                    "pc_address": "0x0",
+                    "defining_pcode_id": null,
+                    "merge_group": 0,
+                    "is_representative": true,
+                    "evidence_ids": ["fixture:ghidra:highvar_instance:args"]
+                }
+            ],
+            "evidence_ids": ["fixture:ghidra:highvar:args"]
+        }
+    ],
+    "stack_frames": [
+        {
+            "frame_id": "ghidra:stack_frame:0x0",
+            "function_id": "ghidra:function:0x0",
+            "entry_point": "0x0",
+            "frame_size": 32,
+            "local_size": 16,
+            "parameter_size": 16,
+            "parameter_offset": 8,
+            "return_address_offset": 0,
+            "growth": "negative",
+            "stack_pointer_register": "RSP",
+            "custom_variable_storage": false,
+            "variables": [
+                {
+                    "variable_id": "ghidra:stack_var:0x0:8:args_shadow",
+                    "name": "args_shadow",
+                    "kind": "parameter",
+                    "offset": 8,
+                    "byte_len": 8,
+                    "ordinal": 0,
+                    "data_type": "struct TheoremTinyArgs *",
+                    "data_type_id": "ghidra:datatype:/fixture/TheoremTinyArgs:2001",
+                    "storage": {
+                        "storage": "stack:0x8:8",
+                        "kind": "stack",
+                        "byte_len": 8,
+                        "pieces": [
+                            {
+                                "piece_id": "ghidra:storage_piece:args_shadow:stack",
+                                "space": "stack",
+                                "offset": 8,
+                                "byte_len": 8,
+                                "register": null,
+                                "is_input": true,
+                                "is_addr_tied": true,
+                                "is_persistent": false,
+                                "is_unique": false,
+                                "is_constant": false,
+                                "is_hash": false,
+                                "is_stack": true
+                            }
+                        ],
+                        "dynamic_storage_required": false,
+                        "forced_indirect": false,
+                        "auto_parameter_type": null
+                    },
+                    "source_type": "ANALYSIS",
+                    "high_variable_id": "ghidra:highvar:0x0:parameter:1:args",
+                    "name_locked": false,
+                    "type_locked": true,
+                    "evidence_ids": ["fixture:ghidra:stack_var:args_shadow"]
+                },
+                {
+                    "variable_id": "ghidra:stack_var:0x0:-4:lhs_tmp",
+                    "name": "lhs_tmp",
+                    "kind": "local",
+                    "offset": -4,
+                    "byte_len": 4,
+                    "ordinal": null,
+                    "data_type": "int",
+                    "data_type_id": "ghidra:datatype:/int",
+                    "storage": {
+                        "storage": "stack:-0x4:4",
+                        "kind": "stack",
+                        "byte_len": 4,
+                        "pieces": [
+                            {
+                                "piece_id": "ghidra:storage_piece:lhs_tmp:stack",
+                                "space": "stack",
+                                "offset": -4,
+                                "byte_len": 4,
+                                "register": null,
+                                "is_input": false,
+                                "is_addr_tied": true,
+                                "is_persistent": false,
+                                "is_unique": false,
+                                "is_constant": false,
+                                "is_hash": false,
+                                "is_stack": true
+                            }
+                        ],
+                        "dynamic_storage_required": false,
+                        "forced_indirect": false,
+                        "auto_parameter_type": null
+                    },
+                    "source_type": "ANALYSIS",
+                    "high_variable_id": null,
+                    "name_locked": false,
+                    "type_locked": true,
+                    "evidence_ids": ["fixture:ghidra:stack_var:lhs_tmp"]
+                }
+            ],
+            "evidence_ids": ["fixture:ghidra:stack_frame:theorem_add"]
+        }
+    ],
+    "parameter_measures": [
+        {
+            "measure_id": "ghidra:param_measure:0x0:input:args",
+            "function_id": "ghidra:function:0x0",
+            "entry_point": "0x0",
+            "io": "input",
+            "rank": "this_function_parameter",
+            "rank_value": 4,
+            "storage": {
+                "storage": "register:0x38:8",
+                "kind": "register",
+                "byte_len": 8,
+                "pieces": [
+                    {
+                        "piece_id": "ghidra:storage_piece:param_args:rdi",
+                        "space": "register",
+                        "offset": 56,
+                        "byte_len": 8,
+                        "register": "RDI",
+                        "is_input": true,
+                        "is_addr_tied": true,
+                        "is_persistent": false,
+                        "is_unique": false,
+                        "is_constant": false,
+                        "is_hash": false,
+                        "is_stack": false
+                    }
+                ],
+                "dynamic_storage_required": false,
+                "forced_indirect": false,
+                "auto_parameter_type": null
+            },
+            "data_type": "struct TheoremTinyArgs *",
+            "data_type_id": "ghidra:datatype:/fixture/TheoremTinyArgs:2001",
+            "model_name": "gcc",
+            "extra_pop": null,
+            "just_prototype": true,
+            "base_variable_id": "ghidra:highvar:0x0:parameter:1:args",
+            "source_statement_id": null,
+            "num_calls": 0,
+            "evidence_ids": ["fixture:ghidra:param_measure:args"]
+        }
+    ],
+    "call_stack_effects": [
+        {
+            "effect_id": "ghidra:stack_effect:0x10:theorem_external",
+            "function_id": "ghidra:function:0x10",
+            "entry_point": "0x10",
+            "callsite_address": "0x20",
+            "callee_function_id": "ghidra:function:external:theorem_external",
+            "callee_name": "theorem_external",
+            "call_opcode": "CALL",
+            "prototype_model": "__stdcall",
+            "stack_pointer_register": "RSP",
+            "stack_space": "stack",
+            "stack_offset_before_call": -16,
+            "instruction_stack_depth_change": 0,
+            "stack_shift_bytes": 8,
+            "purge_size_bytes": 16,
+            "extra_pop_bytes": 24,
+            "effective_extra_pop_bytes": 24,
+            "companion_solution_bytes": 0,
+            "solver_variable_count": 4,
+            "missed_variable_count": 0,
+            "status": "solved",
+            "warnings": [],
+            "evidence_ids": ["fixture:ghidra:stack_effect:external"]
+        }
+    ],
+    "annotations": [
+        {
+            "annotation_id": "ghidra:annotation:comment:0x0:repeatable",
+            "kind": "comment",
+            "function_id": "ghidra:function:0x0",
+            "entry_point": "0x0",
+            "address": "0x0",
+            "comment_type": "REPEATABLE",
+            "bookmark_id": null,
+            "bookmark_type": null,
+            "bookmark_category": null,
+            "message": "fixture analyst note: preserve argument layout",
+            "source_api": "Listing.getComment",
+            "evidence_ids": ["fixture:ghidra:annotation:comment:args"]
+        },
+        {
+            "annotation_id": "ghidra:annotation:bookmark:0x20:warning",
+            "kind": "bookmark",
+            "function_id": "ghidra:function:0x10",
+            "entry_point": "0x10",
+            "address": "0x20",
+            "comment_type": null,
+            "bookmark_id": 1,
+            "bookmark_type": "Warning",
+            "bookmark_category": "Call",
+            "message": "fixture warning: external call needs ABI validation",
+            "source_api": "BookmarkManager.getBookmarksIterator",
+            "evidence_ids": ["fixture:ghidra:annotation:bookmark:external"]
+        }
+    ],
+    "structure_field_accesses": [
+        {
+            "access_id": "ghidra:structure_field_access:0x0:TheoremTinyArgs:lhs",
+            "function_id": "ghidra:function:0x0",
+            "entry_point": "0x0",
+            "address": "0x4",
+            "access_kind": "load",
+            "structure_type_id": "ghidra:datatype:/fixture/TheoremTinyArgs:2001",
+            "structure_name": "TheoremTinyArgs",
+            "root_variable_id": "ghidra:highvar:0x0:parameter:1:args",
+            "root_variable_name": "args",
+            "root_storage": "register:RDI:8",
+            "field_id": "ghidra:datatype_field:TheoremTinyArgs:lhs",
+            "field_name": "lhs",
+            "field_offset": 0,
+            "field_byte_len": 4,
+            "field_data_type_id": "ghidra:datatype:/int",
+            "field_data_type_name": "int",
+            "field_data_type_kind": "primitive",
+            "field_data_type_byte_len": 4,
+            "pcode_opcode": "LOAD",
+            "pcode_op_id": "ghidra:pcode:0x4:0",
+            "statement_id": null,
+            "call_target_address": null,
+            "call_input_slot": null,
+            "pointer_relative_type": "TheoremTinyArgs_offset_0_int",
+            "recursive_call_depth": 0,
+            "creates_new_structure": false,
+            "extends_existing_structure": true,
+            "bit_offset": null,
+            "bit_size": null,
+            "evidence_ids": [
+                "fixture:ghidra:structure_field_access:lhs"
+            ]
+        }
+    ],
+    "symbolic_summaries": [],
+  "diagnostics": [],
+  "semantic_signatures": [
+    {
+      "signature_id": "ghidra:semantic_signature:0x0:fixture",
+      "function_id": "ghidra:function:0x0",
+      "entry_point": "0x0",
+      "function_name": "theorem_add",
+      "feature_version": "ghidra-bsim-signature-v0",
+      "signature_settings": 7,
+      "decompiler_major_version": 11,
+      "decompiler_minor_version": 4,
+      "feature_hashes": ["0x10000001", "0x10000002", "0x10000003"],
+      "debug_features": [
+        {
+          "hash": "0x10000001",
+          "kind": "copy",
+          "raw": "copy/return arithmetic feature"
+        }
+      ],
+      "call_targets": [],
+      "has_unimplemented": false,
+      "has_bad_data": false,
+      "evidence_ids": ["fixture:ghidra:bsim:theorem_add"]
+    },
+    {
+      "signature_id": "ghidra:semantic_signature:0x10:fixture",
+      "function_id": "ghidra:function:0x10",
+      "entry_point": "0x10",
+      "function_name": "main",
+      "feature_version": "ghidra-bsim-signature-v0",
+      "signature_settings": 7,
+      "decompiler_major_version": 11,
+      "decompiler_minor_version": 4,
+      "feature_hashes": ["0x20000001", "0x20000002", "0x10000003"],
+      "debug_features": [
+        {
+          "hash": "0x20000001",
+          "kind": "block",
+          "raw": "call/return control-flow feature"
+        }
+      ],
+      "call_targets": ["0x0"],
+      "has_unimplemented": false,
+      "has_bad_data": false,
+      "evidence_ids": ["fixture:ghidra:bsim:main"]
+    }
+  ],
+  "function_id_signatures": [
+    {
+      "fid_id": "ghidra:function_id:0x0:fixture",
+      "function_id": "ghidra:function:0x0",
+      "entry_point": "0x0",
+      "function_name": "theorem_add",
+      "feature_version": "ghidra-function-id-v0",
+      "hash_algorithm": "fnv1a64",
+      "short_hash_code_unit_length": 4,
+      "medium_hash_code_unit_length": 24,
+      "code_unit_size": 6,
+      "full_hash": "0x1111111111111111",
+      "specific_hash_additional_size": 1,
+      "specific_hash": "0x2222222222222222",
+      "matches": [],
+      "evidence_ids": ["fixture:ghidra:fid:theorem_add"]
+    },
+    {
+      "fid_id": "ghidra:function_id:0x10:fixture",
+      "function_id": "ghidra:function:0x10",
+      "entry_point": "0x10",
+      "function_name": "main",
+      "feature_version": "ghidra-function-id-v0",
+      "hash_algorithm": "fnv1a64",
+      "short_hash_code_unit_length": 4,
+      "medium_hash_code_unit_length": 24,
+      "code_unit_size": 8,
+      "full_hash": "0x3333333333333333",
+      "specific_hash_additional_size": 2,
+      "specific_hash": "0x4444444444444444",
+      "matches": [
+        {
+          "match_id": "ghidra:function_id_match:main:fixture-lib",
+          "function_name": "fixture_main",
+          "library_family_name": "fixture-libc",
+          "library_version": "1.0",
+          "library_variant": "x86_64",
+          "library_id": "42",
+          "function_record_id": "7",
+          "domain_path": "/fixture/libc.o",
+          "matched_entry_point": "0x10",
+          "primary_function_match_mode": "full_hash",
+          "primary_function_code_unit_score": 8.0,
+          "child_function_code_unit_score": 0.0,
+          "parent_function_code_unit_score": 0.0,
+          "overall_score": 8.0,
+          "auto_pass": false,
+          "auto_fail": false,
+          "force_specific": false,
+          "force_relation": false,
+          "evidence_ids": ["fixture:ghidra:fid_match:main"]
+        }
+      ],
+      "evidence_ids": ["fixture:ghidra:fid:main"]
+    }
+  ]
 }
