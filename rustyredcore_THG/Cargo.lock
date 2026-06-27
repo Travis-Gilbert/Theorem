@@ -8276,6 +8276,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-offload"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-pg-server"
 version = "0.5.0"
 dependencies = [

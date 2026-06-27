@@ -355,6 +355,9 @@ struct DesktopBackendState {
     local_node: Option<LocalNodeRuntime>,
     commonplace_node: Option<CommonplaceRuntime>,
     receiver_runtime: Option<ReceiverRuntime>,
+    /// The bundled ambient watcher running over the working tree, if started.
+    /// Holding the handle keeps the watcher alive; it is stopped on shutdown.
+    ambient: Option<commonplace_desktop_runtime::WatchHandle>,
     tabs: HashMap<String, TabRuntime>,
     active_tab: Option<String>,
     bounds: Rect,
@@ -384,6 +387,7 @@ impl Default for DesktopBackendState {
             local_node: None,
             commonplace_node: None,
             receiver_runtime: None,
+            ambient: None,
             tabs: HashMap::new(),
             active_tab: None,
             bounds: Rect::default(),
@@ -1364,7 +1368,62 @@ fn stop_local_node(state: &tauri::State<'_, Mutex<DesktopBackendState>>) {
                 let _ = shutdown.send(());
             }
         }
+        stop_ambient_watcher_locked(&mut backend);
         stop_receiver_locked(&mut backend);
+    }
+}
+
+/// The working tree the bundled ambient watcher runs over. Defaults to the first
+/// configured worktree (the desktop state seeds the Theorem checkout); a richer
+/// per-user root picker is a follow-up. Returns `None` if no worktree path is
+/// configured or the configured path is not an existing directory, so the watcher
+/// is simply not started rather than failing the app launch.
+fn ambient_watch_root(backend: &DesktopBackendState) -> Option<PathBuf> {
+    backend
+        .receiver
+        .worktrees
+        .values()
+        .map(PathBuf::from)
+        .find(|path| path.is_dir())
+}
+
+/// Start the bundled ambient watcher over the working tree on a background
+/// thread (handoff Part A: "fresh download runs the watcher, no separate
+/// install"). The watcher is read-only on the tree and writes only into the
+/// `<root>/.rustyred` sidecar. A failure to start is surfaced on stderr and the
+/// app continues; the watcher is best-effort, not a launch gate.
+fn start_ambient_watcher(state: &tauri::State<'_, Mutex<DesktopBackendState>>) -> Result<(), String> {
+    let mut backend = state.lock().map_err(|error| error.to_string())?;
+    if backend.ambient.is_some() {
+        return Ok(());
+    }
+    let Some(root) = ambient_watch_root(&backend) else {
+        eprintln!("[theorem-desktop] ambient watcher not started: no existing worktree configured");
+        return Ok(());
+    };
+
+    let config = commonplace_desktop_runtime::WatchConfig::new(root.clone());
+    match commonplace_desktop_runtime::spawn_ambient(config) {
+        Ok(handle) => {
+            eprintln!("[theorem-desktop] ambient watcher started over {}", root.display());
+            backend.ambient = Some(handle);
+            Ok(())
+        }
+        Err(error) => {
+            // Best-effort: a watcher start failure must not block the app.
+            eprintln!("[theorem-desktop] ambient watcher failed to start: {error}");
+            Ok(())
+        }
+    }
+}
+
+/// Stop the bundled ambient watcher (signal + join the watch thread) if running.
+/// Called under the backend lock during shutdown.
+fn stop_ambient_watcher_locked(backend: &mut DesktopBackendState) {
+    if let Some(handle) = backend.ambient.take() {
+        if let Err(error) = handle.stop() {
+            eprintln!("[theorem-desktop] ambient watcher stop failed: {error}");
+        }
     }
 }
 
@@ -2035,6 +2094,10 @@ pub fn run() {
             let state = app.state::<Mutex<DesktopBackendState>>();
             start_local_node(app.handle(), &state)?;
             start_commonplace_api(app.handle(), &state)?;
+            // Bundled ambient watcher: starts over the working tree so a fresh
+            // download runs the watcher with no separate install. Best-effort:
+            // a start failure logs and the app continues.
+            start_ambient_watcher(&state)?;
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -25,6 +25,10 @@ serde_json = "1"
 theorem-receiver = { path = "../../../rustyredcore_THG/crates/theorem-receiver" }
 rustyred-thg-server = { path = "../../../rustyredcore_THG/crates/rustyred-thg-server" }
 commonplace-api = { path = "../../commonplace-api" }
+# Bundled ambient watcher: a fresh download runs the file watcher (with its
+# durable commonplace ingest + ambient passes) over the working tree with no
+# separate install. Spawned on a background thread in setup, stopped on shutdown.
+commonplace-desktop-runtime = { path = "../../commonplace-desktop-runtime" }
 tokio = { version = "1", features = ["sync"] }
 reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

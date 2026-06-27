@@ -53,6 +53,7 @@ members = [
     "crates/rustyred-thg-lift",
     "crates/rustyred-thg-reconstruct",
     "crates/rustyred-thg-reconstruct-harness",
+    "crates/rustyred-thg-offload",
 ]
 resolver = "2"
 

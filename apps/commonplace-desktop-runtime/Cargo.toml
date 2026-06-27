@@ -1,0 +1,83 @@
+[package]
+name = "commonplace-desktop-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Notify-backed ambient watcher for RustyRed: watches the canonical git working tree and emits settled change sets (read-only on the tree)."
+
+[dependencies]
+notify-debouncer-full = "0.5"
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+commonplace = { path = "../../rustyredcore_THG/crates/commonplace" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+# Pulls the reconstruction stack (binformat/disasm/lift/reconstruct) for the
+# real-wired ReconstructionPass. First build is a long cold compile.
+rustyred-thg-reconstruct-harness = { path = "../../rustyredcore_THG/crates/rustyred-thg-reconstruct-harness" }
+# The compute-offload engine for the real-wired OffloadPass: classifies the
+# graph-algorithm derivation the ingest triggers as offload-eligible, runs the
+# wired exact-PageRank substrate affordance over the just-ingested SIMILAR_TO
+# item graph, and ledgers the GPU-seconds saved (compute-offload thesis).
+rustyred-thg-offload = { path = "../../rustyredcore_THG/crates/rustyred-thg-offload" }
+# Part B (B1): the loopback control endpoint + device-pairing trust boundary.
+# axum is the HTTP surface (same crate sibling apps commonplace-api/theorem-grpc
+# use); tokio drives serve(); sha2 hashes device tokens at rest; subtle gives the
+# constant-time comparison; getrandom is the OS CSPRNG for token/code entropy.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+sha2 = "0.10"
+subtle = "2"
+getrandom = "0.3"
+# Run channel (B3): the SSE event stream is built by wrapping each run's tokio
+# broadcast receiver in a `futures` stream (no new heavy runtime crate; both are
+# already in the resolved graph via axum/tokio).
+futures-core = "0.3"
+futures-util = "0.3"
+# Part B (B4): the action-tier authorization surface. We reuse harness-core's
+# `ActionTierPolicy` tier-seed (tier_one/two/three) and its `evaluate_publication`
+# alignment guard so a held run's gating decision comes from agent_binding's
+# tiers, not an invented enum. No parallel policy.
+theorem-harness-core = { path = "../../rustyredcore_THG/crates/theorem-harness-core" }
+# Agent co-presence layer (spec: HANDOFF-AGENT-COEDIT-PRESENCE-LAYER.md): reuse
+# theorem-copresence's code-surface model for the workspace presence registry. We
+# consume only its public value types (FileRange / CodeEditFootprint /
+# CodePresenceSnapshot / PresenceKind) so this layer never reinvents the model;
+# bytes still merge via git (CodeContentStrategy::GitMergeOnly), this layer is
+# AWARENESS ONLY and writes no file bytes.
+theorem-copresence = { path = "../../rustyredcore_THG/crates/theorem-copresence" }
+# Part B (B2, connectivity, deliverable 2):
+# - mdns-sd: same-network discovery. Advertises the loopback control endpoint over
+#   mDNS/DNS-SD (service type + instance name + port + a TXT record with a
+#   NON-secret instance id) and browses for it. Pure-Rust, no platform Bonjour
+#   linkage. `async` feature off: the browse/register API is sync (flume channels),
+#   which is all the discovery seam needs.
+mdns-sd = { version = "0.20", default-features = false }
+# - tokio-tungstenite: the OUTBOUND relay tunnel (RelayClient connects out to a
+#   relay over a websocket; the MockRelay is a loopback ws server in tests). Only
+#   ws:// (loopback + the relay's own TLS-terminating front door) is needed here,
+#   so no TLS feature is enabled; the default features (connect/handshake/stream)
+#   cover client connect + server accept.
+tokio-tungstenite = "0.29"
+# `bytes::Bytes` is tungstenite 0.29's Binary/into_data payload type; the tunnel
+# carries response bodies as bytes.
+bytes = "1"
+# Tunnel frames are JSON text; request/response bodies (possibly binary) ride as
+# base64 so a non-UTF8 body stays text-safe inside the JSON frame.
+base64 = "0.22"
+# The relay tunnel proxies to the loopback control endpoint with an HTTP client.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Generates a minimal but real object file at test time so the reconstruction
+# pass is proven end-to-end without checking in a heavy binary fixture. Pinned to
+# the same version the binformat loader parses with.
+object = { version = "0.37.3", features = ["write"] }
+# Control-endpoint tests: `tower::ServiceExt::oneshot` drives the router without a
+# socket; `http-body-util` collects the response body; `reqwest` exercises the
+# real loopback bind. `tokio` test macros come from the main dep's `macros`.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[workspace]
