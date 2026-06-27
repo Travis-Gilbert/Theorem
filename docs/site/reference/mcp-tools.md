@@ -95,6 +95,7 @@ Search and ingest code as a graph.
 |---|---|
 | `compute_code` | Native code discovery: search, context, explain, recognize, explore. |
 | `code_ingest` | Ingest or reindex a local repository into the code graph. |
+| `reconstruct_binary` | Load/analyze/lift binary artifacts through the reconstruction harness and return evidence-backed reconstruction receipts. |
 | `harness_kg_status` | Status of the merged code-graph view (base + session delta). |
 | `harness_kg_search` | Lexical code-object search. |
 | `harness_kg_ppr` | Rank code objects by relevance to seeds. |
