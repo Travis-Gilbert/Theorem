@@ -2,6 +2,7 @@
   "fixture_id": "ghidra:oracle:hello-tiny:x86_64-elf-relocatable",
   "source_uri": "tests/fixtures/ghidra_oracle/hello_tiny.c",
   "export_script": "tests/fixtures/ghidra_oracle/ExportTheoremFacts.java",
+  "evidence_ids": ["fixture:ghidra:hello-tiny"],
   "artifact": {
     "sha256": "ebe5c2e042166b0941bc14869ed7bb85168dc131f06eae04abd409c1be150f33",
     "format": "Elf",
@@ -9,10 +10,35 @@
     "endian": "little"
   },
   "loader_expectations": {
-    "section_names": [".text", ".comment", ".eh_frame", ".symtab", ".strtab"],
-    "symbol_names": ["hello_tiny.c", "theorem_add", "main", "theorem_external"],
+    "section_names": [
+      ".comment",
+      ".eh_frame",
+      ".llvm_addrsig",
+      ".note.GNU-stack",
+      ".rela.eh_frame",
+      ".rela.text",
+      ".strtab",
+      ".symtab",
+      ".text"
+    ],
+    "symbol_names": ["hello_tiny.c", "main", "theorem_add", "theorem_external"],
     "import_names": ["theorem_external"],
-    "relocation_targets": ["theorem_add", "theorem_external"]
+    "relocation_targets": ["symbol:2", "theorem_add", "theorem_external"],
+    "string_values": [
+      ".comment",
+      ".llvm_addrsig",
+      ".note.GNU-stack",
+      ".rela.eh_frame",
+      ".rela.text",
+      ".strtab",
+      ".symtab",
+      "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+      "fffff.",
+      "hello_tiny.c",
+      "main",
+      "theorem_add",
+      "theorem_external"
+    ]
   },
   "program_summary": {
     "ghidra_version": "fixture-ghidra-headless",

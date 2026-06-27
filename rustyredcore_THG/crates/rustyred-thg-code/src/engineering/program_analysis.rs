@@ -273,6 +273,9 @@ pub fn compile_program_analysis_run_in_memory(
             "toolchain": &input.toolchain,
             "profile": &input.profile,
             "artifact_hash": &artifact_hash,
+            "started_at_ms": input.started_at_ms,
+            "finished_at_ms": input.finished_at_ms,
+            "status": &input.status,
         }))
     );
     let receipt_hash = stable_hash(json!({
@@ -328,12 +331,19 @@ pub fn compile_program_analysis_run_in_store<S: GraphStore>(
 pub fn ghidra_oracle_fixture_to_program_analysis_input(
     tenant_id: impl Into<String>,
     artifact: BinaryArtifact,
-    fixture: GhidraOracleFixture,
+    mut fixture: GhidraOracleFixture,
 ) -> ProgramAnalysisInput {
     let evidence_ids = normalize_strings(fixture.evidence_ids.clone());
+    fixture.evidence_ids = evidence_ids.clone();
+    let status = if fixture.program_summary.analysis_timeout_occurred {
+        ProgramAnalysisStatus::Partial
+    } else {
+        ProgramAnalysisStatus::Complete
+    };
     let mut input = ProgramAnalysisInput::new(tenant_id, artifact);
     input.toolchain = format!("ghidra-oracle:{}", fixture.program_summary.ghidra_version);
     input.profile = "ghidra-headless-oracle-v0".to_string();
+    input.status = status.clone();
     input.analyzer_receipts.push(AnalyzerPassReceipt {
         receipt_id: format!(
             "program-analysis:receipt:{}",
@@ -352,11 +362,7 @@ pub fn ghidra_oracle_fixture_to_program_analysis_input(
             "source_uri": &fixture.source_uri,
             "summary": &fixture.program_summary,
         })),
-        status: if fixture.program_summary.analysis_timeout_occurred {
-            ProgramAnalysisStatus::Partial
-        } else {
-            ProgramAnalysisStatus::Complete
-        },
+        status,
         evidence_ids,
     });
     input.oracle_fixture = Some(fixture);
@@ -400,9 +406,11 @@ fn normalize_input(input: &mut ProgramAnalysisInput) {
         });
         fact.evidence_ids = normalize_strings(fact.evidence_ids.clone());
     }
-    input
-        .instruction_facts
-        .sort_by(|left, right| left.address.cmp(&right.address));
+    input.instruction_facts.sort_by(|left, right| {
+        left.instruction_id
+            .cmp(&right.instruction_id)
+            .then_with(|| left.address.cmp(&right.address))
+    });
     input
         .instruction_facts
         .dedup_by(|left, right| left.instruction_id == right.instruction_id);
@@ -469,11 +477,14 @@ fn build_graph_payload(
     input: &ProgramAnalysisInput,
     run: &ProgramAnalysisRun,
 ) -> (Vec<NodeRecord>, Vec<EdgeRecord>) {
+    let run_node_id = run.run_id.clone();
+    let artifact_node_id = tenant_scoped_node_id(&input.tenant_id, &input.artifact.artifact_id);
     let mut nodes = vec![
         NodeRecord::new(
-            &run.run_id,
+            &run_node_id,
             [PROGRAM_ANALYSIS_RUN_LABEL],
             json!({
+                "logical_id": &run.run_id,
                 "tenant_id": &run.tenant_id,
                 "artifact_id": &run.artifact_id,
                 "target_kind": &run.target_kind,
@@ -488,9 +499,10 @@ fn build_graph_payload(
             }),
         ),
         NodeRecord::new(
-            &input.artifact.artifact_id,
+            &artifact_node_id,
             [BINARY_ARTIFACT_LABEL],
             json!({
+                "logical_id": &input.artifact.artifact_id,
                 "tenant_id": &input.tenant_id,
                 "sha256": &input.artifact.sha256,
                 "format": &input.artifact.format,
@@ -505,10 +517,10 @@ fn build_graph_payload(
         ),
     ];
     let mut edges = vec![EdgeRecord::new(
-        edge_id(&run.run_id, ANALYZES_ARTIFACT, &input.artifact.artifact_id),
-        &run.run_id,
+        edge_id(&run_node_id, ANALYZES_ARTIFACT, &artifact_node_id),
+        &run_node_id,
         ANALYZES_ARTIFACT,
-        &input.artifact.artifact_id,
+        &artifact_node_id,
         edge_props(
             input,
             run,
@@ -518,10 +530,12 @@ fn build_graph_payload(
     )];
 
     for fact in &input.loader_facts {
+        let fact_node_id = tenant_scoped_node_id(&input.tenant_id, &fact.fact_id);
         nodes.push(NodeRecord::new(
-            &fact.fact_id,
+            &fact_node_id,
             [LOADER_FACT_LABEL],
             json!({
+                "logical_id": &fact.fact_id,
                 "tenant_id": &input.tenant_id,
                 "artifact_id": &input.artifact.artifact_id,
                 "run_id": &run.run_id,
@@ -536,19 +550,21 @@ fn build_graph_payload(
             }),
         ));
         edges.push(EdgeRecord::new(
-            edge_id(&run.run_id, HAS_LOADER_FACT, &fact.fact_id),
-            &run.run_id,
+            edge_id(&run_node_id, HAS_LOADER_FACT, &fact_node_id),
+            &run_node_id,
             HAS_LOADER_FACT,
-            &fact.fact_id,
+            &fact_node_id,
             edge_props(input, run, AUTHORITY_OBSERVED_FACT, &fact.evidence_ids),
         ));
     }
 
     for fact in &input.instruction_facts {
+        let fact_node_id = tenant_scoped_node_id(&input.tenant_id, &fact.instruction_id);
         nodes.push(NodeRecord::new(
-            &fact.instruction_id,
+            &fact_node_id,
             [INSTRUCTION_FACT_LABEL],
             json!({
+                "logical_id": &fact.instruction_id,
                 "tenant_id": &input.tenant_id,
                 "artifact_id": &input.artifact.artifact_id,
                 "run_id": &run.run_id,
@@ -564,19 +580,21 @@ fn build_graph_payload(
             }),
         ));
         edges.push(EdgeRecord::new(
-            edge_id(&run.run_id, HAS_INSTRUCTION_FACT, &fact.instruction_id),
-            &run.run_id,
+            edge_id(&run_node_id, HAS_INSTRUCTION_FACT, &fact_node_id),
+            &run_node_id,
             HAS_INSTRUCTION_FACT,
-            &fact.instruction_id,
+            &fact_node_id,
             edge_props(input, run, AUTHORITY_OBSERVED_FACT, &fact.evidence_ids),
         ));
     }
 
     for function in &input.ir_functions {
+        let function_node_id = tenant_scoped_node_id(&input.tenant_id, &function.function_id);
         nodes.push(NodeRecord::new(
-            &function.function_id,
+            &function_node_id,
             [THEOREM_IR_FUNCTION_LABEL],
             json!({
+                "logical_id": &function.function_id,
                 "tenant_id": &input.tenant_id,
                 "artifact_id": &input.artifact.artifact_id,
                 "run_id": &run.run_id,
@@ -589,19 +607,21 @@ fn build_graph_payload(
             }),
         ));
         edges.push(EdgeRecord::new(
-            edge_id(&run.run_id, HAS_THIR_FUNCTION, &function.function_id),
-            &run.run_id,
+            edge_id(&run_node_id, HAS_THIR_FUNCTION, &function_node_id),
+            &run_node_id,
             HAS_THIR_FUNCTION,
-            &function.function_id,
+            &function_node_id,
             edge_props(input, run, AUTHORITY_DERIVED_FACT, &function.evidence_ids),
         ));
     }
 
     for fact in &input.data_flow_facts {
+        let fact_node_id = tenant_scoped_node_id(&input.tenant_id, &fact.fact_id);
         nodes.push(NodeRecord::new(
-            &fact.fact_id,
+            &fact_node_id,
             [PROGRAM_DATA_FLOW_FACT_LABEL],
             json!({
+                "logical_id": &fact.fact_id,
                 "tenant_id": &input.tenant_id,
                 "artifact_id": &input.artifact.artifact_id,
                 "run_id": &run.run_id,
@@ -614,19 +634,21 @@ fn build_graph_payload(
             }),
         ));
         edges.push(EdgeRecord::new(
-            edge_id(&run.run_id, HAS_DATA_FLOW_FACT, &fact.fact_id),
-            &run.run_id,
+            edge_id(&run_node_id, HAS_DATA_FLOW_FACT, &fact_node_id),
+            &run_node_id,
             HAS_DATA_FLOW_FACT,
-            &fact.fact_id,
+            &fact_node_id,
             edge_props(input, run, AUTHORITY_DERIVED_FACT, &fact.evidence_ids),
         ));
     }
 
     for hypothesis in &input.semantic_hypotheses {
+        let hypothesis_node_id = tenant_scoped_node_id(&input.tenant_id, &hypothesis.hypothesis_id);
         nodes.push(NodeRecord::new(
-            &hypothesis.hypothesis_id,
+            &hypothesis_node_id,
             [PROGRAM_SEMANTIC_HYPOTHESIS_LABEL],
             json!({
+                "logical_id": &hypothesis.hypothesis_id,
                 "tenant_id": &input.tenant_id,
                 "artifact_id": &input.artifact.artifact_id,
                 "run_id": &run.run_id,
@@ -641,23 +663,21 @@ fn build_graph_payload(
             }),
         ));
         edges.push(EdgeRecord::new(
-            edge_id(
-                &run.run_id,
-                HAS_SEMANTIC_HYPOTHESIS,
-                &hypothesis.hypothesis_id,
-            ),
-            &run.run_id,
+            edge_id(&run_node_id, HAS_SEMANTIC_HYPOTHESIS, &hypothesis_node_id),
+            &run_node_id,
             HAS_SEMANTIC_HYPOTHESIS,
-            &hypothesis.hypothesis_id,
+            &hypothesis_node_id,
             edge_props(input, run, AUTHORITY_HYPOTHESIS, &hypothesis.evidence_ids),
         ));
     }
 
     for receipt in &input.analyzer_receipts {
+        let receipt_node_id = tenant_scoped_node_id(&input.tenant_id, &receipt.receipt_id);
         nodes.push(NodeRecord::new(
-            &receipt.receipt_id,
+            &receipt_node_id,
             [ANALYZER_PASS_RECEIPT_LABEL],
             json!({
+                "logical_id": &receipt.receipt_id,
                 "tenant_id": &input.tenant_id,
                 "artifact_id": &input.artifact.artifact_id,
                 "run_id": &run.run_id,
@@ -672,19 +692,21 @@ fn build_graph_payload(
             }),
         ));
         edges.push(EdgeRecord::new(
-            edge_id(&run.run_id, HAS_ANALYZER_RECEIPT, &receipt.receipt_id),
-            &run.run_id,
+            edge_id(&run_node_id, HAS_ANALYZER_RECEIPT, &receipt_node_id),
+            &run_node_id,
             HAS_ANALYZER_RECEIPT,
-            &receipt.receipt_id,
+            &receipt_node_id,
             edge_props(input, run, &receipt.authority_layer, &receipt.evidence_ids),
         ));
     }
 
     if let Some(fixture) = &input.oracle_fixture {
+        let fixture_node_id = tenant_scoped_node_id(&input.tenant_id, &fixture.fixture_id);
         nodes.push(NodeRecord::new(
-            &fixture.fixture_id,
+            &fixture_node_id,
             [GHIDRA_ORACLE_FIXTURE_LABEL],
             json!({
+                "logical_id": &fixture.fixture_id,
                 "tenant_id": &input.tenant_id,
                 "artifact_id": &input.artifact.artifact_id,
                 "run_id": &run.run_id,
@@ -697,10 +719,10 @@ fn build_graph_payload(
             }),
         ));
         edges.push(EdgeRecord::new(
-            edge_id(&run.run_id, DERIVED_FROM_ORACLE, &fixture.fixture_id),
-            &run.run_id,
+            edge_id(&run_node_id, DERIVED_FROM_ORACLE, &fixture_node_id),
+            &run_node_id,
             DERIVED_FROM_ORACLE,
-            &fixture.fixture_id,
+            &fixture_node_id,
             edge_props(input, run, AUTHORITY_OBSERVED_FACT, &fixture.evidence_ids),
         ));
     }
@@ -728,6 +750,13 @@ fn edge_id(from_id: &str, edge_kind: &str, to_id: &str) -> String {
     format!(
         "program-analysis:edge:{}",
         stable_hash(json!([from_id, edge_kind, to_id]))
+    )
+}
+
+fn tenant_scoped_node_id(tenant_id: &str, logical_id: &str) -> String {
+    format!(
+        "program-analysis:tenant-node:{}",
+        stable_hash(json!([tenant_id, logical_id]))
     )
 }
 
@@ -874,7 +903,10 @@ mod tests {
             .expect("program analysis payload writes");
 
         assert!(store.get_node(&output.run.run_id).is_some());
-        assert!(store.get_node(&output.artifact.artifact_id).is_some());
+        assert!(output.graph_nodes.iter().any(|node| {
+            node.labels.contains(&BINARY_ARTIFACT_LABEL.to_string())
+                && node.properties.get("logical_id") == Some(&json!(output.artifact.artifact_id))
+        }));
         assert_eq!(
             store
                 .query_nodes(NodeQuery::label(PROGRAM_ANALYSIS_RUN_LABEL))
@@ -887,6 +919,35 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn program_analysis_graph_nodes_are_tenant_scoped() {
+        let first = compile_program_analysis_run_in_memory(fixture_input());
+        let mut second_input = fixture_input();
+        second_input.tenant_id = "Another-Tenant".to_string();
+        let second = compile_program_analysis_run_in_memory(second_input);
+
+        let first_artifact_node_id = graph_node_id_for_logical_id(
+            &first,
+            BINARY_ARTIFACT_LABEL,
+            &first.artifact.artifact_id,
+        );
+        let second_artifact_node_id = graph_node_id_for_logical_id(
+            &second,
+            BINARY_ARTIFACT_LABEL,
+            &second.artifact.artifact_id,
+        );
+
+        assert_ne!(first_artifact_node_id, second_artifact_node_id);
+        assert!(first
+            .graph_nodes
+            .iter()
+            .any(|node| node.id == first.run.run_id));
+        assert!(second
+            .graph_nodes
+            .iter()
+            .any(|node| node.id == second.run.run_id));
     }
 
     #[test]
@@ -905,31 +966,98 @@ mod tests {
                 string_count: 1,
                 cfg_edge_count: 1,
             },
-            evidence_ids: vec!["e:ghidra".to_string()],
+            evidence_ids: vec![" e:ghidra ".to_string(), "e:ghidra".to_string()],
         };
-        let input = ghidra_oracle_fixture_to_program_analysis_input(
-            "Travis-Gilbert",
-            artifact(),
-            fixture.clone(),
-        );
+        let fixture_id = fixture.fixture_id.clone();
+        let input =
+            ghidra_oracle_fixture_to_program_analysis_input("Travis-Gilbert", artifact(), fixture);
         let output = compile_program_analysis_run_in_memory(input);
 
         assert_eq!(output.run.toolchain, "ghidra-oracle:11.4.2");
+        assert_eq!(output.run.status, ProgramAnalysisStatus::Complete);
         assert_eq!(output.analyzer_receipts.len(), 1);
+        assert_eq!(output.analyzer_receipts[0].evidence_ids, vec!["e:ghidra"]);
         assert_eq!(
             output.analyzer_receipts[0].authority_layer,
             AUTHORITY_OBSERVED_FACT
         );
+        assert_eq!(
+            output
+                .graph_nodes
+                .iter()
+                .find(|node| node
+                    .labels
+                    .contains(&GHIDRA_ORACLE_FIXTURE_LABEL.to_string()))
+                .and_then(|node| node.properties.get("evidence_ids")),
+            Some(&json!(["e:ghidra"]))
+        );
         assert!(output
             .graph_nodes
             .iter()
-            .any(|node| node.id == fixture.fixture_id
-                && node
-                    .labels
-                    .contains(&GHIDRA_ORACLE_FIXTURE_LABEL.to_string())));
+            .any(
+                |node| node.properties.get("logical_id") == Some(&json!(fixture_id))
+                    && node
+                        .labels
+                        .contains(&GHIDRA_ORACLE_FIXTURE_LABEL.to_string())
+            ));
         assert!(output
             .graph_edges
             .iter()
             .any(|edge| edge.edge_type == DERIVED_FROM_ORACLE));
+    }
+
+    #[test]
+    fn ghidra_oracle_timeout_marks_run_partial() {
+        let mut fixture = GhidraOracleFixture {
+            fixture_id: "ghidra:fixture:timeout".to_string(),
+            source_uri: "ghidra://headless/timeout".to_string(),
+            export_script: "ExportTheoremFacts.java".to_string(),
+            program_summary: GhidraOracleProgramSummary {
+                ghidra_version: "11.4.2".to_string(),
+                language_id: Some("x86:LE:64:default".to_string()),
+                compiler_spec_id: Some("gcc".to_string()),
+                analysis_timeout_occurred: true,
+                function_count: 1,
+                import_count: 1,
+                string_count: 1,
+                cfg_edge_count: 1,
+            },
+            evidence_ids: vec!["e:timeout".to_string()],
+        };
+        let complete = ghidra_oracle_fixture_to_program_analysis_input(
+            "Travis-Gilbert",
+            artifact(),
+            fixture.clone(),
+        );
+        fixture.program_summary.analysis_timeout_occurred = false;
+        let non_timeout =
+            ghidra_oracle_fixture_to_program_analysis_input("Travis-Gilbert", artifact(), fixture);
+
+        let timed_out = compile_program_analysis_run_in_memory(complete);
+        let finished = compile_program_analysis_run_in_memory(non_timeout);
+
+        assert_eq!(timed_out.run.status, ProgramAnalysisStatus::Partial);
+        assert_eq!(
+            timed_out.analyzer_receipts[0].status,
+            ProgramAnalysisStatus::Partial
+        );
+        assert_eq!(finished.run.status, ProgramAnalysisStatus::Complete);
+        assert_ne!(timed_out.run.run_id, finished.run.run_id);
+    }
+
+    fn graph_node_id_for_logical_id(
+        output: &ProgramAnalysisOutput,
+        label: &str,
+        logical_id: &str,
+    ) -> String {
+        output
+            .graph_nodes
+            .iter()
+            .find(|node| {
+                node.labels.contains(&label.to_string())
+                    && node.properties.get("logical_id") == Some(&json!(logical_id))
+            })
+            .map(|node| node.id.clone())
+            .expect("graph node with logical id exists")
     }
 }

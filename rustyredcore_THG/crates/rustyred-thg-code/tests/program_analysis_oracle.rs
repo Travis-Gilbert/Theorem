@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use rustyred_thg_code::{
     compile_program_analysis_run_in_store, ghidra_oracle_fixture_to_program_analysis_input,
     load_native_binary, GhidraOracleFixture, GhidraOracleProgramSummary, LOADER_FACT_LABEL,
@@ -11,6 +13,7 @@ struct OracleFile {
     fixture_id: String,
     source_uri: String,
     export_script: String,
+    evidence_ids: Vec<String>,
     artifact: OracleArtifact,
     loader_expectations: LoaderExpectations,
     program_summary: GhidraOracleProgramSummary,
@@ -30,6 +33,7 @@ struct LoaderExpectations {
     symbol_names: Vec<String>,
     import_names: Vec<String>,
     relocation_targets: Vec<String>,
+    string_values: Vec<String>,
 }
 
 #[test]
@@ -39,18 +43,19 @@ fn native_loader_matches_ghidra_oracle_fixture_and_writes_program_analysis_graph
         "fixtures/ghidra_oracle/hello_tiny.oracle.json"
     ))
     .expect("oracle fixture is valid json");
+    let ghidra_fixture: GhidraOracleFixture = serde_json::from_str(include_str!(
+        "fixtures/ghidra_oracle/hello_tiny.oracle.json"
+    ))
+    .expect("oracle fixture is directly loadable as GhidraOracleFixture");
 
-    let native = load_native_binary(
-        &bytes,
-        vec![format!("fixture:{}", oracle.fixture_id.as_str())],
-    )
-    .expect("native loader parses fixture object");
+    let native = load_native_binary(&bytes, oracle.evidence_ids.clone())
+        .expect("native loader parses fixture object");
 
     assert_eq!(native.artifact.sha256, oracle.artifact.sha256);
     assert_eq!(native.artifact.format, oracle.artifact.format);
     assert_eq!(native.artifact.arch, oracle.artifact.arch);
     assert_eq!(native.artifact.endian, oracle.artifact.endian);
-    assert_contains_all(
+    assert_exact_normalized_set(
         native
             .loader_fact
             .sections
@@ -62,7 +67,7 @@ fn native_loader_matches_ghidra_oracle_fixture_and_writes_program_analysis_graph
             .iter()
             .map(String::as_str),
     );
-    assert_contains_all(
+    assert_exact_normalized_set(
         native
             .loader_fact
             .symbols
@@ -74,7 +79,7 @@ fn native_loader_matches_ghidra_oracle_fixture_and_writes_program_analysis_graph
             .iter()
             .map(String::as_str),
     );
-    assert_contains_all(
+    assert_exact_normalized_set(
         native
             .loader_fact
             .imports
@@ -86,7 +91,7 @@ fn native_loader_matches_ghidra_oracle_fixture_and_writes_program_analysis_graph
             .iter()
             .map(String::as_str),
     );
-    assert_contains_all(
+    assert_exact_normalized_set(
         native
             .loader_fact
             .relocations
@@ -98,23 +103,29 @@ fn native_loader_matches_ghidra_oracle_fixture_and_writes_program_analysis_graph
             .iter()
             .map(String::as_str),
     );
-    assert!(native
-        .loader_fact
-        .strings
-        .iter()
-        .any(|string| string.value == "theorem_add"));
+    assert_exact_normalized_set(
+        native
+            .loader_fact
+            .strings
+            .iter()
+            .map(|string| string.value.as_str()),
+        oracle
+            .loader_expectations
+            .string_values
+            .iter()
+            .map(String::as_str),
+    );
     assert_eq!(
         native.analyzer_receipt.status,
         rustyred_thg_code::ProgramAnalysisStatus::Complete
     );
 
-    let ghidra_fixture = GhidraOracleFixture {
-        fixture_id: oracle.fixture_id.clone(),
-        source_uri: oracle.source_uri,
-        export_script: oracle.export_script,
-        program_summary: oracle.program_summary,
-        evidence_ids: native.loader_fact.evidence_ids.clone(),
-    };
+    assert_eq!(ghidra_fixture.fixture_id, oracle.fixture_id);
+    assert_eq!(ghidra_fixture.source_uri, oracle.source_uri);
+    assert_eq!(ghidra_fixture.export_script, oracle.export_script);
+    assert_eq!(ghidra_fixture.program_summary, oracle.program_summary);
+    assert_eq!(ghidra_fixture.evidence_ids, oracle.evidence_ids);
+
     let mut input = ghidra_oracle_fixture_to_program_analysis_input(
         "Travis-Gilbert",
         native.artifact.clone(),
@@ -128,12 +139,13 @@ fn native_loader_matches_ghidra_oracle_fixture_and_writes_program_analysis_graph
         .expect("program analysis output writes to graph");
 
     assert!(store.get_node(&compiled.run.run_id).is_some());
-    assert_eq!(
-        store
-            .get_node(&compiled.artifact.artifact_id)
-            .and_then(|node| node.properties.get("tenant_id")),
-        Some(&json!("Travis-Gilbert"))
-    );
+    assert!(store
+        .query_nodes(NodeQuery::label(rustyred_thg_code::BINARY_ARTIFACT_LABEL))
+        .iter()
+        .any(
+            |node| node.properties.get("tenant_id") == Some(&json!("Travis-Gilbert"))
+                && node.properties.get("logical_id") == Some(&json!(compiled.artifact.artifact_id))
+        ));
     assert_eq!(
         store.query_nodes(NodeQuery::label(LOADER_FACT_LABEL)).len(),
         1
@@ -141,21 +153,17 @@ fn native_loader_matches_ghidra_oracle_fixture_and_writes_program_analysis_graph
     assert!(compiled
         .graph_nodes
         .iter()
-        .any(|node| node.id == oracle.fixture_id));
+        .any(|node| node.properties.get("logical_id") == Some(&json!(oracle.fixture_id))));
 }
 
-fn assert_contains_all<'a, Actual, Expected>(actual: Actual, expected: Expected)
+fn assert_exact_normalized_set<'a, Actual, Expected>(actual: Actual, expected: Expected)
 where
     Actual: IntoIterator<Item = &'a str>,
     Expected: IntoIterator<Item = &'a str>,
 {
-    let actual = actual.into_iter().collect::<Vec<_>>();
-    for expected_value in expected {
-        assert!(
-            actual.contains(&expected_value),
-            "expected {expected_value:?} in {actual:?}"
-        );
-    }
+    let actual = actual.into_iter().collect::<BTreeSet<_>>();
+    let expected = expected.into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected);
 }
 
 fn decode_hex(input: &str) -> Vec<u8> {
