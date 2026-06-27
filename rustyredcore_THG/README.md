@@ -56,8 +56,8 @@ The root crate (`src/`) is a `#[pymodule]` exported to Python as `theseus_native
 Exports:
 
 - `push_ppr`, `push_ppr_filtered`: ACL local-push personalized PageRank with lazy neighbor extraction (`src/push_ppr.rs`).
-- `cmh_*`: Continuous Agent Memory Harness hashes (atom id, handoff state hash); a cross-language byte-parity contract (`src/cmh.rs`).
-- `bgi_*`: stable hashing, e-graph and Datalog receipts, probabilistic source reliability and expected value, evolution archive, receipt compaction (`src/bgi.rs`).
+- `cmh_*`: Continuous Agent Memory Harness hash parity helpers (atom id, handoff state hash); the pure native owner is `theorem-harness-core::cmh`, while `src/cmh.rs` is only the Python ABI wrapper. Not the live memory store/read path, which lives in `theorem-harness-runtime`/`rustyred-thg-mcp` over `GraphStore`.
+- `bgi_*`: stable hashing, receipt summaries, fact-pack hashing, probabilistic source reliability and expected value, evolution archive, receipt compaction. Deterministic JSON/hash contracts live in `theorem-harness-core::bgi`; engine-backed calls stay behind the Python ABI in `src/bgi.rs`.
 - `search_*`: URL normalization, frontier scoring, score fusion, cosine top-k (`src/search_kernel.rs`).
 - `graph_*`: id remap and edge packing (`src/graph_export.rs`).
 - `rustyred_thg_expand_bounded`, `rustyred_thg_paths_shortest`, and the `RustyredThgCoreExecutor` class (`src/thg.rs`).

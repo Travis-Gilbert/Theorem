@@ -73,6 +73,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 rustyred-thg-core = { path = "crates/rustyred-thg-core" }
 rustyred-thg-adapters = { path = "crates/rustyred-thg-adapters" }
+theorem-harness-core = { path = "crates/theorem-harness-core" }
 egg = "0.10"
 datafrog = "2.0"
 

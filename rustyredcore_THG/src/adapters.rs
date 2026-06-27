@@ -11,6 +11,142 @@ use rustyred_thg_core::{
 
 pyo3::create_exception!(theseus_native, ThgErrorPy, PyException);
 
+#[derive(Debug, Clone)]
+struct AdapterStoreConfig {
+    // Store root selected from environment; tenant data lives under `<base>/tenants/<tenant>`.
+    base_data_dir: PathBuf,
+    // Fallback tenant when tenant-aware discovery finds no tenant directories.
+    default_tenant: String,
+}
+
+impl AdapterStoreConfig {
+    fn from_env() -> Self {
+        Self {
+            // Current harness/runtime env names are checked first, then
+            // legacy adapter and product-prefixed names.
+            base_data_dir: first_non_empty_env_value(&[
+                "THEOREM_HARNESS_DATA_DIR",
+                "THEOREM_DATA_DIR",
+                "RUSTYRED_THG_ADAPTER_DATA_DIR",
+                "RUSTY_RED_DATA_DIR",
+                "RUSTYRED_THG_PRODUCT_DATA_DIR",
+            ])
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data/rusty-red")),
+            default_tenant: first_non_empty_env_value(&[
+                "THEOREM_TENANT_SLUG",
+                "RUSTYRED_THG_TENANT_SLUG",
+                "THEOREM_TENANT_ID",
+                "THEOREM_HARNESS_TENANT_SLUG",
+                "THEOREM_AGENT_TENANT_SLUG",
+                "RUSTYRED_THG_ADAPTER_DEFAULT_TENANT",
+                "RUSTY_RED_MCP_DEFAULT_TENANT",
+                "RUSTYRED_THG_MCP_DEFAULT_TENANT",
+            ])
+            .unwrap_or_else(|| "default".to_string()),
+        }
+    }
+
+    fn tenant_data_dir(&self, tenant_id: &str) -> PathBuf {
+        self.base_data_dir
+            .join("tenants")
+            .join(sanitize_tenant_segment(tenant_id))
+    }
+
+    fn discover_tenants(&self) -> Result<Vec<String>, ThgError> {
+        let tenants_root = self.base_data_dir.join("tenants");
+        let mut tenants = Vec::new();
+        let entries = std::fs::read_dir(&tenants_root).map_err(|error| {
+            ThgError::new(
+                "adapter_tenant_discovery_failed",
+                format!(
+                    "unable to read adapter tenants at '{}': {}",
+                    tenants_root.display(),
+                    error
+                ),
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ThgError::new(
+                    "adapter_tenant_discovery_failed",
+                    format!(
+                        "unable to read adapter tenant entry under '{}': {}",
+                        tenants_root.display(),
+                        error
+                    ),
+                )
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                ThgError::new(
+                    "adapter_tenant_discovery_failed",
+                    format!(
+                        "unable to inspect adapter tenant entry '{}' under '{}': {}",
+                        entry.file_name().to_string_lossy(),
+                        tenants_root.display(),
+                        error
+                    ),
+                )
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let tenant = entry.file_name().into_string().map_err(|raw| {
+                ThgError::new(
+                    "adapter_tenant_discovery_failed",
+                    format!(
+                        "adapter tenant directory name is not valid UTF-8 under '{}': {:?}",
+                        tenants_root.display(),
+                        raw
+                    ),
+                )
+            })?;
+            tenants.push(tenant);
+        }
+        tenants.sort_unstable();
+        if tenants.is_empty() {
+            tenants.push(self.default_tenant.clone());
+        }
+        Ok(tenants)
+    }
+
+    fn open_store_for_tenant(&self, tenant_id: &str) -> Result<RedCoreGraphStore, ThgError> {
+        let tenant_data_dir = self.tenant_data_dir(tenant_id);
+        RedCoreGraphStore::open(
+            tenant_data_dir.clone(),
+            RedCoreOptions {
+                durability: RedCoreDurability::AofEverysec,
+                snapshot_interval_writes: 1_000,
+                strict_acid: false,
+            },
+        )
+        .map_err(|error| {
+            let code = if error.code.trim().is_empty() {
+                "adapter_graph_store_open_failed"
+            } else {
+                error.code.as_str()
+            };
+            ThgError::new(
+                code,
+                format!(
+                    "unable to open adapter store for tenant '{}' at '{}': {}",
+                    tenant_id,
+                    tenant_data_dir.display(),
+                    error.message
+                ),
+            )
+        })
+    }
+}
+
+fn first_non_empty_env_value(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .next()
+}
+
 #[pyclass(module = "theseus_native.adapters", get_all, set_all)]
 #[derive(Clone)]
 pub struct LoraAdapter {
@@ -145,7 +281,7 @@ pub fn upsert_adapter(
 
 #[pyfunction]
 pub fn get_adapter(adapter_id: String) -> PyResult<Option<LoraAdapter>> {
-    for tenant in discover_tenants() {
+    for tenant in discover_tenants()? {
         let store = open_store_for_tenant(&tenant)?;
         if let Some(adapter) =
             adapters::find_adapter_by_id(&store, &adapter_id).map_err(py_thg_error)?
@@ -313,20 +449,17 @@ impl From<adapters::AdapterRef> for AdapterRef {
 }
 
 fn open_store_for_tenant(tenant_id: &str) -> PyResult<RedCoreGraphStore> {
-    RedCoreGraphStore::open(
-        tenant_data_dir(tenant_id),
-        RedCoreOptions {
-            durability: RedCoreDurability::AofEverysec,
-            snapshot_interval_writes: 1_000,
-            strict_acid: false,
-        },
-    )
-    .map_err(|error| py_thg_error(ThgError::new(error.code, error.message)))
+    AdapterStoreConfig::from_env()
+        .open_store_for_tenant(tenant_id)
+        .map_err(py_thg_error)
 }
 
 fn tenant_for_adapter(adapter_id: &str) -> PyResult<String> {
-    for tenant in discover_tenants() {
-        let store = open_store_for_tenant(&tenant)?;
+    let config = AdapterStoreConfig::from_env();
+    for tenant in config.discover_tenants().map_err(py_thg_error)? {
+        let store = config
+            .open_store_for_tenant(&tenant)
+            .map_err(py_thg_error)?;
         if adapters::find_adapter_by_id(&store, adapter_id)
             .map_err(py_thg_error)?
             .is_some()
@@ -340,44 +473,229 @@ fn tenant_for_adapter(adapter_id: &str) -> PyResult<String> {
     )))
 }
 
-fn discover_tenants() -> Vec<String> {
-    let tenants_root = base_data_dir().join("tenants");
-    let mut tenants = std::fs::read_dir(&tenants_root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(|file_type| file_type.is_dir())
-                .and_then(|_| entry.file_name().into_string().ok())
-        })
-        .collect::<Vec<_>>();
-    if tenants.is_empty() {
-        tenants.push(default_tenant());
-    }
-    tenants
-}
-
-fn tenant_data_dir(tenant_id: &str) -> PathBuf {
-    let safe_tenant = sanitize_tenant_segment(tenant_id);
-    base_data_dir().join("tenants").join(safe_tenant)
-}
-
-fn base_data_dir() -> PathBuf {
-    env::var("RUSTYRED_THG_ADAPTER_DATA_DIR")
-        .or_else(|_| env::var("RUSTY_RED_DATA_DIR"))
-        .or_else(|_| env::var("RUSTYRED_THG_PRODUCT_DATA_DIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/rusty-red"))
-}
-
-fn default_tenant() -> String {
-    env::var("RUSTYRED_THG_ADAPTER_DEFAULT_TENANT").unwrap_or_else(|_| "default".to_string())
+fn discover_tenants() -> PyResult<Vec<String>> {
+    AdapterStoreConfig::from_env()
+        .discover_tenants()
+        .map_err(py_thg_error)
 }
 
 fn py_thg_error(error: ThgError) -> PyErr {
     PyErr::new::<ThgErrorPy, _>(format!("{}: {}", error.code, error.message))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{first_non_empty_env_value, AdapterStoreConfig};
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvScope {
+        snapshot: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvScope {
+        fn new(values: &[(&str, Option<&str>)]) -> Self {
+            let mut seen = HashSet::new();
+            let mut snapshot = Vec::new();
+            for (key, value) in values {
+                let key = key.to_string();
+                if seen.insert(key.clone()) {
+                    snapshot.push((key.clone(), env::var(&key).ok()));
+                }
+                match value {
+                    Some(value) => env::set_var(&key, value),
+                    None => env::remove_var(&key),
+                }
+            }
+            Self { snapshot }
+        }
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (key, previous) in self.snapshot.drain(..) {
+                match previous {
+                    Some(previous) => env::set_var(&key, previous),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn set_adapter_env(values: &[(&str, Option<&str>)]) -> EnvScope {
+        let mut vars = vec![
+            ("THEOREM_HARNESS_DATA_DIR", None),
+            ("THEOREM_DATA_DIR", None),
+            ("RUSTYRED_THG_ADAPTER_DATA_DIR", None),
+            ("RUSTY_RED_DATA_DIR", None),
+            ("RUSTYRED_THG_PRODUCT_DATA_DIR", None),
+            ("THEOREM_TENANT_SLUG", None),
+            ("RUSTYRED_THG_TENANT_SLUG", None),
+            ("THEOREM_TENANT_ID", None),
+            ("THEOREM_HARNESS_TENANT_SLUG", None),
+            ("THEOREM_AGENT_TENANT_SLUG", None),
+            ("RUSTYRED_THG_ADAPTER_DEFAULT_TENANT", None),
+            ("RUSTY_RED_MCP_DEFAULT_TENANT", None),
+            ("RUSTYRED_THG_MCP_DEFAULT_TENANT", None),
+        ];
+        vars.extend_from_slice(values);
+        EnvScope::new(&vars)
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"))
+    }
+
+    #[test]
+    fn adapter_store_config_prefers_current_tenant_slug_env() {
+        let _guard = env_lock();
+        let _scope = set_adapter_env(&[
+            ("THEOREM_TENANT_SLUG", Some("CurrentTenant")),
+            ("RUSTYRED_THG_TENANT_SLUG", Some("LegacyTenant")),
+            ("RUSTYRED_THG_ADAPTER_DEFAULT_TENANT", Some("AdapterTenant")),
+        ]);
+
+        let config = AdapterStoreConfig::from_env();
+        assert_eq!(config.default_tenant, "CurrentTenant");
+    }
+
+    #[test]
+    fn adapter_store_config_prefers_legacy_tenant_fallbacks() {
+        let _guard = env_lock();
+        let _scope = set_adapter_env(&[
+            ("RUSTYRED_THG_TENANT_SLUG", Some("LegacyTenant")),
+            ("RUSTYRED_THG_ADAPTER_DEFAULT_TENANT", Some("AdapterTenant")),
+            ("RUSTY_RED_MCP_DEFAULT_TENANT", Some("McpTenant")),
+        ]);
+
+        let config = AdapterStoreConfig::from_env();
+        assert_eq!(config.default_tenant, "LegacyTenant");
+    }
+
+    #[test]
+    fn adapter_store_config_falls_back_to_default_tenant() {
+        let _guard = env_lock();
+        let _scope = set_adapter_env(&[]);
+
+        let config = AdapterStoreConfig::from_env();
+        assert_eq!(config.default_tenant, "default");
+    }
+
+    #[test]
+    fn adapter_store_config_prefers_current_data_dir_env() {
+        let _guard = env_lock();
+        let _scope = set_adapter_env(&[
+            ("THEOREM_HARNESS_DATA_DIR", Some("/tmp/harness-root")),
+            ("THEOREM_DATA_DIR", Some("/tmp/theorem-data")),
+            ("RUSTYRED_THG_ADAPTER_DATA_DIR", Some("/tmp/legacy")),
+        ]);
+
+        let config = AdapterStoreConfig::from_env();
+        assert_eq!(config.base_data_dir, PathBuf::from("/tmp/harness-root"));
+    }
+
+    #[test]
+    fn adapter_store_config_falls_back_to_legacy_data_dir() {
+        let _guard = env_lock();
+        let _scope = set_adapter_env(&[
+            ("RUSTY_RED_DATA_DIR", Some("/tmp/rusty-red-data")),
+            ("RUSTYRED_THG_PRODUCT_DATA_DIR", Some("/tmp/product-data")),
+        ]);
+
+        let config = AdapterStoreConfig::from_env();
+        assert_eq!(config.base_data_dir, PathBuf::from("/tmp/rusty-red-data"));
+    }
+
+    #[test]
+    fn adapter_store_config_uses_default_data_dir_when_unset() {
+        let _guard = env_lock();
+        let _scope = set_adapter_env(&[]);
+        let config = AdapterStoreConfig::from_env();
+        assert_eq!(config.base_data_dir, PathBuf::from("data/rusty-red"));
+    }
+
+    #[test]
+    fn adapter_store_discover_tenants_reads_subdirs_only_and_falls_back_to_default() {
+        let tenants_root = unique_temp_dir("rustyredcore-tenant-discovery");
+        fs::create_dir_all(tenants_root.join("tenants").join("tenant-a")).unwrap();
+        fs::create_dir_all(tenants_root.join("tenants").join("tenant-b")).unwrap();
+        fs::write(tenants_root.join("tenants").join("not-a-dir"), "content").unwrap();
+
+        let config = AdapterStoreConfig {
+            base_data_dir: tenants_root,
+            default_tenant: "FallbackTenant".to_string(),
+        };
+        let discovered = config.discover_tenants().unwrap();
+        let discovered: HashSet<String> = discovered.into_iter().collect();
+        assert_eq!(
+            discovered,
+            ["tenant-a", "tenant-b"]
+                .into_iter()
+                .map(|tenant| tenant.to_string())
+                .collect::<HashSet<_>>()
+        );
+
+        let empty_root = unique_temp_dir("rustyredcore-tenant-discovery-empty");
+        fs::create_dir_all(empty_root.join("tenants")).unwrap();
+        let fallback_config = AdapterStoreConfig {
+            base_data_dir: empty_root,
+            default_tenant: "FallbackTenant".to_string(),
+        };
+        assert_eq!(
+            fallback_config.discover_tenants().unwrap(),
+            vec!["FallbackTenant".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&config.base_data_dir);
+        let _ = fs::remove_dir_all(&fallback_config.base_data_dir);
+    }
+
+    #[test]
+    fn adapter_store_discover_tenants_surfaces_missing_tenants_root() {
+        let root = unique_temp_dir("rustyredcore-tenant-discovery-missing");
+        let config = AdapterStoreConfig {
+            base_data_dir: root,
+            default_tenant: "FallbackTenant".to_string(),
+        };
+        let error = config.discover_tenants().unwrap_err();
+        assert_eq!(error.code, "adapter_tenant_discovery_failed");
+        assert!(error.message.contains("unable to read adapter tenants"));
+
+        let _ = fs::remove_dir_all(&config.base_data_dir);
+    }
+
+    #[test]
+    fn first_non_empty_env_value_prefers_first_non_empty_and_ignores_blank() {
+        let _guard = env_lock();
+        let key_a = "RUSTYRED_THG_DATA_DIR_TEST_A";
+        let key_b = "RUSTYRED_THG_DATA_DIR_TEST_B";
+        let _scope = EnvScope::new(&[(key_a, Some("  ")), (key_b, Some("/tmp/actual"))]);
+
+        let value = first_non_empty_env_value(&[key_a, key_b]).unwrap();
+        assert_eq!(value, "/tmp/actual");
+    }
+
+    #[test]
+    fn first_non_empty_env_value_none_when_all_missing() {
+        let _guard = env_lock();
+        let _scope = EnvScope::new(&[("NO_SUCH_KEY_A", None), ("NO_SUCH_KEY_B", None)]);
+        let value = first_non_empty_env_value(&["NO_SUCH_KEY_A", "NO_SUCH_KEY_B"]);
+        assert!(value.is_none());
+    }
 }

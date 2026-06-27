@@ -8406,6 +8406,7 @@ dependencies = [
  "rustyred-thg-core",
  "serde_json",
  "sha2 0.10.9",
+ "theorem-harness-core",
 ]
 
 [[package]]
