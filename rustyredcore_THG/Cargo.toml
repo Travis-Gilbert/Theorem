@@ -57,6 +57,11 @@ members = [
     "crates/rustyred-thg-datawave-harness",
 ]
 resolver = "2"
+# rustyred-thg-graphblas links native SuiteSparse:GraphBLAS + LAGraph, so it is
+# deliberately NOT a default member: membership would force the native build on
+# every `cargo build --workspace`. It is pulled in only via rustyred-thg-core's
+# optional `graphblas` feature, and tested standalone via --manifest-path.
+exclude = ["crates/rustyred-thg-graphblas"]
 
 [patch.crates-io]
 # Fork patch: TurboVec 0.8.0 exposes a nightly-only AVX-512 kernel on stable

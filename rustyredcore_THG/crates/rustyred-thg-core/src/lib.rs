@@ -22,6 +22,16 @@ pub mod fulltext_tantivy;
 pub mod graph;
 pub mod graph_csr;
 pub mod graph_store;
+/// D2-D6: GraphBLAS sparse-matrix compute (typed adjacency, semiring traversal,
+/// LAGraph algorithms, CFL-reachability). Requires the `graphblas` feature.
+#[cfg(feature = "graphblas")]
+pub mod graphblas_adjacency;
+/// D5: CFL-reachability dataflow (points-to / taint) over the typed adjacency.
+#[cfg(feature = "graphblas")]
+pub mod graphblas_cfl;
+/// D6: graph-analytic + reachability operators as first-class hybrid plan nodes.
+#[cfg(feature = "graphblas")]
+pub mod graphblas_plan;
 pub mod hooks;
 pub mod identity_index;
 pub mod index_advisor;

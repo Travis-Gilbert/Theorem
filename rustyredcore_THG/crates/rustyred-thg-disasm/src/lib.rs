@@ -9,10 +9,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub const INSTRUCTION_FACT_LABEL: &str = "InstructionFact";
+pub const FUNCTION_START_CANDIDATE_LABEL: &str = "FunctionStartCandidate";
 pub const SECTION_HAS_INSTRUCTION: &str = "SECTION_HAS_INSTRUCTION";
 pub const ARTIFACT_HAS_INSTRUCTION: &str = "ARTIFACT_HAS_INSTRUCTION";
+pub const SECTION_HAS_FUNCTION_START_CANDIDATE: &str = "SECTION_HAS_FUNCTION_START_CANDIDATE";
+pub const ARTIFACT_HAS_FUNCTION_START_CANDIDATE: &str = "ARTIFACT_HAS_FUNCTION_START_CANDIDATE";
 pub const DISASM_SOURCE: &str = "rustyred-thg-disasm";
 pub const DISASM_VERSION: &str = "rustyred-thg-disasm-v0";
+pub const FUNCTION_START_PATTERN_VERSION: &str = "ghidra-byte-pattern-function-start-v0";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InstructionFact {
@@ -31,10 +35,48 @@ pub struct InstructionFact {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionStartCandidateAction {
+    FunctionStart,
+    PossibleFunctionStart,
+    CodeBoundary,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FunctionStartCandidate {
+    pub candidate_id: String,
+    pub artifact_id: String,
+    pub section_id: String,
+    pub address: u64,
+    pub offset: usize,
+    pub action: FunctionStartCandidateAction,
+    pub pattern_id: String,
+    pub pattern_description: String,
+    pub pattern_bytes: String,
+    pub pattern_mask: String,
+    pub constraints: Vec<String>,
+    pub confidence: f64,
+    pub evidence: Vec<String>,
+    pub authority: String,
+}
+
+#[derive(Clone, Debug)]
+struct FunctionStartPattern {
+    pattern_id: &'static str,
+    action: FunctionStartCandidateAction,
+    bytes: &'static [u8],
+    mask: &'static [u8],
+    description: &'static str,
+    constraints: &'static [&'static str],
+    confidence: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct DisassemblyReport {
     pub artifact_id: String,
     pub decoder: String,
     pub instructions: Vec<InstructionFact>,
+    pub function_start_candidates: Vec<FunctionStartCandidate>,
 }
 
 pub fn decode_instructions(report: &BinaryLoadReport) -> GraphStoreResult<DisassemblyReport> {
@@ -49,14 +91,40 @@ pub fn decode_instructions(report: &BinaryLoadReport) -> GraphStoreResult<Disass
     }
 
     let mut instructions = Vec::new();
+    let mut function_start_candidates = Vec::new();
     for section in report.sections.iter().filter(|section| section.executable) {
         instructions.extend(decode_section(&report.artifact.artifact_id, section)?);
+        function_start_candidates.extend(scan_function_start_candidates_for_section(
+            &report.artifact.artifact_id,
+            section,
+        ));
     }
     Ok(DisassemblyReport {
         artifact_id: report.artifact.artifact_id.clone(),
         decoder: "iced-x86".to_string(),
         instructions,
+        function_start_candidates,
     })
+}
+
+pub fn scan_function_start_candidates(report: &BinaryLoadReport) -> Vec<FunctionStartCandidate> {
+    let mut candidates = report
+        .sections
+        .iter()
+        .filter(|section| section.executable)
+        .flat_map(|section| {
+            scan_function_start_candidates_for_section(&report.artifact.artifact_id, section)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.address
+            .cmp(&right.address)
+            .then_with(|| left.pattern_id.cmp(&right.pattern_id))
+    });
+    candidates.dedup_by(|left, right| {
+        left.address == right.address && left.pattern_id == right.pattern_id
+    });
+    candidates
 }
 
 pub fn decode_section(
@@ -88,6 +156,131 @@ pub fn decode_section(
         facts.push(fact);
     }
     Ok(facts)
+}
+
+fn scan_function_start_candidates_for_section(
+    artifact_id: &str,
+    section: &BinarySection,
+) -> Vec<FunctionStartCandidate> {
+    let patterns = ghidra_x86_64_function_start_patterns();
+    let mut candidates = Vec::new();
+    for offset in 0..section.bytes.len() {
+        for pattern in &patterns {
+            if !matches_pattern(&section.bytes, offset, pattern) {
+                continue;
+            }
+            let address = section.address + offset as u64;
+            let confidence = if offset == 0 {
+                (pattern.confidence + 0.05).min(0.95)
+            } else {
+                pattern.confidence
+            };
+            candidates.push(FunctionStartCandidate {
+                candidate_id: format!(
+                    "funcstart:{}",
+                    stable_hash(json!([
+                        FUNCTION_START_PATTERN_VERSION,
+                        artifact_id,
+                        &section.section_id,
+                        address,
+                        pattern.pattern_id
+                    ]))
+                ),
+                artifact_id: artifact_id.to_string(),
+                section_id: section.section_id.clone(),
+                address,
+                offset,
+                action: pattern.action.clone(),
+                pattern_id: pattern.pattern_id.to_string(),
+                pattern_description: pattern.description.to_string(),
+                pattern_bytes: hex_bytes(pattern.bytes),
+                pattern_mask: hex_bytes(pattern.mask),
+                constraints: pattern
+                    .constraints
+                    .iter()
+                    .map(|constraint| (*constraint).to_string())
+                    .collect(),
+                confidence,
+                evidence: vec![
+                    section.section_id.clone(),
+                    format!("pattern:{}", pattern.pattern_id),
+                ],
+                authority: "candidate_evidence".to_string(),
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.address
+            .cmp(&right.address)
+            .then_with(|| left.pattern_id.cmp(&right.pattern_id))
+    });
+    candidates
+}
+
+fn matches_pattern(bytes: &[u8], offset: usize, pattern: &FunctionStartPattern) -> bool {
+    if pattern.bytes.len() != pattern.mask.len() {
+        return false;
+    }
+    let Some(window) = bytes.get(offset..offset.saturating_add(pattern.bytes.len())) else {
+        return false;
+    };
+    if window.len() != pattern.bytes.len() {
+        return false;
+    }
+    window
+        .iter()
+        .zip(pattern.bytes.iter().zip(pattern.mask.iter()))
+        .all(|(byte, (expected, mask))| (*byte & *mask) == (*expected & *mask))
+}
+
+fn ghidra_x86_64_function_start_patterns() -> Vec<FunctionStartPattern> {
+    vec![
+        FunctionStartPattern {
+            pattern_id: "ghidra:x86-64gcc:funcstart:push-rbp-mov-rbp-rsp",
+            action: FunctionStartCandidateAction::FunctionStart,
+            bytes: &[0x55, 0x48, 0x89, 0xe5],
+            mask: &[0xff, 0xff, 0xff, 0xff],
+            description: "PUSH RBP; MOV RBP, RSP",
+            constraints: &["after=defined_or_block_start"],
+            confidence: 0.82,
+        },
+        FunctionStartPattern {
+            pattern_id: "ghidra:x86-64gcc:funcstart:push-rbp-mov-ebp-esp",
+            action: FunctionStartCandidateAction::FunctionStart,
+            bytes: &[0x55, 0x89, 0xe5],
+            mask: &[0xff, 0xff, 0xff],
+            description: "PUSH RBP; MOV EBP, ESP",
+            constraints: &["after=defined_or_block_start"],
+            confidence: 0.78,
+        },
+        FunctionStartPattern {
+            pattern_id: "ghidra:x86-64gcc:funcstart:sub-rsp-imm8",
+            action: FunctionStartCandidateAction::FunctionStart,
+            bytes: &[0x48, 0x83, 0xec, 0x00],
+            mask: &[0xff, 0xff, 0xff, 0x00],
+            description: "SUB RSP, imm8",
+            constraints: &["after=defined_or_block_start", "validcode>=10"],
+            confidence: 0.68,
+        },
+        FunctionStartPattern {
+            pattern_id: "ghidra:x86-64gcc:funcstart:sub-rsp-imm32",
+            action: FunctionStartCandidateAction::FunctionStart,
+            bytes: &[0x48, 0x81, 0xec, 0x00, 0x00, 0x00, 0x00],
+            mask: &[0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00],
+            description: "SUB RSP, imm32",
+            constraints: &["after=defined_or_block_start", "validcode>=10"],
+            confidence: 0.68,
+        },
+        FunctionStartPattern {
+            pattern_id: "ghidra:x86-64gcc:codeboundary:endbr64",
+            action: FunctionStartCandidateAction::CodeBoundary,
+            bytes: &[0xf3, 0x0f, 0x1e, 0xfa],
+            mask: &[0xff, 0xff, 0xff, 0xff],
+            description: "ENDBR64 code boundary",
+            constraints: &["codeboundary", "may_be_exception_handler"],
+            confidence: 0.56,
+        },
+    ]
 }
 
 pub fn write_instruction_facts_in_store<S: GraphStore>(
@@ -127,6 +320,41 @@ pub fn write_instruction_facts_in_store<S: GraphStore>(
             }),
         ))?;
     }
+    for candidate in &report.function_start_candidates {
+        store.upsert_node(function_start_candidate_node(candidate))?;
+        store.upsert_edge(EdgeRecord::new(
+            edge_id(
+                &candidate.section_id,
+                SECTION_HAS_FUNCTION_START_CANDIDATE,
+                &candidate.candidate_id,
+            ),
+            &candidate.section_id,
+            SECTION_HAS_FUNCTION_START_CANDIDATE,
+            &candidate.candidate_id,
+            json!({
+                "authority": "candidate_evidence",
+                "source": DISASM_SOURCE,
+                "version": DISASM_VERSION,
+                "pattern_version": FUNCTION_START_PATTERN_VERSION,
+            }),
+        ))?;
+        store.upsert_edge(EdgeRecord::new(
+            edge_id(
+                &candidate.artifact_id,
+                ARTIFACT_HAS_FUNCTION_START_CANDIDATE,
+                &candidate.candidate_id,
+            ),
+            &candidate.artifact_id,
+            ARTIFACT_HAS_FUNCTION_START_CANDIDATE,
+            &candidate.candidate_id,
+            json!({
+                "authority": "candidate_evidence",
+                "source": DISASM_SOURCE,
+                "version": DISASM_VERSION,
+                "pattern_version": FUNCTION_START_PATTERN_VERSION,
+            }),
+        ))?;
+    }
     Ok(())
 }
 
@@ -146,7 +374,7 @@ fn instruction_fact(
             ),
         )
     })? as usize;
-    let size = instruction.len() as usize;
+    let size = instruction.len();
     let bytes = section
         .bytes
         .get(offset..offset.saturating_add(size))
@@ -239,6 +467,31 @@ fn instruction_node(instruction: &InstructionFact) -> NodeRecord {
     )
 }
 
+fn function_start_candidate_node(candidate: &FunctionStartCandidate) -> NodeRecord {
+    NodeRecord::new(
+        &candidate.candidate_id,
+        [FUNCTION_START_CANDIDATE_LABEL],
+        json!({
+            "artifact_id": candidate.artifact_id,
+            "section_id": candidate.section_id,
+            "address": candidate.address,
+            "offset": candidate.offset,
+            "action": candidate.action,
+            "pattern_id": candidate.pattern_id,
+            "pattern_description": candidate.pattern_description,
+            "pattern_bytes": candidate.pattern_bytes,
+            "pattern_mask": candidate.pattern_mask,
+            "constraints": candidate.constraints,
+            "confidence": candidate.confidence,
+            "evidence": candidate.evidence,
+            "authority": candidate.authority,
+            "source": DISASM_SOURCE,
+            "version": DISASM_VERSION,
+            "pattern_version": FUNCTION_START_PATTERN_VERSION,
+        }),
+    )
+}
+
 fn edge_id(from: &str, edge_type: &str, to: &str) -> String {
     format!("instr:edge:{}", stable_hash(json!([from, edge_type, to])))
 }
@@ -282,6 +535,7 @@ mod tests {
             strings: Vec::new(),
             relocations: Vec::new(),
             entrypoints: Vec::new(),
+            language_specs: Vec::new(),
         }
     }
 
@@ -306,6 +560,42 @@ mod tests {
     }
 
     #[test]
+    fn finds_ghidra_style_function_start_candidates() {
+        let mut load = fixture_load_report();
+        load.sections[0].bytes = vec![0x55, 0x48, 0x89, 0xe5, 0xc3];
+        load.sections[0].size = load.sections[0].bytes.len() as u64;
+
+        let candidates = scan_function_start_candidates(&load);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].action,
+            FunctionStartCandidateAction::FunctionStart
+        );
+        assert_eq!(candidates[0].address, 0x1000);
+        assert_eq!(candidates[0].pattern_bytes, "554889e5");
+        assert!(candidates[0]
+            .constraints
+            .contains(&"after=defined_or_block_start".to_string()));
+        assert_eq!(candidates[0].authority, "candidate_evidence");
+    }
+
+    #[test]
+    fn records_endbr64_as_code_boundary_candidate() {
+        let mut load = fixture_load_report();
+        load.sections[0].bytes = vec![0xf3, 0x0f, 0x1e, 0xfa, 0xc3];
+        load.sections[0].size = load.sections[0].bytes.len() as u64;
+
+        let report = decode_instructions(&load).unwrap();
+
+        assert!(report.function_start_candidates.iter().any(|candidate| {
+            candidate.action == FunctionStartCandidateAction::CodeBoundary
+                && candidate.pattern_id == "ghidra:x86-64gcc:codeboundary:endbr64"
+                && candidate.constraints.contains(&"codeboundary".to_string())
+        }));
+    }
+
+    #[test]
     fn writes_instruction_nodes() {
         let load = fixture_load_report();
         let report = decode_instructions(&load).unwrap();
@@ -317,6 +607,28 @@ mod tests {
                 .query_nodes(NodeQuery::label(INSTRUCTION_FACT_LABEL))
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn writes_function_start_candidate_nodes() {
+        let mut load = fixture_load_report();
+        load.sections[0].bytes = vec![0x55, 0x48, 0x89, 0xe5, 0xc3];
+        load.sections[0].size = load.sections[0].bytes.len() as u64;
+        let report = decode_instructions(&load).unwrap();
+        let mut store = InMemoryGraphStore::new();
+        write_binary_facts_in_store(&mut store, &load).unwrap();
+        write_instruction_facts_in_store(&mut store, &report).unwrap();
+
+        let candidates = store.query_nodes(NodeQuery::label(FUNCTION_START_CANDIDATE_LABEL));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].properties["authority"],
+            json!("candidate_evidence")
+        );
+        assert_eq!(
+            candidates[0].properties["pattern_version"],
+            json!(FUNCTION_START_PATTERN_VERSION)
         );
     }
 }

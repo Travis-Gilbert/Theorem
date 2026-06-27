@@ -1,0 +1,196 @@
+{
+  "fixture": {
+    "fixture_id": "ghidra:oracle:hello-switch:x86_64-elf-relocatable",
+    "source_uri": "tests/fixtures/ghidra_oracle/hello_switch.c",
+    "export_script": "tests/fixtures/ghidra_oracle/ExportTheoremFacts.java",
+    "evidence_ids": ["fixture:ghidra:hello-switch"],
+    "program_summary": {
+      "ghidra_version": "fixture-ghidra-headless",
+      "language_id": "x86:LE:64:default",
+      "compiler_spec_id": "gcc",
+      "analysis_timeout_occurred": false,
+      "function_count": 2,
+      "import_count": 1,
+      "string_count": 0,
+      "cfg_edge_count": 9
+    }
+  },
+  "artifact": {
+    "sha256": "e8b9ce595e2607cb6e77b1b49f3922d9acd5c22d07cd61259353796dde97367d",
+    "format": "Elf",
+    "arch": "X86_64",
+    "endian": "little"
+  },
+  "functions": [
+    {
+      "function_id": "ghidra:function:0x0",
+      "entry_point": "0x0",
+      "name": "theorem_switch",
+      "body_start": "0x0",
+      "body_end": "0x7f",
+      "evidence_ids": ["fixture:ghidra:function:theorem_switch"]
+    },
+    {
+      "function_id": "ghidra:function:0x80",
+      "entry_point": "0x80",
+      "name": "main",
+      "body_start": "0x80",
+      "body_end": "0x9f",
+      "evidence_ids": ["fixture:ghidra:function:main"]
+    }
+  ],
+  "pcode_ops": [],
+  "references": [
+    {
+      "reference_id": "ghidra:reference:0x10:0x100",
+      "from_address": "0x10",
+      "to_address": "0x100",
+      "reference_type": "DATA",
+      "operand_index": 1,
+      "is_primary": true,
+      "source_type": "ANALYSIS",
+      "semantic_roles": ["data", "memory", "jump_table"],
+      "is_external": false,
+      "is_memory": true,
+      "is_register": false,
+      "is_stack": false,
+      "evidence_ids": ["fixture:ghidra:reference:jump-table-load"]
+    }
+  ],
+  "call_edges": [
+    {
+      "edge_id": "ghidra:call:0x80:0x0",
+      "source_entry": "0x80",
+      "target_entry": "0x0",
+      "callsite_address": "0x88",
+      "evidence_ids": ["fixture:ghidra:call:main-to-switch"]
+    }
+  ],
+  "jump_tables": [
+    {
+      "jump_table_id": "ghidra:jumptable:0x10",
+      "function_id": "ghidra:function:0x0",
+      "entry_point": "0x0",
+      "switch_address": "0x10",
+      "switch_statement_id": null,
+      "display_format": "decimal",
+      "cases": [
+        {
+          "case_id": "ghidra:jumptable_case:0x10:0",
+          "destination": "0x20",
+          "label_value": 0,
+          "is_default": false,
+          "label": "case_0",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-0"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:1",
+          "destination": "0x28",
+          "label_value": 1,
+          "is_default": false,
+          "label": "case_1",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-1"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:2",
+          "destination": "0x30",
+          "label_value": 2,
+          "is_default": false,
+          "label": "case_2",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-2"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:3",
+          "destination": "0x38",
+          "label_value": 3,
+          "is_default": false,
+          "label": "case_3",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-3"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:4",
+          "destination": "0x40",
+          "label_value": 4,
+          "is_default": false,
+          "label": "case_4",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-4"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:5",
+          "destination": "0x48",
+          "label_value": 5,
+          "is_default": false,
+          "label": "case_5",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-5"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:6",
+          "destination": "0x50",
+          "label_value": 6,
+          "is_default": false,
+          "label": "case_6",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-6"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:7",
+          "destination": "0x58",
+          "label_value": 7,
+          "is_default": false,
+          "label": "case_7",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-7"]
+        },
+        {
+          "case_id": "ghidra:jumptable_case:0x10:default",
+          "destination": "0x70",
+          "label_value": null,
+          "is_default": true,
+          "label": "default",
+          "evidence_ids": ["fixture:ghidra:jump-table:case-default"]
+        }
+      ],
+      "load_tables": [
+        {
+          "load_table_id": "ghidra:jumptable_load:0x10:0",
+          "address": "0x100",
+          "entry_byte_len": 4,
+          "entry_count": 8,
+          "interpreted_as_pointer_table": true,
+          "evidence_ids": ["fixture:ghidra:jump-table:load-table"]
+        }
+      ],
+      "override_applied": false,
+      "references_complete": true,
+      "evidence_ids": ["fixture:ghidra:jump-table"]
+    }
+  ],
+  "equates": [
+    {
+      "equate_id": "ghidra:equate:switch-case-seven",
+      "function_id": "ghidra:function:0x0",
+      "name": "SWITCH_CASE_SEVEN",
+      "display_name": "SWITCH_CASE_SEVEN",
+      "value": 7,
+      "display_value": "7",
+      "format": "dec",
+      "enum_uuid": "enum:uuid:switch-selector",
+      "enum_based": true,
+      "valid_uuid": true,
+      "references": [
+        {
+          "reference_id": "ghidra:equate_ref:switch-case-seven:operand",
+          "address": "0x10",
+          "operand_index": 0,
+          "dynamic_hash": 4276993775,
+          "instruction_id": "ghidra:instruction:0x10",
+          "statement_id": null,
+          "evidence_ids": ["fixture:ghidra:equate-ref:switch-case-seven"]
+        }
+      ],
+      "evidence_ids": ["fixture:ghidra:equate:switch-case-seven"]
+    }
+  ],
+  "symbolic_summaries": [],
+  "diagnostics": [],
+  "semantic_signatures": [],
+  "function_id_signatures": []
+}
