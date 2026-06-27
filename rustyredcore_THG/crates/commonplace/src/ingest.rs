@@ -7,7 +7,8 @@
 //! text/SigLIP/RunPod embedders can implement [`Embedder`] behind the same seam.
 
 use std::collections::{BTreeSet, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1003,11 +1004,12 @@ where
             }
         }
         ContentCoreRoute::Binary { mime, extension } => {
+            let receipt_source = stable_extraction_source(&input);
             if !config.enabled {
                 return (
                     input,
                     Some(skipped_extraction(
-                        None,
+                        Some(receipt_source),
                         ContentCoreExtractionError::Disabled.reason(),
                     )),
                 );
@@ -1021,7 +1023,7 @@ where
                     return (
                         input,
                         Some(skipped_extraction(
-                            None,
+                            Some(receipt_source),
                             format!("could not stage content-core input: {error}"),
                         )),
                     );
@@ -1029,10 +1031,10 @@ where
             };
             let source = temp.path_string();
             match extract(&source, config) {
-                Ok(doc) => apply_binary_extraction(input, source, mime, doc),
+                Ok(doc) => apply_binary_extraction(input, receipt_source, mime, doc),
                 Err(error) => (
                     input,
-                    Some(skipped_extraction(Some(source), error.reason())),
+                    Some(skipped_extraction(Some(receipt_source), error.reason())),
                 ),
             }
         }
@@ -1064,7 +1066,7 @@ fn apply_url_extraction(
 
 fn apply_binary_extraction(
     mut input: IngestInput,
-    source: String,
+    receipt_source: String,
     mime: Option<String>,
     doc: ExtractedDoc,
 ) -> (IngestInput, Option<IngestExtractionReceipt>) {
@@ -1072,7 +1074,7 @@ fn apply_binary_extraction(
         return (
             input,
             Some(skipped_extraction(
-                Some(source),
+                Some(receipt_source),
                 "content-core returned empty extracted text",
             )),
         );
@@ -1082,11 +1084,33 @@ fn apply_binary_extraction(
         text: doc.text.clone(),
         kind,
     };
-    let mut receipt = extracted_receipt(Some(source), &doc);
+    let mut receipt = extracted_receipt(Some(receipt_source), &doc);
     if receipt.detected_type.is_none() {
         receipt.detected_type = mime;
     }
     (input, Some(receipt))
+}
+
+fn stable_extraction_source(input: &IngestInput) -> String {
+    input
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            input
+                .source_ref
+                .as_ref()
+                .map(|source_ref| source_ref.source.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            let title = input.title.trim();
+            (!title.is_empty()).then(|| title.to_string())
+        })
+        .unwrap_or_else(|| "binary ingest item".to_string())
 }
 
 fn extracted_receipt(source: Option<String>, doc: &ExtractedDoc) -> IngestExtractionReceipt {
@@ -1251,21 +1275,33 @@ struct TempExtractionFile {
 
 impl TempExtractionFile {
     fn new(bytes: &[u8], extension: Option<&str>) -> std::io::Result<Self> {
-        let mut path = std::env::temp_dir();
         let suffix = extension
             .map(|value| value.trim().trim_start_matches('.'))
             .filter(|value| !value.is_empty())
             .unwrap_or("bin");
-        let unique = SystemTime::now()
+        let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        path.push(format!(
-            "commonplace-content-core-{}-{unique}.{suffix}",
-            std::process::id()
-        ));
-        fs::write(&path, bytes)?;
-        Ok(Self { path })
+        for attempt in 0..16 {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "commonplace-content-core-{}-{seed}-{attempt}.{suffix}",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(bytes)?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate unique content-core temp file",
+        ))
     }
 
     fn path_string(&self) -> String {
@@ -1607,6 +1643,7 @@ mod tests {
         ));
         let receipt = receipt.expect("extraction receipt");
         assert_eq!(receipt.status, "extracted");
+        assert_eq!(receipt.source.as_deref(), Some("contract.pdf"));
         assert_eq!(receipt.detected_type.as_deref(), Some("application/pdf"));
         assert_eq!(receipt.engine.as_deref(), Some("docling"));
     }
@@ -1634,7 +1671,9 @@ mod tests {
             });
 
         assert!(matches!(input.body, IngestBody::Binary { .. }));
-        let reason = receipt.expect("skip receipt").reason.expect("skip reason");
+        let receipt = receipt.expect("skip receipt");
+        assert_eq!(receipt.source.as_deref(), Some("meeting.mp3"));
+        let reason = receipt.reason.expect("skip reason");
         assert!(reason.contains("content-core unavailable"));
     }
 
