@@ -5,9 +5,11 @@ mod drift;
 mod features;
 mod hooks;
 mod ir;
+mod obligations;
 mod pattern;
 mod process;
 mod runpod;
+mod trace_contract;
 
 pub use ambient::{
     compiler_ambient_readout_in_store, refresh_code_compiler_artifacts_for_repo,
@@ -33,6 +35,12 @@ pub use ir::{
     CODE_COMPILER_VERSION, CODE_SPEC_LABEL, DEFAULT_CODE_COMPILER_SYMBOL_LIMIT, DRIFT_FOR_CODE,
     DRIFT_FOR_SPEC, SPECIFIES_CODE,
 };
+pub use obligations::{
+    compile_code_implementation_obligations, compile_code_implementation_obligations_in_store,
+    CodeImplementationObligation, CodeImplementationObligationInput,
+    CodeImplementationObligationOutput, CodeSpecificationSummary,
+    CODE_IMPLEMENTATION_OBLIGATION_LABEL, OBLIGATES_CODE_SYMBOL, OBLIGATION_DERIVES_FROM,
+};
 pub use pattern::{
     record_code_pattern_memory_in_store, relevant_code_patterns, CodePatternMemoryInput,
     CodePatternMemoryRecord, CODE_PATTERN_LABEL, PATTERN_APPLIES_TO_CODE,
@@ -46,6 +54,11 @@ pub use runpod::{
     import_runpod_burst_response_in_store, CodeRunPodArtifact, CodeRunPodBurstRequest,
     CodeRunPodBurstResponse, CodeRunPodImportReport, BURST_PRODUCED_ARTIFACT,
     CODE_BURST_ARTIFACT_LABEL, CODE_BURST_JOB_LABEL,
+};
+pub use trace_contract::{
+    compile_trace_contract, ApiContractObservation, BodyShapeHint, EndpointContract,
+    HttpExchangeTrace, ObservedStateTransition, RuntimeTraceEvent, RuntimeTraceEventKind,
+    TimingRange, TraceContractReport, TraceErrorObservation, TraceValidatorSpec,
 };
 
 #[cfg(test)]

@@ -29,6 +29,7 @@ mod code_epistemic_hook;
 mod code_hooks;
 mod compiler;
 mod context_pack;
+pub mod engineering;
 mod ensure;
 mod ingest_jobs;
 mod map_projection;
@@ -45,30 +46,49 @@ pub use code_epistemic_hook::{
 pub use code_hooks::{code_kg_hooks, incremental_centrality_hook, CENTRALITY_PROPERTY};
 pub use compiler::{
     annotate_code_features_in_store, build_runpod_burst_request,
-    build_runpod_burst_request_from_store, compile_code_spec_in_store, compile_code_spec_snapshot,
-    compiler_ambient_readout_in_store, detect_code_processes_in_store, detect_code_spec_drift,
-    detect_code_spec_drift_in_store, extract_code_features_in_store,
-    import_runpod_burst_response_in_store, incremental_code_compiler_hook,
-    record_code_pattern_memory_in_store, refresh_code_compiler_artifacts_for_repo,
-    relevant_code_patterns, AmbientCompilerReadout, CodeAnnotationInput, CodeAnnotationOutput,
+    build_runpod_burst_request_from_store, compile_code_implementation_obligations,
+    compile_code_implementation_obligations_in_store, compile_code_spec_in_store,
+    compile_code_spec_snapshot, compile_trace_contract, compiler_ambient_readout_in_store,
+    detect_code_processes_in_store, detect_code_spec_drift, detect_code_spec_drift_in_store,
+    extract_code_features_in_store, import_runpod_burst_response_in_store,
+    incremental_code_compiler_hook, record_code_pattern_memory_in_store,
+    refresh_code_compiler_artifacts_for_repo, relevant_code_patterns, AmbientCompilerReadout,
+    ApiContractObservation, BodyShapeHint, CodeAnnotationInput, CodeAnnotationOutput,
     CodeCompilerAnnotationRecord, CodeConnectionFeatureVector, CodeDependencySnapshot,
     CodeEblFeatureContribution, CodeFeatureExtractInput, CodeFeatureExtractOutput,
-    CodeFeatureRecord, CodeFileSnapshot, CodePatternMemoryInput, CodePatternMemoryRecord,
-    CodeProcessDetectInput, CodeProcessDetectOutput, CodeProcessFlow, CodeProcessStep,
-    CodeRunPodArtifact, CodeRunPodBurstRequest, CodeRunPodBurstResponse, CodeRunPodImportReport,
-    CodeSpecCompileInput, CodeSpecCompileOutput, CodeSpecDriftFinding, CodeSpecDriftInput,
-    CodeSpecDriftKind, CodeSpecDriftReport, CodeSymbolSnapshot, ANNOTATES_CODE_FEATURE,
-    BURST_PRODUCED_ARTIFACT, CODE_ANNOTATION_LABEL, CODE_BURST_ARTIFACT_LABEL,
-    CODE_BURST_JOB_LABEL, CODE_COMPILER_DRIFT_LABEL, CODE_COMPILER_FEATURE_VERSION,
-    CODE_COMPILER_VERSION, CODE_FEATURE_LABEL, CODE_PATTERN_LABEL, CODE_PROCESS_LABEL,
-    CODE_SPEC_LABEL, DEFAULT_AMBIENT_COMPILER_FINDING_LIMIT, DEFAULT_CODE_COMPILER_SYMBOL_LIMIT,
-    DRIFT_FOR_CODE, DRIFT_FOR_SPEC, FEATURE_SOURCE_CODE, FEATURE_TARGET_CODE,
-    PATTERN_APPLIES_TO_CODE, PROCESS_ENTRYPOINT, PROCESS_TOUCHES_CODE, SPECIFIES_CODE,
+    CodeFeatureRecord, CodeFileSnapshot, CodeImplementationObligation,
+    CodeImplementationObligationInput, CodeImplementationObligationOutput, CodePatternMemoryInput,
+    CodePatternMemoryRecord, CodeProcessDetectInput, CodeProcessDetectOutput, CodeProcessFlow,
+    CodeProcessStep, CodeRunPodArtifact, CodeRunPodBurstRequest, CodeRunPodBurstResponse,
+    CodeRunPodImportReport, CodeSpecCompileInput, CodeSpecCompileOutput, CodeSpecDriftFinding,
+    CodeSpecDriftInput, CodeSpecDriftKind, CodeSpecDriftReport, CodeSpecificationSummary,
+    CodeSymbolSnapshot, EndpointContract, HttpExchangeTrace, ObservedStateTransition,
+    RuntimeTraceEvent, RuntimeTraceEventKind, TimingRange, TraceContractReport,
+    TraceErrorObservation, TraceValidatorSpec, ANNOTATES_CODE_FEATURE, BURST_PRODUCED_ARTIFACT,
+    CODE_ANNOTATION_LABEL, CODE_BURST_ARTIFACT_LABEL, CODE_BURST_JOB_LABEL,
+    CODE_COMPILER_DRIFT_LABEL, CODE_COMPILER_FEATURE_VERSION, CODE_COMPILER_VERSION,
+    CODE_FEATURE_LABEL, CODE_IMPLEMENTATION_OBLIGATION_LABEL, CODE_PATTERN_LABEL,
+    CODE_PROCESS_LABEL, CODE_SPEC_LABEL, DEFAULT_AMBIENT_COMPILER_FINDING_LIMIT,
+    DEFAULT_CODE_COMPILER_SYMBOL_LIMIT, DRIFT_FOR_CODE, DRIFT_FOR_SPEC, FEATURE_SOURCE_CODE,
+    FEATURE_TARGET_CODE, OBLIGATES_CODE_SYMBOL, OBLIGATION_DERIVES_FROM, PATTERN_APPLIES_TO_CODE,
+    PROCESS_ENTRYPOINT, PROCESS_TOUCHES_CODE, SPECIFIES_CODE,
 };
 pub use context_pack::{
     code_context_pack_in_store, context_pack, context_pack_fetch, AdmittedSymbol,
     CodeContextPackInput, CodeContextPackOutput, ContextPackOutput,
     DEFAULT_CONTEXT_PACK_BUDGET_TOKENS,
+};
+pub use engineering::{
+    compile_engineering_in_memory, compile_engineering_in_store, ApiContract,
+    ArchitectureComponent, ArchitectureMap, BehaviorSpec, EngineeringCompileInput,
+    EngineeringCompileOutput, EvidenceAuthority, EvidenceMap, EvidenceSource,
+    ImplementationObligation, ObservedApiContractInput, ObservedArchitectureInput,
+    ObservedBehaviorInput, ObservedImplementationObligationInput, ObservedValidatorSpecInput,
+    UnknownsLedger, ValidatorSpec, ENGINEERING_API_LABEL, ENGINEERING_ARCHITECTURE_LABEL,
+    ENGINEERING_BEHAVIOR_LABEL, ENGINEERING_COMPILER_VERSION, ENGINEERING_COMPILE_LABEL,
+    ENGINEERING_EVIDENCE_LABEL, ENGINEERING_OBLIGATION_LABEL, ENGINEERING_VALIDATOR_LABEL,
+    HAS_API_CONTRACT, HAS_ARCHITECTURE_MAP, HAS_BEHAVIOR, HAS_EVIDENCE_SOURCE,
+    HAS_IMPLEMENTATION_OBLIGATION, HAS_VALIDATOR,
 };
 pub use ensure::{
     code_ingest_ensure, ensure_repo_kg, ensure_repo_kg_in_store, RepoKgStatus, HEAD_SHA_PROPERTY,

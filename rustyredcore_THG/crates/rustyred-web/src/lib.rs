@@ -68,6 +68,13 @@ pub use browser_engine::{
     WebConsumeRequest,
 };
 
+pub mod behavior_spec;
+pub use behavior_spec::{
+    observations_from_inputs, observations_from_pages, observations_from_receipts, BehaviorInput,
+    BehaviorObservationBundle, DomainSummary, ObservedForm, ObservedInteraction, ObservedRoute,
+    WebBehaviorObservation,
+};
+
 pub mod browser_automation;
 pub use browser_automation::{
     expect, perform_locator_action, selector_engine_provenance, ActionOptions, Actionability,
