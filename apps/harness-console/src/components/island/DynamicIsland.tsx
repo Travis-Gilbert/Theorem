@@ -288,7 +288,11 @@ export function DynamicIsland() {
                   surfaceMode={surfaceMode}
                   agentTurn={agentTurn}
                   onChoose={choose}
-                  onOpenAgent={(prompt) => router.push(`/agent?prompt=${encodeURIComponent(prompt)}`)}
+                  onOpenAgent={(prompt) => {
+                    setPaletteOpen(false);
+                    setSearchOn(false);
+                    router.push(`/agent?prompt=${encodeURIComponent(prompt)}`);
+                  }}
                   setPaletteOpen={setPaletteOpen}
                 />
               )}

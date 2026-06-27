@@ -64,8 +64,6 @@ export const liveClient: HarnessClient = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tenant: "Travis-Gilbert",
-        binding_id: "agent:theorem",
         task: prompt,
         scope: scope ?? [],
       }),
@@ -133,7 +131,9 @@ function agentPayloadText(payload: unknown): string {
   const result = unwrapAgentResult(payload);
   if (!isRecord(result)) return "";
   if ("error" in result) {
-    return [result.error, result.message].filter((part) => typeof part === "string").join(": ");
+    const nestedError = isRecord(result.error) ? stringProp(result.error, "message") : "";
+    const errorText = typeof result.error === "string" ? result.error : nestedError;
+    return [errorText, stringProp(result, "message")].filter(Boolean).join(": ");
   }
 
   const direct = stringProp(result, "message", "content", "text", "answer", "output", "summary");
