@@ -3956,6 +3956,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzyhash"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f79db37cf4b2ca9a6b735f62ca679926ba0d233d47e164147298fd4fa4786db"
+
+[[package]]
 name = "gemm"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8156,6 +8162,28 @@ dependencies = [
  "theorem-harness-core",
  "turbovec",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "rustyred-thg-datawave"
+version = "0.1.0"
+dependencies = [
+ "fuzzyhash",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "rustyred-thg-datawave-harness"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "rustyred-thg-datawave",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
