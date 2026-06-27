@@ -8,7 +8,11 @@ use serde_json::{json, Value};
 
 use crate::SOURCE;
 
+pub mod native_loader;
 pub mod program_analysis;
+pub use native_loader::{
+    load_native_binary, NativeLoaderError, NativeLoaderOutput, NATIVE_LOADER_ANALYZER_ID,
+};
 pub use program_analysis::{
     compile_program_analysis_run_in_memory, compile_program_analysis_run_in_store,
     ghidra_oracle_fixture_to_program_analysis_input, AnalyzerPassReceipt, BinaryArtifact,
