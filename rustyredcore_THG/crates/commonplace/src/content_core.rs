@@ -5,7 +5,7 @@
 //! extraction metadata for the existing ingest organizer to consume.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -259,26 +259,33 @@ fn run_content_core_command(
         }
     };
 
+    let stdout_reader = child.stdout.take().map(read_pipe).ok_or_else(|| {
+        ContentCoreExtractionError::Unavailable("stdout pipe missing".to_string())
+    })?;
+    let stderr_reader = child.stderr.take().map(read_pipe).ok_or_else(|| {
+        ContentCoreExtractionError::Unavailable("stderr pipe missing".to_string())
+    })?;
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|error| ContentCoreExtractionError::Unavailable(error.to_string()))?;
-                if !output.status.success() {
+            Ok(Some(status)) => {
+                let stdout = join_pipe_reader(stdout_reader, "stdout")?;
+                let stderr = join_pipe_reader(stderr_reader, "stderr")?;
+                if !status.success() {
                     return Err(ContentCoreExtractionError::Failed {
-                        status: output.status.code(),
-                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        status: status.code(),
+                        stderr: String::from_utf8_lossy(&stderr).to_string(),
                     });
                 }
-                return serde_json::from_slice(&output.stdout)
+                return serde_json::from_slice(&stdout)
                     .map_err(|error| ContentCoreExtractionError::InvalidJson(error.to_string()));
             }
             Ok(None) => {
                 if started.elapsed() >= config.timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_pipe_reader(stdout_reader, "stdout");
+                    let _ = join_pipe_reader(stderr_reader, "stderr");
                     return Err(ContentCoreExtractionError::Timeout {
                         timeout_ms: config.timeout.as_millis() as u64,
                     });
@@ -290,6 +297,27 @@ fn run_content_core_command(
             }
         }
     }
+}
+
+fn read_pipe<T>(mut pipe: T) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    T: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_pipe_reader(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    name: &str,
+) -> Result<Vec<u8>, ContentCoreExtractionError> {
+    reader
+        .join()
+        .map_err(|_| ContentCoreExtractionError::Unavailable(format!("{name} reader panicked")))?
+        .map_err(|error| ContentCoreExtractionError::Unavailable(format!("read {name}: {error}")))
 }
 
 fn content_core_commands_from_env() -> Vec<ContentCoreCommand> {
@@ -392,5 +420,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doc.engine.as_deref(), Some("firecrawl"));
+    }
+
+    #[test]
+    fn extract_drains_large_stdout_while_waiting() {
+        let config = ContentCoreExtractionConfig {
+            enabled: true,
+            timeout: Duration::from_secs(5),
+            commands: vec![ContentCoreCommand::new(
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "printf '{\"content\":\"'; i=0; while [ $i -lt 100000 ]; do printf x; i=$((i + 1)); done; printf '\"}'".to_string(),
+                ],
+            )],
+            env: BTreeMap::new(),
+        };
+
+        let doc = content_core_extract_with_config("/tmp/large.pdf", &config).unwrap();
+        assert_eq!(doc.text.len(), 100_000);
     }
 }
