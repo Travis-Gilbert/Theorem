@@ -54,6 +54,7 @@ use rustyred_thg_core::{
     HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
 use rustyred_thg_reconstruct_harness::{ReconstructionHarnessPlugin, RECONSTRUCT_CAPABILITY_PACK};
+use rustyred_thg_datawave_harness::{DatawaveIngestPlugin, INGEST_CAPABILITY_PACK};
 use rustyred_web::{canonicalize_url, query_rustyweb_datawave_snapshot, RUSTYWEB_PAGE_DATA_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -501,6 +502,19 @@ pub trait McpGraphBackend {
             "app_affordance": response,
         }))
     }
+    // DATAWAVE intake is a pure in-process graph plugin (no theorem_grpc service),
+    // so unlike reconstruct there is no app-affordance default: only a store-backed
+    // backend can run it. Backends without a store report this honestly.
+    fn invoke_datawave_ingest(
+        &mut self,
+        _tenant: &str,
+        _arguments: &Value,
+        _operation: &str,
+    ) -> Result<Value, McpError> {
+        Err(McpError::internal(
+            "datawave ingest requires the in-process RedCore graph backend",
+        ))
+    }
     fn put_cold_document_bytes(&mut self, _body: &[u8]) -> GraphStoreResult<Option<String>> {
         Ok(None)
     }
@@ -864,6 +878,16 @@ impl<S: McpGraphBackend> McpGraphBackend for SharedStore<S> {
         self.0
             .borrow_mut()
             .invoke_reconstruct_binary(tenant, arguments, operation)
+    }
+    fn invoke_datawave_ingest(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        self.0
+            .borrow_mut()
+            .invoke_datawave_ingest(tenant, arguments, operation)
     }
     fn put_cold_document_bytes(&mut self, body: &[u8]) -> GraphStoreResult<Option<String>> {
         self.0.borrow_mut().put_cold_document_bytes(body)
@@ -2020,6 +2044,16 @@ fn call_tool<P: McpGraphProvider>(
                 })));
             }
             reconstruct_binary_payload(&tenant, &mut backend, &arguments, &operation)?
+        }
+        "datawave_ingest" | "theorem_harness_datawave_ingest" => {
+            let operation = datawave_ingest_operation(&arguments)?;
+            if datawave_ingest_writes_graph(&operation) && config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "DATAWAVE ingest graph writes are unavailable while read-only mode is active."
+                })));
+            }
+            datawave_ingest_payload(&tenant, &mut backend, &arguments, &operation)?
         }
         "remember" | "theorem_harness_remember" => {
             if config.read_only {
@@ -7688,6 +7722,52 @@ fn reconstruct_binary_command(operation: &str) -> &'static str {
     }
 }
 
+fn datawave_ingest_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    backend.invoke_datawave_ingest(tenant, arguments, operation)
+}
+
+fn datawave_ingest_operation(arguments: &Value) -> Result<String, McpError> {
+    let raw = arguments
+        .get("operation")
+        .or_else(|| arguments.get("mode"))
+        .or_else(|| arguments.get("verb"))
+        .and_then(Value::as_str)
+        .unwrap_or("describe")
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.'], "_");
+    match raw.as_str() {
+        "describe" => Ok("describe".to_string()),
+        "record" | "ingest_record" => Ok("record".to_string()),
+        "batch" | "ingest_batch" => Ok("batch".to_string()),
+        "lookup" | "ingest_lookup" => Ok("lookup".to_string()),
+        "intersect" | "ingest_intersect" => Ok("intersect".to_string()),
+        _ => Err(McpError::invalid_params(format!(
+            "unsupported datawave_ingest operation `{raw}`"
+        ))),
+    }
+}
+
+fn datawave_ingest_writes_graph(operation: &str) -> bool {
+    matches!(operation, "record" | "batch")
+}
+
+fn datawave_ingest_command(operation: &str) -> &'static str {
+    match operation {
+        "describe" => "ingest.describe",
+        "record" => "ingest.record",
+        "batch" => "ingest.batch",
+        "lookup" => "ingest.lookup",
+        "intersect" => "ingest.intersect",
+        _ => "ingest.describe",
+    }
+}
+
 fn normalize_code_arguments(arguments: &Value, operation: &str) -> Value {
     let mut normalized = arguments.clone();
     let Some(object) = normalized.as_object_mut() else {
@@ -7861,6 +7941,50 @@ fn redcore_reconstruct_binary_payload(
         )
         .map_err(reconstruct_binary_error)?;
     Ok(reconstruct_binary_response(output, operation))
+}
+
+fn datawave_ingest_error(error: GraphStoreError) -> McpError {
+    let message = format!("{}: {}", error.code, error.message);
+    if error.code.starts_with("invalid_") || error.code.starts_with("missing_") {
+        McpError::invalid_params(message)
+    } else {
+        McpError::internal(message)
+    }
+}
+
+fn datawave_ingest_response(
+    output: rustyred_thg_core::PluginExecutionOutput,
+    operation: &str,
+) -> Value {
+    json!({
+        "tenant": output.tenant_id,
+        "operation": operation,
+        "command": output.command,
+        "writes_graph": output.writes_graph,
+        "affordance_id": format!("rustyred_thg_datawave.{operation}"),
+        "engine": "rustyred_thg_datawave",
+        "capability_pack": INGEST_CAPABILITY_PACK,
+        "result": output.result,
+    })
+}
+
+fn redcore_datawave_ingest_payload(
+    store: &mut RedCoreGraphStore,
+    tenant: &str,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    let mut registry = PluginRegistry::new();
+    registry.register(DatawaveIngestPlugin);
+    let output = registry
+        .execute(
+            store,
+            tenant,
+            datawave_ingest_command(operation),
+            arguments.clone(),
+        )
+        .map_err(datawave_ingest_error)?;
+    Ok(datawave_ingest_response(output, operation))
 }
 
 fn remember_memory_payload(
@@ -11475,6 +11599,7 @@ fn tool_result_family(tool_name: &str) -> &'static str {
     match tool_name {
         "compute_code" | "rustyred_thg_compute_code" | "theorem_harness_compute_code" => "code",
         "reconstruct_binary" | "theorem_harness_reconstruct_binary" => "reconstruct",
+        "datawave_ingest" | "theorem_harness_datawave_ingest" => "datawave",
         name if name.contains("code") => "code",
         name if name.contains("reconstruct") => "reconstruct",
         name if name.contains("fractal") => "fractal",
@@ -13258,6 +13383,53 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "timeout_ms": { "type": "integer" },
                     "dry_run": { "type": "boolean", "default": false },
                     "confirmed": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
+        tool_write(
+            "datawave_ingest",
+            "DATAWAVE-style intake: turn any record into normalized field-facts plus declared entity-edges (record/batch), then read them back by value+field (lookup/intersect). Data-driven via a HelperSpec (csv/json/mapped); the engine does the normalization, not the agent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant_slug": { "type": "string" },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["describe", "record", "batch", "lookup", "intersect"],
+                        "default": "describe"
+                    },
+                    "data_type": { "type": "string", "description": "Logical data-type name for record/batch." },
+                    "helper": {
+                        "type": "object",
+                        "description": "HelperSpec selecting the intake shape; tagged by `kind`.",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["csv", "json", "mapped"] },
+                            "columns": { "type": "array", "items": { "type": "string" } },
+                            "delimiter": { "type": "string" },
+                            "extra_fields": { "type": "boolean" },
+                            "uppercase_keys": { "type": "boolean" },
+                            "rules": { "type": "array", "items": { "type": "object" } },
+                            "config": { "type": "object" }
+                        }
+                    },
+                    "edges": { "type": "array", "items": { "type": "object" }, "description": "Optional declared entity-edge definitions." },
+                    "record": { "description": "One raw record for operation=record." },
+                    "records": { "type": "array", "description": "Raw records for operation=batch." },
+                    "field": { "type": "string", "description": "Field name for operation=lookup." },
+                    "value": { "type": "string", "description": "Field value for operation=lookup." },
+                    "limit": { "type": "integer", "description": "Deduplicated event-id ceiling for operation=lookup." },
+                    "predicates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field": { "type": "string" },
+                                "value": { "type": "string" }
+                            },
+                            "required": ["field", "value"]
+                        },
+                        "description": "AND-intersected value+field predicates for operation=intersect."
+                    }
                 }
             }),
         ),
@@ -15252,6 +15424,15 @@ impl McpGraphBackend for RedCoreGraphStore {
         operation: &str,
     ) -> Result<Value, McpError> {
         redcore_reconstruct_binary_payload(self, tenant, arguments, operation)
+    }
+
+    fn invoke_datawave_ingest(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        redcore_datawave_ingest_payload(self, tenant, arguments, operation)
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -17666,6 +17847,7 @@ mod tests {
         assert!(has_tool(tools, "compute_code"));
         assert!(has_tool(tools, "code_ingest"));
         assert!(has_tool(tools, "reconstruct_binary"));
+        assert!(has_tool(tools, "datawave_ingest"));
         assert!(has_tool(tools, "harness_prepare"));
         assert!(has_tool(tools, "design_extract"));
         assert!(has_tool(tools, "design_audit"));
@@ -18007,6 +18189,74 @@ mod tests {
             output["result"]["instructions"][0]["id"],
             "recon:instr:test"
         );
+    }
+
+    #[test]
+    fn redcore_datawave_ingest_describe_runs_in_process() {
+        let mut store = RedCoreGraphStore::memory();
+        let output = super::datawave_ingest_payload(
+            "smoke",
+            &mut store,
+            &json!({ "operation": "describe" }),
+            "describe",
+        )
+        .unwrap();
+
+        assert_eq!(output["engine"], "rustyred_thg_datawave");
+        assert_eq!(
+            output["capability_pack"],
+            rustyred_thg_datawave_harness::INGEST_CAPABILITY_PACK
+        );
+        assert!(output["result"]["operations"].as_array().unwrap().len() >= 5);
+    }
+
+    #[test]
+    fn redcore_datawave_ingest_record_writes_field_facts_in_process() {
+        let mut store = RedCoreGraphStore::memory();
+        let output = super::datawave_ingest_payload(
+            "smoke",
+            &mut store,
+            &json!({
+                "operation": "record",
+                "data_type": "doc",
+                "helper": {
+                    "kind": "json",
+                    "config": { "types": { "k": "lc_text" }, "policies": { "k": { "indexed": true } } }
+                },
+                "record": {
+                    "data_type": "doc",
+                    "body": { "kind": "json", "data": { "k": "shared" } },
+                    "event_time_ms": 1
+                }
+            }),
+            "record",
+        )
+        .unwrap();
+
+        assert_eq!(output["engine"], "rustyred_thg_datawave");
+        assert_eq!(output["writes_graph"], true);
+        assert_eq!(output["command"], "ingest.record");
+        assert!(output["result"]["fields_written"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn datawave_ingest_write_operations_are_read_only_gated() {
+        let (provider, mut config) = fixture();
+        config.read_only = true;
+        let gated = call_tool_json(
+            &provider,
+            &config,
+            "datawave_ingest",
+            json!({
+                "tenant": "smoke",
+                "operation": "record",
+                "data_type": "person",
+                "helper": { "kind": "json" },
+                "record": { "name": "Ada" }
+            }),
+        );
+
+        assert_eq!(gated["error"], "mcp_read_only");
     }
 
     #[test]
