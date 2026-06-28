@@ -28,6 +28,7 @@ rustyred-thg-lift
 rustyred-thg-mcp
 rustyred-thg-memory
 rustyred-thg-ml
+rustyred-thg-offload
 rustyred-thg-pg-server
 rustyred-thg-reconstruct
 rustyred-thg-reconstruct-harness

@@ -155,13 +155,18 @@ fn re_registration_is_idempotent_and_preserves_learned_fitness() {
 fn builtin_affordances_become_graph_nodes() {
     let mut store = InMemoryGraphStore::new();
     let result = register_builtin_affordances(&mut store, "theorem", Some("test")).unwrap();
-    // The harness-core registry has 11 symbolic-engine affordances.
-    assert_eq!(result.affordance_node_ids.len(), 11);
+    // The harness-core registry has the symbolic-engine affordances plus the
+    // compute-offload router entry.
+    assert_eq!(result.affordance_node_ids.len(), 12);
     let affordances = store.query_nodes(NodeQuery::label(AFFORDANCE_LABEL).with_limit(100));
-    assert_eq!(affordances.len(), 11);
+    assert_eq!(affordances.len(), 12);
     assert!(result
         .affordance_node_ids
         .contains(&affordance_node_id("theorem", "datalog.derive")));
+    assert!(result.affordance_node_ids.contains(&affordance_node_id(
+        "theorem",
+        "compute_offload.route_operation"
+    )));
 }
 
 #[test]

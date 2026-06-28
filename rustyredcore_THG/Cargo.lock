@@ -8312,6 +8312,7 @@ dependencies = [
  "rustyred-thg-connectors",
  "rustyred-thg-core",
  "rustyred-thg-ml",
+ "rustyred-thg-offload",
  "rustyred-thg-reconstruct-harness",
  "serde",
  "serde_json",
@@ -8344,6 +8345,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers",
+]
+
+[[package]]
+name = "rustyred-thg-offload"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
