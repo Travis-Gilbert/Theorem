@@ -233,6 +233,31 @@ export async function commonplaceStatus(): Promise<CommonplaceStatus> {
   };
 }
 
+/** Status of the in-process local proxy + whether Claude Code is pointed at it (D6). */
+export interface ProxyStatus {
+  proxyUp: boolean;
+  connected: boolean;
+  endpoint: string;
+  port: number;
+}
+
+/** Rust: `theorem_proxy_status() -> ProxyStatus`. */
+export async function theoremProxyStatus(): Promise<ProxyStatus> {
+  if (isTauri()) return invoke<ProxyStatus>("theorem_proxy_status");
+  return { proxyUp: false, connected: false, endpoint: "http://127.0.0.1:17891", port: 17891 };
+}
+
+/** Rust: `connect_claude_code() -> String`. Writes ANTHROPIC_BASE_URL into ~/.claude/settings.json. */
+export async function connectClaudeCode(): Promise<string> {
+  if (isTauri()) return invoke<string>("connect_claude_code");
+  return "http://127.0.0.1:17891";
+}
+
+/** Rust: `disconnect_claude_code()`. Removes ANTHROPIC_BASE_URL from ~/.claude/settings.json. */
+export async function disconnectClaudeCode(): Promise<void> {
+  if (isTauri()) return invoke("disconnect_claude_code");
+}
+
 /** Rust: `receiver_settings_get() -> ReceiverSettings`. */
 export async function receiverSettingsGet(): Promise<ReceiverSettings | null> {
   if (isTauri()) return invoke<ReceiverSettings | null>("receiver_settings_get");

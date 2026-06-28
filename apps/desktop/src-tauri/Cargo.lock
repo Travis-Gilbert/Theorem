@@ -730,6 +730,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d6867f1565b3aad85681f1015055b087fcfd840d6aeee6eee7f2da317603695"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1828,13 +1841,28 @@ dependencies = [
 name = "commonplace-desktop-runtime"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "bytes",
  "commonplace",
+ "futures-core",
+ "futures-util",
+ "getrandom 0.3.4",
  "ignore",
+ "mdns-sd",
  "notify-debouncer-full",
+ "reqwest 0.12.28",
  "rustyred-thg-core",
+ "rustyred-thg-offload",
  "rustyred-thg-reconstruct-harness",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
+ "theorem-copresence",
+ "theorem-harness-core",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
 ]
 
 [[package]]
@@ -2913,6 +2941,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "theorem-proxy",
  "theorem-receiver",
  "tokio",
 ]
@@ -3756,6 +3785,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
+dependencies = [
+ "spin 0.9.8",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3923,6 +3961,12 @@ dependencies = [
  "pin-project-lite",
  "slab",
 ]
+
+[[package]]
+name = "fuzzyhash"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f79db37cf4b2ca9a6b735f62ca679926ba0d233d47e164147298fd4fa4786db"
 
 [[package]]
 name = "gdk"
@@ -4928,6 +4972,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ignore"
 version = "0.4.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5652,6 +5706,20 @@ name = "md5"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
+
+[[package]]
+name = "mdns-sd"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb75febbe5fa1837a52fdbd1c735e168286c5c645fc2ddd31526f65c49941c2e"
+dependencies = [
+ "fastrand",
+ "flume 0.12.0",
+ "if-addrs",
+ "mio",
+ "socket-pktinfo",
+ "socket2 0.6.4",
+]
 
 [[package]]
 name = "memchr"
@@ -7639,12 +7707,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower 0.5.3",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.7",
 ]
@@ -7679,7 +7749,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -7946,6 +8016,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "object",
+ "quick-xml",
  "rustyred-thg-core",
  "serde",
  "serde_json",
@@ -8009,6 +8080,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-datawave"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "fuzzyhash",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "rustyred-thg-datawave-harness"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "rustyred-thg-datawave",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-disasm"
 version = "0.1.0"
 dependencies = [
@@ -8057,7 +8150,9 @@ dependencies = [
  "rustyred-thg-code",
  "rustyred-thg-connectors",
  "rustyred-thg-core",
+ "rustyred-thg-datawave-harness",
  "rustyred-thg-ml",
+ "rustyred-thg-offload",
  "rustyred-thg-reconstruct-harness",
  "serde",
  "serde_json",
@@ -8076,6 +8171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-offload"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-reconstruct"
 version = "0.1.0"
 dependencies = [
@@ -8083,6 +8187,7 @@ dependencies = [
  "egg",
  "petgraph 0.8.3",
  "rustyred-thg-binformat",
+ "rustyred-thg-code",
  "rustyred-thg-core",
  "rustyred-thg-disasm",
  "rustyred-thg-lift",
@@ -8102,6 +8207,7 @@ dependencies = [
  "rustyred-thg-reconstruct",
  "serde",
  "serde_json",
+ "ureq 3.3.0",
 ]
 
 [[package]]
@@ -8715,6 +8821,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket-pktinfo"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e8e43b4bdce7cff8a4d3f8025ee38fce5ca138fab868ebbf9529c81328fbf9d"
+dependencies = [
+ "libc",
+ "socket2 0.6.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9006,7 +9123,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
- "flume",
+ "flume 0.11.1",
  "futures-channel",
  "futures-core",
  "futures-executor",
@@ -9707,6 +9824,19 @@ dependencies = [
  "theorem-harness-core",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "theorem-proxy"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "clap",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+ "ureq 2.12.1",
 ]
 
 [[package]]
@@ -10744,6 +10874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64 0.22.1",
+ "flate2",
  "log",
  "percent-encoding",
  "rustls",
@@ -11022,6 +11153,19 @@ dependencies = [
  "indexmap 2.14.0",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

@@ -29,6 +29,9 @@ commonplace-api = { path = "../../commonplace-api" }
 # durable commonplace ingest + ambient passes) over the working tree with no
 # separate install. Spawned on a background thread in setup, stopped on shutdown.
 commonplace-desktop-runtime = { path = "../../commonplace-desktop-runtime" }
+# Local Anthropic Messages proxy (roadmap D6): spawned in-process on launch so the
+# desktop is the one-click connect surface for Claude Code.
+theorem-proxy = { path = "../../theorem-proxy" }
 tokio = { version = "1", features = ["sync"] }
 reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
