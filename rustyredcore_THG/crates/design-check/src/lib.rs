@@ -13,6 +13,20 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
+pub mod scout;
+
+pub use scout::{
+    apca_contrast_lc, color_fact_from_hex, delta_e2000, design_audit, design_audit_from_json,
+    design_drift, design_drift_from_json, design_fact_set_from_dembrandt_json,
+    design_fact_set_from_json, design_html_report, design_scout_parity_receipt, design_tokens_dtcg,
+    design_tokens_tailwind, facts_hash, AccessibilityFact, BorderFact, BreakpointFact, ColorFact,
+    ColorSpaceFact, ComponentFact, ContrastPairFact, CoverageScore, DesignAuditFinding,
+    DesignAuditReport, DesignAuditScores, DesignDriftCategory, DesignDriftChange,
+    DesignDriftReport, DesignDriftSummary, DesignFactSet, DriftConfig, RadiusFact, RgbFact,
+    ShadowFact, SpacingFact, TypographyFact, DEMBRANDT_SYNTHETIC_FIXTURE,
+    DESIGN_SCOUT_REFERENCE_COMMIT, DESIGN_SCOUT_REFERENCE_REPO,
+};
+
 pub const PACK_ID: &str = "skill-pack:design-engineering-general-v0.1";
 pub const PACK_NAME: &str = "design-engineering";
 pub const SOURCE_REF: &str = "source:design-engineering-external-corpus-v0.1";
@@ -482,6 +496,7 @@ pub fn pack_hash() -> String {
             ),
             ("fixture_css", STATIC_FIXTURE_CSS),
             ("fixture_tokens", STATIC_TOKENS_JSON),
+            ("dembrandt_synthetic_fixture", DEMBRANDT_SYNTHETIC_FIXTURE),
             ("apg_fixtures", APG_FIXTURES_JSON),
             ("corpus_packets", CORPUS_PACKETS_JSON),
             ("validation_tasks", VALIDATION_TASKS_JSON),
@@ -523,7 +538,13 @@ pub fn design_engineering_pack_payload(parent_hash: Option<&str>) -> Value {
                 "css_declaration_view": css_atoms,
                 "design_token_view": token_atoms
             },
-            "checker_results": fixture_reports
+            "checker_results": fixture_reports,
+            "design_scout": {
+                "reference_repo": DESIGN_SCOUT_REFERENCE_REPO,
+                "reference_commit": DESIGN_SCOUT_REFERENCE_COMMIT,
+                "browser_dependency": "none_for_next_build_cut",
+                "parity_receipts": [design_scout_parity_receipt()]
+            }
         },
         "provenance": {
             "confidence": "scanned",
