@@ -70,14 +70,17 @@ fn charter_enumerates_all_builtin_reasoning_affordances() {
     )
     .unwrap();
 
-    assert_eq!(charter.visible_tools.len(), 11);
-    assert_eq!(charter.callable_tools.len(), 11);
+    assert_eq!(charter.visible_tools.len(), 12);
+    assert_eq!(charter.callable_tools.len(), 12);
     assert!(charter
         .visible_tool_ids()
         .contains(&"datalog.derive".to_string()));
     assert!(charter
         .visible_tool_ids()
         .contains(&"solver.check".to_string()));
+    assert!(charter
+        .visible_tool_ids()
+        .contains(&"compute_offload.route_operation".to_string()));
     assert!(charter
         .confirmation_gated_tools
         .contains(&"solver.check".to_string()));
@@ -86,7 +89,7 @@ fn charter_enumerates_all_builtin_reasoning_affordances() {
 
     let charter_payload = charter.charter_compiled_payload();
     assert_eq!(charter_payload["charter_hash"], charter.charter_hash);
-    assert_eq!(charter_payload["visible_tool_count"], 11);
+    assert_eq!(charter_payload["visible_tool_count"], 12);
 
     let capability_payload = charter.capabilities_selected_payload();
     assert_eq!(
@@ -98,7 +101,7 @@ fn charter_enumerates_all_builtin_reasoning_affordances() {
             .as_array()
             .unwrap()
             .len(),
-        11
+        12
     );
 }
 

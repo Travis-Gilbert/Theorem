@@ -21,6 +21,11 @@ tantivy = ["dep:tantivy"]
 # §P8-A pa8.1+pa8.2: S2 cells as alternative spatial backend behind
 # RUSTY_RED_SPATIAL_BACKEND=s2. Default builds keep H3.
 s2 = ["dep:s2"]
+# Optional GraphBLAS sparse-matrix compute: typed adjacency over graph_csr,
+# semiring traversal, LAGraph algorithms, and CFL-reachability. Pulls in the
+# native rustyred-thg-graphblas leaf crate (SuiteSparse:GraphBLAS + LAGraph);
+# default builds stay native-free (no libgraphblas required).
+graphblas = ["dep:rustyred-thg-graphblas"]
 
 [dependencies]
 egg = "0.10"
@@ -38,6 +43,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tantivy = { version = "0.22", optional = true }
 turbovec = { version = "0.8.0", optional = true }
+rustyred-thg-graphblas = { path = "../rustyred-thg-graphblas", optional = true }
 zstd = "0.13"
 
 [dev-dependencies]

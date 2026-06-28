@@ -27,10 +27,11 @@ fn affordance_registry_covers_python_projection_surface() {
         "design.drift",
         "design.tokens",
         "design.report",
+        "compute_offload.route_operation",
     ] {
         assert!(ids.iter().any(|candidate| candidate == id), "{id} missing");
     }
-    assert_eq!(default_affordance_registry().len(), 16);
+    assert_eq!(default_affordance_registry().len(), 17);
     validate_affordance_registry().expect("registry should be internally valid");
 }
 
@@ -48,6 +49,11 @@ fn affordance_lookup_preserves_execution_boundary_metadata() {
     assert_eq!(design.execution_surface, "design-check");
     assert_eq!(design.parity_status, "browserless-parity-cut");
     assert!(design.tags.iter().any(|tag| tag == "gate"));
+
+    let offload = affordance_by_id("compute_offload.route_operation")
+        .expect("compute offload should be registered");
+    assert_eq!(offload.family, "compute_offload");
+    assert_eq!(offload.execution_surface, "affordance-router");
 }
 
 #[test]

@@ -347,6 +347,7 @@ impl Affordance {
             cost: json!({
                 "execution_surface": contract.execution_surface,
                 "parity_status": contract.parity_status,
+                "source_module": contract.source_module,
             }),
             writeback_policy: contract.writeback_policy.clone(),
             tags: contract.tags.clone(),

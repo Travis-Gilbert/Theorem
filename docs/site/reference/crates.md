@@ -31,6 +31,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `rustyred-thg-mcp` | Model Context Protocol adapter for the Theorem HotGraph graph database. |
 | `rustyred-thg-memory` | Graph-native memory recall, consolidation, decay, and validity plugin for RustyRedCore-THG. |
 | `rustyred-thg-ml` | Shared graph tensor and message-passing primitives for RustyRedCore-THG learned organs. |
+| `rustyred-thg-offload` | Compute-offload planner: operation algebra, version-keyed reuse, calibrated cascade, verification receipts, and CPU graph affordances for Theorem. |
 | `rustyred-thg-pg-server` | Postgres wire protocol server for RustyRedCore-THG native views. |
 | `rustyred-thg-reconstruct-harness` | Harness capability pack for Theorem binary reconstruction. |
 | `rustyred-thg-reconstruct` | Semantic graph and reconstruction instruction compiler for binary artifacts. |

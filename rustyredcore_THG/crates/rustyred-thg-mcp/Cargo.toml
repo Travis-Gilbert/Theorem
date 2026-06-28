@@ -21,6 +21,7 @@ rustyred-thg-code = { path = "../rustyred-thg-code" }
 rustyred-thg-ml = { path = "../rustyred-thg-ml" }
 rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
 rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
+rustyred-thg-offload = { path = "../rustyred-thg-offload" }
 rustyred-thg-reconstruct-harness = { path = "../rustyred-thg-reconstruct-harness" }
 theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }

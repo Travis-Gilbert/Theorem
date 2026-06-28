@@ -650,6 +650,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d6867f1565b3aad85681f1015055b087fcfd840d6aeee6eee7f2da317603695"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -657,6 +670,26 @@ checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
 dependencies = [
  "serde",
  "unty",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.70.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+dependencies = [
+ "bitflags 2.11.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex",
+ "syn",
 ]
 
 [[package]]
@@ -3954,6 +3987,12 @@ dependencies = [
  "pin-project-lite",
  "slab",
 ]
+
+[[package]]
+name = "fuzzyhash"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f79db37cf4b2ca9a6b735f62ca679926ba0d233d47e164147298fd4fa4786db"
 
 [[package]]
 name = "gemm"
@@ -8149,6 +8188,7 @@ dependencies = [
  "redis",
  "rkyv",
  "roaring",
+ "rustyred-thg-graphblas",
  "s2",
  "serde",
  "serde_json",
@@ -8157,6 +8197,29 @@ dependencies = [
  "theorem-harness-core",
  "turbovec",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "rustyred-thg-datawave"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal 0.4.10",
+ "fuzzyhash",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "rustyred-thg-datawave-harness"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "rustyred-thg-datawave",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -8207,6 +8270,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-graphblas"
+version = "0.5.0"
+dependencies = [
+ "bindgen 0.70.1",
+]
+
+[[package]]
 name = "rustyred-thg-intake"
 version = "0.1.0"
 dependencies = [
@@ -8242,6 +8312,7 @@ dependencies = [
  "rustyred-thg-connectors",
  "rustyred-thg-core",
  "rustyred-thg-ml",
+ "rustyred-thg-offload",
  "rustyred-thg-reconstruct-harness",
  "serde",
  "serde_json",
@@ -8274,6 +8345,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers",
+]
+
+[[package]]
+name = "rustyred-thg-offload"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -8409,6 +8489,7 @@ dependencies = [
  "rustyred-thg-core",
  "serde_json",
  "sha2 0.10.9",
+ "theorem-harness-core",
 ]
 
 [[package]]
@@ -8432,7 +8513,7 @@ version = "0.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc7fbc04bb52c40b5f48c9bb2d2961375301916e0c25d9f373750654d588cd5c"
 dependencies = [
- "bigdecimal",
+ "bigdecimal 0.3.1",
  "cgmath",
  "float_extras",
  "lazy_static",

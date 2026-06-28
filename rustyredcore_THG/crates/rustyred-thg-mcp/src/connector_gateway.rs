@@ -20,6 +20,9 @@ use rustyred_thg_core::{
     GraphStoreResult, GraphTransaction, GraphWriteResult, NeighborHit, NeighborQuery, NodeQuery,
     NodeRecord,
 };
+use rustyred_thg_offload::{
+    plan_from_json, COMPUTE_OFFLOAD_ENGINE_ID, COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID,
+};
 use serde_json::{json, Value};
 
 use crate::{McpError, McpGraphBackend};
@@ -202,6 +205,21 @@ pub(crate) fn invoke_payload<B: McpGraphBackend>(
     };
     let actor = first_string(arguments, &["actor", "actor_id", "actorId"]);
     let dry_run = first_bool(arguments, &["dry_run", "dryRun"]).unwrap_or(false);
+    if let Some(affordance) = registered_affordance(tenant, backend, &affordance_id)? {
+        if affordance.affordance_id == COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID
+            && affordance.server_id == COMPUTE_OFFLOAD_ENGINE_ID
+        {
+            return invoke_compute_offload_payload(
+                tenant,
+                backend,
+                &task_type,
+                &affordance,
+                tool_arguments,
+                actor,
+                dry_run,
+            );
+        }
+    }
     let policy = if dry_run {
         InvokePolicy::DryRun
     } else {
@@ -222,6 +240,57 @@ pub(crate) fn invoke_payload<B: McpGraphBackend>(
     )
     .map_err(mcp_connector_error)?;
     Ok(invoke_report_payload(tenant, &task_type, report))
+}
+
+fn registered_affordance<B: McpGraphBackend>(
+    tenant: &str,
+    backend: &B,
+    affordance_id: &str,
+) -> Result<Option<Affordance>, McpError> {
+    let node_id = affordance_node_id(tenant, affordance_id);
+    let Some(node) = backend.get_node(&node_id)? else {
+        return Ok(None);
+    };
+    Affordance::from_node_record(&node)
+        .map(Some)
+        .map_err(mcp_affordance_error)
+}
+
+fn invoke_compute_offload_payload<B: McpGraphBackend>(
+    tenant: &str,
+    backend: &mut B,
+    task_type: &str,
+    affordance: &Affordance,
+    tool_arguments: Value,
+    actor: Option<String>,
+    dry_run: bool,
+) -> Result<Value, McpError> {
+    let graph_version = backend.stats()?.version;
+    let plan = plan_from_json(&tool_arguments, graph_version).map_err(McpError::invalid_params)?;
+    Ok(json!({
+        "tenant": tenant,
+        "task_type": task_type,
+        "planned": {
+            "affordance_id": affordance.affordance_id,
+            "server_id": affordance.server_id,
+            "tool_name": affordance.tool_name,
+            "writeback_policy": affordance.writeback_policy
+        },
+        "fired": !dry_run,
+        "dry_run": dry_run,
+        "dry_run_reason": if dry_run {
+            Some("dry_run requested; computed a read-only offload plan without recording an invocation")
+        } else {
+            None
+        },
+        "outcome": {
+            "is_error": false,
+            "text": "compute-offload plan generated"
+        },
+        "recorded": Value::Null,
+        "actor": actor,
+        "offload_plan": plan
+    }))
 }
 
 fn invoke_report_payload(tenant: &str, task_type: &str, report: InvokeReport) -> Value {

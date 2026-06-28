@@ -1,0 +1,18 @@
+[package]
+name = "rustyred-thg-datawave"
+version = "0.1.0"
+edition = "2021"
+description = "DATAWAVE-style intake: turn any source record into typed normalized field-facts plus declared entity-edges in a GraphStore, with per-field index policy, a self-describing dictionary, cell visibility/masking, and content + fuzzy hashing. The general front door the binary-reconstruction facts compose with, because they share the graph."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+# Exact-decimal number normalization (DATAWAVE NumericalEncoder uses BigDecimal),
+# so large integers past f64's 53-bit mantissa do not collapse.
+bigdecimal = "0.4"
+fuzzyhash = "0.2"
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Content hashing for dedup; same sha256 convention as rustyred-thg-binformat.
+sha2 = "0.10"

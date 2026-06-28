@@ -14906,7 +14906,9 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use rustyred_thg_affordances::registry::register_connector_with_target;
+    use rustyred_thg_affordances::registry::{
+        register_builtin_affordances, register_connector_with_target,
+    };
     use rustyred_thg_affordances::{ConnectorManifest, ToolManifest, CONNECTOR_FAMILY};
     use rustyred_thg_connectors::ConnectionTarget;
     use rustyred_thg_core::{
@@ -15344,6 +15346,43 @@ mod tests {
         .unwrap();
     }
 
+    fn register_compute_offload_family_connector(provider: &FixtureProvider) {
+        let target = ConnectionTarget::Http {
+            url: "http://127.0.0.1:9/mcp".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            auth: None,
+        };
+        let manifest = ConnectorManifest {
+            tenant_id: "smoke".to_string(),
+            server_id: "remote-offload".to_string(),
+            label: "Remote offload MCP".to_string(),
+            tools: vec![ToolManifest {
+                name: "remote.plan".to_string(),
+                label: "Remote plan".to_string(),
+                description: "A third-party offload family tool.".to_string(),
+                family: "compute_offload".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    }
+                }),
+                permissions: vec!["planner:read".to_string()],
+                cost: json!({}),
+                writeback_policy: "read-only".to_string(),
+                tags: vec!["compute_offload".to_string()],
+                description_embedding: None,
+            }],
+        };
+        register_connector_with_target(
+            &mut *provider.0.borrow_mut(),
+            manifest,
+            Some(serde_json::to_value(target).unwrap()),
+            Some("test"),
+        )
+        .unwrap();
+    }
+
     fn unique_code_repo(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -15713,6 +15752,147 @@ mod tests {
         assert!(
             invoked["planned"].get("connection_target").is_none(),
             "invoke must not leak persisted connector targets or auth material"
+        );
+    }
+
+    #[test]
+    fn compute_offload_routes_through_gateway_not_tools_list() {
+        let (provider, config) = fixture();
+        let before = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        let before_names = before["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !before_names.contains(&"compute_offload.route_operation"),
+            "compute offload must not be advertised as a flat tool"
+        );
+
+        register_builtin_affordances(&mut *provider.0.borrow_mut(), "smoke", Some("test")).unwrap();
+
+        let after = handle_mcp_request(
+            &provider,
+            &config,
+            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list"}),
+        );
+        let after_names = after["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !after_names.contains(&"compute_offload.route_operation"),
+            "registered offload affordance stays behind the gateway"
+        );
+
+        let searched = call_tool_json(
+            &provider,
+            &config,
+            "tool_search",
+            json!({
+                "query": "compute offload planner proxy verification",
+                "allow_families": ["compute_offload"],
+                "k": 5
+            }),
+        );
+        assert_eq!(
+            searched["results"][0]["affordance_id"],
+            "compute_offload.route_operation"
+        );
+
+        let invoked = call_tool_json(
+            &provider,
+            &config,
+            "invoke",
+            json!({
+                "affordance_id": "compute_offload.route_operation",
+                "task_type": "compute offload",
+                "dry_run": false,
+                "arguments": {
+                    "operations": [
+                        {
+                            "operation_id": "filter",
+                            "kind": "predicate_filter",
+                            "estimated_rows": 100,
+                            "selectivity": 0.1
+                        },
+                        {
+                            "operation_id": "synth",
+                            "kind": "neural_synthesis",
+                            "estimated_rows": 100,
+                            "quality_floor": 0.7,
+                            "candidates": [
+                                {
+                                    "executor": "cheap_model",
+                                    "model_id": "small",
+                                    "cost": {
+                                        "prompt_tokens": 100,
+                                        "completion_tokens": 40,
+                                        "gpu_seconds": 0.1,
+                                        "quality": 0.8
+                                    }
+                                },
+                                {
+                                    "executor": "expensive_model",
+                                    "model_id": "frontier",
+                                    "cost": {
+                                        "prompt_tokens": 1000,
+                                        "completion_tokens": 400,
+                                        "gpu_seconds": 2.0,
+                                        "quality": 0.95
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        );
+        assert_eq!(
+            invoked["planned"]["affordance_id"],
+            "compute_offload.route_operation"
+        );
+        assert_eq!(invoked["fired"], json!(true));
+        assert_eq!(
+            invoked["offload_plan"]["steps"][0]["operation"]["operation_id"],
+            "filter"
+        );
+        assert!(
+            invoked["offload_plan"]["totals"]["tokens_saved"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn compute_offload_family_connectors_still_use_connector_route() {
+        let (provider, config) = fixture();
+        register_compute_offload_family_connector(&provider);
+
+        let invoked = call_tool_json(
+            &provider,
+            &config,
+            "invoke",
+            json!({
+                "affordance_id": "remote-offload.remote.plan",
+                "task_type": "remote compute offload",
+                "dry_run": true,
+                "arguments": { "query": "route this remotely" }
+            }),
+        );
+        assert_eq!(invoked["fired"], json!(false));
+        assert_eq!(invoked["planned"]["server_id"], "remote-offload");
+        assert_eq!(
+            invoked["planned"]["affordance_id"],
+            "remote-offload.remote.plan"
         );
     }
 
