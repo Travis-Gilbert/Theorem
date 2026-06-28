@@ -374,8 +374,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             &heads,
             HeadInvocationKind::Critique,
             &input.domain,
-            #[allow(clippy::cloned_ref_to_slice_refs)]
-            &[primary.head_id.clone()],
+            std::slice::from_ref(&primary.head_id),
             input.routing_explore_token.saturating_add(round_index),
         )?;
         let critic = critic_route.0;
@@ -449,8 +448,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             &heads,
             HeadInvocationKind::Verification,
             &input.domain,
-            #[allow(clippy::cloned_ref_to_slice_refs)]
-            &[synthesis.head_id.clone()],
+            std::slice::from_ref(&synthesis.head_id),
             input.routing_explore_token.saturating_add(round_index),
         )?;
         let verifier = verifier_route.0;
@@ -940,6 +938,11 @@ fn invoke_head<I: HeadInvoker>(
         .collect();
     let prior_context = revisions.iter().filter_map(revision_context).collect();
     let policy_decision = constitution.head_turn_decision(binding, &head.head_id, kind);
+    // Thread the binding's agent constitution (persona/voice) through every
+    // head invocation: proposal, critique, synthesis, and verification. The
+    // synthesis step (DRAFTS.SYNTHESIZED) is where voice matters most, but
+    // carrying it on every step keeps tone consistent across all contributions
+    // and gives the verifier the same voice context to judge against.
     let request = HeadInvocationRequest::new_with_context(
         head,
         kind,
@@ -952,7 +955,8 @@ fn invoke_head<I: HeadInvoker>(
     )
     .with_policy_decision(policy_decision)
     .with_scratchpad_crdt(binding.working_memory_scope.scratchpad.crdt.clone())
-    .with_context_membrane(input.context_membrane.clone());
+    .with_context_membrane(input.context_membrane.clone())
+    .with_constitution(binding.identity.agent_constitution.clone());
     invoker
         .invoke(request)
         .map_err(IntraAgentLoopError::Invocation)

@@ -215,6 +215,7 @@ pub fn default_theorem_binding(binding_id: &str) -> Result<AgentBinding, Binding
             version: 1,
             trust_tier: "first_party".to_string(),
             active_head_set,
+            agent_constitution: None,
         },
         BindingComposition { heads },
         BindingBudgetScope::new("theorem", 32_000.0, max_parallel_heads),

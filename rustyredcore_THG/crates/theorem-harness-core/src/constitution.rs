@@ -211,6 +211,7 @@ mod tests {
                 version: 1,
                 trust_tier: "first_party".to_string(),
                 active_head_set: vec!["deepseek".to_string(), "mistral".to_string()],
+                agent_constitution: None,
             },
             BindingComposition {
                 heads: vec![head("deepseek", "deepseek"), head("mistral", "mistral")],

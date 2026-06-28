@@ -526,6 +526,7 @@ fn fixture_binding() -> AgentBinding {
                 "deepseek".to_string(),
                 "mistral_ocr".to_string(),
             ],
+            agent_constitution: None,
         },
         BindingComposition {
             heads: vec![
@@ -666,4 +667,119 @@ impl HeadInvoker for DefectThenAcceptedVerifier {
             1.0,
         ))
     }
+}
+
+// --- Agent Theorem S1: persona/voice in AgentBinding -----------------------
+//
+// The three tests below prove the wiring added in S1: when a binding carries
+// an `agent_constitution`, the intra-agent loop threads it into every head
+// invocation request (proposal, critique, synthesis, verification), and the
+// receipt surfaces the same text so the synthesis step (DRAFTS.SYNTHESIZED) is
+// guaranteed to have seen Theorem's voice. The third test pins the
+// back-compat parity: a binding serialized without the new field still
+// deserializes (`agent_constitution: None`) and produces invocation requests
+// without a constitution field.
+
+const FAKE_CONSTITUTION_TEXT: &str =
+    "Theorem speaks one voice across many heads: grounded, concise, no slop.";
+
+#[test]
+fn fake_loop_threads_agent_constitution_through_every_head_invocation() {
+    let mut binding = fixture_binding();
+    binding.identity.agent_constitution = Some(FAKE_CONSTITUTION_TEXT.to_string());
+    let input = FakeIntraAgentLoopInput::new(
+        "publish a grounded theorem answer",
+        vec![GroundedClaim::new(
+            "Theorem can publish grounded composed-agent output",
+            "source:binding-test",
+        )],
+    );
+
+    let result = run_fake_intra_agent_loop(binding, input).unwrap();
+
+    // All four invocations (proposal, critique, synthesis, verification) must
+    // carry the constitution. Voice consistency across steps is the whole
+    // point of S1.
+    assert_eq!(result.invocation_receipts.len(), 4);
+    for receipt in &result.invocation_receipts {
+        let constitution = receipt
+            .payload
+            .get("constitution")
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected receipt for kind {:?} to carry constitution",
+                    receipt.kind
+                )
+            });
+        assert_eq!(constitution, FAKE_CONSTITUTION_TEXT);
+    }
+
+    // Synthesis is the load-bearing surface: assert explicitly that the
+    // synthesis receipt (the one that DRAFTS.SYNTHESIZED later commits) saw
+    // the constitution.
+    let synthesis_receipt = result
+        .invocation_receipts
+        .iter()
+        .find(|receipt| receipt.kind == HeadInvocationKind::Synthesis)
+        .expect("loop must produce a synthesis receipt");
+    assert_eq!(
+        synthesis_receipt
+            .payload
+            .get("constitution")
+            .and_then(|value| value.as_str()),
+        Some(FAKE_CONSTITUTION_TEXT)
+    );
+}
+
+#[test]
+fn fake_loop_omits_constitution_when_binding_has_none() {
+    // Back-compat: a binding without a constitution should produce invocation
+    // receipts that do NOT carry a constitution field, so existing
+    // replay/parity hashes continue to match.
+    let binding = fixture_binding();
+    assert!(binding.identity.agent_constitution.is_none());
+
+    let input = FakeIntraAgentLoopInput::new(
+        "publish a grounded theorem answer",
+        vec![GroundedClaim::new(
+            "Theorem can publish grounded composed-agent output",
+            "source:binding-test",
+        )],
+    );
+
+    let result = run_fake_intra_agent_loop(binding, input).unwrap();
+
+    assert_eq!(result.invocation_receipts.len(), 4);
+    for receipt in &result.invocation_receipts {
+        assert!(
+            receipt.payload.get("constitution").is_none(),
+            "receipt for kind {:?} should not carry constitution when binding has none",
+            receipt.kind
+        );
+    }
+}
+
+#[test]
+fn binding_identity_deserializes_without_agent_constitution_field_for_back_compat() {
+    // Older serialized BindingIdentity blobs (written before S1) did not
+    // include `agent_constitution`. They must still deserialize, with the new
+    // field defaulted to `None`.
+    let legacy_json = serde_json::json!({
+        "agent_id": "theorem",
+        "owner_id": "travis",
+        "agent_name": "Theorem",
+        "composition_hash": "",
+        "version": 1,
+        "trust_tier": "first_party",
+        "active_head_set": ["claude", "deepseek"],
+    });
+    let identity: BindingIdentity =
+        serde_json::from_value(legacy_json).expect("legacy BindingIdentity must deserialize");
+    assert_eq!(identity.agent_constitution, None);
+
+    // And a fresh identity round-trips through JSON with `None` preserved.
+    let round_trip: BindingIdentity =
+        serde_json::from_value(serde_json::to_value(&identity).unwrap()).unwrap();
+    assert_eq!(round_trip.agent_constitution, None);
 }
