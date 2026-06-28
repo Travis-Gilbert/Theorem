@@ -1690,7 +1690,14 @@ fn call_tool<P: McpGraphProvider>(
             })));
         }
         "design_extract" | "design_extract_static_facts" | "theorem_design_extract" => {
-            design_extract_payload(&tenant, &arguments, name)?
+            let payload = design_extract_payload(&tenant, &arguments, name)?;
+            if payload.get("error").is_some() {
+                // Live extraction is unsupported on the browserless lane; surface
+                // it as an MCP tool error so clients see isError and fall back to
+                // the async browser route instead of reading it as success.
+                return Ok(tool_result_error(payload));
+            }
+            payload
         }
         "design_audit" | "theorem_design_audit" => design_audit_payload(&tenant, &arguments, name)?,
         "design_drift" | "theorem_design_drift" => design_drift_payload(&tenant, &arguments, name)?,

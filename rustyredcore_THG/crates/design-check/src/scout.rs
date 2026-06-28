@@ -350,6 +350,46 @@ pub fn design_fact_set_from_dembrandt_value(
         });
     }
 
+    // Import the real rendered text/background pairs Dembrandt records under the
+    // top-level `wcag` array (`--wcag` runs). Without these, design_audit only
+    // sees the synthesized semantic pair and can pass a page whose actual DOM
+    // pairs failed. Theorem re-audits each pair from its own fg/bg colors.
+    if let Some(pairs) = value.get("wcag").and_then(Value::as_array) {
+        for (index, pair) in pairs.iter().enumerate() {
+            let (Some(foreground), Some(background)) = (
+                pair.get("fg").and_then(Value::as_str).and_then(normalize_color_hex),
+                pair.get("bg").and_then(Value::as_str).and_then(normalize_color_hex),
+            ) else {
+                continue;
+            };
+            let descriptor = pair
+                .get("source")
+                .or_else(|| pair.get("tag"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("pair_{index}"));
+            let context = match pair
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|state| !state.is_empty() && *state != "rest" && *state != "default")
+            {
+                Some(state) => format!("wcag:{descriptor}:{state}"),
+                None => format!("wcag:{descriptor}"),
+            };
+            facts.contrast_pairs.push(ContrastPairFact {
+                foreground,
+                background,
+                context,
+                non_text: false,
+                text_size_px: Some(16.0),
+                bold: false,
+            });
+        }
+    }
+
     if let Some(styles) = value
         .pointer("/typography/styles")
         .and_then(Value::as_array)
@@ -902,7 +942,7 @@ pub fn apca_contrast_lc(foreground: &Color, background: &Color) -> f64 {
 }
 
 pub fn facts_hash(facts: &DesignFactSet) -> String {
-    hash_value(&serde_json::to_value(facts).unwrap_or_else(|_| json!(null)))
+    hash_value(&serde_json::to_value(facts).unwrap_or(json!(null)))
 }
 
 fn audit_contrast(facts: &DesignFactSet) -> Vec<DesignAuditFinding> {
@@ -1388,7 +1428,11 @@ fn compare_typography(
     let mut removed = 0;
     for base in &baseline.typography {
         let key = base.context.to_ascii_lowercase();
-        let Some(bucket) = buckets.get_mut(&key) else {
+        // A bucket can be drained when the baseline has more entries for a
+        // context than the candidate; treat an emptied bucket like a missing one
+        // (report the extra baseline style as removed) so `bucket.remove` below
+        // never runs on an empty Vec.
+        let Some(bucket) = buckets.get_mut(&key).filter(|bucket| !bucket.is_empty()) else {
             removed += 1;
             penalty += 1.0;
             peak = peak.max(1.0);
@@ -1878,6 +1922,7 @@ fn confidence(value: &Value) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finding(
     rule_id: &str,
     severity: &str,
@@ -2373,5 +2418,61 @@ mod tests {
         assert!(dtcg["color"].is_object());
         assert!(tailwind["theme"]["extend"]["colors"].is_object());
         assert!(html.contains("Design Scout Report"));
+    }
+
+    #[test]
+    fn typography_drift_handles_repeated_context_without_panic() {
+        // Regression: a baseline with more entries for one context than the
+        // candidate used to drain the bucket and panic on bucket.remove(0).
+        let style = |context: &str, size: f64| TypographyFact {
+            context: context.to_string(),
+            family: "Inter".to_string(),
+            size_px: size,
+            weight: 400,
+            line_height: None,
+            measure_ch: None,
+            usage_count: 1,
+        };
+        let baseline = DesignFactSet {
+            typography: vec![style("body", 16.0), style("body", 14.0)],
+            ..DesignFactSet::default()
+        };
+        let candidate = DesignFactSet {
+            typography: vec![style("body", 16.0)],
+            ..DesignFactSet::default()
+        };
+        let report = design_drift(&baseline, &candidate, DriftConfig::default());
+        assert!(report
+            .changes
+            .iter()
+            .any(|change| change.category == "typography" && change.kind == "removed"));
+    }
+
+    #[test]
+    fn dembrandt_wcag_pairs_import_into_contrast_facts() {
+        let dembrandt = serde_json::json!({
+            "colors": {
+                "semantic": { "primary": "#133174", "background": "#ffffff" },
+                "palette": []
+            },
+            "wcag": [
+                { "fg": "#777777", "bg": "#ffffff", "ratio": 4.48, "aa": false,
+                  "aaLarge": true, "aaa": false, "tag": "p", "source": ".hero p", "state": "rest" },
+                { "fg": "#ffffff", "bg": "#1166ee", "ratio": 3.9, "aa": false,
+                  "aaLarge": true, "aaa": false, "tag": "button", "state": "hover" }
+            ]
+        });
+        let facts =
+            design_fact_set_from_json(&dembrandt.to_string()).expect("dembrandt normalizes");
+        let contexts: Vec<&str> = facts
+            .contrast_pairs
+            .iter()
+            .map(|pair| pair.context.as_str())
+            .collect();
+        // Synthesized semantic pair plus both rendered wcag pairs are imported.
+        assert!(contexts.contains(&"primary_on_canvas"));
+        assert!(contexts.contains(&"wcag:.hero p"));
+        assert!(contexts.contains(&"wcag:button:hover"));
+        assert!(facts.contrast_pairs.len() >= 3);
     }
 }
