@@ -163,7 +163,7 @@ Fetch, search, and drive the web into the graph.
 | Tool | What it does |
 |---|---|
 | `web_consume` | Fetch, observe, and optionally ingest one page. |
-| `web.query` | Query tenant-scoped RustyWeb DATAWAVE page facts with planner receipts and hydrate matching page nodes; `coordination_context` and `harness_prepare` use the same read path for ambient run-start web evidence. |
+| `web_query` | Query tenant-scoped RustyWeb DATAWAVE page facts with planner receipts and hydrate matching page nodes; `coordination_context` and `harness_prepare` use the same read path for ambient run-start web evidence. Legacy calls to `web.query` are still accepted, but the advertised MCP tool name is host-safe for Claude. |
 | `browse_with_me` | Supervised co-browse with pre-action preview. |
 | `browse_for_me` | Autonomous browse bounded by policy. |
 | `web_search_graph` | Search that returns graph-shaped results. |

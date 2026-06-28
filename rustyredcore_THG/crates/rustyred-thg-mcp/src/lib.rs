@@ -13568,7 +13568,7 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
         }),
     ));
     tools.push(tool(
-        "web.query",
+        "web_query",
         "Query tenant-scoped RustyWeb DATAWAVE page facts and hydrate matching page nodes.",
         json!({
             "type": "object",
@@ -17503,6 +17503,20 @@ mod tests {
         }
     }
 
+    fn assert_claude_safe_tool_names(tools: &[Value]) {
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            assert!(
+                !name.is_empty() && name.len() <= 64 && name.chars().all(is_claude_tool_char),
+                "{name} must match Claude tool name pattern ^[a-zA-Z0-9_-]{{1,64}}$"
+            );
+        }
+    }
+
+    fn is_claude_tool_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+    }
+
     fn assert_output_schemas_present(tools: &[Value]) {
         for tool in tools {
             let name = tool["name"].as_str().unwrap_or("<unnamed>");
@@ -17609,6 +17623,7 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_no_top_level_schema_combinators(tools);
+        assert_claude_safe_tool_names(tools);
         assert_output_schemas_present(tools);
         assert!(tools
             .iter()
@@ -17639,7 +17654,7 @@ mod tests {
         assert!(has_tool(tools, "skill_get"));
         assert!(!has_tool(tools, "fractal_expansion"));
         assert!(has_tool(tools, "web_consume"));
-        assert!(has_tool(tools, "web.query"));
+        assert!(has_tool(tools, "web_query"));
         assert!(!has_tool(tools, "browse_with_me"));
         assert!(!has_tool(tools, "browse_for_me"));
         assert!(has_tool(tools, "mentions"));
@@ -18086,18 +18101,14 @@ mod tests {
         }
 
         config.read_only = true;
-        let payload = call_tool_json(
-            &provider,
-            &config,
-            "web.query",
-            json!({
-                "tenant": "smoke",
-                "predicates": [
-                    { "field": "url", "value": "https://example.com/index.html" },
-                    { "field": "domain", "value": "example.com" }
-                ]
-            }),
-        );
+        let query_args = json!({
+            "tenant": "smoke",
+            "predicates": [
+                { "field": "url", "value": "https://example.com/index.html" },
+                { "field": "domain", "value": "example.com" }
+            ]
+        });
+        let payload = call_tool_json(&provider, &config, "web_query", query_args.clone());
 
         assert_eq!(payload["operation"], json!("query"));
         assert_eq!(payload["affordance_id"], json!("rustyred_web.web.query"));
@@ -18117,6 +18128,9 @@ mod tests {
                     .unwrap_or("")
                     .contains("ambient code intelligence")));
         assert_eq!(payload["result"]["trace"]["full_relation_scans"], json!(0));
+
+        let legacy_payload = call_tool_json(&provider, &config, "web.query", query_args);
+        assert_eq!(legacy_payload["operation"], json!("query"));
     }
 
     #[test]
@@ -18307,6 +18321,7 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_no_top_level_schema_combinators(tools);
+        assert_claude_safe_tool_names(tools);
         assert_output_schemas_present(tools);
         assert!(has_tool(tools, "coordination_room"));
         assert!(has_tool(tools, "presence"));
@@ -18315,7 +18330,7 @@ mod tests {
         assert!(has_tool(tools, "rustyweb_search_acquisition"));
         assert!(has_tool(tools, "fractal_expansion"));
         assert!(has_tool(tools, "web_consume"));
-        assert!(has_tool(tools, "web.query"));
+        assert!(has_tool(tools, "web_query"));
         assert!(has_tool(tools, "browse_with_me"));
         assert!(has_tool(tools, "browse_for_me"));
         assert!(has_tool(tools, "coordination_record"));
