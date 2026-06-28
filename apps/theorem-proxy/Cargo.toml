@@ -1,0 +1,33 @@
+[package]
+name = "theorem-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Local Theorem node: faithful Anthropic Messages passthrough proxy (SPEC-LOCAL-PROXY-MVP deliverable 1). The substrate on the model path; membrane and ambient injection stack on this."
+
+[[bin]]
+name = "theorem-proxy"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+serde_json = "1"
+# Blocking HTTP client for the substrate MemorySource: MemorySource::retrieve is sync
+# and runs inside the async handler, so a tokio-free client avoids a runtime conflict.
+ureq = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
+serde_json = "1"
+
+# Standalone Cargo root (bare workspace), like apps/theorem-grpc and apps/commonplace-api:
+# isolated from the rustyredcore_THG workspace so it builds independently and never
+# collides with another head's in-flight changes there.
+[workspace]
