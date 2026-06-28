@@ -124,6 +124,7 @@ fn upsert_allowed_fields<S: GraphStore>(
 }
 
 /// `job_list`: the board, ordered by priority then submitted_at.
+#[allow(clippy::needless_option_as_deref)]
 pub fn job_list<S: GraphStore>(
     store: &S,
     repo: Option<&str>,
@@ -233,6 +234,7 @@ pub fn job_archive<S: GraphStore>(
 }
 
 /// Load one job by id.
+#[allow(clippy::needless_borrow)]
 pub fn load_job<S: GraphStore>(store: &S, job_id: &str) -> RuntimeResult<Option<Job>> {
     store
         .get_node(&job_node_id(job_id))

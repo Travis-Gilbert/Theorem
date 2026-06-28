@@ -241,6 +241,7 @@ impl PatchSequencer {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn receipt(
         &self,
         proposal: &PatchProposal,

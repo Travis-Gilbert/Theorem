@@ -2105,6 +2105,7 @@ fn should_try_indexed_recall_candidates(
         && (kind_filter.is_empty() || kind_filter != COMMUNITY_SUMMARY_KIND)
 }
 
+#[allow(clippy::manual_clamp)]
 fn indexed_recall_candidate_limit(limit: usize, seed_limit: usize) -> usize {
     seed_limit
         .max(limit.saturating_mul(INDEXED_RECALL_CANDIDATE_MULTIPLIER))
@@ -2127,7 +2128,6 @@ fn load_indexed_recall_atoms<S: MemoryGraphStore>(
 ) -> MemoryResult<Vec<RecallAtom>> {
     let mut candidate_ids = indexed_fulltext_seed_scores(store, query, candidate_limit)?
         .into_iter()
-        .map(|(graph_id, score)| (graph_id, score))
         .collect::<Vec<_>>();
     candidate_ids.extend(indexed_vector_seed_scores(store, input, candidate_limit)?);
     let candidate_ids = dedupe_rank_scores(candidate_ids, true, candidate_limit)?;

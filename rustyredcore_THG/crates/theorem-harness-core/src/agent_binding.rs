@@ -35,6 +35,15 @@ pub struct BindingIdentity {
     pub trust_tier: String,
     #[serde(default)]
     pub active_head_set: Vec<String>,
+    /// Optional persona/voice text that conditions every head contribution this
+    /// binding produces. The text is owned by the caller that constructs the
+    /// binding; loading it from disk (e.g. from
+    /// `docs/plans/agent-theorem/constitution.md`) is a higher-layer concern.
+    /// When present, the intra-agent loop threads it through every head
+    /// invocation request so proposal, critique, synthesis, and verification
+    /// share one voice.
+    #[serde(default)]
+    pub agent_constitution: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -472,6 +481,7 @@ impl ScratchpadDocument {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_with_links(
         &mut self,
         actor_head_id: impl Into<String>,
@@ -546,16 +556,11 @@ impl ScratchpadDocument {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScratchpadCrdtKind {
+    #[default]
     GraphCrdtYrsRegions,
-}
-
-impl Default for ScratchpadCrdtKind {
-    fn default() -> Self {
-        Self::GraphCrdtYrsRegions
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2943,6 +2948,7 @@ mod tests {
                 version: 1,
                 trust_tier: "first_party".to_string(),
                 active_head_set: vec!["claude".to_string(), "deepseek".to_string()],
+                agent_constitution: None,
             },
             BindingComposition {
                 heads: vec![
