@@ -16,6 +16,8 @@ rustyred-thg-code
 rustyred-thg-compat-server
 rustyred-thg-connectors
 rustyred-thg-core
+rustyred-thg-datawave
+rustyred-thg-datawave-harness
 rustyred-thg-disasm
 rustyred-thg-fractal
 rustyred-thg-fuse
