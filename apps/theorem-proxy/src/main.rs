@@ -6,11 +6,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use theorem_proxy::memory::{DirectoryMemorySource, HttpMemorySource, MemorySource};
-use theorem_proxy::{serve, ProxyConfig};
+use theorem_proxy::{resolve_memory, run_wrapped, serve, ProxyConfig};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +41,23 @@ enum Command {
         #[arg(long, env = "THEOREM_PROXY_MEMORY_DIR")]
         memory_dir: Option<PathBuf>,
     },
+    /// Start the proxy and run a command (e.g. `claude`) pointed at it -- one command,
+    /// no manual ANTHROPIC_BASE_URL export. Put the command after `--`.
+    Wrap {
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        #[arg(long, default_value = "https://api.anthropic.com")]
+        upstream: String,
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_URL")]
+        memory_url: Option<String>,
+        #[arg(long, env = "THEOREM_PROXY_TENANT")]
+        tenant: Option<String>,
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_DIR")]
+        memory_dir: Option<PathBuf>,
+        /// The command to run with ANTHROPIC_BASE_URL set (everything after `--`).
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -56,22 +71,8 @@ async fn main() -> std::io::Result<()> {
             memory_dir,
         } => {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            // The live node memory (--memory-url) wins; the directory is the no-node
-            // fallback; neither set is faithful passthrough.
-            let (memory, memory_desc): (Option<Arc<dyn MemorySource>>, String) =
-                if let Some(url) = &memory_url {
-                    (
-                        Some(Arc::new(HttpMemorySource::new(url.clone(), tenant.clone()))),
-                        format!("live local node memory at {url}"),
-                    )
-                } else if let Some(dir) = &memory_dir {
-                    (
-                        Some(Arc::new(DirectoryMemorySource::new(dir))),
-                        format!("relevant memory from {}", dir.display()),
-                    )
-                } else {
-                    (None, "off (faithful passthrough)".to_string())
-                };
+            let (memory, memory_desc) =
+                resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
             println!("theorem proxy live at http://{addr}");
             println!();
             println!("point Claude Code at it:");
@@ -88,6 +89,31 @@ async fn main() -> std::io::Result<()> {
                 },
             )
             .await
+        }
+        Command::Wrap {
+            port,
+            upstream,
+            memory_url,
+            tenant,
+            memory_dir,
+            command,
+        } => {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let (memory, memory_desc) =
+                resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
+            eprintln!("theorem proxy live at http://{addr} (ambient memory: {memory_desc})");
+            eprintln!("running: {}", command.join(" "));
+            let code = run_wrapped(
+                addr,
+                ProxyConfig {
+                    upstream,
+                    memory,
+                    max_memories: 8,
+                },
+                command,
+            )
+            .await?;
+            std::process::exit(code);
         }
     }
 }

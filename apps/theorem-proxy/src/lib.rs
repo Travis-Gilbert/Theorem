@@ -158,3 +158,64 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "content-length"
     )
 }
+
+/// Build the ambient `MemorySource` from the CLI/env options, plus a human description
+/// of what was selected. A live node URL wins over a directory; neither set is faithful
+/// passthrough. Shared by the `proxy` and `wrap` subcommands.
+pub fn resolve_memory(
+    memory_url: Option<&str>,
+    tenant: Option<String>,
+    memory_dir: Option<&std::path::Path>,
+) -> (Option<Arc<dyn memory::MemorySource>>, String) {
+    if let Some(url) = memory_url {
+        (
+            Some(Arc::new(memory::HttpMemorySource::new(url.to_string(), tenant))),
+            format!("live local node memory at {url}"),
+        )
+    } else if let Some(dir) = memory_dir {
+        (
+            Some(Arc::new(memory::DirectoryMemorySource::new(dir))),
+            format!("relevant memory from {}", dir.display()),
+        )
+    } else {
+        (None, "off (faithful passthrough)".to_string())
+    }
+}
+
+/// Serve the proxy on `addr`, wait until it answers `/healthz`, then run `command` with
+/// `ANTHROPIC_BASE_URL` pointed at it; return the child's exit code. One command instead
+/// of a manual base-URL export (SPEC-LOCAL-PROXY-MVP D5 / one-click connect).
+pub async fn run_wrapped(
+    addr: SocketAddr,
+    config: ProxyConfig,
+    command: Vec<String>,
+) -> std::io::Result<i32> {
+    let (program, args) = command.split_first().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "wrap: empty command")
+    })?;
+    // Serve in the background; aborted when the wrapped command exits.
+    let server = tokio::spawn(serve(addr, config));
+    wait_until_healthy(addr).await;
+    let status = tokio::process::Command::new(program)
+        .args(args)
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+        .status()
+        .await?;
+    server.abort();
+    Ok(status.code().unwrap_or(0))
+}
+
+/// Poll `/healthz` until the proxy answers (bounded ~5s). Best-effort: if it never comes
+/// up the command still runs and surfaces its own connection error.
+async fn wait_until_healthy(addr: SocketAddr) {
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/healthz");
+    for _ in 0..100 {
+        if let Ok(response) = client.get(&url).send().await {
+            if response.status().is_success() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

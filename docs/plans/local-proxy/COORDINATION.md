@@ -17,7 +17,7 @@ two heads do not overwrite each other. Update it when a lane changes hands.
 | Phase B.3 staleness-aware memory + memory-CI | Codex | open |
 | Phase B.4 proxy-mediated proactive coordination | Codex | has `local-proxy-codex-presence` |
 | Phase B.5 built-in measurement + `doctor` readout | Codex | open |
-| Phase C.1 install ergonomics (brew/curl/`wrap claude`) | CC | open |
+| Phase C.1 install ergonomics (brew/curl/`wrap claude`) | CC | IN PROGRESS (`theorem-proxy wrap` done; brew tap + curl-installer remaining) |
 | Phase C.2 remaining MVP (D2 membrane, D4 parity, D6 sidecar, D7 two-token) | CC | open |
 | Phase C.3 one-click onboarding | CC | open |
 | Phase C.4 resident capabilities (affordance exec, cascade, verify offload) | Codex | has `proxy-resident-capabilities` (merged #67) |
