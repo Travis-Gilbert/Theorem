@@ -1129,7 +1129,6 @@ async fn mcp_post(
         ),
     };
     if inject_search_tools {
-        inject_hippo_retrieve_tool_definition(&mut response);
         inject_web_search_graph_tool_definition(&mut response);
     }
     Json(response).into_response()
@@ -2525,7 +2524,7 @@ async fn hippo_retrieve_payload(
         })
     })?;
     let indexing = if auto_index_memory {
-        warm_hippo_memory_index(&mut gate_store, &tenant, arguments)?
+        warm_hippo_memory_index(&mut gate_store, &tenant, arguments).await?
     } else {
         json!({
             "ran": false,
@@ -2565,7 +2564,36 @@ async fn hippo_retrieve_payload(
     }))
 }
 
-fn warm_hippo_memory_index(
+/// Bridges the env-configured rustyred-web HTTP embedder to HippoRAG's `HippoTextEmbedder`
+/// so memory indexing and query embedding use the SAME model -- the fix that makes node
+/// retrieval semantic instead of hash-bucketed.
+struct HippoWebEmbedder<E: TextEmbedder>(E);
+
+impl<E: TextEmbedder> rustyred_hipporag::HippoTextEmbedder for HippoWebEmbedder<E> {
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+
+    fn embed<'a>(
+        &'a self,
+        inputs: &'a [String],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = rustyred_hipporag::HippoResult<Vec<Vec<f32>>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.0
+                .embed(inputs)
+                .await
+                .map_err(|error| rustyred_hipporag::HippoError::new("embedding", error.to_string()))
+        })
+    }
+}
+
+async fn warm_hippo_memory_index(
     store: &mut TenantMirrorGraphStore<'_>,
     tenant: &str,
     arguments: &Value,
@@ -2587,6 +2615,18 @@ fn warm_hippo_memory_index(
     let mut source_page_ids = Vec::new();
     let tenant_aliases = hippo_tenant_slug_aliases(tenant);
     let mut source_ids_seen = BTreeSet::new();
+    // Real embedder (env-configured HTTP) used for BOTH indexing here and query embedding,
+    // so cosine similarity is semantic. None -> the deterministic hash path (no relevance).
+    let embedder = match configured_qwen3_embedding_4b_client_from_env() {
+        Ok(Some(client)) => Some(HippoWebEmbedder(client)),
+        Ok(None) => None,
+        Err(error) => {
+            return Err(json!({
+                "error": "hippo_embedding_config_invalid",
+                "message": error.to_string()
+            }))
+        }
+    };
 
     for label in ["MemoryDocument", "MemoryNode"] {
         for alias in &tenant_aliases {
@@ -2632,8 +2672,17 @@ fn warm_hippo_memory_index(
                 );
                 store.upsert_node(page).map_err(hippo_index_store_error)?;
                 pages_upserted += 1;
-                let stats = rustyred_hipporag::index_passage(store, &page_id)
-                    .map_err(|error| hippo_index_error("hippo_index_passage_failed", error))?;
+                let stats = match &embedder {
+                    Some(embedder) => {
+                        rustyred_hipporag::index_passage_with_embedder(store, &page_id, embedder)
+                            .await
+                            .map_err(|error| {
+                                hippo_index_error("hippo_index_passage_failed", error)
+                            })?
+                    }
+                    None => rustyred_hipporag::index_passage(store, &page_id)
+                        .map_err(|error| hippo_index_error("hippo_index_passage_failed", error))?,
+                };
                 passages_indexed += 1;
                 phrases_upserted += stats.phrases_upserted;
                 contains_edges += stats.contains_edges;
@@ -3295,68 +3344,6 @@ fn spawn_web_search_graph_warming(
             "web_search_graph warming pass complete"
         );
     });
-}
-
-/// Append the `web_search_graph` tool definition to a `tools/list` response. The
-/// tool's call execution is intercepted in the async router (it persists membrane
-/// receipts + warm pages), so the synchronous MCP backend does not own its
-/// definition; the router injects it so the tool is discoverable in `tools/list`.
-fn inject_hippo_retrieve_tool_definition(response: &mut Value) {
-    let Some(tools) = response
-        .get_mut("result")
-        .and_then(|result| result.get_mut("tools"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    if tools
-        .iter()
-        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("hippo_retrieve"))
-    {
-        return;
-    }
-    tools.push(hippo_retrieve_tool_definition());
-}
-
-fn hippo_retrieve_tool_definition() -> Value {
-    json!({
-        "name": "hippo_retrieve",
-        "description": "HippoRAG 2 graph-resident candidate generation: run query-specific PPR over Page, Phrase, and Hub nodes and return membrane Candidate values. This tool does not rerank or admit to budget.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The retrieval query."
-                },
-                "tenant": {
-                    "type": "string",
-                    "description": "Tenant slug whose graph store is searched. Defaults to the server's default tenant."
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": "Max candidates returned. Default 8.",
-                    "minimum": 1,
-                    "maximum": 100
-                },
-                "include_hubs": {
-                    "type": "boolean",
-                    "description": "Whether Hub nodes can appear as candidates. Default true."
-                },
-                "auto_index_memory": {
-                    "type": "boolean",
-                    "description": "When true, warm a missing HippoRAG index from active MemoryDocument/MemoryNode records before retrieval. Default true."
-                },
-                "index_limit": {
-                    "type": "integer",
-                    "description": "Maximum memory records to warm-index on this call. Default 200.",
-                    "minimum": 1,
-                    "maximum": 5000
-                }
-            },
-            "required": ["query"]
-        }
-    })
 }
 
 fn inject_web_search_graph_tool_definition(response: &mut Value) {
@@ -10259,7 +10246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_tools_list_includes_search_tools() {
+    async fn mcp_tools_list_hides_ambient_retrieval_but_includes_action_search() {
         let state = memory_product_state();
         let config = state.mcp_config();
         let mut response = handle_mcp_request_with_context(
@@ -10273,16 +10260,13 @@ mod tests {
                 "params": {}
             }),
         );
-        super::inject_hippo_retrieve_tool_definition(&mut response);
         super::inject_web_search_graph_tool_definition(&mut response);
 
         let tools = response["result"]["tools"].as_array().unwrap();
-        let hippo_retrieve = tools
-            .iter()
-            .find(|tool| tool["name"] == "hippo_retrieve")
-            .expect("tools/list should advertise hippo_retrieve");
-        assert_eq!(hippo_retrieve["inputSchema"]["required"][0], "query");
-        assert!(hippo_retrieve["inputSchema"]["properties"]["include_hubs"].is_object());
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "hippo_retrieve"),
+            "hippo_retrieve is ambient memory retrieval for the proxy and must not be advertised"
+        );
         let web_search_graph = tools
             .iter()
             .find(|tool| tool["name"] == "web_search_graph")

@@ -24,13 +24,13 @@ pub fn openapi_document() -> Value {
         "info": {
             "title": "Theorem Harness HTTP API",
             "version": API_VERSION,
-            "summary": "HTTP/JSON transport for Theorem's Harness — runs, rooms, jobs, and connectors.",
+            "summary": "HTTP/JSON transport for Theorem's Harness — runs, rooms, compound learning, jobs, and connectors.",
             "description": concat!(
                 "The HTTP surface of `theorem-harness-server`: a thin Axum server over a durable ",
                 "file-backed graph store. It serves the read contract Theorem clients consume ",
-                "(runs, codebase maps, coordination rooms, presence, intents, records, mentions) ",
-                "plus write endpoints for room messages, dispatch jobs, and MCP connector ",
-                "registration.\n\n",
+                "(runs, codebase maps, coordination rooms, presence, intents, records, mentions, ",
+                "and Compound Engineering captures/action candidates) plus write endpoints for ",
+                "room messages, dispatch jobs, and MCP connector registration.\n\n",
                 "Scope: this is the Harness product transport only. The graph engine ",
                 "(`rustyred-thg-server`) is a separate service with its own, larger API published ",
                 "at its own `GET /openapi.json`.\n\n",
@@ -60,6 +60,7 @@ pub fn openapi_document() -> Value {
             { "name": "runs", "description": "Harness run read contract (typed event log per run)." },
             { "name": "maps", "description": "Codebase map artifacts projected into the graph." },
             { "name": "rooms", "description": "Coordination rooms: presence, intents, records, messages, live stream." },
+            { "name": "compound", "description": "Compound Engineering captures, fitness records, and read-only action candidates." },
             { "name": "actors", "description": "Per-actor mention inbox." },
             { "name": "jobs", "description": "Dispatch v2 job board and Postgres dispatch counts." },
             { "name": "connectors", "description": "MCP connector registration and learnable tool affordances." }
@@ -261,6 +262,33 @@ pub fn openapi_document() -> Value {
                                     "room_id": { "type": "string" },
                                     "records": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
                                     "count": { "type": "integer" }
+                                }
+                            } } }
+                        }
+                    }
+                }
+            },
+            "/harness/compound-engineering": {
+                "get": {
+                    "tags": ["compound"],
+                    "summary": "Read Compound Engineering captures, records, and action candidates",
+                    "description": "Returns the passive run-close learning surface as an agent-visible summary. It does not auto-spawn jobs; repeated failures, promotion proposals, demotions, and tensions are surfaced as reviewable action items.",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/Tenant" },
+                        { "name": "cluster_key", "in": "query", "required": false, "schema": { "type": "string" },
+                          "description": "Optional exact cluster key filter." },
+                        { "name": "since", "in": "query", "required": false, "schema": { "type": "string" },
+                          "description": "Optional updated_at lower bound for captures." },
+                        { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50 } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Compound Engineering summary for the tenant.",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "tenant": { "type": "string" },
+                                    "compound_engineering": { "$ref": "#/components/schemas/CompoundEngineeringSummary" }
                                 }
                             } } }
                         }
@@ -540,6 +568,38 @@ pub fn openapi_document() -> Value {
                         "entry_count": { "type": "integer" },
                         "entries": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
                         "markdown_body": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                },
+                "CompoundEngineeringSummary": {
+                    "type": "object",
+                    "description": "Read-only Compound Engineering summary: background captures, gate records, and reviewable action candidates.",
+                    "properties": {
+                        "tenant_slug": { "type": "string" },
+                        "config_hash": { "type": "string" },
+                        "run_counter": { "type": "integer" },
+                        "capture_count": { "type": "integer" },
+                        "record_count": { "type": "integer" },
+                        "action_count": { "type": "integer" },
+                        "captures": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                        "records": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                        "action_items": { "type": "array", "items": { "$ref": "#/components/schemas/CompoundActionItem" } }
+                    },
+                    "additionalProperties": true
+                },
+                "CompoundActionItem": {
+                    "type": "object",
+                    "description": "A suggested follow-up derived from Compound Engineering receipts. It is never executed by this read route.",
+                    "properties": {
+                        "action_id": { "type": "string" },
+                        "action_type": { "type": "string", "examples": ["open_fix_task", "review_promotion_proposal"] },
+                        "title": { "type": "string" },
+                        "summary": { "type": "string" },
+                        "severity": { "type": "string", "examples": ["medium", "high"] },
+                        "cluster_key": { "type": "string" },
+                        "supporting_capture_doc_ids": { "type": "array", "items": { "type": "string" } },
+                        "supporting_record_ids": { "type": "array", "items": { "type": "string" } },
+                        "metadata": { "type": "object", "additionalProperties": true }
                     },
                     "additionalProperties": true
                 },

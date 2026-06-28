@@ -2126,6 +2126,7 @@ fn load_indexed_recall_atoms<S: MemoryGraphStore>(
     candidate_limit: usize,
     input: &RecallMemoryInput,
 ) -> MemoryResult<Vec<RecallAtom>> {
+    #[allow(clippy::map_identity)]
     let mut candidate_ids = indexed_fulltext_seed_scores(store, query, candidate_limit)?
         .into_iter()
         .collect::<Vec<_>>();

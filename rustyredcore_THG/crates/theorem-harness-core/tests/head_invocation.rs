@@ -67,13 +67,13 @@ fn invocation_request_carries_prior_revision_context() {
         vec![
             RevisionContext {
                 revision_id: "scratchrev:proposal".to_string(),
-                kind: HeadInvocationKind::Proposal,
+                kind: HeadInvocationKind::Proposal.as_str().to_string(),
                 output_summary: "proposal summary".to_string(),
                 payload: object_payload(json!({ "text": "proposal body" })),
             },
             RevisionContext {
                 revision_id: "scratchrev:critique".to_string(),
-                kind: HeadInvocationKind::Critique,
+                kind: HeadInvocationKind::Critique.as_str().to_string(),
                 output_summary: "critique summary".to_string(),
                 payload: object_payload(json!({ "text": "critique body" })),
             },

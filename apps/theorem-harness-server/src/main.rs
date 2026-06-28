@@ -10,6 +10,7 @@
 //!   GET /harness/rooms/{room_id}/presence -> { "presence": [...] }
 //!   GET /harness/rooms/{room_id}/intents  -> { "intents": [...] }
 //!   GET /harness/rooms/{room_id}/records  -> { "records": [...] }
+//!   GET /harness/compound-engineering -> { "compound_engineering": {...} }
 //!   POST /harness/rooms/{room_id}/messages -> write a message + emit push (tap/hold)
 //!   GET  /harness/rooms/{room_id}/stream    -> SSE of this room's messages (live)
 //!   GET /harness/actors/{actor}/mentions  -> { "mentions": [...] }
@@ -50,10 +51,10 @@ use theorem_harness_runtime::{
 };
 use theorem_harness_server::push::write_room_message;
 use theorem_harness_server::{
-    connectors_json, github_router, intents_json, map_json, maps_json, mentions_json,
-    openapi_document, presence_json, push_router, records_json, room_json, run_json, runs_json,
-    spawn_wake_listener, Delivery, GithubApp, GithubWebhookState, GraphStoreMapArtifactSink,
-    MessagePost, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
+    compound_engineering_json, connectors_json, github_router, intents_json, map_json, maps_json,
+    mentions_json, openapi_document, presence_json, push_router, records_json, room_json, run_json,
+    runs_json, spawn_wake_listener, Delivery, GithubApp, GithubWebhookState,
+    GraphStoreMapArtifactSink, MessagePost, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
 };
 
 type SharedStore = Arc<Mutex<RedCoreGraphStore>>;
@@ -70,6 +71,8 @@ struct CoordinationQuery {
     urgencies: Option<String>,
     record_type: Option<String>,
     record_types: Option<String>,
+    cluster_key: Option<String>,
+    since: Option<String>,
     consume: Option<bool>,
     limit: Option<usize>,
 }
@@ -221,6 +224,10 @@ async fn main() {
         .route("/harness/rooms/:room_id/presence", get(get_room_presence))
         .route("/harness/rooms/:room_id/intents", get(get_room_intents))
         .route("/harness/rooms/:room_id/records", get(get_room_records))
+        .route(
+            "/harness/compound-engineering",
+            get(get_compound_engineering),
+        )
         .route(
             "/harness/actors/:actor_id/mentions",
             get(get_actor_mentions),
@@ -552,6 +559,23 @@ async fn get_room_records(
         &tenant_slug,
         &room_id,
         &query.record_types(),
+        query.limit.unwrap_or(50),
+    )
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn get_compound_engineering(
+    State(store): State<SharedStore>,
+    Query(query): Query<CoordinationQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let tenant_slug = query.tenant_slug()?;
+    let store = store.lock().expect("store lock");
+    compound_engineering_json(
+        &*store,
+        &tenant_slug,
+        query.cluster_key.as_deref(),
+        query.since.as_deref(),
         query.limit.unwrap_or(50),
     )
     .map(Json)

@@ -169,4 +169,35 @@ mod tests {
         let source = VecMemorySource::new(vec![("cats", "cats are nice")]);
         assert_eq!(inject_memory(&body, &source, 5), body);
     }
+
+    #[test]
+    fn preserves_tool_use_and_tool_result_blocks() {
+        // D4 tool-call parity: injection appends to the last user TEXT turn and must
+        // leave tool_use ids and tool_result blocks byte-identical.
+        let original = json!({
+            "model": "claude",
+            "tools": [{"name": "Read"}],
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file bytes"}
+                ]},
+                {"role": "user", "content": "now tell me about the planner pushdown"}
+            ]
+        });
+        let body = serde_json::to_vec(&original).unwrap();
+        let source = VecMemorySource::new(vec![("planner", "planner.rs pushdown")]);
+        let out: Value = serde_json::from_slice(&inject_memory(&body, &source, 5)).unwrap();
+
+        // The tool_use turn and the tool_result turn survive untouched.
+        assert_eq!(out["messages"][1], original["messages"][1], "tool_use preserved");
+        assert_eq!(out["messages"][2], original["messages"][2], "tool_result preserved");
+        // Injection landed only in the last user text turn.
+        let last = serde_json::to_string(&out["messages"][3]).unwrap();
+        assert!(last.contains("planner.rs"), "memory injected into last user turn");
+        assert!(last.contains("theorem-memory"), "injection delimited");
+    }
 }
