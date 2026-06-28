@@ -81,12 +81,46 @@ cargo run -p rustyred-proxy -- \
 
 The compatibility command `theorem-agentd --proxy` serves the same endpoint.
 
-The proxy serves `POST /v1/messages` on loopback, forwards Anthropic auth and
-beta headers to the upstream provider, streams SSE response bytes through, and
-keeps the request's `system` and `tools` prefix unchanged. Oversized native
-`tool_result` blocks are sampled before forwarding; error/anomaly rows survive,
-the `tool_use_id` is preserved, and the original bytes are available from
-`GET /v1/tool-result-fetch?fetch_handle=...`.
+The proxy serves `POST /v1/messages` on loopback and forwards Anthropic auth and
+beta headers to the selected provider. With resident capabilities enabled, it
+injects hidden cache-stable harness tools, consumes resident `tool_use` blocks
+locally, appends `tool_result` blocks back into context, and returns only the
+final assistant turn to the client. It exposes the selected
+`compute_offload.route_operation` affordance from `rustyred-thg-affordances`
+directly, plus the `tool_search`/`describe`/`invoke` gateway tools for affordance
+discovery and execution. Disable this loop with
+`THEOREM_PROXY_RESIDENT_CAPABILITIES=0` to restore byte-stream passthrough.
+
+Resident tier-two and tier-three `invoke` calls are held when their input carries
+`action_tier` without `human_authorized=true`; the proxy returns an
+`approval_required` tool result with `executed=false` rather than running the
+affordance. Oversized native `tool_result` blocks are sampled before forwarding;
+error/anomaly rows survive, the `tool_use_id` is preserved, and the original
+bytes are available from `GET /v1/tool-result-fetch?fetch_handle=...`.
+
+The resident cascade is gated by corpus calibration. Set
+`THEOREM_PROXY_LOCAL_ANTHROPIC_UPSTREAM` to an Anthropic-compatible local model
+endpoint and `THEOREM_PROXY_CASCADE_CALIBRATION` to a JSON file shaped as:
+
+```json
+{
+  "source": "SPEC-BEHAVIOR-CORPUS.md deliverables 3 and 5",
+  "quality_floor": 0.72,
+  "samples": [
+    { "raw_score": 0.2, "observed_success": false, "weight": 1.0 },
+    { "raw_score": 0.9, "observed_success": true, "weight": 1.0 }
+  ]
+}
+```
+
+If the calibration file is missing, unreadable, invalid, empty, or not sourced
+from the behavior corpus deliverables, the proxy routes upstream.
+
+Advisory verification reads `<proxy-data-dir>/verification_claims.json` or
+`THEOREM_PROXY_VERIFICATION_CLAIMS`. Claims are JSON objects with `claim`,
+`contradicted_by`, `basis`, and optional `checker`; matching assistant text
+causes the proxy to inject a non-blocking verification advisory and ask the model
+to revise instead of failing the turn.
 
 The same proxy exposes the simplified local co-presence protocol from the
 CommonPlace runtime:

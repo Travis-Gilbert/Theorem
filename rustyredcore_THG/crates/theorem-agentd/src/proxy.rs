@@ -1,9 +1,10 @@
 //! Local Anthropic Messages proxy for Claude Code and compatible clients.
 //!
 //! The proxy keeps the Anthropic credential on the local model path and uses the
-//! harness credential only for optional ambient retrieval. It never mutates the
-//! request's system prefix or tools array; all injection happens inside the
-//! latest user turn.
+//! harness credential for optional ambient retrieval and proxy-resident tool
+//! execution. Ambient context is injected into the latest user turn; resident
+//! capabilities are injected as hidden gateway tools and consumed locally before
+//! the client sees a response.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -31,6 +32,7 @@ pub const DEFAULT_PROXY_PORT: u16 = 8484;
 pub const DEFAULT_ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
 pub const DEFAULT_TOOL_RESULT_BUDGET_BYTES: usize = 16 * 1024;
 pub const DEFAULT_AMBIENT_BUDGET_BYTES: usize = 4 * 1024;
+pub const DEFAULT_RESIDENT_MAX_ROUNDS: usize = 4;
 
 static TOOL_RESULT_BODIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
@@ -57,6 +59,11 @@ pub struct ProxyConfig {
     pub tenant_slug: String,
     pub default_room_id: String,
     pub enable_ambient: bool,
+    pub resident_capabilities_enabled: bool,
+    pub local_upstream_base_url: Option<String>,
+    pub cascade_calibration_path: Option<PathBuf>,
+    pub verification_claims_path: Option<PathBuf>,
+    pub resident_max_rounds: usize,
     pub tool_result_budget_bytes: usize,
     pub ambient_budget_bytes: usize,
 }
@@ -99,6 +106,13 @@ impl ProxyConfig {
                 .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true)
         });
+        let local_upstream_base_url = std::env::var("THEOREM_PROXY_LOCAL_ANTHROPIC_UPSTREAM")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let cascade_calibration_path =
+            std::env::var_os("THEOREM_PROXY_CASCADE_CALIBRATION").map(PathBuf::from);
+        let verification_claims_path =
+            std::env::var_os("THEOREM_PROXY_VERIFICATION_CLAIMS").map(PathBuf::from);
         Self {
             bind: cli.bind.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             port: cli
@@ -121,6 +135,15 @@ impl ProxyConfig {
             tenant_slug,
             default_room_id,
             enable_ambient,
+            resident_capabilities_enabled: crate::resident::resident_enabled_from_env(),
+            local_upstream_base_url,
+            cascade_calibration_path,
+            verification_claims_path,
+            resident_max_rounds: std::env::var("THEOREM_PROXY_RESIDENT_MAX_ROUNDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|rounds| *rounds > 0)
+                .unwrap_or(DEFAULT_RESIDENT_MAX_ROUNDS),
             tool_result_budget_bytes: std::env::var("THEOREM_PROXY_TOOL_RESULT_BUDGET_BYTES")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -137,10 +160,11 @@ impl ProxyConfig {
     }
 
     fn upstream_messages_url(&self, request_uri: &Uri) -> String {
-        let mut url = format!(
-            "{}/v1/messages",
-            self.upstream_base_url.trim_end_matches('/')
-        );
+        self.messages_url_for_base(&self.upstream_base_url, request_uri)
+    }
+
+    fn messages_url_for_base(&self, base_url: &str, request_uri: &Uri) -> String {
+        let mut url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
         if let Some(query) = request_uri.query() {
             url.push('?');
             url.push_str(query);
@@ -999,11 +1023,26 @@ async fn proxy_messages(
     )
     .unwrap_or_else(|| body.to_vec());
 
+    if state.config.resident_capabilities_enabled {
+        if let Ok(value) = serde_json::from_slice::<Value>(&transformed) {
+            return proxy_messages_with_resident_loop(&state, &uri, &headers, value).await;
+        }
+    }
+
+    proxy_messages_passthrough(&state, &uri, &headers, transformed).await
+}
+
+async fn proxy_messages_passthrough(
+    state: &ProxyState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+) -> Response {
     let url = state.config.upstream_messages_url(&uri);
     let mut request = state
         .http
         .request(Method::POST, url)
-        .body(transformed)
+        .body(body)
         .header("content-type", "application/json");
     for (name, value) in headers.iter() {
         if request_header_allowed(name) {
@@ -1052,6 +1091,211 @@ async fn proxy_messages(
         })
 }
 
+async fn proxy_messages_with_resident_loop(
+    state: &ProxyState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    mut request: Value,
+) -> Response {
+    let original_stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    request["stream"] = json!(false);
+    crate::resident::inject_resident_tools(&mut request);
+
+    let mut verification_advised = false;
+    let max_rounds = state.config.resident_max_rounds.max(1);
+    for _ in 0..max_rounds {
+        let latest_user = latest_user_text_from_value(&request);
+        let decision = crate::resident::route_with_calibration_file(
+            state.config.cascade_calibration_path.as_deref(),
+            &latest_user,
+            state.config.local_upstream_base_url.is_some(),
+        );
+        let upstream_base = match decision.selected {
+            crate::resident::CascadeRouteTarget::Local => state
+                .config
+                .local_upstream_base_url
+                .as_deref()
+                .unwrap_or(&state.config.upstream_base_url),
+            crate::resident::CascadeRouteTarget::Upstream
+            | crate::resident::CascadeRouteTarget::CalibrationRequired => {
+                &state.config.upstream_base_url
+            }
+        };
+        let assistant = match send_upstream_json(state, uri, headers, &request, upstream_base).await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+
+        let tool_uses = crate::resident::resident_tool_uses(&assistant);
+        if !tool_uses.is_empty() {
+            let mut results = Vec::with_capacity(tool_uses.len());
+            for tool_use in tool_uses {
+                results.push(execute_resident_tool_use(state, tool_use).await);
+            }
+            crate::resident::append_tool_results(&mut request, &assistant, results);
+            continue;
+        }
+
+        if !verification_advised {
+            let claims = crate::resident::load_verification_claims(
+                state.config.verification_claims_path.as_deref(),
+                &state.config.data_dir,
+            );
+            let findings = crate::resident::verification_findings(
+                &crate::resident::assistant_text(&assistant),
+                &claims,
+            );
+            if !findings.is_empty() {
+                verification_advised = true;
+                crate::resident::append_verification_advisory(&mut request, &assistant, &findings);
+                continue;
+            }
+        }
+
+        return final_messages_response(assistant, original_stream);
+    }
+
+    proxy_json_error(
+        StatusCode::LOOP_DETECTED,
+        "theorem_proxy_resident_round_limit",
+        "resident tool loop exceeded THEOREM_PROXY_RESIDENT_MAX_ROUNDS",
+    )
+}
+
+async fn send_upstream_json(
+    state: &ProxyState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &Value,
+    base_url: &str,
+) -> Result<Value, Response> {
+    let bytes = serde_json::to_vec(body).map_err(|error| {
+        proxy_json_error(
+            StatusCode::BAD_GATEWAY,
+            "theorem_proxy_request_encode_error",
+            &error.to_string(),
+        )
+    })?;
+    let url = state.config.messages_url_for_base(base_url, uri);
+    let mut request = state
+        .http
+        .request(Method::POST, url)
+        .body(bytes)
+        .header("content-type", "application/json");
+    for (name, value) in headers.iter() {
+        if request_header_allowed(name) {
+            request = request.header(name, value);
+        }
+    }
+
+    let upstream = request.send().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": {
+                    "type": "theorem_proxy_upstream_error",
+                    "message": error.to_string()
+                }
+            })),
+        )
+            .into_response()
+    })?;
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let response_headers = upstream.headers().clone();
+    let bytes = upstream.bytes().await.map_err(|error| {
+        proxy_json_error(
+            StatusCode::BAD_GATEWAY,
+            "theorem_proxy_upstream_read_error",
+            &error.to_string(),
+        )
+    })?;
+    if !status.is_success() {
+        let mut builder = Response::builder().status(status);
+        for (name, value) in response_headers.iter() {
+            if response_header_allowed(name) {
+                builder = builder.header(name, value);
+            }
+        }
+        return Err(builder.body(Body::from(bytes)).unwrap_or_else(|error| {
+            proxy_json_error(
+                StatusCode::BAD_GATEWAY,
+                "theorem_proxy_response_error",
+                &error.to_string(),
+            )
+        }));
+    }
+    serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+        proxy_json_error(
+            StatusCode::BAD_GATEWAY,
+            "theorem_proxy_upstream_invalid_json",
+            &format!("upstream Messages response was not JSON: {error}"),
+        )
+    })
+}
+
+async fn execute_resident_tool_use(
+    state: &ProxyState,
+    tool_use: crate::resident::ResidentToolUse,
+) -> Value {
+    if let Some(hold) = crate::resident::approval_required_payload(&tool_use) {
+        return crate::resident::tool_result_block(&tool_use.id, hold, false);
+    }
+    let (gateway_name, arguments) =
+        crate::resident::gateway_call_for_tool_use(&tool_use, &state.config.tenant_slug);
+    match call_harness_tool_value(state, &gateway_name, arguments.clone()).await {
+        Ok(payload) => crate::resident::tool_result_block(&tool_use.id, payload, false),
+        Err(message) => {
+            let fallback_input =
+                if crate::resident::resident_tool_name_to_affordance_id(&tool_use.name).is_some() {
+                    &tool_use.input
+                } else {
+                    &arguments
+                };
+            if let Some(payload) = crate::resident::fallback_tool_result(
+                &tool_use.name,
+                fallback_input,
+                &state.config.tenant_slug,
+            ) {
+                return crate::resident::tool_result_block(&tool_use.id, payload, false);
+            }
+            crate::resident::tool_result_block(
+                &tool_use.id,
+                json!({
+                    "error": "resident_tool_failed",
+                    "tool_name": tool_use.name,
+                    "gateway_tool_name": gateway_name,
+                    "message": message
+                }),
+                true,
+            )
+        }
+    }
+}
+
+fn final_messages_response(message: Value, stream: bool) -> Response {
+    if stream {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(crate::resident::anthropic_sse_from_message(
+                &message,
+            )))
+            .unwrap_or_else(|error| {
+                proxy_json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "theorem_proxy_sse_encode_error",
+                    &error.to_string(),
+                )
+            });
+    }
+    Json(message).into_response()
+}
+
 fn request_header_allowed(name: &HeaderName) -> bool {
     !matches!(
         *name,
@@ -1068,6 +1312,23 @@ async fn call_harness_tool(
     name: &str,
     arguments: Value,
 ) -> Result<Value, Response> {
+    call_harness_tool_value(state, name, arguments)
+        .await
+        .map_err(|message| {
+            let status = if message.contains("timed out") {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            proxy_json_error(status, "theorem_proxy_harness_error", &message)
+        })
+}
+
+async fn call_harness_tool_value(
+    state: &ProxyState,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
     let request = state.http.post(&state.config.harness_mcp_url).json(&json!({
         "jsonrpc": "2.0",
         "id": format!("theorem-proxy-{name}"),
@@ -1080,46 +1341,21 @@ async fn call_harness_tool(
     let request = apply_harness_auth(&state.config, request);
     let response = match tokio::time::timeout(Duration::from_secs(5), request.send()).await {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            return Err(proxy_json_error(
-                StatusCode::BAD_GATEWAY,
-                "theorem_proxy_harness_error",
-                &format!("harness MCP {name} call failed: {error}"),
-            ))
-        }
-        Err(_) => {
-            return Err(proxy_json_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "theorem_proxy_harness_timeout",
-                &format!("harness MCP {name} call timed out"),
-            ))
-        }
+        Ok(Err(error)) => return Err(format!("harness MCP {name} call failed: {error}")),
+        Err(_) => return Err(format!("harness MCP {name} call timed out")),
     };
     let status = response.status();
     let value = match response.json::<Value>().await {
         Ok(value) => value,
-        Err(error) => {
-            return Err(proxy_json_error(
-                StatusCode::BAD_GATEWAY,
-                "theorem_proxy_harness_invalid_json",
-                &format!("harness MCP {name} returned invalid JSON: {error}"),
-            ))
-        }
+        Err(error) => return Err(format!("harness MCP {name} returned invalid JSON: {error}")),
     };
     if !status.is_success() {
-        return Err(proxy_json_error(
-            StatusCode::BAD_GATEWAY,
-            "theorem_proxy_harness_http_error",
-            &format!("harness MCP {name} returned HTTP {status}: {value}"),
+        return Err(format!(
+            "harness MCP {name} returned HTTP {status}: {value}"
         ));
     }
-    mcp_payload_from_response(&value).map_err(|message| {
-        proxy_json_error(
-            StatusCode::BAD_GATEWAY,
-            "theorem_proxy_harness_tool_error",
-            &format!("harness MCP {name} failed: {message}"),
-        )
-    })
+    mcp_payload_from_response(&value)
+        .map_err(|message| format!("harness MCP {name} failed: {message}"))
 }
 
 fn apply_harness_auth(
@@ -1257,14 +1493,22 @@ fn ambient_text_from_mcp(value: &Value) -> Option<String> {
 
 pub fn latest_user_text(raw_body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(raw_body).ok()?;
-    let messages = value.get("messages")?.as_array()?;
+    Some(latest_user_text_from_value(&value))
+}
+
+fn latest_user_text_from_value(value: &Value) -> String {
+    let Some(messages) = value.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
     for message in messages.iter().rev() {
         if message.get("role").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        return Some(content_text(message.get("content")?));
+        if let Some(content) = message.get("content") {
+            return content_text(content);
+        }
     }
-    None
+    String::new()
 }
 
 fn content_text(content: &Value) -> String {
@@ -1566,6 +1810,11 @@ mod tests {
             tenant_slug: "Travis-Gilbert".to_string(),
             default_room_id: "repo:theorem:branch:main".to_string(),
             enable_ambient: false,
+            resident_capabilities_enabled: true,
+            local_upstream_base_url: None,
+            cascade_calibration_path: None,
+            verification_claims_path: None,
+            resident_max_rounds: DEFAULT_RESIDENT_MAX_ROUNDS,
             tool_result_budget_bytes: DEFAULT_TOOL_RESULT_BUDGET_BYTES,
             ambient_budget_bytes: DEFAULT_AMBIENT_BUDGET_BYTES,
         }
@@ -1652,6 +1901,65 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("theorem_ambient_context"));
+    }
+
+    #[test]
+    fn resident_mode_injects_gateway_tools_without_touching_prefix() {
+        let mut request = base_request(json!("find compute affordances"));
+        crate::resident::inject_resident_tools(&mut request);
+        assert_eq!(request["system"], "stable system prefix");
+        let tool_names = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"demo"));
+        assert!(tool_names.contains(&crate::resident::TOOL_SEARCH));
+        assert!(tool_names.contains(&crate::resident::DESCRIBE));
+        assert!(tool_names.contains(&crate::resident::INVOKE));
+        assert!(tool_names.contains(&crate::resident::DIRECT_COMPUTE_OFFLOAD_ROUTE));
+    }
+
+    #[test]
+    fn messages_url_for_base_preserves_request_query() {
+        let config = proxy_config();
+        let uri = "/v1/messages?beta=1".parse::<Uri>().unwrap();
+        assert_eq!(
+            config.messages_url_for_base("http://127.0.0.1:11434/", &uri),
+            "http://127.0.0.1:11434/v1/messages?beta=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_direct_affordance_resolves_inline_without_installed_mcp() {
+        let mut config = proxy_config();
+        config.harness_mcp_url = "http://127.0.0.1:9/mcp".to_string();
+        let state = ProxyState {
+            config,
+            http: reqwest::Client::builder().build().unwrap(),
+            presence: LocalPresenceRegistry::new(),
+        };
+        let block = execute_resident_tool_use(
+            &state,
+            crate::resident::ResidentToolUse {
+                id: "toolu_direct".to_string(),
+                name: crate::resident::DIRECT_COMPUTE_OFFLOAD_ROUTE.to_string(),
+                input: json!({
+                    "operations": [{
+                        "operation_id": "verify",
+                        "kind": "verification_check",
+                        "quality_floor": 0.9
+                    }]
+                }),
+            },
+        )
+        .await;
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["is_error"], false);
+        let content = block["content"].as_str().unwrap();
+        assert!(content.contains("offload_plan"));
+        assert!(content.contains("verify"));
     }
 
     #[test]

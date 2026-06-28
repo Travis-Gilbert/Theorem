@@ -41,7 +41,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `scene-os-core` | Rust SceneOS atom, catalog, selection, and package compiler contracts for Theorem. |
 | `scene-os-web` | Theorem SceneOS renderer bundle (Lane B): embeds the self-contained canvas renderer and serves a scene-package-v2 as one HTML asset, the SERP injection pattern. |
 | `theorem-acp` | CommonPlace ACP host: subprocess JSON-RPC, harness MCP injection, scoped file review, PTY command approval, and copresence registration. |
-| `theorem-agentd` | Local Theorem assistant daemon: OpenAI-compatible model loop, MCP tool host, receiver sidecar, and compute-offload ledger. |
+| `theorem-agentd` | Local Theorem assistant daemon: OpenAI-compatible model loop, MCP tool host, receiver sidecar, compute-offload ledger, and the shared local proxy module with resident harness affordances, cascade routing, and advisory verification. |
 | `theorem-browser-agent` | Rust-native Theorem browser-use perceive/govern/afford contracts and kernels. |
 | `theorem-copresence` | Headless co-presence peer and surface-adapter seam over the RustyRed substrate. |
 | `theorem-dispatch` | Postgres hot execution queue for Theorem Dispatch v2. |
