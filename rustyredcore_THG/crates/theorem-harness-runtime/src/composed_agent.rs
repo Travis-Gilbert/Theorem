@@ -101,15 +101,25 @@ pub fn run_composed_agent_with_claims<S: GraphStore>(
             "composed_agent_run requires task".to_string(),
         ));
     }
-    let binding = match load_binding(store, &binding_id)? {
+    let mut binding = match load_binding(store, &binding_id)? {
         Some(binding) => binding,
         None => default_theorem_binding(&binding_id)?,
     };
+    // S3 memory continuity: pin the composition hash before computing the
+    // lineage so the binding's identity is stable when the lineage walker
+    // runs. The walker itself excludes the current binding by its node id
+    // (keyed by `run_id`), not by `composition_hash` -- see
+    // `lineage_memory_for_binding` -- so prior runs that happen to share
+    // the same head roster still surface their lineage memory.
+    if binding.identity.composition_hash.is_empty() {
+        binding.identity.composition_hash = composition_hash(&binding);
+    }
     let mut input = FakeIntraAgentLoopInput::new(task, claims);
     input.budget_units = composed_agent_budget_units()?;
     input.max_parallel_heads = input
         .max_parallel_heads
         .max(binding.reasoning_core_ids().len());
+    input.lineage_memory = crate::binding_store::lineage_memory_for_binding(store, &binding)?;
     let result = run_intra_agent_loop_with_invoker(binding, input, invoker)?;
     persist_binding_run_result(store, &result.binding, &result.events)?;
     let policy_event = result
@@ -173,12 +183,21 @@ pub fn run_configured_composed_agent_with_claims<S: GraphStore>(
         None => default_theorem_binding(&binding_id)?,
     };
     let binding = runtime_candidate_binding(binding)?;
-    let binding = binding_with_available_runtime_heads(binding)?;
+    let mut binding = binding_with_available_runtime_heads(binding)?;
+    // S3 memory continuity: pin the composition hash before lineage so the
+    // binding's identity is stable when the lineage walker runs. The walker
+    // excludes the current binding by its node id (keyed by `run_id`), so
+    // prior runs that share the same head roster still surface their
+    // lineage memory.
+    if binding.identity.composition_hash.is_empty() {
+        binding.identity.composition_hash = composition_hash(&binding);
+    }
     let mut input = FakeIntraAgentLoopInput::new(task, claims);
     input.budget_units = composed_agent_budget_units()?;
     input.max_parallel_heads = input
         .max_parallel_heads
         .max(binding.reasoning_core_ids().len());
+    input.lineage_memory = crate::binding_store::lineage_memory_for_binding(store, &binding)?;
 
     let registry = AgentHeadRegistry::from_binding(&binding)
         .map_err(|error| ComposedAgentRuntimeError::Loop(IntraAgentLoopError::Registry(error)))?;
@@ -371,16 +390,58 @@ fn run_single_head_agent<I: HeadInvoker>(
 
     let scope_id = binding.working_memory_scope.scope_id.clone();
     let scratchpad_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    let mut mounted_payload = json!({
+        "scope_id": scope_id,
+        "scratchpad_id": scratchpad_id
+    });
+    if !input.lineage_memory.is_empty() {
+        let lineage_array = input
+            .lineage_memory
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(entry)
+                    .expect("BindingLineageMemoryEntry serialization should be infallible")
+            })
+            .collect::<Vec<_>>();
+        if let Some(payload_obj) = mounted_payload.as_object_mut() {
+            payload_obj.insert(
+                "lineage_size".to_string(),
+                Value::Number(serde_json::Number::from(input.lineage_memory.len())),
+            );
+            payload_obj.insert("lineage_memory".to_string(), Value::Array(lineage_array));
+        }
+    }
+    // Pin the scratchpad length BEFORE MOUNTED runs so the post-MOUNTED
+    // capture iterates only the newly appended revisions, matching the
+    // multi-head loop's behaviour and preventing pre-existing
+    // `lineage:agent_published` revisions on the loaded binding from
+    // re-entering the loop's local `revisions` vec.
+    let mounted_revision_start = binding.working_memory_scope.scratchpad.revisions.len();
     binding = apply_step(
         binding,
         "MEMORY_SCOPE.MOUNTED",
-        object_payload(json!({
-            "scope_id": scope_id,
-            "scratchpad_id": scratchpad_id
-        })),
+        object_payload(mounted_payload),
         &input.started_at,
         &mut events,
     )?;
+    // Mirror the multi-head loop: when MOUNTED projected lineage_memory
+    // entries as scratchpad revisions, surface them onto the local
+    // `revisions` vec so the single head's `invoke_head` call includes
+    // them in `prior_revision_ids` (otherwise the single head never sees
+    // the inherited lineage memory).
+    if !input.lineage_memory.is_empty() {
+        for revision in binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .skip(mounted_revision_start)
+        {
+            if revision.actor_head_id == "lineage:agent_published" {
+                revisions.push(revision.clone());
+            }
+        }
+    }
     binding = apply_step(
         binding,
         "CHARTER.COMPILED",
@@ -992,6 +1053,217 @@ mod tests {
         );
         assert!(!result.published_claims.is_empty());
         assert_eq!(result.events.last().unwrap().event_type, "RUN.CLOSED");
+    }
+
+    // --- F3 (PR #73 CodeRabbit): single-head flow threads lineage memory ----
+    //
+    // The single-head flow (only one provider key set) projects lineage
+    // memory into MOUNTED but, before the fix, never threaded the synthetic
+    // `lineage:agent_published` revisions into the local `revisions` vec
+    // the single head's `invoke_head` call uses. Seed a prior published
+    // binding for the same agent, run single-head, and prove the head's
+    // receipt carries the lineage revision in its `prior_revision_ids`.
+    #[test]
+    fn configured_single_head_run_threads_lineage_memory_into_head_request() {
+        use crate::binding_store::append_binding_transition;
+        let _env = ScopedEnv::new([("DEEPSEEK_API_KEY", "deepseek-test-secret")]);
+        let mut store = InMemoryGraphStore::new();
+
+        // Plant a prior fully-published binding for agent_id "theorem" with a
+        // distinct run_id (the lineage walker excludes only the CURRENT
+        // binding's node id, so same-composition prior runs still surface).
+        // The prior binding needs at least 2 distinct heads so the
+        // `consensus_below_threshold` guard accepts its publication; the
+        // current single-head run still gets the lineage memory threaded.
+        let mut prior = default_theorem_binding_with_two_heads("agent:prior-published");
+        prior.identity.composition_hash =
+            theorem_harness_core::composition_hash(&prior);
+        for (event_type, payload) in lineage_v1_lifecycle_events_for_prior() {
+            let transition = BindingTransitionInput::new(
+                event_type,
+                payload.as_object().cloned().unwrap_or_default(),
+            )
+            .at("2026-06-27T00:00:00Z");
+            prior = append_binding_transition(&mut store, prior, transition)
+                .unwrap()
+                .binding;
+        }
+        assert_eq!(prior.lifecycle.status, "closed");
+
+        // Now run the single-head flow. The single head must see the lineage
+        // memory revision_id in its proposal request's prior_revision_ids.
+        let result = run_configured_composed_agent_with_claims(
+            &mut store,
+            "agent:single-head-lineage",
+            "publish",
+            vec![GroundedClaim::new("grounded", "source:1")],
+            &FakeHeadInvoker::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.consensus_head_set, vec!["deepseek"]);
+        assert_eq!(result.invocation_receipts.len(), 1);
+
+        // FakeHeadInvoker writes `prior_revision_ids` into its receipt
+        // payload; read it back to assert the lineage revision was threaded.
+        let proposal = &result.invocation_receipts[0];
+        let prior_ids = proposal
+            .payload
+            .get("prior_revision_ids")
+            .and_then(Value::as_array)
+            .expect("FakeHeadInvoker stuffs prior_revision_ids into the receipt payload");
+        let prior_id_strings = prior_ids
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        // Look up the just-mounted lineage revision id on the binding
+        // scratchpad and assert it appears in the head's prior_revision_ids.
+        let lineage_revisions: Vec<_> = result
+            .scratchpad_revisions
+            .iter()
+            .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+            .collect();
+        assert_eq!(
+            lineage_revisions.len(),
+            1,
+            "single-head MOUNTED must project one lineage memory revision"
+        );
+        let lineage_revision_id = lineage_revisions[0].revision_id.as_str();
+        assert!(
+            prior_id_strings.contains(&lineage_revision_id),
+            "F3: single-head proposal must carry the lineage revision_id in prior_revision_ids; got {prior_id_strings:?}",
+        );
+    }
+
+    // Prior binding with two ReasoningCore heads so the publication-time
+    // consensus guard accepts it. The heads use distinct ids that the
+    // lifecycle events below reference in HEADS.CONTRIBUTE/DRAFTS.SYNTHESIZED.
+    fn default_theorem_binding_with_two_heads(run_id: &str) -> AgentBinding {
+        let heads = vec![
+            AgentHead {
+                head_id: "claude-prior".to_string(),
+                display_name: "claude-prior".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude".to_string(),
+                credential_ref: "credential:claude-prior".to_string(),
+                transport: HeadTransport::Api,
+                kind: HeadKind::ReasoningCore,
+                capabilities: Vec::new(),
+                cost_profile: HeadCostProfile::default(),
+                reliability_profile: HeadReliabilityProfile::default(),
+                allowed_tools: Vec::new(),
+                trace_tier: TraceTier::Receipt,
+            },
+            AgentHead {
+                head_id: "deepseek-prior".to_string(),
+                display_name: "deepseek-prior".to_string(),
+                provider: "deepseek".to_string(),
+                model: "v4".to_string(),
+                credential_ref: "credential:deepseek-prior".to_string(),
+                transport: HeadTransport::Api,
+                kind: HeadKind::ReasoningCore,
+                capabilities: Vec::new(),
+                cost_profile: HeadCostProfile::default(),
+                reliability_profile: HeadReliabilityProfile::default(),
+                allowed_tools: Vec::new(),
+                trace_tier: TraceTier::Receipt,
+            },
+        ];
+        let mut binding = AgentBinding::new(
+            BindingIdentity {
+                agent_id: "theorem".to_string(),
+                owner_id: "travis".to_string(),
+                agent_name: "Theorem".to_string(),
+                composition_hash: String::new(),
+                version: 1,
+                trust_tier: "first_party".to_string(),
+                active_head_set: vec!["claude-prior".to_string(), "deepseek-prior".to_string()],
+                agent_constitution: None,
+            },
+            BindingComposition { heads },
+            BindingBudgetScope::new("theorem", 100.0, 2),
+        )
+        .unwrap();
+        binding.lifecycle.run_id = run_id.to_string();
+        binding
+    }
+
+    // Lifecycle events for the prior binding F3 plants. The
+    // HEADS.CONTRIBUTE / DRAFTS.SYNTHESIZED entries match the head ids that
+    // `default_theorem_binding_with_two_heads` produces so the consensus
+    // guard accepts the publication. Mirrors the same canonical sequence
+    // as `binding_store::tests::lineage_v1_lifecycle_events`.
+    fn lineage_v1_lifecycle_events_for_prior() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "BINDING.RESOLVED",
+                json!({ "binding_id": "agent:prior-published", "composition_hash": "ignored" }),
+            ),
+            (
+                "HEADS.PROBED",
+                json!({ "probed_head_set": ["claude-prior", "deepseek-prior"] }),
+            ),
+            (
+                "MEMORY_SCOPE.MOUNTED",
+                json!({ "scope_id": "bindingscope:theorem", "scratchpad_id": "scratchpad:theorem" }),
+            ),
+            (
+                "CHARTER.COMPILED",
+                json!({ "charter_hash": "charter:1", "stance": "grounded composed agent" }),
+            ),
+            (
+                "CAPABILITIES.SELECTED",
+                json!({ "capability_scope_hash": "cap:1", "visible_tools": ["datalog"], "callable_tools": ["datalog"] }),
+            ),
+            (
+                "BUDGET.ALLOCATED",
+                json!({ "budget_units": 25.0, "max_parallel_heads": 2 }),
+            ),
+            (
+                "RUN.STARTED",
+                json!({ "task": "answer", "started_at": "2026-06-27T00:00:00Z" }),
+            ),
+            (
+                "PRIVATE_WORK.OPENED",
+                json!({ "scratchpad_revision_id": "scratchrev:1" }),
+            ),
+            (
+                "HEADS.CONTRIBUTE",
+                json!({ "head_id": "claude-prior", "contribution_id": "contrib:1", "contribution_kind": "proposal" }),
+            ),
+            (
+                "DRAFTS.SYNTHESIZED",
+                json!({ "synthesis_id": "synth:1", "contributing_heads": ["claude-prior", "deepseek-prior"] }),
+            ),
+            (
+                "PUBLICATION.PROPOSED",
+                json!({ "publication_id": "pub:1", "draft_hash": "draft:1" }),
+            ),
+            (
+                "POLICY.CHECKED",
+                json!({
+                    "policy_receipt_id": "policy:1",
+                    "allowed": true,
+                    "claims": [{ "text": "grounded", "provenance": "src:1" }]
+                }),
+            ),
+            (
+                "PUBLISHED_TO_SUBSTRATE",
+                json!({ "publication_id": "pub:1", "substrate_receipt_id": "substrate:1" }),
+            ),
+            (
+                "OUTCOME.RECORDED",
+                json!({ "outcome_id": "outcome:1", "accepted": true, "summary": "published" }),
+            ),
+            (
+                "MEMORY_PATCHES.PROPOSED",
+                json!({ "patch_ids": ["patch:1"], "review_required": true }),
+            ),
+            (
+                "RUN.CLOSED",
+                json!({ "summary": "closed", "closed_by": "claude-code" }),
+            ),
+        ]
     }
 
     #[test]

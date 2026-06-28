@@ -8,9 +8,9 @@
 
 use crate::agent_binding::{
     apply_binding_transition, AgentBinding, BindingBudgetDecision, BindingError, BindingEventState,
-    BindingHeadOutcome, BindingRoutingDecision, BindingSubtask, BindingTransitionInput,
-    BindingTransitionResult, BindingVerificationOutcome, HeadKind, ScratchpadRelationKind,
-    ScratchpadRevision, ScratchpadRevisionLink,
+    BindingHeadOutcome, BindingLineageMemoryEntry, BindingRoutingDecision, BindingSubtask,
+    BindingTransitionInput, BindingTransitionResult, BindingVerificationOutcome, HeadKind,
+    ScratchpadRelationKind, ScratchpadRevision, ScratchpadRevisionLink,
 };
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
 use crate::constitution::Constitution;
@@ -107,6 +107,16 @@ pub struct FakeIntraAgentLoopInput {
     pub user_model: Option<UserModel>,
     pub started_at: String,
     pub closed_by: String,
+    /// S3 memory continuity: prior `AgentPublished` memory entries to thread
+    /// into the binding's `MEMORY_SCOPE.MOUNTED` event so the new binding
+    /// inherits Context from its lineage. `#[serde(default)]` keeps existing
+    /// JSON inputs (which never carried this field) deserializable. Callers
+    /// that compute lineage off a `GraphStore` (e.g. the runtime's
+    /// `lineage_memory_for_binding`) populate this before running the loop;
+    /// the loop dispatches it through MOUNTED so the kernel projects each
+    /// entry as a scratchpad revision before `HEADS.CONTRIBUTE`.
+    #[serde(default)]
+    pub lineage_memory: Vec<BindingLineageMemoryEntry>,
 }
 
 impl FakeIntraAgentLoopInput {
@@ -136,6 +146,7 @@ impl FakeIntraAgentLoopInput {
             user_model: None,
             started_at: "2026-06-02T00:00:00Z".to_string(),
             closed_by: "fake-loop".to_string(),
+            lineage_memory: Vec::new(),
         }
     }
 }
@@ -230,6 +241,9 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
 
     let scope_id = binding.working_memory_scope.scope_id.clone();
     let scratchpad_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    // Build the MOUNTED payload, merging in both S2's optional `user_model`
+    // and S3's optional `lineage_memory`. Both arms are independent: the
+    // payload may carry either, both, or neither.
     let mut mount_payload = object_payload(json!({
         "scope_id": scope_id,
         "scratchpad_id": scratchpad_id
@@ -241,6 +255,28 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
                 .expect("UserModel serialization should be infallible"),
         );
     }
+    if !input.lineage_memory.is_empty() {
+        let lineage_array = input
+            .lineage_memory
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(entry)
+                    .expect("BindingLineageMemoryEntry serialization should be infallible")
+            })
+            .collect::<Vec<_>>();
+        mount_payload.insert(
+            "lineage_size".to_string(),
+            Value::Number(serde_json::Number::from(input.lineage_memory.len())),
+        );
+        mount_payload.insert("lineage_memory".to_string(), Value::Array(lineage_array));
+    }
+    // Pin the scratchpad length BEFORE MOUNTED runs so the post-MOUNTED
+    // captures iterate ONLY the newly appended revisions. Without this
+    // anchor, a binding loaded with pre-existing `binding:mount` or
+    // `lineage:agent_published` revisions on its scratchpad (e.g. from a
+    // previous run that persisted state) would re-add those stale revisions
+    // to the loop's local `revisions` vec.
+    let mounted_revision_start = binding.working_memory_scope.scratchpad.revisions.len();
     binding = apply_step(
         binding,
         "MEMORY_SCOPE.MOUNTED",
@@ -249,22 +285,49 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &mut events,
     )?
     .binding;
-    // PR #72 P2: when a user_model was mounted, the MOUNTED arm appended a
-    // `binding:mount` Context revision to the binding's scratchpad inside
-    // `apply_binding_payload`. The local `revisions` vec is what later
-    // `invoke_head` calls use to build `prior_revision_ids` and
-    // `prior_context`, so propagate the just-appended mount revision here
-    // -- otherwise the proposal/critique/synthesis/verification heads never
-    // see the user_model and the slice's purpose is defeated.
+    // PR #72 P2 (S2): when a user_model was mounted, the MOUNTED arm
+    // appended a `binding:mount` Context revision to the binding's
+    // scratchpad inside `apply_binding_payload`. The local `revisions` vec
+    // is what later `invoke_head` calls use to build `prior_revision_ids`
+    // and `prior_context`, so propagate the just-appended mount revision
+    // here -- otherwise the proposal/critique/synthesis/verification heads
+    // never see the user_model and the slice's purpose is defeated. Search
+    // only the slice appended in this MOUNTED call so we never re-capture
+    // a stale mount revision from a prior run on the same binding.
     if input.user_model.is_some() {
         if let Some(last) = binding
             .working_memory_scope
             .scratchpad
             .revisions
-            .last()
-            .filter(|revision| revision.actor_head_id == "binding:mount")
+            .iter()
+            .skip(mounted_revision_start)
+            .rev()
+            .find(|revision| revision.actor_head_id == "binding:mount")
         {
             revisions.push(last.clone());
+        }
+    }
+    // P1 (S3): when MOUNTED projected lineage_memory entries as scratchpad
+    // revisions (attributed to the synthetic `lineage:agent_published`
+    // actor), capture them onto the loop's local `revisions` vec so the
+    // first proposal/critique/synthesis `invoke_head` call surfaces them in
+    // `prior_revision_ids` (and the kernel sees them as prior context the
+    // heads must read). Without this, the kernel mounts the memory into
+    // the binding but the heads never see it. Iterate only the slice
+    // appended in this MOUNTED call so any pre-existing
+    // `lineage:agent_published` revisions on the loaded binding are left
+    // alone.
+    if !input.lineage_memory.is_empty() {
+        for revision in binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .skip(mounted_revision_start)
+        {
+            if revision.actor_head_id == "lineage:agent_published" {
+                revisions.push(revision.clone());
+            }
         }
     }
 
