@@ -6,11 +6,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use theorem_proxy::memory::{DirectoryMemorySource, MemorySource};
-use theorem_proxy::{serve, ProxyConfig};
+use theorem_proxy::{resolve_memory, run_wrapped, serve, ProxyConfig};
 
 #[derive(Parser)]
 #[command(
@@ -30,10 +28,53 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "https://api.anthropic.com")]
         upstream: String,
-        /// Directory of `*.md` memories to inject ambiently (D3). Omit for faithful
-        /// passthrough.
-        #[arg(long)]
+        /// Live local Theorem node MCP endpoint (e.g. http://127.0.0.1:8790/mcp). When
+        /// set, ambient memory is the node's relevance-ranked graph memory
+        /// (`hippo_retrieve`). Takes precedence over --memory-dir.
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_URL")]
+        memory_url: Option<String>,
+        /// Tenant slug for the node memory query (optional; node default if omitted).
+        #[arg(long, env = "THEOREM_PROXY_TENANT")]
+        tenant: Option<String>,
+        /// Directory of `*.md` memories to inject ambiently. Fallback when no node URL
+        /// is set; omit both for faithful passthrough.
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_DIR")]
         memory_dir: Option<PathBuf>,
+        /// D2 membrane: max inline tool_result bytes before the latest turn's oversized
+        /// results are sampled (full output served at /tool_result/{id}). 0 = off.
+        #[arg(long, default_value_t = 0)]
+        membrane_threshold: usize,
+    },
+    /// Start the proxy and run a command (e.g. `claude`) pointed at it -- one command,
+    /// no manual ANTHROPIC_BASE_URL export. Put the command after `--`.
+    Wrap {
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        #[arg(long, default_value = "https://api.anthropic.com")]
+        upstream: String,
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_URL")]
+        memory_url: Option<String>,
+        #[arg(long, env = "THEOREM_PROXY_TENANT")]
+        tenant: Option<String>,
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_DIR")]
+        memory_dir: Option<PathBuf>,
+        /// D2 membrane threshold in bytes (0 = off). See `proxy --help`.
+        #[arg(long, default_value_t = 0)]
+        membrane_threshold: usize,
+        /// The command to run with ANTHROPIC_BASE_URL set (everything after `--`).
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Check the local stack chain (Valkey, node, proxy) and print a readout.
+    Doctor {
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_URL")]
+        memory_url: Option<String>,
+        /// Proxy base URL to check (defaults to $ANTHROPIC_BASE_URL if set).
+        #[arg(long, env = "ANTHROPIC_BASE_URL")]
+        proxy_url: Option<String>,
+        /// Valkey warm-tier `host:port` to check.
+        #[arg(long, default_value = "127.0.0.1:6391")]
+        valkey_addr: String,
     },
 }
 
@@ -43,21 +84,20 @@ async fn main() -> std::io::Result<()> {
         Command::Proxy {
             port,
             upstream,
+            memory_url,
+            tenant,
             memory_dir,
+            membrane_threshold,
         } => {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            let memory = memory_dir
-                .as_ref()
-                .map(|dir| Arc::new(DirectoryMemorySource::new(dir)) as Arc<dyn MemorySource>);
+            let (memory, memory_desc) =
+                resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
             println!("theorem proxy live at http://{addr}");
             println!();
             println!("point Claude Code at it:");
             println!("    export ANTHROPIC_BASE_URL=http://{addr}");
             println!();
-            match &memory_dir {
-                Some(dir) => println!("ambient memory: injecting relevant memory from {}", dir.display()),
-                None => println!("ambient memory: off (faithful passthrough)"),
-            }
+            println!("ambient memory: {memory_desc}");
             println!("forwarding to {upstream} (CPU-only, no model download)");
             serve(
                 addr,
@@ -65,9 +105,70 @@ async fn main() -> std::io::Result<()> {
                     upstream,
                     memory,
                     max_memories: 8,
+                    membrane_threshold,
                 },
             )
             .await
+        }
+        Command::Wrap {
+            port,
+            upstream,
+            memory_url,
+            tenant,
+            memory_dir,
+            membrane_threshold,
+            command,
+        } => {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let (memory, memory_desc) =
+                resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
+            eprintln!("theorem proxy live at http://{addr} (ambient memory: {memory_desc})");
+            eprintln!("running: {}", command.join(" "));
+            let code = run_wrapped(
+                addr,
+                ProxyConfig {
+                    upstream,
+                    memory,
+                    max_memories: 8,
+                    membrane_threshold,
+                },
+                command,
+            )
+            .await?;
+            std::process::exit(code);
+        }
+        Command::Doctor {
+            memory_url,
+            proxy_url,
+            valkey_addr,
+        } => {
+            let checks = theorem_proxy::doctor(
+                memory_url.as_deref(),
+                proxy_url.as_deref(),
+                Some(&valkey_addr),
+            )
+            .await;
+            let mut all_ok = true;
+            for check in &checks {
+                if !check.ok {
+                    all_ok = false;
+                }
+                let mark = if check.ok { "ok  " } else { "FAIL" };
+                println!("[{mark}] {:<8} {}", check.name, check.detail);
+            }
+            if memory_url.is_none() {
+                println!("[note] memory   no --memory-url / THEOREM_PROXY_MEMORY_URL set (proxy would run passthrough)");
+            }
+            println!();
+            println!(
+                "{}",
+                if all_ok {
+                    "stack healthy"
+                } else {
+                    "stack has issues (see FAIL above)"
+                }
+            );
+            Ok(())
         }
     }
 }
