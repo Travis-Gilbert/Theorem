@@ -18,7 +18,10 @@ PROXY_PORT="${THEOREM_PROXY_PORT:-8788}"
 PROXY="${THEOREM_PROXY_BIN:-$HOME/.cargo/bin/theorem-proxy}"
 MEM_DIR="${THEOREM_MEMORY_DIR:-$HOME/.claude/projects/-Users-travisgilbert-Tech-Dev-Local-Creative-Website-Theorem/memory}"
 
-cleanup() { pkill -f "rustyred-thg-server" >/dev/null 2>&1 || true; }
+# Only tear down a node THIS script started (NODE_PID set below). A node that was already
+# running when we launched is left alone on exit.
+NODE_PID=""
+cleanup() { [ -n "$NODE_PID" ] && kill "$NODE_PID" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM
 
 up() {
@@ -33,6 +36,7 @@ up() {
 # points at, plus the optional node graph memory.
 if ! curl -fsS "http://127.0.0.1:$NODE_PORT/ready" >/dev/null 2>&1; then
   RUSTY_RED_PORT="$NODE_PORT" bash "$HERE/node-local.sh" >/tmp/theorem-node.log 2>&1 &
+  NODE_PID=$!
 fi
 up "http://127.0.0.1:$NODE_PORT/ready" || {
   echo "node failed to start; see /tmp/theorem-node.log" >&2
