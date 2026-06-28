@@ -19,7 +19,7 @@ two heads do not overwrite each other. Update it when a lane changes hands.
 | Phase B.5 built-in measurement + `doctor` readout | Codex | open |
 | Phase C.1 install ergonomics (brew/curl/`wrap claude`) | CC | IN PROGRESS (`theorem-proxy wrap` done; brew tap + curl-installer remaining) |
 | Phase C.2 remaining MVP (D2 membrane, D4 parity, D6 sidecar, D7 two-token) | CC | open |
-| Phase C.3 one-click onboarding | CC | open |
+| Phase C.3 one-click onboarding | CC | IN PROGRESS (`theorem doctor` chain-check done; site download / `theorem login` remaining) |
 | Phase C.4 resident capabilities (affordance exec, cascade, verify offload) | Codex | has `proxy-resident-capabilities` (merged #67) |
 | `fix-proxy-timeout-mcp-latency` -> main | Codex | branch `5df900607`, unmerged |
 

@@ -219,3 +219,110 @@ async fn wait_until_healthy(addr: SocketAddr) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// One link in the local-stack chain check.
+#[derive(Debug, Clone)]
+pub struct Check {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl Check {
+    fn new(name: &str, ok: bool, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            ok,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Probe the local stack (roadmap C.3 `theorem doctor`): the Valkey warm tier, the local
+/// node (`/ready` + a real memory retrieval round-trip), and a running proxy. Each link
+/// is probed independently; a down link is reported, never fatal. This is also where
+/// B.5's value readout will hang. `valkey_addr` is `host:port`.
+pub async fn doctor(
+    memory_url: Option<&str>,
+    proxy_url: Option<&str>,
+    valkey_addr: Option<&str>,
+) -> Vec<Check> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("failed to build reqwest client");
+    let mut checks = Vec::new();
+
+    if let Some(addr) = valkey_addr {
+        let ok = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        checks.push(Check::new(
+            "valkey",
+            ok,
+            if ok {
+                format!("reachable at {addr}")
+            } else {
+                format!("no TCP connect to {addr}")
+            },
+        ));
+    }
+
+    if let Some(url) = memory_url {
+        let base = url.strip_suffix("/mcp").unwrap_or(url);
+        let ready = client.get(format!("{base}/ready")).send().await;
+        let ready_ok = ready.as_ref().map(|r| r.status().is_success()).unwrap_or(false);
+        checks.push(Check::new(
+            "node",
+            ready_ok,
+            match &ready {
+                Ok(response) => format!("/ready -> {}", response.status()),
+                Err(error) => format!("unreachable: {error}"),
+            },
+        ));
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": "doctor", "method": "tools/call",
+            "params": {"name": "hippo_retrieve", "arguments": {"query": "doctor", "top_k": 1}}
+        });
+        let retrieval = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap_or_default())
+            .send()
+            .await;
+        let retrieval_ok = retrieval
+            .as_ref()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        checks.push(Check::new(
+            "memory",
+            retrieval_ok,
+            match &retrieval {
+                Ok(response) => format!("hippo_retrieve -> {}", response.status()),
+                Err(error) => format!("retrieval failed: {error}"),
+            },
+        ));
+    }
+
+    if let Some(url) = proxy_url {
+        let base = url.trim_end_matches('/');
+        let health = client.get(format!("{base}/healthz")).send().await;
+        let ok = health.as_ref().map(|r| r.status().is_success()).unwrap_or(false);
+        checks.push(Check::new(
+            "proxy",
+            ok,
+            match &health {
+                Ok(response) => format!("/healthz -> {}", response.status()),
+                Err(error) => format!("unreachable: {error}"),
+            },
+        ));
+    }
+
+    checks
+}

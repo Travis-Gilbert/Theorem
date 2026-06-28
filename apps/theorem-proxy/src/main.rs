@@ -58,6 +58,17 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// Check the local stack chain (Valkey, node, proxy) and print a readout.
+    Doctor {
+        #[arg(long, env = "THEOREM_PROXY_MEMORY_URL")]
+        memory_url: Option<String>,
+        /// Proxy base URL to check (defaults to $ANTHROPIC_BASE_URL if set).
+        #[arg(long, env = "ANTHROPIC_BASE_URL")]
+        proxy_url: Option<String>,
+        /// Valkey warm-tier `host:port` to check.
+        #[arg(long, default_value = "127.0.0.1:6391")]
+        valkey_addr: String,
+    },
 }
 
 #[tokio::main]
@@ -114,6 +125,39 @@ async fn main() -> std::io::Result<()> {
             )
             .await?;
             std::process::exit(code);
+        }
+        Command::Doctor {
+            memory_url,
+            proxy_url,
+            valkey_addr,
+        } => {
+            let checks = theorem_proxy::doctor(
+                memory_url.as_deref(),
+                proxy_url.as_deref(),
+                Some(&valkey_addr),
+            )
+            .await;
+            let mut all_ok = true;
+            for check in &checks {
+                if !check.ok {
+                    all_ok = false;
+                }
+                let mark = if check.ok { "ok  " } else { "FAIL" };
+                println!("[{mark}] {:<8} {}", check.name, check.detail);
+            }
+            if memory_url.is_none() {
+                println!("[note] memory   no --memory-url / THEOREM_PROXY_MEMORY_URL set (proxy would run passthrough)");
+            }
+            println!();
+            println!(
+                "{}",
+                if all_ok {
+                    "stack healthy"
+                } else {
+                    "stack has issues (see FAIL above)"
+                }
+            );
+            Ok(())
         }
     }
 }
