@@ -15,8 +15,10 @@ use rustyred_thg_core::{
     GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
     HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, MemoryDocumentQuery, NeighborHit,
     NeighborQuery, NodeQuery, NodeRecord, RedCoreGraphStore, RedCoreOptions, RedisGraphStore,
+    PluginExecutionOutput, PluginRegistry,
     SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
 };
+use rustyred_thg_datawave_harness::{DatawaveIngestPlugin, INGEST_CAPABILITY_PACK};
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
     AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
@@ -2690,6 +2692,55 @@ impl McpGraphBackend for ProductMcpBackend {
         })
         .join()
         .map_err(|_| McpError::internal("dispatch thread panicked"))?
+    }
+
+    fn invoke_datawave_ingest(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+        operation: &str,
+    ) -> Result<Value, McpError> {
+        match &mut self.store {
+            TenantGraphStore::RedCore(executor) => {
+                let mut writer = executor
+                    .writer
+                    .lock()
+                    .map_err(|_| McpError::internal("RedCore writer lock poisoned"))?;
+                let mut registry = PluginRegistry::new();
+                registry.register(DatawaveIngestPlugin);
+                let command = match operation {
+                    "describe" => "ingest.describe",
+                    "record" => "ingest.record",
+                    "batch" => "ingest.batch",
+                    "lookup" => "ingest.lookup",
+                    "intersect" => "ingest.intersect",
+                    _ => "ingest.describe",
+                };
+                let output = registry
+                    .execute(&mut writer, tenant, command, arguments.clone())
+                    .map_err(|error| {
+                        let message = format!("{}: {}", error.code, error.message);
+                        if error.code.starts_with("invalid_") || error.code.starts_with("missing_") {
+                            McpError::invalid_params(message)
+                        } else {
+                            McpError::internal(message)
+                        }
+                    })?;
+                Ok(json!({
+                    "tenant": output.tenant_id,
+                    "operation": operation,
+                    "command": output.command,
+                    "writes_graph": output.writes_graph,
+                    "affordance_id": format!("rustyred_thg_datawave.{operation}"),
+                    "engine": "rustyred_thg_datawave",
+                    "capability_pack": INGEST_CAPABILITY_PACK,
+                    "result": output.result,
+                }))
+            }
+            TenantGraphStore::Redis(_) => Err(McpError::internal(
+                "datawave ingest requires the in-process RedCore graph backend",
+            )),
+        }
     }
 }
 
