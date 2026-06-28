@@ -21,7 +21,7 @@ use rustyred_thg_core::{
     NodeRecord,
 };
 use rustyred_thg_offload::{
-    plan_from_json, COMPUTE_OFFLOAD_FAMILY, COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID,
+    plan_from_json, COMPUTE_OFFLOAD_ENGINE_ID, COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID,
 };
 use serde_json::{json, Value};
 
@@ -206,8 +206,8 @@ pub(crate) fn invoke_payload<B: McpGraphBackend>(
     let actor = first_string(arguments, &["actor", "actor_id", "actorId"]);
     let dry_run = first_bool(arguments, &["dry_run", "dryRun"]).unwrap_or(false);
     if let Some(affordance) = registered_affordance(tenant, backend, &affordance_id)? {
-        if affordance.family == COMPUTE_OFFLOAD_FAMILY
-            || affordance.affordance_id == COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID
+        if affordance.affordance_id == COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID
+            && affordance.server_id == COMPUTE_OFFLOAD_ENGINE_ID
         {
             return invoke_compute_offload_payload(
                 tenant,

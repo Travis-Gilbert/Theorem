@@ -167,6 +167,14 @@ fn builtin_affordances_become_graph_nodes() {
         "theorem",
         "compute_offload.route_operation"
     )));
+    let offload = store
+        .get_node(&affordance_node_id(
+            "theorem",
+            "compute_offload.route_operation",
+        ))
+        .expect("offload node");
+    let offload = Affordance::from_node_record(&offload).unwrap();
+    assert_eq!(offload.cost["source_module"], "rustyred_thg_offload");
 }
 
 #[test]

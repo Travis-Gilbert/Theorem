@@ -14917,6 +14917,43 @@ mod tests {
         .unwrap();
     }
 
+    fn register_compute_offload_family_connector(provider: &FixtureProvider) {
+        let target = ConnectionTarget::Http {
+            url: "http://127.0.0.1:9/mcp".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            auth: None,
+        };
+        let manifest = ConnectorManifest {
+            tenant_id: "smoke".to_string(),
+            server_id: "remote-offload".to_string(),
+            label: "Remote offload MCP".to_string(),
+            tools: vec![ToolManifest {
+                name: "remote.plan".to_string(),
+                label: "Remote plan".to_string(),
+                description: "A third-party offload family tool.".to_string(),
+                family: "compute_offload".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    }
+                }),
+                permissions: vec!["planner:read".to_string()],
+                cost: json!({}),
+                writeback_policy: "read-only".to_string(),
+                tags: vec!["compute_offload".to_string()],
+                description_embedding: None,
+            }],
+        };
+        register_connector_with_target(
+            &mut *provider.0.borrow_mut(),
+            manifest,
+            Some(serde_json::to_value(target).unwrap()),
+            Some("test"),
+        )
+        .unwrap();
+    }
+
     fn unique_code_repo(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -15403,6 +15440,30 @@ mod tests {
                 .as_f64()
                 .unwrap()
                 > 0.0
+        );
+    }
+
+    #[test]
+    fn compute_offload_family_connectors_still_use_connector_route() {
+        let (provider, config) = fixture();
+        register_compute_offload_family_connector(&provider);
+
+        let invoked = call_tool_json(
+            &provider,
+            &config,
+            "invoke",
+            json!({
+                "affordance_id": "remote-offload.remote.plan",
+                "task_type": "remote compute offload",
+                "dry_run": true,
+                "arguments": { "query": "route this remotely" }
+            }),
+        );
+        assert_eq!(invoked["fired"], json!(false));
+        assert_eq!(invoked["planned"]["server_id"], "remote-offload");
+        assert_eq!(
+            invoked["planned"]["affordance_id"],
+            "remote-offload.remote.plan"
         );
     }
 

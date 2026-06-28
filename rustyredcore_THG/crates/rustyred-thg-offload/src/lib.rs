@@ -419,11 +419,7 @@ impl OperationPlanner {
             });
         }
 
-        let mut current_rows = ordered
-            .iter()
-            .find(|op| op.estimated_rows > 0)
-            .map(|op| op.estimated_rows as f64)
-            .unwrap_or(1.0);
+        let mut current_rows = initial_row_estimate(&ordered);
         let mut previous_fusion_key: Option<String> = None;
         let mut steps = Vec::with_capacity(ordered.len());
         let mut totals = CostSummary::default();
@@ -533,6 +529,23 @@ impl OperationPlanner {
         match (left_meets, right_meets) {
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
+            (false, false) => right
+                .cost
+                .quality
+                .partial_cmp(&left.cost.quality)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    let left_cost = self.config.cost_weights.weighted_cost(left.cost);
+                    let right_cost = self.config.cost_weights.weighted_cost(right.cost);
+                    left_cost
+                        .partial_cmp(&right_cost)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    left.executor
+                        .preference_rank()
+                        .cmp(&right.executor.preference_rank())
+                }),
             _ => {
                 let left_cost = self.config.cost_weights.weighted_cost(left.cost);
                 let right_cost = self.config.cost_weights.weighted_cost(right.cost);
@@ -1090,10 +1103,7 @@ pub fn plan_from_json(
 ) -> Result<OffloadPlan, String> {
     let mut invocation: PlannerInvocation =
         serde_json::from_value(arguments.clone()).map_err(|e| e.to_string())?;
-    if invocation.config.graph_version == 0 {
-        invocation.config.graph_version =
-            invocation.graph_version.unwrap_or(fallback_graph_version);
-    }
+    invocation.config.graph_version = fallback_graph_version;
     if invocation.operations.is_empty() {
         return Err("compute-offload planning requires at least one operation".to_string());
     }
@@ -1156,7 +1166,7 @@ fn default_candidates(operation: &Operation) -> Vec<PhysicalCandidate> {
         return vec![
             PhysicalCandidate {
                 executor,
-                affordance_id: Some(format!("{COMPUTE_OFFLOAD_ENGINE_ID}.{:?}", operation.kind)),
+                affordance_id: cpu_affordance_id(&operation.kind).map(str::to_string),
                 model_id: None,
                 cost: CostEstimate {
                     cpu_ms: 5.0 + rows,
@@ -1186,6 +1196,30 @@ fn default_candidates(operation: &Operation) -> Vec<PhysicalCandidate> {
     ]
 }
 
+fn cpu_affordance_id(kind: &OperationKind) -> Option<&'static str> {
+    match kind {
+        OperationKind::PredicateFilter => Some("predicate.filter"),
+        OperationKind::DatalogDerivation => Some("datalog.derive"),
+        OperationKind::ProbabilisticReliability => Some("probabilistic.source_reliability"),
+        OperationKind::ConstraintCheck => Some("solver.check"),
+        OperationKind::GraphPageRank => Some("graph.pagerank"),
+        OperationKind::GraphCommunity => Some("graph.communities"),
+        OperationKind::GraphShortestPath => Some("graph.shortest_path"),
+        OperationKind::VerificationCheck => Some("verification.claim_check"),
+        OperationKind::CodeSynthesisSurrogate => Some("surrogate.code_synthesis"),
+        OperationKind::NeuralSynthesis => None,
+    }
+}
+
+fn initial_row_estimate(operations: &[Operation]) -> f64 {
+    operations
+        .iter()
+        .find(|op| op.kind.is_filter() || op.kind.is_model_heavy())
+        .or_else(|| operations.iter().find(|op| op.estimated_rows > 0))
+        .map(|op| op.estimated_rows.max(1) as f64)
+        .unwrap_or(1.0)
+}
+
 fn reorder_for_pushdown(operations: Vec<Operation>) -> Vec<Operation> {
     let mut pending = operations;
     let mut complete = BTreeSet::new();
@@ -1211,17 +1245,12 @@ fn reorder_for_pushdown(operations: Vec<Operation>) -> Vec<Operation> {
 }
 
 fn operation_order_key(operation: &Operation) -> (u8, u64) {
-    let class = if operation.kind.is_filter() {
-        0
-    } else if operation.kind.is_cpu_symbolic() {
-        1
-    } else if operation.kind.is_model_heavy() {
-        3
+    if operation.kind.is_filter() {
+        let selectivity_rank = (operation.selectivity * 1_000_000.0) as u64;
+        (0, selectivity_rank)
     } else {
-        2
-    };
-    let selectivity_rank = (operation.selectivity * 1_000_000.0) as u64;
-    (class, selectivity_rank)
+        (1, 0)
+    }
 }
 
 fn ordered_ids(operations: &[Operation]) -> Vec<String> {
@@ -1347,6 +1376,53 @@ mod tests {
             synth_step.selected.cost.prompt_tokens < 100.0,
             "model prompt tokens should scale down after pushdown"
         );
+    }
+
+    #[test]
+    fn non_filter_cpu_ops_do_not_push_down_or_shrink_model_cost() {
+        let graph = Operation {
+            operation_id: "rank".to_string(),
+            kind: OperationKind::GraphPageRank,
+            estimated_rows: 1,
+            ..Operation::new("", OperationKind::GraphPageRank)
+        };
+        let synth = Operation {
+            operation_id: "synth".to_string(),
+            kind: OperationKind::NeuralSynthesis,
+            estimated_rows: 1_000,
+            quality_floor: 0.7,
+            candidates: vec![cheap_model(0.8), expensive_model()],
+            ..Operation::new("", OperationKind::NeuralSynthesis)
+        };
+        let plan = OperationPlanner::new(PlannerConfig::default()).plan(vec![graph, synth]);
+        assert!(!plan
+            .rewrites
+            .iter()
+            .any(|rewrite| rewrite.axis == OffloadAxis::PredicatePushdown));
+        let synth_step = plan
+            .steps
+            .iter()
+            .find(|step| step.operation.operation_id == "synth")
+            .unwrap();
+        assert_eq!(synth_step.selected.cost.prompt_tokens, 100.0);
+    }
+
+    #[test]
+    fn planner_prefers_highest_quality_fallback_when_floor_is_unmet() {
+        let operation = Operation {
+            operation_id: "hard-synthesis".to_string(),
+            kind: OperationKind::NeuralSynthesis,
+            quality_floor: 0.99,
+            candidates: vec![cheap_model(0.2), expensive_model()],
+            ..Operation::new("", OperationKind::NeuralSynthesis)
+        };
+        let plan = OperationPlanner::new(PlannerConfig::default()).plan(vec![operation]);
+        assert_eq!(
+            plan.steps[0].selected.executor,
+            ExecutorKind::ExpensiveModel
+        );
+        assert_eq!(plan.steps[0].selected.cost.quality, 0.94);
+        assert!(!plan.steps[0].quality_floor_met);
     }
 
     #[test]
@@ -1499,5 +1575,38 @@ mod tests {
             },
         );
         assert_eq!(path.payload["path"], json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn default_cpu_candidates_use_stable_affordance_ids() {
+        let plan = OperationPlanner::new(PlannerConfig::default()).plan(vec![Operation {
+            operation_id: "rank".to_string(),
+            kind: OperationKind::GraphPageRank,
+            estimated_rows: 5,
+            ..Operation::new("", OperationKind::GraphPageRank)
+        }]);
+        assert_eq!(
+            plan.steps[0].selected.affordance_id.as_deref(),
+            Some("graph.pagerank")
+        );
+    }
+
+    #[test]
+    fn plan_from_json_uses_backend_graph_version() {
+        let plan = plan_from_json(
+            &json!({
+                "graph_version": 1,
+                "config": { "graph_version": 2 },
+                "operations": [{
+                    "operation_id": "rank",
+                    "kind": "graph_page_rank",
+                    "estimated_rows": 5
+                }]
+            }),
+            9,
+        )
+        .unwrap();
+        assert_eq!(plan.graph_version, 9);
+        assert_eq!(plan.steps[0].ledger_entry.graph_version, 9);
     }
 }
