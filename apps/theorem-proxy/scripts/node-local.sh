@@ -15,8 +15,9 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/SSD Samsung/theorem-recon-
 export PKG_CONFIG_PATH="/opt/homebrew/opt/openblas/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export LIBRARY_PATH="/opt/homebrew/opt/openblas/lib:${LIBRARY_PATH:-}"
 
-# Node config (RedCore durable on the SSD; flip RUSTY_RED_MODE=redis +
-# RUSTY_RED_REDIS_URL=redis://127.0.0.1:6391 to back it with Valkey instead).
+# Node config. Embedded mode is the canonical local substrate: RedCore durable
+# graph state on the SSD. Redis/Valkey mode is a legacy compatibility path for
+# the graph store; use it only when explicitly testing that path.
 export RUSTY_RED_HOST="${RUSTY_RED_HOST:-127.0.0.1}"
 export RUSTY_RED_PORT="${RUSTY_RED_PORT:-8380}"
 export RUSTY_RED_MODE="${RUSTY_RED_MODE:-embedded}"
@@ -28,4 +29,4 @@ mkdir -p "$RUSTY_RED_DATA_DIR"
 echo "theorem node: ${RUSTY_RED_HOST}:${RUSTY_RED_PORT}  data -> ${RUSTY_RED_DATA_DIR}  (mode=${RUSTY_RED_MODE}, auth=${RUSTY_RED_REQUIRE_AUTH})"
 echo "point the proxy at it: --memory-url http://${RUSTY_RED_HOST}:${RUSTY_RED_PORT}/mcp"
 cd "$REPO_THG"
-exec cargo run -p rustyred-thg-server
+exec cargo run -p rustyred-thg-server --bin rustyred-thg-server

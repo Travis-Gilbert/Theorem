@@ -17,7 +17,7 @@ two heads do not overwrite each other. Update it when a lane changes hands.
 | Phase B.3 staleness-aware memory + memory-CI | Codex | open |
 | Phase B.4 proxy-mediated proactive coordination | Codex | has `local-proxy-codex-presence` |
 | Phase B.5 built-in measurement + `doctor` readout | Codex | open |
-| Phase C.1 install ergonomics (brew/curl/`wrap claude`) | CC | IN PROGRESS (`theorem-proxy wrap` done; brew tap + curl-installer remaining) |
+| Phase C.1 install ergonomics (brew/curl/`wrap claude`) | CC | DONE local (`wrap` + `doctor` + `scripts/install.sh` from-source); brew tap + release-binary `curl\|sh` is the outward-facing publish step (gated) |
 | Phase C.2 remaining MVP (D2 membrane, D4 parity, D6 sidecar, D7 two-token) | CC | IN PROGRESS (D2 membrane + D4 parity + D7 two-token done; D6 sidecar remaining) |
 | Phase C.3 one-click onboarding | CC | IN PROGRESS (`theorem doctor` chain-check done; site download / `theorem login` remaining) |
 | Phase C.4 resident capabilities (affordance exec, cascade, verify offload) | Codex | has `proxy-resident-capabilities` (merged #67) |
@@ -53,3 +53,23 @@ to the original #69 commit, so CC's base == main's proxy. To land cleanly:
   Whichever merges second just rebases.
 
 Nothing is pushed yet; push topology is Travis's call.
+
+## Gated / cross-surface (named blockers, not silent cuts)
+
+- **D6 Commonplace sidecar (spec deliverable 6):** Tauri sidecar bundling + spawn-on-app-launch
+  + a "Connect Claude Code" control. Lives in `commonplace-desktop-runtime` + the desktop app
+  (`apps/desktop` src-tauri) -- Codex's desktop/runtime lane, not a theorem-proxy change. The
+  proxy side it needs is done (single zero-config binary; `theorem-proxy wrap` is the connect
+  convenience; CPU-only default). Handoff to Codex: add theorem-proxy as a Tauri `externalBin`,
+  spawn it on launch, write `ANTHROPIC_BASE_URL` from the Connect control.
+- **C.1 brew tap + `curl|sh`-from-release:** needs a published GitHub release with per-platform
+  prebuilt binaries + a Homebrew tap repo. Outward-facing (publishing) -- Travis's call. The
+  from-source installer (`scripts/install.sh`) covers the local path now.
+- **C.3 `theorem login` + site download + Connect-button parity:** `login` needs an account ->
+  substrate-key backend to authenticate against (the harness remote, currently degraded); the
+  site download needs a web distribution surface. Both depend on external infra, not local code.
+  `theorem doctor` (the chain-check half of C.3) is done; B.5 will add its value readout (Codex).
+- **C.4 resident capabilities (affordance exec / cascade / verify offload):** Codex owns it
+  (`proxy-resident-capabilities`, merged #67).
+- **Binary naming:** reconciled -- the CLI entry is `theorem-proxy` (`proxy` / `wrap` / `doctor`);
+  the specs' `rustyred proxy` wording predates the crate. No code change; specs lag the binary.
