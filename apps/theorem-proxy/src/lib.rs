@@ -238,12 +238,16 @@ pub async fn run_wrapped(
     let (program, args) = command.split_first().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "wrap: empty command")
     })?;
-    // Serve in the background; aborted when the wrapped command exits.
-    let server = tokio::spawn(serve(addr, config));
+    // Bind the listener up front so a port already in use fails HERE -- this proves the
+    // proxy we point the child at is OURS, not another process already answering /healthz
+    // on the same port (whose memory/upstream settings would differ).
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| std::io::Error::other(format!("theorem-proxy could not bind {addr}: {error}")))?;
+    let server = tokio::spawn(async move { axum::serve(listener, router(config)).await });
 
-    // Wait for /healthz, but bail early if the server task dies (e.g. a bind failure makes
-    // `serve` return immediately). The health probe is time-bounded so a port held by a
-    // non-responsive process can't hang the wait before we re-check the server task.
+    // Wait until our server answers /healthz (it owns the port now); bail if the task dies.
+    // The probe is time-bounded so a transient stall can't hang the wait.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
