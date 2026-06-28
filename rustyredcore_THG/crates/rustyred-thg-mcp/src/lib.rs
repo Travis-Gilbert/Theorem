@@ -8701,7 +8701,7 @@ fn project_coordination_intent_onto_binding(
         .map_err(|error| McpError::internal(error.to_string()))?;
     let scratchpad_document_id = binding.working_memory_scope.scratchpad.document_id.clone();
     let state_hash = hash_agent_binding(&binding);
-    persist_coordination_agent_binding(backend, &binding, &state_hash)?;
+    persist_coordination_agent_binding(backend, &binding, &revision, &state_hash)?;
 
     Ok(McpBindingProjection {
         scratchpad_revision_id: revision.revision_id,
@@ -8735,6 +8735,7 @@ fn load_coordination_agent_binding(
 fn persist_coordination_agent_binding(
     backend: &mut impl McpGraphBackend,
     binding: &AgentBinding,
+    revision: &ScratchpadRevision,
     state_hash: &str,
 ) -> Result<(), McpError> {
     upsert_node_if_changed(
@@ -8743,21 +8744,19 @@ fn persist_coordination_agent_binding(
     )?;
     let document_id = &binding.working_memory_scope.scratchpad.document_id;
     let run_id = &binding.lifecycle.run_id;
-    for revision in &binding.working_memory_scope.scratchpad.revisions {
-        upsert_node_if_changed(
-            backend,
-            coordination_scratchpad_revision_node(document_id, revision)?,
-        )?;
+    upsert_node_if_changed(
+        backend,
+        coordination_scratchpad_revision_node(document_id, revision)?,
+    )?;
+    upsert_edge_if_changed(
+        backend,
+        coordination_scratchpad_revision_of_edge(document_id, run_id, revision),
+    )?;
+    if revision.seq > 1 {
         upsert_edge_if_changed(
             backend,
-            coordination_scratchpad_revision_of_edge(document_id, run_id, revision),
+            coordination_previous_scratchpad_revision_edge(document_id, revision),
         )?;
-        if revision.seq > 1 {
-            upsert_edge_if_changed(
-                backend,
-                coordination_previous_scratchpad_revision_edge(document_id, revision),
-            )?;
-        }
     }
     Ok(())
 }
@@ -15525,7 +15524,7 @@ mod tests {
         append_harness_transition_to_store, composed_agent_run_to_store, handle_mcp_request,
         handle_mcp_request_with_context, harness_run_detail_from_store,
         subscribe_coordination_room_events, AppAffordanceInvocation, McpError, McpGraphBackend,
-        McpGraphProvider, McpRequestContext, McpServerConfig,
+        McpGraphProvider, McpRequestContext, McpServerConfig, WriteIntentInput,
     };
 
     struct FixtureProvider(Rc<RefCell<InMemoryGraphStore>>);
@@ -15533,11 +15532,176 @@ mod tests {
     #[derive(Clone)]
     struct SharedFixtureBackend(Rc<RefCell<InMemoryGraphStore>>);
 
+    struct CountingBackend {
+        store: InMemoryGraphStore,
+        get_node_ids: RefCell<Vec<String>>,
+        get_edge_ids: RefCell<Vec<String>>,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                store: InMemoryGraphStore::new(),
+                get_node_ids: RefCell::new(Vec::new()),
+                get_edge_ids: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn clear_reads(&mut self) {
+            self.get_node_ids.borrow_mut().clear();
+            self.get_edge_ids.borrow_mut().clear();
+        }
+    }
+
     impl McpGraphProvider for FixtureProvider {
         type Backend = SharedFixtureBackend;
 
         fn backend_for_tenant(&self, _tenant: &str) -> Result<Self::Backend, McpError> {
             Ok(SharedFixtureBackend(self.0.clone()))
+        }
+    }
+
+    impl McpGraphBackend for CountingBackend {
+        fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+            self.get_node_ids.borrow_mut().push(id.to_string());
+            Ok(InMemoryGraphStore::get_node(&self.store, id).cloned())
+        }
+
+        fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+            self.get_edge_ids.borrow_mut().push(id.to_string());
+            Ok(InMemoryGraphStore::get_edge(&self.store, id).cloned())
+        }
+
+        fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
+            Ok(InMemoryGraphStore::query_nodes(&self.store, query))
+        }
+
+        fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
+            Ok(InMemoryGraphStore::neighbors(&self.store, query))
+        }
+
+        fn stats(&self) -> GraphStoreResult<GraphStats> {
+            Ok(InMemoryGraphStore::stats(&self.store))
+        }
+
+        fn verify(&self) -> GraphStoreResult<VerifyReport> {
+            Ok(InMemoryGraphStore::verify(&self.store))
+        }
+
+        fn labels(&self) -> GraphStoreResult<Vec<String>> {
+            Ok(InMemoryGraphStore::labels(&self.store))
+        }
+
+        fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
+            Ok(InMemoryGraphStore::edge_types(&self.store))
+        }
+
+        fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
+            Ok(InMemoryGraphStore::property_keys(&self.store))
+        }
+
+        fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
+            Ok(self.store.snapshot().edges)
+        }
+
+        fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
+            Ok(self.store.snapshot())
+        }
+
+        fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+            InMemoryGraphStore::upsert_node(&mut self.store, node).map(|_| ())
+        }
+
+        fn upsert_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+            InMemoryGraphStore::upsert_edge(&mut self.store, edge).map(|_| ())
+        }
+
+        fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
+            Ok(InMemoryGraphStore::vector_designations(&self.store))
+        }
+
+        fn designate_vector_property(
+            &mut self,
+            label: &str,
+            property_name: &str,
+            dimension: usize,
+        ) -> GraphStoreResult<()> {
+            InMemoryGraphStore::designate_vector_property(
+                &mut self.store,
+                label,
+                property_name,
+                dimension,
+            )
+        }
+
+        fn vector_search(
+            &self,
+            label: Option<&str>,
+            property_name: &str,
+            query: &[f32],
+            k: usize,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            InMemoryGraphStore::vector_search(&self.store, label, property_name, query, k)
+        }
+
+        fn hybrid_search(
+            &self,
+            label: Option<&str>,
+            property_name: &str,
+            query: &[f32],
+            k: usize,
+            graph_seeds: &[String],
+            max_hops: usize,
+            alpha: f32,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            InMemoryGraphStore::hybrid_search(
+                &self.store,
+                label,
+                property_name,
+                query,
+                k,
+                graph_seeds,
+                max_hops,
+                alpha,
+            )
+        }
+
+        fn hybrid_search_with_config(
+            &self,
+            label: Option<&str>,
+            property_name: &str,
+            query: &[f32],
+            k: usize,
+            graph_seeds: &[String],
+            max_hops: usize,
+            config: &HybridScoringConfig,
+        ) -> GraphStoreResult<Vec<(String, f32)>> {
+            InMemoryGraphStore::hybrid_search_with_config(
+                &self.store,
+                label,
+                property_name,
+                query,
+                k,
+                graph_seeds,
+                max_hops,
+                config,
+            )
+        }
+
+        fn epistemic_neighbors(
+            &self,
+            node_id: &str,
+            epistemic_types: Option<&[EpistemicType]>,
+            min_confidence: Option<f64>,
+            max_depth: Option<usize>,
+        ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
+            Ok(InMemoryGraphStore::epistemic_neighbors(
+                &self.store,
+                node_id,
+                epistemic_types,
+                min_confidence,
+                max_depth,
+            ))
         }
     }
 
@@ -18732,11 +18896,77 @@ mod tests {
     }
 
     #[test]
+    fn coordination_intent_write_does_not_scan_prior_scratchpad_revisions() {
+        let mut backend = CountingBackend::new();
+        let first = super::write_coordination_intent(
+            &mut backend,
+            WriteIntentInput {
+                tenant_slug: "smoke".to_string(),
+                actor_id: "codex".to_string(),
+                room_id: "mcp-latency-regression".to_string(),
+                status: "working".to_string(),
+                summary: "first intent".to_string(),
+                footprint: vec!["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs".to_string()],
+                updated_at: "2026-06-01T00:00:00Z".to_string(),
+                ..WriteIntentInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.scratchpad_document_id, "scratchpad:theorem");
+        assert_eq!(first.scratchpad_seq, 1);
+
+        let first_revision_node = super::scratchpad_revision_node_id("scratchpad:theorem", 1);
+        let first_revision_edge = "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000001"
+            .to_string();
+        let second_revision_node = super::scratchpad_revision_node_id("scratchpad:theorem", 2);
+        let second_revision_edge =
+            "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000002".to_string();
+
+        backend.clear_reads();
+        let second = super::write_coordination_intent(
+            &mut backend,
+            WriteIntentInput {
+                tenant_slug: "smoke".to_string(),
+                actor_id: "codex".to_string(),
+                room_id: "mcp-latency-regression".to_string(),
+                status: "working".to_string(),
+                summary: "second intent".to_string(),
+                footprint: vec!["rustyredcore_THG/crates/rustyred-thg-mcp/src/lib.rs".to_string()],
+                updated_at: "2026-06-01T00:01:00Z".to_string(),
+                ..WriteIntentInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.scratchpad_seq, 2);
+
+        let node_reads = backend.get_node_ids.borrow();
+        assert!(
+            !node_reads.contains(&first_revision_node),
+            "second write must not scan historical scratchpad revision nodes: {node_reads:?}"
+        );
+        assert!(
+            node_reads.contains(&second_revision_node),
+            "second write must read the current scratchpad revision before upsert: {node_reads:?}"
+        );
+        drop(node_reads);
+
+        let edge_reads = backend.get_edge_ids.borrow();
+        assert!(
+            !edge_reads.contains(&first_revision_edge),
+            "second write must not scan historical scratchpad revision edges: {edge_reads:?}"
+        );
+        assert!(
+            edge_reads.contains(&second_revision_edge),
+            "second write must read the current scratchpad revision edge before upsert: {edge_reads:?}"
+        );
+    }
+
+    #[test]
     fn native_coordination_tools_round_trip_through_mcp() {
         // `binding_active_head_set` is derived from the process-global `THEOREM_AGENT_HEADS`. Hold
-        // the shared env lock and pin it unset (default head set) so this test is deterministic and
-        // serialized against tests that mutate `THEOREM_AGENT_HEADS` (e.g. the provider-head
-        // composed-agent test), which otherwise race under parallel `cargo test`.
+        // the shared env lock and pin it unset so the runtime default provider-head set is
+        // deterministic and serialized against tests that mutate `THEOREM_AGENT_HEADS`, which
+        // otherwise race under parallel `cargo test`.
         let _env = ScopedEnv::new(vec![]);
         let (provider, mut config) = fixture();
         config.read_only = false;
@@ -18818,7 +19048,7 @@ mod tests {
         assert_eq!(intent["intent"]["scratchpad_seq"], 1);
         assert_eq!(
             intent["intent"]["binding_active_head_set"],
-            json!(["claude", "codex", "deepseek"])
+            json!(["ai21", "codex", "deepseek", "gemma", "minimax", "mistral", "openai", "zhipu"])
         );
 
         let mut room_events = subscribe_coordination_room_events();
@@ -21515,7 +21745,7 @@ mod tests {
 
     #[test]
     fn composed_agent_run_round_trips_through_mcp_with_provider_heads() {
-        let mock = MockChatCompletions::start(3);
+        let mock = MockChatCompletions::start(4);
         let _env = ScopedEnv::new(vec![
             ("THEOREM_HEAD_INVOKER", "real".to_string()),
             ("THEOREM_AGENT_HEADS", "mistral,deepseek".to_string()),
@@ -21559,11 +21789,11 @@ mod tests {
             2
         );
         let receipts = result["result"]["invocation_receipts"].as_array().unwrap();
-        assert_eq!(receipts.len(), 3);
+        assert_eq!(receipts.len(), 4);
         assert_eq!(receipts[0]["output_summary"], "provider reply 0");
-        assert_eq!(receipts[2]["claims"][0]["provenance"], "mock:2");
+        assert_eq!(receipts[3]["claims"][0]["provenance"], "mock:3");
 
-        let requests = mock.take_requests(3);
+        let requests = mock.take_requests(4);
         assert!(requests.iter().any(|request| request
             .headers
             .to_ascii_lowercase()
@@ -21572,11 +21802,20 @@ mod tests {
             .headers
             .to_ascii_lowercase()
             .contains("authorization: bearer deepseek-test-secret")));
-        assert_eq!(requests[0].body["messages"][0]["role"], json!("system"));
-        assert!(requests[0].body["messages"][0]["content"]
+        let first_messages = requests[0].body["messages"].as_array().unwrap();
+        assert_eq!(first_messages[0]["role"], json!("system"));
+        assert!(first_messages[0]["content"]
             .as_str()
             .unwrap()
-            .contains("Produce a grounded answer"));
+            .contains("one mind of Theorem"));
+        assert!(first_messages.iter().any(|message| message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("publish composed agent result")));
+        assert!(first_messages.iter().any(|message| message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Claims JSON")));
     }
 
     #[test]
@@ -22022,7 +22261,8 @@ mod tests {
 
     #[test]
     fn version_tools_support_refs_checkout_and_merge() {
-        let (provider, config) = fixture();
+        let (provider, mut config) = fixture();
+        config.tool_result_budget_bytes = 0;
         let base = provider
             .0
             .borrow()
