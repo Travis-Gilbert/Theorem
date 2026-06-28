@@ -206,12 +206,16 @@ impl MemorySource for HttpMemorySource {
     }
 }
 
-/// Map a `hippo_retrieve` JSON-RPC response to ranked hits. Tolerates the candidates
-/// being nested under `result` (JSON-RPC) or flat. A candidate without text is skipped.
+/// Map a `hippo_retrieve` JSON-RPC response to ranked hits. The real MCP `tools/call`
+/// envelope puts the payload under `result.structuredContent`; older/flat shapes put it
+/// at `result.candidates` or the top level. All are tolerated. A candidate without text
+/// is skipped.
 fn parse_candidates(value: &Value, limit: usize) -> Vec<MemoryHit> {
-    let candidates = value
-        .get("result")
-        .and_then(|result| result.get("candidates"))
+    let result = value.get("result");
+    let candidates = result
+        .and_then(|result| result.get("structuredContent"))
+        .and_then(|structured| structured.get("candidates"))
+        .or_else(|| result.and_then(|result| result.get("candidates")))
         .or_else(|| value.get("candidates"))
         .and_then(Value::as_array);
     let Some(candidates) = candidates else {
@@ -280,6 +284,26 @@ mod tests {
         assert_eq!(hits[0].title, "mem:1");
         assert!(hits[0].body.contains("pushdown"));
         assert_eq!(hits[0].score, 0.9);
+    }
+
+    #[test]
+    fn parses_real_mcp_structured_content_envelope() {
+        // The shape rustyred-thg-server /mcp actually returns: payload under
+        // result.structuredContent (caught against the live node, 2026-06-28).
+        let value = json!({
+            "result": {
+                "structuredContent": {
+                    "candidates": [
+                        {"node_id": "hippo:page:memory:sha256:abc", "text": "live node hit", "ppr_proximity": 0.7}
+                    ]
+                }
+            }
+        });
+        let hits = parse_candidates(&value, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "hippo:page:memory:sha256:abc");
+        assert!(hits[0].body.contains("live node hit"));
+        assert_eq!(hits[0].score, 0.7);
     }
 
     #[test]

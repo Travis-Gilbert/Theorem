@@ -10,8 +10,9 @@ Travis's API usage spiked to ~33% in one day (very high even for him). The direc
 
 ## Current state (grounded, 2026-06-28)
 
-- `apps/theorem-proxy` built: SPEC-LOCAL-PROXY-MVP **D1** (faithful Anthropic Messages passthrough: streaming + non-streaming, headers/body/SSE preserved byte-for-byte) **and D3** (cache-stable ambient memory injection: relevance-ranked `MemorySource` seam, injection appended only to the last user message so system+tools stay byte-identical, deterministic re-serialization so a second identical request hits the prompt cache, fail-open). 8 tests green, clippy-clean. **PR #69** open (`theorem-proxy-mvp` -> `main`): https://github.com/Travis-Gilbert/Theorem/pull/69.
-- The proxy's `MemorySource` default is `DirectoryMemorySource` (a dir of `*.md`); the substrate retrieval is the swap-in behind the trait.
+- `apps/theorem-proxy` built: SPEC-LOCAL-PROXY-MVP **D1** (faithful Anthropic Messages passthrough: streaming + non-streaming, headers/body/SSE preserved byte-for-byte) **and D3** (cache-stable ambient memory injection: relevance-ranked `MemorySource` seam, injection appended only to the last user message so system+tools stay byte-identical, deterministic re-serialization so a second identical request hits the prompt cache, fail-open). PR #69 (`theorem-proxy-mvp` -> `main`) is merged on `origin/main`.
+- Phase B.1 local start: the proxy now has `HttpMemorySource` behind `--memory-url` / `THEOREM_PROXY_MEMORY_URL`, calling the local node's hidden `hippo_retrieve` MCP intercept. `recall` is hidden from `rustyred-thg-mcp` `tools/list`, while the compatibility call handler remains. The product server also keeps `hippo_retrieve` callable but no longer advertises it.
+- The proxy's fallback `MemorySource` is `DirectoryMemorySource` (a dir of `*.md`); live use should prefer `THEOREM_PROXY_MEMORY_URL` once Phase A's local node is running.
 - Specs: `docs/plans/local-proxy/SPEC-PROXY-PROVE-AND-PRUNE.md` (the 5 deliverables). Source specs `SPEC-LOCAL-PROXY-MVP.md`, `SPEC-PROXY-RESIDENT-CAPABILITIES.md`, `SPEC-ONECLICK-ONBOARDING.md` still in `~/Downloads` -- MOVE them into `docs/plans/local-proxy/`.
 - Builds route to the SSD via `rustyredcore_THG/.cargo/config.toml` (gitignored, `target-dir = /Volumes/SSD Samsung/theorem-recon-target`). Other standalone crates (`apps/theorem-proxy`) need their own `CARGO_TARGET_DIR=` prefix or a per-crate `.cargo/config.toml`.
 - Substrate facts: `RedCoreGraphStore` = durable file-backed in-process store (AOF + snapshots; `open(data_dir, RedCoreOptions)`). `RedisGraphStore` = connects to a Redis/Valkey server (Valkey is Redis wire-compatible). `rustyred-thg-memory` = graph-native memory with `recall`/`encode`, bitemporal validity (`valid_at_ms`/`invalid_at_ms`), decay. `rustyred-embedded` = in-process embedded engine + a stdio MCP binary over a local data dir. Server surfaces: `rustyred-thg-server` (HTTP/gRPC/MCP), `theorem-grpc`, `theorem-harness-server`, `theorem-agentd` (local model host, blocking).
@@ -33,7 +34,7 @@ Note: Phase A is the largest and most underspecified. Open it with a short desig
 
 Ordered by usage leverage.
 
-- **B.1 (spec D1) Relevance-ranked injection wired to the substrate + remove `recall`.** Swap the proxy's directory `MemorySource` for the substrate retrieval (`hippo_retrieve`/index-context); retire wholesale `MEMORY.md`; remove the `recall` MCP tool (memory becomes ambient, never elected). Acceptance per spec D1. Direct usage reducer.
+- **B.1 (spec D1) Relevance-ranked injection wired to the substrate + remove `recall`.** Started locally: proxy `HttpMemorySource` calls hidden local-node `hippo_retrieve`, and `recall` is no longer advertised in MCP tools. Remaining live acceptance: run a proxied Claude/provider session against the local node and confirm prompt-cache usage on two identical requests.
 - **B.2 (spec D2) Tool-surface pruning.** From the usage audit (Codex is running one), cut never-called tools from the advertised set; move context-injection "tools" to proxy injection. Acceptance per spec D2. **Biggest immediate token-tax reducer; pull forward if usage is urgent.**
 - **B.3 (spec D4) Staleness-aware memory + memory CI.** Wire the existing `rustyred-thg-memory` validity layer to the ambient path; periodic memory-CI marks dead memories (referenced file/symbol gone). Acceptance per spec D4.
 - **B.4 (spec D3) Proxy-mediated proactive coordination.** Needs Phase A's local multi-head traffic. Push a "head B edited file X 90s ago" heads-up before an action targets a contended file. Acceptance per spec D3.
@@ -57,4 +58,4 @@ Ordered by usage leverage.
 
 - Memory: `[[harness-local-proxy]]` (the inversion + what's built + this roadmap).
 - The five Prove-and-Prune deliverables with full acceptance: `SPEC-PROXY-PROVE-AND-PRUNE.md` (same dir).
-- PR in flight: #69 (theorem-proxy D1+D3).
+- PR #69 (theorem-proxy D1+D3) is merged on `origin/main`; this branch carries the Phase B.1 follow-on.

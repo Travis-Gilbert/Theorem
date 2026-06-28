@@ -29,11 +29,14 @@ async fn injects_ranked_hits_from_a_live_node_over_mcp() {
             axum::Json(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": "theorem-proxy-recall",
+                // Real rustyred-thg-server /mcp envelope: payload under structuredContent.
                 "result": {
-                    "candidates": [
-                        {"node_id": "mem:planner", "text": "planner.rs does boolean pushdown", "ppr_proximity": 0.91},
-                        {"node_id": "mem:cats", "text": "cats are nice", "ppr_proximity": 0.10}
-                    ]
+                    "structuredContent": {
+                        "candidates": [
+                            {"node_id": "mem:planner", "text": "planner.rs does boolean pushdown", "ppr_proximity": 0.91},
+                            {"node_id": "mem:cats", "text": "cats are nice", "ppr_proximity": 0.10}
+                        ]
+                    }
                 }
             }))
         }),
@@ -64,4 +67,23 @@ async fn fails_open_when_the_node_is_unreachable() {
     .await
     .unwrap();
     assert!(hits.is_empty(), "down node fails open to passthrough");
+}
+
+/// End-to-end against a REAL running local node: `rustyred-thg-server` on
+/// 127.0.0.1:8380 (scripts/node-local.sh) with a memory encoded for the query. Ignored
+/// by default (needs the node up); run with:
+///   cargo test --test substrate_memory -- --ignored
+#[tokio::test]
+#[ignore]
+async fn live_local_node_returns_hits() {
+    let hits = tokio::task::spawn_blocking(|| {
+        HttpMemorySource::new("http://127.0.0.1:8380/mcp", Some("default".to_string()))
+            .retrieve("theorem-proxy local node ambient memory hippo_retrieve", 5)
+    })
+    .await
+    .unwrap();
+    assert!(
+        !hits.is_empty(),
+        "live local node returned ambient memory hits"
+    );
 }
