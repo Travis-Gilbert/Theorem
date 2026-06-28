@@ -14,10 +14,12 @@
 //! nothing: never mutate the cached prefix (system, tools), and fail open.
 
 pub mod inject;
+pub mod membrane;
 pub mod memory;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -37,6 +39,10 @@ pub struct ProxyConfig {
     pub memory: Option<Arc<dyn memory::MemorySource>>,
     /// Maximum memories injected per turn.
     pub max_memories: usize,
+    /// D2 native-tool membrane: max inline tool_result length before the latest turn's
+    /// oversized results are sampled to a head+tail stub (full output served at
+    /// `/tool_result/{id}`). `0` disables the membrane (the default).
+    pub membrane_threshold: usize,
 }
 
 impl Default for ProxyConfig {
@@ -45,6 +51,7 @@ impl Default for ProxyConfig {
             upstream: "https://api.anthropic.com".to_string(),
             memory: None,
             max_memories: 8,
+            membrane_threshold: 0,
         }
     }
 }
@@ -55,6 +62,10 @@ struct ProxyState {
     upstream: String,
     memory: Option<Arc<dyn memory::MemorySource>>,
     max_memories: usize,
+    membrane_threshold: usize,
+    /// Full content of tool_result blocks the membrane elided, keyed by retrieval id,
+    /// served at `GET /tool_result/{id}`.
+    tool_results: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Build the proxy router (exposed for tests and for embedding behind another
@@ -70,10 +81,13 @@ pub fn router(config: ProxyConfig) -> Router {
         upstream: config.upstream.trim_end_matches('/').to_string(),
         memory: config.memory,
         max_memories: config.max_memories,
+        membrane_threshold: config.membrane_threshold,
+        tool_results: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/messages", any(proxy_messages))
+        .route("/tool_result/{id}", get(serve_tool_result))
         .with_state(state)
 }
 
@@ -89,6 +103,21 @@ async fn proxy_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // D2: membrane the latest turn's oversized tool_result blocks (cache-safe: last
+    // message only). The full content is stashed for out-of-band retrieval.
+    let body = if state.membrane_threshold > 0 {
+        let (membraned, stored) = crate::membrane::apply_membrane(&body, state.membrane_threshold);
+        if !stored.is_empty() {
+            if let Ok(mut store) = state.tool_results.lock() {
+                for (id, content) in stored {
+                    store.insert(id, content);
+                }
+            }
+        }
+        Bytes::from(membraned)
+    } else {
+        body
+    };
     // D3: inject relevant memory at the cache-stable suffix (the last user turn),
     // never into system or tools. Fail open -- an unparseable body, or one with no
     // relevant memory, is forwarded unchanged.
@@ -139,6 +168,18 @@ async fn proxy_messages(
     let mut response = (status, Body::from_stream(upstream.bytes_stream())).into_response();
     *response.headers_mut() = response_headers;
     response
+}
+
+/// Serve the full content of a tool_result the membrane elided (D2). Out-of-band
+/// retrieval: the truncated stub points here. 404 if unknown or already evicted.
+async fn serve_tool_result(
+    State(state): State<ProxyState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.tool_results.lock().ok().and_then(|store| store.get(&id).cloned()) {
+        Some(content) => content.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Hop-by-hop headers (and the ones the proxied connection recomputes) that must

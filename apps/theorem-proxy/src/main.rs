@@ -40,6 +40,10 @@ enum Command {
         /// is set; omit both for faithful passthrough.
         #[arg(long, env = "THEOREM_PROXY_MEMORY_DIR")]
         memory_dir: Option<PathBuf>,
+        /// D2 membrane: max inline tool_result bytes before the latest turn's oversized
+        /// results are sampled (full output served at /tool_result/{id}). 0 = off.
+        #[arg(long, default_value_t = 0)]
+        membrane_threshold: usize,
     },
     /// Start the proxy and run a command (e.g. `claude`) pointed at it -- one command,
     /// no manual ANTHROPIC_BASE_URL export. Put the command after `--`.
@@ -54,6 +58,9 @@ enum Command {
         tenant: Option<String>,
         #[arg(long, env = "THEOREM_PROXY_MEMORY_DIR")]
         memory_dir: Option<PathBuf>,
+        /// D2 membrane threshold in bytes (0 = off). See `proxy --help`.
+        #[arg(long, default_value_t = 0)]
+        membrane_threshold: usize,
         /// The command to run with ANTHROPIC_BASE_URL set (everything after `--`).
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -80,6 +87,7 @@ async fn main() -> std::io::Result<()> {
             memory_url,
             tenant,
             memory_dir,
+            membrane_threshold,
         } => {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             let (memory, memory_desc) =
@@ -97,6 +105,7 @@ async fn main() -> std::io::Result<()> {
                     upstream,
                     memory,
                     max_memories: 8,
+                    membrane_threshold,
                 },
             )
             .await
@@ -107,6 +116,7 @@ async fn main() -> std::io::Result<()> {
             memory_url,
             tenant,
             memory_dir,
+            membrane_threshold,
             command,
         } => {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -120,6 +130,7 @@ async fn main() -> std::io::Result<()> {
                     upstream,
                     memory,
                     max_memories: 8,
+                    membrane_threshold,
                 },
                 command,
             )
