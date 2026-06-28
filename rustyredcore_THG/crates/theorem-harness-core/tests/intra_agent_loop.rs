@@ -1012,6 +1012,70 @@ fn fake_loop_threads_lineage_memory_into_head_requests() {
     );
 }
 
+// --- F2 (PR #73 CodeRabbit): post-MOUNTED capture is scoped to the new slice -
+//
+// If a binding loaded into the loop already carries a stale
+// `lineage:agent_published` revision on its scratchpad (e.g. from a previous
+// run that persisted state), the post-MOUNTED capture must NOT re-add it to
+// the loop's local `revisions` vec. With the F2 fix the scan iterates only
+// the slice appended in this MOUNTED call.
+#[test]
+fn fake_loop_post_mounted_capture_ignores_pre_existing_lineage_revisions() {
+    let invoker = RecordingInvoker::default();
+    let mut binding = fixture_binding();
+    // Stale prior-run revision sitting on the binding's scratchpad BEFORE the
+    // loop runs. The actor id matches the synthetic lineage actor so it would
+    // be matched by the post-MOUNTED scan if the scan saw it.
+    let stale = binding.working_memory_scope.scratchpad.append(
+        "lineage:agent_published",
+        "stale prior-run lineage memory (must not be re-captured)",
+        "hash:stale",
+        serde_json::Map::new(),
+        "1970-01-01T00:00:00.000Z",
+    );
+    let stale_revision_id = stale.revision_id.clone();
+
+    let lineage_entry = BindingLineageMemoryEntry {
+        source_binding_id: "harness:binding:agent:theorem:v2".to_string(),
+        source_composition_hash: "comp:v2".to_string(),
+        source_version: 2,
+        summary: "prior binding agent:theorem:v2 (v2) published memory".to_string(),
+        patch_ids: vec!["patch:fresh".to_string()],
+        substrate_receipt_id: "substrate:fresh".to_string(),
+        published_at: "1970-01-01T00:00:02.000Z".to_string(),
+    };
+    let mut input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    input.lineage_memory = vec![lineage_entry];
+
+    let result =
+        theorem_harness_core::run_intra_agent_loop_with_invoker(binding, input, &invoker).unwrap();
+
+    // The MOUNTED arm appends exactly one fresh lineage revision; the stale
+    // one is still on the scratchpad (we never delete revisions), but the
+    // post-MOUNTED capture must NOT have surfaced it to the heads.
+    let lineage_count = result
+        .binding
+        .working_memory_scope
+        .scratchpad
+        .revisions
+        .iter()
+        .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+        .count();
+    assert_eq!(lineage_count, 2, "stale + one freshly appended");
+
+    let requests = invoker.requests.into_inner();
+    let proposal = requests
+        .iter()
+        .find(|request| request.kind == HeadInvocationKind::Proposal)
+        .expect("loop must produce a proposal request");
+    assert!(
+        !proposal.prior_revision_ids.contains(&stale_revision_id),
+        "F2: stale pre-existing lineage revision must NOT enter prior_revision_ids; got {:?}",
+        proposal.prior_revision_ids
+    );
+}
+
 #[test]
 fn fake_loop_omits_lineage_memory_revisions_when_input_has_none() {
     // Back-compat: when input.lineage_memory is empty, no

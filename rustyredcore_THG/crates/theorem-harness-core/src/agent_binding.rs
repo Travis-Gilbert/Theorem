@@ -2269,6 +2269,18 @@ fn payload_lineage_memory_entries(value: Option<&Value>) -> Vec<BindingLineageMe
         Some(Value::Array(items)) => items
             .iter()
             .filter_map(|item| serde_json::from_value::<BindingLineageMemoryEntry>(item.clone()).ok())
+            // `BindingLineageMemoryEntry` carries `#[serde(default)]` on every
+            // field so it round-trips legacy payloads, but that means an empty
+            // `{}` element parses into a default-everything entry. Reject
+            // entries missing the join key (`source_binding_id`) OR any
+            // concrete payload signal (`substrate_receipt_id` / `patch_ids`).
+            // Without this guard, MOUNTED would synthesize empty
+            // `lineage:agent_published` revisions for stray empty items.
+            .filter(|entry| {
+                !entry.source_binding_id.trim().is_empty()
+                    && (!entry.substrate_receipt_id.trim().is_empty()
+                        || !entry.patch_ids.is_empty())
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -3322,5 +3334,39 @@ mod tests {
             "legacy MOUNTED payload must not synthesize any scratchpad revisions"
         );
         assert_eq!(mounted.binding.lifecycle.status, "memory_scope_mounted");
+    }
+
+    // ---- F1: payload_lineage_memory_entries filters synthetic empties ----
+
+    #[test]
+    fn payload_lineage_memory_entries_filters_empty_and_keyless_entries() {
+        let array = json!([
+            // Pure empty entry (every field defaults via serde(default)).
+            {},
+            // Missing the join key entirely.
+            {"source_binding_id": "", "patch_ids": ["patch:1"]},
+            // Has join key but no payload signal at all.
+            {"source_binding_id": "b1", "patch_ids": [], "substrate_receipt_id": ""},
+            // Valid: join key + a substrate receipt.
+            {
+                "source_binding_id": "b-keep-receipt",
+                "substrate_receipt_id": "substrate:1",
+                "patch_ids": []
+            },
+            // Valid: join key + patch ids.
+            {
+                "source_binding_id": "b-keep-patches",
+                "substrate_receipt_id": "",
+                "patch_ids": ["patch:1"]
+            }
+        ]);
+        let entries = payload_lineage_memory_entries(Some(&array));
+        assert_eq!(
+            entries.len(),
+            2,
+            "only entries with join key AND a payload signal must survive"
+        );
+        assert_eq!(entries[0].source_binding_id, "b-keep-receipt");
+        assert_eq!(entries[1].source_binding_id, "b-keep-patches");
     }
 }

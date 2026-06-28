@@ -305,7 +305,11 @@ pub struct BindingLineageEntry {
     pub agent_name: String,
     pub version: u32,
     pub composition_hash: String,
-    pub created_at_ms: String,
+    /// The lifecycle creation timestamp of the binding node, populated as an
+    /// RFC3339 string (e.g. `"2026-06-28T12:00:00Z"`) -- NOT epoch
+    /// milliseconds, despite the legacy `_ms` field name that previously
+    /// shipped here. Sorted lexicographically.
+    pub created_at_rfc3339: String,
     pub active_head_set: Vec<String>,
     pub trust_tier: String,
 }
@@ -313,10 +317,11 @@ pub struct BindingLineageEntry {
 /// Walk the graph for every `AgentBinding` node whose `identity.agent_id`
 /// matches `agent_id`. The chain is the named lineage; different
 /// `composition_hash` values distinguish versions of the same agent. Ordering
-/// is `(version, created_at_ms, binding_id)` so a strictly-increasing version
-/// rules; equal versions fall back to the lifecycle creation timestamp and
-/// then the durable binding node id, keeping the order deterministic. Returns
-/// an empty vec when the agent has no recorded lineage.
+/// is `(version, created_at_rfc3339, binding_id)` so a strictly-increasing
+/// version rules; equal versions fall back to the lifecycle creation
+/// timestamp and then the durable binding node id, keeping the order
+/// deterministic. Returns an empty vec when the agent has no recorded
+/// lineage.
 pub fn binding_lineage<S: GraphStore>(
     store: &S,
     agent_id: &str,
@@ -363,7 +368,7 @@ pub fn binding_lineage<S: GraphStore>(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let created_at_ms = node
+            let created_at_rfc3339 = node
                 .properties
                 .get("lifecycle")
                 .and_then(Value::as_object)
@@ -377,7 +382,7 @@ pub fn binding_lineage<S: GraphStore>(
                 agent_name,
                 version,
                 composition_hash,
-                created_at_ms,
+                created_at_rfc3339,
                 active_head_set,
                 trust_tier,
             })
@@ -386,7 +391,7 @@ pub fn binding_lineage<S: GraphStore>(
     entries.sort_by(|a, b| {
         a.version
             .cmp(&b.version)
-            .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+            .then_with(|| a.created_at_rfc3339.cmp(&b.created_at_rfc3339))
             .then_with(|| a.binding_id.cmp(&b.binding_id))
     });
     Ok(entries)
@@ -438,10 +443,11 @@ pub fn lineage_memory_for_binding<S: GraphStore>(
             continue;
         }
         let events = load_binding_events(store, &run_id)?;
-        let substrate_receipt_id = events
+        let substrate_event = events
             .iter()
             .rev()
-            .find(|event| event.event_type == "PUBLISHED_TO_SUBSTRATE")
+            .find(|event| event.event_type == "PUBLISHED_TO_SUBSTRATE");
+        let substrate_receipt_id = substrate_event
             .and_then(|event| event.payload.get("substrate_receipt_id"))
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -460,8 +466,15 @@ pub fn lineage_memory_for_binding<S: GraphStore>(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Prefer the MEMORY_PATCHES.PROPOSED timestamp when present, since it
+        // is the more specific signal about when the inheritable memory was
+        // proposed. Fall back to the PUBLISHED_TO_SUBSTRATE event's
+        // timestamp so bindings that published without proposing patches
+        // still surface a non-empty `published_at` -- previously such
+        // entries shipped an empty string.
         let published_at = memory_patches
             .map(|event| event.created_at.clone())
+            .or_else(|| substrate_event.map(|event| event.created_at.clone()))
             .unwrap_or_default();
         // Skip a prior binding with no substrate publication and no proposed
         // memory patches: there is nothing concrete to inherit from it yet.
@@ -1410,7 +1423,7 @@ mod tests {
             assert_eq!(entry.agent_name, "Theorem");
             assert_eq!(entry.trust_tier, "first_party");
             assert!(!entry.composition_hash.is_empty());
-            assert!(!entry.created_at_ms.is_empty());
+            assert!(!entry.created_at_rfc3339.is_empty());
         }
         // All three composition hashes must be distinct (head_seed drives this);
         // otherwise the lineage cannot represent multiple binding versions.
@@ -1436,6 +1449,79 @@ mod tests {
             entries.is_empty(),
             "a prior binding with no publication signals must not surface as lineage memory; got {entries:?}"
         );
+    }
+
+    // --- F4 (PR #73 CodeRabbit): created_at_rfc3339 is RFC3339 not epoch ms ---
+    //
+    // The legacy field was named `created_at_ms` which suggested epoch
+    // milliseconds; in fact the populator copied the binding lifecycle's
+    // `created_at` (an RFC3339 string). The field rename pins the shape:
+    // digit-prefixed, contains `T`, ends with `Z` (or an offset).
+    #[test]
+    fn binding_lineage_created_at_rfc3339_is_rfc3339_string() {
+        let mut store = InMemoryGraphStore::new();
+        let mut binding = lineage_binding("agent:theorem:rfc", 1, "a");
+        binding.lifecycle.created_at = "2026-06-28T12:34:56Z".to_string();
+        persist_binding(&mut store, &binding, &hash_agent_binding(&binding)).unwrap();
+
+        let lineage = binding_lineage(&store, "theorem").unwrap();
+        assert_eq!(lineage.len(), 1);
+        let stamp = &lineage[0].created_at_rfc3339;
+        assert!(
+            stamp.starts_with(|ch: char| ch.is_ascii_digit()),
+            "created_at_rfc3339 must start with a digit (year), got {stamp:?}"
+        );
+        assert!(
+            stamp.contains('T'),
+            "created_at_rfc3339 must contain RFC3339 'T' separator, got {stamp:?}"
+        );
+        assert!(
+            stamp.ends_with('Z') || stamp.contains('+') || stamp.contains('-'),
+            "created_at_rfc3339 must carry a zone (Z or numeric offset), got {stamp:?}"
+        );
+        assert_eq!(stamp, "2026-06-28T12:34:56Z");
+    }
+
+    // --- F5 (PR #73 CodeRabbit): published_at falls back to PUBLISHED_TO_SUBSTRATE ---
+    //
+    // A prior binding that has PUBLISHED_TO_SUBSTRATE but no
+    // MEMORY_PATCHES.PROPOSED event must still surface a non-empty
+    // `published_at` (the substrate event's `created_at`). Before the fix,
+    // `published_at` was empty in this case.
+    #[test]
+    fn lineage_memory_published_at_falls_back_to_substrate_event() {
+        let mut store = InMemoryGraphStore::new();
+        // Build a prior binding that goes ALL the way through to
+        // PUBLISHED_TO_SUBSTRATE but stops short of MEMORY_PATCHES.PROPOSED.
+        let mut v1 = lineage_binding("agent:theorem:noPatches", 1, "a");
+        for (event, payload) in lineage_v1_lifecycle_events() {
+            if event == "MEMORY_PATCHES.PROPOSED" {
+                continue;
+            }
+            v1 = append_binding_transition(&mut store, v1, transition(event, payload))
+                .unwrap()
+                .binding;
+        }
+
+        let current = lineage_binding("agent:theorem:noPatches:v2", 2, "b");
+        let entries = lineage_memory_for_binding(&store, &current).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "prior binding with substrate publication (and no patches) must still appear"
+        );
+        let entry = &entries[0];
+        assert_eq!(entry.substrate_receipt_id, "substrate:1");
+        assert!(
+            entry.patch_ids.is_empty(),
+            "this prior binding never proposed memory patches"
+        );
+        assert!(
+            !entry.published_at.is_empty(),
+            "published_at must fall back to the substrate event's created_at; got empty"
+        );
+        // The substrate event's `created_at` is the harness `TS` test constant.
+        assert_eq!(entry.published_at, TS);
     }
 
     #[test]

@@ -270,6 +270,13 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         );
         mount_payload.insert("lineage_memory".to_string(), Value::Array(lineage_array));
     }
+    // Pin the scratchpad length BEFORE MOUNTED runs so the post-MOUNTED
+    // captures iterate ONLY the newly appended revisions. Without this
+    // anchor, a binding loaded with pre-existing `binding:mount` or
+    // `lineage:agent_published` revisions on its scratchpad (e.g. from a
+    // previous run that persisted state) would re-add those stale revisions
+    // to the loop's local `revisions` vec.
+    let mounted_revision_start = binding.working_memory_scope.scratchpad.revisions.len();
     binding = apply_step(
         binding,
         "MEMORY_SCOPE.MOUNTED",
@@ -284,13 +291,16 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
     // is what later `invoke_head` calls use to build `prior_revision_ids`
     // and `prior_context`, so propagate the just-appended mount revision
     // here -- otherwise the proposal/critique/synthesis/verification heads
-    // never see the user_model and the slice's purpose is defeated.
+    // never see the user_model and the slice's purpose is defeated. Search
+    // only the slice appended in this MOUNTED call so we never re-capture
+    // a stale mount revision from a prior run on the same binding.
     if input.user_model.is_some() {
         if let Some(last) = binding
             .working_memory_scope
             .scratchpad
             .revisions
             .iter()
+            .skip(mounted_revision_start)
             .rev()
             .find(|revision| revision.actor_head_id == "binding:mount")
         {
@@ -303,9 +313,18 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
     // first proposal/critique/synthesis `invoke_head` call surfaces them in
     // `prior_revision_ids` (and the kernel sees them as prior context the
     // heads must read). Without this, the kernel mounts the memory into
-    // the binding but the heads never see it.
+    // the binding but the heads never see it. Iterate only the slice
+    // appended in this MOUNTED call so any pre-existing
+    // `lineage:agent_published` revisions on the loaded binding are left
+    // alone.
     if !input.lineage_memory.is_empty() {
-        for revision in &binding.working_memory_scope.scratchpad.revisions {
+        for revision in binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .skip(mounted_revision_start)
+        {
             if revision.actor_head_id == "lineage:agent_published" {
                 revisions.push(revision.clone());
             }
