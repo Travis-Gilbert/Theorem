@@ -135,14 +135,8 @@ fn synthesis_receives_proposal_and_critique_context() {
         .find(|request| request.kind == HeadInvocationKind::Synthesis)
         .unwrap();
     assert_eq!(synthesis.prior_context.len(), 2);
-    assert_eq!(
-        synthesis.prior_context[0].kind,
-        HeadInvocationKind::Proposal
-    );
-    assert_eq!(
-        synthesis.prior_context[1].kind,
-        HeadInvocationKind::Critique
-    );
+    assert_eq!(synthesis.prior_context[0].kind, "proposal");
+    assert_eq!(synthesis.prior_context[1].kind, "critique");
     assert!(synthesis.prior_context[0]
         .payload
         .get("task")
@@ -359,7 +353,10 @@ fn mounted_with_user_model_writes_context_entry_before_heads_contribute() {
         FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
     input.user_model = Some(model.clone());
 
-    let result = run_fake_intra_agent_loop(fixture_binding(), input).unwrap();
+    let invoker = RecordingInvoker::default();
+    let result =
+        theorem_harness_core::run_intra_agent_loop_with_invoker(fixture_binding(), input, &invoker)
+            .unwrap();
 
     // 1) The MOUNTED transition receipt records the user_model hash.
     let mount_event = result
@@ -422,6 +419,159 @@ fn mounted_with_user_model_writes_context_entry_before_heads_contribute() {
     assert!(
         context_index < first_contribute_index,
         "user_model context entry (idx {context_index}) must precede the first contribution revision (idx {first_contribute_index})"
+    );
+
+    // 4) PR #72 P2: every subsequent head invocation (proposal, critique,
+    //    synthesis, verification) must see the mount revision in
+    //    `prior_revision_ids` AND in `prior_context` -- so heads can act on
+    //    the user_model the binding mount staged for them.
+    let mount_revision_id = mounted_revision.revision_id.clone();
+    let requests = invoker.requests.into_inner();
+    assert!(
+        !requests.is_empty(),
+        "the loop produced at least one head invocation"
+    );
+    for request in &requests {
+        assert!(
+            request.prior_revision_ids.contains(&mount_revision_id),
+            "{:?} request prior_revision_ids should include the mount revision id; got {:?}",
+            request.kind,
+            request.prior_revision_ids
+        );
+        let mount_ctx = request
+            .prior_context
+            .iter()
+            .find(|context| context.revision_id == mount_revision_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?} request prior_context should include the mount revision",
+                    request.kind
+                )
+            });
+        assert_eq!(mount_ctx.kind, "context");
+        let head_view_user_model: UserModel = serde_json::from_value(
+            mount_ctx
+                .payload
+                .get("user_model")
+                .cloned()
+                .expect("mount prior_context entry carries the user_model"),
+        )
+        .expect("user_model on prior_context deserializes back");
+        assert_eq!(head_view_user_model, model);
+    }
+}
+
+#[test]
+fn mounted_with_user_model_is_replayable_with_stable_state_hash() {
+    // PR #72 P1: two independent applies of the same MEMORY_SCOPE.MOUNTED
+    // transition (same agent_id + composition_hash + created_at + user_model
+    // payload) MUST produce identical binding state hashes. Before the fix
+    // the mount path generated UUID-based scratchpad revision and op ids on
+    // each apply, so `hash_agent_binding` returned a different value every
+    // time and binding receipts were not replayable for mounted user-model
+    // runs.
+    use theorem_harness_core::{
+        apply_binding_transition, hash_agent_binding, AgentHeadRegistry, BindingTransitionInput,
+    };
+
+    let mut model = UserModel::default();
+    model
+        .preferences
+        .insert("voice".to_string(), "spare".to_string());
+    model.style_notes.push(UserModelNote::new(
+        "no em-dashes",
+        "2026-06-28T00:00:00Z",
+    ));
+    let user_model_value = serde_json::to_value(&model).unwrap();
+    let created_at = "2026-06-28T00:00:00Z".to_string();
+
+    fn apply_transition(
+        binding: AgentBinding,
+        event_type: &str,
+        payload: serde_json::Map<String, serde_json::Value>,
+        created_at: &str,
+    ) -> AgentBinding {
+        apply_binding_transition(
+            binding,
+            BindingTransitionInput {
+                event_type: event_type.to_string(),
+                payload,
+                run_id: String::new(),
+                actor: String::new(),
+                created_at: created_at.to_string(),
+            },
+        )
+        .unwrap()
+        .binding
+    }
+
+    let user_model_value_for_a = user_model_value.clone();
+    let created_at_for_a = created_at.clone();
+    let user_model_value_for_b = user_model_value.clone();
+    let created_at_for_b = created_at.clone();
+
+    let build_through_mount = move |user_model_value: serde_json::Value,
+                                    created_at: String|
+          -> AgentBinding {
+        let mut binding = fixture_binding();
+        // Pin the per-process nondeterminism in `BindingLifecycleState::new()`
+        // (UUID run_id + wall-clock created_at/updated_at) to fixed values so
+        // the state-hash comparison isolates the mount-path determinism we
+        // care about.
+        binding.lifecycle.run_id = "bindingrun:replay-test".to_string();
+        binding.lifecycle.created_at = created_at.clone();
+        binding.lifecycle.updated_at = created_at.clone();
+        let registry = AgentHeadRegistry::from_binding(&binding).unwrap();
+
+        let mut resolved_payload = serde_json::Map::new();
+        resolved_payload.insert("binding_id".to_string(), json!("agent:theorem"));
+        resolved_payload.insert(
+            "composition_hash".to_string(),
+            json!("computed-by-kernel"),
+        );
+        let binding = apply_transition(
+            binding,
+            "BINDING.RESOLVED",
+            resolved_payload,
+            &created_at,
+        );
+
+        let binding = apply_transition(
+            binding,
+            "HEADS.PROBED",
+            registry.heads_probed_payload(),
+            &created_at,
+        );
+
+        let mut mount_payload = serde_json::Map::new();
+        mount_payload.insert("scope_id".to_string(), json!("scope:test"));
+        mount_payload.insert("scratchpad_id".to_string(), json!("scratchpad:test"));
+        mount_payload.insert("user_model".to_string(), user_model_value);
+        apply_transition(binding, "MEMORY_SCOPE.MOUNTED", mount_payload, &created_at)
+    };
+
+    let binding_a = build_through_mount(user_model_value_for_a, created_at_for_a);
+    let binding_b = build_through_mount(user_model_value_for_b, created_at_for_b);
+
+    assert_eq!(
+        hash_agent_binding(&binding_a),
+        hash_agent_binding(&binding_b),
+        "two independent mount applies with the same input must produce the same binding state hash"
+    );
+
+    // And the scratchpad's mount-revision id is the deterministic seed,
+    // not a UUID-prefixed one (any other ScratchpadDocument field drift
+    // would still trip the state-hash equality above).
+    let mount_rev = binding_a
+        .working_memory_scope
+        .scratchpad
+        .revisions
+        .last()
+        .expect("scratchpad gained the mount revision");
+    assert!(
+        mount_rev.revision_id.starts_with("scratchrev:mount:"),
+        "mount revision should carry the deterministic seed prefix, got {}",
+        mount_rev.revision_id
     );
 }
 

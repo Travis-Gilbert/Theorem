@@ -356,7 +356,7 @@ fn request_with_transport(
         vec!["scratchrev:1".to_string()],
         vec![theorem_harness_core::RevisionContext {
             revision_id: "scratchrev:1".to_string(),
-            kind: HeadInvocationKind::Proposal,
+            kind: HeadInvocationKind::Proposal.as_str().to_string(),
             output_summary: "prior proposal".to_string(),
             payload: {
                 let mut payload = serde_json::Map::new();

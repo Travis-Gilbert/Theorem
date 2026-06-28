@@ -102,7 +102,13 @@ impl ContextMembranePrime {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RevisionContext {
     pub revision_id: String,
-    pub kind: HeadInvocationKind,
+    /// The scratchpad revision's `kind` payload field as a stable string.
+    /// Carries the standard turn kinds (`"proposal"`, `"critique"`,
+    /// `"synthesis"`, `"verification"`) plus `"context"` for grounding
+    /// revisions like the binding-mount user-model entry (PR #72 P2). Kept
+    /// as a plain string so context revisions can ride `prior_context` to
+    /// downstream heads without widening `HeadInvocationKind`.
+    pub kind: String,
     pub output_summary: String,
     #[serde(default)]
     pub payload: Payload,

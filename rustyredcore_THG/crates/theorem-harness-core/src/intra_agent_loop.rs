@@ -249,6 +249,24 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &mut events,
     )?
     .binding;
+    // PR #72 P2: when a user_model was mounted, the MOUNTED arm appended a
+    // `binding:mount` Context revision to the binding's scratchpad inside
+    // `apply_binding_payload`. The local `revisions` vec is what later
+    // `invoke_head` calls use to build `prior_revision_ids` and
+    // `prior_context`, so propagate the just-appended mount revision here
+    // -- otherwise the proposal/critique/synthesis/verification heads never
+    // see the user_model and the slice's purpose is defeated.
+    if input.user_model.is_some() {
+        if let Some(last) = binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .last()
+            .filter(|revision| revision.actor_head_id == "binding:mount")
+        {
+            revisions.push(last.clone());
+        }
+    }
 
     binding = apply_step(
         binding,
@@ -963,27 +981,20 @@ fn invoke_head<I: HeadInvoker>(
 }
 
 fn revision_context(revision: &ScratchpadRevision) -> Option<RevisionContext> {
-    let kind = revision
-        .payload
-        .get("kind")
-        .and_then(Value::as_str)
-        .and_then(parse_invocation_kind)?;
+    let kind = revision.payload.get("kind").and_then(Value::as_str)?;
+    // Surface the standard turn kinds AND `"context"` so grounding revisions
+    // (e.g. the binding-mount user-model entry) reach downstream heads through
+    // `prior_context`. Unknown kinds are still filtered out.
+    let kind_str = match kind {
+        "proposal" | "critique" | "synthesis" | "verification" | "context" => kind.to_string(),
+        _ => return None,
+    };
     Some(RevisionContext {
         revision_id: revision.revision_id.clone(),
-        kind,
+        kind: kind_str,
         output_summary: revision.summary.clone(),
         payload: revision.payload.clone(),
     })
-}
-
-fn parse_invocation_kind(kind: &str) -> Option<HeadInvocationKind> {
-    match kind {
-        "proposal" => Some(HeadInvocationKind::Proposal),
-        "critique" => Some(HeadInvocationKind::Critique),
-        "synthesis" => Some(HeadInvocationKind::Synthesis),
-        "verification" => Some(HeadInvocationKind::Verification),
-        _ => None,
-    }
 }
 
 fn contribute_from_receipt(
