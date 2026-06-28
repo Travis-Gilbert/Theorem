@@ -2,6 +2,7 @@ use crate::alignment::evaluate_publication;
 use crate::budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
 use crate::state_hash::stable_value_hash;
 use crate::types::{now_string, prefixed_id, GuardViolation, Payload};
+use crate::user_model::{user_model_hash, UserModel};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -492,6 +493,61 @@ impl ScratchpadDocument {
         links: Vec<ScratchpadRevisionLink>,
         created_at: impl Into<String>,
     ) -> ScratchpadRevision {
+        self.append_internal(
+            actor_head_id.into(),
+            summary.into(),
+            content_hash.into(),
+            payload,
+            parent_revision_ids,
+            links,
+            created_at.into(),
+            prefixed_id("scratchrev"),
+            prefixed_id("scratchop"),
+        )
+    }
+
+    /// Append a revision with caller-provided deterministic `revision_id` and
+    /// `op_id`, bypassing the UUID-based generators used by `append` /
+    /// `append_with_links`. Used by the binding-mount path so identical
+    /// `(agent_id, user_model_hash, created_at)` inputs always produce the
+    /// same scratchpad state hash on replay (PR #72 P1 fix).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_with_deterministic_ids(
+        &mut self,
+        actor_head_id: impl Into<String>,
+        summary: impl Into<String>,
+        content_hash: impl Into<String>,
+        payload: Payload,
+        revision_id: String,
+        op_id: String,
+        created_at: impl Into<String>,
+    ) -> ScratchpadRevision {
+        self.append_internal(
+            actor_head_id.into(),
+            summary.into(),
+            content_hash.into(),
+            payload,
+            Vec::new(),
+            Vec::new(),
+            created_at.into(),
+            revision_id,
+            op_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_internal(
+        &mut self,
+        actor_head_id: String,
+        summary: String,
+        content_hash: String,
+        payload: Payload,
+        parent_revision_ids: Vec<String>,
+        links: Vec<ScratchpadRevisionLink>,
+        created_at: String,
+        revision_id: String,
+        op_id: String,
+    ) -> ScratchpadRevision {
         let parent_revision_ids = if parent_revision_ids.is_empty() {
             self.revisions
                 .last()
@@ -506,23 +562,20 @@ impl ScratchpadDocument {
             .and_then(|_| parent_revision_ids.first().cloned())
             .unwrap_or_default();
         self.version += 1;
-        let revision_id = prefixed_id("scratchrev");
-        let actor_head_id = actor_head_id.into();
-        let created_at = created_at.into();
         let revision = ScratchpadRevision {
             revision_id: revision_id.clone(),
             parent_revision_id,
             parent_revision_ids,
             seq: self.version,
             actor_head_id: actor_head_id.clone(),
-            summary: summary.into(),
-            content_hash: content_hash.into(),
+            summary,
+            content_hash,
             payload,
             created_at: created_at.clone(),
         };
         self.revisions.push(revision.clone());
         self.crdt_ops.push(ScratchpadCrdtOperation {
-            op_id: prefixed_id("scratchop"),
+            op_id,
             actor_head_id: actor_head_id.clone(),
             revision_id: revision_id.clone(),
             op_kind: "upsert_revision".to_string(),
@@ -1350,7 +1403,7 @@ pub struct BindingTransitionResult {
 
 pub fn apply_binding_transition(
     mut binding: AgentBinding,
-    transition: BindingTransitionInput,
+    mut transition: BindingTransitionInput,
 ) -> Result<BindingTransitionResult, BindingError> {
     validate_binding(&binding)?;
     if binding_target_status(&transition.event_type).is_empty() {
@@ -1393,7 +1446,7 @@ pub fn apply_binding_transition(
 
     let before_status = binding.lifecycle.status.clone();
     let before_hash = hash_agent_binding(&binding);
-    apply_binding_payload(&mut binding, &transition)?;
+    apply_binding_payload(&mut binding, &mut transition)?;
     binding.lifecycle.status = binding_target_status(&transition.event_type).to_string();
     binding.lifecycle.last_event_seq += 1;
     binding.lifecycle.updated_at = transition.created_at.clone();
@@ -1542,11 +1595,77 @@ fn validate_binding(binding: &AgentBinding) -> Result<(), BindingError> {
 
 fn apply_binding_payload(
     binding: &mut AgentBinding,
-    transition: &BindingTransitionInput,
+    transition: &mut BindingTransitionInput,
 ) -> Result<(), BindingError> {
     match transition.event_type.as_str() {
         "BINDING.RESOLVED" => {
             binding.identity.composition_hash = composition_hash(binding);
+        }
+        "MEMORY_SCOPE.MOUNTED" => {
+            // Optional: if the caller supplied a `user_model` field in the
+            // payload, ground every head's turn on the same picture of the
+            // user by appending a Context revision to the scratchpad before
+            // HEADS.CONTRIBUTE fires, and stamp the model's content hash onto
+            // the stored event payload so the receipt records which model was
+            // mounted. Absent payload field => no-op (back-compat with the
+            // pre-S2 lifecycle).
+            if let Some(value) = transition.payload.get("user_model") {
+                match serde_json::from_value::<UserModel>(value.clone()) {
+                    Ok(user_model) => {
+                        let hash = user_model_hash(&user_model);
+                        let model_value = serde_json::to_value(&user_model)
+                            .expect("UserModel serialization should be infallible");
+                        let mut payload = Payload::new();
+                        payload.insert("kind".to_string(), Value::String("context".to_string()));
+                        payload.insert("source".to_string(), Value::String("user_model".to_string()));
+                        payload.insert("user_model".to_string(), model_value);
+                        payload.insert("user_model_hash".to_string(), Value::String(hash.clone()));
+                        // Deterministic revision/op ids so that replay or fork of
+                        // an identical (agent_id, user_model_hash, created_at) input
+                        // produces the same scratchpad state -- and therefore the
+                        // same `state_hash_after` -- as the original apply. Without
+                        // these the UUID-based generators in `ScratchpadDocument`
+                        // would drift the binding state hash on every replay,
+                        // breaking deterministic binding receipts for mounted
+                        // user-model runs. See PR #72 P1.
+                        let id_seed = stable_value_hash(&json!([
+                            "memory_scope.mounted.user_model",
+                            &binding.identity.agent_id,
+                            &hash,
+                            &transition.created_at,
+                        ]));
+                        let revision_id = format!("scratchrev:mount:{id_seed}");
+                        let op_id = format!("scratchop:mount:{id_seed}");
+                        binding
+                            .working_memory_scope
+                            .scratchpad
+                            .append_with_deterministic_ids(
+                                "binding:mount",
+                                "user model mounted",
+                                hash.clone(),
+                                payload,
+                                revision_id,
+                                op_id,
+                                transition.created_at.clone(),
+                            );
+                        transition
+                            .payload
+                            .insert("user_model_hash".to_string(), Value::String(hash));
+                    }
+                    Err(error) => {
+                        return Err(guard_violation(
+                            "invalid_user_model_payload",
+                            format!(
+                                "MEMORY_SCOPE.MOUNTED user_model field could not be parsed: {error}"
+                            ),
+                            "user_model",
+                            "invalid_user_model",
+                            vec!["user_model".to_string()],
+                            Payload::new(),
+                        ));
+                    }
+                }
+            }
         }
         "CHARTER.COMPILED" => {
             binding.capability_scope.charter_hash =

@@ -209,9 +209,7 @@ pub(crate) fn prompt_for_request(request: &HeadInvocationRequest) -> String {
         for context in &request.prior_context {
             prompt.push_str(&format!(
                 "- {} ({}) {}\n",
-                context.revision_id,
-                context.kind.as_str(),
-                context.output_summary
+                context.revision_id, context.kind, context.output_summary
             ));
             if let Some(text) = context.payload.get("text").and_then(Value::as_str) {
                 prompt.push_str(text);
@@ -430,7 +428,7 @@ mod tests {
             vec!["scratchrev:1".to_string()],
             vec![theorem_harness_core::RevisionContext {
                 revision_id: "scratchrev:1".to_string(),
-                kind: HeadInvocationKind::Proposal,
+                kind: HeadInvocationKind::Proposal.as_str().to_string(),
                 output_summary: "proposal".to_string(),
                 payload: object_payload(json!({ "text": "proposal body" })),
             }],
