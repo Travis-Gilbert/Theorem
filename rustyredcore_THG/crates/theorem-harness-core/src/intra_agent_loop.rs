@@ -20,6 +20,7 @@ use crate::head_invocation::{
 };
 use crate::state_hash::stable_value_hash;
 use crate::types::Payload;
+use crate::user_model::UserModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -102,6 +103,8 @@ pub struct FakeIntraAgentLoopInput {
     pub expected_value_units: f64,
     #[serde(default = "default_expected_invocation_cost_units")]
     pub expected_invocation_cost_units: f64,
+    #[serde(default)]
+    pub user_model: Option<UserModel>,
     pub started_at: String,
     pub closed_by: String,
 }
@@ -130,6 +133,7 @@ impl FakeIntraAgentLoopInput {
             uncertainty_escalation_threshold: default_uncertainty_escalation_threshold(),
             expected_value_units: default_expected_value_units(),
             expected_invocation_cost_units: default_expected_invocation_cost_units(),
+            user_model: None,
             started_at: "2026-06-02T00:00:00Z".to_string(),
             closed_by: "fake-loop".to_string(),
         }
@@ -226,13 +230,21 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
 
     let scope_id = binding.working_memory_scope.scope_id.clone();
     let scratchpad_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    let mut mount_payload = object_payload(json!({
+        "scope_id": scope_id,
+        "scratchpad_id": scratchpad_id
+    }));
+    if let Some(user_model) = &input.user_model {
+        mount_payload.insert(
+            "user_model".to_string(),
+            serde_json::to_value(user_model)
+                .expect("UserModel serialization should be infallible"),
+        );
+    }
     binding = apply_step(
         binding,
         "MEMORY_SCOPE.MOUNTED",
-        object_payload(json!({
-            "scope_id": scope_id,
-            "scratchpad_id": scratchpad_id
-        })),
+        mount_payload,
         &input.started_at,
         &mut events,
     )?
@@ -362,6 +374,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             &heads,
             HeadInvocationKind::Critique,
             &input.domain,
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             &[primary.head_id.clone()],
             input.routing_explore_token.saturating_add(round_index),
         )?;
@@ -436,6 +449,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             &heads,
             HeadInvocationKind::Verification,
             &input.domain,
+            #[allow(clippy::cloned_ref_to_slice_refs)]
             &[synthesis.head_id.clone()],
             input.routing_explore_token.saturating_add(round_index),
         )?;

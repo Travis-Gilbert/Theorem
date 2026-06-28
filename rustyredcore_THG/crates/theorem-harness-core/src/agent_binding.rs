@@ -2,6 +2,7 @@ use crate::alignment::evaluate_publication;
 use crate::budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
 use crate::state_hash::stable_value_hash;
 use crate::types::{now_string, prefixed_id, GuardViolation, Payload};
+use crate::user_model::{user_model_hash, UserModel};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -472,6 +473,7 @@ impl ScratchpadDocument {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_with_links(
         &mut self,
         actor_head_id: impl Into<String>,
@@ -552,6 +554,7 @@ pub enum ScratchpadCrdtKind {
     GraphCrdtYrsRegions,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ScratchpadCrdtKind {
     fn default() -> Self {
         Self::GraphCrdtYrsRegions
@@ -1345,7 +1348,7 @@ pub struct BindingTransitionResult {
 
 pub fn apply_binding_transition(
     mut binding: AgentBinding,
-    transition: BindingTransitionInput,
+    mut transition: BindingTransitionInput,
 ) -> Result<BindingTransitionResult, BindingError> {
     validate_binding(&binding)?;
     if binding_target_status(&transition.event_type).is_empty() {
@@ -1388,7 +1391,7 @@ pub fn apply_binding_transition(
 
     let before_status = binding.lifecycle.status.clone();
     let before_hash = hash_agent_binding(&binding);
-    apply_binding_payload(&mut binding, &transition)?;
+    apply_binding_payload(&mut binding, &mut transition)?;
     binding.lifecycle.status = binding_target_status(&transition.event_type).to_string();
     binding.lifecycle.last_event_seq += 1;
     binding.lifecycle.updated_at = transition.created_at.clone();
@@ -1537,11 +1540,56 @@ fn validate_binding(binding: &AgentBinding) -> Result<(), BindingError> {
 
 fn apply_binding_payload(
     binding: &mut AgentBinding,
-    transition: &BindingTransitionInput,
+    transition: &mut BindingTransitionInput,
 ) -> Result<(), BindingError> {
     match transition.event_type.as_str() {
         "BINDING.RESOLVED" => {
             binding.identity.composition_hash = composition_hash(binding);
+        }
+        "MEMORY_SCOPE.MOUNTED" => {
+            // Optional: if the caller supplied a `user_model` field in the
+            // payload, ground every head's turn on the same picture of the
+            // user by appending a Context revision to the scratchpad before
+            // HEADS.CONTRIBUTE fires, and stamp the model's content hash onto
+            // the stored event payload so the receipt records which model was
+            // mounted. Absent payload field => no-op (back-compat with the
+            // pre-S2 lifecycle).
+            if let Some(value) = transition.payload.get("user_model") {
+                match serde_json::from_value::<UserModel>(value.clone()) {
+                    Ok(user_model) => {
+                        let hash = user_model_hash(&user_model);
+                        let model_value = serde_json::to_value(&user_model)
+                            .expect("UserModel serialization should be infallible");
+                        let mut payload = Payload::new();
+                        payload.insert("kind".to_string(), Value::String("context".to_string()));
+                        payload.insert("source".to_string(), Value::String("user_model".to_string()));
+                        payload.insert("user_model".to_string(), model_value);
+                        payload.insert("user_model_hash".to_string(), Value::String(hash.clone()));
+                        binding.working_memory_scope.scratchpad.append(
+                            "binding:mount",
+                            "user model mounted",
+                            hash.clone(),
+                            payload,
+                            transition.created_at.clone(),
+                        );
+                        transition
+                            .payload
+                            .insert("user_model_hash".to_string(), Value::String(hash));
+                    }
+                    Err(error) => {
+                        return Err(guard_violation(
+                            "invalid_user_model_payload",
+                            format!(
+                                "MEMORY_SCOPE.MOUNTED user_model field could not be parsed: {error}"
+                            ),
+                            "user_model",
+                            "invalid_user_model",
+                            vec!["user_model".to_string()],
+                            Payload::new(),
+                        ));
+                    }
+                }
+            }
         }
         "CHARTER.COMPILED" => {
             binding.capability_scope.charter_hash =

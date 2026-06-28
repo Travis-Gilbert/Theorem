@@ -2,12 +2,13 @@ use std::cell::RefCell;
 
 use serde_json::json;
 use theorem_harness_core::{
-    default_authority_order, run_fake_intra_agent_loop, AgentBinding, AgentHead,
+    default_authority_order, run_fake_intra_agent_loop, user_model_hash, AgentBinding, AgentHead,
     BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
     BindingVerificationOutcome, ContextMembranePrime, FakeIntraAgentLoopInput, GroundedClaim,
     HeadCapabilityReliability, HeadCostProfile, HeadInvocationError, HeadInvocationKind,
     HeadInvocationReceipt, HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile,
-    HeadTransport, IntraAgentLoopError, ScratchpadRelationKind, TraceTier,
+    HeadTransport, IntraAgentLoopError, ScratchpadRelationKind, TraceTier, UserModel,
+    UserModelNote, UserModelProjectRef, UserModelReference,
 };
 
 #[test]
@@ -325,6 +326,190 @@ fn fake_loop_requires_two_active_non_plugin_heads() {
         error,
         IntraAgentLoopError::NotEnoughReasoningHeads { available: 1 }
     ));
+}
+
+#[test]
+fn mounted_with_user_model_writes_context_entry_before_heads_contribute() {
+    let mut model = UserModel::default();
+    model
+        .preferences
+        .insert("voice".to_string(), "spare".to_string());
+    model
+        .preferences
+        .insert("emojis".to_string(), "never".to_string());
+    model
+        .style_notes
+        .push(UserModelNote::new("no em-dashes", "2026-06-28T00:00:00Z"));
+    model.recent_focus.push(UserModelReference::new(
+        "node:theorem.harness.core",
+        "harness kernel",
+    ));
+    model.open_frustrations.push(UserModelNote::new(
+        "clippy 1.95 noisy",
+        "2026-06-28T00:00:00Z",
+    ));
+    model.working_on.push(UserModelProjectRef::new(
+        "project:agent-theorem",
+        "Agent Theorem",
+        "in_progress",
+    ));
+    let expected_hash = user_model_hash(&model);
+
+    let mut input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    input.user_model = Some(model.clone());
+
+    let result = run_fake_intra_agent_loop(fixture_binding(), input).unwrap();
+
+    // 1) The MOUNTED transition receipt records the user_model hash.
+    let mount_event = result
+        .events
+        .iter()
+        .find(|event| event.event_type == "MEMORY_SCOPE.MOUNTED")
+        .expect("MEMORY_SCOPE.MOUNTED transition fires");
+    let stamped_hash = mount_event
+        .payload
+        .get("user_model_hash")
+        .and_then(serde_json::Value::as_str)
+        .expect("user_model_hash is stamped on the receipt");
+    assert_eq!(stamped_hash, expected_hash);
+
+    // 2) The scratchpad gained a Context revision authored by "binding:mount"
+    //    whose payload deserializes back to the original UserModel.
+    let scratchpad = &result.binding.working_memory_scope.scratchpad;
+    let context_index = scratchpad
+        .revisions
+        .iter()
+        .position(|revision| {
+            revision.actor_head_id == "binding:mount"
+                && revision
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("context")
+        })
+        .expect("a binding:mount Context revision lands on the scratchpad");
+    let mounted_revision = &scratchpad.revisions[context_index];
+    assert_eq!(mounted_revision.summary, "user model mounted");
+    assert_eq!(mounted_revision.content_hash, expected_hash);
+    let payload_model: UserModel = serde_json::from_value(
+        mounted_revision
+            .payload
+            .get("user_model")
+            .cloned()
+            .expect("revision payload carries the user_model"),
+    )
+    .expect("user_model deserializes back");
+    assert_eq!(payload_model, model);
+
+    // 3) The Context revision is BEFORE any HEADS.CONTRIBUTE revision.
+    //    HEADS.CONTRIBUTE rides on proposal / critique / synthesis kinds in
+    //    the scratchpad; assert at least one such revision exists and is
+    //    written after the mount.
+    let first_contribute_index = scratchpad
+        .revisions
+        .iter()
+        .position(|revision| {
+            matches!(
+                revision
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str),
+                Some("proposal") | Some("critique") | Some("synthesis")
+            )
+        })
+        .expect("the loop produces at least one contribution revision");
+    assert!(
+        context_index < first_contribute_index,
+        "user_model context entry (idx {context_index}) must precede the first contribution revision (idx {first_contribute_index})"
+    );
+}
+
+#[test]
+fn mounted_without_user_model_omits_context_entry() {
+    // Baseline: no user_model => no binding:mount revision, no user_model_hash.
+    let result = run_fake_intra_agent_loop(
+        fixture_binding(),
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]),
+    )
+    .unwrap();
+
+    let mount_event = result
+        .events
+        .iter()
+        .find(|event| event.event_type == "MEMORY_SCOPE.MOUNTED")
+        .expect("MEMORY_SCOPE.MOUNTED transition fires");
+    assert!(
+        mount_event.payload.get("user_model_hash").is_none(),
+        "no user_model_hash should be stamped when no user_model was supplied"
+    );
+    assert!(
+        mount_event.payload.get("user_model").is_none(),
+        "no user_model field should leak into the receipt when none was supplied"
+    );
+
+    let scratchpad = &result.binding.working_memory_scope.scratchpad;
+    assert!(
+        !scratchpad
+            .revisions
+            .iter()
+            .any(|revision| revision.actor_head_id == "binding:mount"),
+        "no binding:mount Context revision should be appended"
+    );
+    let context_kinds = scratchpad
+        .revisions
+        .iter()
+        .filter(|revision| {
+            revision
+                .payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("context")
+        })
+        .count();
+    assert_eq!(
+        context_kinds, 0,
+        "no kind=context revisions should appear without a user_model"
+    );
+}
+
+#[test]
+fn user_model_serde_defaults_and_roundtrip() {
+    // 1) Deserializing an object missing every field yields the empty model.
+    let parsed: UserModel = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(parsed, UserModel::default());
+    assert!(parsed.is_empty());
+
+    // 2) Serializing-then-deserializing a populated UserModel round-trips byte-identical.
+    let mut model = UserModel::default();
+    model
+        .preferences
+        .insert("voice".to_string(), "spare".to_string());
+    model
+        .preferences
+        .insert("emojis".to_string(), "never".to_string());
+    model
+        .style_notes
+        .push(UserModelNote::new("no em-dashes", "2026-06-28T00:00:00Z"));
+    model.recent_focus.push(UserModelReference::new(
+        "node:theorem.harness.core",
+        "harness kernel",
+    ));
+    model.open_frustrations.push(UserModelNote::new(
+        "clippy 1.95 noisy",
+        "2026-06-28T00:00:00Z",
+    ));
+    model.working_on.push(UserModelProjectRef::new(
+        "project:agent-theorem",
+        "Agent Theorem",
+        "in_progress",
+    ));
+
+    let json_form = serde_json::to_value(&model).unwrap();
+    let reparsed: UserModel = serde_json::from_value(json_form.clone()).unwrap();
+    assert_eq!(reparsed, model);
+    let reserialized = serde_json::to_value(&reparsed).unwrap();
+    assert_eq!(reserialized, json_form);
 }
 
 fn fixture_binding() -> AgentBinding {

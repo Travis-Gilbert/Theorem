@@ -134,10 +134,12 @@ pub fn job_list<S: GraphStore>(
         .into_iter()
         .filter(|job| repo.map(|repo| job.repo == repo).unwrap_or(true))
         .filter(|job| {
-            state
+            #[allow(clippy::needless_option_as_deref)]
+            let derived = state
                 .as_deref()
                 .map(|state| job.derived_state() == state)
-                .unwrap_or(true)
+                .unwrap_or(true);
+            derived
         })
         .collect();
     sort_jobs(&mut jobs);
@@ -234,6 +236,7 @@ pub fn job_archive<S: GraphStore>(
 
 /// Load one job by id.
 pub fn load_job<S: GraphStore>(store: &S, job_id: &str) -> RuntimeResult<Option<Job>> {
+    #[allow(clippy::needless_borrow)]
     store
         .get_node(&job_node_id(job_id))
         .map(|node| node_to_job(&node))
