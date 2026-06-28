@@ -196,6 +196,7 @@ fn fixture_binding() -> AgentBinding {
             version: 1,
             trust_tier: "first_party".to_string(),
             active_head_set: vec!["claude".to_string(), "mistral_ocr".to_string()],
+            agent_constitution: None,
         },
         BindingComposition {
             heads: vec![

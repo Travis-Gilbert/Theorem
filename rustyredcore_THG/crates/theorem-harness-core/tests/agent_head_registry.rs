@@ -134,6 +134,7 @@ fn fixture_binding() -> AgentBinding {
                 "gemma_local".to_string(),
                 "codex_hosted".to_string(),
             ],
+            agent_constitution: None,
         },
         BindingComposition {
             heads: vec![

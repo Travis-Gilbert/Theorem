@@ -658,6 +658,7 @@ fn append_compound_event<S: GraphStore>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_run_if_qualifies<S: GraphStore>(
     store: &mut S,
     run: &RunState,
@@ -787,6 +788,7 @@ fn run_qualifies_for_capture(events: &[EventState], config: &CompoundConfig) -> 
     has_outcome && (has_validation || has_contribution || events.len() >= config.capture_step_floor)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_usage_fitness<S: GraphStore>(
     store: &mut S,
     tenant: &str,

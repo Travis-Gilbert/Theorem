@@ -1291,6 +1291,7 @@ fn default_coordination_binding(
             version: 1,
             trust_tier: "first_party".to_string(),
             active_head_set: vec![actor_head.head_id.clone()],
+            agent_constitution: None,
         },
         BindingComposition {
             heads: vec![actor_head],
