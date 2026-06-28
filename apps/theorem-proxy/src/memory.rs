@@ -9,6 +9,9 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde_json::{json, Value};
 
 /// A ranked memory retrieval surface.
 pub trait MemorySource: Send + Sync {
@@ -136,6 +139,123 @@ impl MemorySource for DirectoryMemorySource {
     }
 }
 
+/// Substrate-backed source: the live local Theorem node's graph memory, reached over
+/// its MCP endpoint (`hippo_retrieve` -- the spec's named retrieval path: query-specific
+/// PPR over the memory graph). This is the production memory the proxy injects --
+/// relevance-ranked by the substrate, not a static directory.
+///
+/// Fail open by construction: a node that is down, slow, or returns garbage yields no
+/// hits, so the turn is forwarded unchanged. The agent's short read timeout guarantees
+/// a hung node can never delay a model turn.
+pub struct HttpMemorySource {
+    /// The node's MCP endpoint, e.g. `http://127.0.0.1:8790/mcp`.
+    endpoint: String,
+    /// Optional tenant slug; omitted uses the node's default tenant.
+    tenant: Option<String>,
+    agent: ureq::Agent,
+}
+
+impl HttpMemorySource {
+    pub fn new(endpoint: impl Into<String>, tenant: Option<String>) -> Self {
+        // Node retrieval over a real corpus (PPR + a multi-KB response) takes seconds, not
+        // milliseconds, so the read timeout is generous; it still bounds a hung node. The
+        // fast, low-latency ambient path is `DirectoryMemorySource` -- this HTTP source is
+        // opt-in for graph retrieval.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(300))
+            .timeout_read(Duration::from_millis(3000))
+            .build();
+        Self {
+            endpoint: endpoint.into(),
+            tenant,
+            agent,
+        }
+    }
+
+    /// JSON-RPC `tools/call` for `hippo_retrieve` against the node. `None` on any
+    /// transport/parse failure (the caller maps that to no hits -> passthrough).
+    fn query(&self, query: &str, limit: usize) -> Option<Vec<MemoryHit>> {
+        // auto_index_memory=false keeps this a pure read: indexing the corpus re-scans
+        // every memory and far exceeds the agent's read timeout, so the hot path must
+        // query the already-warm index. Building/warming the index is the seed step's job
+        // (scripts/seed-node.py), not the per-turn retrieval's.
+        let mut arguments =
+            json!({ "query": query, "top_k": limit.max(1), "auto_index_memory": false });
+        if let Some(tenant) = &self.tenant {
+            arguments["tenant"] = json!(tenant);
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "theorem-proxy-recall",
+            "method": "tools/call",
+            "params": { "name": "hippo_retrieve", "arguments": arguments },
+        });
+        let body = serde_json::to_string(&request).ok()?;
+        let response = self
+            .agent
+            .post(&self.endpoint)
+            .set("content-type", "application/json")
+            .send_string(&body)
+            .ok()?;
+        let text = response.into_string().ok()?;
+        let value: Value = serde_json::from_str(&text).ok()?;
+        Some(parse_candidates(&value, limit))
+    }
+}
+
+impl MemorySource for HttpMemorySource {
+    fn retrieve(&self, query: &str, limit: usize) -> Vec<MemoryHit> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        // ponytail: blocking HTTP on the async worker, bounded by the agent read
+        // timeout so a hung node cannot delay a turn. If localhost latency ever shows,
+        // make MemorySource async or wrap this in spawn_blocking.
+        self.query(query, limit).unwrap_or_default()
+    }
+}
+
+/// Map a `hippo_retrieve` JSON-RPC response to ranked hits. The real MCP `tools/call`
+/// envelope puts the payload under `result.structuredContent`; older/flat shapes put it
+/// at `result.candidates` or the top level. All are tolerated. A candidate without text
+/// is skipped.
+fn parse_candidates(value: &Value, limit: usize) -> Vec<MemoryHit> {
+    let result = value.get("result");
+    let candidates = result
+        .and_then(|result| result.get("structuredContent"))
+        .and_then(|structured| structured.get("candidates"))
+        .or_else(|| result.and_then(|result| result.get("candidates")))
+        .or_else(|| value.get("candidates"))
+        .and_then(Value::as_array);
+    let Some(candidates) = candidates else {
+        return Vec::new();
+    };
+    let mut hits: Vec<MemoryHit> = candidates.iter().filter_map(candidate_to_hit).collect();
+    hits.truncate(limit.max(1));
+    hits
+}
+
+fn candidate_to_hit(candidate: &Value) -> Option<MemoryHit> {
+    let body = candidate
+        .get("text")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
+    if body.is_empty() {
+        return None;
+    }
+    let title = candidate
+        .get("node_id")
+        .and_then(Value::as_str)
+        .unwrap_or("memory")
+        .to_string();
+    let score = candidate
+        .get("ppr_proximity")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    Some(MemoryHit { title, body, score })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +275,49 @@ mod tests {
     fn empty_query_returns_nothing() {
         let source = VecMemorySource::new(vec![("a", "b")]);
         assert!(source.retrieve("", 5).is_empty());
+    }
+
+    #[test]
+    fn parses_hippo_retrieve_candidates_nested_under_result() {
+        let value = json!({
+            "result": {
+                "candidates": [
+                    {"node_id": "mem:1", "text": "planner.rs does boolean pushdown", "ppr_proximity": 0.9},
+                    {"node_id": "mem:2", "text": "  ", "ppr_proximity": 0.5},
+                    {"node_id": "mem:3", "ppr_proximity": 0.4}
+                ]
+            }
+        });
+        let hits = parse_candidates(&value, 5);
+        assert_eq!(hits.len(), 1, "empty-text and text-less candidates are skipped");
+        assert_eq!(hits[0].title, "mem:1");
+        assert!(hits[0].body.contains("pushdown"));
+        assert_eq!(hits[0].score, 0.9);
+    }
+
+    #[test]
+    fn parses_real_mcp_structured_content_envelope() {
+        // The shape rustyred-thg-server /mcp actually returns: payload under
+        // result.structuredContent (caught against the live node, 2026-06-28).
+        let value = json!({
+            "result": {
+                "structuredContent": {
+                    "candidates": [
+                        {"node_id": "hippo:page:memory:sha256:abc", "text": "live node hit", "ppr_proximity": 0.7}
+                    ]
+                }
+            }
+        });
+        let hits = parse_candidates(&value, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "hippo:page:memory:sha256:abc");
+        assert!(hits[0].body.contains("live node hit"));
+        assert_eq!(hits[0].score, 0.7);
+    }
+
+    #[test]
+    fn garbage_response_yields_no_hits() {
+        assert!(parse_candidates(&json!({"error": "boom"}), 5).is_empty());
+        assert!(parse_candidates(&json!("not even an object"), 5).is_empty());
     }
 }

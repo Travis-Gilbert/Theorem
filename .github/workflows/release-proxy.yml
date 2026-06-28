@@ -1,0 +1,44 @@
+name: release-proxy
+
+# Builds theorem-proxy binaries for macOS (arm64 + x64) and Linux (x64) and attaches
+# them to a GitHub release. Trigger by pushing a tag like `proxy-v0.1.0`. The Homebrew
+# formula (apps/theorem-proxy/packaging/homebrew/theorem-proxy.rb) consumes these assets.
+on:
+  push:
+    tags:
+      - "proxy-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path apps/theorem-proxy/Cargo.toml
+      - name: Package
+        run: |
+          set -eu
+          OUT="theorem-proxy-${{ matrix.target }}"
+          cp "apps/theorem-proxy/target/${{ matrix.target }}/release/theorem-proxy" "$OUT"
+          shasum -a 256 "$OUT" | tee "$OUT.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            theorem-proxy-${{ matrix.target }}
+            theorem-proxy-${{ matrix.target }}.sha256
