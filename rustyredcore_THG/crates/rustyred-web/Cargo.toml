@@ -40,6 +40,7 @@ rustyred-membrane = { path = "../rustyred-membrane", features = ["graph-store"] 
 rustyred-hipporag = { path = "../rustyred-hipporag" }
 rustyred-rerank = { path = "../rustyred-rerank" }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
+rustyred-thg-datawave = { path = "../rustyred-thg-datawave" }
 pilot-core = { path = "../pilot-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
