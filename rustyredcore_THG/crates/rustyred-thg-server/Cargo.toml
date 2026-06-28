@@ -33,6 +33,7 @@ rustyred-thg-adapters = { version = "0.5.0", path = "../rustyred-thg-adapters", 
 rustyred-thg-affordances = { version = "0.1.0", path = "../rustyred-thg-affordances" }
 rustyred-thg-connectors = { version = "0.1.0", path = "../rustyred-thg-connectors" }
 rustyred-thg-mcp = { version = "0.5.0", path = "../rustyred-thg-mcp", features = ["redis-store"] }
+rustyred-thg-datawave-harness = { version = "0.1.0", path = "../rustyred-thg-datawave-harness" }
 rustyred-thg-fractal = { version = "0.5.0", path = "../rustyred-thg-fractal" }
 rustyred-web = { version = "0.1.0", path = "../rustyred-web" }
 rustyred-hipporag = { version = "0.1.0", path = "../rustyred-hipporag" }
