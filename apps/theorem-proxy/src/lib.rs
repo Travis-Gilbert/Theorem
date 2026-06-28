@@ -61,8 +61,9 @@ struct ProxyState {
 /// listener). `/healthz` is liveness; `/v1/messages` is the passthrough.
 pub fn router(config: ProxyConfig) -> Router {
     let client = reqwest::Client::builder()
-        // A model turn can stream for minutes; do not impose a short timeout.
-        .timeout(Duration::from_secs(600))
+        // Streaming model turns can legitimately run longer than a fixed total
+        // response deadline; keep only the connection-establishment bound.
+        .connect_timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build reqwest client");
     let state = ProxyState {
