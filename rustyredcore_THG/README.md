@@ -147,7 +147,7 @@ Each crate has its own README with the public API surface. Group by role:
 | [`scene-os-core`](crates/scene-os-core) | SceneOS director: serde-only scene contracts, projection/chrome catalogs, `compile_scene_package` to a `ScenePackageV2`. |
 | [`scene-os-web`](crates/scene-os-web) | SceneOS renderer: a `ScenePackageV2` to one self-contained HTML page, with script-safe payload escaping. |
 | [`prose-check`](crates/prose-check) | Deterministic writing-engineering style checker and skill-pack payload. |
-| [`design-check`](crates/design-check) | Static design-engineering checker (CSS, tokens, WCAG contrast, grid/type/motion) and skill-pack payload. |
+| [`design-check`](crates/design-check) | Static design-engineering checker (CSS, tokens, WCAG contrast, grid/type/motion) and skill-pack payload, now with the browserless Design Scout callable validator cut for normalized facts, audit/drift, token output, and HTML reports. |
 
 **Standalone (not a workspace member)**
 

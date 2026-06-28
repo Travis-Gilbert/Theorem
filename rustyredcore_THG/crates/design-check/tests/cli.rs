@@ -52,3 +52,50 @@ fn cli_css_static_reports_bad_contrast() {
             finding["rule_id"] == "contrast_minimum_met" && finding["status"] == "failed"
         }));
 }
+
+#[test]
+fn cli_audit_facts_accepts_dembrandt_fixture_json() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_design-check"))
+        .arg("--audit-facts")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn design-check");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(design_check::DEMBRANDT_SYNTHETIC_FIXTURE.as_bytes())
+        .expect("write fixture JSON");
+    let output = child.wait_with_output().expect("wait");
+
+    assert!(output.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit report json");
+    assert_eq!(report["checker"], "design_scout_audit");
+    assert!(report["facts_hash"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+}
+
+#[test]
+fn cli_tokens_dtcg_emits_color_tokens() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_design-check"))
+        .arg("--tokens-dtcg")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn design-check");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(design_check::DEMBRANDT_SYNTHETIC_FIXTURE.as_bytes())
+        .expect("write fixture JSON");
+    let output = child.wait_with_output().expect("wait");
+
+    assert!(output.status.success());
+    let tokens: serde_json::Value = serde_json::from_slice(&output.stdout).expect("token JSON");
+    assert_eq!(tokens["color"]["primary"]["$value"], "#1a73e8");
+}

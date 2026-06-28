@@ -76,22 +76,25 @@ use theorem_harness_runtime::{
     coordination_room_node_id, coordination_stream_cursor_node_id,
     coordination_stream_event_edge_id, coordination_stream_event_node_id,
     coordination_stream_node_id, coordination_stream_subscription_node_id, default_theorem_binding,
-    encode_memory, forget_memory, get_skill_pack, handoff_memory, infer_coordination_room_id,
-    list_skill_packs, load_events, load_run, normalize_actor_id, normalize_coordination_urgency,
-    parse_coordination_mentions, publish_coordination_room_event_from_state,
-    publish_footprint_event, publish_presence_event, publish_record_event, publish_skill_pack,
-    publish_work_graph_transition, recall_archived_memory, recall_memory, relate_memory,
-    remember_memory, revise_memory_document, scratchpad_revision_node_id, self_note_memory,
-    stable_coordination_message_id, stable_coordination_record_id, task_node_graph_id, upsert_note,
-    AddOrRemove, ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
+    design_audit, design_drift_from_json, design_fact_set_from_dembrandt_json,
+    design_fact_set_from_json, design_html_report, design_scout_parity_receipt, design_tokens_dtcg,
+    design_tokens_tailwind, encode_memory, forget_memory, get_skill_pack, handoff_memory,
+    infer_coordination_room_id, list_skill_packs, load_events, load_run, normalize_actor_id,
+    normalize_coordination_urgency, parse_coordination_mentions,
+    publish_coordination_room_event_from_state, publish_footprint_event, publish_presence_event,
+    publish_record_event, publish_skill_pack, publish_work_graph_transition,
+    recall_archived_memory, recall_memory, relate_memory, remember_memory, revise_memory_document,
+    scratchpad_revision_node_id, self_note_memory, stable_coordination_message_id,
+    stable_coordination_record_id, task_node_graph_id, upsert_note, AddOrRemove,
+    ArchiveMemoryInput, CoordinationIntentState, CoordinationMessageState,
     CoordinationPresenceState, CoordinationRecordState, CoordinationRoomMember,
-    CoordinationRoomState, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
+    CoordinationRoomState, DesignFactSet, EncodeMemoryInput, ForgetMemoryInput, HandoffMemoryInput,
     HarnessRuntimeError, JobActionResult, JobNoteInput, JoinRoomInput, MemoryError,
     MemoryGraphStore, MemoryWriteInput, PresenceInput, ProviderHeadInvoker, RecallMemoryInput,
     RelateMemoryInput, ReviseMemoryInput, SkillPackApplyInput, SkillPackError, SkillPackGetInput,
     SkillPackGraphStore, SkillPackListInput, SkillPackPublishInput, UpsertNoteInput,
-    WriteIntentInput, WriteMessageInput, WriteRecordInput, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO,
-    TASK_NODE_LABEL,
+    WriteIntentInput, WriteMessageInput, WriteRecordInput, DESIGN_SCOUT_REFERENCE_COMMIT,
+    DESIGN_SCOUT_REFERENCE_REPO, EDGE_PREREQUISITE_OF, EDGE_REFINED_INTO, TASK_NODE_LABEL,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -1686,6 +1689,24 @@ fn call_tool<P: McpGraphProvider>(
                 "message": "web_consume is handled by the async THG server MCP route because it can navigate, extract, and ingest live web pages."
             })));
         }
+        "design_extract" | "design_extract_static_facts" | "theorem_design_extract" => {
+            let payload = design_extract_payload(&tenant, &arguments, name)?;
+            if payload.get("error").is_some() {
+                // Live extraction is unsupported on the browserless lane; surface
+                // it as an MCP tool error so clients see isError and fall back to
+                // the async browser route instead of reading it as success.
+                return Ok(tool_result_error(payload));
+            }
+            payload
+        }
+        "design_audit" | "theorem_design_audit" => design_audit_payload(&tenant, &arguments, name)?,
+        "design_drift" | "theorem_design_drift" => design_drift_payload(&tenant, &arguments, name)?,
+        "design_tokens" | "theorem_design_tokens" => {
+            design_tokens_payload(&tenant, &arguments, name)?
+        }
+        "design_report" | "theorem_design_report" => {
+            design_report_payload(&tenant, &arguments, name)?
+        }
         "browse_with_me" | "theorem_browser_browse_with_me" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
@@ -2962,6 +2983,299 @@ fn index_spine_node_payload(node: NodeRecord) -> Value {
         "labels": node.labels,
         "version": node.version,
         "properties": node.properties
+    })
+}
+
+fn design_extract_payload(
+    tenant: &str,
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<Value, McpError> {
+    if design_has_static_fact_arguments(arguments) {
+        let facts = design_facts_from_arguments(arguments, tool_name)?;
+        return Ok(json!({
+            "tenant": tenant,
+            "tool": tool_name,
+            "engine": "design-check",
+            "mode": "static_facts",
+            "facts": facts,
+            "reference": design_scout_reference_payload(),
+            "parity_receipt": design_scout_parity_receipt()
+        }));
+    }
+
+    if argument_text(arguments, &["url", "task", "query"]).is_some() {
+        return Ok(json!({
+            "tenant": tenant,
+            "tool": tool_name,
+            "engine": "design-check",
+            "error": "design_extract_requires_async_browser",
+            "message": "Live design extraction is handled by the async THG browser route because it rides browse_for_me/browse_with_me over the native browser stack. Pass facts or dembrandt_json for the browserless parity lane.",
+            "reference": design_scout_reference_payload()
+        }));
+    }
+
+    Err(McpError::invalid_params(format!(
+        "{tool_name} requires facts, facts_json, dembrandt, dembrandt_json, or a live url/task for the async browser route"
+    )))
+}
+
+fn design_audit_payload(
+    tenant: &str,
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<Value, McpError> {
+    let facts = design_facts_from_arguments(arguments, tool_name)?;
+    let report = design_audit(&facts);
+    Ok(json!({
+        "tenant": tenant,
+        "tool": tool_name,
+        "engine": "design-check",
+        "facts_hash": report.facts_hash.clone(),
+        "report": report,
+        "reference": design_scout_reference_payload(),
+        "parity_receipt": design_scout_parity_receipt()
+    }))
+}
+
+fn design_drift_payload(
+    tenant: &str,
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<Value, McpError> {
+    let baseline_json = required_json_text_argument(
+        arguments,
+        &[
+            "baseline",
+            "baseline_json",
+            "baselineJson",
+            "baseline_facts",
+            "baselineFacts",
+            "baseline_dembrandt",
+            "baselineDembrandt",
+        ],
+        tool_name,
+        "baseline",
+    )?;
+    let candidate_json = required_json_text_argument(
+        arguments,
+        &[
+            "candidate",
+            "candidate_json",
+            "candidateJson",
+            "candidate_facts",
+            "candidateFacts",
+            "candidate_dembrandt",
+            "candidateDembrandt",
+            "facts",
+            "facts_json",
+            "factsJson",
+            "dembrandt",
+            "dembrandt_json",
+            "dembrandtJson",
+        ],
+        tool_name,
+        "candidate",
+    )?;
+    let report = design_drift_from_json(&baseline_json, &candidate_json).map_err(|error| {
+        McpError::invalid_params(format!("{tool_name} invalid drift inputs: {error}"))
+    })?;
+    Ok(json!({
+        "tenant": tenant,
+        "tool": tool_name,
+        "engine": "design-check",
+        "report": report,
+        "reference": design_scout_reference_payload(),
+        "parity_receipt": design_scout_parity_receipt()
+    }))
+}
+
+fn design_tokens_payload(
+    tenant: &str,
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<Value, McpError> {
+    let facts = design_facts_from_arguments(arguments, tool_name)?;
+    let format = argument_text(arguments, &["format", "output", "kind"])
+        .unwrap_or_else(|| "dtcg".to_string())
+        .replace('-', "_")
+        .to_ascii_lowercase();
+    let tokens = match format.as_str() {
+        "dtcg" | "w3c" | "design_tokens" => design_tokens_dtcg(&facts),
+        "tailwind" | "tailwind_config" => design_tokens_tailwind(&facts),
+        "all" => json!({
+            "dtcg": design_tokens_dtcg(&facts),
+            "tailwind": design_tokens_tailwind(&facts)
+        }),
+        _ => {
+            return Err(McpError::invalid_params(format!(
+                "{tool_name} format must be dtcg, tailwind, or all"
+            )));
+        }
+    };
+    Ok(json!({
+        "tenant": tenant,
+        "tool": tool_name,
+        "engine": "design-check",
+        "format": format,
+        "tokens": tokens,
+        "reference": design_scout_reference_payload(),
+        "parity_receipt": design_scout_parity_receipt()
+    }))
+}
+
+fn design_report_payload(
+    tenant: &str,
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<Value, McpError> {
+    let facts = design_facts_from_arguments(arguments, tool_name)?;
+    let audit = design_audit(&facts);
+    let drift = if optional_json_text_argument(
+        arguments,
+        &[
+            "baseline",
+            "baseline_json",
+            "baselineJson",
+            "baseline_facts",
+            "baselineFacts",
+        ],
+    )?
+    .is_some()
+    {
+        let baseline_json = required_json_text_argument(
+            arguments,
+            &[
+                "baseline",
+                "baseline_json",
+                "baselineJson",
+                "baseline_facts",
+                "baselineFacts",
+            ],
+            tool_name,
+            "baseline",
+        )?;
+        let facts_json = serde_json::to_string(&facts).map_err(|error| {
+            McpError::internal(format!("{tool_name} failed to serialize facts: {error}"))
+        })?;
+        Some(
+            design_drift_from_json(&baseline_json, &facts_json).map_err(|error| {
+                McpError::invalid_params(format!("{tool_name} invalid drift baseline: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
+    let html = design_html_report(&facts, &audit, drift.as_ref());
+    Ok(json!({
+        "tenant": tenant,
+        "tool": tool_name,
+        "engine": "design-check",
+        "html": html,
+        "audit": audit,
+        "drift": drift,
+        "reference": design_scout_reference_payload(),
+        "parity_receipt": design_scout_parity_receipt()
+    }))
+}
+
+fn design_facts_from_arguments(
+    arguments: &Value,
+    tool_name: &str,
+) -> Result<DesignFactSet, McpError> {
+    if let Some(json_text) = optional_json_text_argument(
+        arguments,
+        &[
+            "facts",
+            "facts_json",
+            "factsJson",
+            "design_facts",
+            "designFacts",
+        ],
+    )? {
+        return design_fact_set_from_json(&json_text).map_err(|error| {
+            McpError::invalid_params(format!("{tool_name} invalid facts: {error}"))
+        });
+    }
+    if let Some(json_text) = optional_json_text_argument(
+        arguments,
+        &[
+            "dembrandt",
+            "dembrandt_json",
+            "dembrandtJson",
+            "extraction",
+            "extraction_json",
+            "extractionJson",
+        ],
+    )? {
+        let source_ref = argument_text(arguments, &["source_ref", "sourceRef", "url"])
+            .unwrap_or_else(|| "dembrandt://extraction".to_string());
+        return design_fact_set_from_dembrandt_json(&source_ref, &json_text).map_err(|error| {
+            McpError::invalid_params(format!("{tool_name} invalid dembrandt extraction: {error}"))
+        });
+    }
+    Err(McpError::invalid_params(format!(
+        "{tool_name} requires facts/facts_json or dembrandt/dembrandt_json"
+    )))
+}
+
+fn design_has_static_fact_arguments(arguments: &Value) -> bool {
+    [
+        "facts",
+        "facts_json",
+        "factsJson",
+        "design_facts",
+        "designFacts",
+        "dembrandt",
+        "dembrandt_json",
+        "dembrandtJson",
+        "extraction",
+        "extraction_json",
+        "extractionJson",
+    ]
+    .iter()
+    .any(|key| arguments.get(*key).is_some())
+}
+
+fn optional_json_text_argument(
+    arguments: &Value,
+    keys: &[&str],
+) -> Result<Option<String>, McpError> {
+    for key in keys {
+        let Some(value) = arguments.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        return match value {
+            Value::String(text) => Ok(Some(text.clone())),
+            other => serde_json::to_string(other)
+                .map(Some)
+                .map_err(|error| McpError::invalid_params(format!("{key} must be JSON: {error}"))),
+        };
+    }
+    Ok(None)
+}
+
+fn required_json_text_argument(
+    arguments: &Value,
+    keys: &[&str],
+    tool_name: &str,
+    label: &str,
+) -> Result<String, McpError> {
+    optional_json_text_argument(arguments, keys)?.ok_or_else(|| {
+        McpError::invalid_params(format!(
+            "{tool_name} requires {label}: one of {}",
+            keys.join(", ")
+        ))
+    })
+}
+
+fn design_scout_reference_payload() -> Value {
+    json!({
+        "repo": DESIGN_SCOUT_REFERENCE_REPO,
+        "commit": DESIGN_SCOUT_REFERENCE_COMMIT
     })
 }
 
@@ -10657,6 +10971,7 @@ fn tool_result_family(tool_name: &str) -> &'static str {
         | "theorem_harness_self_recall_archive" => "recall",
         "coordination_context" | "theorem_harness_coordination_context" => "coordination",
         "harness_run" | "theorem_harness_run" => "harness",
+        name if name.contains("design") => "design",
         name if name.contains("graph") || name.contains("neighbors") => "graph",
         _ => "default",
     }
@@ -11538,6 +11853,96 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "dry_run": { "type": "boolean", "default": false }
                 },
                 "required": ["affordance_id", "arguments"]
+            }),
+        ),
+        tool(
+            "design_extract",
+            "Normalize static design facts or dembrandt extraction JSON into the Design Scout fact model; live browser extraction is routed through the async native browser server.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "facts": { "type": "object" },
+                    "facts_json": { "type": "string" },
+                    "dembrandt": { "type": "object" },
+                    "dembrandt_json": { "type": "string" },
+                    "extraction": { "type": "object" },
+                    "extraction_json": { "type": "string" },
+                    "source_ref": { "type": "string" },
+                    "url": { "type": "string" },
+                    "task": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "design_audit",
+            "Run deterministic Design Scout validators over normalized facts or dembrandt extraction JSON.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "facts": { "type": "object" },
+                    "facts_json": { "type": "string" },
+                    "dembrandt": { "type": "object" },
+                    "dembrandt_json": { "type": "string" },
+                    "source_ref": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "design_drift",
+            "Compare candidate design facts against a baseline and return a dembrandt-style drift report.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "baseline": { "type": "object" },
+                    "baseline_json": { "type": "string" },
+                    "baseline_dembrandt": { "type": "object" },
+                    "candidate": { "type": "object" },
+                    "candidate_json": { "type": "string" },
+                    "candidate_dembrandt": { "type": "object" },
+                    "facts": { "type": "object" },
+                    "facts_json": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "design_tokens",
+            "Emit design tokens from facts in W3C DTCG, Tailwind, or both formats.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "facts": { "type": "object" },
+                    "facts_json": { "type": "string" },
+                    "dembrandt": { "type": "object" },
+                    "dembrandt_json": { "type": "string" },
+                    "format": { "type": "string", "enum": ["dtcg", "tailwind", "all"], "default": "dtcg" },
+                    "source_ref": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "design_report",
+            "Render a self-contained HTML Design Scout report from facts, with optional baseline drift.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "facts": { "type": "object" },
+                    "facts_json": { "type": "string" },
+                    "dembrandt": { "type": "object" },
+                    "dembrandt_json": { "type": "string" },
+                    "baseline": { "type": "object" },
+                    "baseline_json": { "type": "string" },
+                    "source_ref": { "type": "string" }
+                }
             }),
         ),
         tool(
@@ -13715,6 +14120,12 @@ fn output_schema_for_tool(name: &str) -> Value {
         "harness_prepare" => harness_prepare_output_schema(),
         "web_consume" => web_consume_output_schema(),
         "browse_with_me" | "browse_for_me" => browsing_run_output_schema(),
+        "design_extract"
+        | "design_extract_static_facts"
+        | "design_audit"
+        | "design_drift"
+        | "design_tokens"
+        | "design_report" => design_scout_output_schema(),
         "fractal_expansion" | "rustyweb_search_acquisition" => async_run_output_schema(),
         _ => generic_object_output_schema(),
     }
@@ -13774,6 +14185,30 @@ fn web_consume_output_schema() -> Value {
             "page": { "type": "object" },
             "ingested": { "type": "boolean" },
             "receipt": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn design_scout_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "tool": { "type": "string" },
+            "engine": { "type": "string" },
+            "mode": { "type": "string" },
+            "facts": { "type": "object" },
+            "facts_hash": { "type": "string" },
+            "report": { "type": "object" },
+            "tokens": { "type": "object" },
+            "html": { "type": "string" },
+            "audit": { "type": "object" },
+            "drift": { "type": "object" },
+            "reference": { "type": "object" },
+            "parity_receipt": { "type": "object" },
             "error": { "type": "string" },
             "message": { "type": "string" }
         },
@@ -13857,6 +14292,7 @@ fn open_world_hint_for_tool(name: &str) -> bool {
             | "web_consume"
             | "browse_with_me"
             | "browse_for_me"
+            | "design_extract"
     )
 }
 
@@ -16455,6 +16891,11 @@ mod tests {
         assert!(has_tool(tools, "code_ingest"));
         assert!(has_tool(tools, "reconstruct_binary"));
         assert!(has_tool(tools, "harness_prepare"));
+        assert!(has_tool(tools, "design_extract"));
+        assert!(has_tool(tools, "design_audit"));
+        assert!(has_tool(tools, "design_drift"));
+        assert!(has_tool(tools, "design_tokens"));
+        assert!(has_tool(tools, "design_report"));
         assert_eq!(
             tool_by_name(tools, "compute_code")["inputSchema"]["properties"]["repo"]["type"],
             "string"
@@ -16855,6 +17296,77 @@ mod tests {
         );
 
         assert_eq!(payload["error"], "browser_use_requires_async_server");
+    }
+
+    #[test]
+    fn design_scout_tools_round_trip_static_fixture() {
+        let (provider, config) = fixture();
+        let extracted = call_tool_json(
+            &provider,
+            &config,
+            "design_extract",
+            json!({
+                "tenant": "smoke",
+                "source_ref": "fixture://dembrandt-synthetic",
+                "dembrandt_json": theorem_harness_runtime::DEMBRANDT_SYNTHETIC_FIXTURE
+            }),
+        );
+        assert_eq!(extracted["engine"], "design-check");
+        assert_eq!(extracted["mode"], "static_facts");
+        assert_eq!(
+            extracted["reference"]["commit"],
+            theorem_harness_runtime::DESIGN_SCOUT_REFERENCE_COMMIT
+        );
+        assert!(extracted["facts"]["colors"]
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false));
+
+        let facts = extracted["facts"].clone();
+        let audit = call_tool_json(
+            &provider,
+            &config,
+            "design_audit",
+            json!({ "tenant": "smoke", "facts": facts.clone() }),
+        );
+        assert_eq!(audit["report"]["checker"], "design_scout_audit");
+        assert!(audit["facts_hash"].as_str().unwrap().starts_with("sha256:"));
+
+        let tokens = call_tool_json(
+            &provider,
+            &config,
+            "design_tokens",
+            json!({ "tenant": "smoke", "facts": facts.clone(), "format": "tailwind" }),
+        );
+        assert!(tokens["tokens"]["theme"]["extend"]["colors"].is_object());
+
+        let report = call_tool_json(
+            &provider,
+            &config,
+            "design_report",
+            json!({ "tenant": "smoke", "facts": facts.clone(), "baseline": facts.clone() }),
+        );
+        assert!(report["html"]
+            .as_str()
+            .unwrap()
+            .contains("Design Scout Report"));
+        assert_eq!(report["drift"]["status"], "stable");
+
+        let drift = call_tool_json(
+            &provider,
+            &config,
+            "design_drift",
+            json!({ "tenant": "smoke", "baseline": facts.clone(), "candidate": facts }),
+        );
+        assert_eq!(drift["report"]["status"], "stable");
+
+        let live = call_tool_json(
+            &provider,
+            &config,
+            "design_extract",
+            json!({ "tenant": "smoke", "url": "https://example.test" }),
+        );
+        assert_eq!(live["error"], "design_extract_requires_async_browser");
     }
 
     #[test]
