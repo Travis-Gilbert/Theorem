@@ -4,10 +4,11 @@ use serde_json::json;
 use theorem_harness_core::{
     default_authority_order, run_fake_intra_agent_loop, AgentBinding, AgentHead,
     BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
-    BindingVerificationOutcome, ContextMembranePrime, FakeIntraAgentLoopInput, GroundedClaim,
-    HeadCapabilityReliability, HeadCostProfile, HeadInvocationError, HeadInvocationKind,
-    HeadInvocationReceipt, HeadInvocationRequest, HeadInvoker, HeadKind, HeadReliabilityProfile,
-    HeadTransport, IntraAgentLoopError, ScratchpadRelationKind, TraceTier,
+    BindingLineageMemoryEntry, BindingVerificationOutcome, ContextMembranePrime,
+    FakeIntraAgentLoopInput, GroundedClaim, HeadCapabilityReliability, HeadCostProfile,
+    HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
+    HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError,
+    ScratchpadRelationKind, TraceTier,
 };
 
 #[test]
@@ -573,6 +574,147 @@ fn fake_loop_omits_constitution_when_binding_has_none() {
             receipt.kind
         );
     }
+}
+
+// --- Agent Theorem S3 #73 P1: lineage_memory threaded into head requests ----
+//
+// When `MEMORY_SCOPE.MOUNTED` projects a lineage memory entry as a
+// `lineage:agent_published` scratchpad revision, the intra-agent loop must
+// add it to its local `revisions` vec so the first proposal/critique/synthesis
+// `invoke_head` call carries the lineage revision_id in
+// `prior_revision_ids`. Without P1 the kernel mounts the memory into the
+// binding but the heads never receive it.
+#[test]
+fn fake_loop_threads_lineage_memory_into_head_requests() {
+    let invoker = RecordingInvoker::default();
+    let mut input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    let lineage_entry = BindingLineageMemoryEntry {
+        source_binding_id: "harness:binding:agent:theorem:v1".to_string(),
+        source_composition_hash: "comp:v1".to_string(),
+        source_version: 1,
+        summary: "prior binding agent:theorem:v1 (v1) published memory".to_string(),
+        patch_ids: vec!["patch:1".to_string()],
+        substrate_receipt_id: "substrate:1".to_string(),
+        published_at: "1970-01-01T00:00:01.000Z".to_string(),
+    };
+    input.lineage_memory = vec![lineage_entry.clone()];
+
+    let result = theorem_harness_core::run_intra_agent_loop_with_invoker(
+        fixture_binding(),
+        input,
+        &invoker,
+    )
+    .unwrap();
+
+    // The kernel must have appended one synthetic lineage:agent_published
+    // revision into the binding scratchpad (the existing P1 invariant on the
+    // MEMORY_SCOPE.MOUNTED arm). Capture its id so we can assert the heads
+    // saw the same id in their prior_revision_ids.
+    let lineage_revisions: Vec<_> = result
+        .binding
+        .working_memory_scope
+        .scratchpad
+        .revisions
+        .iter()
+        .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+        .collect();
+    assert_eq!(
+        lineage_revisions.len(),
+        1,
+        "MEMORY_SCOPE.MOUNTED must project the lineage entry as one scratchpad revision"
+    );
+    let lineage_revision_id = lineage_revisions[0].revision_id.clone();
+
+    // Each invoked head must carry that lineage revision_id in
+    // prior_revision_ids. Proposal sees only it (the first revision in the
+    // loop); critique/synthesis/verification see it plus the contributions
+    // appended along the way.
+    let requests = invoker.requests.into_inner();
+    assert!(
+        !requests.is_empty(),
+        "loop must invoke at least one head; got 0 requests"
+    );
+
+    let proposal = requests
+        .iter()
+        .find(|request| request.kind == HeadInvocationKind::Proposal)
+        .expect("loop must produce a proposal request");
+    assert!(
+        proposal.prior_revision_ids.contains(&lineage_revision_id),
+        "P1: proposal must see the lineage revision_id in prior_revision_ids; got {:?}",
+        proposal.prior_revision_ids
+    );
+
+    for kind in [
+        HeadInvocationKind::Critique,
+        HeadInvocationKind::Synthesis,
+        HeadInvocationKind::Verification,
+    ] {
+        let request = requests
+            .iter()
+            .find(|request| request.kind == kind)
+            .unwrap_or_else(|| panic!("loop must produce a {kind:?} request"));
+        assert!(
+            request.prior_revision_ids.contains(&lineage_revision_id),
+            "P1: {kind:?} must see the lineage revision_id; got {:?}",
+            request.prior_revision_ids
+        );
+    }
+
+    // The lineage revision payload (kind = "lineage_memory") is intentionally
+    // outside the four typed HeadInvocationKind variants, so it does NOT
+    // appear in prior_context (which is typed by HeadInvocationKind). The
+    // contract is: heads see the lineage by revision_id reference and can
+    // resolve the payload through the shared scratchpad CRDT. Pin that
+    // boundary so future refactors do not silently widen the typed slot.
+    assert!(
+        proposal
+            .prior_context
+            .iter()
+            .all(|ctx| ctx.revision_id != lineage_revision_id),
+        "lineage revisions must not collapse into the typed prior_context slot"
+    );
+}
+
+#[test]
+fn fake_loop_omits_lineage_memory_revisions_when_input_has_none() {
+    // Back-compat: when input.lineage_memory is empty, no
+    // lineage:agent_published revisions are appended and head requests look
+    // exactly like the pre-S3 contract -- prior_revision_ids on proposal is
+    // just the PRIVATE_WORK.OPENED revision id.
+    let invoker = RecordingInvoker::default();
+    let input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    assert!(input.lineage_memory.is_empty());
+
+    let result = theorem_harness_core::run_intra_agent_loop_with_invoker(
+        fixture_binding(),
+        input,
+        &invoker,
+    )
+    .unwrap();
+
+    let lineage_count = result
+        .binding
+        .working_memory_scope
+        .scratchpad
+        .revisions
+        .iter()
+        .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+        .count();
+    assert_eq!(lineage_count, 0);
+
+    let requests = invoker.requests.into_inner();
+    let proposal = requests
+        .iter()
+        .find(|request| request.kind == HeadInvocationKind::Proposal)
+        .expect("loop must produce a proposal request");
+    assert_eq!(
+        proposal.prior_revision_ids.len(),
+        1,
+        "back-compat: proposal sees only the PRIVATE_WORK.OPENED revision when no lineage memory is threaded"
+    );
 }
 
 #[test]

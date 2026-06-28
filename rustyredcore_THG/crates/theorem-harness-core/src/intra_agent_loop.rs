@@ -266,6 +266,20 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
         &mut events,
     )?
     .binding;
+    // P1: when MOUNTED projected lineage_memory entries as scratchpad
+    // revisions (attributed to the synthetic `lineage:agent_published`
+    // actor), capture them onto the loop's local `revisions` vec so the
+    // first proposal/critique/synthesis `invoke_head` call surfaces them in
+    // `prior_revision_ids` (and the kernel sees them as prior context the
+    // heads must read). Without this, the kernel mounts the memory into
+    // the binding but the heads never see it.
+    if !input.lineage_memory.is_empty() {
+        for revision in &binding.working_memory_scope.scratchpad.revisions {
+            if revision.actor_head_id == "lineage:agent_published" {
+                revisions.push(revision.clone());
+            }
+        }
+    }
 
     binding = apply_step(
         binding,

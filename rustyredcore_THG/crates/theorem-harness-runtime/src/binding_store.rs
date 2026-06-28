@@ -410,10 +410,16 @@ pub fn lineage_memory_for_binding<S: GraphStore>(
     binding: &AgentBinding,
 ) -> BindingRuntimeResult<Vec<theorem_harness_core::BindingLineageMemoryEntry>> {
     let lineage = binding_lineage(store, &binding.identity.agent_id)?;
-    let current_hash = binding.identity.composition_hash.as_str();
+    // P2: exclude only the CURRENT binding by its node id (keyed by run_id),
+    // not every prior binding sharing the same composition_hash. The prior
+    // filter dropped legitimate prior runs whenever they happened to reuse
+    // the same head roster -- the common case for an agent rerun -- and
+    // returned an empty lineage. Same-composition prior runs must now
+    // surface their lineage memory.
+    let current_binding_id = binding_node_id(&binding.lifecycle.run_id);
     let mut entries = Vec::new();
     for entry in lineage {
-        if entry.composition_hash == current_hash {
+        if entry.binding_id == current_binding_id {
             continue;
         }
         let prior_binding = match store.get_node(&entry.binding_id) {
@@ -1549,6 +1555,85 @@ mod tests {
                 .get("source_binding_id")
                 .and_then(Value::as_str),
             Some(binding_node_id("agent:theorem:v1").as_str())
+        );
+    }
+
+    #[test]
+    fn lineage_memory_for_binding_returns_same_composition_prior_run() {
+        // P2 regression: a prior binding that shares the same head roster
+        // (and therefore the same composition_hash) as the current binding
+        // must still surface its published memory. The prior filter dropped
+        // every same-composition prior run, which excluded the common case
+        // (an agent rerun with the same heads). The exclude-by-binding-id
+        // filter must only drop the current binding's own node.
+        let mut store = InMemoryGraphStore::new();
+        // v1 and v2 both use head_seed "a" -- identical heads, so the
+        // composition_hash both bindings get from BINDING.RESOLVED matches.
+        let mut v1 = lineage_binding("agent:theorem:rerun:v1", 1, "a");
+        for (event, payload) in lineage_v1_lifecycle_events() {
+            v1 = append_binding_transition(&mut store, v1, transition(event, payload))
+                .unwrap()
+                .binding;
+        }
+        assert_eq!(v1.lifecycle.status, "closed");
+
+        let mut v2 = lineage_binding("agent:theorem:rerun:v2", 2, "a");
+        v2 = append_binding_transition(
+            &mut store,
+            v2,
+            transition(
+                "BINDING.RESOLVED",
+                json!({ "binding_id": "agent:theorem:rerun:v2", "composition_hash": "ignored" }),
+            ),
+        )
+        .unwrap()
+        .binding;
+        // Pin the precondition the prior filter dropped: same composition.
+        assert_eq!(
+            v1.identity.composition_hash, v2.identity.composition_hash,
+            "test setup: v1 and v2 must share composition_hash so this test exercises the same-composition path"
+        );
+        assert_ne!(
+            binding_node_id(&v1.lifecycle.run_id),
+            binding_node_id(&v2.lifecycle.run_id),
+            "test setup: v1 and v2 must be distinct binding nodes"
+        );
+
+        let entries = lineage_memory_for_binding(&store, &v2).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "P2 fix: same-composition prior runs must surface their lineage; got {entries:?}"
+        );
+        assert_eq!(
+            entries[0].source_binding_id,
+            binding_node_id("agent:theorem:rerun:v1")
+        );
+        assert_eq!(entries[0].substrate_receipt_id, "substrate:1");
+        assert_eq!(entries[0].patch_ids, vec!["patch:1".to_string()]);
+    }
+
+    #[test]
+    fn lineage_memory_for_binding_still_excludes_current_binding() {
+        // P2 invariant: the new exclude-by-binding-id filter must still
+        // drop the current binding's own node from its own lineage, even
+        // when the binding's BindingEvent history already carries
+        // PUBLISHED_TO_SUBSTRATE + MEMORY_PATCHES.PROPOSED receipts. The
+        // ScratchpadDocument is supposed to inherit memory from PRIOR
+        // bindings, never from itself.
+        let mut store = InMemoryGraphStore::new();
+        let mut v1 = lineage_binding("agent:theorem:self:v1", 1, "a");
+        for (event, payload) in lineage_v1_lifecycle_events() {
+            v1 = append_binding_transition(&mut store, v1, transition(event, payload))
+                .unwrap()
+                .binding;
+        }
+        assert_eq!(v1.lifecycle.status, "closed");
+
+        let entries = lineage_memory_for_binding(&store, &v1).unwrap();
+        assert!(
+            entries.is_empty(),
+            "the current binding must never appear in its own lineage; got {entries:?}"
         );
     }
 
