@@ -59,6 +59,14 @@ pub use crawl_hooks::{
     RustyWebHooksPlugin, EDGE_MENTIONS, WEB_ENTITY_LABEL,
 };
 
+pub mod datawave_ingest;
+pub use datawave_ingest::{
+    datawave_records_from_crawl_graph, ingest_crawl_graph_as_datawave, query_rustyweb_datawave,
+    query_rustyweb_datawave_snapshot, rustyweb_datawave_field_config, rustyweb_datawave_ingest,
+    CrawlDatawaveIngestReport, RustyWebDatawaveQueryInput, RustyWebDatawaveQueryPredicate,
+    RUSTYWEB_PAGE_DATA_TYPE,
+};
+
 pub mod browser_engine;
 pub use browser_engine::{
     action_allowed_by_policy, action_allowed_by_robots, page_state_from_html, web_consume_to_graph,
@@ -508,12 +516,32 @@ pub struct CrawlGraph {
     pub batch: GraphMutationBatch,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CrawlGraphApplyReport {
+    pub graph_writes: Vec<GraphWriteResult>,
+    pub datawave: CrawlDatawaveIngestReport,
+}
+
 impl CrawlGraph {
     pub fn apply_to_store(
         &self,
         store: &mut impl GraphStore,
     ) -> GraphStoreResult<Vec<GraphWriteResult>> {
         apply_batch_to_store(store, &self.batch)
+    }
+
+    pub fn apply_to_store_with_datawave(
+        &self,
+        store: &mut impl GraphStore,
+        tenant_id: Option<String>,
+    ) -> GraphStoreResult<CrawlGraphApplyReport> {
+        let graph_writes = self.apply_to_store(store)?;
+        let datawave = ingest_crawl_graph_as_datawave(store, self, tenant_id)
+            .map_err(rustyweb_datawave_to_graph_error)?;
+        Ok(CrawlGraphApplyReport {
+            graph_writes,
+            datawave,
+        })
     }
 
     pub fn nodes(&self) -> Vec<NodeRecord> {
@@ -1918,5 +1946,29 @@ fn blake3_hash(bytes: &[u8]) -> String {
 impl From<RustyWebError> for GraphStoreError {
     fn from(err: RustyWebError) -> Self {
         GraphStoreError::new("rustyweb_error", err.to_string())
+    }
+}
+
+fn rustyweb_datawave_to_graph_error(
+    error: rustyred_thg_datawave::DatawaveError,
+) -> GraphStoreError {
+    match error {
+        rustyred_thg_datawave::DatawaveError::Graph(error) => error,
+        error => GraphStoreError::new("rustyweb_datawave_ingest_error", error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datawave_graph_error_mapping_preserves_inner_code() {
+        let error = rustyweb_datawave_to_graph_error(rustyred_thg_datawave::DatawaveError::Graph(
+            GraphStoreError::new("inner_graph_error", "inner message"),
+        ));
+
+        assert_eq!(error.code, "inner_graph_error");
+        assert_eq!(error.message, "inner message");
     }
 }
