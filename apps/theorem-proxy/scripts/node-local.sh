@@ -28,5 +28,12 @@ export RUSTY_RED_MCP_ENABLED="${RUSTY_RED_MCP_ENABLED:-true}"
 mkdir -p "$RUSTY_RED_DATA_DIR"
 echo "theorem node: ${RUSTY_RED_HOST}:${RUSTY_RED_PORT}  data -> ${RUSTY_RED_DATA_DIR}  (mode=${RUSTY_RED_MODE}, auth=${RUSTY_RED_REQUIRE_AUTH})"
 echo "point the proxy at it: --memory-url http://${RUSTY_RED_HOST}:${RUSTY_RED_PORT}/mcp"
+# Prefer the prebuilt binary (fast startup, no recompile). `cargo run` can trigger a slow
+# rebuild whenever another crate in the shared SSD target changed its fingerprint, which
+# blows the launcher's readiness wait. Fall back to building when the binary is absent.
+BIN="${CARGO_TARGET_DIR}/debug/rustyred-thg-server"
+if [ -x "$BIN" ]; then
+  exec "$BIN"
+fi
 cd "$REPO_THG"
 exec cargo run -p rustyred-thg-server --bin rustyred-thg-server
