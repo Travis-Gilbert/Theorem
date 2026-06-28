@@ -6,6 +6,8 @@ The pure-logic harness kernel: a guarded run state machine, content-addressed st
 
 - State machine: `apply_transition(state: Option<RunState>, input: TransitionInput) -> Result<TransitionResult, HarnessError>` (all guards enforced here). `RunState`, `TransitionInput`, `EventState`, `GuardViolation`, `Payload`.
 - State hashing: `hash_run_state(&RunState)`, `stable_value_hash(&Value)`, `empty_state_hash()` (canonical-JSON SHA256).
+- CMH hash contracts: `cmh_body_hash`, `cmh_atom_id_v1`, `cmh_handoff_state_hash_v1` (pure native owner; PyO3 only wraps them for `theseus_native` compatibility).
+- BGI JSON/hash contracts: stable JSON hash, fact-pack row hash, receipt summaries, and receipt compaction; engine-backed BGI execution stays downstream.
 - Replay/fork: `replay_events`, `replay_run`, `fork_run`, `fork_events`.
 - Toolgraph: `select_tools(task_type, scope)`, `compile_task_toolkit(...) -> CompiledToolkit`, `normalize_permissions`, `ToolContract`.
 - Jobs: `Job`, `JobSubmission`, `JobReceipt`, `idempotency_key_for`, `TargetHead { Claude, Codex, Either }`, `Priority { P0, P1, P2 }`.
@@ -13,7 +15,7 @@ The pure-logic harness kernel: a guarded run state machine, content-addressed st
 - Work graph (multi-head CAS): `WorkGraph`, `TaskNode`, `ClaimLease`, `claim_task_node`, `spawn_verify_node`, `submit_verify_receipt`, `HeadFitness`, `next_for_head`.
 - Budget/policy/memory: `check_contribution_budget`, `Constitution`, `compile_map_artifact`, `PrepareMemoryBank`, `ContextManager`, `AffordanceContract`, `receive_federated_signal`, `SessionMetricsState`.
 
-Modules: `state_machine`, `types`, `state_hash`, `replay`, `toolgraph`, `job`, `agent_binding`, `agent_head_registry`, `alignment`, `head_invocation`, `intra_agent_loop`, `budget`, `constitution`, `work_graph`, `work_graph_verify`, `head_fitness`, `scheduler`, `affordances`, `map_artifacts`, `memory_contracts`, `provider_head_adapter`, `context_manager`, `context_web`, `federated_signals`, `session_metrics`.
+Modules: `state_machine`, `types`, `state_hash`, `cmh`, `bgi`, `replay`, `toolgraph`, `job`, `agent_binding`, `agent_head_registry`, `alignment`, `head_invocation`, `intra_agent_loop`, `budget`, `constitution`, `work_graph`, `work_graph_verify`, `head_fitness`, `scheduler`, `affordances`, `map_artifacts`, `memory_contracts`, `provider_head_adapter`, `context_manager`, `context_web`, `federated_signals`, `session_metrics`.
 
 ## Build and test
 

@@ -2,15 +2,14 @@
 name = "rustyred-thg-offload"
 version = "0.1.0"
 edition = "2021"
-description = "Compute-offload engine: classifies LLM-forward-pass operations as substrate-eligible, routes them to CPU substrate affordances, and ledgers the GPU-seconds saved (compute-offload thesis, commonplace-substrate-architecture-part-4-1)."
+description = "Compute-offload planner: operation algebra, version-keyed reuse, calibrated cascade, verification receipts, and CPU graph affordances for Theorem."
 license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/rustyred-thg-offload"
+readme = "README.md"
 rust-version = "1.85"
 
 [dependencies]
-# The substrate core: the wired GraphAlgorithm affordance computes exact PageRank
-# on CPU via `rustyred_thg_core::graph::pagerank` (an EdgeRecord power-iteration),
-# the thesis's "what are the most central entities" operation done as substrate
-# compute instead of GPU approximation.
-rustyred-thg-core = { path = "../rustyred-thg-core" }
+rustyred-thg-core = { version = "0.5.0", path = "../rustyred-thg-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

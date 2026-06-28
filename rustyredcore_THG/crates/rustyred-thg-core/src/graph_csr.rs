@@ -144,6 +144,39 @@ impl CsrGraph {
         self.ids.get(dense).map(String::as_str)
     }
 
+    /// All directed edges as deduplicated, sorted `(from_id, to_id)` pairs.
+    /// The structural oracle the GraphBLAS typed adjacency must agree with.
+    pub fn directed_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = BTreeSet::new();
+        for u in 0..self.node_count() {
+            for (v, _w) in self.out_edges(u) {
+                pairs.insert((self.ids[u].clone(), self.ids[v].clone()));
+            }
+        }
+        pairs.into_iter().collect()
+    }
+
+    /// Forward reachability (BFS over out-edges) from `sources`: the set of
+    /// dense indices reachable, inclusive of the sources. The walk oracle that
+    /// GraphBLAS semiring traversal must reproduce.
+    pub fn reachable_from(&self, sources: &[usize]) -> BTreeSet<usize> {
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        for &s in sources {
+            if s < self.node_count() && visited.insert(s) {
+                queue.push_back(s);
+            }
+        }
+        while let Some(u) = queue.pop_front() {
+            for (v, _w) in self.out_edges(u) {
+                if visited.insert(v) {
+                    queue.push_back(v);
+                }
+            }
+        }
+        visited
+    }
+
     /// Out-neighbors of `u` as `(target_index, weight)` slices.
     fn out_edges(&self, u: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
         let start = self.row_ptr[u] as usize;

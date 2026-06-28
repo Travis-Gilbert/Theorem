@@ -187,3 +187,44 @@ fn get_i64(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<i64>> {
         None => None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_url_filters_tracking_params_and_fragment() {
+        assert_eq!(
+            normalize_url(" HTTPS://Example.COM/a/b?utm_source=x&fbclid=y&keep=1#frag "),
+            "https://example.com/a/b?keep=1"
+        );
+    }
+
+    #[test]
+    fn normalize_url_rejects_missing_http_scheme_or_host() {
+        assert_eq!(normalize_url("example.com/path"), "");
+        assert_eq!(normalize_url("ftp://example.com/path"), "");
+        assert_eq!(normalize_url("https:///path"), "");
+    }
+
+    #[test]
+    fn cosine_returns_zero_for_empty_mismatched_or_zero_vectors() {
+        assert_eq!(cosine(&[], &[]), 0.0);
+        assert_eq!(cosine(&[1.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn cosine_topk_ties_by_id_for_stable_output() {
+        let out = search_cosine_topk(
+            vec![1.0, 0.0],
+            vec![
+                ("b".to_string(), vec![1.0, 0.0]),
+                ("a".to_string(), vec![1.0, 0.0]),
+                ("z".to_string(), vec![0.0, 1.0]),
+            ],
+            2,
+        );
+        assert_eq!(out, vec![("a".to_string(), 1.0), ("b".to_string(), 1.0)]);
+    }
+}

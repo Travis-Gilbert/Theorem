@@ -1,11 +1,21 @@
 //! Continuous Agent Memory Harness (CMH) native helpers.
 //!
-//! Exposes two PyO3 functions used by
-//! ``apps.orchestrate.runtime.memory_canonical`` and
+//! Exposes PyO3 hash helpers that mirror the historical Theseus Python
+//! callers in ``apps.orchestrate.runtime.memory_canonical`` and
 //! ``apps.orchestrate.runtime.handoff_compiler``. The corresponding
 //! Python implementations remain in place as graceful fallbacks per the
 //! `push_ppr` pattern (see `apps/notebook/sparse_ppr.py`). Byte-parity
-//! is enforced by `theseus_native/tests/test_cmh_parity.py`.
+//! is enforced by `rustyredcore_THG/tests/test_cmh_parity.py`.
+//!
+//! This module is not the Theorems Harness V2 memory storage or recall
+//! path. Native harness memory is written and read through
+//! `theorem-harness-runtime::memory` and the `rustyred-thg-mcp`
+//! `McpMemoryStore` adapter over the caller's `GraphStore`
+//! (`RedCoreGraphStore` for durable local stores). These CMH helpers only
+//! pin the atom-id and handoff-hash algorithms so older Theseus CMH
+//! artifacts and Rust-native peers can agree on identifiers.
+//! The pure Rust owner is `theorem-harness-core::cmh`; this module is
+//! only the Python ABI wrapper.
 //!
 //! Why Rust here, given Python's hashlib is already C-backed?
 //!
@@ -57,31 +67,15 @@
 //!     impl; this function does not re-canonicalize.
 
 use pyo3::prelude::*;
-use sha2::{Digest, Sha256};
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest.iter() {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
-/// Normalize body text the same way Python's
-/// ``memory_canonical._body_hash`` does:
-///   ``" ".join(str(text or "").lower().split())``
-fn normalize_body(text: &str) -> String {
-    text.split_whitespace()
-        .map(|chunk| chunk.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use theorem_harness_core::{
+    cmh_atom_id_v1 as core_cmh_atom_id_v1, cmh_body_hash as core_cmh_body_hash,
+    cmh_handoff_state_hash_v1 as core_cmh_handoff_state_hash_v1,
+};
 
 /// SHA256 hex of the normalized body text.
 #[pyfunction]
 pub fn cmh_body_hash(text: &str) -> String {
-    sha256_hex(normalize_body(text).as_bytes())
+    core_cmh_body_hash(text)
 }
 
 /// Deterministic atom id v1 used by ``memory_canonical._atom_id``.
@@ -91,15 +85,7 @@ pub fn cmh_body_hash(text: &str) -> String {
 /// which language ran it.
 #[pyfunction]
 pub fn cmh_atom_id_v1(workstream_id: &str, kind: &str, body: &str) -> String {
-    let mut keyed = String::with_capacity(workstream_id.len() + kind.len() + 66);
-    keyed.push_str(workstream_id);
-    keyed.push('\0');
-    keyed.push_str(kind);
-    keyed.push('\0');
-    keyed.push_str(&sha256_hex(normalize_body(body).as_bytes()));
-    let digest = sha256_hex(keyed.as_bytes());
-    let prefix: String = digest.chars().take(32).collect();
-    format!("atom:{prefix}")
+    core_cmh_atom_id_v1(workstream_id, kind, body)
 }
 
 /// HandoffArtifact state hash v1. The caller passes the canonical JSON
@@ -109,7 +95,7 @@ pub fn cmh_atom_id_v1(workstream_id: &str, kind: &str, body: &str) -> String {
 /// Python contract byte-for-byte.
 #[pyfunction]
 pub fn cmh_handoff_state_hash_v1(canonical_json: &str) -> String {
-    format!("sha256:{}", sha256_hex(canonical_json.as_bytes()))
+    core_cmh_handoff_state_hash_v1(canonical_json)
 }
 
 #[cfg(test)]
@@ -118,8 +104,8 @@ mod tests {
 
     #[test]
     fn body_hash_normalizes_whitespace_and_case() {
-        let a = cmh_body_hash("Use   Memgraph  for STORAGE");
-        let b = cmh_body_hash(" use memgraph for storage ");
+        let a = cmh_body_hash("Use   GraphStore  for STORAGE");
+        let b = cmh_body_hash(" use graphstore for storage ");
         assert_eq!(a, b);
     }
 

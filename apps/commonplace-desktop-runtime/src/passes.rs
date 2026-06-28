@@ -46,11 +46,12 @@
 use std::path::Path;
 
 use rustyred_thg_core::{
-    now_ms, DiskObjectStore, EdgeRecord, GraphStore, GraphStoreResult, NeighborQuery, NodeRecord,
-    RedCoreGraphStore,
+    now_ms, DiskObjectStore, EdgeRecord, GraphSnapshot, GraphStore, GraphStoreResult, NeighborQuery,
+    NodeRecord, RedCoreGraphStore,
 };
 use rustyred_thg_offload::{
-    OffloadEngine, OffloadOperation, OffloadOperationKind, OffloadOutcome,
+    ExecutorKind, GraphAffordanceEngine, GraphAffordanceRequest, Operation, OperationKind,
+    OperationPlanner, PlannerConfig, COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID,
 };
 use rustyred_thg_reconstruct_harness::{
     run_reconstruction_pipeline, write_pipeline_output_in_store,
@@ -326,16 +327,21 @@ impl AmbientPass for ReconstructionPass {
 /// REAL-WIRED offload pass. On a settled change set, the ingest triggers a
 /// graph-algorithm derivation -- centrality over the just-ingested items'
 /// `SIMILAR_TO` subgraph (F2 writes those edges) -- which is offload-eligible
-/// (cheaper + exact as CPU substrate compute). The pass classifies that
-/// derivation through the [`OffloadEngine`], runs the wired exact-PageRank
-/// substrate affordance over the real subgraph, and records a `Produced`
-/// receipt carrying the offload decision and the `gpu_seconds_saved` ledger
-/// total.
+/// (cheaper + exact as CPU substrate compute, not a GPU forward-pass
+/// approximation). The pass routes that derivation through the compute-offload
+/// planner ([`OperationPlanner`]) as a [`OperationKind::GraphPageRank`]
+/// operation: the planner picks the cheapest executor satisfying the quality
+/// floor, which for an exact graph op is the CPU `graph.pagerank` affordance over
+/// the [`ExecutorKind::ExpensiveModel`] baseline, and its
+/// [`CostSummary`](rustyred_thg_offload::CostSummary) banks the `gpu_seconds_saved`
+/// / `tokens_saved`. The pass then EXECUTES that exact PageRank over the real
+/// subgraph through the wired [`GraphAffordanceEngine`] and records a `Produced`
+/// receipt carrying both the routing decision and the real centrality result
+/// (the most central item).
 ///
-/// The engine is constructed per-run (it owns a fresh ledger; the cumulative
-/// `gpu_seconds_saved` for this change set is read off it after routing). A
-/// longer-lived cumulative ledger across change sets is a later-slice concern;
-/// each receipt carries the per-change-set saving.
+/// The planner is constructed per-run with the planner's default cost weights;
+/// each receipt carries the per-change-set offload saving. A longer-lived
+/// cumulative ledger across change sets is a later-slice concern.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OffloadPass;
 
@@ -424,46 +430,90 @@ impl AmbientPass for OffloadPass {
             });
         }
 
-        // Classify + route the derivation through the offload engine. The op is
-        // scaled by the node count (centrality cost grows with the graph), so a
-        // bigger subgraph records a bigger GPU-second delta.
-        let node_count = {
-            let mut nodes = std::collections::HashSet::new();
-            for edge in &edges {
-                nodes.insert(edge.from_id.clone());
-                nodes.insert(edge.to_id.clone());
-            }
-            nodes.len()
+        // The induced subgraph nodes (the centrality cost grows with the graph,
+        // so the planner's row estimate is scaled by the node count).
+        let node_ids: std::collections::BTreeSet<String> = edges
+            .iter()
+            .flat_map(|edge| [edge.from_id.clone(), edge.to_id.clone()])
+            .collect();
+        let node_count = node_ids.len();
+
+        // Route the centrality derivation through the compute-offload planner as
+        // a GraphPageRank operation. A graph op is CPU-symbolic, so the planner
+        // picks the exact `graph.pagerank` CPU affordance over the expensive-model
+        // baseline; the plan's totals bank the GPU-seconds the offload saved.
+        let operation = Operation {
+            operation_id: "ingested_item_similarity_centrality".to_string(),
+            kind: OperationKind::GraphPageRank,
+            description: "centrality over the just-ingested SIMILAR_TO item subgraph".to_string(),
+            estimated_rows: node_count.max(1) as u64,
+            quality_floor: 1.0,
+            ..Operation::new("", OperationKind::GraphPageRank)
         };
-        let operation = OffloadOperation::new(
-            "ingested_item_similarity_centrality",
-            OffloadOperationKind::GraphAlgorithm,
-        )
-        .with_units(node_count as u64)
-        .with_payload(json!({ "edges": edges }));
+        let plan = OperationPlanner::new(PlannerConfig::default()).plan(vec![operation]);
+        let step = plan
+            .steps
+            .first()
+            .expect("planner returns one step for one operation");
+        let selected_executor = step.selected.executor.clone();
+        let selected_affordance = step.selected.affordance_id.clone();
 
-        let mut engine = OffloadEngine::default();
-        let report = engine.route(&operation);
-
-        // The wired affordance ran: Produced receipt carrying the decision, the
-        // result summary, and the gpu_seconds_saved the offload banked.
-        let status = match &report.outcome {
-            OffloadOutcome::Executed { .. } => PassStatus::Produced,
-            // The graph affordance IS wired in the default engine, so a non-
-            // executed outcome here means a genuine affordance failure (e.g. a
-            // malformed edge); surface it as Degraded, named, not faked.
-            OffloadOutcome::ExecutionFailed { error } => {
-                PassStatus::Degraded(format!("offload affordance failed: {error}"))
-            }
-            OffloadOutcome::EligibleUnrouted { kind } => PassStatus::Degraded(format!(
-                "graph-algorithm offload unexpectedly unrouted for {kind:?}"
-            )),
-            OffloadOutcome::NotEligible => {
-                PassStatus::Degraded("graph-algorithm op unexpectedly classified not-eligible".into())
-            }
+        // Execute the real exact PageRank over the induced subgraph through the
+        // wired CPU graph affordance, then read the most central item off its
+        // payload. The snapshot is the scoped subgraph: the ingested items that
+        // participate in a SIMILAR_TO edge among the change set, plus those edges.
+        let snapshot = GraphSnapshot {
+            version: plan.graph_version,
+            nodes: node_ids
+                .iter()
+                .map(|id| NodeRecord::new(id, ["Item"], json!({ "id": id })))
+                .collect(),
+            edges: edges.clone(),
         };
+        let pagerank = GraphAffordanceEngine::run(
+            &snapshot,
+            GraphAffordanceRequest::PageRank {
+                damping: 0.85,
+                max_iter: 100,
+                tolerance: 1e-9,
+            },
+        );
+        let top_node = pagerank.payload["scores"]
+            .as_object()
+            .and_then(|scores| {
+                scores
+                    .iter()
+                    .filter_map(|(id, score)| score.as_f64().map(|s| (id.clone(), s)))
+                    // Highest score wins; ties break on id for determinism.
+                    .max_by(|left, right| {
+                        left.1
+                            .partial_cmp(&right.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| right.0.cmp(&left.0))
+                    })
+                    .map(|(id, _)| id)
+            });
 
-        let result_summary = report.result().map(|result| result.summary.clone());
+        // The planner routed the op to the CPU affordance (the offload), and the
+        // affordance executed: a Produced receipt carrying the decision, the real
+        // centrality result, and the gpu_seconds_saved the offload banked. If the
+        // planner unexpectedly kept the op on a model executor, that is a genuine
+        // routing regression -- surface it as Degraded, named, not faked.
+        let routed_to_cpu = matches!(
+            selected_executor,
+            ExecutorKind::CpuAffordance | ExecutorKind::Cache
+        );
+        let status = if routed_to_cpu && top_node.is_some() {
+            PassStatus::Produced
+        } else if top_node.is_none() {
+            PassStatus::Degraded(
+                "exact PageRank affordance returned no scores for the subgraph".to_string(),
+            )
+        } else {
+            PassStatus::Degraded(format!(
+                "graph-algorithm op unexpectedly routed to {selected_executor:?} instead of a CPU affordance"
+            ))
+        };
 
         Ok(PassReceipt {
             pass: Self::NAME.to_string(),
@@ -473,25 +523,34 @@ impl AmbientPass for OffloadPass {
                 .iter()
                 .map(|entry| entry.relative_path.clone())
                 .collect(),
-            evidence_ids: report
-                .result()
-                .and_then(|result| result.summary["top_node"].as_str().map(str::to_string))
-                .into_iter()
-                .collect(),
+            evidence_ids: top_node.iter().cloned().collect(),
             produced: json!({
-                "operation": operation.label,
-                "kind": operation.kind.tag(),
-                "eligible": report.decision.eligible,
-                "affordance": report.decision.affordance,
-                "rationale": report.decision.rationale,
-                "gpu_seconds_saved": report.gpu_seconds_saved,
-                "cumulative_gpu_seconds_saved": engine.gpu_seconds_saved(),
+                "operation": operation_id_of(&plan),
+                "kind": "graph_page_rank",
+                "route_affordance": COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID,
+                "selected_executor": selected_executor,
+                "affordance": selected_affordance,
+                "gpu_seconds_saved": plan.totals.gpu_seconds_saved,
+                "tokens_saved": plan.totals.tokens_saved,
                 "node_count": node_count,
                 "edge_count": edges.len(),
-                "result_summary": result_summary,
+                "result_summary": json!({
+                    "top_node": top_node,
+                    "affordance_id": pagerank.affordance_id,
+                    "scores": pagerank.payload["scores"].clone(),
+                }),
             }),
         })
     }
+}
+
+/// The operation id of the single planned step (kept stable for the receipt's
+/// `operation` field after the planner normalizes the operation).
+fn operation_id_of(plan: &rustyred_thg_offload::OffloadPlan) -> String {
+    plan.steps
+        .first()
+        .map(|step| step.operation.operation_id.clone())
+        .unwrap_or_default()
 }
 
 /// DEGRADED standing-seed pass. No standing-query / standing-seed evaluation
@@ -809,13 +868,22 @@ mod tests {
         assert_eq!(
             receipt.status,
             PassStatus::Produced,
-            "the wired affordance ran over the seeded subgraph"
+            "the planner routed the centrality op to the CPU affordance and it ran"
         );
 
-        // The decision is eligible and routed to the exact-PageRank affordance.
-        assert_eq!(receipt.produced["eligible"], json!(true));
-        assert_eq!(receipt.produced["affordance"], json!("graph_pagerank_exact"));
-        assert_eq!(receipt.produced["kind"], json!("graph_algorithm"));
+        // The planner routed the graph op to the exact CPU PageRank affordance
+        // (the offload), not a model executor.
+        assert_eq!(
+            receipt.produced["selected_executor"],
+            json!("cpu_affordance"),
+            "an exact graph op must route to the CPU affordance, not a model"
+        );
+        assert_eq!(receipt.produced["affordance"], json!("graph.pagerank"));
+        assert_eq!(receipt.produced["kind"], json!("graph_page_rank"));
+        assert_eq!(
+            receipt.produced["route_affordance"],
+            json!(COMPUTE_OFFLOAD_ROUTE_AFFORDANCE_ID)
+        );
 
         // A REAL PageRank result: the hub is the most central item.
         assert_eq!(
@@ -825,13 +893,15 @@ mod tests {
         );
         assert_eq!(receipt.evidence_ids, vec!["hub".to_string()]);
 
-        // The monetization metric is recorded and positive.
+        // The monetization metric is recorded and positive: routing the exact
+        // graph op to CPU banks the expensive-model baseline's GPU-seconds.
         let saved = receipt.produced["gpu_seconds_saved"].as_f64().unwrap();
         assert!(saved > 0.0, "offload must record a positive gpu_seconds_saved");
-        let cumulative = receipt.produced["cumulative_gpu_seconds_saved"]
-            .as_f64()
-            .unwrap();
-        assert!(cumulative > 0.0);
+        let tokens_saved = receipt.produced["tokens_saved"].as_f64().unwrap();
+        assert!(
+            tokens_saved > 0.0,
+            "offloading off the model baseline must bank tokens too"
+        );
     }
 
     #[test]

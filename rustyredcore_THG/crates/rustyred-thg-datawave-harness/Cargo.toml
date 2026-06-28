@@ -1,0 +1,16 @@
+[package]
+name = "rustyred-thg-datawave-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Harness capability pack theorem.ingest.datawave: exposes the DATAWAVE-style intake (ingest a record/batch, write the dictionary, look up and intersect facts by value+field) to agents as RustyRed plugin operations, mirroring rustyred-thg-reconstruct-harness."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+rustyred-thg-core = { path = "../rustyred-thg-core" }
+rustyred-thg-datawave = { path = "../rustyred-thg-datawave" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
