@@ -11,6 +11,7 @@ pub mod constrained_decoding;
 pub mod ledger;
 pub mod mcp;
 pub mod model;
+pub mod proxy;
 pub mod receiver_sidecar;
 pub mod relay;
 pub mod tools;

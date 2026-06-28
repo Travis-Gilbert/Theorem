@@ -11,20 +11,25 @@ export function Settings() {
   const { state, actions } = useApp();
   const { settings } = state;
   const [nodeStatus, setNodeStatus] = useState<cmd.LocalNodeStatus | null>(null);
+  const [proxyStatus, setProxyStatus] = useState<cmd.ProxyStatus | null>(null);
   const [receiverStatus, setReceiverStatus] = useState<cmd.ReceiverStatus | null>(null);
+  const [proxyReceipt, setProxyReceipt] =
+    useState<cmd.ProxyConnectReceipt | null>(null);
   const [connectorProof, setConnectorProof] =
     useState<cmd.ConnectorProofResult | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     async function refresh() {
-      const [node, receiver, backendReceiver] = await Promise.all([
+      const [node, proxy, receiver, backendReceiver] = await Promise.all([
         cmd.localNodeStatus(),
+        cmd.proxyStatus(),
         cmd.receiverStatus(),
         cmd.receiverSettingsGet(),
       ]);
       if (cancelled) return;
       setNodeStatus(node);
+      setProxyStatus(proxy);
       setReceiverStatus(receiver);
       if (backendReceiver) actions.setReceiver(backendReceiver);
     }
@@ -119,6 +124,28 @@ export function Settings() {
             <code>{nodeStatus?.storePath ?? "..."}</code>
             <span>Tools parity</span>
             <code>{nodeStatus?.toolsMatchHosted ? "matching" : "not verified"}</code>
+          </div>
+        </section>
+
+        <section className="settings__group">
+          <h3>Claude Code</h3>
+          <div className="settings__status">
+            <span className={proxyStatus?.nodeUp ? "badge badge--on" : "badge"}>
+              {proxyStatus?.nodeUp ? "Proxy up" : "Proxy off"}
+            </span>
+            <span className="settings__muted">{proxyStatus?.endpoint ?? "..."}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void cmd.proxyConnectClaude().then(setProxyReceipt)}
+          >
+            Connect Claude Code
+          </button>
+          <div className="settings__kv">
+            <span>Store</span>
+            <code>{proxyStatus?.storePath ?? "..."}</code>
+            <span>Connect</span>
+            <code>{proxyReceipt?.message ?? "not run"}</code>
           </div>
         </section>
 

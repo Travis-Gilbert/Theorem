@@ -201,6 +201,21 @@ export interface CommonplaceStatus {
   storePath: string;
 }
 
+export interface ProxyStatus {
+  nodeUp: boolean;
+  endpoint: string;
+  port: number;
+  storePath: string;
+  ambientEnabled: boolean;
+}
+
+export interface ProxyConnectReceipt {
+  status: "ok" | "error";
+  endpoint: string;
+  command: string;
+  message: string;
+}
+
 export interface ReceiverStatus {
   enabled: boolean;
   state: "off" | "configured" | "running" | "error";
@@ -230,6 +245,29 @@ export async function commonplaceStatus(): Promise<CommonplaceStatus> {
     endpoint: "http://127.0.0.1:17890",
     port: 17890,
     storePath: "~/Library/Application Support/Theorem/store/commonplace-api",
+  };
+}
+
+/** Rust: `proxy_status() -> ProxyStatus`. */
+export async function proxyStatus(): Promise<ProxyStatus> {
+  if (isTauri()) return invoke<ProxyStatus>("proxy_status");
+  return {
+    nodeUp: false,
+    endpoint: "http://127.0.0.1:8484",
+    port: 8484,
+    storePath: "~/Library/Application Support/Theorem/store/proxy",
+    ambientEnabled: true,
+  };
+}
+
+/** Rust: `proxy_connect_claude() -> ProxyConnectReceipt`. */
+export async function proxyConnectClaude(): Promise<ProxyConnectReceipt> {
+  if (isTauri()) return invoke<ProxyConnectReceipt>("proxy_connect_claude");
+  return {
+    status: "error",
+    endpoint: "http://127.0.0.1:8484",
+    command: "ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ENABLE_TOOL_SEARCH=true claude",
+    message: "Claude Code connection is available in the desktop app.",
   };
 }
 

@@ -1,0 +1,99 @@
+name: RustyRed Release
+
+on:
+  push:
+    tags:
+      - "rustyred-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, for example rustyred-v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Build RustyRed local binaries
+        run: |
+          cargo build \
+            --release \
+            --target "${{ matrix.target }}" \
+            --manifest-path rustyredcore_THG/Cargo.toml \
+            -p theorem-agentd \
+            -p rustyred-proxy \
+            --bins
+
+      - name: Package RustyRed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.target }}"
+          cp "rustyredcore_THG/target/${{ matrix.target }}/release/theorem-agentd" "dist/${{ matrix.target }}/theorem-agentd"
+          cp "rustyredcore_THG/target/${{ matrix.target }}/release/theorem-localmodel" "dist/${{ matrix.target }}/theorem-localmodel"
+          cp "rustyredcore_THG/target/${{ matrix.target }}/release/rustyred-proxy" "dist/${{ matrix.target }}/rustyred-proxy"
+          cp scripts/theorem "dist/${{ matrix.target }}/theorem"
+          cp scripts/theorem "dist/${{ matrix.target }}/rustyred"
+          chmod 0755 \
+            "dist/${{ matrix.target }}/theorem-agentd" \
+            "dist/${{ matrix.target }}/theorem-localmodel" \
+            "dist/${{ matrix.target }}/rustyred-proxy" \
+            "dist/${{ matrix.target }}/theorem" \
+            "dist/${{ matrix.target }}/rustyred"
+          tar -czf "rustyred-${{ matrix.target }}.tar.gz" -C "dist/${{ matrix.target }}" theorem-agentd theorem-localmodel rustyred-proxy theorem rustyred
+          shasum -a 256 "rustyred-${{ matrix.target }}.tar.gz" > "rustyred-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustyred-${{ matrix.target }}
+          path: |
+            rustyred-${{ matrix.target }}.tar.gz
+            rustyred-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rustyred-*
+          merge-multiple: true
+
+      - name: Publish assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --notes "RustyRed local proxy release."
+          fi
+          gh release upload "$RELEASE_TAG" rustyred-*.tar.gz rustyred-*.tar.gz.sha256 --clobber
