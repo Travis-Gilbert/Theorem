@@ -343,6 +343,20 @@ const STATIC_AFFORDANCES: &[StaticAffordanceContract] = &[
         permissions: &["graph_read"],
         tags: &["bgi", "symbolic", "constraints"],
     },
+    StaticAffordanceContract {
+        affordance_id: "compute_offload.route_operation",
+        engine_id: "rustyred-thg-offload",
+        family: "compute_offload",
+        label: "Compute offload router",
+        input_shape: "operation_plan_request",
+        output_shape: "offload_plan_receipt",
+        writeback_policy: "read-only",
+        execution_surface: "affordance-router",
+        parity_status: "native-planner-seed",
+        source_module: "rustyred_thg_offload",
+        permissions: &["graph_read"],
+        tags: &["compute_offload", "planner", "proxy", "mcp", "verification"],
+    },
 ];
 
 fn strings(values: &[&str]) -> Vec<String> {
