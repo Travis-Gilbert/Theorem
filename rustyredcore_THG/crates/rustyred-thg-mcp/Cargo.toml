@@ -23,6 +23,7 @@ rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
 rustyred-thg-connectors = { path = "../rustyred-thg-connectors" }
 rustyred-thg-offload = { path = "../rustyred-thg-offload" }
 rustyred-thg-reconstruct-harness = { path = "../rustyred-thg-reconstruct-harness" }
+rustyred-thg-datawave-harness = { path = "../rustyred-thg-datawave-harness" }
 theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-harness-runtime = { path = "../theorem-harness-runtime" }
 tokio = { version = "1", features = ["sync"] }

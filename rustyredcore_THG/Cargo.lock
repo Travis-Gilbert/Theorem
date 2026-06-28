@@ -8311,6 +8311,7 @@ dependencies = [
  "rustyred-thg-code",
  "rustyred-thg-connectors",
  "rustyred-thg-core",
+ "rustyred-thg-datawave-harness",
  "rustyred-thg-ml",
  "rustyred-thg-offload",
  "rustyred-thg-reconstruct-harness",
