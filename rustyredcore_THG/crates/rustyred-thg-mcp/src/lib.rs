@@ -53,8 +53,8 @@ use rustyred_thg_core::{
     VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
     HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
-use rustyred_thg_reconstruct_harness::{ReconstructionHarnessPlugin, RECONSTRUCT_CAPABILITY_PACK};
 use rustyred_thg_datawave_harness::{DatawaveIngestPlugin, INGEST_CAPABILITY_PACK};
+use rustyred_thg_reconstruct_harness::{ReconstructionHarnessPlugin, RECONSTRUCT_CAPABILITY_PACK};
 use rustyred_web::{canonicalize_url, query_rustyweb_datawave_snapshot, RUSTYWEB_PAGE_DATA_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};

@@ -8498,6 +8498,7 @@ dependencies = [
  "rustyred-thg-affordances",
  "rustyred-thg-connectors",
  "rustyred-thg-core",
+ "rustyred-thg-datawave-harness",
  "rustyred-thg-fractal",
  "rustyred-thg-mcp",
  "rustyred-web",
