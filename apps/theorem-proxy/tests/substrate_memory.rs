@@ -106,21 +106,23 @@ async fn memory_request_carries_no_anthropic_credential() {
     );
 }
 
-/// End-to-end against a REAL running local node: `rustyred-thg-server` on
-/// 127.0.0.1:8380 (scripts/node-local.sh) with a memory encoded for the query. Ignored
-/// by default (needs the node up); run with:
+/// End-to-end against a REAL running local node: `rustyred-thg-server` on 127.0.0.1:8380
+/// SEEDED with the memory corpus (`scripts/seed-node.py`, which also warms the index).
+/// Ignored by default (needs the seeded+warm node up); run with:
 ///   cargo test --test substrate_memory -- --ignored
+/// The query uses distinctive tokens from a known corpus memory so it returns hits even
+/// under the node's default (weak) hash embedder.
 #[tokio::test]
 #[ignore]
 async fn live_local_node_returns_hits() {
     let hits = tokio::task::spawn_blocking(|| {
         HttpMemorySource::new("http://127.0.0.1:8380/mcp", Some("default".to_string()))
-            .retrieve("theorem-proxy local node ambient memory hippo_retrieve", 5)
+            .retrieve("railway dockerfile copy drift rust deploy MSRV", 5)
     })
     .await
     .unwrap();
     assert!(
         !hits.is_empty(),
-        "live local node returned ambient memory hits"
+        "seeded local node returned ambient memory hits"
     );
 }

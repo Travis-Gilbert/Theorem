@@ -157,9 +157,13 @@ pub struct HttpMemorySource {
 
 impl HttpMemorySource {
     pub fn new(endpoint: impl Into<String>, tenant: Option<String>) -> Self {
+        // Node retrieval over a real corpus (PPR + a multi-KB response) takes seconds, not
+        // milliseconds, so the read timeout is generous; it still bounds a hung node. The
+        // fast, low-latency ambient path is `DirectoryMemorySource` -- this HTTP source is
+        // opt-in for graph retrieval.
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_millis(300))
-            .timeout_read(Duration::from_millis(800))
+            .timeout_read(Duration::from_millis(3000))
             .build();
         Self {
             endpoint: endpoint.into(),
@@ -171,7 +175,12 @@ impl HttpMemorySource {
     /// JSON-RPC `tools/call` for `hippo_retrieve` against the node. `None` on any
     /// transport/parse failure (the caller maps that to no hits -> passthrough).
     fn query(&self, query: &str, limit: usize) -> Option<Vec<MemoryHit>> {
-        let mut arguments = json!({ "query": query, "top_k": limit.max(1) });
+        // auto_index_memory=false keeps this a pure read: indexing the corpus re-scans
+        // every memory and far exceeds the agent's read timeout, so the hot path must
+        // query the already-warm index. Building/warming the index is the seed step's job
+        // (scripts/seed-node.py), not the per-turn retrieval's.
+        let mut arguments =
+            json!({ "query": query, "top_k": limit.max(1), "auto_index_memory": false });
         if let Some(tenant) = &self.tenant {
             arguments["tenant"] = json!(tenant);
         }
