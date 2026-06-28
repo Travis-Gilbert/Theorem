@@ -61,11 +61,11 @@ This is a lot. The composed-agent kernel is correctness-critical, parity-tested,
 
 These are open work items the composed-agent spec acknowledges or that fell out of scope; each is a real prerequisite to "Agent Theorem" the user can actually use.
 
-### A. Lane B model layer is ~70%, not done
+### A. Lane B model layer ✅ COMPLETE (was named open; S4 audit on 2026-06-28 found it already shipped)
 From [`composed-agent/lane-b-next-plan.md`](../composed-agent/lane-b-next-plan.md):
-- **`AgentHeadRegistry` runtime/provider credential resolver** — the registry resolves `credential_ref`s, but the live runtime adapter that exchanges them for actual provider keys (Anthropic, OpenAI, etc.) and dispatches real API calls is open. Today the loop runs against `FakeHeadInvoker` for tests and `ProviderHeadInvoker` for API-backed heads; the credential-resolution-at-call-time is implemented but the full live registry/provider adapter is named open.
-- **Live model invocation receipts** replacing the deterministic fake-head receipts inside `run_fake_intra_agent_loop`. The loop *shape* (propose/critique/synthesize/verify with budget + grounding guards + reliability routing) is correct; the heads inside it need to be real, not fake.
-- **Live `theorem_grpc.*` invocation adapter** — the Theseus app affordances are registered as graph-visible metadata but not yet callable end-to-end via the binding's affordance lane.
+- ~~**`AgentHeadRegistry` runtime/provider credential resolver**~~ **DONE.** `theorem-harness-runtime/src/head_invoker/credentials.rs::CredentialResolver` exchanges `env:`/`secret:`/`secret-store:` refs at call time with typed errors; never persists to GraphStore.
+- ~~**Live model invocation receipts**~~ **DONE.** Production paths (`rustyred-thg-mcp::composed_agent_run_to_store`, `rustyred-thg-server::TenantGraphStore::composed_agent_run`, `apps/commonplace-api/src/schema.rs`) default to `ProviderHeadInvoker::from_env()`. `FakeHeadInvoker` only used in tests via `<I: HeadInvoker>` injection.
+- ~~**Live `theorem_grpc.*` invocation adapter**~~ **DONE.** `TenantGraphStore::invoke_app_affordance` in `rustyred-thg-server/src/state.rs:2618-2810` — real tonic dispatch against `/theorem_grpc.AppAffordanceService/InvokeAffordance` with env-resolved endpoint. See [`../composed-agent/lane-b-next-plan.md`](../composed-agent/lane-b-next-plan.md) §"S4 audit verdict (2026-06-28)".
 - **Charter-surface reintegration** — the charter compiler is built but its visibility surface (what each head *sees* it can call when contributing to the scratchpad) needs a final reintegration pass.
 - **Pairformer A/B for intra-agent router moderation** — referenced in CA-B2.2; landed as per-capability reliability routing but the explicit pairformer wiring for proposal-vs-critique routing wasn't called out as done.
 
@@ -149,10 +149,7 @@ Each slice is oracle-testable (cargo test + clippy):
    - Read the existing MOUNTED implementation; verify it pulls `AgentPublished` memory; add tests if not.
    - Add `binding_lineage(agent_id)` query in `theorem-harness-runtime`.
 
-4. **Slice S4 — Lane B model layer completion** (composed-agent's open work)
-   - Live provider credential resolver (LB-1 tail).
-   - Live model invocation receipts inside the intra-agent loop (replace fake-head path for production).
-   - Live `theorem_grpc.*` invocation adapter.
+4. ~~**Slice S4 — Lane B model layer completion**~~ ✅ **COMPLETE** (audit on 2026-06-28: already shipped on `main`; no code written for this slice). Live credential resolver, `ProviderHeadInvoker` production default, and live tonic dispatch for `theorem_grpc.*` app affordances are all in place. See [`../composed-agent/lane-b-next-plan.md`](../composed-agent/lane-b-next-plan.md) §"S4 audit verdict (2026-06-28)".
 
 5. **Slice S5 — user-facing Theorem surface**
    - `apps/theorem-gateway` route: `chat(agent: "theorem", ...)` resolving to `composed_agent_run`.
@@ -162,7 +159,7 @@ Each slice is oracle-testable (cargo test + clippy):
    - SQL views for binding/event/scratchpad/memory.
    - Encode the agent_id cache-scoping decision; implement if yes.
 
-S1-S3 are user-presentation-layer (the gap this plan owns). S4 is composed-agent Lane B's named-open work. S5 is the new app surface. S6 is infrastructure cleanup.
+S1-S3 are user-presentation-layer (the gap this plan owns). ~~S4 is composed-agent Lane B's named-open work~~ — S4 was already shipped (audit on 2026-06-28). S5 is the new app surface. S6 is infrastructure cleanup.
 
 ## 6. Resolved decisions (2026-06-28)
 
