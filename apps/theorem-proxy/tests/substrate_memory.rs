@@ -69,6 +69,43 @@ async fn fails_open_when_the_node_is_unreachable() {
     assert!(hits.is_empty(), "down node fails open to passthrough");
 }
 
+#[tokio::test]
+async fn memory_request_carries_no_anthropic_credential() {
+    // D7 two-token isolation: HttpMemorySource builds its own request to the node, so the
+    // client's Anthropic credential (x-api-key / authorization) must never reach it.
+    use std::sync::{Arc, Mutex};
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    let node = Router::new().route(
+        "/mcp",
+        post(move |headers: axum::http::HeaderMap, _body: String| {
+            let recorder = recorder.clone();
+            async move {
+                let mut names = recorder.lock().unwrap();
+                for key in headers.keys() {
+                    names.push(key.as_str().to_lowercase());
+                }
+                axum::Json(serde_json::json!({
+                    "result": {"structuredContent": {"candidates": []}}
+                }))
+            }
+        }),
+    );
+    let addr = spawn(node).await;
+    let endpoint = format!("http://{addr}/mcp");
+    let _ = tokio::task::spawn_blocking(move || {
+        HttpMemorySource::new(endpoint, None).retrieve("anything", 3)
+    })
+    .await
+    .unwrap();
+
+    let names = seen.lock().unwrap();
+    assert!(
+        !names.iter().any(|h| h == "x-api-key" || h == "authorization"),
+        "memory-node request must not carry the Anthropic credential; saw: {names:?}"
+    );
+}
+
 /// End-to-end against a REAL running local node: `rustyred-thg-server` on
 /// 127.0.0.1:8380 (scripts/node-local.sh) with a memory encoded for the query. Ignored
 /// by default (needs the node up); run with:
