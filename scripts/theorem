@@ -6,8 +6,11 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly DEFAULT_SOURCE_DIR="$HOME/.theorem/source"
 readonly THEOREM_HOME_DIR="${THEOREM_HOME:-$HOME/.theorem}"
 readonly PID_FILE="$THEOREM_HOME_DIR/agentd.pid"
+readonly PROXY_PID_FILE="$THEOREM_HOME_DIR/proxy.pid"
 readonly OUT_LOG="$THEOREM_HOME_DIR/agentd.out.log"
 readonly ERR_LOG="$THEOREM_HOME_DIR/agentd.err.log"
+readonly PROXY_OUT_LOG="$THEOREM_HOME_DIR/proxy.out.log"
+readonly PROXY_ERR_LOG="$THEOREM_HOME_DIR/proxy.err.log"
 
 usage() {
     cat <<'EOF'
@@ -15,19 +18,90 @@ usage: theorem <command> [args]
 
 Commands:
   init [--force] [dir]     Create a no-secret starter config and first-turn note.
-  start [agentd args...]   Start theorem-agentd in the foreground.
-  once <prompt>            Run one theorem-agentd turn and print the transcript.
+  harness [agentd args...] Start the full local node: proxy plus theorem-localmodel.
+  start [agentd args...]   Start theorem-localmodel in the foreground.
+  proxy [proxy args...]    Start the Anthropic Messages proxy on localhost.
+  appear [actor] [opts]    Announce a local actor into the harness room.
+  codex-endpoint [args...] Start Codex app-server and announce its endpoint.
+  wrap <claude|codex>      Start proxy room wiring, then launch the agent CLI.
+  once <prompt>            Run one theorem-localmodel turn and print the transcript.
   stop                     Stop the background agentd started by install.sh.
   status                   Show background agentd status and source checkout.
   logs                     Tail background agentd logs.
   doctor                   Check local prerequisites and repo discovery.
-  agentd [args...]         Pass arguments directly to theorem-agentd.
+  agentd [args...]         Pass arguments directly to theorem-localmodel.
   repo                     Print the source checkout used by this wrapper.
 EOF
 }
 
 log() {
     printf '[theorem] %s\n' "$*" >&2
+}
+
+json_quote() {
+    local value=${1-}
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$value"
+        return 0
+    fi
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\t'/\\t}
+    printf '"%s"' "$value"
+}
+
+find_agentd_bin() {
+    if [[ -n "${THEOREM_LOCALMODEL_BIN:-}" && -x "$THEOREM_LOCALMODEL_BIN" ]]; then
+        printf '%s\n' "$THEOREM_LOCALMODEL_BIN"
+        return 0
+    fi
+
+    if [[ -n "${THEOREM_AGENTD_BIN:-}" && -x "$THEOREM_AGENTD_BIN" ]]; then
+        printf '%s\n' "$THEOREM_AGENTD_BIN"
+        return 0
+    fi
+
+    if command -v theorem-localmodel >/dev/null 2>&1; then
+        command -v theorem-localmodel
+        return 0
+    fi
+
+    if command -v theorem-agentd >/dev/null 2>&1; then
+        command -v theorem-agentd
+        return 0
+    fi
+
+    if [[ -x "$SCRIPT_DIR/theorem-localmodel" ]]; then
+        printf '%s\n' "$SCRIPT_DIR/theorem-localmodel"
+        return 0
+    fi
+
+    if [[ -x "$SCRIPT_DIR/theorem-agentd" ]]; then
+        printf '%s\n' "$SCRIPT_DIR/theorem-agentd"
+        return 0
+    fi
+
+    return 1
+}
+
+find_proxy_bin() {
+    if [[ -n "${THEOREM_PROXY_BIN:-}" && -x "$THEOREM_PROXY_BIN" ]]; then
+        printf '%s\n' "$THEOREM_PROXY_BIN"
+        return 0
+    fi
+
+    if command -v rustyred-proxy >/dev/null 2>&1; then
+        command -v rustyred-proxy
+        return 0
+    fi
+
+    if [[ -x "$SCRIPT_DIR/rustyred-proxy" ]]; then
+        printf '%s\n' "$SCRIPT_DIR/rustyred-proxy"
+        return 0
+    fi
+
+    return 1
 }
 
 find_repo() {
@@ -76,15 +150,38 @@ agentd_config_arg() {
 }
 
 run_agentd() {
+    local agentd_bin
+    if agentd_bin="$(find_agentd_bin)"; then
+        "$agentd_bin" "$@"
+        return
+    fi
     local repo
     repo="$(find_repo)"
-    cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd -- "$@"
+    cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd --bin theorem-localmodel -- "$@"
 }
 
 exec_agentd() {
+    local agentd_bin
+    if agentd_bin="$(find_agentd_bin)"; then
+        exec "$agentd_bin" "$@"
+    fi
     local repo
     repo="$(find_repo)"
-    exec cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd -- "$@"
+    exec cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd --bin theorem-localmodel -- "$@"
+}
+
+exec_proxy() {
+    local proxy_bin
+    if proxy_bin="$(find_proxy_bin)"; then
+        exec "$proxy_bin" "$@"
+    fi
+    local agentd_bin
+    if agentd_bin="$(find_agentd_bin)"; then
+        exec "$agentd_bin" --proxy "$@"
+    fi
+    local repo
+    repo="$(find_repo)"
+    exec cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p rustyred-proxy --bin rustyred-proxy -- "$@"
 }
 
 write_agentd_config() {
@@ -232,59 +329,592 @@ cmd_start() {
     exec_agentd "$@"
 }
 
+cmd_proxy() {
+    mkdir -p "$THEOREM_HOME_DIR"
+    local config_path
+    if config_path="$(agentd_config_arg)"; then
+        exec_proxy "$@" "$config_path"
+    fi
+    exec_proxy "$@"
+}
+
+cmd_harness() {
+    local port="${THEOREM_PROXY_PORT:-8484}"
+    local data_dir="${THEOREM_PROXY_DATA_DIR:-$THEOREM_HOME_DIR/proxy}"
+    local base_url="http://127.0.0.1:$port"
+    local proxy_args=(--proxy-port "$port" --proxy-data-dir "$data_dir")
+    local config_path=""
+    if config_path="$(agentd_config_arg)"; then
+        proxy_args+=("$config_path")
+    else
+        config_path=""
+    fi
+
+    mkdir -p "$THEOREM_HOME_DIR" "$data_dir"
+    "$0" proxy "${proxy_args[@]}" &
+    local proxy_pid=$!
+    trap 'kill "$proxy_pid" 2>/dev/null || true' EXIT INT TERM
+    if ! wait_for_proxy "$base_url"; then
+        kill "$proxy_pid" 2>/dev/null || true
+        log "proxy did not become healthy at $base_url"
+        return 1
+    fi
+    log "proxy ready at $base_url"
+
+    local status=0
+    if [[ $# -eq 0 && -n "$config_path" ]]; then
+        run_agentd "$config_path" || status=$?
+    else
+        run_agentd "$@" || status=$?
+    fi
+    kill "$proxy_pid" 2>/dev/null || true
+    trap - EXIT INT TERM
+    return "$status"
+}
+
+wait_for_proxy() {
+    local url=$1
+    local attempt
+    for attempt in $(seq 1 50); do
+        if command -v curl >/dev/null 2>&1 && curl -fsS "$url/healthz" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+proxy_base_url() {
+    local port="${THEOREM_PROXY_PORT:-8484}"
+    printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+ensure_proxy_running() {
+    if ! command -v curl >/dev/null 2>&1; then
+        log "curl not found"
+        return 1
+    fi
+
+    local base_url
+    base_url="$(proxy_base_url)"
+    if wait_for_proxy "$base_url"; then
+        return 0
+    fi
+
+    local port="${THEOREM_PROXY_PORT:-8484}"
+    local data_dir="${THEOREM_PROXY_DATA_DIR:-$THEOREM_HOME_DIR/proxy}"
+    mkdir -p "$THEOREM_HOME_DIR" "$data_dir"
+    nohup "$0" proxy --proxy-port "$port" --proxy-data-dir "$data_dir" --proxy-no-ambient \
+        >>"$PROXY_OUT_LOG" 2>>"$PROXY_ERR_LOG" &
+    local proxy_pid=$!
+    printf '%s\n' "$proxy_pid" >"$PROXY_PID_FILE"
+    if ! wait_for_proxy "$base_url"; then
+        kill "$proxy_pid" 2>/dev/null || true
+        log "proxy did not become healthy at $base_url"
+        return 1
+    fi
+    log "started proxy pid $proxy_pid at $base_url"
+}
+
+git_value_or_empty() {
+    local repo=$1
+    shift
+    if [[ -n "$repo" ]] && command -v git >/dev/null 2>&1; then
+        git -C "$repo" "$@" 2>/dev/null || true
+    fi
+}
+
+presence_label() {
+    case "$1" in
+        codex)
+            printf 'Codex\n'
+            ;;
+        claude-code)
+            printf 'Claude Code\n'
+            ;;
+        gemma)
+            printf 'Gemma\n'
+            ;;
+        *)
+            printf '%s\n' "$1"
+            ;;
+    esac
+}
+
+announce_presence() {
+    local actor=$1
+    local endpoint=$2
+    local surface=$3
+    local summary=$4
+    local room_id=$5
+    local ttl=$6
+
+    ensure_proxy_running
+    local base_url
+    base_url="$(proxy_base_url)"
+
+    local path="${THEOREM_PRESENCE_PATH:-.}"
+    local line="${THEOREM_PRESENCE_LINE:-1}"
+    local col="${THEOREM_PRESENCE_COL:-0}"
+    local label
+    label="$(presence_label "$actor")"
+
+    local payload
+    payload=$(cat <<EOF
+{
+  "actor": $(json_quote "$actor"),
+  "path": $(json_quote "$path"),
+  "line": $line,
+  "col": $col,
+  "label": $(json_quote "$label"),
+  "kind": "agent",
+  "ttl_seconds": $ttl
+}
+EOF
+)
+    local response
+    response="$(curl -fsS -X POST "$base_url/v1/presence" \
+        -H 'content-type: application/json' \
+        --data-binary "$payload")"
+
+    if [[ "${THEOREM_PROXY_LEGACY_ROOM_SYNC:-0}" != "0" ]]; then
+        announce_legacy_room_presence \
+            "$actor" \
+            "$endpoint" \
+            "$surface" \
+            "$summary" \
+            "$room_id" \
+            "$ttl" >/dev/null || log "legacy harness room sync failed for $actor"
+    fi
+
+    printf '%s\n' "$response"
+}
+
+announce_legacy_room_presence() {
+    local actor=$1
+    local endpoint=$2
+    local surface=$3
+    local summary=$4
+    local room_id=$5
+    local ttl=$6
+
+    local base_url
+    base_url="$(proxy_base_url)"
+
+    local repo=""
+    if repo="$(find_repo 2>/dev/null)"; then
+        :
+    else
+        repo=""
+    fi
+    local worktree="$repo"
+    local branch
+    branch="$(git_value_or_empty "$repo" rev-parse --abbrev-ref HEAD)"
+    local head
+    head="$(git_value_or_empty "$repo" rev-parse --short HEAD)"
+    local repo_name
+    repo_name="$(git_value_or_empty "$repo" config --get remote.origin.url)"
+    if [[ -z "$repo_name" ]]; then
+        repo_name="Theorem"
+    fi
+
+    local payload
+    payload=$(cat <<EOF
+{
+  "actor_id": $(json_quote "$actor"),
+  "room_id": $(json_quote "$room_id"),
+  "surface": $(json_quote "$surface"),
+  "status": "active",
+  "worktree": $(json_quote "$worktree"),
+  "branch": $(json_quote "$branch"),
+  "head": $(json_quote "$head"),
+  "repo": $(json_quote "$repo_name"),
+  "task": $(json_quote "local proxy presence"),
+  "endpoint": $(json_quote "$endpoint"),
+  "summary": $(json_quote "$summary"),
+  "capabilities": ["codex.app-server", "codex.exec", "workspace-edit"],
+  "ttl_seconds": $ttl
+}
+EOF
+)
+    curl -fsS -X POST "$base_url/v1/agents/presence" \
+        -H 'content-type: application/json' \
+        --data-binary "$payload"
+}
+
+presence_heartbeat_loop() {
+    local watched_pid=$1
+    local actor=$2
+    local endpoint=$3
+    local surface=$4
+    local summary=$5
+    local room_id=$6
+    local ttl=$7
+    local interval=$8
+
+    while kill -0 "$watched_pid" 2>/dev/null; do
+        sleep "$interval" || return 0
+        if ! kill -0 "$watched_pid" 2>/dev/null; then
+            return 0
+        fi
+        if ! announce_presence "$actor" "$endpoint" "$surface" "$summary" "$room_id" "$ttl" >/dev/null; then
+            log "presence heartbeat failed for $actor"
+        fi
+    done
+}
+
+presence_heartbeat_forever() {
+    local actor=$1
+    local endpoint=$2
+    local surface=$3
+    local summary=$4
+    local room_id=$5
+    local ttl=$6
+    local interval=$7
+
+    while true; do
+        sleep "$interval" || return 0
+        if ! announce_presence "$actor" "$endpoint" "$surface" "$summary" "$room_id" "$ttl" >/dev/null; then
+            log "presence heartbeat failed for $actor"
+        fi
+    done
+}
+
+cmd_appear() {
+    local actor=codex
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+        actor=$1
+        shift
+    fi
+    local room_id="${THEOREM_PROXY_ROOM_ID:-repo:theorem:branch:main}"
+    local endpoint="${THEOREM_CODEX_APP_ENDPOINT:-}"
+    local surface="theorem-proxy"
+    local summary=""
+    local ttl="${THEOREM_PROXY_PRESENCE_TTL:-120}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --room | --room-id)
+                shift
+                room_id=${1:?--room requires a room id}
+                ;;
+            --endpoint)
+                shift
+                endpoint=${1:?--endpoint requires a URL}
+                ;;
+            --surface)
+                shift
+                surface=${1:?--surface requires a value}
+                ;;
+            --summary)
+                shift
+                summary=${1:?--summary requires text}
+                ;;
+            --ttl)
+                shift
+                ttl=${1:?--ttl requires seconds}
+                ;;
+            -h | --help)
+                printf 'usage: theorem appear [actor] [--room id] [--endpoint url] [--surface name] [--summary text] [--ttl seconds]\n'
+                return 0
+                ;;
+            *)
+                log "unknown appear flag $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if [[ -z "$summary" ]]; then
+        if [[ -n "$endpoint" ]]; then
+            summary="$actor local endpoint ready at $endpoint"
+        else
+            summary="$actor is active through the local Theorem proxy"
+        fi
+    fi
+    announce_presence "$actor" "$endpoint" "$surface" "$summary" "$room_id" "$ttl"
+}
+
+cmd_codex_endpoint() {
+    if ! command -v codex >/dev/null 2>&1; then
+        log "codex not found on PATH"
+        return 1
+    fi
+    local port="${THEOREM_CODEX_APP_PORT:-18489}"
+    local endpoint="${THEOREM_CODEX_APP_ENDPOINT:-ws://127.0.0.1:$port}"
+    local room_id="${THEOREM_PROXY_ROOM_ID:-repo:theorem:branch:main}"
+    local ttl="${THEOREM_PROXY_PRESENCE_TTL:-120}"
+    local heartbeat_interval="${THEOREM_PROXY_HEARTBEAT_INTERVAL:-45}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)
+                shift
+                port=${1:?--port requires a port}
+                endpoint="ws://127.0.0.1:$port"
+                ;;
+            --listen | --endpoint)
+                shift
+                endpoint=${1:?--listen requires a URL}
+                ;;
+            --room | --room-id)
+                shift
+                room_id=${1:?--room requires a room id}
+                ;;
+            --ttl)
+                shift
+                ttl=${1:?--ttl requires seconds}
+                ;;
+            --heartbeat | --heartbeat-interval)
+                shift
+                heartbeat_interval=${1:?--heartbeat requires seconds}
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -h | --help)
+                printf 'usage: theorem codex-endpoint [--port port | --listen ws://ip:port] [--room id] [--ttl seconds] [--heartbeat seconds] [-- codex app-server args]\n'
+                return 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+        shift
+    done
+
+    codex app-server --listen "$endpoint" "$@" &
+    local codex_pid=$!
+    sleep 0.2
+    if ! kill -0 "$codex_pid" 2>/dev/null; then
+        wait "$codex_pid"
+        return $?
+    fi
+    announce_presence \
+        codex \
+        "$endpoint" \
+        "codex:app-server" \
+        "Codex app-server endpoint ready at $endpoint" \
+        "$room_id" \
+        "$ttl"
+    presence_heartbeat_loop \
+        "$codex_pid" \
+        codex \
+        "$endpoint" \
+        "codex:app-server" \
+        "Codex app-server endpoint live at $endpoint" \
+        "$room_id" \
+        "$ttl" \
+        "$heartbeat_interval" &
+    local heartbeat_pid=$!
+    trap 'kill "$heartbeat_pid" 2>/dev/null || true; kill "$codex_pid" 2>/dev/null || true' EXIT INT TERM
+    local status=0
+    wait "$codex_pid" || status=$?
+    kill "$heartbeat_pid" 2>/dev/null || true
+    trap - EXIT INT TERM
+    return "$status"
+}
+
+announce_wrapped_codex() {
+    local codex_pid=$1
+    local base_url=$2
+    local room_id="${THEOREM_PROXY_ROOM_ID:-repo:theorem:branch:main}"
+    local ttl="${THEOREM_PROXY_PRESENCE_TTL:-120}"
+    local heartbeat_interval="${THEOREM_PROXY_HEARTBEAT_INTERVAL:-45}"
+    announce_presence \
+        codex \
+        "$base_url" \
+        "codex:cli" \
+        "Codex CLI active through local Theorem proxy" \
+        "$room_id" \
+        "$ttl" >/dev/null
+    presence_heartbeat_loop \
+        "$codex_pid" \
+        codex \
+        "$base_url" \
+        "codex:cli" \
+        "Codex CLI active through local Theorem proxy" \
+        "$room_id" \
+        "$ttl" \
+        "$heartbeat_interval"
+}
+
+announce_wrapped_claude_loop() {
+    local base_url=$1
+    local room_id="${THEOREM_PROXY_ROOM_ID:-repo:theorem:branch:main}"
+    local ttl="${THEOREM_PROXY_PRESENCE_TTL:-120}"
+    local heartbeat_interval="${THEOREM_PROXY_HEARTBEAT_INTERVAL:-45}"
+    announce_presence \
+        claude-code \
+        "$base_url" \
+        "claude-code:cli" \
+        "Claude Code active through local Theorem proxy" \
+        "$room_id" \
+        "$ttl" >/dev/null
+    presence_heartbeat_forever \
+        claude-code \
+        "$base_url" \
+        "claude-code:cli" \
+        "Claude Code active through local Theorem proxy" \
+        "$room_id" \
+        "$ttl" \
+        "$heartbeat_interval"
+}
+
+cmd_wrap() {
+    local target=${1:-}
+    if [[ -z "$target" ]]; then
+        log "wrap requires a command, for example: theorem wrap claude"
+        return 1
+    fi
+    shift
+    if [[ "$target" != "claude" && "$target" != "claude-code" && "$target" != "codex" ]]; then
+        log "unsupported wrap target $target"
+        return 1
+    fi
+
+    local port="${THEOREM_PROXY_PORT:-8484}"
+    local data_dir="${THEOREM_PROXY_DATA_DIR:-$THEOREM_HOME_DIR/proxy}"
+    local base_url="http://127.0.0.1:$port"
+    mkdir -p "$data_dir"
+
+    "$0" proxy --proxy-port "$port" --proxy-data-dir "$data_dir" &
+    local proxy_pid=$!
+    trap 'kill "$proxy_pid" 2>/dev/null || true' EXIT INT TERM
+    if ! wait_for_proxy "$base_url"; then
+        log "proxy did not become healthy at $base_url"
+        return 1
+    fi
+    if [[ "$target" == "codex" ]]; then
+        if ! command -v codex >/dev/null 2>&1; then
+            log "codex not found on PATH"
+            return 1
+        fi
+        THEOREM_ROOM_PROXY_URL="$base_url" codex "$@" &
+        local codex_pid=$!
+        announce_wrapped_codex "$codex_pid" "$base_url" &
+        local heartbeat_pid=$!
+        trap 'kill "$heartbeat_pid" 2>/dev/null || true; kill "$codex_pid" 2>/dev/null || true; kill "$proxy_pid" 2>/dev/null || true' EXIT INT TERM
+        local status=0
+        wait "$codex_pid" || status=$?
+        kill "$heartbeat_pid" 2>/dev/null || true
+        return "$status"
+    fi
+    if ! command -v claude >/dev/null 2>&1; then
+        log "claude not found on PATH"
+        return 1
+    fi
+    announce_wrapped_claude_loop "$base_url" &
+    local heartbeat_pid=$!
+    trap 'kill "$heartbeat_pid" 2>/dev/null || true; kill "$proxy_pid" 2>/dev/null || true' EXIT INT TERM
+    local status=0
+    ANTHROPIC_BASE_URL="$base_url" ENABLE_TOOL_SEARCH=true claude "$@" || status=$?
+    kill "$heartbeat_pid" 2>/dev/null || true
+    trap - EXIT INT TERM
+    return "$status"
+}
+
 cmd_stop() {
     if [[ ! -f "$PID_FILE" ]]; then
         log "no pid file at $PID_FILE"
-        return 0
-    fi
-    local pid
-    pid="$(cat "$PID_FILE")"
-    if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid"
-        log "stopped agentd pid $pid"
     else
-        log "agentd pid $pid is not running"
+        local pid
+        pid="$(cat "$PID_FILE")"
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            log "stopped agentd pid $pid"
+        else
+            log "agentd pid $pid is not running"
+        fi
+        rm -f "$PID_FILE"
     fi
-    rm -f "$PID_FILE"
+    if [[ -f "$PROXY_PID_FILE" ]]; then
+        local proxy_pid
+        proxy_pid="$(cat "$PROXY_PID_FILE")"
+        if kill -0 "$proxy_pid" 2>/dev/null; then
+            kill "$proxy_pid"
+            log "stopped proxy pid $proxy_pid"
+        else
+            log "proxy pid $proxy_pid is not running"
+        fi
+        rm -f "$PROXY_PID_FILE"
+    fi
 }
 
 cmd_status() {
-    local repo
-    repo="$(find_repo)"
-    printf 'source: %s\n' "$repo"
+    local repo=""
+    if repo="$(find_repo 2>/dev/null)"; then
+        printf 'source: %s\n' "$repo"
+    else
+        printf 'source: unavailable (binary install)\n'
+    fi
+    if find_agentd_bin >/dev/null; then
+        printf 'localmodel binary: %s\n' "$(find_agentd_bin)"
+    else
+        printf 'localmodel binary: cargo fallback\n'
+    fi
+    if find_proxy_bin >/dev/null; then
+        printf 'proxy binary: %s\n' "$(find_proxy_bin)"
+    else
+        printf 'proxy binary: cargo/theorem-agentd fallback\n'
+    fi
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid="$(cat "$PID_FILE")"
         if kill -0 "$pid" 2>/dev/null; then
             printf 'agentd: running (pid %s)\n' "$pid"
+        else
+            printf 'agentd: stale pid file (%s)\n' "$pid"
+        fi
+    else
+        printf 'agentd: not started by install.sh\n'
+    fi
+    if [[ -f "$PROXY_PID_FILE" ]]; then
+        local proxy_pid
+        proxy_pid="$(cat "$PROXY_PID_FILE")"
+        if kill -0 "$proxy_pid" 2>/dev/null; then
+            printf 'proxy: running (pid %s, %s)\n' "$proxy_pid" "$(proxy_base_url)"
             return 0
         fi
-        printf 'agentd: stale pid file (%s)\n' "$pid"
+        printf 'proxy: stale pid file (%s)\n' "$proxy_pid"
         return 0
     fi
-    printf 'agentd: not started by install.sh\n'
+    if wait_for_proxy "$(proxy_base_url)" 2>/dev/null; then
+        printf 'proxy: running (%s)\n' "$(proxy_base_url)"
+    else
+        printf 'proxy: not started by theorem wrapper\n'
+    fi
 }
 
 cmd_logs() {
     mkdir -p "$THEOREM_HOME_DIR"
-    touch "$OUT_LOG" "$ERR_LOG"
-    tail -f "$OUT_LOG" "$ERR_LOG"
+    touch "$OUT_LOG" "$ERR_LOG" "$PROXY_OUT_LOG" "$PROXY_ERR_LOG"
+    tail -f "$OUT_LOG" "$ERR_LOG" "$PROXY_OUT_LOG" "$PROXY_ERR_LOG"
 }
 
 cmd_doctor() {
     local ok=true
-    if ! command -v cargo >/dev/null 2>&1; then
-        log "cargo not found"
-        ok=false
-    fi
-    if ! command -v git >/dev/null 2>&1; then
-        log "git not found"
-        ok=false
-    fi
-    if find_repo >/dev/null; then
-        log "source checkout: $(find_repo)"
+    if find_agentd_bin >/dev/null; then
+        log "agentd binary: $(find_agentd_bin)"
+        if command -v git >/dev/null 2>&1; then
+            log "git found"
+        fi
     else
-        ok=false
+        if ! command -v cargo >/dev/null 2>&1; then
+            log "cargo not found and no theorem-agentd binary found"
+            ok=false
+        fi
+        if ! command -v git >/dev/null 2>&1; then
+            log "git not found"
+            ok=false
+        fi
+        if find_repo >/dev/null; then
+            log "source checkout: $(find_repo)"
+        else
+            ok=false
+        fi
     fi
     if [[ "$ok" == "true" ]]; then
         log "doctor passed"
@@ -303,8 +933,23 @@ main() {
         init)
             cmd_init "$@"
             ;;
+        harness)
+            cmd_harness "$@"
+            ;;
         start)
             cmd_start "$@"
+            ;;
+        proxy)
+            cmd_proxy "$@"
+            ;;
+        appear)
+            cmd_appear "$@"
+            ;;
+        codex-endpoint)
+            cmd_codex_endpoint "$@"
+            ;;
+        wrap)
+            cmd_wrap "$@"
             ;;
         once)
             cmd_once "$@"

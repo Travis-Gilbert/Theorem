@@ -5,6 +5,10 @@ OpenAI-compatible local model, dispatches schema-guarded tool calls through MCP,
 writes one JSONL ledger line per turn, and can embed `theorem-receiver` on a
 dedicated OS thread.
 
+The descriptive local-model binary is `theorem-localmodel`; `theorem-agentd`
+remains as the compatibility binary. The proxy-only binary is `rustyred-proxy`
+and reuses the same proxy module without starting the local model loop.
+
 It does not spawn Claude or Codex directly. When the model wants another head, it
 uses the room tools (`coordinate` or `job_submit`), and the existing receiver
 does the local launch.
@@ -65,6 +69,48 @@ receiver communicate only through the coordination room.
 not store real tokens in the plist; set them through launchctl or another secret
 manager.
 
+## Anthropic Messages proxy
+
+`rustyred-proxy` starts a local Anthropic Messages-compatible endpoint:
+
+```bash
+cargo run -p rustyred-proxy -- \
+  --proxy-port 8484 \
+  --proxy-data-dir "/Volumes/SSD Samsung/theorem-local-proxy"
+```
+
+The compatibility command `theorem-agentd --proxy` serves the same endpoint.
+
+The proxy serves `POST /v1/messages` on loopback, forwards Anthropic auth and
+beta headers to the upstream provider, streams SSE response bytes through, and
+keeps the request's `system` and `tools` prefix unchanged. Oversized native
+`tool_result` blocks are sampled before forwarding; error/anomaly rows survive,
+the `tool_use_id` is preserved, and the original bytes are available from
+`GET /v1/tool-result-fetch?fetch_handle=...`.
+
+The same proxy exposes the simplified local co-presence protocol from the
+CommonPlace runtime:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8484/v1/presence \
+  -H 'content-type: application/json' \
+  --data '{"actor":"codex","path":"src/lib.rs","line":1,"col":0,"label":"Codex"}'
+```
+
+Use `POST /v1/presence/footprint` to publish a pending edit range and
+`POST /v1/presence/would-overlap` to ask whether a peer has an overlapping
+pending edit on the same path. The proxy keeps this registry local-first, so
+Claude Code, Codex, Gemma, and other local clients can coordinate even when the
+remote harness room is offline. The legacy `/v1/agents/*` room endpoints remain
+available for compatibility.
+
+Ambient context injection is opt-in by environment or harness availability. A
+local file at `<proxy-data-dir>/ambient.md` or `THEOREM_PROXY_AMBIENT_TEXT`
+injects into the latest user turn. When the harness MCP endpoint is reachable,
+the proxy also attempts a bounded `hippo_retrieve` call using either the
+desktop-provided harness bearer or the configured harness token environment
+variable. Anthropic credentials are never used for harness calls.
+
 ## Use through the `theorem` wrapper
 
 The repo-level wrapper gives the install/onboarding path a single command:
@@ -72,11 +118,31 @@ The repo-level wrapper gives the install/onboarding path a single command:
 ```bash
 scripts/theorem init
 scripts/theorem once "hello from the wrapper"
+scripts/theorem harness
 scripts/theorem start
+scripts/theorem proxy --proxy-data-dir "/Volumes/SSD Samsung/theorem-local-proxy"
+scripts/theorem appear codex
+scripts/theorem codex-endpoint
+scripts/theorem wrap claude
+scripts/theorem wrap codex
 ```
 
-`scripts/install.sh` installs that wrapper as `theorem` and can start agentd
-with the same no-config defaults.
+`scripts/install.sh` installs that wrapper as `theorem` and can start the local
+daemon with the same no-config defaults. It also installs `rustyred` as an alias
+for the same wrapper, so `rustyred proxy` and `rustyred wrap claude` work after
+install. For release installs, the wrapper prefers installed `rustyred-proxy`
+and `theorem-localmodel` binaries and falls back to Cargo only when no binary
+exists.
+
+`theorem appear`, `theorem codex-endpoint`, and `theorem wrap <claude|codex>`
+announce native local co-presence over `POST /v1/presence` and keep a short-TTL
+heartbeat alive while the local process is alive. Set
+`THEOREM_PROXY_LEGACY_ROOM_SYNC=1` to also best-effort mirror presence to the
+older `/v1/agents/presence` harness-room compatibility endpoint.
+
+`rustyred proxy` runs CPU-only by default and does not download a model or ONNX
+asset on first launch. `THEOREM_PROXY_DATA_DIR` or `--proxy-data-dir` can point
+the proxy state at an external volume.
 
 ## Tool-call guardrail
 

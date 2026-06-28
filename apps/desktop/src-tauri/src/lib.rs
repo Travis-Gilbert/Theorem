@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -19,6 +20,7 @@ use tokio::sync::oneshot;
 const HOSTED_ENDPOINT: &str = "https://rustyredcore-theorem-production.up.railway.app/mcp";
 const LOCAL_NODE_PORT: u16 = 17888;
 const COMMONPLACE_NODE_PORT: u16 = 17890;
+const PROXY_NODE_PORT: u16 = 8484;
 const KEYCHAIN_SERVICE: &str = "com.theorem.desktop";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,6 +79,25 @@ struct CommonplaceStatus {
     endpoint: String,
     port: u16,
     store_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyStatus {
+    node_up: bool,
+    endpoint: String,
+    port: u16,
+    store_path: String,
+    ambient_enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyConnectReceipt {
+    status: String,
+    endpoint: String,
+    command: String,
+    message: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -335,6 +356,12 @@ struct CommonplaceRuntime {
     shutdown: Option<oneshot::Sender<()>>,
 }
 
+struct ProxyRuntime {
+    endpoint: String,
+    store_path: String,
+    ambient_enabled: bool,
+}
+
 #[derive(Default)]
 struct ReceiverThreadStatus {
     state: String,
@@ -354,6 +381,7 @@ struct DesktopBackendState {
     receiver: ReceiverSettings,
     local_node: Option<LocalNodeRuntime>,
     commonplace_node: Option<CommonplaceRuntime>,
+    proxy_node: Option<ProxyRuntime>,
     receiver_runtime: Option<ReceiverRuntime>,
     /// The bundled ambient watcher running over the working tree, if started.
     /// Holding the handle keeps the watcher alive; it is stopped on shutdown.
@@ -386,6 +414,7 @@ impl Default for DesktopBackendState {
             },
             local_node: None,
             commonplace_node: None,
+            proxy_node: None,
             receiver_runtime: None,
             ambient: None,
             tabs: HashMap::new(),
@@ -1186,6 +1215,16 @@ fn commonplace_is_healthy(endpoint: &str) -> bool {
         .is_some()
 }
 
+fn proxy_is_healthy(endpoint: &str) -> bool {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+        .ok()
+        .and_then(|client| client.get(format!("{endpoint}/healthz")).send().ok())
+        .and_then(|response| response.error_for_status().ok())
+        .is_some()
+}
+
 fn wait_for_commonplace_health(endpoint: &str) -> Result<(), String> {
     for _ in 0..20 {
         if commonplace_is_healthy(endpoint) {
@@ -1196,6 +1235,16 @@ fn wait_for_commonplace_health(endpoint: &str) -> Result<(), String> {
     Err(format!(
         "commonplace-api health check failed at {endpoint}/healthz"
     ))
+}
+
+fn wait_for_proxy_health(endpoint: &str) -> Result<(), String> {
+    for _ in 0..40 {
+        if proxy_is_healthy(endpoint) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("proxy health check failed at {endpoint}/healthz"))
 }
 
 fn start_commonplace_api(
@@ -1251,6 +1300,63 @@ fn start_commonplace_api(
     Ok(())
 }
 
+fn start_proxy_node(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<(), String> {
+    let store_path = app_store_path(app)?.join("proxy");
+    std::fs::create_dir_all(&store_path).map_err(|error| error.to_string())?;
+
+    let endpoint = format!("http://127.0.0.1:{PROXY_NODE_PORT}");
+    if proxy_is_healthy(&endpoint) {
+        let mut backend = state.lock().map_err(|error| error.to_string())?;
+        backend.proxy_node = Some(ProxyRuntime {
+            endpoint,
+            store_path: store_path.display().to_string(),
+            ambient_enabled: true,
+        });
+        return Ok(());
+    }
+
+    let (harness, harness_bearer) = {
+        let backend = state.lock().map_err(|error| error.to_string())?;
+        (backend.harness.clone(), bearer_token().ok())
+    };
+    let tenant_slug = if harness.tenant.trim().is_empty() {
+        "Travis-Gilbert".to_string()
+    } else {
+        harness.tenant.clone()
+    };
+    let config = theorem_agentd::proxy::ProxyConfig {
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port: PROXY_NODE_PORT,
+        data_dir: store_path.clone(),
+        upstream_base_url: std::env::var("THEOREM_ANTHROPIC_UPSTREAM")
+            .unwrap_or_else(|_| theorem_agentd::proxy::DEFAULT_ANTHROPIC_UPSTREAM.to_string()),
+        harness_mcp_url: harness.endpoint,
+        harness_bearer,
+        harness_token_env: Some("THEOREM_HARNESS_TOKEN".to_string()),
+        tenant_slug,
+        enable_ambient: true,
+        tool_result_budget_bytes: theorem_agentd::proxy::DEFAULT_TOOL_RESULT_BUDGET_BYTES,
+        ambient_budget_bytes: theorem_agentd::proxy::DEFAULT_AMBIENT_BUDGET_BYTES,
+    };
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = theorem_agentd::proxy::serve_proxy(config).await {
+            eprintln!("[theorem-desktop] proxy stopped: {error}");
+        }
+    });
+    wait_for_proxy_health(&endpoint)?;
+
+    let mut backend = state.lock().map_err(|error| error.to_string())?;
+    backend.proxy_node = Some(ProxyRuntime {
+        endpoint,
+        store_path: store_path.display().to_string(),
+        ambient_enabled: true,
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn commonplace_status(
     app: tauri::AppHandle,
@@ -1279,6 +1385,60 @@ fn commonplace_status(
         endpoint,
         port: COMMONPLACE_NODE_PORT,
         store_path,
+    })
+}
+
+#[tauri::command]
+fn proxy_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<ProxyStatus, String> {
+    let (endpoint, store_path, ambient_enabled) = {
+        let backend = state.lock().map_err(|error| error.to_string())?;
+        let fallback_store = app_store_path(&app)?.join("proxy");
+        (
+            backend
+                .proxy_node
+                .as_ref()
+                .map(|node| node.endpoint.clone())
+                .unwrap_or_else(|| format!("http://127.0.0.1:{PROXY_NODE_PORT}")),
+            backend
+                .proxy_node
+                .as_ref()
+                .map(|node| node.store_path.clone())
+                .unwrap_or_else(|| fallback_store.display().to_string()),
+            backend
+                .proxy_node
+                .as_ref()
+                .map(|node| node.ambient_enabled)
+                .unwrap_or(true),
+        )
+    };
+    Ok(ProxyStatus {
+        node_up: proxy_is_healthy(&endpoint),
+        endpoint,
+        port: PROXY_NODE_PORT,
+        store_path,
+        ambient_enabled,
+    })
+}
+
+#[tauri::command]
+fn proxy_connect_claude(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<ProxyConnectReceipt, String> {
+    start_proxy_node(&app, &state)?;
+    let status = proxy_status(app, state)?;
+    if !status.node_up {
+        return Err("proxy is not healthy".to_string());
+    }
+    let command = spawn_claude_with_proxy(&status.endpoint)?;
+    Ok(ProxyConnectReceipt {
+        status: "ok".to_string(),
+        endpoint: status.endpoint,
+        command,
+        message: "Claude Code launched through the local proxy.".to_string(),
     })
 }
 
@@ -1392,7 +1552,9 @@ fn ambient_watch_root(backend: &DesktopBackendState) -> Option<PathBuf> {
 /// install"). The watcher is read-only on the tree and writes only into the
 /// `<root>/.rustyred` sidecar. A failure to start is surfaced on stderr and the
 /// app continues; the watcher is best-effort, not a launch gate.
-fn start_ambient_watcher(state: &tauri::State<'_, Mutex<DesktopBackendState>>) -> Result<(), String> {
+fn start_ambient_watcher(
+    state: &tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<(), String> {
     let mut backend = state.lock().map_err(|error| error.to_string())?;
     if backend.ambient.is_some() {
         return Ok(());
@@ -1405,7 +1567,10 @@ fn start_ambient_watcher(state: &tauri::State<'_, Mutex<DesktopBackendState>>) -
     let config = commonplace_desktop_runtime::WatchConfig::new(root.clone());
     match commonplace_desktop_runtime::spawn_ambient(config) {
         Ok(handle) => {
-            eprintln!("[theorem-desktop] ambient watcher started over {}", root.display());
+            eprintln!(
+                "[theorem-desktop] ambient watcher started over {}",
+                root.display()
+            );
             backend.ambient = Some(handle);
             Ok(())
         }
@@ -1726,6 +1891,69 @@ fn tools_list(url: &str, token: Option<&str>) -> Result<Vec<String>, String> {
         .collect::<Vec<_>>();
     tools.sort();
     Ok(tools)
+}
+
+fn spawn_claude_with_proxy(endpoint: &str) -> Result<String, String> {
+    let claude = resolve_claude_binary();
+    let command = format!(
+        "ANTHROPIC_BASE_URL={} ENABLE_TOOL_SEARCH=true {}",
+        shell_quote(endpoint),
+        shell_quote(&claude)
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Terminal\" to do script {}",
+            applescript_quote(&command)
+        );
+        if Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return Ok(command);
+        }
+    }
+
+    Command::new(&claude)
+        .env("ANTHROPIC_BASE_URL", endpoint)
+        .env("ENABLE_TOOL_SEARCH", "true")
+        .spawn()
+        .map_err(|error| format!("failed to launch Claude Code: {error}"))?;
+    Ok(command)
+}
+
+fn resolve_claude_binary() -> String {
+    if let Ok(path) = std::env::var("CLAUDE_BIN") {
+        if !path.trim().is_empty() {
+            return path;
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{home}/.local/bin/claude"));
+        candidates.push(format!("{home}/.npm-global/bin/claude"));
+    }
+    candidates.push("/opt/homebrew/bin/claude".to_string());
+    candidates.push("/usr/local/bin/claude".to_string());
+    candidates
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn recall_hits(payload: &Value) -> Vec<RecallHit> {
@@ -2094,6 +2322,7 @@ pub fn run() {
             let state = app.state::<Mutex<DesktopBackendState>>();
             start_local_node(app.handle(), &state)?;
             start_commonplace_api(app.handle(), &state)?;
+            start_proxy_node(app.handle(), &state)?;
             // Bundled ambient watcher: starts over the working tree so a fresh
             // download runs the watcher with no separate install. Best-effort:
             // a start failure logs and the app continues.
@@ -2113,6 +2342,8 @@ pub fn run() {
             harness_bearer_clear,
             local_node_status,
             commonplace_status,
+            proxy_status,
+            proxy_connect_claude,
             hosted_connection_status,
             model_status,
             receiver_settings_get,

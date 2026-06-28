@@ -5,6 +5,7 @@ edition = "2021"
 description = "Local Theorem assistant daemon: OpenAI-compatible model loop, MCP tool host, receiver sidecar, and compute-offload ledger."
 license = "MIT"
 rust-version = "1.85"
+default-run = "theorem-localmodel"
 
 [lib]
 name = "theorem_agentd"
@@ -14,10 +15,18 @@ path = "src/lib.rs"
 name = "theorem-agentd"
 path = "src/main.rs"
 
+[[bin]]
+name = "theorem-localmodel"
+path = "src/localmodel_main.rs"
+
 [dependencies]
-reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+axum = "0.8"
+futures-util = "0.3"
+reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+rustyred-thg-core = { path = "../rustyred-thg-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+theorem-copresence = { path = "../theorem-copresence" }
 theorem-receiver = { path = "../theorem-receiver" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 toml = "0.8"
-
