@@ -1,6 +1,7 @@
 use design_check::{
-    css_static_report, design_engineering_pack_payload, fixture_reports, lower_css,
-    lower_tokens_json, token_lint_report, CssStaticInput, PACK_ID,
+    css_static_report, design_audit, design_drift_from_json, design_engineering_pack_payload,
+    design_fact_set_from_json, design_html_report, design_tokens_dtcg, design_tokens_tailwind,
+    fixture_reports, lower_css, lower_tokens_json, token_lint_report, CssStaticInput, PACK_ID,
 };
 use std::io::{self, Read};
 
@@ -15,6 +16,7 @@ fn run() -> Result<(), String> {
     let mut mode = Mode::CssStatic;
     let mut parent_hash: Option<String> = None;
     let mut token_json: Option<String> = None;
+    let mut baseline_json: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -24,6 +26,11 @@ fn run() -> Result<(), String> {
             "--token-lint" => mode = Mode::TokenLint,
             "--lower-css" => mode = Mode::LowerCss,
             "--lower-tokens" => mode = Mode::LowerTokens,
+            "--audit-facts" => mode = Mode::AuditFacts,
+            "--drift-facts" => mode = Mode::DriftFacts,
+            "--tokens-dtcg" => mode = Mode::TokensDtcg,
+            "--tokens-tailwind" => mode = Mode::TokensTailwind,
+            "--html-report" => mode = Mode::HtmlReport,
             "--parent-hash" => {
                 parent_hash = Some(
                     args.next()
@@ -34,6 +41,12 @@ fn run() -> Result<(), String> {
                 token_json = Some(
                     args.next()
                         .ok_or_else(|| "--tokens-json requires JSON text".to_string())?,
+                );
+            }
+            "--baseline-json" => {
+                baseline_json = Some(
+                    args.next()
+                        .ok_or_else(|| "--baseline-json requires JSON text".to_string())?,
                 );
             }
             "--help" | "-h" => {
@@ -76,6 +89,36 @@ fn run() -> Result<(), String> {
             serde_json::to_value(lower_tokens_json("stdin://tokens", &tokens)?)
                 .map_err(|error| format!("failed to serialize token atoms: {error}"))?
         }
+        Mode::AuditFacts => {
+            let input = read_stdin()?;
+            let facts = design_fact_set_from_json(&input)?;
+            serde_json::to_value(design_audit(&facts))
+                .map_err(|error| format!("failed to serialize audit report: {error}"))?
+        }
+        Mode::DriftFacts => {
+            let candidate = read_stdin()?;
+            let baseline = baseline_json
+                .as_deref()
+                .ok_or_else(|| "--drift-facts requires --baseline-json JSON".to_string())?;
+            serde_json::to_value(design_drift_from_json(baseline, &candidate)?)
+                .map_err(|error| format!("failed to serialize drift report: {error}"))?
+        }
+        Mode::TokensDtcg => {
+            let input = read_stdin()?;
+            let facts = design_fact_set_from_json(&input)?;
+            design_tokens_dtcg(&facts)
+        }
+        Mode::TokensTailwind => {
+            let input = read_stdin()?;
+            let facts = design_fact_set_from_json(&input)?;
+            design_tokens_tailwind(&facts)
+        }
+        Mode::HtmlReport => {
+            let input = read_stdin()?;
+            let facts = design_fact_set_from_json(&input)?;
+            let audit = design_audit(&facts);
+            ValueString(design_html_report(&facts, &audit, None)).into_value()
+        }
     };
 
     let json =
@@ -94,8 +137,16 @@ fn read_stdin() -> Result<String, String> {
 
 fn print_usage() {
     println!(
-        "Usage: design-check [--pack-payload [--parent-hash HASH] | --fixture-report | --css-static | --token-lint | --lower-css | --lower-tokens] [--tokens-json JSON]\n\nPack id: {PACK_ID}"
+        "Usage: design-check [--pack-payload [--parent-hash HASH] | --fixture-report | --css-static | --token-lint | --lower-css | --lower-tokens | --audit-facts | --drift-facts --baseline-json JSON | --tokens-dtcg | --tokens-tailwind | --html-report] [--tokens-json JSON]\n\nPack id: {PACK_ID}"
     );
+}
+
+struct ValueString(String);
+
+impl ValueString {
+    fn into_value(self) -> serde_json::Value {
+        serde_json::Value::String(self.0)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -106,4 +157,9 @@ enum Mode {
     TokenLint,
     LowerCss,
     LowerTokens,
+    AuditFacts,
+    DriftFacts,
+    TokensDtcg,
+    TokensTailwind,
+    HtmlReport,
 }

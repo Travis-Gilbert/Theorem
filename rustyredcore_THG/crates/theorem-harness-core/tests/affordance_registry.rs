@@ -7,23 +7,30 @@ use theorem_harness_core::{
 #[test]
 fn affordance_registry_covers_python_projection_surface() {
     let ids = affordance_ids();
-    assert_eq!(
-        ids,
-        vec![
-            "datalog.derive",
-            "probabilistic.source_reliability",
-            "probabilistic.expected_value_of_information",
-            "causal.intervention_effect",
-            "evolution.archive",
-            "proof.create_obligation",
-            "optimizer.optimize",
-            "expression.render",
-            "egraph.extract",
-            "simulation.dry_run",
-            "solver.check",
-        ]
-    );
-    assert_eq!(default_affordance_registry().len(), 11);
+    let legacy = [
+        "datalog.derive",
+        "probabilistic.source_reliability",
+        "probabilistic.expected_value_of_information",
+        "causal.intervention_effect",
+        "evolution.archive",
+        "proof.create_obligation",
+        "optimizer.optimize",
+        "expression.render",
+        "egraph.extract",
+        "simulation.dry_run",
+        "solver.check",
+    ];
+    assert_eq!(&ids[..legacy.len()], legacy);
+    for id in [
+        "design.extract.static_facts",
+        "design.audit",
+        "design.drift",
+        "design.tokens",
+        "design.report",
+    ] {
+        assert!(ids.iter().any(|candidate| candidate == id), "{id} missing");
+    }
+    assert_eq!(default_affordance_registry().len(), 16);
     validate_affordance_registry().expect("registry should be internally valid");
 }
 
@@ -36,6 +43,11 @@ fn affordance_lookup_preserves_execution_boundary_metadata() {
     let solver = affordance_by_id("solver.check").expect("solver should be registered");
     assert_eq!(solver.writeback_policy, "proposal-only");
     assert_eq!(solver.execution_surface, "runtime-adapter");
+
+    let design = affordance_by_id("design.audit").expect("design audit should be registered");
+    assert_eq!(design.execution_surface, "design-check");
+    assert_eq!(design.parity_status, "browserless-parity-cut");
+    assert!(design.tags.iter().any(|tag| tag == "gate"));
 }
 
 #[test]
