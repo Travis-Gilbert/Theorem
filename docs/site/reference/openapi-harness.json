@@ -38,6 +38,100 @@
       }
     },
     "schemas": {
+      "CompoundActionItem": {
+        "additionalProperties": true,
+        "description": "A suggested follow-up derived from Compound Engineering receipts. It is never executed by this read route.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "action_type": {
+            "examples": [
+              "open_fix_task",
+              "review_promotion_proposal"
+            ],
+            "type": "string"
+          },
+          "cluster_key": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "severity": {
+            "examples": [
+              "medium",
+              "high"
+            ],
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "supporting_capture_doc_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "supporting_record_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "CompoundEngineeringSummary": {
+        "additionalProperties": true,
+        "description": "Read-only Compound Engineering summary: background captures, gate records, and reviewable action candidates.",
+        "properties": {
+          "action_count": {
+            "type": "integer"
+          },
+          "action_items": {
+            "items": {
+              "$ref": "#/components/schemas/CompoundActionItem"
+            },
+            "type": "array"
+          },
+          "capture_count": {
+            "type": "integer"
+          },
+          "captures": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "config_hash": {
+            "type": "string"
+          },
+          "record_count": {
+            "type": "integer"
+          },
+          "records": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "run_counter": {
+            "type": "integer"
+          },
+          "tenant_slug": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ConnectionTarget": {
         "additionalProperties": true,
         "description": "How to reach an MCP server. The stdio transport is shown.",
@@ -380,8 +474,8 @@
     }
   },
   "info": {
-    "description": "The HTTP surface of `theorem-harness-server`: a thin Axum server over a durable file-backed graph store. It serves the read contract Theorem clients consume (runs, codebase maps, coordination rooms, presence, intents, records, mentions) plus write endpoints for room messages, dispatch jobs, and MCP connector registration.\n\nScope: this is the Harness product transport only. The graph engine (`rustyred-thg-server`) is a separate service with its own, larger API published at its own `GET /openapi.json`.\n\nAuthentication: this server performs NO authentication today. The tenant is supplied as a plain `tenant` (or `tenant_slug`) string per request, or by a non-default configured value from `THEOREM_HARNESS_TENANT_SLUG`, `THEOREM_AGENT_TENANT_SLUG`, or `THEOREM_TENANT_ID`; silent fallback to `default` is refused. Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, `POST /harness/rooms/{room_id}/messages`) are therefore unauthenticated. Run it on a trusted network or behind an authenticating proxy before exposing it publicly.\n\nResponse shapes: envelope keys are stable and documented here. Inner objects (a run, an event, a room, an intent) are serialized graph-node state; their fields are described where pinned and otherwise left open rather than guessed.",
-    "summary": "HTTP/JSON transport for Theorem's Harness — runs, rooms, jobs, and connectors.",
+    "description": "The HTTP surface of `theorem-harness-server`: a thin Axum server over a durable file-backed graph store. It serves the read contract Theorem clients consume (runs, codebase maps, coordination rooms, presence, intents, records, mentions, and Compound Engineering captures/action candidates) plus write endpoints for room messages, dispatch jobs, and MCP connector registration.\n\nScope: this is the Harness product transport only. The graph engine (`rustyred-thg-server`) is a separate service with its own, larger API published at its own `GET /openapi.json`.\n\nAuthentication: this server performs NO authentication today. The tenant is supplied as a plain `tenant` (or `tenant_slug`) string per request, or by a non-default configured value from `THEOREM_HARNESS_TENANT_SLUG`, `THEOREM_AGENT_TENANT_SLUG`, or `THEOREM_TENANT_ID`; silent fallback to `default` is refused. Write endpoints (`POST /harness/jobs`, `POST /connectors/register`, `POST /harness/rooms/{room_id}/messages`) are therefore unauthenticated. Run it on a trusted network or behind an authenticating proxy before exposing it publicly.\n\nResponse shapes: envelope keys are stable and documented here. Inner objects (a run, an event, a room, an intent) are serialized graph-node state; their fields are described where pinned and otherwise left open rather than guessed.",
+    "summary": "HTTP/JSON transport for Theorem's Harness — runs, rooms, compound learning, jobs, and connectors.",
     "title": "Theorem Harness HTTP API",
     "version": "0.1.0"
   },
@@ -696,6 +790,67 @@
         "summary": "Read (and optionally consume) an actor's mention inbox",
         "tags": [
           "actors"
+        ]
+      }
+    },
+    "/harness/compound-engineering": {
+      "get": {
+        "description": "Returns the passive run-close learning surface as an agent-visible summary. It does not auto-spawn jobs; repeated failures, promotion proposals, demotions, and tensions are surfaced as reviewable action items.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Tenant"
+          },
+          {
+            "description": "Optional exact cluster key filter.",
+            "in": "query",
+            "name": "cluster_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional updated_at lower bound for captures.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "compound_engineering": {
+                      "$ref": "#/components/schemas/CompoundEngineeringSummary"
+                    },
+                    "tenant": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Compound Engineering summary for the tenant."
+          }
+        },
+        "summary": "Read Compound Engineering captures, records, and action candidates",
+        "tags": [
+          "compound"
         ]
       }
     },
@@ -1321,6 +1476,10 @@
     {
       "description": "Coordination rooms: presence, intents, records, messages, live stream.",
       "name": "rooms"
+    },
+    {
+      "description": "Compound Engineering captures, fitness records, and read-only action candidates.",
+      "name": "compound"
     },
     {
       "description": "Per-actor mention inbox.",

@@ -38,9 +38,9 @@ use theorem_harness_core::{
     MapArtifactState,
 };
 use theorem_harness_runtime::{
-    list_presence, load_events, load_run, read_intents_for_room, read_mentions_for_actor,
-    read_mentions_for_actor_with_urgencies, read_records_for_room, room_status, CoordinationError,
-    HarnessRuntimeError,
+    compound_engineering_summary, list_presence, load_events, load_run, read_intents_for_room,
+    read_mentions_for_actor, read_mentions_for_actor_with_urgencies, read_records_for_room,
+    room_status, CoordinationError, HarnessRuntimeError,
 };
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
@@ -165,6 +165,22 @@ pub fn records_json<S: GraphStore>(
         "room_id": room_id,
         "records": records,
         "count": records.len()
+    }))
+}
+
+/// Agent-visible Compound Engineering surface: run-close captures, gate records,
+/// and read-only action candidates synthesized from recurring failure patterns.
+pub fn compound_engineering_json<S: GraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    cluster_key: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<Value, HarnessRuntimeError> {
+    let summary = compound_engineering_summary(store, tenant_slug, cluster_key, since, limit)?;
+    Ok(json!({
+        "tenant": summary.tenant_slug,
+        "compound_engineering": summary,
     }))
 }
 
@@ -365,9 +381,10 @@ mod tests {
     use std::path::PathBuf;
     use theorem_harness_core::TransitionInput;
     use theorem_harness_runtime::{
-        append_transition_from_store, heartbeat_presence, join_room, write_intent, write_message,
-        write_record, JoinRoomInput, PresenceInput, WriteIntentInput, WriteMessageInput,
-        WriteRecordInput,
+        append_transition_from_store, create_memory_document, heartbeat_presence, join_room,
+        write_intent, write_message, write_record, JoinRoomInput, MemoryWriteInput, PresenceInput,
+        WriteIntentInput, WriteMessageInput, WriteRecordInput, COMPOUND_CAPTURE_TAG,
+        COMPOUND_ROOM_ID,
     };
 
     fn payload(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -574,6 +591,78 @@ mod tests {
         )
         .expect("filtered records");
         assert_eq!(filtered["count"], json!(0));
+    }
+
+    #[test]
+    fn serves_compound_engineering_summary_and_actions() {
+        let mut store = InMemoryGraphStore::default();
+        for run_id in ["run-a", "run-b"] {
+            create_memory_document(
+                &mut store,
+                MemoryWriteInput {
+                    tenant_slug: "smoke".to_string(),
+                    doc_id: format!("compound:capture:{run_id}"),
+                    kind: "postmortem".to_string(),
+                    title: format!("Failed {run_id}"),
+                    content: "same failing test".to_string(),
+                    summary: "same failing test".to_string(),
+                    tags: vec![
+                        COMPOUND_CAPTURE_TAG.to_string(),
+                        "cluster:repeat-test".to_string(),
+                    ],
+                    metadata: Map::from_iter([
+                        ("run_id".to_string(), json!(run_id)),
+                        ("cluster_key".to_string(), json!("repeat-test")),
+                    ]),
+                    created_at: format!(
+                        "2026-06-08T0{}:00:00Z",
+                        if run_id == "run-a" { 1 } else { 2 }
+                    ),
+                    ..MemoryWriteInput::default()
+                },
+            )
+            .expect("compound capture");
+        }
+        write_record(
+            &mut store,
+            WriteRecordInput {
+                tenant_slug: "smoke".to_string(),
+                room_id: COMPOUND_ROOM_ID.to_string(),
+                actor_id: "compound-engineering".to_string(),
+                record_id: "compound:gate:run-b:pack".to_string(),
+                record_type: "event".to_string(),
+                title: "promotion proposal".to_string(),
+                summary: "promote pack".to_string(),
+                body: "pack passed compound threshold".to_string(),
+                metadata: Map::from_iter([(
+                    "proposal".to_string(),
+                    json!({
+                        "run_id": "run-b",
+                        "cluster_key": "repeat-test",
+                        "pack_content_hash": "sha256:pack",
+                        "from": "advisory",
+                        "to": "validated"
+                    }),
+                )]),
+                created_at: "2026-06-08T03:00:00Z".to_string(),
+            },
+        )
+        .expect("gate record");
+
+        let response = compound_engineering_json(&store, "smoke", Some("repeat-test"), None, 20)
+            .expect("compound summary");
+
+        assert_eq!(response["tenant"], json!("smoke"));
+        assert_eq!(response["compound_engineering"]["capture_count"], json!(2));
+        let actions = response["compound_engineering"]["action_items"]
+            .as_array()
+            .expect("actions array");
+        assert!(actions
+            .iter()
+            .any(|action| action["action_type"] == json!("open_fix_task")));
+        assert!(actions
+            .iter()
+            .any(|action| action["action_type"] == json!("review_promotion_proposal")));
     }
 
     #[test]
