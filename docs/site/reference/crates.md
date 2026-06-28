@@ -5,7 +5,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | Crate | What it is |
 |-------|------------|
 | `commonplace` | CommonPlace consumer object model (Item/Collection/Tag) and auto-structuring ingest, graph-native over the RustyRedCore-THG substrate. |
-| `design-check` | Static design-engineering checker and skill-pack payload for Theorem harness design systems. |
+| `design-check` | Static design-engineering checker and skill-pack payload for Theorem harness design systems, including the browserless Design Scout callable validator cut for normalized facts, deterministic audit/drift, token output, and HTML reports. |
 | `ensemble` | Ensemble: the capability-pack registry, budgeted selector, and trust ladder over RustyRedCore-THG. |
 | `pilot-core` | Servo-free, Playwright-class browser automation core: locator, actionability + auto-wait, geometry snapshot, coordinate synthesis, and web-first assertions behind a BrowserDriver trait. |
 | `prose-check` | Deterministic writing-engineering style checker for Theorem harness receipts. |
