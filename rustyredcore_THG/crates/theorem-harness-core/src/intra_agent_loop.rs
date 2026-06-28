@@ -8,9 +8,9 @@
 
 use crate::agent_binding::{
     apply_binding_transition, AgentBinding, BindingBudgetDecision, BindingError, BindingEventState,
-    BindingHeadOutcome, BindingRoutingDecision, BindingSubtask, BindingTransitionInput,
-    BindingTransitionResult, BindingVerificationOutcome, HeadKind, ScratchpadRelationKind,
-    ScratchpadRevision, ScratchpadRevisionLink,
+    BindingHeadOutcome, BindingLineageMemoryEntry, BindingRoutingDecision, BindingSubtask,
+    BindingTransitionInput, BindingTransitionResult, BindingVerificationOutcome, HeadKind,
+    ScratchpadRelationKind, ScratchpadRevision, ScratchpadRevisionLink,
 };
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
 use crate::constitution::Constitution;
@@ -104,6 +104,16 @@ pub struct FakeIntraAgentLoopInput {
     pub expected_invocation_cost_units: f64,
     pub started_at: String,
     pub closed_by: String,
+    /// S3 memory continuity: prior `AgentPublished` memory entries to thread
+    /// into the binding's `MEMORY_SCOPE.MOUNTED` event so the new binding
+    /// inherits Context from its lineage. `#[serde(default)]` keeps existing
+    /// JSON inputs (which never carried this field) deserializable. Callers
+    /// that compute lineage off a `GraphStore` (e.g. the runtime's
+    /// `lineage_memory_for_binding`) populate this before running the loop;
+    /// the loop dispatches it through MOUNTED so the kernel projects each
+    /// entry as a scratchpad revision before `HEADS.CONTRIBUTE`.
+    #[serde(default)]
+    pub lineage_memory: Vec<BindingLineageMemoryEntry>,
 }
 
 impl FakeIntraAgentLoopInput {
@@ -132,6 +142,7 @@ impl FakeIntraAgentLoopInput {
             expected_invocation_cost_units: default_expected_invocation_cost_units(),
             started_at: "2026-06-02T00:00:00Z".to_string(),
             closed_by: "fake-loop".to_string(),
+            lineage_memory: Vec::new(),
         }
     }
 }
@@ -226,13 +237,31 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
 
     let scope_id = binding.working_memory_scope.scope_id.clone();
     let scratchpad_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    let mut mounted_payload = json!({
+        "scope_id": scope_id,
+        "scratchpad_id": scratchpad_id
+    });
+    if !input.lineage_memory.is_empty() {
+        let lineage_array = input
+            .lineage_memory
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(entry)
+                    .expect("BindingLineageMemoryEntry serialization should be infallible")
+            })
+            .collect::<Vec<_>>();
+        if let Some(payload_obj) = mounted_payload.as_object_mut() {
+            payload_obj.insert(
+                "lineage_size".to_string(),
+                Value::Number(serde_json::Number::from(input.lineage_memory.len())),
+            );
+            payload_obj.insert("lineage_memory".to_string(), Value::Array(lineage_array));
+        }
+    }
     binding = apply_step(
         binding,
         "MEMORY_SCOPE.MOUNTED",
-        object_payload(json!({
-            "scope_id": scope_id,
-            "scratchpad_id": scratchpad_id
-        })),
+        object_payload(mounted_payload),
         &input.started_at,
         &mut events,
     )?

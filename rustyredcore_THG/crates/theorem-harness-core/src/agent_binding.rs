@@ -1548,6 +1548,27 @@ fn apply_binding_payload(
         "BINDING.RESOLVED" => {
             binding.identity.composition_hash = composition_hash(binding);
         }
+        "MEMORY_SCOPE.MOUNTED" => {
+            // S3: when the runtime threads lineage memory into the mount
+            // payload, project each entry as a scratchpad Context revision
+            // before the binding's heads start contributing. The revisions are
+            // attributed to a synthetic `lineage:agent_published` actor (a
+            // kernel-injected source, not a head contribution) so the binding's
+            // head/budget guards do not fire. Empty / absent lineage is a
+            // no-op, which preserves the legacy MOUNTED behaviour.
+            let entries = payload_lineage_memory_entries(transition.payload.get("lineage_memory"));
+            for entry in entries {
+                let payload = entry.into_payload();
+                let content_hash = stable_value_hash(&Value::Object(payload.clone()));
+                binding.working_memory_scope.scratchpad.append(
+                    "lineage:agent_published",
+                    "lineage agent_published memory",
+                    content_hash,
+                    payload,
+                    transition.created_at.clone(),
+                );
+            }
+        }
         "CHARTER.COMPILED" => {
             binding.capability_scope.charter_hash =
                 payload_to_string(transition.payload.get("charter_hash"));
@@ -2070,6 +2091,69 @@ fn remaining_run_budget_units(scope: &BindingBudgetScope, state: &BindingBudgetS
         scope.shared_budget_units
     };
     (run_cap - state.spent_total).max(0.0)
+}
+
+/// A single lineage memory record threaded into `MEMORY_SCOPE.MOUNTED` so a
+/// new binding inherits Context from the agent's prior published memory. The
+/// runtime computes these from the `binding_lineage` walk and the kernel
+/// injects each as a scratchpad revision; no field is required, which keeps
+/// the legacy `{scope_id, scratchpad_id}` MOUNTED payload byte-compatible.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingLineageMemoryEntry {
+    #[serde(default)]
+    pub source_binding_id: String,
+    #[serde(default)]
+    pub source_composition_hash: String,
+    #[serde(default)]
+    pub source_version: u32,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub patch_ids: Vec<String>,
+    #[serde(default)]
+    pub substrate_receipt_id: String,
+    #[serde(default)]
+    pub published_at: String,
+}
+
+impl BindingLineageMemoryEntry {
+    pub fn into_payload(self) -> Payload {
+        let mut payload = Payload::new();
+        payload.insert("kind".to_string(), Value::String("lineage_memory".to_string()));
+        payload.insert(
+            "source_binding_id".to_string(),
+            Value::String(self.source_binding_id),
+        );
+        payload.insert(
+            "source_composition_hash".to_string(),
+            Value::String(self.source_composition_hash),
+        );
+        payload.insert(
+            "source_version".to_string(),
+            Value::Number(self.source_version.into()),
+        );
+        payload.insert("summary".to_string(), Value::String(self.summary));
+        payload.insert(
+            "patch_ids".to_string(),
+            Value::Array(self.patch_ids.into_iter().map(Value::String).collect()),
+        );
+        payload.insert(
+            "substrate_receipt_id".to_string(),
+            Value::String(self.substrate_receipt_id),
+        );
+        payload.insert("published_at".to_string(), Value::String(self.published_at));
+        payload
+    }
+}
+
+fn payload_lineage_memory_entries(value: Option<&Value>) -> Vec<BindingLineageMemoryEntry> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| serde_json::from_value::<BindingLineageMemoryEntry>(item.clone()).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn payload_array_strings(value: Option<&Value>) -> Vec<String> {
@@ -2998,5 +3082,127 @@ mod tests {
         match error {
             BindingError::Guard(violation) => assert_eq!(violation.code, expected_code),
         }
+    }
+
+    // ---- S3: MOUNTED arm projects lineage memory as Context revisions ----
+
+    #[test]
+    fn mounted_with_lineage_memory_appends_scratchpad_context_revisions() {
+        let binding = fixture_binding();
+        let binding = apply(
+            binding,
+            "BINDING.RESOLVED",
+            json!({ "binding_id": "agent:theorem", "composition_hash": "ignored" }),
+        );
+        let binding = apply(
+            binding.binding,
+            "HEADS.PROBED",
+            json!({ "probed_head_set": ["claude", "deepseek", "mistral_ocr"] }),
+        );
+        let revisions_before = binding.binding.working_memory_scope.scratchpad.revisions.len();
+        let mounted = apply(
+            binding.binding,
+            "MEMORY_SCOPE.MOUNTED",
+            json!({
+                "scope_id": "bindingscope:theorem",
+                "scratchpad_id": "scratchpad:theorem",
+                "lineage_size": 2,
+                "lineage_memory": [
+                    {
+                        "source_binding_id": "harness:binding:agent:theorem:v1",
+                        "source_composition_hash": "hash:v1",
+                        "source_version": 1,
+                        "summary": "prior v1 published",
+                        "patch_ids": ["patch:1", "patch:2"],
+                        "substrate_receipt_id": "substrate:v1",
+                        "published_at": "2026-06-01T00:00:00Z"
+                    },
+                    {
+                        "source_binding_id": "harness:binding:agent:theorem:v2",
+                        "source_composition_hash": "hash:v2",
+                        "source_version": 2,
+                        "summary": "prior v2 published",
+                        "patch_ids": ["patch:3"],
+                        "substrate_receipt_id": "substrate:v2",
+                        "published_at": "2026-06-02T00:00:00Z"
+                    }
+                ]
+            }),
+        );
+        let scratchpad = &mounted.binding.working_memory_scope.scratchpad;
+        let lineage_revs = scratchpad
+            .revisions
+            .iter()
+            .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lineage_revs.len(),
+            2,
+            "MOUNTED with lineage_memory must append one revision per entry"
+        );
+        assert_eq!(
+            scratchpad.revisions.len(),
+            revisions_before + 2,
+            "no other revisions should be touched"
+        );
+        // Order is preserved: array index N maps to revision N (in append order).
+        assert_eq!(
+            lineage_revs[0]
+                .payload
+                .get("source_version")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            lineage_revs[0]
+                .payload
+                .get("substrate_receipt_id")
+                .and_then(Value::as_str),
+            Some("substrate:v1")
+        );
+        assert_eq!(
+            lineage_revs[1]
+                .payload
+                .get("source_version")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            lineage_revs[1]
+                .payload
+                .get("source_binding_id")
+                .and_then(Value::as_str),
+            Some("harness:binding:agent:theorem:v2")
+        );
+    }
+
+    #[test]
+    fn mounted_without_lineage_memory_leaves_scratchpad_untouched() {
+        let binding = fixture_binding();
+        let binding = apply(
+            binding,
+            "BINDING.RESOLVED",
+            json!({ "binding_id": "agent:theorem", "composition_hash": "ignored" }),
+        );
+        let binding = apply(
+            binding.binding,
+            "HEADS.PROBED",
+            json!({ "probed_head_set": ["claude", "deepseek", "mistral_ocr"] }),
+        );
+        let revisions_before = binding.binding.working_memory_scope.scratchpad.revisions.len();
+        let mounted = apply(
+            binding.binding,
+            "MEMORY_SCOPE.MOUNTED",
+            json!({
+                "scope_id": "bindingscope:theorem",
+                "scratchpad_id": "scratchpad:theorem"
+            }),
+        );
+        assert_eq!(
+            mounted.binding.working_memory_scope.scratchpad.revisions.len(),
+            revisions_before,
+            "legacy MOUNTED payload must not synthesize any scratchpad revisions"
+        );
+        assert_eq!(mounted.binding.lifecycle.status, "memory_scope_mounted");
     }
 }

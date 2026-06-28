@@ -292,6 +292,238 @@ pub fn load_scratchpad_revisions<S: GraphStore>(
     Ok(revisions)
 }
 
+/// A public-facing summary of one binding in an agent's lineage. The lineage
+/// is the chain of `AgentBinding` nodes persisted across runs that share the
+/// same `agent_id` (the named lineage; different `composition_hash` distinguish
+/// versions). The entry surfaces the load-bearing identity facts so callers
+/// can fan out reads (e.g. fetching each binding's published memory) without
+/// re-deserializing the full binding node.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BindingLineageEntry {
+    pub binding_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub version: u32,
+    pub composition_hash: String,
+    pub created_at_ms: String,
+    pub active_head_set: Vec<String>,
+    pub trust_tier: String,
+}
+
+/// Walk the graph for every `AgentBinding` node whose `identity.agent_id`
+/// matches `agent_id`. The chain is the named lineage; different
+/// `composition_hash` values distinguish versions of the same agent. Ordering
+/// is `(version, created_at_ms, binding_id)` so a strictly-increasing version
+/// rules; equal versions fall back to the lifecycle creation timestamp and
+/// then the durable binding node id, keeping the order deterministic. Returns
+/// an empty vec when the agent has no recorded lineage.
+pub fn binding_lineage<S: GraphStore>(
+    store: &S,
+    agent_id: &str,
+) -> BindingRuntimeResult<Vec<BindingLineageEntry>> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut entries = store
+        .query_nodes(NodeQuery::label("AgentBinding").with_limit(usize::MAX))
+        .into_iter()
+        .filter_map(|node| {
+            // The store's property index is single-level, so `identity.agent_id`
+            // is not directly queryable. Filter the AgentBinding label set in
+            // memory; an agent's lineage is bounded in practice.
+            let identity = node.properties.get("identity")?.as_object()?;
+            let candidate = identity.get("agent_id").and_then(Value::as_str)?;
+            if candidate != agent_id {
+                return None;
+            }
+            let agent_name = identity
+                .get("agent_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let version = identity.get("version").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let composition_hash = identity
+                .get("composition_hash")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let trust_tier = identity
+                .get("trust_tier")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let active_head_set = identity
+                .get("active_head_set")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let created_at_ms = node
+                .properties
+                .get("lifecycle")
+                .and_then(Value::as_object)
+                .and_then(|lifecycle| lifecycle.get("created_at"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some(BindingLineageEntry {
+                binding_id: node.id.clone(),
+                agent_id: agent_id.to_string(),
+                agent_name,
+                version,
+                composition_hash,
+                created_at_ms,
+                active_head_set,
+                trust_tier,
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        a.version
+            .cmp(&b.version)
+            .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+            .then_with(|| a.binding_id.cmp(&b.binding_id))
+    });
+    Ok(entries)
+}
+
+/// Build the lineage-memory payload to thread into `MEMORY_SCOPE.MOUNTED` for
+/// the binding currently being mounted. The runtime walks the agent's prior
+/// bindings (every `AgentBinding` node sharing `identity.agent_id` whose
+/// `composition_hash` differs from the current binding) and projects each
+/// prior binding's published-substrate signal as a
+/// `BindingLineageMemoryEntry`. The kernel will then append each entry as a
+/// scratchpad revision before `HEADS.CONTRIBUTE` (see `apply_binding_payload`
+/// in `theorem-harness-core`).
+///
+/// Returns the entries (possibly empty) so callers can decide whether to merge
+/// them into the MOUNTED payload. An agent with no recorded prior binding
+/// (cold start) yields `vec![]`, which the kernel treats as a no-op — the
+/// legacy MOUNTED behaviour.
+pub fn lineage_memory_for_binding<S: GraphStore>(
+    store: &S,
+    binding: &AgentBinding,
+) -> BindingRuntimeResult<Vec<theorem_harness_core::BindingLineageMemoryEntry>> {
+    let lineage = binding_lineage(store, &binding.identity.agent_id)?;
+    let current_hash = binding.identity.composition_hash.as_str();
+    let mut entries = Vec::new();
+    for entry in lineage {
+        if entry.composition_hash == current_hash {
+            continue;
+        }
+        let prior_binding = match store.get_node(&entry.binding_id) {
+            Some(node) => node,
+            None => continue,
+        };
+        let run_id = prior_binding
+            .properties
+            .get("lifecycle")
+            .and_then(Value::as_object)
+            .and_then(|lifecycle| lifecycle.get("run_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if run_id.is_empty() {
+            continue;
+        }
+        let events = load_binding_events(store, &run_id)?;
+        let substrate_receipt_id = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "PUBLISHED_TO_SUBSTRATE")
+            .and_then(|event| event.payload.get("substrate_receipt_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let memory_patches = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "MEMORY_PATCHES.PROPOSED");
+        let patch_ids = memory_patches
+            .and_then(|event| event.payload.get("patch_ids"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let published_at = memory_patches
+            .map(|event| event.created_at.clone())
+            .unwrap_or_default();
+        // Skip a prior binding with no substrate publication and no proposed
+        // memory patches: there is nothing concrete to inherit from it yet.
+        if substrate_receipt_id.is_empty() && patch_ids.is_empty() {
+            continue;
+        }
+        let summary = format!(
+            "prior binding {} (v{}) published memory",
+            entry.binding_id, entry.version
+        );
+        entries.push(theorem_harness_core::BindingLineageMemoryEntry {
+            source_binding_id: entry.binding_id,
+            source_composition_hash: entry.composition_hash,
+            source_version: entry.version,
+            summary,
+            patch_ids,
+            substrate_receipt_id,
+            published_at,
+        });
+    }
+    Ok(entries)
+}
+
+/// Build the `MEMORY_SCOPE.MOUNTED` payload that the runtime should hand to
+/// `apply_binding_transition` for the given binding. The payload always
+/// carries `scope_id` and `scratchpad_id` (the legacy contract); when prior
+/// lineage memory exists, it also carries `lineage_memory` (the array the
+/// kernel's MOUNTED arm projects as scratchpad Context revisions) and
+/// `lineage_size` (a numeric receipt so callers can detect injection without
+/// re-parsing the array).
+pub fn mounted_payload_for_binding<S: GraphStore>(
+    store: &S,
+    binding: &AgentBinding,
+) -> BindingRuntimeResult<theorem_harness_core::Payload> {
+    let entries = lineage_memory_for_binding(store, binding)?;
+    let mut payload = theorem_harness_core::Payload::new();
+    payload.insert(
+        "scope_id".to_string(),
+        Value::String(binding.working_memory_scope.scope_id.clone()),
+    );
+    payload.insert(
+        "scratchpad_id".to_string(),
+        Value::String(
+            binding
+                .working_memory_scope
+                .scratchpad
+                .document_id
+                .clone(),
+        ),
+    );
+    if !entries.is_empty() {
+        let lineage_array = entries
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(entry).expect(
+                    "BindingLineageMemoryEntry serialization should be infallible",
+                )
+            })
+            .collect::<Vec<_>>();
+        payload.insert(
+            "lineage_size".to_string(),
+            Value::Number(serde_json::Number::from(entries.len())),
+        );
+        payload.insert("lineage_memory".to_string(), Value::Array(lineage_array));
+    }
+    Ok(payload)
+}
+
 pub fn binding_node_id(run_id: &str) -> String {
     format!("harness:binding:{run_id}")
 }
@@ -1008,5 +1240,369 @@ mod tests {
             payload.as_object().cloned().unwrap_or_else(Map::new),
         )
         .at(TS)
+    }
+
+    // ---- S3: binding lineage + memory continuity tests ----
+
+    fn lineage_binding(run_id: &str, version: u32, head_seed: &str) -> AgentBinding {
+        // Same agent_id ("theorem"), distinct (run_id, composition) so the
+        // durable binding nodes split into separate AgentBinding rows that the
+        // lineage walker can sort. `head_seed` drives composition_hash drift.
+        let mut binding = AgentBinding::new(
+            BindingIdentity {
+                agent_id: "theorem".to_string(),
+                owner_id: "travis".to_string(),
+                agent_name: "Theorem".to_string(),
+                composition_hash: String::new(),
+                version,
+                trust_tier: "first_party".to_string(),
+                active_head_set: vec![format!("claude-{head_seed}"), format!("deepseek-{head_seed}")],
+                agent_constitution: None,
+            },
+            BindingComposition {
+                heads: vec![
+                    head(
+                        &format!("claude-{head_seed}"),
+                        "anthropic",
+                        "claude",
+                        HeadKind::ReasoningCore,
+                    ),
+                    head(
+                        &format!("deepseek-{head_seed}"),
+                        "deepseek",
+                        "v4",
+                        HeadKind::ReasoningCore,
+                    ),
+                ],
+            },
+            BindingBudgetScope::new("theorem", 100.0, 3),
+        )
+        .unwrap();
+        binding.lifecycle.run_id = run_id.to_string();
+        binding
+    }
+
+    /// Lifecycle event sequence (BINDING.RESOLVED through RUN.CLOSED) using
+    /// the head ids that `lineage_binding(_, _, "a")` produces, so the
+    /// HEADS.CONTRIBUTE / DRAFTS.SYNTHESIZED guards accept the binding.
+    fn lineage_v1_lifecycle_events() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "BINDING.RESOLVED",
+                json!({ "binding_id": "agent:theorem:v1", "composition_hash": "ignored" }),
+            ),
+            (
+                "HEADS.PROBED",
+                json!({ "probed_head_set": ["claude-a", "deepseek-a"] }),
+            ),
+            (
+                "MEMORY_SCOPE.MOUNTED",
+                json!({ "scope_id": "bindingscope:theorem", "scratchpad_id": "scratchpad:theorem" }),
+            ),
+            (
+                "CHARTER.COMPILED",
+                json!({ "charter_hash": "charter:1", "stance": "grounded composed agent" }),
+            ),
+            (
+                "CAPABILITIES.SELECTED",
+                json!({ "capability_scope_hash": "cap:1", "visible_tools": ["datalog"], "callable_tools": ["datalog"] }),
+            ),
+            (
+                "BUDGET.ALLOCATED",
+                json!({ "budget_units": 25.0, "max_parallel_heads": 2 }),
+            ),
+            (
+                "RUN.STARTED",
+                json!({ "task": "answer with Theorem voice", "started_at": "2026-06-02T00:00:00Z" }),
+            ),
+            (
+                "PRIVATE_WORK.OPENED",
+                json!({ "scratchpad_revision_id": "scratchrev:1" }),
+            ),
+            (
+                "HEADS.CONTRIBUTE",
+                json!({ "head_id": "claude-a", "contribution_id": "contrib:1", "contribution_kind": "proposal" }),
+            ),
+            (
+                "DRAFTS.SYNTHESIZED",
+                json!({ "synthesis_id": "synth:1", "contributing_heads": ["claude-a", "deepseek-a"] }),
+            ),
+            (
+                "PUBLICATION.PROPOSED",
+                json!({ "publication_id": "pub:1", "draft_hash": "draft:1" }),
+            ),
+            (
+                "POLICY.CHECKED",
+                json!({
+                    "policy_receipt_id": "policy:1",
+                    "allowed": true,
+                    "claims": [{ "text": "grounded", "provenance": "src:1" }]
+                }),
+            ),
+            (
+                "PUBLISHED_TO_SUBSTRATE",
+                json!({ "publication_id": "pub:1", "substrate_receipt_id": "substrate:1" }),
+            ),
+            (
+                "OUTCOME.RECORDED",
+                json!({ "outcome_id": "outcome:1", "accepted": true, "summary": "published" }),
+            ),
+            (
+                "MEMORY_PATCHES.PROPOSED",
+                json!({ "patch_ids": ["patch:1"], "review_required": true }),
+            ),
+            (
+                "RUN.CLOSED",
+                json!({ "summary": "closed", "closed_by": "claude-code" }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn binding_lineage_returns_empty_for_unknown_agent() {
+        let mut store = InMemoryGraphStore::new();
+        // Persist one binding for a different agent_id to prove the filter is
+        // doing real work (not just returning an empty graph).
+        let mut binding = fixture_binding();
+        binding.lifecycle.run_id = "agent:other".to_string();
+        binding.identity.agent_id = "other-agent".to_string();
+        persist_binding(&mut store, &binding, &hash_agent_binding(&binding)).unwrap();
+
+        let lineage = binding_lineage(&store, "theorem").unwrap();
+        assert!(
+            lineage.is_empty(),
+            "lineage for unknown agent must be empty, got {lineage:?}"
+        );
+
+        let empty_id = binding_lineage(&store, "").unwrap();
+        assert!(empty_id.is_empty(), "lineage for blank agent_id must be empty");
+    }
+
+    #[test]
+    fn binding_lineage_walks_all_versions_in_order() {
+        let mut store = InMemoryGraphStore::new();
+        // Persist out of order to prove the walker reorders by (version, created_at).
+        for (run_id, version, seed, created_at) in [
+            ("agent:theorem:v2", 2u32, "b", "2026-06-02T00:00:00Z"),
+            ("agent:theorem:v1", 1u32, "a", "2026-06-01T00:00:00Z"),
+            ("agent:theorem:v3", 3u32, "c", "2026-06-03T00:00:00Z"),
+        ] {
+            let mut binding = lineage_binding(run_id, version, seed);
+            binding.lifecycle.created_at = created_at.to_string();
+            persist_binding(&mut store, &binding, &hash_agent_binding(&binding)).unwrap();
+        }
+        let lineage = binding_lineage(&store, "theorem").unwrap();
+        assert_eq!(lineage.len(), 3, "expected three lineage entries");
+        assert_eq!(lineage[0].version, 1);
+        assert_eq!(lineage[1].version, 2);
+        assert_eq!(lineage[2].version, 3);
+        assert_eq!(lineage[0].binding_id, binding_node_id("agent:theorem:v1"));
+        assert_eq!(lineage[1].binding_id, binding_node_id("agent:theorem:v2"));
+        assert_eq!(lineage[2].binding_id, binding_node_id("agent:theorem:v3"));
+        for entry in &lineage {
+            assert_eq!(entry.agent_id, "theorem");
+            assert_eq!(entry.agent_name, "Theorem");
+            assert_eq!(entry.trust_tier, "first_party");
+            assert!(!entry.composition_hash.is_empty());
+            assert!(!entry.created_at_ms.is_empty());
+        }
+        // All three composition hashes must be distinct (head_seed drives this);
+        // otherwise the lineage cannot represent multiple binding versions.
+        let hashes = lineage
+            .iter()
+            .map(|entry| entry.composition_hash.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hashes.len(), 3, "composition hashes must be distinct");
+    }
+
+    #[test]
+    fn lineage_memory_for_binding_skips_prior_with_no_publication() {
+        let mut store = InMemoryGraphStore::new();
+        // Prior binding persisted via persist_binding without any BindingEvent
+        // history: its substrate_receipt + patch_ids are both empty so it must
+        // not appear as a lineage memory entry.
+        let prior = lineage_binding("agent:theorem:cold", 1, "a");
+        persist_binding(&mut store, &prior, &hash_agent_binding(&prior)).unwrap();
+
+        let current = lineage_binding("agent:theorem:warm", 2, "b");
+        let entries = lineage_memory_for_binding(&store, &current).unwrap();
+        assert!(
+            entries.is_empty(),
+            "a prior binding with no publication signals must not surface as lineage memory; got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn mounted_loads_agent_published_memory_from_prior_binding() {
+        // End-to-end memory continuity test: bring a binding through to
+        // PUBLISHED_TO_SUBSTRATE + MEMORY_PATCHES.PROPOSED, then mount a new
+        // binding (same agent_id, fresh run_id and composition) and prove the
+        // MOUNTED transition projects the prior binding's published memory
+        // into the new binding's scratchpad as a Context revision.
+        let mut store = InMemoryGraphStore::new();
+        let mut v1 = lineage_binding("agent:theorem:v1", 1, "a");
+        for (event, payload) in lineage_v1_lifecycle_events() {
+            v1 = append_binding_transition(&mut store, v1, transition(event, payload))
+                .unwrap()
+                .binding;
+        }
+        assert_eq!(v1.lifecycle.status, "closed");
+
+        // Pretend v1's composition hash is now "frozen"; v2 must be different.
+        let mut v2 = lineage_binding("agent:theorem:v2", 2, "b");
+        assert_ne!(v2.identity.composition_hash, v1.identity.composition_hash);
+
+        let mut mounted_payload = mounted_payload_for_binding(&store, &v2).unwrap();
+        let lineage_size = mounted_payload
+            .get("lineage_size")
+            .and_then(Value::as_u64)
+            .expect("lineage_size present");
+        assert_eq!(lineage_size, 1, "v2 must inherit v1's published memory");
+        let lineage_array = mounted_payload
+            .get("lineage_memory")
+            .and_then(Value::as_array)
+            .expect("lineage_memory array present");
+        let entry = &lineage_array[0];
+        assert_eq!(
+            entry.get("source_binding_id").and_then(Value::as_str),
+            Some(binding_node_id("agent:theorem:v1").as_str())
+        );
+        assert_eq!(
+            entry.get("substrate_receipt_id").and_then(Value::as_str),
+            Some("substrate:1"),
+            "MOUNTED payload must carry the prior binding's PUBLISHED_TO_SUBSTRATE receipt id"
+        );
+        let patch_ids = entry
+            .get("patch_ids")
+            .and_then(Value::as_array)
+            .expect("patch_ids array");
+        assert_eq!(
+            patch_ids.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            vec!["patch:1"],
+            "MOUNTED payload must carry the prior binding's MEMORY_PATCHES.PROPOSED patch_ids"
+        );
+
+        // Walk v2 through BINDING.RESOLVED, HEADS.PROBED, MEMORY_SCOPE.MOUNTED
+        // with the lineage-augmented payload. Prove the kernel arm appended a
+        // scratchpad revision attributed to the synthetic lineage actor.
+        v2 = append_binding_transition(
+            &mut store,
+            v2,
+            transition(
+                "BINDING.RESOLVED",
+                json!({ "binding_id": "agent:theorem:v2", "composition_hash": "ignored" }),
+            ),
+        )
+        .unwrap()
+        .binding;
+        v2 = append_binding_transition(
+            &mut store,
+            v2,
+            transition(
+                "HEADS.PROBED",
+                json!({ "probed_head_set": ["claude-b", "deepseek-b"] }),
+            ),
+        )
+        .unwrap()
+        .binding;
+        // Rehydrate the lineage payload now that the binding's composition_hash
+        // has been recomputed by BINDING.RESOLVED (guarantees v2 still excludes
+        // itself from its own lineage).
+        mounted_payload = mounted_payload_for_binding(&store, &v2).unwrap();
+        let mounted_transition = BindingTransitionInput::new(
+            "MEMORY_SCOPE.MOUNTED",
+            mounted_payload,
+        )
+        .at(TS);
+        let mounted = append_binding_transition(&mut store, v2, mounted_transition).unwrap();
+        let lineage_revisions = mounted
+            .binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lineage_revisions.len(),
+            1,
+            "MOUNTED must project one lineage memory entry as a scratchpad revision"
+        );
+        let revision = lineage_revisions[0];
+        assert_eq!(
+            revision
+                .payload
+                .get("kind")
+                .and_then(Value::as_str),
+            Some("lineage_memory")
+        );
+        assert_eq!(
+            revision
+                .payload
+                .get("substrate_receipt_id")
+                .and_then(Value::as_str),
+            Some("substrate:1")
+        );
+        assert_eq!(
+            revision
+                .payload
+                .get("source_binding_id")
+                .and_then(Value::as_str),
+            Some(binding_node_id("agent:theorem:v1").as_str())
+        );
+    }
+
+    #[test]
+    fn mounted_without_lineage_memory_is_backward_compatible() {
+        // No prior bindings persisted, so MOUNTED stays the legacy
+        // {scope_id, scratchpad_id} payload (no lineage_size, no
+        // lineage_memory) and the scratchpad gains no lineage revisions.
+        let mut store = InMemoryGraphStore::new();
+        let binding = fixture_binding();
+        let payload = mounted_payload_for_binding(&store, &binding).unwrap();
+        assert!(payload.get("scope_id").is_some());
+        assert!(payload.get("scratchpad_id").is_some());
+        assert!(payload.get("lineage_memory").is_none());
+        assert!(payload.get("lineage_size").is_none());
+
+        let resolved = append_binding_transition(
+            &mut store,
+            binding,
+            transition(
+                "BINDING.RESOLVED",
+                json!({ "binding_id": "agent:theorem", "composition_hash": "ignored" }),
+            ),
+        )
+        .unwrap();
+        let probed = append_binding_transition(
+            &mut store,
+            resolved.binding,
+            transition(
+                "HEADS.PROBED",
+                json!({ "probed_head_set": ["claude", "deepseek"] }),
+            ),
+        )
+        .unwrap();
+        let mounted = append_binding_transition(
+            &mut store,
+            probed.binding,
+            transition(
+                "MEMORY_SCOPE.MOUNTED",
+                json!({
+                    "scope_id": "bindingscope:theorem",
+                    "scratchpad_id": "scratchpad:theorem"
+                }),
+            ),
+        )
+        .unwrap();
+        let lineage_revisions = mounted
+            .binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+            .count();
+        assert_eq!(lineage_revisions, 0);
     }
 }

@@ -60,10 +60,11 @@ pub use agent_runner::{
     DEFAULT_HEARTBEAT_TTL_SECONDS, DEFAULT_MENTION_LIMIT,
 };
 pub use binding_store::{
-    append_binding_transition, binding_event_node_id, binding_node_id, load_binding,
-    load_binding_events, load_scratchpad_revisions, persist_binding, persist_binding_event_state,
+    append_binding_transition, binding_event_node_id, binding_lineage, binding_node_id,
+    lineage_memory_for_binding, load_binding, load_binding_events, load_scratchpad_revisions,
+    mounted_payload_for_binding, persist_binding, persist_binding_event_state,
     persist_binding_run_result, persist_binding_transition_result, scratchpad_revision_node_id,
-    BindingRuntimeError, BindingRuntimeResult,
+    BindingLineageEntry, BindingRuntimeError, BindingRuntimeResult,
 };
 pub use canonical_write::{
     alias_witness_node_id, canonical_fact_node_id, canonicalize_on_write,

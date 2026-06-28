@@ -101,15 +101,24 @@ pub fn run_composed_agent_with_claims<S: GraphStore>(
             "composed_agent_run requires task".to_string(),
         ));
     }
-    let binding = match load_binding(store, &binding_id)? {
+    let mut binding = match load_binding(store, &binding_id)? {
         Some(binding) => binding,
         None => default_theorem_binding(&binding_id)?,
     };
+    // S3 memory continuity: pin the composition hash before computing the
+    // lineage so the lineage walker excludes the current binding from its own
+    // ancestor list (a fresh binding without `composition_hash` would never
+    // exclude itself if its hash was the empty string and a prior binding
+    // happened to have the same).
+    if binding.identity.composition_hash.is_empty() {
+        binding.identity.composition_hash = composition_hash(&binding);
+    }
     let mut input = FakeIntraAgentLoopInput::new(task, claims);
     input.budget_units = composed_agent_budget_units()?;
     input.max_parallel_heads = input
         .max_parallel_heads
         .max(binding.reasoning_core_ids().len());
+    input.lineage_memory = crate::binding_store::lineage_memory_for_binding(store, &binding)?;
     let result = run_intra_agent_loop_with_invoker(binding, input, invoker)?;
     persist_binding_run_result(store, &result.binding, &result.events)?;
     let policy_event = result
@@ -173,12 +182,18 @@ pub fn run_configured_composed_agent_with_claims<S: GraphStore>(
         None => default_theorem_binding(&binding_id)?,
     };
     let binding = runtime_candidate_binding(binding)?;
-    let binding = binding_with_available_runtime_heads(binding)?;
+    let mut binding = binding_with_available_runtime_heads(binding)?;
+    // S3 memory continuity: pin the composition hash before lineage so the
+    // walker excludes the current binding from its own ancestor list.
+    if binding.identity.composition_hash.is_empty() {
+        binding.identity.composition_hash = composition_hash(&binding);
+    }
     let mut input = FakeIntraAgentLoopInput::new(task, claims);
     input.budget_units = composed_agent_budget_units()?;
     input.max_parallel_heads = input
         .max_parallel_heads
         .max(binding.reasoning_core_ids().len());
+    input.lineage_memory = crate::binding_store::lineage_memory_for_binding(store, &binding)?;
 
     let registry = AgentHeadRegistry::from_binding(&binding)
         .map_err(|error| ComposedAgentRuntimeError::Loop(IntraAgentLoopError::Registry(error)))?;
@@ -371,13 +386,31 @@ fn run_single_head_agent<I: HeadInvoker>(
 
     let scope_id = binding.working_memory_scope.scope_id.clone();
     let scratchpad_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    let mut mounted_payload = json!({
+        "scope_id": scope_id,
+        "scratchpad_id": scratchpad_id
+    });
+    if !input.lineage_memory.is_empty() {
+        let lineage_array = input
+            .lineage_memory
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(entry)
+                    .expect("BindingLineageMemoryEntry serialization should be infallible")
+            })
+            .collect::<Vec<_>>();
+        if let Some(payload_obj) = mounted_payload.as_object_mut() {
+            payload_obj.insert(
+                "lineage_size".to_string(),
+                Value::Number(serde_json::Number::from(input.lineage_memory.len())),
+            );
+            payload_obj.insert("lineage_memory".to_string(), Value::Array(lineage_array));
+        }
+    }
     binding = apply_step(
         binding,
         "MEMORY_SCOPE.MOUNTED",
-        object_payload(json!({
-            "scope_id": scope_id,
-            "scratchpad_id": scratchpad_id
-        })),
+        object_payload(mounted_payload),
         &input.started_at,
         &mut events,
     )?;
