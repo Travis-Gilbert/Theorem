@@ -22,6 +22,8 @@ use crate::{CrawlGraph, EDGE_HAS_SNAPSHOT, EDGE_RESULTED_IN, LABEL_PAGE};
 pub const RUSTYWEB_PAGE_DATA_TYPE: &str = "rustyweb_page";
 const DEFAULT_RUSTYWEB_QUERY_LIMIT: u64 = 20;
 const MAX_RUSTYWEB_QUERY_LIMIT: u64 = 100;
+const MAX_RUSTYWEB_QUERY_PREDICATES: usize = 8;
+const MAX_RUSTYWEB_DATAWAVE_TEXT_CHARS: usize = 4096;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CrawlDatawaveIngestReport {
@@ -142,10 +144,13 @@ pub fn datawave_records_from_crawl_graph(graph: &CrawlGraph) -> Vec<RawRecord> {
             "body_bytes": attempt.and_then(|node| property_string(&node.properties, "body_bytes")),
             "content_hash": snapshot.and_then(|node| property_string(&node.properties, "content_hash")),
             "byte_len": snapshot.and_then(|node| property_string(&node.properties, "byte_len")),
-            "text": snapshot.and_then(|node| property_string(&node.properties, "text")),
+            "text": snapshot
+                .and_then(|node| property_string(&node.properties, "text"))
+                .map(|text| capped_text_excerpt(&text, MAX_RUSTYWEB_DATAWAVE_TEXT_CHARS)),
         });
         records.push(
-            RawRecord::json(RUSTYWEB_PAGE_DATA_TYPE, body, 0).with_external_id(page.id.clone()),
+            RawRecord::json(RUSTYWEB_PAGE_DATA_TYPE, body, 0)
+                .with_external_id(format!("{}:{}", graph.run_id, page.id)),
         );
     }
     records
@@ -294,7 +299,7 @@ impl RustyWebDatawaveQueryInput {
         {
             for value in values {
                 if let Some(predicate) = rustyweb_query_predicate_from_value(value, tenant_id)? {
-                    predicates.push(predicate);
+                    push_rustyweb_query_predicate(&mut predicates, predicate)?;
                 }
             }
         }
@@ -312,7 +317,7 @@ impl RustyWebDatawaveQueryInput {
                 query_value_to_raw_string(value)?,
                 tenant_id,
             )? {
-                predicates.push(predicate);
+                push_rustyweb_query_predicate(&mut predicates, predicate)?;
             }
         }
         if predicates.is_empty() {
@@ -328,6 +333,22 @@ impl RustyWebDatawaveQueryInput {
             .clamp(1, MAX_RUSTYWEB_QUERY_LIMIT) as usize;
         Ok(Self { predicates, limit })
     }
+}
+
+fn push_rustyweb_query_predicate(
+    predicates: &mut Vec<RustyWebDatawaveQueryPredicate>,
+    predicate: RustyWebDatawaveQueryPredicate,
+) -> GraphStoreResult<()> {
+    if predicates.len() >= MAX_RUSTYWEB_QUERY_PREDICATES {
+        return Err(GraphStoreError::new(
+            "too_many_rustyweb_query_predicates",
+            format!(
+                "web.query accepts at most {MAX_RUSTYWEB_QUERY_PREDICATES} non-tenant predicates"
+            ),
+        ));
+    }
+    predicates.push(predicate);
+    Ok(())
 }
 
 fn rustyweb_query_predicate_from_value(
@@ -562,6 +583,15 @@ fn property_string(properties: &Value, key: &str) -> Option<String> {
     }
 }
 
+fn capped_text_excerpt(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut excerpt = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        excerpt.push_str("...");
+    }
+    excerpt
+}
+
 #[cfg(test)]
 mod tests {
     use rustyred_thg_core::{InMemoryGraphStore, NodeQuery, RedCoreGraphStore};
@@ -625,6 +655,40 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("alpha beta"));
+    }
+
+    #[test]
+    fn datawave_records_key_pages_by_run_and_bound_text() {
+        let long_text = "x".repeat(MAX_RUSTYWEB_DATAWAVE_TEXT_CHARS + 64);
+        let request = CrawlRequest::new(
+            "rw-datawave-run-key",
+            vec!["https://example.com/index.html".to_string()],
+        );
+        let output = build_v2_fixture_crawl(
+            request,
+            &[FixturePage::html(
+                "https://example.com/index.html",
+                format!("<html><body>{long_text}</body></html>"),
+            )],
+        )
+        .unwrap();
+
+        let records = datawave_records_from_crawl_graph(&output.graph);
+
+        assert_eq!(records.len(), 1);
+        let body = records[0].body.as_json().unwrap();
+        let expected_external_id = format!(
+            "{}:{}",
+            output.graph.run_id,
+            body["page_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            records[0].external_id.as_deref(),
+            Some(expected_external_id.as_str())
+        );
+        let text = body["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), MAX_RUSTYWEB_DATAWAVE_TEXT_CHARS + 3);
+        assert!(text.ends_with("..."));
     }
 
     #[test]
@@ -702,5 +766,86 @@ mod tests {
         assert!(!access_paths
             .iter()
             .any(|path| path["method"] == json!("full_scan")));
+    }
+
+    #[test]
+    fn rustyweb_query_does_not_join_field_facts_across_crawl_runs() {
+        let first_request = CrawlRequest::new(
+            "rw-cross-run-a",
+            vec!["https://example.com/index.html".to_string()],
+        );
+        let first_output = build_v2_fixture_crawl(
+            first_request,
+            &[FixturePage::html(
+                "https://example.com/index.html",
+                "<html><body>alpha run-a only</body></html>",
+            )],
+        )
+        .unwrap();
+        let second_request = CrawlRequest::new(
+            "rw-cross-run-b",
+            vec!["https://example.com/index.html".to_string()],
+        );
+        let second_output = build_v2_fixture_crawl(
+            second_request,
+            &[FixturePage::html(
+                "https://example.com/index.html",
+                "<html><body>beta run-b only</body></html>",
+            )],
+        )
+        .unwrap();
+
+        let mut store = RedCoreGraphStore::memory();
+        first_output
+            .graph
+            .apply_to_store_with_datawave(&mut store, Some("tenant-a".to_string()))
+            .unwrap();
+        second_output
+            .graph
+            .apply_to_store_with_datawave(&mut store, Some("tenant-a".to_string()))
+            .unwrap();
+
+        let mismatched = query_rustyweb_datawave(
+            &store,
+            Some("tenant-a"),
+            json!({
+                "predicates": [
+                    { "field": "text", "value": "alpha run-a only" },
+                    { "field": "run_id", "value": "rw-cross-run-b" }
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(mismatched["event_count"], json!(0));
+
+        let matched = query_rustyweb_datawave(
+            &store,
+            Some("tenant-a"),
+            json!({
+                "predicates": [
+                    { "field": "text", "value": "beta run-b only" },
+                    { "field": "run_id", "value": "rw-cross-run-b" }
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(matched["event_count"], json!(1));
+    }
+
+    #[test]
+    fn rustyweb_query_rejects_too_many_non_tenant_predicates() {
+        let predicates = (0..=MAX_RUSTYWEB_QUERY_PREDICATES)
+            .map(|index| json!({ "field": "run_id", "value": format!("run-{index}") }))
+            .collect::<Vec<_>>();
+
+        let error = RustyWebDatawaveQueryInput::from_value(
+            json!({
+                "predicates": predicates
+            }),
+            Some("tenant-a"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "too_many_rustyweb_query_predicates");
     }
 }

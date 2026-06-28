@@ -1952,5 +1952,23 @@ impl From<RustyWebError> for GraphStoreError {
 fn rustyweb_datawave_to_graph_error(
     error: rustyred_thg_datawave::DatawaveError,
 ) -> GraphStoreError {
-    GraphStoreError::new("rustyweb_datawave_ingest_error", error.to_string())
+    match error {
+        rustyred_thg_datawave::DatawaveError::Graph(error) => error,
+        error => GraphStoreError::new("rustyweb_datawave_ingest_error", error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datawave_graph_error_mapping_preserves_inner_code() {
+        let error = rustyweb_datawave_to_graph_error(rustyred_thg_datawave::DatawaveError::Graph(
+            GraphStoreError::new("inner_graph_error", "inner message"),
+        ));
+
+        assert_eq!(error.code, "inner_graph_error");
+        assert_eq!(error.message, "inner message");
+    }
 }
