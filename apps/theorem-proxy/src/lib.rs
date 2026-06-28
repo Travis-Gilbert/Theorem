@@ -227,6 +227,9 @@ pub fn resolve_memory(
 /// Serve the proxy on `addr`, wait until it answers `/healthz`, then run `command` with
 /// `ANTHROPIC_BASE_URL` pointed at it; return the child's exit code. One command instead
 /// of a manual base-URL export (SPEC-LOCAL-PROXY-MVP D5 / one-click connect).
+///
+/// If the proxy never comes up (commonly: the port is already in use), the wrapped command
+/// is NOT launched -- returning an error beats pointing the child at a dead endpoint.
 pub async fn run_wrapped(
     addr: SocketAddr,
     config: ProxyConfig,
@@ -235,9 +238,50 @@ pub async fn run_wrapped(
     let (program, args) = command.split_first().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "wrap: empty command")
     })?;
-    // Serve in the background; aborted when the wrapped command exits.
-    let server = tokio::spawn(serve(addr, config));
-    wait_until_healthy(addr).await;
+    // Bind the listener up front so a port already in use fails HERE -- this proves the
+    // proxy we point the child at is OURS, not another process already answering /healthz
+    // on the same port (whose memory/upstream settings would differ).
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| std::io::Error::other(format!("theorem-proxy could not bind {addr}: {error}")))?;
+    let server = tokio::spawn(async move { axum::serve(listener, router(config)).await });
+
+    // Wait until our server answers /healthz (it owns the port now); bail if the task dies.
+    // The probe is time-bounded so a transient stall can't hang the wait.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .expect("failed to build health-check client");
+    let health = format!("http://{addr}/healthz");
+    let mut healthy = false;
+    for _ in 0..100 {
+        if server.is_finished() {
+            break;
+        }
+        if let Ok(response) = client.get(&health).send().await {
+            if response.status().is_success() {
+                healthy = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !healthy {
+        let detail = if server.is_finished() {
+            match server.await {
+                Ok(Err(error)) => error.to_string(),
+                Ok(Ok(())) => "proxy exited before becoming healthy".to_string(),
+                Err(join) => join.to_string(),
+            }
+        } else {
+            server.abort();
+            "proxy did not become healthy within the startup window".to_string()
+        };
+        return Err(std::io::Error::other(format!(
+            "theorem-proxy could not start on {addr}: {detail}"
+        )));
+    }
+
     let status = tokio::process::Command::new(program)
         .args(args)
         .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
@@ -245,21 +289,6 @@ pub async fn run_wrapped(
         .await?;
     server.abort();
     Ok(status.code().unwrap_or(0))
-}
-
-/// Poll `/healthz` until the proxy answers (bounded ~5s). Best-effort: if it never comes
-/// up the command still runs and surfaces its own connection error.
-async fn wait_until_healthy(addr: SocketAddr) {
-    let client = reqwest::Client::new();
-    let url = format!("http://{addr}/healthz");
-    for _ in 0..100 {
-        if let Ok(response) = client.get(&url).send().await {
-            if response.status().is_success() {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// One link in the local-stack chain check.

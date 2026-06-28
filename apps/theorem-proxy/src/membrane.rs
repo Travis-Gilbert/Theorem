@@ -69,6 +69,11 @@ fn truncate_tool_result(block: &mut Value, threshold: usize, stored: &mut Vec<(S
     let stub = format!(
         "{head}\n[theorem-membrane: elided {elided} bytes; full tool output at GET /tool_result/{id}]\n{tail}"
     );
+    // Never grow a result: a value only slightly over the threshold would expand once the
+    // head + tail + marker are added. If the stub is not actually smaller, leave it.
+    if stub.len() >= full.len() {
+        return;
+    }
     block["content"] = Value::String(stub);
     stored.push((id, full));
 }
@@ -168,5 +173,16 @@ mod tests {
         let (out, stored) = apply_membrane(&original, 1000);
         assert!(stored.is_empty(), "earlier-turn tool_result left alone");
         assert_eq!(out, original);
+    }
+
+    #[test]
+    fn does_not_grow_a_result_only_slightly_over_threshold() {
+        // A result just over the threshold would expand once head + tail + marker are
+        // added; the membrane must leave it untouched rather than make it bigger.
+        let near = "Z".repeat(520);
+        let original = body_with_tool_result(&near);
+        let (out, stored) = apply_membrane(&original, 500);
+        assert!(stored.is_empty(), "near-threshold result not stored");
+        assert_eq!(out, original, "near-threshold result left unchanged (not grown)");
     }
 }
