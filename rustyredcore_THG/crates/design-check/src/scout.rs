@@ -274,13 +274,7 @@ pub struct DesignDriftReport {
 pub fn design_fact_set_from_json(json_text: &str) -> Result<DesignFactSet, String> {
     let value: Value =
         serde_json::from_str(json_text).map_err(|error| format!("invalid design JSON: {error}"))?;
-    if value.get("source_ref").is_some()
-        && value
-            .get("colors")
-            .and_then(Value::as_array)
-            .map(|colors| colors.first().and_then(|first| first.get("hex")).is_some())
-            .unwrap_or(false)
-    {
+    if value.get("source_ref").is_some() {
         return serde_json::from_value(value)
             .map_err(|error| format!("invalid design fact set: {error}"));
     }
@@ -1263,8 +1257,8 @@ fn score_for(
         .iter()
         .filter(|finding| predicate(finding))
         .map(|finding| if finding.severity == "error" { 12 } else { 6 })
-        .sum::<u8>();
-    100u8.saturating_sub(cost)
+        .sum::<u16>();
+    100u8.saturating_sub(cost.min(u16::from(u8::MAX)) as u8)
 }
 
 fn coverage(facts: &DesignFactSet) -> CoverageScore {
@@ -1309,10 +1303,11 @@ fn compare_colors(
                 best_idx = Some(index);
             }
         }
-        if let Some(best_idx) = best_idx {
-            if best_delta <= config.color_same {
+        match best_idx {
+            Some(best_idx) if best_delta <= config.color_same => {
                 used.insert(best_idx);
-            } else if best_delta <= config.color_shift {
+            }
+            Some(best_idx) if best_delta <= config.color_shift => {
                 used.insert(best_idx);
                 changed += 1;
                 penalty += (best_delta / config.color_shift).clamp(0.0, 1.0) * weight;
@@ -1324,7 +1319,8 @@ fn compare_colors(
                     after: Some(candidate.colors[best_idx].hex.clone()),
                     delta: Some(round1(best_delta)),
                 });
-            } else {
+            }
+            _ => {
                 removed += 1;
                 penalty += weight;
                 changes.push(DesignDriftChange {
@@ -1485,10 +1481,11 @@ fn compare_dimensions(
                 best_idx = Some(index);
             }
         }
-        if let Some(best_idx) = best_idx {
-            if best_pct <= config.dim_pct {
+        match best_idx {
+            Some(best_idx) if best_pct <= config.dim_pct => {
                 used.insert(best_idx);
-            } else if best_pct <= config.dim_shift_pct {
+            }
+            Some(best_idx) if best_pct <= config.dim_shift_pct => {
                 used.insert(best_idx);
                 changed += 1;
                 penalty += (best_pct / config.dim_shift_pct).clamp(0.0, 1.0);
@@ -1500,7 +1497,8 @@ fn compare_dimensions(
                     after: Some(format!("{}px", trim_float(candidate[best_idx]))),
                     delta: Some(round1(best_pct)),
                 });
-            } else {
+            }
+            _ => {
                 removed += 1;
                 penalty += 1.0;
                 changes.push(DesignDriftChange {
@@ -2254,6 +2252,87 @@ mod tests {
         assert!(ids.contains("spacing_eight_point_grid"));
         assert!(ids.contains("target_size_minimum"));
         assert!(ids.contains("readability_size_floor"));
+    }
+
+    #[test]
+    fn normalized_fact_sets_can_be_colorless() {
+        let facts = DesignFactSet {
+            source_ref: "fixture://typography-only".to_string(),
+            typography: vec![TypographyFact {
+                context: "body".to_string(),
+                family: "Inter".to_string(),
+                size_px: 16.0,
+                weight: 400,
+                line_height: Some(1.5),
+                measure_ch: Some(64.0),
+                usage_count: 1,
+            }],
+            ..DesignFactSet::default()
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        let parsed = design_fact_set_from_json(&json).expect("normalized facts parse");
+        assert_eq!(parsed.source_ref, "fixture://typography-only");
+        assert_eq!(parsed.colors.len(), 0);
+        assert_eq!(parsed.typography.len(), 1);
+    }
+
+    #[test]
+    fn audit_scores_saturate_large_finding_counts() {
+        let findings = (0..300)
+            .map(|index| DesignAuditFinding {
+                rule_id: format!("rule-{index}"),
+                severity: "error".to_string(),
+                category: "contrast".to_string(),
+                group: "fixture".to_string(),
+                message: "fixture".to_string(),
+                measured: Some(index as f64),
+                threshold: Some(1.0),
+                evidence: Map::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            score_for(&findings, |finding| finding.category == "contrast"),
+            0
+        );
+    }
+
+    #[test]
+    fn drift_counts_empty_candidate_palette_and_dimensions_as_removed() {
+        let baseline = clean_facts();
+        let mut candidate = baseline.clone();
+        candidate.colors.clear();
+        candidate.spacing.clear();
+        candidate.radii.clear();
+
+        let report = design_drift(&baseline, &candidate, DriftConfig::default());
+        let color = report
+            .categories
+            .iter()
+            .find(|category| category.category == "color")
+            .expect("color category");
+        assert_eq!(color.removed, baseline.colors.len());
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .filter(|change| change.category == "color" && change.kind == "removed")
+                .count(),
+            baseline.colors.len()
+        );
+
+        let spacing = report
+            .categories
+            .iter()
+            .find(|category| category.category == "spacing")
+            .expect("spacing category");
+        assert_eq!(spacing.removed, baseline.spacing.len());
+
+        let radius = report
+            .categories
+            .iter()
+            .find(|category| category.category == "radius")
+            .expect("radius category");
+        assert_eq!(radius.removed, baseline.radii.len());
     }
 
     #[test]
