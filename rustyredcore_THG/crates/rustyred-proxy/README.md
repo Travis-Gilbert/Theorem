@@ -13,6 +13,16 @@ cargo run -p rustyred-proxy -- \
 It exposes:
 
 - `POST /v1/messages` for Anthropic Messages passthrough.
+- hidden resident harness affordances on `/v1/messages`: direct
+  `compute_offload.route_operation` plus `tool_search`/`describe`/`invoke`,
+  with tier-two and tier-three holds represented as approval-required tool
+  results.
+- corpus-gated local/upstream cascade routing when
+  `THEOREM_PROXY_LOCAL_ANTHROPIC_UPSTREAM` and
+  `THEOREM_PROXY_CASCADE_CALIBRATION` are set.
+- advisory verification injection from
+  `<proxy-data-dir>/verification_claims.json` or
+  `THEOREM_PROXY_VERIFICATION_CLAIMS`.
 - `GET /v1/tool-result-fetch` for byte-slice recovery of sampled tool output.
 - `POST/GET /v1/presence` for native local co-presence.
 - `POST /v1/presence/footprint` and `DELETE /v1/presence/footprint` for

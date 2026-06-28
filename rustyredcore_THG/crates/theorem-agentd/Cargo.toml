@@ -24,9 +24,15 @@ axum = "0.8"
 futures-util = "0.3"
 reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
+rustyred-thg-affordances = { path = "../rustyred-thg-affordances" }
+rustyred-thg-offload = { path = "../rustyred-thg-offload" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 theorem-copresence = { path = "../theorem-copresence" }
+theorem-harness-core = { path = "../theorem-harness-core" }
 theorem-receiver = { path = "../theorem-receiver" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.10"
