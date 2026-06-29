@@ -480,7 +480,7 @@ async fn step_7_outbox_drains_after_offline_window() {
 /// only against the in-process fakes; flip on with `cargo test ... -- --ignored`
 /// plus the env vars below.
 #[tokio::test]
-#[ignore = "set THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_RAILWAY_URL + THEOREM_SYNC_RAILWAY_TOKEN to run"]
+#[ignore = "set THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_RAILWAY_URL (and optionally THEOREM_SYNC_RAILWAY_TOKEN) to run"]
 async fn live_round_against_railway() {
     if std::env::var("THEOREM_SYNC_LIVE_E2E").as_deref() != Ok("1") {
         eprintln!("skipping: THEOREM_SYNC_LIVE_E2E != 1");
@@ -488,15 +488,19 @@ async fn live_round_against_railway() {
     }
     let url = std::env::var("THEOREM_SYNC_RAILWAY_URL")
         .expect("THEOREM_SYNC_RAILWAY_URL must be set for live mode");
-    let token = std::env::var("THEOREM_SYNC_RAILWAY_TOKEN")
-        .expect("THEOREM_SYNC_RAILWAY_TOKEN must be set for live mode");
     let tenant = std::env::var("THEOREM_SYNC_TENANT").unwrap_or_else(|_| "Travis-Gilbert".into());
 
-    let remote = McpClient::new(
-        url,
-        tenant.clone(),
-        theorem_substrate_sync::railway_client::TenantToken::Present(token),
-    );
+    // Token is optional: the production rustyredcore-theorem-production tenant
+    // accepts unauthenticated MCP calls today (validated by direct curl probes
+    // before this test landed). Pass a token if your tenant is auth-gated.
+    let remote = match std::env::var("THEOREM_SYNC_RAILWAY_TOKEN").ok() {
+        Some(token) if !token.is_empty() => McpClient::new(
+            url.clone(),
+            tenant.clone(),
+            theorem_substrate_sync::railway_client::TenantToken::Present(token),
+        ),
+        _ => McpClient::unauthenticated(url.clone(), tenant.clone()),
+    };
 
     // Local stays a fake so we don't depend on a running local node for this
     // smoke. The exercise is: does the live Railway endpoint successfully
