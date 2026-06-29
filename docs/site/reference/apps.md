@@ -30,6 +30,7 @@ Standalone crates and clients under `apps/`. Each depends on the `rustyredcore_T
 | `theorem-harness-swift` | Swift (UniFFI) binding over the `theorem-harness` Rust SDK. Same surface as the Node binding, generated from the same core. Serves the iOS app. |
 | `theorem-ios` | SwiftPM native iOS client scaffold: SwiftUI shell, Dynamic Island control surface, projection picker, smoke executable. |
 | `theorem-proxy` | Local model-path proxy for Claude and Codex. Serves Anthropic Messages (`/v1/messages`) and OpenAI Responses (`/v1/responses`) on localhost, forwards to the provider upstreams, and injects RustyRed memory at the cache-stable suffix. Includes one-shot launchers for Claude Code, Claude Desktop gateway mode, and Codex. |
+| `theorem-substrate-sync` | Standalone local-to-hosted substrate sync daemon. Drives Prolly version-pack rounds over the existing graph-version MCP verbs, drains a Valkey outbox through harness stream verbs, maintains Valkey cursors, and exposes `/status` plus `/trigger` for the local stack. Default-off behind `THEOREM_SYNC_ENABLED=1`. |
 | `web` | Empty local web staging directory seen by full doc-drift checks. Not a tracked product surface yet; keep product web work in `harness-console` or `theorem-gateway` until it has a manifest and code. |
 
 This table is maintained by hand because the apps draw descriptions from mixed manifests (Cargo, package.json, Package.swift). When you add or rename an app, update this row and the app table in `CLAUDE.md`, then run `scripts/check-doc-drift.sh --refresh`.

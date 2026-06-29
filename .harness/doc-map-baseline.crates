@@ -39,6 +39,7 @@ rustyred-web
 scene-os-core
 scene-os-web
 theorem-acp
+theorem-agentd
 theorem-browser-agent
 theorem-copresence
 theorem-dispatch

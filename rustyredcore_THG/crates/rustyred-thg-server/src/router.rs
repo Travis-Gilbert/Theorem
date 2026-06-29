@@ -1117,7 +1117,7 @@ async fn mcp_post(
             payload,
         )
     });
-    let mut response = match tokio::time::timeout(Duration::from_secs(20), call).await {
+    let mut response = match tokio::time::timeout(mcp_http_budget(), call).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => mcp_http_error_response(
             request_id,
@@ -1226,6 +1226,25 @@ fn theorem_agent_http_timeout() -> Duration {
         .filter(|seconds| (1..=60).contains(seconds))
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(12))
+}
+
+/// Per-request HTTP budget for the MCP endpoint.
+///
+/// Hard ceiling for any single `POST /mcp` JSON-RPC call. Configurable via
+/// `THEOREM_MCP_HTTP_BUDGET_SECS` so a deployment with a large graph store
+/// (the production tenant carries multi-GB Prolly state) can grant slower
+/// verbs like `rustyred_thg_graph_version_ref` (which snapshots + compiles a
+/// pack) and `harness_kg_status` enough room to return. Defaults to 60s,
+/// up from the prior hardcoded 20s that was tripping on real production
+/// state. Bounded at 1..=300 so a misconfigured value cannot make the
+/// server hold a request open longer than Railway's own edge tolerance.
+fn mcp_http_budget() -> Duration {
+    std::env::var("THEOREM_MCP_HTTP_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=300).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(60))
 }
 
 fn mcp_payload_tenant(

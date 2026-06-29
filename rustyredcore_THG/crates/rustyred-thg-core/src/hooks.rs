@@ -39,9 +39,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
+use crate::crdt::{ActorId, Hlc};
 use crate::graph_store::{GraphStoreError, RedCoreGraphStore};
+use crate::state::stable_hash;
 
 /// The kind of mutation that produced an event. For edges, the event's
 /// `labels` carries `[edge_type]`, so matchers filter node labels and edge
@@ -301,6 +304,139 @@ impl fmt::Debug for HookRegistration {
 /// Default coalescing key: coalesce per event id.
 pub fn coalesce_per_id(_event: &MutationEvent) -> Option<String> {
     None
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SubstrateSyncEvent {
+    pub tenant: String,
+    pub op_kind: String,
+    pub id: String,
+    pub labels: Vec<String>,
+    pub changed_props: Vec<String>,
+    pub property_delta: Value,
+    pub committed_at_ms: u64,
+    pub hlc: Hlc,
+    pub content_hash: String,
+}
+
+impl From<&MutationEvent> for SubstrateSyncEvent {
+    fn from(event: &MutationEvent) -> Self {
+        let hlc = Hlc::new(
+            event.committed_at_ms.min(i64::MAX as u64) as i64,
+            event.depth,
+            ActorId::from_label("substrate-sync-hook"),
+        );
+        let mut envelope = Self {
+            tenant: event.tenant.clone(),
+            op_kind: event.kind.as_str().to_string(),
+            id: event.id.clone(),
+            labels: event.labels.clone(),
+            changed_props: event.changed_props.clone(),
+            property_delta: Value::Object(Map::new()),
+            committed_at_ms: event.committed_at_ms,
+            hlc,
+            content_hash: String::new(),
+        };
+        envelope.refresh_content_hash();
+        envelope
+    }
+}
+
+impl SubstrateSyncEvent {
+    fn refresh_content_hash(&mut self) {
+        self.content_hash.clear();
+        self.content_hash = stable_hash(serde_json::to_value(&self).unwrap_or_default());
+    }
+
+    fn with_property_delta(mut self, property_delta: Value) -> Self {
+        self.property_delta = property_delta;
+        self.refresh_content_hash();
+        self
+    }
+}
+
+pub trait SubstrateSyncOutbox: Send + Sync {
+    fn push(&self, tenant: &str, event: &SubstrateSyncEvent) -> Result<(), HookError>;
+}
+
+pub fn substrate_sync_hook(outbox: Arc<dyn SubstrateSyncOutbox>) -> HookRegistration {
+    let handler: HookHandler = Arc::new(move |_ctx, events| {
+        for event in events {
+            let envelope = SubstrateSyncEvent::from(event)
+                .with_property_delta(event_property_delta(_ctx.store, event));
+            outbox.push(&event.tenant, &envelope)?;
+        }
+        Ok(HookOutcome::Wrote {
+            mutations: events.len(),
+        })
+    });
+
+    HookRegistration::new(
+        "rustyred.substrate_sync.outbox",
+        MutationMatcher::any(),
+        coalesce_substrate_sync_event,
+        handler,
+    )
+}
+
+fn coalesce_substrate_sync_event(event: &MutationEvent) -> Option<String> {
+    Some(format!(
+        "{}:{}:{}:{}",
+        event.kind.as_str(),
+        event.id,
+        event.committed_at_ms,
+        event.depth
+    ))
+}
+
+fn event_property_delta(store: &RedCoreGraphStore, event: &MutationEvent) -> Value {
+    match event.kind {
+        MutationKind::NodeUpserted | MutationKind::NodeDeleted => store
+            .get_node(&event.id)
+            .ok()
+            .flatten()
+            .map(|node| {
+                json!({
+                    "record_kind": "node",
+                    "version": node.version,
+                    "tombstone": node.tombstone,
+                    "properties": select_changed_props(&node.properties, &event.changed_props),
+                    "record": node,
+                })
+            })
+            .unwrap_or_else(|| json!({ "record_kind": "node", "deleted": true })),
+        MutationKind::EdgeUpserted | MutationKind::EdgeDeleted => store
+            .get_edge(&event.id)
+            .ok()
+            .flatten()
+            .map(|edge| {
+                json!({
+                    "record_kind": "edge",
+                    "version": edge.version,
+                    "tombstone": edge.tombstone,
+                    "from_id": edge.from_id,
+                    "to_id": edge.to_id,
+                    "edge_type": edge.edge_type,
+                    "confidence": edge.confidence,
+                    "properties": select_changed_props(&edge.properties, &event.changed_props),
+                    "record": edge,
+                })
+            })
+            .unwrap_or_else(|| json!({ "record_kind": "edge", "deleted": true })),
+    }
+}
+
+fn select_changed_props(properties: &Value, changed_props: &[String]) -> Value {
+    let Some(properties) = properties.as_object() else {
+        return Value::Object(Map::new());
+    };
+    let mut out = Map::new();
+    for key in changed_props {
+        if let Some(value) = properties.get(key) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 /// Abstracts how the worker obtains exclusive access to the store to run
@@ -826,6 +962,20 @@ pub(crate) fn changed_property_keys(prior: Option<&Value>, next: &Value) -> Vec<
 mod tests {
     use super::*;
 
+    struct FakeOutbox {
+        events: Arc<Mutex<Vec<SubstrateSyncEvent>>>,
+    }
+
+    impl SubstrateSyncOutbox for FakeOutbox {
+        fn push(&self, _tenant: &str, event: &SubstrateSyncEvent) -> Result<(), HookError> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event.clone());
+            Ok(())
+        }
+    }
+
     fn ev(
         kind: MutationKind,
         id: &str,
@@ -942,5 +1092,41 @@ mod tests {
         );
         assert_eq!(a.depth, 1);
         assert_eq!(a.committed_at_ms, 20);
+    }
+
+    #[test]
+    fn substrate_sync_hook_pushes_flat_event_to_outbox() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let outbox = Arc::new(FakeOutbox {
+            events: Arc::clone(&events),
+        });
+        let reg = substrate_sync_hook(outbox);
+        let mut store = RedCoreGraphStore::memory();
+        let mut ctx = HookContext {
+            store: &mut store,
+            tenant: "tenant-a",
+            depth: 1,
+        };
+        let event = MutationEvent::new(
+            MutationKind::NodeUpserted,
+            "tenant-a",
+            "mem:a",
+            vec!["MemoryDocument".to_string()],
+            vec!["status".to_string(), "tags".to_string()],
+            42,
+            0,
+        );
+
+        (reg.handler)(&mut ctx, &[event]).expect("hook handler");
+
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op_kind, "node_upserted");
+        assert_eq!(events[0].id, "mem:a");
+        assert_eq!(events[0].changed_props, vec!["status", "tags"]);
+        assert_eq!(events[0].hlc.physical_ms, 42);
+        assert!(!events[0].content_hash.is_empty());
     }
 }
