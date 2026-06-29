@@ -183,6 +183,7 @@ fn signature_changed(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drift_finding(
     input: &CodeSpecDriftInput,
     drift_kind: CodeSpecDriftKind,

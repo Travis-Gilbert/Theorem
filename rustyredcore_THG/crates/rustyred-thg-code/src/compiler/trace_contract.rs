@@ -12,6 +12,7 @@ pub struct RuntimeTraceEvent {
 }
 
 /// Typed payload variants for trace events.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RuntimeTraceEventKind {
     HttpExchange(HttpExchangeTrace),
@@ -224,7 +225,7 @@ pub fn compile_trace_contract(events: &[RuntimeTraceEvent]) -> TraceContractRepo
                         .request_body_shape
                         .entry(shape.kind)
                         .or_default()
-                        .extend(shape.fields.into_iter());
+                        .extend(shape.fields);
                 }
                 if let Some(shape) = &exchange.response_body_shape {
                     let shape = shape.normalized();
@@ -232,7 +233,7 @@ pub fn compile_trace_contract(events: &[RuntimeTraceEvent]) -> TraceContractRepo
                         .response_body_shape
                         .entry(shape.kind)
                         .or_default()
-                        .extend(shape.fields.into_iter());
+                        .extend(shape.fields);
                 }
                 for evidence in &exchange.evidence_ids {
                     entry.evidence_ids.insert(evidence.clone());

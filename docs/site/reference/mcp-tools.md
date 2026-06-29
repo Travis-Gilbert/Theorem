@@ -95,7 +95,20 @@ Search and ingest code as a graph.
 |---|---|
 | `compute_code` | Native code discovery: search, context, explain, recognize, explore. |
 | `code_ingest` | Ingest or reindex a local repository into the code graph. |
+| `code_compile_spec` | Compile CodeFile/CodeSymbol graph records into a CodeSpecification IR snapshot. |
+| `code_extract_features` | Extract code connection feature records from a repository code graph snapshot. |
+| `code_implementation_obligations` | Compile implementation obligations from code spec, feature, pattern, and drift evidence. |
+| `code_patterns_relevant` | Read relevant code pattern memories for a repository and query or path prefix. |
+| `code_spec_drift` | Compare a CodeSpecification against the current repository code graph snapshot. |
+| `reverse_engineer_compose` | Compose source ensure, code compiler, Datawave projection, binary summary, and receipt writing into a ReconstructionSpec. |
+| `reverse_engineer_slice` | Select a bounded feature slice from a composed ReconstructionSpec. |
+| `reverse_engineer_behavior_ir` | Lower a feature slice into language-neutral behavior IR. |
+| `reverse_engineer_target_plan` | Lower behavior IR into a target-language/project plan. |
+| `reverse_engineer_emit` | Emit a conservative PatchSet scaffold and tests from behavior IR and a target plan. |
+| `reverse_engineer_validate` | Attach not-run validation receipts to an emitted PatchSet for the target checkout. |
+| `reverse_engineer_port` | Run compose -> slice -> behavior IR -> target plan -> emit -> validate and return all artifacts. |
 | `reconstruct_binary` | Load/analyze/lift binary artifacts through the reconstruction harness and return evidence-backed reconstruction receipts. |
+| `datawave_ingest` | Normalize records into Datawave-style field facts, entity edges, dictionary entries, and lookup/intersection receipts. |
 | `harness_kg_status` | Status of the merged code-graph view (base + session delta). |
 | `harness_kg_search` | Lexical code-object search. |
 | `harness_kg_ppr` | Rank code objects by relevance to seeds. |

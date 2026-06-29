@@ -12,7 +12,7 @@ pub const SPECIFIES_CODE: &str = "SPECIFIES_CODE";
 pub const DRIFT_FOR_SPEC: &str = "DRIFT_FOR_SPEC";
 pub const DRIFT_FOR_CODE: &str = "DRIFT_FOR_CODE";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CodeSpecCompileInput {
     pub tenant_id: String,
     pub repo_id: String,
@@ -43,7 +43,7 @@ impl CodeSpecCompileInput {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CodeSpecDriftInput {
     pub tenant_id: String,
     pub repo_id: String,
@@ -96,6 +96,8 @@ pub struct CodeSymbolSnapshot {
     pub line: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     #[serde(default)]
     pub call_names: Vec<String>,
     #[serde(default)]
@@ -117,7 +119,7 @@ pub struct CodeDependencySnapshot {
     pub edge_type: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CodeSpecCompileOutput {
     pub spec_node: NodeRecord,
     pub spec_edges: Vec<EdgeRecord>,
@@ -167,7 +169,7 @@ pub struct CodeSpecDriftFinding {
     pub suggested_next_step: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CodeSpecDriftReport {
     pub tenant_id: String,
     pub repo_id: String,

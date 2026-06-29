@@ -55,7 +55,8 @@ This file is the navigation map. Read it first. Order of truth: this map, then t
 | `rustyred-thg-adapters` | Adapters into the core. |
 | `rustyred-thg-affordances` | Connector-as-substrate learning registry: MCP tools become `Affordance` nodes; PPR-over-outcomes selection scoped per agent (`CapabilityScope`). |
 | `rustyred-thg-binformat` | Binary-reconstruction loader (artifact/section/symbol/string/reloc/entrypoint facts -> GraphStore). |
-| `rustyred-thg-code` | Code parsing plugin: source -> code graph for CodeCrawler/code-KG; opt-in on-write symbol indexing; embeddings via `rustyred-code-embedding`. |
+| `rustyred-thg-behavior-ir` | Language-neutral feature-port contracts: source slice, behavior IR, target plan, patch set, and validation receipt shapes for reverse-engineer emit. |
+| `rustyred-thg-code` | Code graph and compiler runtime: source -> code KG, code spec/features/obligations/drift, reverse-engineer compose, Datawave projection, and behavior-IR feature-port scaffolds. |
 | `rustyred-thg-connectors` | Live outbound MCP transport: connect over stdio, walk `tools/list`, register each as a learnable `Affordance`; invoke bridge gated by `InvokePolicy`. |
 | `rustyred-thg-disasm` | Binary-reconstruction decoder (`iced-x86` -> `InstructionFact` nodes). |
 | `rustyred-thg-lift` | Binary-reconstruction THIR lifter (instructions -> SSA-like `ThirFunction`). |
@@ -66,7 +67,7 @@ This file is the navigation map. Read it first. Order of truth: this map, then t
 | `rustyred-thg-compat-server` | Legacy HTTP control server (command exec/run/state-hash/health over memory or Redis). |
 | `rustyred-thg-geotemporal` | Geo + temporal indexing (`time_series` access method for `TimeRange`). |
 | `rustyred-thg-fractal` | Native fractal expansion over RustyRed+RustyWeb (crawls/admits web state into a quarantined lower-trust tier). |
-| `rustyred-thg-mcp` | Native Rust MCP server (graph reads/algorithms; GraphQL surface, adaptive-index inspection, `reconstruct_binary`, `datawave_ingest`). The in-process MCP seam. |
+| `rustyred-thg-mcp` | Native Rust MCP server (graph reads/algorithms; GraphQL surface, adaptive-index inspection, `compute_code`/`code_ingest`, compiler tools, `reconstruct_binary`, `datawave_ingest`, and `reverse_engineer_*`). The in-process MCP seam. |
 | `rustyred-thg-ml` | Graph tensor + message-passing primitives (`GraphTensorBatch`, scatter; feature-gated Burn). |
 | `rustyred-thg-offload` | Compute-offload planner (operation algebra, reuse cache, pushdown/fusion, cascade routing); one routed affordance `compute_offload.route_operation`. |
 | `rustyred-thg-graphblas` | GraphBLAS sparse-matrix compute core (SuiteSparse v9.4.5 + LAGraph v1.2.1 FFI/safe layer, masked `mxv`/`mxm`, the 7 LAGraph algorithms). NOT a workspace member; pulled via core's optional `graphblas` feature. Build needs `RUSTYRED_GRAPHBLAS_PREFIX` + `LIBCLANG_PATH`; downstream binaries need `DYLD_FALLBACK_LIBRARY_PATH`. |

@@ -2,7 +2,7 @@
 name = "rustyred-thg-mcp"
 version = "0.5.0"
 edition = "2021"
-description = "Model Context Protocol adapter for the Theorem HotGraph graph database."
+description = "Native MCP adapter for Theorem graph, code, reconstruction, and reverse-engineer tools."
 license = "MIT"
 rust-version = "1.85"
 

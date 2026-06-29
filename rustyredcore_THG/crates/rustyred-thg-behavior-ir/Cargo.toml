@@ -1,0 +1,11 @@
+[package]
+name = "rustyred-thg-behavior-ir"
+version = "0.1.0"
+edition = "2021"
+description = "Portable behavior IR for Theorem feature-port reconstruction."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

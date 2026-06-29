@@ -26,6 +26,7 @@ members = [
     "crates/rustyred-hipporag",
     "crates/rustyred-web",
     "crates/rustyred-code-embedding",
+    "crates/rustyred-thg-behavior-ir",
     "crates/rustyred-thg-code",
     "crates/rustyred-thg-memory",
     "crates/rustyred-thg-catalog",

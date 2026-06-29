@@ -114,7 +114,7 @@ pub struct CodeFeatureRecord {
     pub provenance: Value,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CodeFeatureExtractOutput {
     pub tenant_id: String,
     pub repo_id: String,
