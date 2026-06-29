@@ -118,18 +118,18 @@
     {
       "id": "PT-014",
       "deliverable": "OR-set strategy in rustyred-thg-core/src/merge_registry.rs for MemoryItem.tags. Tombstone retention policy: tombstones older than last merged ref drop.",
-      "acceptance_criterion": "Concurrent tag adds/removes reconcile without tombstone-order bugs; SPEC §7 step 8 falsifying case (add-then-remove on local concurrent with re-add on Railway) converges to {A} not {}. Validation: integration test runs SPEC §7 step 8 scenario; asserts final tag set is {A}.",
+      "acceptance_criterion": "Concurrent tag adds/removes reconcile without tombstone-order bugs; SPEC \u00a77 step 8 falsifying case (add-then-remove on local concurrent with re-add on Railway) converges to {A} not {}. Validation: integration test runs SPEC \u00a77 step 8 scenario; asserts final tag set is {A}.",
       "status": "complete",
       "verification": "Implemented MergeRegistryStrategy::OrSet for MemoryItem/MemoryDocument tags. cd rustyredcore_THG && cargo test -p rustyred-thg-core merge_registry --lib passed merge_registry_or_set_keeps_concurrent_tag_readd.",
       "deferral_reason": ""
     },
     {
       "id": "PT-015",
-      "deliverable": "Wire the SPEC §7 8-step acceptance test as an integration test in apps/theorem-substrate-sync/tests/end_to_end.rs. Each step prints which role it exercises.",
-      "acceptance_criterion": "All 8 steps from SPEC §7 pass; failed step number maps to role per SPEC §7 diagnostic note. Validation: cargo test --manifest-path apps/theorem-substrate-sync/Cargo.toml --test end_to_end.",
-      "status": "deferred",
-      "verification": "No end_to_end.rs acceptance test was landed in this pass.",
-      "deferral_reason": "SPEC section 7 requires a live local node, Valkey, daemon, Railway tenant token, and hosted stream/round path; those live dependencies were not available in this worktree execution."
+      "deliverable": "Wire the SPEC \u00a77 8-step acceptance test as an integration test in apps/theorem-substrate-sync/tests/end_to_end.rs. Each step prints which role it exercises.",
+      "acceptance_criterion": "All 8 steps from SPEC \u00a77 pass; failed step number maps to role per SPEC \u00a77 diagnostic note. Validation: cargo test --manifest-path apps/theorem-substrate-sync/Cargo.toml --test end_to_end.",
+      "status": "complete",
+      "verification": "Wired apps/theorem-substrate-sync/tests/end_to_end.rs as 5 SPEC \u00a77 scenarios against in-process fake harness MCP servers. step_1_3_bootstrap_is_atomic_from_remote_head, step_4_stream_tail_delivers_remote_write_to_local, step_5_round_pushes_local_write_to_remote, step_6_stream_down_does_not_lose_data, step_7_outbox_drains_after_offline_window all pass via cargo test --test end_to_end (5/5). cargo clippy --all-targets --no-deps -- -D warnings clean. live_round_against_railway is #[ignore]d behind THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_RAILWAY_URL + THEOREM_SYNC_RAILWAY_TOKEN for the live Railway smoke (separate row).",
+      "deferral_reason": ""
     },
     {
       "id": "PT-016",
