@@ -132,6 +132,20 @@ impl RelationalStore {
             ));
         }
         let relation_id = row.relation.clone();
+        if let Some(existing) = self
+            .relations
+            .get(&relation_id)
+            .and_then(|relation| relation.get(&row.id))
+            .cloned()
+        {
+            self.access_methods.on_write(&RowChange {
+                relation: relation_id.clone(),
+                row_id: existing.id,
+                values: existing.values,
+                properties: existing.properties,
+                kind: RowChangeKind::Delete,
+            })?;
+        }
         self.relations
             .entry(relation_id.clone())
             .or_insert_with(|| Relation::new(inferred_schema(&relation_id, &row)));
@@ -146,6 +160,72 @@ impl RelationalStore {
             relation.upsert(row);
         }
         Ok(())
+    }
+
+    pub fn delete_row(&mut self, relation: &str, row_id: &str) -> GraphStoreResult<bool> {
+        let Some(existing) = self
+            .relations
+            .get(relation)
+            .and_then(|relation| relation.get(row_id))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        self.access_methods.on_write(&RowChange {
+            relation: relation.to_string(),
+            row_id: existing.id.clone(),
+            values: existing.values,
+            properties: existing.properties,
+            kind: RowChangeKind::Delete,
+        })?;
+        if let Some(relation) = self.relations.get_mut(relation) {
+            relation.rows.remove(row_id);
+        }
+        Ok(true)
+    }
+
+    pub fn drop_relation(&mut self, relation: &str) -> GraphStoreResult<bool> {
+        let Some(existing) = self.relations.remove(relation) else {
+            return Ok(false);
+        };
+        for row in existing.rows.into_values() {
+            self.access_methods.on_write(&RowChange {
+                relation: relation.to_string(),
+                row_id: row.id,
+                values: row.values,
+                properties: row.properties,
+                kind: RowChangeKind::Delete,
+            })?;
+        }
+        Ok(true)
+    }
+
+    pub fn replace_relation(
+        &mut self,
+        schema: RelationSchema,
+        rows: Vec<RelationalRow>,
+    ) -> GraphStoreResult<()> {
+        self.drop_relation(&schema.relation)?;
+        self.create_relation(schema);
+        for row in rows {
+            self.upsert_row(row)?;
+        }
+        Ok(())
+    }
+
+    pub fn rename_relation(&mut self, from: &str, to: &str) -> GraphStoreResult<bool> {
+        let Some(existing) = self.relations.get(from).cloned() else {
+            return Ok(false);
+        };
+        self.drop_relation(from)?;
+        let mut schema = existing.schema;
+        schema.relation = to.to_string();
+        self.create_relation(schema);
+        for mut row in existing.rows.into_values() {
+            row.relation = to.to_string();
+            self.upsert_row(row)?;
+        }
+        Ok(true)
     }
 
     pub fn relation(&self, relation: &str) -> Option<&Relation> {

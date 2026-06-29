@@ -1,0 +1,14 @@
+rustyred_pgwire:
+  target: local
+  outputs:
+    local:
+      type: postgres
+      host: 127.0.0.1
+      port: "{{ env_var('RUSTYRED_DBT_PG_PORT', '6543') | int }}"
+      user: postgres
+      password: "{{ env_var('RUSTYRED_DBT_PG_PASSWORD', '') }}"
+      dbname: postgres
+      schema: public
+      threads: 1
+      connect_timeout: 10
+      sslmode: disable
