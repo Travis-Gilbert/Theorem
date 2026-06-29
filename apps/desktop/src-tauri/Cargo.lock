@@ -730,6 +730,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d6867f1565b3aad85681f1015055b087fcfd840d6aeee6eee7f2da317603695"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2929,6 +2942,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "theorem-agentd",
+ "theorem-proxy",
  "theorem-receiver",
  "tokio",
 ]
@@ -3948,6 +3962,12 @@ dependencies = [
  "pin-project-lite",
  "slab",
 ]
+
+[[package]]
+name = "fuzzyhash"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f79db37cf4b2ca9a6b735f62ca679926ba0d233d47e164147298fd4fa4786db"
 
 [[package]]
 name = "gdk"
@@ -8061,6 +8081,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-datawave"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "fuzzyhash",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "rustyred-thg-datawave-harness"
+version = "0.1.0"
+dependencies = [
+ "rustyred-thg-core",
+ "rustyred-thg-datawave",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-disasm"
 version = "0.1.0"
 dependencies = [
@@ -8109,9 +8151,11 @@ dependencies = [
  "rustyred-thg-code",
  "rustyred-thg-connectors",
  "rustyred-thg-core",
+ "rustyred-thg-datawave-harness",
  "rustyred-thg-ml",
  "rustyred-thg-offload",
  "rustyred-thg-reconstruct-harness",
+ "rustyred-web",
  "serde",
  "serde_json",
  "theorem-harness-core",
@@ -8189,6 +8233,7 @@ dependencies = [
  "rustyred-thg-affordances",
  "rustyred-thg-connectors",
  "rustyred-thg-core",
+ "rustyred-thg-datawave-harness",
  "rustyred-thg-fractal",
  "rustyred-thg-mcp",
  "rustyred-web",
@@ -8223,6 +8268,7 @@ dependencies = [
  "rustyred-membrane",
  "rustyred-rerank",
  "rustyred-thg-core",
+ "rustyred-thg-datawave",
  "serde",
  "serde_json",
  "texting_robots",
@@ -9730,8 +9776,10 @@ dependencies = [
  "axum 0.8.9",
  "futures-util",
  "reqwest 0.12.28",
+ "rustyred-thg-core",
  "serde",
  "serde_json",
+ "theorem-copresence",
  "theorem-receiver",
  "tokio",
  "toml 0.8.2",
@@ -9796,6 +9844,19 @@ dependencies = [
  "theorem-harness-core",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "theorem-proxy"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "clap",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+ "ureq 2.12.1",
 ]
 
 [[package]]

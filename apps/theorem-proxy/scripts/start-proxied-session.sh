@@ -2,7 +2,7 @@
 # One-shot: bring up the local node and run Claude Code through the proxy with ambient
 # memory (roadmap G3). Tears the node down on exit.
 #
-#   scripts/start-proxied-session.sh                 # node + proxy + `claude`
+#   scripts/start-proxied-session.sh                 # node + proxy + Claude Code
 #   THEOREM_SEED=1 scripts/start-proxied-session.sh  # also (re)seed the node's graph memory
 #   scripts/start-proxied-session.sh claude -p "hi"  # args pass through to the wrapped cmd
 #
@@ -16,13 +16,30 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE_PORT="${RUSTY_RED_PORT:-8380}"
 PROXY_PORT="${THEOREM_PROXY_PORT:-8788}"
 PROXY="${THEOREM_PROXY_BIN:-$HOME/.cargo/bin/theorem-proxy}"
-MEM_DIR="${THEOREM_MEMORY_DIR:-$HOME/.claude/projects/-Users-travisgilbert-Tech-Dev-Local-Creative-Website-Theorem/memory}"
-
-# Only tear down a node THIS script started (NODE_PID set below). A node that was already
-# running when we launched is left alone on exit.
+PROJECT_KEY="$(printf '%s' "$PWD" | sed 's#/#-#g')"
+MEM_DIR="${THEOREM_MEMORY_DIR:-$HOME/.claude/projects/$PROJECT_KEY/memory}"
+NODE_LOG="${THEOREM_NODE_LOG:-$(mktemp -t theorem-node.XXXXXX.log)}"
 NODE_PID=""
-cleanup() { [ -n "$NODE_PID" ] && kill "$NODE_PID" >/dev/null 2>&1 || true; }
+
+cleanup() {
+  if [ -n "$NODE_PID" ] && kill -0 "$NODE_PID" >/dev/null 2>&1; then
+    kill "$NODE_PID" >/dev/null 2>&1 || true
+    wait "$NODE_PID" >/dev/null 2>&1 || true
+  fi
+}
 trap cleanup EXIT INT TERM
+
+default_claude_cmd() {
+  if [ -n "${THEOREM_CLAUDE_BIN:-}" ]; then
+    printf '%s\n' "$THEOREM_CLAUDE_BIN"
+    return 0
+  fi
+  if [ -x "$HOME/.local/bin/claude" ]; then
+    printf '%s\n' "$HOME/.local/bin/claude"
+    return 0
+  fi
+  command -v claude
+}
 
 up() {
   for _ in $(seq 1 300); do
@@ -35,11 +52,11 @@ up() {
 # Local node (embedded RedCore = RustyRed). Serves the harness MCP tools the plugin now
 # points at, plus the optional node graph memory.
 if ! curl -fsS "http://127.0.0.1:$NODE_PORT/ready" >/dev/null 2>&1; then
-  RUSTY_RED_PORT="$NODE_PORT" bash "$HERE/node-local.sh" >/tmp/theorem-node.log 2>&1 &
+  RUSTY_RED_PORT="$NODE_PORT" bash "$HERE/node-local.sh" >"$NODE_LOG" 2>&1 &
   NODE_PID=$!
 fi
 up "http://127.0.0.1:$NODE_PORT/ready" || {
-  echo "node failed to start; see /tmp/theorem-node.log" >&2
+  echo "node failed to start; see $NODE_LOG" >&2
   exit 1
 }
 echo "node up (embedded RedCore) at 127.0.0.1:$NODE_PORT"
@@ -51,7 +68,9 @@ if [ "${THEOREM_SEED:-0}" = "1" ]; then
     || echo "seed had issues (continuing)" >&2
 fi
 
-[ "$#" -eq 0 ] && set -- claude
+if [ "$#" -eq 0 ]; then
+  set -- "$(default_claude_cmd)"
+fi
 if [ "${THEOREM_USE_NODE_MEMORY:-0}" = "1" ]; then
   SOURCE=(--memory-url "http://127.0.0.1:$NODE_PORT/mcp")
   echo "launching '$*' (ambient memory: node graph) ..."

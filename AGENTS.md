@@ -7,6 +7,22 @@ This file briefs coding agents working in this repository. CLAUDE.md carries the
 - Run `git pull` first. Commits made through the GitHub MCP land on the remote, not on this local checkout, until you pull.
 - There is no top-level Cargo workspace. Use `rustyredcore_THG/` for workspace Cargo commands, or the specific standalone app manifest when the task points at one.
 
+## Local RustyRed and model-path proxy
+
+The practical "next session inside local RustyRed" path is the local node plus model-path proxy. Keep the source working directory as this checkout or a materialized RustyRed worktree unless a task explicitly asks for a DocTree/FUSE mount. Claude Desktop can also use this path through Desktop 3P gateway mode; do not configure it as an MCP HTTP server. Codex can use the same proxy through the OpenAI Responses surface.
+
+- One-shot launch from this repo: `apps/theorem-proxy/scripts/start-proxied-session.sh`. It starts the local embedded RedCore/RustyRed node, starts `theorem-proxy`, and runs `claude` with `ANTHROPIC_BASE_URL` pointed at the proxy for that process.
+- One-shot Codex launch from this repo: `apps/theorem-proxy/scripts/start-proxied-codex-session.sh`. It starts the local node and proxy, then runs `codex -c 'openai_base_url="http://127.0.0.1:8788/v1"'`, so Codex's Responses traffic passes through RustyRed/proxy for that process.
+- Claude Desktop gateway launch from this repo: `apps/theorem-proxy/scripts/start-desktop-gateway.sh`. Export exactly one upstream credential first (`THEOREM_PROXY_UPSTREAM_API_KEY` or `THEOREM_PROXY_UPSTREAM_AUTH_TOKEN`). For subscription/OAuth tokens, also export `THEOREM_PROXY_UPSTREAM_BETA=oauth-2025-04-20`.
+- First-run seed: `THEOREM_SEED=1 apps/theorem-proxy/scripts/start-proxied-session.sh`.
+- Graph-memory path: `THEOREM_USE_NODE_MEMORY=1 apps/theorem-proxy/scripts/start-proxied-session.sh` uses the live node's `/mcp` retrieval path. Without it, the launcher uses the fast directory-memory fallback.
+- Local node state lives on the external SSD by default (`/Volumes/SSD Samsung/theorem-local-node`). Do not treat that directory as a source checkout; it is durable RustyRed graph/file state.
+- Embedded RedCore is the canonical local mode (`RUSTY_RED_MODE=embedded`). Valkey is only the Redis-wire compatibility/warm-tier path via `apps/theorem-proxy/scripts/valkey-local.sh` and `RUSTY_RED_MODE=redis`; do not describe Valkey as required for the normal local session.
+- To point an existing Claude Code process at the proxy, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8788`. Claude Code's gateway docs say env vars can also be persisted under the `env` key in `~/.claude/settings.json` or `.claude/settings.local.json`; keep credentials out of committed project settings. Setting only `ANTHROPIC_BASE_URL` routes model traffic through the proxy but does not replace the active Claude credential.
+- To point an existing Codex process at the proxy, run with `codex -c 'openai_base_url="http://127.0.0.1:8788/v1"'` or add the same `openai_base_url` only to a temporary/profile config. Keep the normal global Codex config untouched unless the user explicitly asks for persistent routing.
+- To point Claude Desktop at the proxy, use Claude Desktop 3P gateway config (`~/Library/Application Support/Claude-3p/claude_desktop_config.json` or the in-app Developer -> Configure third-party inference flow), not `mcpServers`. The Desktop config may use a harmless local gateway key; the running proxy must provide the real upstream credential through `THEOREM_PROXY_UPSTREAM_API_KEY` or `THEOREM_PROXY_UPSTREAM_AUTH_TOKEN`, so Desktop's local key is stripped before forwarding.
+- The proxy makes RustyRed memory/coordination ambient for Claude Code and Codex on their model path. It does not, by itself, make Codex a second live voice inside the Claude Code UI. Cross-head copresence still needs the `theorem-receiver`/head-adapter job path or a composed Agent Theorem user surface.
+
 ## The harness (Theorems-Harness V2)
 
 This project has a persistent memory and coordination substrate. Use it reflexively, not on request.

@@ -101,7 +101,9 @@ async fn memory_request_carries_no_anthropic_credential() {
 
     let names = seen.lock().unwrap();
     assert!(
-        !names.iter().any(|h| h == "x-api-key" || h == "authorization"),
+        !names
+            .iter()
+            .any(|h| h == "x-api-key" || h == "authorization"),
         "memory-node request must not carry the Anthropic credential; saw: {names:?}"
     );
 }

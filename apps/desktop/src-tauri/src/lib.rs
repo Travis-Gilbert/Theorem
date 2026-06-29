@@ -21,6 +21,7 @@ const HOSTED_ENDPOINT: &str = "https://rustyredcore-theorem-production.up.railwa
 const LOCAL_NODE_PORT: u16 = 17888;
 const COMMONPLACE_NODE_PORT: u16 = 17890;
 const PROXY_NODE_PORT: u16 = 8484;
+const THEOREM_PROXY_PORT: u16 = 17891;
 const KEYCHAIN_SERVICE: &str = "com.theorem.desktop";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -356,6 +357,15 @@ struct CommonplaceRuntime {
     shutdown: Option<oneshot::Sender<()>>,
 }
 
+/// The in-process theorem-proxy (D6). `theorem_proxy::serve` has no shutdown hook, so
+/// the spawn handle is stored and aborted on app teardown.
+struct TheoremProxyRuntime {
+    endpoint: String,
+    port: u16,
+    running: Arc<AtomicBool>,
+    handle: Option<tauri::async_runtime::JoinHandle<()>>,
+}
+
 struct ProxyRuntime {
     endpoint: String,
     store_path: String,
@@ -381,6 +391,7 @@ struct DesktopBackendState {
     receiver: ReceiverSettings,
     local_node: Option<LocalNodeRuntime>,
     commonplace_node: Option<CommonplaceRuntime>,
+    theorem_proxy: Option<TheoremProxyRuntime>,
     proxy_node: Option<ProxyRuntime>,
     receiver_runtime: Option<ReceiverRuntime>,
     /// The bundled ambient watcher running over the working tree, if started.
@@ -414,6 +425,7 @@ impl Default for DesktopBackendState {
             },
             local_node: None,
             commonplace_node: None,
+            theorem_proxy: None,
             proxy_node: None,
             receiver_runtime: None,
             ambient: None,
@@ -1337,6 +1349,7 @@ fn start_proxy_node(
         harness_bearer,
         harness_token_env: Some("THEOREM_HARNESS_TOKEN".to_string()),
         tenant_slug,
+        default_room_id: "repo:theorem:branch:main".to_string(),
         enable_ambient: true,
         tool_result_budget_bytes: theorem_agentd::proxy::DEFAULT_TOOL_RESULT_BUDGET_BYTES,
         ambient_budget_bytes: theorem_agentd::proxy::DEFAULT_AMBIENT_BUDGET_BYTES,
@@ -1528,9 +1541,156 @@ fn stop_local_node(state: &tauri::State<'_, Mutex<DesktopBackendState>>) {
                 let _ = shutdown.send(());
             }
         }
+        if let Some(mut proxy) = backend.theorem_proxy.take() {
+            proxy.running.store(false, Ordering::SeqCst);
+            if let Some(handle) = proxy.handle.take() {
+                handle.abort();
+            }
+        }
         stop_ambient_watcher_locked(&mut backend);
         stop_receiver_locked(&mut backend);
     }
+}
+
+// ---- theorem-proxy (D6): in-process proxy + one-click Claude Code connect ----
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TheoremProxyStatus {
+    proxy_up: bool,
+    connected: bool,
+    endpoint: String,
+    port: u16,
+}
+
+/// Spawn theorem-proxy in-process on `THEOREM_PROXY_PORT`, injecting ambient memory from
+/// the desktop's local node (`/mcp`). The spawn handle is stored for teardown.
+fn start_theorem_proxy(state: &tauri::State<'_, Mutex<DesktopBackendState>>) -> Result<(), String> {
+    let memory_url = format!("http://127.0.0.1:{LOCAL_NODE_PORT}/mcp");
+    let (memory, _desc) = theorem_proxy::resolve_memory(Some(&memory_url), None, None);
+    let config = theorem_proxy::ProxyConfig {
+        memory,
+        max_memories: 8,
+        membrane_threshold: 0,
+        ..Default::default()
+    };
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], THEOREM_PROXY_PORT).into();
+    let running = Arc::new(AtomicBool::new(true));
+    let running_task = Arc::clone(&running);
+    let handle = tauri::async_runtime::spawn(async move {
+        if let Err(error) = theorem_proxy::serve(addr, config).await {
+            eprintln!("[theorem-desktop] theorem-proxy stopped: {error}");
+        }
+        running_task.store(false, Ordering::SeqCst);
+    });
+    let mut backend = state.lock().map_err(|error| error.to_string())?;
+    backend.theorem_proxy = Some(TheoremProxyRuntime {
+        endpoint: format!("http://127.0.0.1:{THEOREM_PROXY_PORT}"),
+        port: THEOREM_PROXY_PORT,
+        running,
+        handle: Some(handle),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn theorem_proxy_status(
+    state: tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<TheoremProxyStatus, String> {
+    let backend = state.lock().map_err(|error| error.to_string())?;
+    let (proxy_up, endpoint, port) = backend
+        .theorem_proxy
+        .as_ref()
+        .map(|proxy| {
+            let proxy_up = proxy.running.load(Ordering::SeqCst);
+            (proxy_up, proxy.endpoint.clone(), proxy.port)
+        })
+        .unwrap_or((
+            false,
+            format!("http://127.0.0.1:{THEOREM_PROXY_PORT}"),
+            THEOREM_PROXY_PORT,
+        ));
+    let connected = current_claude_base_url().as_deref() == Some(endpoint.as_str());
+    Ok(TheoremProxyStatus {
+        proxy_up,
+        connected,
+        endpoint,
+        port,
+    })
+}
+
+/// Point Claude Code at the local proxy by merging ANTHROPIC_BASE_URL into the user's
+/// `~/.claude/settings.json` env (preserving every other setting). Returns the URL.
+#[tauri::command]
+fn connect_claude_code(
+    state: tauri::State<'_, Mutex<DesktopBackendState>>,
+) -> Result<String, String> {
+    let endpoint = {
+        let backend = state.lock().map_err(|error| error.to_string())?;
+        backend
+            .theorem_proxy
+            .as_ref()
+            .map(|proxy| proxy.endpoint.clone())
+            .unwrap_or_else(|| format!("http://127.0.0.1:{THEOREM_PROXY_PORT}"))
+    };
+    set_claude_base_url(Some(&endpoint))?;
+    Ok(endpoint)
+}
+
+/// Remove the proxy's ANTHROPIC_BASE_URL from `~/.claude/settings.json` (reversible).
+#[tauri::command]
+fn disconnect_claude_code() -> Result<(), String> {
+    set_claude_base_url(None)
+}
+
+fn claude_settings_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home).join(".claude").join("settings.json"))
+}
+
+fn current_claude_base_url() -> Option<String> {
+    let raw = std::fs::read_to_string(claude_settings_path().ok()?).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    root.get("env")?
+        .get("ANTHROPIC_BASE_URL")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Set (or clear, with `None`) `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json`
+/// without disturbing any other key.
+fn set_claude_base_url(value: Option<&str>) -> Result<(), String> {
+    let path = claude_settings_path()?;
+    let mut root: serde_json::Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        serde_json::from_str(&raw)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+    if !root.is_object() {
+        return Err(format!("{} must contain a JSON object", path.display()));
+    }
+    let object = root.as_object_mut().expect("root is an object");
+    let env = object.entry("env").or_insert_with(|| serde_json::json!({}));
+    if !env.is_object() {
+        return Err(format!("{}.env must contain a JSON object", path.display()));
+    }
+    let env = env.as_object_mut().expect("env is an object");
+    match value {
+        Some(url) => {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(url));
+        }
+        None => {
+            env.remove("ANTHROPIC_BASE_URL");
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let pretty = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
+    std::fs::write(&path, pretty).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// The working tree the bundled ambient watcher runs over. Defaults to the first
@@ -2323,6 +2483,10 @@ pub fn run() {
             start_local_node(app.handle(), &state)?;
             start_commonplace_api(app.handle(), &state)?;
             start_proxy_node(app.handle(), &state)?;
+            // Local proxy (D6): best-effort so a bind failure does not block launch.
+            if let Err(error) = start_theorem_proxy(&state) {
+                eprintln!("[theorem-desktop] theorem-proxy not started: {error}");
+            }
             // Bundled ambient watcher: starts over the working tree so a fresh
             // download runs the watcher with no separate install. Best-effort:
             // a start failure logs and the app continues.
@@ -2374,7 +2538,10 @@ pub fn run() {
             job_submit,
             queue_status,
             agent_tab_ingest,
-            connector_proof_run
+            connector_proof_run,
+            theorem_proxy_status,
+            connect_claude_code,
+            disconnect_claude_code
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

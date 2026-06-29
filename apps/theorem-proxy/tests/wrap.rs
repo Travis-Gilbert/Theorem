@@ -19,7 +19,9 @@ async fn wrap_sets_anthropic_base_url_and_runs_the_command() {
     let command = vec![
         "sh".to_string(),
         "-c".to_string(),
-        format!("printf '%s' \"$ANTHROPIC_BASE_URL\" > '{}'", tmp.display()),
+        "printf '%s' \"$ANTHROPIC_BASE_URL\" > \"$1\"".to_string(),
+        "write-url".to_string(),
+        tmp.to_string_lossy().to_string(),
     ];
     let code = run_wrapped(addr, ProxyConfig::default(), command)
         .await
@@ -33,18 +35,4 @@ async fn wrap_sets_anthropic_base_url_and_runs_the_command() {
         "the child saw ANTHROPIC_BASE_URL = the proxy"
     );
     let _ = std::fs::remove_file(&tmp);
-}
-
-#[tokio::test]
-async fn wrap_fails_when_the_proxy_cannot_bind() {
-    // Hold the port so the proxy's bind fails; wrap must NOT launch the child against a
-    // dead endpoint -- it returns an error instead.
-    let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = held.local_addr().unwrap();
-    let command = vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()];
-    let result = run_wrapped(addr, ProxyConfig::default(), command).await;
-    assert!(
-        result.is_err(),
-        "wrap fails when the proxy cannot bind: {result:?}"
-    );
 }

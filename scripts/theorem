@@ -5,12 +5,15 @@ IFS=$'\n\t'
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly DEFAULT_SOURCE_DIR="$HOME/.theorem/source"
 readonly THEOREM_HOME_DIR="${THEOREM_HOME:-$HOME/.theorem}"
-readonly PID_FILE="$THEOREM_HOME_DIR/agentd.pid"
+readonly PID_FILE="$THEOREM_HOME_DIR/localmodel.pid"
 readonly PROXY_PID_FILE="$THEOREM_HOME_DIR/proxy.pid"
-readonly OUT_LOG="$THEOREM_HOME_DIR/agentd.out.log"
-readonly ERR_LOG="$THEOREM_HOME_DIR/agentd.err.log"
+readonly OUT_LOG="$THEOREM_HOME_DIR/localmodel.out.log"
+readonly ERR_LOG="$THEOREM_HOME_DIR/localmodel.err.log"
 readonly PROXY_OUT_LOG="$THEOREM_HOME_DIR/proxy.out.log"
 readonly PROXY_ERR_LOG="$THEOREM_HOME_DIR/proxy.err.log"
+
+export MISTRALRS_METAL_PRECOMPILE="${MISTRALRS_METAL_PRECOMPILE:-0}"
+export MISTRALRS_METAL_PLATFORMS="${MISTRALRS_METAL_PLATFORMS:-macos}"
 
 usage() {
     cat <<'EOF'
@@ -18,18 +21,21 @@ usage: theorem <command> [args]
 
 Commands:
   init [--force] [dir]     Create a no-secret starter config and first-turn note.
-  harness [agentd args...] Start the full local node: proxy plus theorem-localmodel.
-  start [agentd args...]   Start theorem-localmodel in the foreground.
+  harness [localmodel args...] Start the full local node: proxy plus theorem-localmodel.
+  start [localmodel args...]   Start theorem-localmodel in the foreground.
+  serve-model [config]     Start the local mistral.rs model host.
   proxy [proxy args...]    Start the Anthropic Messages proxy on localhost.
   appear [actor] [opts]    Announce a local actor into the harness room.
   codex-endpoint [args...] Start Codex app-server and announce its endpoint.
   wrap <claude|codex>      Start proxy room wiring, then launch the agent CLI.
   once <prompt>            Run one theorem-localmodel turn and print the transcript.
-  stop                     Stop the background agentd started by install.sh.
-  status                   Show background agentd status and source checkout.
-  logs                     Tail background agentd logs.
+  stop                     Stop the background localmodel started by install.sh.
+  status                   Show background localmodel status and source checkout.
+  logs                     Tail background localmodel logs.
   doctor                   Check local prerequisites and repo discovery.
-  agentd [args...]         Pass arguments directly to theorem-localmodel.
+  model-doctor [config]    Print local mistral.rs/Theorem host diagnostics.
+  localmodel [args...]     Pass arguments directly to theorem-localmodel.
+  agentd [args...]         Compatibility alias for localmodel.
   repo                     Print the source checkout used by this wrapper.
 EOF
 }
@@ -135,13 +141,24 @@ find_repo() {
     return 1
 }
 
-agentd_config_arg() {
+localmodel_config_arg() {
+    if [[ -n "${THEOREM_LOCALMODEL_CONFIG:-}" ]]; then
+        printf '%s\n' "$THEOREM_LOCALMODEL_CONFIG"
+        return 0
+    fi
+
     if [[ -n "${THEOREM_AGENTD_CONFIG:-}" ]]; then
         printf '%s\n' "$THEOREM_AGENTD_CONFIG"
         return 0
     fi
 
+    if [[ -f "$PWD/theorem-localmodel.toml" ]]; then
+        printf '%s\n' "$PWD/theorem-localmodel.toml"
+        return 0
+    fi
+
     if [[ -f "$PWD/theorem-agentd.toml" ]]; then
+        log "using legacy theorem-agentd.toml; rename it to theorem-localmodel.toml when convenient"
         printf '%s\n' "$PWD/theorem-agentd.toml"
         return 0
     fi
@@ -157,7 +174,7 @@ run_agentd() {
     fi
     local repo
     repo="$(find_repo)"
-    cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd --bin theorem-localmodel -- "$@"
+    cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-localmodel -- "$@"
 }
 
 exec_agentd() {
@@ -167,7 +184,7 @@ exec_agentd() {
     fi
     local repo
     repo="$(find_repo)"
-    exec cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-agentd --bin theorem-localmodel -- "$@"
+    exec cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p theorem-localmodel -- "$@"
 }
 
 exec_proxy() {
@@ -175,16 +192,12 @@ exec_proxy() {
     if proxy_bin="$(find_proxy_bin)"; then
         exec "$proxy_bin" "$@"
     fi
-    local agentd_bin
-    if agentd_bin="$(find_agentd_bin)"; then
-        exec "$agentd_bin" --proxy "$@"
-    fi
     local repo
     repo="$(find_repo)"
     exec cargo run --manifest-path "$repo/rustyredcore_THG/Cargo.toml" -p rustyred-proxy --bin rustyred-proxy -- "$@"
 }
 
-write_agentd_config() {
+write_localmodel_config() {
     local file=$1
     local force=$2
     if [[ -f "$file" && "$force" != "true" ]]; then
@@ -197,7 +210,7 @@ write_agentd_config() {
 # Safe first-run config: no bearer token, model API key, or data-dir env var.
 
 default_room_id = "repo:theorem:branch:main"
-actor = "theorem-agentd"
+actor = "theorem-localmodel"
 operator_memory_tenant = "Travis-Gilbert"
 
 [model]
@@ -211,10 +224,31 @@ grammar_constrained = true
 #
 # provider = "openai-compatible"
 # base_url = "http://127.0.0.1:8080"
-# model = "gemma-4-12b-it-q4"
+# model = "gemma-4-12b-it-qat"
 # api_key_env = "THEOREM_MODEL_API_KEY"
 #
 # Put real secrets in environment variables, never in this file.
+
+[local_model]
+host = "127.0.0.1"
+port = 8080
+api_model_id = "gemma-4-12b-it-qat"
+tok_model_id = "google/gemma-4-12B-it"
+quantized_model_id = "apps/theorem-localmodel"
+quantized_filename = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
+quantization = "Q4_K_XL"
+token_source = "cache"
+paged_attention = true
+max_seqs = 16
+max_seq_len = 4096
+max_batch_size = 1
+resident_memory_estimate_gb = 9.0
+
+# Optional speculative decoding for Gemma 4 MTP assistant checkpoints:
+#
+# [local_model.drafter]
+# model = "google/gemma-4-12B-it-mtp"
+# n_predict = 4
 
 [harness]
 name = "harness"
@@ -234,7 +268,7 @@ tick_interval_secs = 60
 storm_guard_window_secs = 600
 
 [ledger]
-path = ".theorem/agentd-token-ledger.jsonl"
+path = ".theorem/localmodel-token-ledger.jsonl"
 mirror_to_graph = true
 
 [capture]
@@ -264,8 +298,8 @@ Run a no-secret smoke:
 theorem once "hello from Theorem"
 ```
 
-That prints a JSON transcript and writes `.theorem/agentd-token-ledger.jsonl`.
-When you are ready for live model decisions, edit `theorem-agentd.toml` and set
+That prints a JSON transcript and writes `.theorem/localmodel-token-ledger.jsonl`.
+When you are ready for live model decisions, edit `theorem-localmodel.toml` and set
 `[model].provider = "openai-compatible"` plus your local model endpoint.
 EOF
 }
@@ -295,7 +329,7 @@ cmd_init() {
     done
 
     mkdir -p "$target_dir/.theorem/examples"
-    write_agentd_config "$target_dir/theorem-agentd.toml" "$force"
+    write_localmodel_config "$target_dir/theorem-localmodel.toml" "$force"
     write_first_turn_note "$target_dir/.theorem/examples/first-turn.md" "$force"
     log "initialized $target_dir"
     log "next: cd $target_dir && theorem once \"hello from Theorem\""
@@ -313,7 +347,7 @@ cmd_once() {
         prompt+=" $word"
     done
     local config_path
-    if config_path="$(agentd_config_arg)"; then
+    if config_path="$(localmodel_config_arg)"; then
         run_agentd --once "$prompt" "$config_path"
     else
         run_agentd --once "$prompt"
@@ -323,16 +357,33 @@ cmd_once() {
 cmd_start() {
     mkdir -p "$THEOREM_HOME_DIR"
     local config_path
-    if [[ $# -eq 0 ]] && config_path="$(agentd_config_arg)"; then
+    if [[ $# -eq 0 ]] && config_path="$(localmodel_config_arg)"; then
         exec_agentd "$config_path"
     fi
     exec_agentd "$@"
 }
 
+cmd_serve_model() {
+    local config_path
+    if [[ $# -eq 0 ]] && config_path="$(localmodel_config_arg)"; then
+        exec_agentd serve "$config_path"
+    fi
+    exec_agentd serve "$@"
+}
+
+cmd_model_doctor() {
+    local config_path
+    if [[ $# -eq 0 ]] && config_path="$(localmodel_config_arg)"; then
+        run_agentd doctor "$config_path"
+        return
+    fi
+    run_agentd doctor "$@"
+}
+
 cmd_proxy() {
     mkdir -p "$THEOREM_HOME_DIR"
     local config_path
-    if config_path="$(agentd_config_arg)"; then
+    if config_path="$(localmodel_config_arg)"; then
         exec_proxy "$@" "$config_path"
     fi
     exec_proxy "$@"
@@ -344,7 +395,7 @@ cmd_harness() {
     local base_url="http://127.0.0.1:$port"
     local proxy_args=(--proxy-port "$port" --proxy-data-dir "$data_dir")
     local config_path=""
-    if config_path="$(agentd_config_arg)"; then
+    if config_path="$(localmodel_config_arg)"; then
         proxy_args+=("$config_path")
     else
         config_path=""
@@ -824,9 +875,9 @@ cmd_stop() {
         pid="$(cat "$PID_FILE")"
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid"
-            log "stopped agentd pid $pid"
+            log "stopped localmodel pid $pid"
         else
-            log "agentd pid $pid is not running"
+            log "localmodel pid $pid is not running"
         fi
         rm -f "$PID_FILE"
     fi
@@ -858,18 +909,18 @@ cmd_status() {
     if find_proxy_bin >/dev/null; then
         printf 'proxy binary: %s\n' "$(find_proxy_bin)"
     else
-        printf 'proxy binary: cargo/theorem-agentd fallback\n'
+        printf 'proxy binary: cargo/rustyred-proxy fallback\n'
     fi
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid="$(cat "$PID_FILE")"
         if kill -0 "$pid" 2>/dev/null; then
-            printf 'agentd: running (pid %s)\n' "$pid"
+            printf 'localmodel: running (pid %s)\n' "$pid"
         else
-            printf 'agentd: stale pid file (%s)\n' "$pid"
+            printf 'localmodel: stale pid file (%s)\n' "$pid"
         fi
     else
-        printf 'agentd: not started by install.sh\n'
+        printf 'localmodel: not started by install.sh\n'
     fi
     if [[ -f "$PROXY_PID_FILE" ]]; then
         local proxy_pid
@@ -897,13 +948,13 @@ cmd_logs() {
 cmd_doctor() {
     local ok=true
     if find_agentd_bin >/dev/null; then
-        log "agentd binary: $(find_agentd_bin)"
+        log "localmodel binary: $(find_agentd_bin)"
         if command -v git >/dev/null 2>&1; then
             log "git found"
         fi
     else
         if ! command -v cargo >/dev/null 2>&1; then
-            log "cargo not found and no theorem-agentd binary found"
+            log "cargo not found and no theorem-localmodel binary found"
             ok=false
         fi
         if ! command -v git >/dev/null 2>&1; then
@@ -939,6 +990,9 @@ main() {
         start)
             cmd_start "$@"
             ;;
+        serve-model)
+            cmd_serve_model "$@"
+            ;;
         proxy)
             cmd_proxy "$@"
             ;;
@@ -965,6 +1019,12 @@ main() {
             ;;
         doctor)
             cmd_doctor
+            ;;
+        model-doctor)
+            cmd_model_doctor "$@"
+            ;;
+        localmodel)
+            run_agentd "$@"
             ;;
         agentd)
             run_agentd "$@"

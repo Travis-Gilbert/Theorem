@@ -4,12 +4,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.theorem.agentd</string>
+  <string>com.theorem.localmodel</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/theorem-agentd</string>
-    <string>/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/theorem-agentd.toml</string>
+    <string>/usr/local/bin/theorem-localmodel</string>
+    <string>/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/theorem-localmodel.toml</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -29,8 +29,9 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/tmp/theorem-agentd.out.log</string>
+  <string>/tmp/theorem-localmodel.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/theorem-agentd.err.log</string>
+  <string>/tmp/theorem-localmodel.err.log</string>
 </dict>
 </plist>
+

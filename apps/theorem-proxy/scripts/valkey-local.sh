@@ -10,8 +10,8 @@ set -euo pipefail
 DATA_DIR="${THEOREM_VALKEY_DIR:-/Volumes/SSD Samsung/theorem-valkey}"
 PORT="${THEOREM_VALKEY_PORT:-6391}"
 DAEMONIZE="${THEOREM_VALKEY_DAEMONIZE:-false}"
-PID_FILE="${THEOREM_VALKEY_PID_FILE:-/tmp/theorem-valkey-local.pid}"
-LOG_FILE="${THEOREM_VALKEY_LOG_FILE:-/tmp/theorem-valkey-local.log}"
+PID_FILE="${THEOREM_VALKEY_PID_FILE:-$DATA_DIR/theorem-valkey-local.pid}"
+LOG_FILE="${THEOREM_VALKEY_LOG_FILE:-$DATA_DIR/theorem-valkey-local.log}"
 
 if command -v valkey-server >/dev/null 2>&1; then
   SERVER=valkey-server

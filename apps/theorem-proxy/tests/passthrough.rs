@@ -3,6 +3,7 @@
 //! contract); the full live-session acceptance is a manual Claude Code run.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, StatusCode};
@@ -55,7 +56,10 @@ async fn faithful_passthrough_preserves_headers_status_and_body() {
     let response = reqwest::Client::new()
         .post(format!("http://{proxy_addr}/v1/messages"))
         .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", "prompt-caching-2024-07-31,oauth-2025-04-20")
+        .header(
+            "anthropic-beta",
+            "prompt-caching-2024-07-31,oauth-2025-04-20",
+        )
         .header("x-api-key", "sk-ant-test")
         .body("{\"model\":\"claude\",\"messages\":[]}")
         .send()
@@ -66,8 +70,7 @@ async fn faithful_passthrough_preserves_headers_status_and_body() {
     let json: serde_json::Value = response.json().await.unwrap();
     assert_eq!(json["version"], "2023-06-01");
     assert_eq!(
-        json["beta"],
-        "prompt-caching-2024-07-31,oauth-2025-04-20",
+        json["beta"], "prompt-caching-2024-07-31,oauth-2025-04-20",
         "anthropic-beta (incl. oauth subscription cap) preserved"
     );
     assert_eq!(
@@ -75,6 +78,189 @@ async fn faithful_passthrough_preserves_headers_status_and_body() {
         "client credential reaches upstream untouched"
     );
     assert_eq!(json["body"], "{\"model\":\"claude\",\"messages\":[]}");
+}
+
+#[tokio::test]
+async fn upstream_auth_override_strips_client_gateway_key() {
+    let upstream = Router::new().route(
+        "/v1/messages",
+        post(|headers: HeaderMap, body: Bytes| async move {
+            let get = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            axum::Json(serde_json::json!({
+                "authorization": get("authorization"),
+                "api_key": get("x-api-key"),
+                "beta": get("anthropic-beta"),
+                "body": String::from_utf8_lossy(&body),
+            }))
+        }),
+    );
+    let upstream_addr = spawn(upstream).await;
+
+    let proxy = theorem_proxy::router(theorem_proxy::ProxyConfig {
+        upstream: format!("http://{upstream_addr}"),
+        upstream_auth: Some(theorem_proxy::UpstreamAuth::ApiKey(
+            "sk-ant-upstream".to_string(),
+        )),
+        upstream_beta: Some("oauth-2025-04-20".to_string()),
+        ..Default::default()
+    });
+    let proxy_addr = spawn(proxy).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("authorization", "Bearer local-desktop-key")
+        .body("{\"model\":\"claude\",\"messages\":[]}")
+        .send()
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["authorization"], "", "client bearer is stripped");
+    assert_eq!(
+        json["api_key"], "sk-ant-upstream",
+        "proxy-owned upstream API key is applied"
+    );
+    assert_eq!(json["beta"], "oauth-2025-04-20");
+    assert_eq!(json["body"], "{\"model\":\"claude\",\"messages\":[]}");
+}
+
+#[tokio::test]
+async fn model_discovery_path_forwards_with_upstream_auth() {
+    let upstream = Router::new().route(
+        "/v1/models",
+        axum::routing::get(|headers: HeaderMap| async move {
+            let api_key = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({
+                "api_key": api_key,
+                "data": [{"id": "claude-sonnet-4-6", "type": "model"}]
+            }))
+        }),
+    );
+    let upstream_addr = spawn(upstream).await;
+
+    let proxy = theorem_proxy::router(theorem_proxy::ProxyConfig {
+        upstream: format!("http://{upstream_addr}"),
+        upstream_auth: Some(theorem_proxy::UpstreamAuth::ApiKey(
+            "sk-ant-upstream".to_string(),
+        )),
+        ..Default::default()
+    });
+    let proxy_addr = spawn(proxy).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/v1/models"))
+        .header("authorization", "Bearer local-desktop-key")
+        .send()
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["api_key"], "sk-ant-upstream");
+    assert_eq!(json["data"][0]["id"], "claude-sonnet-4-6");
+}
+
+#[tokio::test]
+async fn openai_responses_route_injects_memory_and_preserves_bearer() {
+    let upstream = Router::new().route(
+        "/v1/responses",
+        post(|headers: HeaderMap, body: Bytes| async move {
+            let authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({
+                "authorization": authorization,
+                "body": serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }))
+        }),
+    );
+    let upstream_addr = spawn(upstream).await;
+
+    let proxy = theorem_proxy::router(theorem_proxy::ProxyConfig {
+        openai_upstream: format!("http://{upstream_addr}"),
+        memory: Some(Arc::new(theorem_proxy::memory::VecMemorySource::new(vec![
+            ("planner", "planner.rs pushdown"),
+        ]))),
+        ..Default::default()
+    });
+    let proxy_addr = spawn(proxy).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("authorization", "Bearer sk-openai-client")
+        .json(&serde_json::json!({
+            "model": "gpt-5.5",
+            "tools": [{"type": "function", "name": "shell"}],
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "SYSTEM"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "tell me about planner pushdown"}]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["authorization"], "Bearer sk-openai-client");
+    assert_eq!(json["body"]["tools"][0]["name"], "shell");
+    assert_eq!(json["body"]["input"][0]["role"], "system");
+    let last = serde_json::to_string(&json["body"]["input"][1]).unwrap();
+    assert!(last.contains("tell me about planner pushdown"));
+    assert!(last.contains("planner.rs pushdown"));
+    assert!(last.contains("theorem-memory"));
+}
+
+#[tokio::test]
+async fn openai_auth_override_strips_client_key() {
+    let upstream = Router::new().route(
+        "/v1/responses",
+        post(|headers: HeaderMap, body: Bytes| async move {
+            let get = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            axum::Json(serde_json::json!({
+                "authorization": get("authorization"),
+                "api_key": get("x-api-key"),
+                "body": String::from_utf8_lossy(&body),
+            }))
+        }),
+    );
+    let upstream_addr = spawn(upstream).await;
+
+    let proxy = theorem_proxy::router(theorem_proxy::ProxyConfig {
+        openai_upstream: format!("http://{upstream_addr}"),
+        openai_upstream_api_key: Some("sk-openai-upstream".to_string()),
+        ..Default::default()
+    });
+    let proxy_addr = spawn(proxy).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("authorization", "Bearer local-codex-key")
+        .body("{\"model\":\"gpt-5.5\",\"input\":\"hello\"}")
+        .send()
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["authorization"], "Bearer sk-openai-upstream");
+    assert_eq!(json["api_key"], "");
+    assert_eq!(json["body"], "{\"model\":\"gpt-5.5\",\"input\":\"hello\"}");
 }
 
 #[tokio::test]

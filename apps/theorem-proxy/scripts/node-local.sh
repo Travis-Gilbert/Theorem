@@ -41,11 +41,11 @@ fi
 mkdir -p "$RUSTY_RED_DATA_DIR"
 echo "theorem node: ${RUSTY_RED_HOST}:${RUSTY_RED_PORT}  data -> ${RUSTY_RED_DATA_DIR}  (mode=${RUSTY_RED_MODE}, auth=${RUSTY_RED_REQUIRE_AUTH})"
 echo "point the proxy at it: --memory-url http://${RUSTY_RED_HOST}:${RUSTY_RED_PORT}/mcp"
-# Prefer the prebuilt binary (fast startup, no recompile). `cargo run` can trigger a slow
-# rebuild whenever another crate in the shared SSD target changed its fingerprint, which
-# blows the launcher's readiness wait. Fall back to building when the binary is absent.
+# Prefer the prebuilt binary only when explicitly requested. `cargo run` is the safe
+# default because it binds launch behavior to the current checkout; the fast path is for
+# operators who knowingly want an existing binary from CARGO_TARGET_DIR.
 BIN="${CARGO_TARGET_DIR}/debug/rustyred-thg-server"
-if [ -x "$BIN" ]; then
+if [ "${THEOREM_USE_PREBUILT_NODE:-0}" = "1" ] && [ -x "$BIN" ]; then
   exec "$BIN"
 fi
 cd "$REPO_THG"
