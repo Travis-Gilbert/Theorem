@@ -515,6 +515,15 @@ pub trait McpGraphBackend {
             "datawave ingest requires the in-process RedCore graph backend",
         ))
     }
+    fn invoke_reverse_engineer_compose(
+        &mut self,
+        _tenant: &str,
+        _arguments: &Value,
+    ) -> Result<Value, McpError> {
+        Err(McpError::internal(
+            "reverse_engineer_compose requires an in-process graph backend",
+        ))
+    }
     fn put_cold_document_bytes(&mut self, _body: &[u8]) -> GraphStoreResult<Option<String>> {
         Ok(None)
     }
@@ -889,6 +898,15 @@ impl<S: McpGraphBackend> McpGraphBackend for SharedStore<S> {
             .borrow_mut()
             .invoke_datawave_ingest(tenant, arguments, operation)
     }
+    fn invoke_reverse_engineer_compose(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+    ) -> Result<Value, McpError> {
+        self.0
+            .borrow_mut()
+            .invoke_reverse_engineer_compose(tenant, arguments)
+    }
     fn put_cold_document_bytes(&mut self, body: &[u8]) -> GraphStoreResult<Option<String>> {
         self.0.borrow_mut().put_cold_document_bytes(body)
     }
@@ -1107,6 +1125,11 @@ pub const DEFAULT_TOOL_RESULT_BUDGET_BYTES: usize = 16 * 1024;
 /// of truncating into a tool_result_fetch handle that drops the found/detail
 /// fields a poller reads. The fetch fallback still applies above this ceiling.
 pub const DEFAULT_HARNESS_TOOL_RESULT_BUDGET_BYTES: usize = 512 * 1024;
+
+/// Reverse-engineer compose returns the artifact the skill consumes, not a
+/// preview. Keep normal repository specs inline so the skill can inspect counts,
+/// obligations, facts, and provenance without a second fetch hop.
+pub const DEFAULT_REVERSE_ENGINEER_COMPOSE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 const TOOL_RESULT_MARKER_RESERVED_BYTES: usize = 512;
 
@@ -2005,6 +2028,84 @@ fn call_tool<P: McpGraphProvider>(
         }
         "harness_prepare" | "theorem_harness_prepare" => {
             harness_prepare_payload(&tenant, &mut backend, &arguments)?
+        }
+        "code_compile_spec" | "theorem_harness_code_compile_spec" => {
+            code_compiler_payload(&tenant, &backend, &arguments, "compile_spec")?
+        }
+        "code_extract_features" | "theorem_harness_code_extract_features" => {
+            code_compiler_payload(&tenant, &backend, &arguments, "extract_features")?
+        }
+        "code_implementation_obligations" | "theorem_harness_code_implementation_obligations" => {
+            code_compiler_payload(&tenant, &backend, &arguments, "implementation_obligations")?
+        }
+        "code_patterns_relevant" | "theorem_harness_code_patterns_relevant" => {
+            code_compiler_payload(&tenant, &backend, &arguments, "patterns_relevant")?
+        }
+        "code_spec_drift" | "theorem_harness_code_spec_drift" => {
+            code_compiler_payload(&tenant, &backend, &arguments, "spec_drift")?
+        }
+        "reverse_engineer_compose" | "theorem_harness_reverse_engineer_compose" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reverse_engineer_compose writes compiler, Datawave projection, and compose receipts; it is unavailable while read-only mode is active."
+                })));
+            }
+            reverse_engineer_compose_payload(&tenant, &mut backend, &arguments)?
+        }
+        "reverse_engineer_slice" | "theorem_harness_reverse_engineer_slice" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reverse_engineer_slice writes through the compose ingest front door; it is unavailable while read-only mode is active."
+                })));
+            }
+            reverse_engineer_feature_payload(&tenant, &mut backend, &arguments, "slice")?
+        }
+        "reverse_engineer_behavior_ir" | "theorem_harness_reverse_engineer_behavior_ir" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reverse_engineer_behavior_ir writes through the compose ingest front door; it is unavailable while read-only mode is active."
+                })));
+            }
+            reverse_engineer_feature_payload(&tenant, &mut backend, &arguments, "behavior_ir")?
+        }
+        "reverse_engineer_target_plan" | "theorem_harness_reverse_engineer_target_plan" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reverse_engineer_target_plan writes through the compose ingest front door; it is unavailable while read-only mode is active."
+                })));
+            }
+            reverse_engineer_feature_payload(&tenant, &mut backend, &arguments, "target_plan")?
+        }
+        "reverse_engineer_emit" | "theorem_harness_reverse_engineer_emit" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reverse_engineer_emit writes through the compose ingest front door; it is unavailable while read-only mode is active."
+                })));
+            }
+            reverse_engineer_feature_payload(&tenant, &mut backend, &arguments, "emit")?
+        }
+        "reverse_engineer_validate" | "theorem_harness_reverse_engineer_validate" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reverse_engineer_validate writes through the compose ingest front door; it is unavailable while read-only mode is active."
+                })));
+            }
+            reverse_engineer_feature_payload(&tenant, &mut backend, &arguments, "validate")?
+        }
+        "reverse_engineer_port" | "theorem_harness_reverse_engineer_port" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "reverse_engineer_port writes through the compose ingest front door; it is unavailable while read-only mode is active."
+                })));
+            }
+            reverse_engineer_feature_payload(&tenant, &mut backend, &arguments, "port")?
         }
         "code_search"
         | "compute_code"
@@ -7731,6 +7832,238 @@ fn datawave_ingest_payload(
     backend.invoke_datawave_ingest(tenant, arguments, operation)
 }
 
+fn code_compiler_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    let snapshot = backend.graph_snapshot().map_err(graph_store_mcp_error)?;
+    let mut mirror = InMemoryGraphStore::from_snapshot(snapshot).map_err(graph_store_mcp_error)?;
+    let (tenant_id, repo_id) = code_compiler_target(tenant, arguments)?;
+    let result = match operation {
+        "compile_spec" => {
+            let mut input = rustyred_thg_code::CodeSpecCompileInput::new(&tenant_id, &repo_id);
+            input.repo_label =
+                non_empty_arg(arguments, &["repo_label", "label"]).map(str::to_string);
+            input.spec_id =
+                non_empty_arg(arguments, &["spec_id", "spec_node_id"]).map(str::to_string);
+            input.spec_title =
+                non_empty_arg(arguments, &["spec_title", "title"]).map(str::to_string);
+            if let Some(limit) = usize_arg(arguments, &["max_symbols", "symbol_limit", "limit"]) {
+                input.max_symbols = limit;
+            }
+            let output = rustyred_thg_code::compile_code_spec_in_store(&mut mirror, input)
+                .map_err(graph_store_mcp_error)?;
+            serde_json::to_value(output).map_err(|error| {
+                McpError::internal(format!("code spec serialization failed: {error}"))
+            })?
+        }
+        "extract_features" => {
+            let mut input = rustyred_thg_code::CodeFeatureExtractInput::new(&tenant_id, &repo_id);
+            if let Some(limit) = usize_arg(arguments, &["max_features", "max_pairs", "limit"]) {
+                input.max_pairs = limit;
+            }
+            input.include_candidate_pairs = arguments
+                .get("include_candidate_pairs")
+                .or_else(|| arguments.get("includeCandidatePairs"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let output = rustyred_thg_code::extract_code_features_in_store(&mut mirror, input)
+                .map_err(graph_store_mcp_error)?;
+            serde_json::to_value(output).map_err(|error| {
+                McpError::internal(format!("code feature serialization failed: {error}"))
+            })?
+        }
+        "implementation_obligations" => {
+            let spec = compile_spec_for_tool(&mut mirror, arguments, &tenant_id, &repo_id)?;
+            let mut feature_input =
+                rustyred_thg_code::CodeFeatureExtractInput::new(&tenant_id, &repo_id);
+            if let Some(limit) = usize_arg(arguments, &["max_features", "max_pairs"]) {
+                feature_input.max_pairs = limit;
+            }
+            let features =
+                rustyred_thg_code::extract_code_features_in_store(&mut mirror, feature_input)
+                    .map_err(graph_store_mcp_error)?
+                    .records;
+            let mut input =
+                rustyred_thg_code::CodeImplementationObligationInput::new(&tenant_id, &repo_id);
+            input.code_spec_summary = Some(code_spec_summary(&tenant_id, &repo_id, &spec));
+            input.feature_records = features;
+            let query = non_empty_arg(arguments, &["query", "task", "title"]).unwrap_or_default();
+            let path_prefix =
+                non_empty_arg(arguments, &["path_prefix", "pathPrefix"]).unwrap_or_default();
+            let limit = usize_arg(arguments, &["pattern_limit", "patternLimit"]).unwrap_or(16);
+            input.pattern_memories = rustyred_thg_code::relevant_code_patterns(
+                &mirror,
+                &tenant_id,
+                &repo_id,
+                query,
+                path_prefix,
+                limit,
+            );
+            let output = rustyred_thg_code::compile_code_implementation_obligations_in_store(
+                &mut mirror,
+                input,
+            )
+            .map_err(graph_store_mcp_error)?;
+            serde_json::to_value(output).map_err(|error| {
+                McpError::internal(format!("code obligation serialization failed: {error}"))
+            })?
+        }
+        "patterns_relevant" => {
+            let query = non_empty_arg(arguments, &["query", "task", "title"]).unwrap_or_default();
+            let path_prefix =
+                non_empty_arg(arguments, &["path_prefix", "pathPrefix"]).unwrap_or_default();
+            let limit = usize_arg(arguments, &["limit"]).unwrap_or(16);
+            json!({
+                "tenant_id": tenant_id,
+                "repo_id": repo_id,
+                "patterns": rustyred_thg_code::relevant_code_patterns(
+                    &mirror,
+                    &tenant_id,
+                    &repo_id,
+                    query,
+                    path_prefix,
+                    limit
+                )
+            })
+        }
+        "spec_drift" => {
+            let spec_node_id = match non_empty_arg(arguments, &["spec_id", "spec_node_id"]) {
+                Some(id) => id.to_string(),
+                None => {
+                    compile_spec_for_tool(&mut mirror, arguments, &tenant_id, &repo_id)?
+                        .spec_node
+                        .id
+                }
+            };
+            if spec_node_id.is_empty() {
+                return Err(McpError::invalid_params(
+                    "code_spec_drift requires spec_id/spec_node_id or an ingestible repo snapshot",
+                ));
+            }
+            let mut input =
+                rustyred_thg_code::CodeSpecDriftInput::new(&tenant_id, &repo_id, spec_node_id);
+            if let Some(limit) = usize_arg(arguments, &["max_symbols", "symbol_limit", "limit"]) {
+                input.max_symbols = limit;
+            }
+            let output = rustyred_thg_code::detect_code_spec_drift_in_store(&mut mirror, input)
+                .map_err(graph_store_mcp_error)?;
+            serde_json::to_value(output).map_err(|error| {
+                McpError::internal(format!("code drift serialization failed: {error}"))
+            })?
+        }
+        _ => {
+            return Err(McpError::invalid_params(format!(
+                "unsupported code compiler operation `{operation}`"
+            )))
+        }
+    };
+    Ok(json!({
+        "tenant": tenant,
+        "operation": operation,
+        "affordance_id": format!("rustyred_thg_code.compiler.{operation}"),
+        "engine": "rustyred_thg_code",
+        "writes_graph": false,
+        "result": result,
+    }))
+}
+
+fn reverse_engineer_compose_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    backend.invoke_reverse_engineer_compose(tenant, arguments)
+}
+
+fn reverse_engineer_feature_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+    operation: &str,
+) -> Result<Value, McpError> {
+    let composed = backend.invoke_reverse_engineer_compose(tenant, arguments)?;
+    let spec_value = composed
+        .get("result")
+        .cloned()
+        .ok_or_else(|| McpError::internal("reverse_engineer_compose response omitted result"))?;
+    let spec: rustyred_thg_code::ReconstructionSpec =
+        serde_json::from_value(spec_value).map_err(|error| {
+            McpError::internal(format!(
+                "reverse_engineer_compose result could not be decoded: {error}"
+            ))
+        })?;
+    let slice_input = feature_slice_input_from_arguments(arguments);
+    let feature = rustyred_thg_code::feature_slice_from_reconstruction_spec(&spec, &slice_input);
+    let behavior = rustyred_thg_code::behavior_ir_from_feature_slice(&spec, feature.clone());
+    let result = match operation {
+        "slice" => serde_json::to_value(feature).map_err(|error| {
+            McpError::internal(format!("feature slice serialization failed: {error}"))
+        })?,
+        "behavior_ir" => serde_json::to_value(behavior).map_err(|error| {
+            McpError::internal(format!("behavior IR serialization failed: {error}"))
+        })?,
+        "target_plan" => {
+            let target_input =
+                rustyred_thg_code::target_plan_input_from_value(arguments).map_err(|error| {
+                    McpError::invalid_params(format!("invalid reverse engineer target: {error}"))
+                })?;
+            let plan = rustyred_thg_code::target_plan_from_behavior_ir(&behavior, &target_input);
+            serde_json::to_value(plan).map_err(|error| {
+                McpError::internal(format!("target plan serialization failed: {error}"))
+            })?
+        }
+        "emit" => {
+            let target_input =
+                rustyred_thg_code::target_plan_input_from_value(arguments).map_err(|error| {
+                    McpError::invalid_params(format!("invalid reverse engineer target: {error}"))
+                })?;
+            let plan = rustyred_thg_code::target_plan_from_behavior_ir(&behavior, &target_input);
+            let patch_set = rustyred_thg_code::patch_set_from_behavior_ir(&behavior, &plan);
+            serde_json::to_value(patch_set).map_err(|error| {
+                McpError::internal(format!("patch set serialization failed: {error}"))
+            })?
+        }
+        "validate" => {
+            let target_input =
+                rustyred_thg_code::target_plan_input_from_value(arguments).map_err(|error| {
+                    McpError::invalid_params(format!("invalid reverse engineer target: {error}"))
+                })?;
+            let plan = rustyred_thg_code::target_plan_from_behavior_ir(&behavior, &target_input);
+            let patch_set = rustyred_thg_code::patch_set_from_behavior_ir(&behavior, &plan);
+            let validated = rustyred_thg_code::validate_patch_set(&plan, &patch_set);
+            serde_json::to_value(validated).map_err(|error| {
+                McpError::internal(format!("validation serialization failed: {error}"))
+            })?
+        }
+        "port" => {
+            let target_input =
+                rustyred_thg_code::target_plan_input_from_value(arguments).map_err(|error| {
+                    McpError::invalid_params(format!("invalid reverse engineer target: {error}"))
+                })?;
+            let plan = rustyred_thg_code::target_plan_from_behavior_ir(&behavior, &target_input);
+            let patch_set = rustyred_thg_code::validate_patch_set(
+                &plan,
+                &rustyred_thg_code::patch_set_from_behavior_ir(&behavior, &plan),
+            );
+            json!({
+                "feature_slice": feature,
+                "behavior_ir": behavior,
+                "target_plan": plan,
+                "patch_set": patch_set,
+            })
+        }
+        _ => {
+            return Err(McpError::invalid_params(format!(
+                "unsupported reverse engineer feature operation `{operation}`"
+            )))
+        }
+    };
+    Ok(reverse_engineer_feature_response(tenant, operation, result))
+}
+
 fn datawave_ingest_operation(arguments: &Value) -> Result<String, McpError> {
     let raw = arguments
         .get("operation")
@@ -7833,6 +8166,127 @@ fn code_search_operation(arguments: &Value) -> Result<String, McpError> {
         _ => Err(McpError::invalid_params(format!(
             "unsupported code_search operation `{raw}`"
         ))),
+    }
+}
+
+fn code_compiler_target(tenant: &str, arguments: &Value) -> Result<(String, String), McpError> {
+    let input = compose_input_from_arguments(tenant, arguments)?;
+    let tenant_id = input.tenant_id.unwrap_or_else(|| tenant.to_string());
+    let repo_id = input.source.resolved_repo_id().ok_or_else(|| {
+        McpError::invalid_params("code compiler tools require repo_id/repo or source.github_url")
+    })?;
+    Ok((tenant_id, repo_id))
+}
+
+fn compose_input_from_arguments(
+    tenant: &str,
+    arguments: &Value,
+) -> Result<rustyred_thg_code::ComposeInput, McpError> {
+    let mut normalized = arguments.clone();
+    let Some(object) = normalized.as_object_mut() else {
+        return Err(McpError::invalid_params(
+            "reverse_engineer_compose arguments must be an object",
+        ));
+    };
+    if object.get("source").is_none() {
+        if let Some(source_ref) = object.remove("source_ref") {
+            object.insert("source".to_string(), source_ref);
+        }
+    }
+    if object.get("source").is_none() {
+        let mut source = Map::new();
+        for (key, target) in [
+            ("github_url", "github_url"),
+            ("repo_url", "repo_url"),
+            ("repo_id", "repo_id"),
+            ("repo", "repo_id"),
+            ("local_path", "local_path"),
+            ("repo_path", "local_path"),
+            ("binary_path", "binary_path"),
+            ("web_url", "web_url"),
+            ("sha", "sha"),
+        ] {
+            if let Some(value) = object.get(key).cloned() {
+                source.insert(target.to_string(), value);
+            }
+        }
+        if !source.is_empty() {
+            object.insert("source".to_string(), Value::Object(source));
+        }
+    }
+    object
+        .entry("tenant_id".to_string())
+        .or_insert_with(|| Value::String(tenant.to_string()));
+    serde_json::from_value(normalized).map_err(|error| {
+        McpError::invalid_params(format!("invalid reverse_engineer_compose input: {error}"))
+    })
+}
+
+fn compile_spec_for_tool(
+    store: &mut InMemoryGraphStore,
+    arguments: &Value,
+    tenant_id: &str,
+    repo_id: &str,
+) -> Result<rustyred_thg_code::CodeSpecCompileOutput, McpError> {
+    let mut input = rustyred_thg_code::CodeSpecCompileInput::new(tenant_id, repo_id);
+    input.repo_label = non_empty_arg(arguments, &["repo_label", "label"]).map(str::to_string);
+    input.spec_id = non_empty_arg(arguments, &["spec_id", "spec_node_id"]).map(str::to_string);
+    input.spec_title = non_empty_arg(arguments, &["spec_title", "title"]).map(str::to_string);
+    if let Some(limit) = usize_arg(arguments, &["max_symbols", "symbol_limit", "limit"]) {
+        input.max_symbols = limit;
+    }
+    rustyred_thg_code::compile_code_spec_in_store(store, input).map_err(graph_store_mcp_error)
+}
+
+fn code_spec_summary(
+    tenant_id: &str,
+    repo_id: &str,
+    spec: &rustyred_thg_code::CodeSpecCompileOutput,
+) -> rustyred_thg_code::CodeSpecificationSummary {
+    rustyred_thg_code::CodeSpecificationSummary {
+        spec_node_id: Some(spec.spec_node.id.clone()),
+        artifact_hash: Some(spec.artifact_hash.clone()),
+        tenant_id: tenant_id.to_string(),
+        repo_id: repo_id.to_string(),
+        file_count: spec.file_count,
+        symbol_count: spec.symbol_count,
+    }
+}
+
+fn non_empty_arg<'a>(arguments: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn usize_arg(arguments: &Value, keys: &[&str]) -> Option<usize> {
+    keys.iter().find_map(|key| {
+        arguments
+            .get(*key)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+    })
+}
+
+fn string_array_arg(arguments: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn graph_store_mcp_error(error: GraphStoreError) -> McpError {
+    let message = format!("{}: {}", error.code, error.message);
+    if error.code.starts_with("invalid_") || error.code.starts_with("missing_") {
+        McpError::invalid_params(message)
+    } else {
+        McpError::internal(message)
     }
 }
 
@@ -7985,6 +8439,101 @@ fn redcore_datawave_ingest_payload(
         )
         .map_err(datawave_ingest_error)?;
     Ok(datawave_ingest_response(output, operation))
+}
+
+fn in_store_reverse_engineer_compose_payload<S: GraphStore>(
+    store: &mut S,
+    tenant: &str,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let input = compose_input_from_arguments(tenant, arguments)?;
+    let spec = rustyred_thg_code::compose_reconstruction_spec_in_store(store, &input)
+        .map_err(graph_store_mcp_error)?;
+    let result = serde_json::to_value(spec).map_err(|error| {
+        McpError::internal(format!(
+            "reverse_engineer_compose serialization failed: {error}"
+        ))
+    })?;
+    Ok(reverse_engineer_compose_response(tenant, result))
+}
+
+pub fn redcore_reverse_engineer_compose_payload(
+    store: &mut RedCoreGraphStore,
+    tenant: &str,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let input = compose_input_from_arguments(tenant, arguments)?;
+    let caps = repo_fetch_caps_from_arguments(arguments);
+    let spec =
+        rustyred_thg_code::compose_reconstruction_spec_with_ensure_in_store(store, input, &caps)
+            .map_err(graph_store_mcp_error)?;
+    let result = serde_json::to_value(spec).map_err(|error| {
+        McpError::internal(format!(
+            "reverse_engineer_compose serialization failed: {error}"
+        ))
+    })?;
+    Ok(reverse_engineer_compose_response(tenant, result))
+}
+
+fn reverse_engineer_compose_response(tenant: &str, result: Value) -> Value {
+    json!({
+        "tenant": tenant,
+        "operation": "reverse_engineer_compose",
+        "command": "reverse_engineer.compose",
+        "writes_graph": true,
+        "affordance_id": "rustyred_thg_code.reverse_engineer.compose",
+        "engine": "rustyred_thg_code",
+        "result": result,
+    })
+}
+
+fn feature_slice_input_from_arguments(arguments: &Value) -> rustyred_thg_code::FeatureSliceInput {
+    rustyred_thg_code::FeatureSliceInput {
+        seed: non_empty_arg(arguments, &["seed", "query", "feature", "task"]).map(str::to_string),
+        entry_symbols: string_array_arg(
+            arguments,
+            &[
+                "entry_symbols",
+                "entrySymbols",
+                "symbols",
+                "symbol_ids",
+                "symbolIds",
+            ],
+        ),
+        files: string_array_arg(
+            arguments,
+            &["files", "file_paths", "filePaths", "paths", "source_files"],
+        ),
+        max_files: usize_arg(
+            arguments,
+            &["max_files", "maxFiles", "file_limit", "fileLimit"],
+        ),
+        max_symbols: usize_arg(
+            arguments,
+            &["max_symbols", "maxSymbols", "symbol_limit", "symbolLimit"],
+        ),
+    }
+}
+
+fn reverse_engineer_feature_response(tenant: &str, operation: &str, result: Value) -> Value {
+    json!({
+        "tenant": tenant,
+        "operation": format!("reverse_engineer_{operation}"),
+        "command": format!("reverse_engineer.{operation}"),
+        "writes_graph": true,
+        "affordance_id": format!("rustyred_thg_code.reverse_engineer.{operation}"),
+        "engine": "rustyred_thg_code",
+        "result": result,
+    })
+}
+
+fn repo_fetch_caps_from_arguments(arguments: &Value) -> rustyred_thg_code::RepoFetchCaps {
+    arguments
+        .get("max_total_bytes")
+        .or_else(|| arguments.get("maxTotalBytes"))
+        .and_then(Value::as_u64)
+        .map(rustyred_thg_code::RepoFetchCaps::from_requested)
+        .unwrap_or_default()
 }
 
 fn remember_memory_payload(
@@ -11591,6 +12140,7 @@ fn tool_result_budget_for(config: &McpServerConfig, tool_name: &str) -> usize {
         // family enough room to return the run inline instead of truncating into a
         // fetch handle. An explicit per-family config budget above still wins.
         "harness" => DEFAULT_HARNESS_TOOL_RESULT_BUDGET_BYTES,
+        "reverse_engineer" => DEFAULT_REVERSE_ENGINEER_COMPOSE_BUDGET_BYTES,
         _ => config.tool_result_budget_bytes,
     }
 }
@@ -11600,6 +12150,11 @@ fn tool_result_family(tool_name: &str) -> &'static str {
         "compute_code" | "rustyred_thg_compute_code" | "theorem_harness_compute_code" => "code",
         "reconstruct_binary" | "theorem_harness_reconstruct_binary" => "reconstruct",
         "datawave_ingest" | "theorem_harness_datawave_ingest" => "datawave",
+        name if name.starts_with("reverse_engineer")
+            || name.starts_with("theorem_harness_reverse_engineer") =>
+        {
+            "reverse_engineer"
+        }
         name if name.contains("code") => "code",
         name if name.contains("reconstruct") => "reconstruct",
         name if name.contains("fractal") => "fractal",
@@ -12394,6 +12949,18 @@ const GRAPHQL_COVERED_FLAT_TOOLS: &[&str] = &[
     // code (CodeCrawler)
     "compute_code",
     "code_ingest",
+    "code_compile_spec",
+    "code_extract_features",
+    "code_implementation_obligations",
+    "code_patterns_relevant",
+    "code_spec_drift",
+    "reverse_engineer_compose",
+    "reverse_engineer_slice",
+    "reverse_engineer_behavior_ir",
+    "reverse_engineer_target_plan",
+    "reverse_engineer_emit",
+    "reverse_engineer_validate",
+    "reverse_engineer_port",
     // harness instant-KG
     "harness_kg_status",
     "harness_kg_search",
@@ -13360,6 +13927,66 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "confirmed": { "type": "boolean", "default": true }
                 }
             }),
+        ),
+        tool(
+            "code_compile_spec",
+            "Compile CodeFile/CodeSymbol graph records into a CodeSpecification IR snapshot.",
+            code_compiler_input_schema(),
+        ),
+        tool(
+            "code_extract_features",
+            "Extract code connection feature records from a repository code graph snapshot.",
+            code_compiler_input_schema(),
+        ),
+        tool(
+            "code_implementation_obligations",
+            "Compile implementation obligations from a code specification, features, drift, and patterns.",
+            code_compiler_input_schema(),
+        ),
+        tool(
+            "code_patterns_relevant",
+            "Read relevant code pattern memory records for a repository and query/path prefix.",
+            code_compiler_input_schema(),
+        ),
+        tool(
+            "code_spec_drift",
+            "Compare a CodeSpecification against the current repository code graph snapshot.",
+            code_compiler_input_schema(),
+        ),
+        tool_write(
+            "reverse_engineer_compose",
+            "Compose the reverse-engineer pipeline into a ReconstructionSpec: ensure source repo KG, compile code IR, project code into Datawave facts, and write a compose receipt.",
+            reverse_engineer_compose_input_schema(),
+        ),
+        tool_write(
+            "reverse_engineer_slice",
+            "Select a bounded feature slice from a composed ReconstructionSpec, preserving source evidence and unknowns for later target-language emission.",
+            reverse_engineer_feature_input_schema(),
+        ),
+        tool_write(
+            "reverse_engineer_behavior_ir",
+            "Lower a composed ReconstructionSpec feature slice into language-neutral behavior IR for target-language emission.",
+            reverse_engineer_feature_input_schema(),
+        ),
+        tool_write(
+            "reverse_engineer_target_plan",
+            "Lower behavior IR into a target-language/project plan with validation commands and unresolved obligations.",
+            reverse_engineer_feature_input_schema(),
+        ),
+        tool_write(
+            "reverse_engineer_emit",
+            "Emit a conservative PatchSet scaffold and tests from behavior IR and a target-language plan.",
+            reverse_engineer_feature_input_schema(),
+        ),
+        tool_write(
+            "reverse_engineer_validate",
+            "Attach validation receipts to an emitted PatchSet; receipts are not_run until the patch is applied to a target checkout.",
+            reverse_engineer_feature_input_schema(),
+        ),
+        tool_write(
+            "reverse_engineer_port",
+            "Run compose -> slice -> behavior IR -> target plan -> emit -> validate and return all artifacts.",
+            reverse_engineer_feature_input_schema(),
         ),
         tool_write(
             "reconstruct_binary",
@@ -14880,6 +15507,18 @@ fn epistemic_enrich_apply_tool() -> Value {
 fn output_schema_for_tool(name: &str) -> Value {
     match name {
         "code_search" | "compute_code" | "code_ingest" => code_search_output_schema(),
+        "code_compile_spec"
+        | "code_extract_features"
+        | "code_implementation_obligations"
+        | "code_patterns_relevant"
+        | "code_spec_drift" => code_compiler_output_schema(),
+        "reverse_engineer_compose" => reverse_engineer_compose_output_schema(),
+        "reverse_engineer_slice"
+        | "reverse_engineer_behavior_ir"
+        | "reverse_engineer_target_plan"
+        | "reverse_engineer_emit"
+        | "reverse_engineer_validate"
+        | "reverse_engineer_port" => reverse_engineer_feature_output_schema(),
         "reconstruct_binary" => reconstruct_binary_output_schema(),
         "harness_prepare" => harness_prepare_output_schema(),
         "web_consume" => web_consume_output_schema(),
@@ -14893,6 +15532,112 @@ fn output_schema_for_tool(name: &str) -> Value {
         "fractal_expansion" | "rustyweb_search_acquisition" => async_run_output_schema(),
         _ => generic_object_output_schema(),
     }
+}
+
+fn code_compiler_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "tenant_slug": { "type": "string" },
+            "tenant_id": { "type": "string" },
+            "repo_id": { "type": "string" },
+            "repo": { "type": "string" },
+            "source": { "type": "object" },
+            "source_ref": { "type": "object" },
+            "github_url": { "type": "string" },
+            "repo_url": { "type": "string" },
+            "local_path": { "type": "string" },
+            "repo_path": { "type": "string" },
+            "sha": { "type": "string" },
+            "spec_id": { "type": "string" },
+            "spec_node_id": { "type": "string" },
+            "repo_label": { "type": "string" },
+            "spec_title": { "type": "string" },
+            "query": { "type": "string" },
+            "path_prefix": { "type": "string" },
+            "max_symbols": { "type": "integer" },
+            "max_features": { "type": "integer" },
+            "max_pairs": { "type": "integer" },
+            "limit": { "type": "integer" },
+            "include_candidate_pairs": { "type": "boolean", "default": true }
+        }
+    })
+}
+
+fn reverse_engineer_compose_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "tenant_slug": { "type": "string" },
+            "tenant_id": { "type": "string" },
+            "source": {
+                "type": "object",
+                "properties": {
+                    "github_url": { "type": "string" },
+                    "repo_url": { "type": "string" },
+                    "repo_id": { "type": "string" },
+                    "local_path": { "type": "string" },
+                    "binary_path": { "type": "string" },
+                    "web_url": { "type": "string" },
+                    "sha": { "type": "string" }
+                }
+            },
+            "source_ref": { "type": "object" },
+            "github_url": { "type": "string" },
+            "repo_url": { "type": "string" },
+            "repo_id": { "type": "string" },
+            "repo": { "type": "string" },
+            "local_path": { "type": "string" },
+            "repo_path": { "type": "string" },
+            "target": { "type": "object" },
+            "repo_label": { "type": "string" },
+            "max_symbols": { "type": "integer" },
+            "max_features": { "type": "integer" },
+            "pattern_limit": { "type": "integer" },
+            "path_prefix": { "type": "string" },
+            "datawave_fact_limit": { "type": "integer" },
+            "max_total_bytes": { "type": "integer" }
+        }
+    })
+}
+
+fn reverse_engineer_feature_input_schema() -> Value {
+    let mut schema = reverse_engineer_compose_input_schema();
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("seed".to_string(), json!({ "type": "string" }));
+        properties.insert("query".to_string(), json!({ "type": "string" }));
+        properties.insert("feature".to_string(), json!({ "type": "string" }));
+        properties.insert("task".to_string(), json!({ "type": "string" }));
+        properties.insert(
+            "entry_symbols".to_string(),
+            json!({ "type": "array", "items": { "type": "string" } }),
+        );
+        properties.insert(
+            "files".to_string(),
+            json!({ "type": "array", "items": { "type": "string" } }),
+        );
+        properties.insert("max_files".to_string(), json!({ "type": "integer" }));
+        properties.insert("maxSymbols".to_string(), json!({ "type": "integer" }));
+        properties.insert("target_language".to_string(), json!({ "type": "string" }));
+        properties.insert("language".to_string(), json!({ "type": "string" }));
+        properties.insert("idiom_level".to_string(), json!({ "type": "string" }));
+        properties.insert("target_project".to_string(), json!({ "type": "object" }));
+        properties.insert(
+            "target".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "target_language": { "type": "string" },
+                    "language": { "type": "string" },
+                    "idiom_level": { "type": "string" },
+                    "target_project": { "type": "object" }
+                }
+            }),
+        );
+    }
+    schema
 }
 
 fn generic_object_output_schema() -> Value {
@@ -14995,6 +15740,75 @@ fn code_search_output_schema() -> Value {
             "symbols": { "type": "array", "items": { "type": "object" } },
             "context": { "type": "object" },
             "receipt": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn code_compiler_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "operation": { "type": "string" },
+            "affordance_id": { "type": "string" },
+            "engine": { "type": "string" },
+            "writes_graph": { "type": "boolean" },
+            "result": { "type": "object" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn reverse_engineer_compose_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "operation": { "type": "string" },
+            "command": { "type": "string" },
+            "writes_graph": { "type": "boolean" },
+            "affordance_id": { "type": "string" },
+            "engine": { "type": "string" },
+            "result": {
+                "type": "object",
+                "properties": {
+                    "source_ref": { "type": "object" },
+                    "code_spec": { "type": "object" },
+                    "features": { "type": "array", "items": { "type": "object" } },
+                    "obligations": { "type": "array", "items": { "type": "object" } },
+                    "patterns": { "type": "array", "items": { "type": "object" } },
+                    "binary": { "type": ["object", "null"] },
+                    "datawave_facts": { "type": "array", "items": { "type": "object" } },
+                    "drift": { "type": "array", "items": { "type": "object" } },
+                    "provenance": { "type": "object" },
+                    "code_files_count": { "type": "integer" },
+                    "code_symbols_count": { "type": "integer" }
+                },
+                "additionalProperties": true
+            },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn reverse_engineer_feature_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "operation": { "type": "string" },
+            "command": { "type": "string" },
+            "writes_graph": { "type": "boolean" },
+            "affordance_id": { "type": "string" },
+            "engine": { "type": "string" },
+            "result": { "type": "object", "additionalProperties": true },
             "error": { "type": "string" },
             "message": { "type": "string" }
         },
@@ -15218,6 +16032,14 @@ impl McpGraphBackend for InMemoryGraphStore {
         job_archive_to_store(self, job_id, reason, actor)
     }
 
+    fn invoke_reverse_engineer_compose(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+    ) -> Result<Value, McpError> {
+        in_store_reverse_engineer_compose_payload(self, tenant, arguments)
+    }
+
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
         Ok(InMemoryGraphStore::vector_designations(self))
     }
@@ -15433,6 +16255,14 @@ impl McpGraphBackend for RedCoreGraphStore {
         operation: &str,
     ) -> Result<Value, McpError> {
         redcore_datawave_ingest_payload(self, tenant, arguments, operation)
+    }
+
+    fn invoke_reverse_engineer_compose(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+    ) -> Result<Value, McpError> {
+        redcore_reverse_engineer_compose_payload(self, tenant, arguments)
     }
 
     fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -16090,6 +16920,15 @@ mod tests {
             }))
         }
 
+        fn invoke_reverse_engineer_compose(
+            &mut self,
+            tenant: &str,
+            arguments: &Value,
+        ) -> Result<Value, McpError> {
+            let mut store = self.0.borrow_mut();
+            super::in_store_reverse_engineer_compose_payload(&mut *store, tenant, arguments)
+        }
+
         fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
             Ok(InMemoryGraphStore::vector_designations(&self.0.borrow()))
         }
@@ -16227,6 +17066,139 @@ mod tests {
                 ..McpServerConfig::default()
             },
         )
+    }
+
+    fn seed_reverse_engineer_code_graph(provider: &FixtureProvider) {
+        let mut store = provider.0.borrow_mut();
+        store
+            .upsert_node(NodeRecord::new(
+                "repo:compose",
+                [rustyred_thg_code::CODE_REPO_LABEL],
+                json!({
+                    "tenant_id": "smoke",
+                    "repo_id": "repo:compose",
+                    "head_sha": "abc123",
+                    "source": rustyred_thg_code::SOURCE,
+                }),
+            ))
+            .unwrap();
+        for (file_id, path, hash) in [
+            ("file:lib", "src/lib.rs", "hash:lib"),
+            ("file:model", "src/model.rs", "hash:model"),
+        ] {
+            store
+                .upsert_node(NodeRecord::new(
+                    file_id,
+                    [rustyred_thg_code::CODE_FILE_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "repo:compose",
+                        "file_id": file_id,
+                        "path": path,
+                        "language": "rust",
+                        "content_hash": hash,
+                        "source": rustyred_thg_code::SOURCE,
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    format!("edge:repo-file:{file_id}"),
+                    "repo:compose",
+                    rustyred_thg_code::CONTAINS_FILE,
+                    file_id,
+                    json!({"tenant_id": "smoke", "repo_id": "repo:compose", "source": rustyred_thg_code::SOURCE}),
+                ))
+                .unwrap();
+        }
+        for (symbol_id, file_id, path, kind, name, line) in [
+            (
+                "sym:engine",
+                "file:lib",
+                "src/lib.rs",
+                "struct",
+                "Engine",
+                3u64,
+            ),
+            (
+                "sym:compose",
+                "file:lib",
+                "src/lib.rs",
+                "function",
+                "compose",
+                8u64,
+            ),
+            (
+                "sym:model",
+                "file:model",
+                "src/model.rs",
+                "struct",
+                "Model",
+                2u64,
+            ),
+        ] {
+            let signature = if symbol_id == "sym:compose" {
+                "pub fn compose(payload: f64)".to_string()
+            } else {
+                format!("pub {kind} {name}")
+            };
+            let body = (symbol_id == "sym:compose").then_some(
+                "pub fn compose(payload: f64) -> f64 {\n    if payload < 0 {\n        return 0;\n    }\n    return payload + 1;\n}",
+            );
+            store
+                .upsert_node(NodeRecord::new(
+                    symbol_id,
+                    [rustyred_thg_code::CODE_SYMBOL_LABEL],
+                    json!({
+                        "tenant_id": "smoke",
+                        "repo_id": "repo:compose",
+                        "symbol_id": symbol_id,
+                        "file_id": file_id,
+                        "file_path": path,
+                        "kind": kind,
+                        "name": name,
+                        "language": "rust",
+                        "line": line,
+                        "signature": signature,
+                        "body": body,
+                        "call_names": [],
+                        "dependency_names": [],
+                        "parser_backed": true,
+                        "source": rustyred_thg_code::SOURCE,
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    format!("edge:file-symbol:{symbol_id}"),
+                    file_id,
+                    rustyred_thg_code::DECLARES_SYMBOL,
+                    symbol_id,
+                    json!({"tenant_id": "smoke", "repo_id": "repo:compose", "source": rustyred_thg_code::SOURCE}),
+                ))
+                .unwrap();
+        }
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:compose-engine",
+                "sym:compose",
+                rustyred_thg_code::CALLS_SYMBOL,
+                "sym:engine",
+                json!({"tenant_id": "smoke", "repo_id": "repo:compose", "source": rustyred_thg_code::SOURCE}),
+            ))
+            .unwrap();
+        let mut pattern = rustyred_thg_code::CodePatternMemoryInput::new(
+            "smoke",
+            "repo:compose",
+            "Compose feature requires parser-backed validation",
+            "Validate generated behavior IR against the compose source path before target emission.",
+        );
+        pattern.root_cause = "compose feature bridge".to_string();
+        pattern.feedback = "Preserve the compiler-backed source evidence.".to_string();
+        pattern.symbol_ids = vec!["sym:compose".to_string()];
+        pattern.file_paths = vec!["src/lib.rs".to_string()];
+        pattern.confidence = 0.95;
+        rustyred_thg_code::record_code_pattern_memory_in_store(&mut *store, pattern).unwrap();
     }
 
     fn register_gateway_connector(provider: &FixtureProvider) {
@@ -17846,6 +18818,18 @@ mod tests {
         assert!(!has_tool(tools, "code_search"));
         assert!(has_tool(tools, "compute_code"));
         assert!(has_tool(tools, "code_ingest"));
+        assert!(has_tool(tools, "code_compile_spec"));
+        assert!(has_tool(tools, "code_extract_features"));
+        assert!(has_tool(tools, "code_implementation_obligations"));
+        assert!(has_tool(tools, "code_patterns_relevant"));
+        assert!(has_tool(tools, "code_spec_drift"));
+        assert!(has_tool(tools, "reverse_engineer_compose"));
+        assert!(has_tool(tools, "reverse_engineer_slice"));
+        assert!(has_tool(tools, "reverse_engineer_behavior_ir"));
+        assert!(has_tool(tools, "reverse_engineer_target_plan"));
+        assert!(has_tool(tools, "reverse_engineer_emit"));
+        assert!(has_tool(tools, "reverse_engineer_validate"));
+        assert!(has_tool(tools, "reverse_engineer_port"));
         assert!(has_tool(tools, "reconstruct_binary"));
         assert!(has_tool(tools, "datawave_ingest"));
         assert!(has_tool(tools, "harness_prepare"));
@@ -17911,6 +18895,233 @@ mod tests {
         assert!(!has_tool(tools, "upsert_note"));
         assert!(!has_tool(tools, "forget"));
         assert!(!has_tool(tools, "handoff"));
+    }
+
+    #[test]
+    fn code_compiler_tools_and_reverse_engineer_compose_dispatch() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+        seed_reverse_engineer_code_graph(&provider);
+
+        let base_args = json!({
+            "repo": "repo:compose",
+            "query": "compose",
+            "max_features": 8,
+            "pattern_limit": 4
+        });
+
+        let compiled = call_tool_json(&provider, &config, "code_compile_spec", base_args.clone());
+        assert_eq!(compiled["operation"], "compile_spec");
+        assert_eq!(compiled["result"]["file_count"], json!(2));
+        assert_eq!(compiled["result"]["symbol_count"], json!(3));
+        assert!(compiled["result"]["spec_node"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|label| label == rustyred_thg_code::CODE_SPEC_LABEL));
+
+        let features = call_tool_json(
+            &provider,
+            &config,
+            "code_extract_features",
+            base_args.clone(),
+        );
+        assert_eq!(features["operation"], "extract_features");
+        assert!(!features["result"]["records"].as_array().unwrap().is_empty());
+
+        let obligations = call_tool_json(
+            &provider,
+            &config,
+            "code_implementation_obligations",
+            base_args.clone(),
+        );
+        assert_eq!(obligations["operation"], "implementation_obligations");
+        assert!(!obligations["result"]["obligations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let patterns = call_tool_json(
+            &provider,
+            &config,
+            "code_patterns_relevant",
+            base_args.clone(),
+        );
+        assert_eq!(patterns["operation"], "patterns_relevant");
+        assert!(!patterns["result"]["patterns"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let drift = call_tool_json(&provider, &config, "code_spec_drift", base_args.clone());
+        assert_eq!(drift["operation"], "spec_drift");
+        assert!(drift["result"]["findings"].as_array().unwrap().is_empty());
+
+        let compose = call_tool_json(
+            &provider,
+            &config,
+            "reverse_engineer_compose",
+            base_args.clone(),
+        );
+        assert_eq!(compose["operation"], "reverse_engineer_compose");
+        assert_eq!(compose["command"], "reverse_engineer.compose");
+        assert_eq!(compose["result"]["code_files_count"], json!(2));
+        assert_eq!(compose["result"]["code_symbols_count"], json!(3));
+        assert_eq!(
+            compose["result"]["provenance"]["ingest_path"],
+            "AlreadyInStore"
+        );
+        assert!(!compose["result"]["features"].as_array().unwrap().is_empty());
+        assert!(!compose["result"]["obligations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!compose["result"]["datawave_facts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(compose["result"]["binary"].is_null());
+        assert!(compose["result"]["drift"].as_array().unwrap().is_empty());
+
+        let feature_args = json!({
+            "repo": "repo:compose",
+            "query": "compose",
+            "seed": "compose",
+            "entry_symbols": ["sym:compose"],
+            "target": {
+                "target_language": "rust",
+                "target_project": {
+                    "project_root": "/tmp/target"
+                }
+            }
+        });
+
+        let slice = call_tool_json(
+            &provider,
+            &config,
+            "reverse_engineer_slice",
+            feature_args.clone(),
+        );
+        assert_eq!(slice["operation"], "reverse_engineer_slice");
+        assert_eq!(slice["command"], "reverse_engineer.slice");
+        assert_eq!(slice["result"]["repo_id"], "repo:compose");
+        assert!(!slice["result"]["entry_symbols"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let behavior = call_tool_json(
+            &provider,
+            &config,
+            "reverse_engineer_behavior_ir",
+            feature_args.clone(),
+        );
+        assert_eq!(behavior["operation"], "reverse_engineer_behavior_ir");
+        assert_eq!(behavior["command"], "reverse_engineer.behavior_ir");
+        assert_eq!(behavior["result"]["feature"]["repo_id"], "repo:compose");
+        assert!(!behavior["result"]["public_api"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let target_plan = call_tool_json(
+            &provider,
+            &config,
+            "reverse_engineer_target_plan",
+            feature_args.clone(),
+        );
+        assert_eq!(target_plan["operation"], "reverse_engineer_target_plan");
+        assert_eq!(target_plan["result"]["target_language"], "rust");
+        assert_eq!(
+            target_plan["result"]["module_plan"][0]["module_path"],
+            "src/compose.rs"
+        );
+
+        let emitted = call_tool_json(
+            &provider,
+            &config,
+            "reverse_engineer_emit",
+            feature_args.clone(),
+        );
+        assert_eq!(emitted["operation"], "reverse_engineer_emit");
+        assert_eq!(emitted["result"]["status"], "needs_review");
+        assert!(emitted["result"]["files"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("pub struct PortMetadata"));
+        assert!(emitted["result"]["files"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("if payload < 0.0 {"));
+        assert!(emitted["result"]["files"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("return Ok(0.0);"));
+        assert!(emitted["result"]["files"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("Ok(payload + 1.0)"));
+        assert!(emitted["result"]["tests"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("translated_numeric_examples_match_source_semantics"));
+        assert!(emitted["result"]["tests"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("generated_port::compose(-1.0).unwrap(), 0.0"));
+
+        let validated = call_tool_json(
+            &provider,
+            &config,
+            "reverse_engineer_validate",
+            feature_args.clone(),
+        );
+        assert_eq!(validated["operation"], "reverse_engineer_validate");
+        assert_eq!(validated["result"]["receipts"][0]["status"], "not_run");
+
+        let port = call_tool_json(
+            &provider,
+            &config,
+            "reverse_engineer_port",
+            json!({
+                "repo": "repo:compose",
+                "query": "compose",
+                "seed": "compose",
+                "entry_symbols": ["sym:compose"],
+                "target": {
+                    "target_language": "typescript",
+                    "target_project": {
+                        "project_root": "/tmp/target"
+                    }
+                }
+            }),
+        );
+        assert_eq!(port["operation"], "reverse_engineer_port");
+        assert_eq!(
+            port["result"]["target_plan"]["target_language"],
+            "typescript"
+        );
+        assert_eq!(port["result"]["patch_set"]["status"], "needs_review");
+        assert!(port["result"]["patch_set"]["files"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("if (payload < 0) {"));
+        assert!(port["result"]["patch_set"]["files"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("return 0;"));
+        assert!(port["result"]["patch_set"]["files"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("return payload + 1;"));
+        assert!(port["result"]["patch_set"]["tests"][0]["after"]
+            .as_str()
+            .unwrap()
+            .contains("assert.equal(compose(-1), 0);"));
+        assert_eq!(
+            port["result"]["patch_set"]["receipts"][0]["status"],
+            "not_run"
+        );
     }
 
     #[test]
@@ -18639,6 +19850,18 @@ mod tests {
             "browse_with_me",
             "compute_code",
             "code_ingest",
+            "code_compile_spec",
+            "code_extract_features",
+            "code_implementation_obligations",
+            "code_patterns_relevant",
+            "code_spec_drift",
+            "reverse_engineer_compose",
+            "reverse_engineer_slice",
+            "reverse_engineer_behavior_ir",
+            "reverse_engineer_target_plan",
+            "reverse_engineer_emit",
+            "reverse_engineer_validate",
+            "reverse_engineer_port",
             "harness_prepare",
         ] {
             let tool = tool_by_name(tools, name);
@@ -19182,8 +20405,8 @@ mod tests {
         assert_eq!(first.scratchpad_seq, 1);
 
         let first_revision_node = super::scratchpad_revision_node_id("scratchpad:theorem", 1);
-        let first_revision_edge = "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000001"
-            .to_string();
+        let first_revision_edge =
+            "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000001".to_string();
         let second_revision_node = super::scratchpad_revision_node_id("scratchpad:theorem", 2);
         let second_revision_edge =
             "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000002".to_string();

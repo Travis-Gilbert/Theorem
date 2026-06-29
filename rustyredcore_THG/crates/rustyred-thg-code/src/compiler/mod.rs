@@ -647,6 +647,7 @@ mod tests {
             language: "rust".to_string(),
             line: Some(9),
             signature: Some(signature.to_string()),
+            body: None,
             call_names: Vec::new(),
             dependency_names: Vec::new(),
             parser_backed: true,

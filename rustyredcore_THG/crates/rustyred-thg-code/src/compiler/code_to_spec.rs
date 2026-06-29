@@ -254,6 +254,7 @@ fn symbol_snapshot(node: &NodeRecord) -> Option<CodeSymbolSnapshot> {
         language: property_string(&node.properties, "language").unwrap_or_default(),
         line: property_u64(&node.properties, "line"),
         signature: non_empty_property(&node.properties, "signature"),
+        body: non_empty_property(&node.properties, "body"),
         call_names,
         dependency_names,
         parser_backed: property_bool(&node.properties, "parser_backed"),

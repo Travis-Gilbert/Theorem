@@ -8173,6 +8173,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyred-thg-behavior-ir"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustyred-thg-binformat"
 version = "0.1.0"
 dependencies = [
@@ -8206,7 +8214,9 @@ dependencies = [
  "rustyred-code-embedding",
  "rustyred-membrane",
  "rustyred-rerank",
+ "rustyred-thg-behavior-ir",
  "rustyred-thg-core",
+ "rustyred-thg-datawave",
  "serde",
  "serde_json",
  "sha2 0.10.9",

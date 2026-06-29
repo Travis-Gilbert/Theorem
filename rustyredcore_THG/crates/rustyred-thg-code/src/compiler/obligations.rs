@@ -85,7 +85,7 @@ pub struct CodeImplementationObligation {
     pub unknowns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CodeImplementationObligationOutput {
     pub tenant_id: String,
     pub repo_id: String,
@@ -119,6 +119,12 @@ pub fn compile_code_implementation_obligations(
         &input.tenant_id,
         &input.repo_id,
         &input.pattern_memories,
+        &shared_evidence,
+    ));
+    obligations.extend(derive_feature_obligations(
+        &input.tenant_id,
+        &input.repo_id,
+        &input.feature_records,
         &shared_evidence,
     ));
     obligations.extend(derive_annotation_obligations(
@@ -384,6 +390,45 @@ fn derive_pattern_obligations(
         .collect()
 }
 
+fn derive_feature_obligations(
+    tenant_id: &str,
+    repo_id: &str,
+    features: &[CodeFeatureRecord],
+    shared_evidence: &[String],
+) -> Vec<CodeImplementationObligation> {
+    let Some(first) = features.first() else {
+        return Vec::new();
+    };
+    let mut evidence_ids = features
+        .iter()
+        .take(32)
+        .map(|feature| feature.feature_id.clone())
+        .collect::<Vec<_>>();
+    evidence_ids.extend_from_slice(shared_evidence);
+    vec![CodeImplementationObligation {
+        tenant_id: tenant_id.to_string(),
+        repo_id: repo_id.to_string(),
+        obligation_id: obligation_id(
+            tenant_id,
+            repo_id,
+            &evidence_ids,
+            "Validate compiler feature-evidence anchors",
+            &first.source_symbol_id,
+        ),
+        target_file: None,
+        target_symbol_id: Some(first.source_symbol_id.clone()),
+        obligation: "Validate compiler feature-evidence anchors".to_string(),
+        rationale: format!(
+            "{} compiler feature records connect source and target code symbols; validate the selected feature anchors before treating them as portable behavior.",
+            features.len()
+        ),
+        evidence_ids: normalize_strings(evidence_ids),
+        suggested_validators: normalize_strings(vec![VALIDATOR_FEATURE_ANCHOR.to_string()]),
+        risks: normalize_strings(vec!["medium-risk:compiler-feature-evidence".to_string()]),
+        unknowns: Vec::new(),
+    }]
+}
+
 fn derive_annotation_obligations(
     tenant_id: &str,
     repo_id: &str,
@@ -608,6 +653,34 @@ mod tests {
         assert!(obligation.evidence_ids.contains(&pattern.pattern_id));
         assert_eq!(obligation.target_symbol_id.as_deref(), Some("sym:compile"));
         assert_eq!(obligation.target_file.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn code_obligation_includes_feature_evidence_anchor() {
+        let feature = CodeFeatureRecord {
+            feature_id: "feature:compile-model".to_string(),
+            source_symbol_id: "sym:compile".to_string(),
+            target_symbol_id: "sym:model".to_string(),
+            feature_version: CODE_COMPILER_FEATURE_VERSION.to_string(),
+            model_id: None,
+            features: super::super::features::CodeConnectionFeatureVector::default(),
+            provenance: json!({"kind": "test"}),
+        };
+        let mut input = CodeImplementationObligationInput::new("Travis-Gilbert", "repo:compiler");
+        input.feature_records.push(feature.clone());
+
+        let output = compile_code_implementation_obligations(input);
+        assert_eq!(output.obligations.len(), 1);
+        let obligation = &output.obligations[0];
+        assert_eq!(
+            obligation.obligation,
+            "Validate compiler feature-evidence anchors"
+        );
+        assert_eq!(obligation.target_symbol_id.as_deref(), Some("sym:compile"));
+        assert!(obligation.evidence_ids.contains(&feature.feature_id));
+        assert!(obligation
+            .suggested_validators
+            .contains(&VALIDATOR_FEATURE_ANCHOR.to_string()));
     }
 
     #[test]

@@ -30,9 +30,12 @@ mod code_embed_hook;
 mod code_epistemic_hook;
 mod code_hooks;
 mod compiler;
+mod compose;
 mod context_pack;
+mod datawave_projection;
 pub mod engineering;
 mod ensure;
+mod feature_port;
 mod ingest_jobs;
 mod map_projection;
 mod repo_fetch;
@@ -75,10 +78,20 @@ pub use compiler::{
     FEATURE_TARGET_CODE, OBLIGATES_CODE_SYMBOL, OBLIGATION_DERIVES_FROM, PATTERN_APPLIES_TO_CODE,
     PROCESS_ENTRYPOINT, PROCESS_TOUCHES_CODE, SPECIFIES_CODE,
 };
+pub use compose::{
+    compose_reconstruction_spec_in_store, compose_reconstruction_spec_with_ensure_in_store,
+    BinaryReconstructionSummary, ComposeInput, ComposeProvenance, ReconstructionSpec, SourceRef,
+    REVERSE_ENGINEER_COMPOSE_RECEIPT_LABEL,
+};
 pub use context_pack::{
     code_context_pack_in_store, context_pack, context_pack_fetch, AdmittedSymbol,
     CodeContextPackInput, CodeContextPackOutput, ContextPackOutput,
     DEFAULT_CONTEXT_PACK_BUDGET_TOKENS,
+};
+pub use datawave_projection::{
+    datawave_fact_summaries_for_repo, intersect_field_values, project_code_to_datawave,
+    CodeToDatawaveProjectionInput, FieldFactSummary, ProjectionReceipt, CODE_FILE_DATA_TYPE,
+    CODE_SYMBOL_DATA_TYPE, CODE_TO_DATAWAVE_VERSION,
 };
 pub use engineering::{
     compile_engineering_in_memory, compile_engineering_in_store,
@@ -97,10 +110,10 @@ pub use engineering::{
     EvidenceSource, GhidraOracleAnnotationFact, GhidraOracleCallEdgeFact,
     GhidraOracleCallStackEffectFact, GhidraOracleDataTypeFact, GhidraOracleDataTypeFieldFact,
     GhidraOracleDebugSignatureFeature, GhidraOracleDecompilerDiagnosticFact,
-    GhidraOracleEnumValueFact, GhidraOracleEquateFact,
-    GhidraOracleEquateReferenceFact, GhidraOracleExport, GhidraOracleExternalLinkageFact,
-    GhidraOracleExternalThunkLinkFact, GhidraOracleFixture, GhidraOracleFunctionFact,
-    GhidraOracleFunctionIdFact, GhidraOracleFunctionIdMatchFact, GhidraOracleFunctionPrototypeFact,
+    GhidraOracleEnumValueFact, GhidraOracleEquateFact, GhidraOracleEquateReferenceFact,
+    GhidraOracleExport, GhidraOracleExternalLinkageFact, GhidraOracleExternalThunkLinkFact,
+    GhidraOracleFixture, GhidraOracleFunctionFact, GhidraOracleFunctionIdFact,
+    GhidraOracleFunctionIdMatchFact, GhidraOracleFunctionPrototypeFact,
     GhidraOracleFunctionPrototypeParameterFact, GhidraOracleHighVariableFact,
     GhidraOracleHighVariableInstanceFact, GhidraOracleJumpTableCaseFact, GhidraOracleJumpTableFact,
     GhidraOracleJumpTableLoadTableFact, GhidraOracleMemoryWitnessFact,
@@ -125,23 +138,22 @@ pub use engineering::{
     ENGINEERING_OBLIGATION_LABEL, ENGINEERING_VALIDATOR_LABEL, EVENT_HAS_TAINT_MARK,
     GHIDRA_ORACLE_ANNOTATION_FACT_LABEL, GHIDRA_ORACLE_CALL_EDGE_FACT_LABEL,
     GHIDRA_ORACLE_CALL_STACK_EFFECT_FACT_LABEL, GHIDRA_ORACLE_DATA_TYPE_FACT_LABEL,
-    GHIDRA_ORACLE_DECOMPILER_DIAGNOSTIC_FACT_LABEL,
-    GHIDRA_ORACLE_EQUATE_FACT_LABEL, GHIDRA_ORACLE_EXTERNAL_LINKAGE_FACT_LABEL,
-    GHIDRA_ORACLE_FIXTURE_LABEL, GHIDRA_ORACLE_FUNCTION_FACT_LABEL,
-    GHIDRA_ORACLE_FUNCTION_ID_FACT_LABEL, GHIDRA_ORACLE_FUNCTION_PROTOTYPE_FACT_LABEL,
-    GHIDRA_ORACLE_HIGH_VARIABLE_FACT_LABEL, GHIDRA_ORACLE_JUMP_TABLE_FACT_LABEL,
-    GHIDRA_ORACLE_PARAMETER_MEASURE_FACT_LABEL, GHIDRA_ORACLE_PCODE_OP_FACT_LABEL,
-    GHIDRA_ORACLE_REFERENCE_FACT_LABEL, GHIDRA_ORACLE_SEMANTIC_SIGNATURE_FACT_LABEL,
-    GHIDRA_ORACLE_STACK_FRAME_FACT_LABEL, GHIDRA_ORACLE_STRUCTURE_FIELD_ACCESS_FACT_LABEL,
-    GHIDRA_ORACLE_SYMBOLIC_SUMMARY_FACT_LABEL, HAS_ANALYSIS_DRIFT, HAS_ANALYSIS_PASS,
-    HAS_ANALYSIS_SCHEDULER_STATE, HAS_ANALYSIS_WORK_ITEM, HAS_ANALYZER_RECEIPT, HAS_API_CONTRACT,
-    HAS_ARCHITECTURE_MAP, HAS_BEHAVIOR, HAS_DATA_FLOW_FACT, HAS_EVIDENCE_SOURCE,
-    HAS_IMPLEMENTATION_OBLIGATION, HAS_INSTRUCTION_FACT, HAS_LOADER_FACT, HAS_PROGRAM_PCODE_FACT,
-    HAS_REFERENCE_RECOVERY_EVIDENCE, HAS_RUNTIME_TRACE, HAS_SEMANTIC_HYPOTHESIS, HAS_THIR_FUNCTION,
-    HAS_VALIDATOR, INSTRUCTION_FACT_LABEL, LOADER_FACT_LABEL, NATIVE_LOADER_ANALYZER_ID,
-    ORACLE_FIXTURE_HAS_ANNOTATION_FACT, ORACLE_FIXTURE_HAS_CALL_EDGE_FACT,
-    ORACLE_FIXTURE_HAS_CALL_STACK_EFFECT_FACT, ORACLE_FIXTURE_HAS_DATA_TYPE_FACT,
-    ORACLE_FIXTURE_HAS_DECOMPILER_DIAGNOSTIC_FACT,
+    GHIDRA_ORACLE_DECOMPILER_DIAGNOSTIC_FACT_LABEL, GHIDRA_ORACLE_EQUATE_FACT_LABEL,
+    GHIDRA_ORACLE_EXTERNAL_LINKAGE_FACT_LABEL, GHIDRA_ORACLE_FIXTURE_LABEL,
+    GHIDRA_ORACLE_FUNCTION_FACT_LABEL, GHIDRA_ORACLE_FUNCTION_ID_FACT_LABEL,
+    GHIDRA_ORACLE_FUNCTION_PROTOTYPE_FACT_LABEL, GHIDRA_ORACLE_HIGH_VARIABLE_FACT_LABEL,
+    GHIDRA_ORACLE_JUMP_TABLE_FACT_LABEL, GHIDRA_ORACLE_PARAMETER_MEASURE_FACT_LABEL,
+    GHIDRA_ORACLE_PCODE_OP_FACT_LABEL, GHIDRA_ORACLE_REFERENCE_FACT_LABEL,
+    GHIDRA_ORACLE_SEMANTIC_SIGNATURE_FACT_LABEL, GHIDRA_ORACLE_STACK_FRAME_FACT_LABEL,
+    GHIDRA_ORACLE_STRUCTURE_FIELD_ACCESS_FACT_LABEL, GHIDRA_ORACLE_SYMBOLIC_SUMMARY_FACT_LABEL,
+    HAS_ANALYSIS_DRIFT, HAS_ANALYSIS_PASS, HAS_ANALYSIS_SCHEDULER_STATE, HAS_ANALYSIS_WORK_ITEM,
+    HAS_ANALYZER_RECEIPT, HAS_API_CONTRACT, HAS_ARCHITECTURE_MAP, HAS_BEHAVIOR, HAS_DATA_FLOW_FACT,
+    HAS_EVIDENCE_SOURCE, HAS_IMPLEMENTATION_OBLIGATION, HAS_INSTRUCTION_FACT, HAS_LOADER_FACT,
+    HAS_PROGRAM_PCODE_FACT, HAS_REFERENCE_RECOVERY_EVIDENCE, HAS_RUNTIME_TRACE,
+    HAS_SEMANTIC_HYPOTHESIS, HAS_THIR_FUNCTION, HAS_VALIDATOR, INSTRUCTION_FACT_LABEL,
+    LOADER_FACT_LABEL, NATIVE_LOADER_ANALYZER_ID, ORACLE_FIXTURE_HAS_ANNOTATION_FACT,
+    ORACLE_FIXTURE_HAS_CALL_EDGE_FACT, ORACLE_FIXTURE_HAS_CALL_STACK_EFFECT_FACT,
+    ORACLE_FIXTURE_HAS_DATA_TYPE_FACT, ORACLE_FIXTURE_HAS_DECOMPILER_DIAGNOSTIC_FACT,
     ORACLE_FIXTURE_HAS_EQUATE_FACT, ORACLE_FIXTURE_HAS_EXTERNAL_LINKAGE_FACT,
     ORACLE_FIXTURE_HAS_FUNCTION_FACT, ORACLE_FIXTURE_HAS_FUNCTION_ID_FACT,
     ORACLE_FIXTURE_HAS_FUNCTION_PROTOTYPE_FACT, ORACLE_FIXTURE_HAS_HIGH_VARIABLE_FACT,
@@ -158,6 +170,12 @@ pub use engineering::{
 pub use ensure::{
     code_ingest_ensure, ensure_repo_kg, ensure_repo_kg_in_store, RepoKgStatus, HEAD_SHA_PROPERTY,
     REPO_URL_PROPERTY,
+};
+pub use feature_port::{
+    behavior_ir_from_feature_slice, behavior_ir_from_reconstruction_spec,
+    feature_slice_from_reconstruction_spec, patch_set_from_behavior_ir,
+    port_patch_set_from_reconstruction_spec, target_plan_from_behavior_ir,
+    target_plan_input_from_value, validate_patch_set, FeatureSliceInput, TargetPlanInput,
 };
 pub use ingest_jobs::{
     IngestJobEvent, IngestJobEventKind, IngestJobRegistry, IngestJobRequest, IngestJobState,
@@ -184,6 +202,7 @@ pub const CODE_RECEIPT_LABEL: &str = "CodeInvocationReceipt";
 /// `code_context` reads it back.
 pub const CODE_FILE_TEXT_LABEL: &str = "CodeFileText";
 pub const SOURCE: &str = "rustyred_thg_code";
+pub const CODE_TO_DATAWAVE_SOURCE: &str = "rustyred-thg-code-to-datawave";
 pub const CONTAINS_FILE: &str = "CONTAINS_FILE";
 pub const DECLARES_SYMBOL: &str = "DECLARES_SYMBOL";
 pub const SYMBOL_NAME_TARGET: &str = "SYMBOL_NAME_TARGET";
@@ -2927,6 +2946,7 @@ pub(crate) fn build_node_mutations(
                     "line": symbol.line,
                     "signature": symbol.signature,
                     "snippet": symbol.snippet,
+                    "body": symbol.body,
                     "trust_tier": symbol.trust_tier,
                     "community_id": symbol.community_id,
                     "call_names": symbol.call_names.iter().cloned().collect::<Vec<_>>(),
@@ -6126,7 +6146,8 @@ fn normalize_set(values: Vec<String>) -> BTreeSet<String> {
 fn default_extensions() -> BTreeSet<String> {
     [
         "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "java", "rb", "rs", "go", "swift", "py",
-        "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml", "md", "json",
+        "ts", "tsx", "js", "jsx", "mjs", "cjs", "proto", "toml", "md", "rst", "json", "yaml",
+        "yml", "css", "ini", "cfg",
     ]
     .into_iter()
     .map(str::to_string)

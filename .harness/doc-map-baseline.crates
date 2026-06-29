@@ -11,6 +11,7 @@ rustyred-proxy
 rustyred-rerank
 rustyred-thg-adapters
 rustyred-thg-affordances
+rustyred-thg-behavior-ir
 rustyred-thg-binformat
 rustyred-thg-catalog
 rustyred-thg-code

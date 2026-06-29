@@ -5,7 +5,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | Crate | What it is |
 |-------|------------|
 | `commonplace` | CommonPlace consumer object model (Item/Collection/Tag) and auto-structuring ingest, graph-native over the RustyRedCore-THG substrate. |
-| `design-check` | Static design-engineering checker and skill-pack payload for Theorem harness design systems, including the browserless Design Scout callable validator cut for normalized facts, deterministic audit/drift, token output, and HTML reports. |
+| `design-check` | Static design-engineering checker and skill-pack payload for Theorem harness design systems. |
 | `ensemble` | Ensemble: the capability-pack registry, budgeted selector, and trust ladder over RustyRedCore-THG. |
 | `pilot-core` | Servo-free, Playwright-class browser automation core: locator, actionability + auto-wait, geometry snapshot, coordinate synthesis, and web-first assertions behind a BrowserDriver trait. |
 | `prose-check` | Deterministic writing-engineering style checker for Theorem harness receipts. |
@@ -13,22 +13,27 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `rustyred-code-embedding` | Shared code embedding seam for RustyRed file and CodeCrawler write paths. |
 | `rustyred-hipporag` | HippoRAG 2 candidate generation with RAPTOR-style graph hubs for RustyRed THG. |
 | `rustyred-membrane` | Shared context admission and eviction membrane for RustyRed graph-backed context. |
+| `rustyred-proxy` | Local RustyRed proxy for Anthropic Messages clients and Theorem room protocol. |
 | `rustyred-rerank` | Reranker scorer implementations for RustyRed membrane admission. |
 | `rustyred-thg-adapters` | LoRA adapter catalog and routing over RustyRedCore-THG graph records. |
 | `rustyred-thg-affordances` | Connector-as-substrate learning registry: MCP tools as first-class Affordance graph nodes with learned, scoped selection over RustyRedCore-THG. |
+| `rustyred-thg-behavior-ir` | Portable behavior IR for Theorem feature-port reconstruction. |
 | `rustyred-thg-binformat` | Binary loader facts for Theorem reconstruction. |
 | `rustyred-thg-catalog` | Relational catalog (tenants, projects, billing, auth) and the cold index for the RustyRedCore-THG storage spine, over sqlx/Postgres. |
-| `rustyred-thg-code` | Code parsing plugin/runtime for RustyRedCore-THG tenant graph stores. |
+| `rustyred-thg-code` | Code graph, compiler, and reverse-engineer compose runtime for RustyRedCore-THG tenant graph stores. |
 | `rustyred-thg-compat-server` | Standalone HTTP control server for THG-Core. |
 | `rustyred-thg-connectors` | Live MCP connector transport: connect to an external MCP server, list its tools, and register them as learnable Affordance graph nodes via rustyred-thg-affordances. |
 | `rustyred-thg-core` | Theorem HotGraph core command executor and state machine. |
+| `rustyred-thg-datawave-harness` | Harness capability pack theorem.ingest.datawave: exposes the DATAWAVE-style intake (ingest a record/batch, write the dictionary, look up and intersect facts by value+field) to agents as RustyRed plugin operations, mirroring rustyred-thg-reconstruct-harness. |
+| `rustyred-thg-datawave` | DATAWAVE-style intake: turn any source record into typed normalized field-facts plus declared entity-edges in a GraphStore, with per-field index policy, a self-describing dictionary, cell visibility/masking, and content + fuzzy hashing. |
 | `rustyred-thg-disasm` | Instruction fact decoder for Theorem reconstruction. |
 | `rustyred-thg-fractal` | Native Rust fractal expansion pipeline over RustyRed and RustyWeb. |
 | `rustyred-thg-fuse` | Read-only FUSE/path index over zero-copy RustyRed THG graph archives. |
 | `rustyred-thg-geotemporal` | Tenant-scoped geotemporal composition over THG H3 spatial indexes. |
+| `rustyred-thg-graphblas` | GraphBLAS + LAGraph FFI and safe sparse-linear-algebra layer for RustyRed: matrix/vector/semiring handles, masked mxv/mxm semiring traversal, and LAGraph algorithm bindings. |
 | `rustyred-thg-intake` | CommonPlace source intake: the ingestion-spoke framework (SourceSpoke), the scoped incremental sync driver, curated + MappedSpoke sources, and the NeedsYou-residue -> delegation act seam. |
 | `rustyred-thg-lift` | Minimal THIR lifter for Theorem reconstruction. |
-| `rustyred-thg-mcp` | Model Context Protocol adapter for the Theorem HotGraph graph database. |
+| `rustyred-thg-mcp` | Native MCP adapter for Theorem graph, code, reconstruction, and reverse-engineer tools. |
 | `rustyred-thg-memory` | Graph-native memory recall, consolidation, decay, and validity plugin for RustyRedCore-THG. |
 | `rustyred-thg-ml` | Shared graph tensor and message-passing primitives for RustyRedCore-THG learned organs. |
 | `rustyred-thg-offload` | Compute-offload planner: operation algebra, version-keyed reuse, calibrated cascade, verification receipts, and CPU graph affordances for Theorem. |

@@ -20,8 +20,8 @@ use rustyred_thg_core::{
 use rustyred_thg_datawave_harness::{DatawaveIngestPlugin, INGEST_CAPABILITY_PACK};
 use rustyred_thg_mcp::{
     job_archive_to_store, job_list_from_store, job_note_to_store, job_submit_to_store,
-    AppAffordanceInvocation, HandoffDispatch, McpError, McpGraphBackend, McpGraphProvider,
-    McpServerConfig,
+    redcore_reverse_engineer_compose_payload, AppAffordanceInvocation, HandoffDispatch, McpError,
+    McpGraphBackend, McpGraphProvider, McpServerConfig,
 };
 use rustyred_web::{
     configured_search_providers_from_env, FetchCascade, FetchCascadeOptions, LiveFetchOptions,
@@ -2739,6 +2739,25 @@ impl McpGraphBackend for ProductMcpBackend {
             }
             TenantGraphStore::Redis(_) => Err(McpError::internal(
                 "datawave ingest requires the in-process RedCore graph backend",
+            )),
+        }
+    }
+
+    fn invoke_reverse_engineer_compose(
+        &mut self,
+        tenant: &str,
+        arguments: &Value,
+    ) -> Result<Value, McpError> {
+        match &mut self.store {
+            TenantGraphStore::RedCore(executor) => {
+                let mut writer = executor
+                    .writer
+                    .lock()
+                    .map_err(|_| McpError::internal("RedCore writer lock poisoned"))?;
+                redcore_reverse_engineer_compose_payload(&mut writer, tenant, arguments)
+            }
+            TenantGraphStore::Redis(_) => Err(McpError::internal(
+                "reverse_engineer_compose requires an in-process RedCore graph backend",
             )),
         }
     }
