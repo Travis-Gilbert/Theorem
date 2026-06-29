@@ -92,6 +92,7 @@ install_release_binary() {
         return 1
     fi
     mkdir -p "$INSTALL_DIR"
+    rm -f "$INSTALL_DIR/theorem-agentd" "$INSTALL_DIR/theorem-localmodel" "$INSTALL_DIR/rustyred-proxy" "$INSTALL_DIR/theorem" "$INSTALL_DIR/rustyred"
     install -m 0755 "$tmp/theorem-agentd" "$INSTALL_DIR/theorem-agentd"
     if [[ -x "$tmp/theorem-localmodel" ]]; then
         install -m 0755 "$tmp/theorem-localmodel" "$INSTALL_DIR/theorem-localmodel"
@@ -216,8 +217,13 @@ main() {
     source_checkout="$(resolve_source_checkout)"
 
     mkdir -p "$INSTALL_DIR"
+    rm -f "$INSTALL_DIR/theorem" "$INSTALL_DIR/rustyred"
     install -m 0755 "$source_checkout/scripts/theorem" "$INSTALL_DIR/theorem"
     log "installed $INSTALL_DIR/theorem"
+    if command -v cargo >/dev/null 2>&1 && [[ -f "$source_checkout/apps/theorem-proxy/Cargo.toml" ]]; then
+        log "installing theorem-proxy from source"
+        cargo install --path "$source_checkout/apps/theorem-proxy" --force
+    fi
     if [[ -x "$source_checkout/rustyredcore_THG/target/release/rustyred-proxy" ]]; then
         install -m 0755 "$source_checkout/rustyredcore_THG/target/release/rustyred-proxy" "$INSTALL_DIR/rustyred-proxy"
         log "installed $INSTALL_DIR/rustyred-proxy"

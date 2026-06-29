@@ -1,6 +1,6 @@
 //! Integration acceptance for the substrate-backed memory source (roadmap A.3 /
 //! SPEC-PROXY-PROVE-AND-PRUNE D1): the proxy retrieves live node memory over the
-//! node's MCP `/mcp` endpoint (`hippo_retrieve`), and fails open when the node is
+//! node's MCP `/mcp` endpoint (`graphql_query`), and fails open when the node is
 //! absent so a down node never blocks or alters a turn.
 
 use std::net::SocketAddr;
@@ -20,11 +20,12 @@ async fn spawn(router: Router) -> SocketAddr {
 
 #[tokio::test]
 async fn injects_ranked_hits_from_a_live_node_over_mcp() {
-    // Mock node: /mcp answers a hippo_retrieve tools/call with two candidates.
+    // Mock node: /mcp answers a GraphQL memory query with two docs.
     let node = Router::new().route(
         "/mcp",
         post(|body: String| async move {
-            assert!(body.contains("hippo_retrieve"), "calls the retrieval tool");
+            assert!(body.contains("graphql_query"), "calls the GraphQL transport");
+            assert!(body.contains("memory(query:"), "uses the memory field");
             assert!(body.contains("planner"), "forwards the turn query");
             axum::Json(serde_json::json!({
                 "jsonrpc": "2.0",
@@ -32,10 +33,12 @@ async fn injects_ranked_hits_from_a_live_node_over_mcp() {
                 // Real rustyred-thg-server /mcp envelope: payload under structuredContent.
                 "result": {
                     "structuredContent": {
-                        "candidates": [
-                            {"node_id": "mem:planner", "text": "planner.rs does boolean pushdown", "ppr_proximity": 0.91},
-                            {"node_id": "mem:cats", "text": "cats are nice", "ppr_proximity": 0.10}
-                        ]
+                        "data": {
+                            "memory": [
+                                {"id": "mem:planner", "title": "Planner", "contentPreview": "planner.rs does boolean pushdown", "fitness": 0.91},
+                                {"id": "mem:cats", "title": "Cats", "contentPreview": "cats are nice", "fitness": 0.10}
+                            ]
+                        }
                     }
                 }
             }))
@@ -52,7 +55,7 @@ async fn injects_ranked_hits_from_a_live_node_over_mcp() {
     .unwrap();
 
     assert_eq!(hits.len(), 2, "both candidates returned");
-    assert_eq!(hits[0].title, "mem:planner");
+    assert_eq!(hits[0].title, "Planner");
     assert!(hits[0].body.contains("pushdown"));
     assert_eq!(hits[0].score, 0.91);
 }

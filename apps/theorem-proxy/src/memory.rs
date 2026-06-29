@@ -3,9 +3,9 @@
 //!
 //! The proxy retrieves over a `MemorySource` and injects the top hits at the
 //! cache-stable suffix. The default ranks by query token overlap -- a real, if
-//! simple, relevance signal. The substrate retrieval (`hippo_retrieve` /
-//! index-context, with embeddings + PPR) is the production impl that plugs in behind
-//! this trait without the proxy changing.
+//! simple, relevance signal. The substrate retrieval crosses the typed GraphQL
+//! contract (`graphql_query`) so the membrane consumes the same capability surface
+//! as MCP and other clients instead of reaching around it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -143,9 +143,9 @@ impl MemorySource for DirectoryMemorySource {
 }
 
 /// Substrate-backed source: the live local Theorem node's graph memory, reached over
-/// its MCP endpoint (`hippo_retrieve` -- the spec's named retrieval path: query-specific
-/// PPR over the memory graph). This is the production memory the proxy injects --
-/// relevance-ranked by the substrate, not a static directory.
+/// its MCP endpoint by carrying a GraphQL document through `graphql_query`. This is
+/// the production memory the proxy injects -- served by the substrate contract, not
+/// a static directory or a private handler path.
 ///
 /// Fail open by construction: a node that is down, slow, or returns garbage yields no
 /// hits, so the turn is forwarded unchanged. The agent's short read timeout guarantees
@@ -175,36 +175,42 @@ impl HttpMemorySource {
         }
     }
 
-    /// JSON-RPC `tools/call` for `hippo_retrieve` against the node. `None` on any
+    /// JSON-RPC `tools/call` for `graphql_query` against the node. `None` on any
     /// transport/parse failure (the caller maps that to no hits -> passthrough).
     fn query(&self, query: &str, limit: usize) -> Option<Vec<MemoryHit>> {
         if limit == 0 {
             return Some(Vec::new());
         }
-        // auto_index_memory=false keeps this a pure read: indexing the corpus re-scans
-        // every memory and far exceeds the agent's read timeout, so the hot path must
-        // query the already-warm index. Building/warming the index is the seed step's job
-        // (scripts/seed-node.py), not the per-turn retrieval's.
-        let mut arguments = json!({ "query": query, "top_k": limit, "auto_index_memory": false });
-        if let Some(tenant) = &self.tenant {
-            arguments["tenant"] = json!(tenant);
-        }
+        let arguments = json!({
+            "query": "query($q:String!, $limit:Int!){ memory(query:$q, limit:$limit, detail:\"overview\", detailTopK:$limit, contentPreviewChars:1200){ id title gist summary contentPreview content fitness } }",
+            "variables": {
+                "q": query,
+                "limit": limit
+            }
+        });
         let request = json!({
             "jsonrpc": "2.0",
             "id": "theorem-proxy-recall",
             "method": "tools/call",
-            "params": { "name": "hippo_retrieve", "arguments": arguments },
+            "params": { "name": "graphql_query", "arguments": arguments },
         });
         let body = serde_json::to_string(&request).ok()?;
-        let response = self
+        let mut builder = self
             .agent
             .post(&self.endpoint)
-            .set("content-type", "application/json")
-            .send_string(&body)
-            .ok()?;
+            .set("content-type", "application/json");
+        if let Some(tenant) = &self.tenant {
+            builder = builder.set("x-theorem-tenant", tenant);
+        }
+        let response = builder.send_string(&body).ok()?;
         let text = response.into_string().ok()?;
         let value: Value = serde_json::from_str(&text).ok()?;
-        Some(parse_candidates(&value, limit))
+        let hits = parse_graphql_memory(&value, limit);
+        if hits.is_empty() {
+            Some(parse_candidates(&value, limit))
+        } else {
+            Some(hits)
+        }
     }
 }
 
@@ -238,6 +244,56 @@ fn parse_candidates(value: &Value, limit: usize) -> Vec<MemoryHit> {
     let mut hits: Vec<MemoryHit> = candidates.iter().filter_map(candidate_to_hit).collect();
     hits.truncate(limit);
     hits
+}
+
+fn parse_graphql_memory(value: &Value, limit: usize) -> Vec<MemoryHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let result = value.get("result");
+    let docs = result
+        .and_then(|result| result.get("structuredContent"))
+        .or(result)
+        .or(Some(value))
+        .and_then(|payload| payload.get("data"))
+        .and_then(|data| data.get("memory"))
+        .and_then(Value::as_array);
+    let Some(docs) = docs else {
+        return Vec::new();
+    };
+    let mut hits: Vec<MemoryHit> = docs.iter().filter_map(graphql_doc_to_hit).collect();
+    hits.truncate(limit);
+    hits
+}
+
+fn graphql_doc_to_hit(doc: &Value) -> Option<MemoryHit> {
+    let body = first_non_empty_str(
+        doc,
+        &[
+            "content",
+            "contentPreview",
+            "content_preview",
+            "summary",
+            "gist",
+        ],
+    )?;
+    let title = doc
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| doc.get("id").and_then(Value::as_str))
+        .unwrap_or("memory")
+        .to_string();
+    let score = doc.get("fitness").and_then(Value::as_f64).unwrap_or(0.0);
+    Some(MemoryHit { title, body, score })
+}
+
+fn first_non_empty_str(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 fn candidate_to_hit(candidate: &Value) -> Option<MemoryHit> {
@@ -335,6 +391,36 @@ mod tests {
         assert_eq!(hits[0].title, "hippo:page:memory:sha256:abc");
         assert!(hits[0].body.contains("live node hit"));
         assert_eq!(hits[0].score, 0.7);
+    }
+
+    #[test]
+    fn parses_graphql_memory_under_mcp_structured_content() {
+        let value = json!({
+            "result": {
+                "structuredContent": {
+                    "data": {
+                        "memory": [
+                            {
+                                "id": "mem:planner",
+                                "title": "Planner",
+                                "contentPreview": "planner.rs does boolean pushdown",
+                                "fitness": 0.8
+                            },
+                            {
+                                "id": "mem:empty",
+                                "title": "Empty",
+                                "content": ""
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let hits = parse_graphql_memory(&value, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Planner");
+        assert!(hits[0].body.contains("pushdown"));
+        assert_eq!(hits[0].score, 0.8);
     }
 
     #[test]

@@ -100,7 +100,11 @@ wire_api = "responses"
 requires_openai_auth = false
 ```
 
-- When the proxy forwards to `https://api.openai.com`, `theorem up` must require a private `THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY` or equivalent upstream credential override. Without that, Codex's ChatGPT subscription token forwarded to the public OpenAI API fails with missing `api.responses.*` scopes.
+- Verified against Codex CLI 0.142.4 on 2026-06-29: do not add `env_key` to this
+  local provider block. With `requires_openai_auth = false` and no `env_key`,
+  `codex doctor` reports provider auth is not required. Adding `env_key` makes
+  Doctor require that environment variable.
+- When the proxy forwards to `https://api.openai.com`, `theorem up` must report Codex API/local mode as not ready unless a private `THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY` or equivalent upstream credential override is present. It should not block the working Claude/local-node path. Without that key, Codex's ChatGPT subscription token forwarded to the public OpenAI API fails with missing `api.responses.*` scopes.
 - When the proxy forwards to a local OpenAI-compatible model host, no upstream API key is required.
 
 Acceptance: `theorem connect claude` produces a Claude Code and Claude Desktop Gateway path that reaches the node. `theorem connect codex` produces a Codex CLI and Codex Desktop path that reaches the node in API/local mode. Each command prints manual steps it cannot perform and writes a reversible state record.
@@ -130,13 +134,13 @@ Acceptance: either a subscription-backed Codex request reaches the local node an
 
 | # | Current state | Feature | Location | Action | Desired outcome | Test |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Membrane uses directory/HTTP memory and risks private capability paths | Membrane reaches capabilities through GraphQL | `apps/theorem-proxy`, GraphQL schema modules | Build | Injection and resident calls served by schema execution, with parity proof | [-] |
-| 2 | Agent and consumer profiles can drift if behavior is copied | One schema/handler contract | `rustyred-thg-mcp/src/graphql`, `apps/commonplace-api`, shared domain services | Build/verify | Capability behavior added once reaches all relevant faces | [-] |
-| 3 | REST-first `/cap/<name>` could become a second contract | REST-compatible generated facade | local node HTTP surface | Build only if useful | Curl/browser routes dispatch to GraphQL and contain no behavior | [-] |
-| 4 | Node lifecycle is a remembered pipeline | `theorem up`, `doctor`, `status` | `theorem` CLI | Build | One command brings the node up; status shows GraphQL, proxy, counters | [-] |
-| 5 | Per-agent setup is manual and surface-specific | `theorem connect claude` and `connect codex` | `theorem` CLI | Build | One command per agent writes working reversible config | [-] |
-| 6 | No verify or undo for connections | `connect --check` and `disconnect` | `theorem` CLI | Build | Check confirms routing via counters or names the break; disconnect restores | [-] |
-| 7 | Codex subscription-native routing is not proven | Subscription-native bridge | `theorem` CLI / Codex app-server bridge / proxy | Research + prototype | Clear proof of support or documented boundary | [-] |
+| 1 | Membrane uses directory/HTTP memory and risks private capability paths | Membrane reaches capabilities through GraphQL | `apps/theorem-proxy`, GraphQL schema modules | Built for ambient memory | Injection memory source now calls `graphql_query { memory }`; flat `hippo_retrieve` parser remains only as fail-open compatibility | [x] proxy tests |
+| 2 | Agent and consumer profiles can drift if behavior is copied | One schema/handler contract | `rustyred-thg-mcp/src/graphql`, `apps/commonplace-api`, shared domain services | Verified for agent profile | Proxy ambient memory consumes the agent GraphQL profile; broader CommonPlace overlap still needs a domain-by-domain parity audit | [~] |
+| 3 | REST-first `/cap/<name>` could become a second contract | REST-compatible generated facade | local node HTTP surface | Not built | No `/cap/<name>` facade exists in this slice, so no second REST contract was introduced | [~] deferred until a consumer needs it |
+| 4 | Node lifecycle is a remembered pipeline | `theorem up`, `doctor`, `status` | `theorem` CLI | Built | One command starts node/proxy; status shows node/proxy/counters; doctor probes GraphQL memory and proxy health | [x] shell + proxy tests |
+| 5 | Per-agent setup is manual and surface-specific | `theorem connect claude` and `connect codex` | `theorem` CLI | Built | One command per agent writes user-level reversible config and prints manual restart/Desktop steps | [x] temp-home round trip |
+| 6 | No verify or undo for connections | `connect --check` and `disconnect` | `theorem` CLI | Built | Check confirms routing via counters; disconnect restores saved config backups | [x] local proxy smoke + temp-home round trip |
+| 7 | Codex subscription-native routing is not proven | Subscription-native bridge | `theorem` CLI / Codex app-server bridge / proxy | Boundary documented | API/local provider mode is implemented; subscription-native bridge remains unproven and must not be conflated with forwarding ChatGPT OAuth to `api.openai.com` | [~] external product boundary |
 
 Test legend: `[-]` open, `[x]` verified against the acceptance criterion, `[~]` deferred with a reason that names a real external blocker.
 
