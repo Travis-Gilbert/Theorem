@@ -475,64 +475,151 @@ async fn step_7_outbox_drains_after_offline_window() {
 
 // ----- live mode (gated) -----
 
-/// Run the round + stream scenarios against the real Railway harness when the
-/// environment is configured for it. This is `#[ignore]` by default so CI runs
-/// only against the in-process fakes; flip on with `cargo test ... -- --ignored`
-/// plus the env vars below.
-#[tokio::test]
-#[ignore = "set THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_RAILWAY_URL (and optionally THEOREM_SYNC_RAILWAY_TOKEN) to run"]
-async fn live_round_against_railway() {
+/// Helper: build an McpClient against the configured live Railway tenant.
+/// Returns `None` if the live-mode env vars are not set.
+fn live_remote_client() -> Option<McpClient> {
     if std::env::var("THEOREM_SYNC_LIVE_E2E").as_deref() != Ok("1") {
-        eprintln!("skipping: THEOREM_SYNC_LIVE_E2E != 1");
-        return;
+        return None;
     }
-    let url = std::env::var("THEOREM_SYNC_RAILWAY_URL")
-        .expect("THEOREM_SYNC_RAILWAY_URL must be set for live mode");
+    let url = std::env::var("THEOREM_SYNC_RAILWAY_URL").ok()?;
     let tenant = std::env::var("THEOREM_SYNC_TENANT").unwrap_or_else(|_| "Travis-Gilbert".into());
-
-    // Token is optional: the production rustyredcore-theorem-production tenant
-    // accepts unauthenticated MCP calls today (validated by direct curl probes
-    // before this test landed). Pass a token if your tenant is auth-gated.
-    let remote = match std::env::var("THEOREM_SYNC_RAILWAY_TOKEN").ok() {
+    Some(match std::env::var("THEOREM_SYNC_RAILWAY_TOKEN").ok() {
         Some(token) if !token.is_empty() => McpClient::new(
-            url.clone(),
-            tenant.clone(),
+            url,
+            tenant,
             theorem_substrate_sync::railway_client::TenantToken::Present(token),
         ),
-        _ => McpClient::unauthenticated(url.clone(), tenant.clone()),
-    };
+        _ => McpClient::unauthenticated(url, tenant),
+    })
+}
 
-    // Local stays a fake so we don't depend on a running local node for this
-    // smoke. The exercise is: does the live Railway endpoint successfully
-    // serve compile + ref + stream verbs within the configured HTTP budget?
+/// Live smoke for Role 2 (stream-tail freshness). Exercises the same
+/// `stream_publish` + `stream_read` verbs the daemon's drainer and
+/// subscriber use, against a fresh tenant on rustyredcore-theorem-
+/// production. If this passes the daemon CAN reach Railway and round-
+/// trip events end-to-end; if it fails the daemon's Role 2 path is
+/// broken or the live endpoint is unreachable.
+#[tokio::test]
+#[ignore = "set THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_RAILWAY_URL (and optionally THEOREM_SYNC_RAILWAY_TOKEN, THEOREM_SYNC_TENANT) to run"]
+async fn live_stream_smoke_against_railway() {
+    let Some(remote) = live_remote_client() else {
+        eprintln!("skipping: live mode env not configured");
+        return;
+    };
+    let stream_name = format!(
+        "tenant:substrate-sync-pt015-smoke-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+
+    let publish = remote
+        .call_tool(
+            "stream_publish",
+            json!({
+                "stream": stream_name,
+                "actor": "theorem-substrate-sync-pt015",
+                "kind": "substrate_sync_smoke",
+                "urgency": "info",
+                "payload": { "hello": "world" }
+            }),
+        )
+        .await
+        .expect("live stream_publish must succeed");
+    eprintln!("live publish: {publish}");
+    assert_eq!(
+        publish.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "stream_publish ok"
+    );
+    let published_event_id = publish
+        .get("event_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .expect("publish returned event_id");
+
+    let read = remote
+        .call_tool(
+            "stream_read",
+            json!({
+                "stream": stream_name,
+                "actor": "theorem-substrate-sync-pt015",
+                "advance": false,
+                "limit": 5,
+            }),
+        )
+        .await
+        .expect("live stream_read must succeed");
+    eprintln!("live read: {read}");
+    let events = read
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        events.iter().any(|event| {
+            event.get("id").and_then(Value::as_str) == Some(published_event_id.as_str())
+        }),
+        "the just-published event must be readable back from live"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Live Role 1 (Prolly round) is BLOCKED by a daemon-vs-production-server
+/// schema mismatch. The daemon's `round::compile_snapshot` expects
+/// `pack.objects` (a flat array of `{kind, payload}`) but the live
+/// `rustyred_thg_graph_version_compile` returns the pack as
+/// `{ manifest, commit, tree: { root_hash, root_level, entries_total,
+/// nodes: [{hash, level, first_key, last_key}, ...] }, capabilities }`.
+/// The graph objects live behind the Prolly tree's content-addressed
+/// hashes and must be fetched separately. Closing this gap requires
+/// either updating `compile_snapshot` to walk the tree + fetch objects
+/// by hash, or having the server bundle objects with the pack on
+/// request. Out of scope for the substrate-sync-daemon initial cut;
+/// tracked as a documented blocker in `.harness/checklist.json` PT-015's
+/// verification line. This test stays here so the gap is visible in
+/// `cargo test --ignored` until the daemon is updated.
+#[tokio::test]
+#[ignore = "BLOCKED on daemon-vs-server pack-shape mismatch; see test doc + PT-015 verification line"]
+async fn live_round_blocked_on_pack_shape() {
+    let Some(remote) = live_remote_client() else {
+        eprintln!("skipping: live mode env not configured");
+        return;
+    };
     let local_fake = FakeState::new();
     let local_url = spawn_fake(local_fake.clone()).await;
-    let local = McpClient::unauthenticated(local_url, tenant.clone());
+    let local = McpClient::unauthenticated(local_url, "irrelevant");
 
     let status = handle();
-    // Pure round-trip: compile remote, apply locally, push back. If the
-    // 60s budget bump on rustyred-thg-server is live, this completes; if
-    // the verbs still trip the old 20s budget we see SyncError::Mcp with
-    // the "MCP request exceeded the HTTP execution budget" string.
-    let receipt = run_round(&local, &remote, &status).await;
+    let result = run_round(&local, &remote, &status).await;
 
-    match receipt {
-        Ok(r) => {
-            eprintln!("live round receipt: {r:?}");
+    match result {
+        Err(e) if format!("{e}").contains("pack.objects") => {
+            eprintln!(
+                "EXPECTED FAILURE — daemon pack-shape mismatch persists; see test doc: {e}"
+            );
         }
-        Err(e) => {
-            let msg = format!("{e}");
+        Err(other) => {
+            let msg = format!("{other}");
             assert!(
                 !msg.contains("HTTP execution budget"),
-                "live Railway still hitting the HTTP execution budget; bump did not take effect: {msg}"
+                "live Railway hitting HTTP execution budget; bump did not take effect: {msg}"
             );
-            // Other live failures (e.g., upstream graph too big to compile)
-            // are real product issues, not test setup issues. Surface them.
-            panic!("live round failed: {msg}");
+            panic!("unexpected live failure (was expecting pack.objects schema gap): {msg}");
+        }
+        Ok(receipt) => {
+            // If this branch runs the daemon has been updated to handle the
+            // live pack shape. Flip the test from blocked to expected-success
+            // and update PT-015's verification line.
+            eprintln!("live round receipt: {receipt:?}");
+            panic!(
+                "live round now passes — daemon pack-shape gap closed; \
+                 remove #[ignore] + drop the blocked-on-pack-shape framing"
+            );
         }
     }
 
-    // Hold the live status briefly for the runtime to surface the
-    // connection state to the status endpoint observer.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }

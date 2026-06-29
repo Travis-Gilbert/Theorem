@@ -93,10 +93,31 @@ impl McpClient {
         if let Some(error) = body.get("error") {
             return Err(SyncError::Mcp(error.to_string()));
         }
-        body.get("result")
-            .and_then(|result| result.get("structuredContent").or(Some(result)))
-            .cloned()
-            .ok_or_else(|| SyncError::Mcp("MCP response missing result".to_string()))
+        let result = body
+            .get("result")
+            .ok_or_else(|| SyncError::Mcp("MCP response missing result".to_string()))?;
+
+        // The MCP transport returns one of two shapes depending on server age:
+        //   1. modern:  result.structuredContent = { ... }
+        //   2. legacy:  result.content = [{ type: "text", text: "{...json...}" }]
+        // The live `rustyredcore-theorem-production` server still ships shape (2)
+        // for these verbs, so unwrap content[].text as JSON before falling back
+        // to the raw result. Tests that mock structuredContent continue to work.
+        if let Some(structured) = result.get("structuredContent").cloned() {
+            return Ok(structured);
+        }
+        if let Some(content) = result.get("content").and_then(Value::as_array) {
+            if let Some(text) = content
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .and_then(|block| block.get("text").and_then(Value::as_str))
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    return Ok(parsed);
+                }
+            }
+        }
+        Ok(result.clone())
     }
 
     pub async fn doctor(&self) -> ConnectionState {
