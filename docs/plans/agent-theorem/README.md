@@ -2,7 +2,7 @@
 
 The agent the user actually talks to. One identity, one voice, one continuous memory of *you* — composed of multiple LLM substrates that the user never has to think about. The substrate work is done; the **user-presentation layer** that turns "infrastructure for a composed agent" into "Theorem, who knows you" is what this plan owns.
 
-Date: 2026-06-28. Author: claude-code (this session). Status: research+plan, no code yet.
+Date: 2026-06-28. Author: claude-code (this session). Status: active implementation.
 
 ## 0. Why this doc exists
 
@@ -96,6 +96,15 @@ The binding has `agent_id`, `agent_name`, `trust_tier`. **No `agent_voice` / `ag
 - OpenClaw action layer (deferred; tier-3 alignment guard is the hook it lands behind)
 - Latent memory / xLSTM / native hidden-state capture (open research)
 
+### I. Qwen and Mistral are callable, but must become resident participants
+Qwen (the spoken "Quinn" shorthand) and Mistral are no longer just optional model-provider smoke targets. They should be first-class room participants in both the local RustyRed room and the general room.
+
+The distinction matters:
+- **Callable provider head**: the harness can invoke `qwen` or `mistral` when a run explicitly asks for that head.
+- **Always-on participant**: a running room runner posts presence, consumes wake or mention events, invokes the configured head through `ProviderHeadInvoker`, and writes the contribution/reflection back into the coordination room.
+
+The bridge is the configured room runner, not a chat transcript file. `THEOREM_AGENT_HEADS=qwen,mistral` plus the matching `QWEN_API_KEY` / `MISTRAL_API_KEY` makes those heads available to the binding; `THEOREM_AGENT_ROOM_RUNNER=1` makes the binding resident in the room. Acceptance is a room-level proof: a message mentioning `@theorem` causes the runner to publish a Qwen/Mistral-backed contribution record without manually calling a smoke script.
+
 ## 4. The four user-presentation completion items
 
 To turn the substrate into the user experience of "Theorem", in priority order:
@@ -151,15 +160,21 @@ Each slice is oracle-testable (cargo test + clippy):
 
 4. ~~**Slice S4 — Lane B model layer completion**~~ ✅ **COMPLETE** (audit on 2026-06-28: already shipped on `main`; no code written for this slice). Live credential resolver, `ProviderHeadInvoker` production default, and live tonic dispatch for `theorem_grpc.*` app affordances are all in place. See [`../composed-agent/lane-b-next-plan.md`](../composed-agent/lane-b-next-plan.md) §"S4 audit verdict (2026-06-28)".
 
-5. **Slice S5 — user-facing Theorem surface**
+5. **Slice S4.5 — resident provider participants**
+   - Register Qwen as an OpenAI-compatible provider profile and keep Mistral on `mistral-small-latest`.
+   - Make `agent_runner` use the configured composed-agent path so one configured provider head can answer a room wake in single-head mode, while multiple configured heads still use the composed loop.
+   - Add a sourceable local helper for `qwen,mistral` room participation that loads the private env files and sets `THEOREM_AGENT_ROOM_RUNNER=1`.
+   - Test: offline runner regression proves a configured Qwen head wakes from a room mention and publishes a contribution; live acceptance uses the local env files and provider keys.
+
+6. **Slice S5 — user-facing Theorem surface**
    - `apps/theorem-gateway` route: `chat(agent: "theorem", ...)` resolving to `composed_agent_run`.
    - Optionally: extend `apps/commonplace` with a Theorem chat view (or new app).
 
-6. **Slice S6 — PG wire views + cache scoping decision**
+7. **Slice S6 — PG wire views + cache scoping decision**
    - SQL views for binding/event/scratchpad/memory.
    - Encode the agent_id cache-scoping decision; implement if yes.
 
-S1-S3 are user-presentation-layer (the gap this plan owns). ~~S4 is composed-agent Lane B's named-open work~~ — S4 was already shipped (audit on 2026-06-28). S5 is the new app surface. S6 is infrastructure cleanup.
+S1-S3 are user-presentation-layer (the gap this plan owns). ~~S4 is composed-agent Lane B's named-open work~~ — S4 was already shipped (audit on 2026-06-28). S4.5 makes provider heads resident in rooms. S5 is the new app surface. S6 is infrastructure cleanup.
 
 ## 6. Resolved decisions (2026-06-28)
 
@@ -169,6 +184,7 @@ S1-S3 are user-presentation-layer (the gap this plan owns). ~~S4 is composed-age
 | User model schema | `preferences` / `style_notes` / `recent_focus` / `open_frustrations` / `working_on`. | S2 graph schema follows this; pre-existing `theorem_grpc.user_model` affordance is rewired to populate/query this shape. |
 | Cache scoping | **Substrate-shared (default).** Offload planner stays keyed on `(op, inputs, graph_version)` — no `agent_id`. | No code change to `OperationPlanner`. Closes the question. |
 | User-facing surface | **`apps/commonplace`** (extend; don't create new app). | S5 adds a Theorem chat view *inside* the existing Commonplace surface, reusing its user, local-first infra, and UI conventions. Avoids parallel-app drift. |
+| Qwen and Mistral in the room | Treat Qwen and Mistral as resident provider participants when their keys are loaded, not only as direct smoke-test targets. | The room runner uses the configured composed-agent path; provider env files set `THEOREM_AGENT_HEADS=qwen,mistral` and `THEOREM_AGENT_ROOM_RUNNER=1` for local/general room runs. |
 
 ## 7. Cross-references
 

@@ -15,7 +15,7 @@ import os
 import urllib.request
 
 NODE = os.environ.get("THEOREM_NODE_URL", "http://127.0.0.1:8380/mcp")
-PROJECT_KEY = os.getcwd().replace(os.sep, "-")
+PROJECT_KEY = os.getcwd().replace(os.sep, "-").replace(" ", "-")
 MEM_DIR = os.environ.get(
     "THEOREM_MEMORY_DIR",
     os.path.expanduser(f"~/.claude/projects/{PROJECT_KEY}/memory"),

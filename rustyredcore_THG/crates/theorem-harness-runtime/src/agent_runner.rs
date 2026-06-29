@@ -1,9 +1,9 @@
 use crate::{
-    heartbeat_presence, join_room, read_mentions_for_actor_in_room, run_composed_agent_with_claims,
-    write_message, write_record, ComposedAgentRunResult, ComposedAgentRuntimeError,
-    CoordinationError, CoordinationMessageState, CoordinationPresenceState,
-    CoordinationRecordState, CoordinationRoomState, JoinRoomInput, PresenceInput,
-    WriteMessageInput, WriteRecordInput, DEFAULT_BINDING_ID,
+    heartbeat_presence, join_room, read_mentions_for_actor_in_room,
+    run_configured_composed_agent_with_claims, write_message, write_record, ComposedAgentRunResult,
+    ComposedAgentRuntimeError, CoordinationError, CoordinationMessageState,
+    CoordinationPresenceState, CoordinationRecordState, CoordinationRoomState, JoinRoomInput,
+    PresenceInput, WriteMessageInput, WriteRecordInput, DEFAULT_BINDING_ID,
 };
 use rustyred_thg_core::GraphStore;
 use serde::{Deserialize, Serialize};
@@ -191,7 +191,7 @@ pub fn run_agent_room_cycle<S: GraphStore, I: HeadInvoker>(
             mention.message.clone(),
             format!("coordination_message:{}", mention.message_id),
         )];
-        let turn = match run_composed_agent_with_claims(
+        let turn = match run_configured_composed_agent_with_claims(
             store,
             &binding_id,
             &mention.message,
@@ -469,14 +469,18 @@ fn default_mention_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composed_agent::THEOREM_AGENT_HEADS_ENV;
     use crate::{
         list_presence, read_mentions_for_actor, read_records_for_room, write_message,
         WriteMessageInput,
     };
     use rustyred_thg_core::InMemoryGraphStore;
+    use std::sync::Mutex;
     use theorem_harness_core::{
         FakeHeadInvoker, HeadInvocationError, HeadInvocationReceipt, HeadInvocationRequest,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Test double whose every head invocation fails like an upstream provider
     /// outage. Used to prove the room runner surfaces a `ProviderError` as a
@@ -499,6 +503,11 @@ mod tests {
 
     #[test]
     fn runner_heartbeats_consumes_room_mention_and_posts_contribution() {
+        let _env = ScopedEnv::new([
+            (THEOREM_AGENT_HEADS_ENV, "mistral"),
+            ("MISTRAL_API_KEY", "mistral-test-secret"),
+            ("MISTRAL_MODEL", "mistral-small-latest"),
+        ]);
         let mut store = InMemoryGraphStore::new();
         write_room_mention(
             &mut store,
@@ -530,13 +539,62 @@ mod tests {
                 .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].actor_id, "theorem");
+        assert_eq!(
+            cycle.turns[0].run.as_ref().unwrap().consensus_head_set,
+            vec!["mistral"]
+        );
         let mentions =
             read_mentions_for_actor(&mut store, "tenant-a", "theorem", false, 20).unwrap();
         assert!(mentions.is_empty());
     }
 
     #[test]
+    fn runner_wakes_configured_qwen_room_participant() {
+        let _env = ScopedEnv::new([
+            (THEOREM_AGENT_HEADS_ENV, "qwen"),
+            ("QWEN_API_KEY", "qwen-test-secret"),
+            ("QWEN_MODEL", "qwen3.7-max"),
+        ]);
+        let mut store = InMemoryGraphStore::new();
+        write_room_mention(
+            &mut store,
+            "tenant-a",
+            "room:a",
+            "claude",
+            "qwen should see @theorem",
+        );
+
+        let cycle = run_agent_room_cycle(
+            &mut store,
+            AgentRoomRunnerConfig::theorem_default("tenant-a", "room:a"),
+            &FakeHeadInvoker::default(),
+        )
+        .unwrap();
+
+        assert_eq!(cycle.turns.len(), 1);
+        assert_eq!(
+            cycle.turns[0].status,
+            AgentRoomRunnerTurnStatus::Contributed
+        );
+        let run = cycle.turns[0].run.as_ref().expect("turn has run result");
+        assert_eq!(run.consensus_head_set, vec!["qwen"]);
+        assert_eq!(run.invocation_receipts.len(), 1);
+        assert_eq!(run.invocation_receipts[0].head_id, "qwen");
+        assert_eq!(
+            run.alignment_verdict
+                .get("single_head_mode")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn runner_does_not_consume_other_tenant_or_room_mentions() {
+        let _env = ScopedEnv::new([
+            (THEOREM_AGENT_HEADS_ENV, "mistral"),
+            ("MISTRAL_API_KEY", "mistral-test-secret"),
+            ("MISTRAL_MODEL", "mistral-small-latest"),
+        ]);
         let mut store = InMemoryGraphStore::new();
         write_room_mention(&mut store, "tenant-a", "room:a", "codex", "a asks @theorem");
         write_room_mention(&mut store, "tenant-a", "room:b", "codex", "b asks @theorem");
@@ -570,6 +628,11 @@ mod tests {
 
     #[test]
     fn runner_surfaces_provider_failure_as_blocked_turn_without_panic() {
+        let _env = ScopedEnv::new([
+            (THEOREM_AGENT_HEADS_ENV, "mistral"),
+            ("MISTRAL_API_KEY", "mistral-test-secret"),
+            ("MISTRAL_MODEL", "mistral-small-latest"),
+        ]);
         // T2 acceptance: a provider outage must surface as a blocked turn
         // carrying the ProviderError, never panic the room runner. This swaps
         // ONLY the invoker versus the contributing FakeHeadInvoker case above,
@@ -653,5 +716,66 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    struct ScopedEnv {
+        saved: Vec<(String, Option<String>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnv {
+        fn new<const N: usize>(pairs: [(&'static str, &'static str); N]) -> Self {
+            let guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut names = vec![
+                THEOREM_AGENT_HEADS_ENV.to_string(),
+                "AI21_API_KEY".to_string(),
+                "ANTHROPIC_API_KEY".to_string(),
+                "CLAUDE_API_KEY".to_string(),
+                "DASHSCOPE_API_KEY".to_string(),
+                "DEEPSEEK_API_KEY".to_string(),
+                "GEMMA_API_KEY".to_string(),
+                "MINIMAX_API_KEY".to_string(),
+                "MISTRAL_API_KEY".to_string(),
+                "MISTRAL_MODEL".to_string(),
+                "OPENAI_API_KEY".to_string(),
+                "QWEN_API_KEY".to_string(),
+                "QWEN_MODEL".to_string(),
+                "ZHIPU_API_KEY".to_string(),
+            ];
+            for (name, _) in pairs {
+                names.push(name.to_string());
+            }
+            names.sort();
+            names.dedup();
+            let saved = names
+                .into_iter()
+                .map(|name| {
+                    let value = std::env::var(&name).ok();
+                    std::env::remove_var(&name);
+                    (name, value)
+                })
+                .collect::<Vec<_>>();
+            for (name, value) in pairs {
+                std::env::set_var(name, value);
+            }
+            Self {
+                saved,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
     }
 }

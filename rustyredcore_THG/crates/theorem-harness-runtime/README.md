@@ -19,12 +19,12 @@ Path deps: `rustyred-thg-affordances`, `rustyred-thg-core`, `theorem-harness-cor
 For the API-backed composed-agent binding:
 
 ```bash
-THEOREM_AGENT_HEADS=deepseek,mistral,minimax
-DEEPSEEK_API_KEY=...   # plus MISTRAL_API_KEY, MINIMAX_API_KEY
+THEOREM_AGENT_HEADS=deepseek,mistral,qwen,minimax
+DEEPSEEK_API_KEY=...   # plus MISTRAL_API_KEY, QWEN_API_KEY, MINIMAX_API_KEY
 THEOREM_HEAD_INVOKER=real
 ```
 
-Override models with `DEEPSEEK_MODEL` / `MISTRAL_MODEL` / `MINIMAX_MODEL`; endpoints with `*_CHAT_URL`. `HeadTransport::Local` uses `THEOREM_LOCAL_OPENAI_URL` (default `http://127.0.0.1:8080/v1/chat/completions`). Production `run_composed_agent` allocates `THEOREM_COMPOSED_AGENT_BUDGET_UNITS` (default 5000).
+Override models with `DEEPSEEK_MODEL` / `MISTRAL_MODEL` / `QWEN_MODEL` / `MINIMAX_MODEL`; endpoints with `*_CHAT_URL`. Defaults include `MISTRAL_MODEL=mistral-small-latest` and `QWEN_MODEL=qwen3.7-max`. `HeadTransport::Local` uses `THEOREM_LOCAL_OPENAI_URL` (default `http://127.0.0.1:8080/v1/chat/completions`). Production `run_composed_agent` allocates `THEOREM_COMPOSED_AGENT_BUDGET_UNITS` (default 5000).
 
 ## Build and test
 

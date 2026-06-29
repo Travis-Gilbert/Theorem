@@ -54,6 +54,13 @@ pub fn api_provider_profile(provider: &str) -> Option<ApiProviderProfile> {
             default_endpoint: "https://api.minimaxi.com/v1/chat/completions",
             request_shape: ApiRequestShape::OpenAiChatCompletions,
         }),
+        "qwen" | "dashscope" | "alibaba" | "aliyun" => Some(ApiProviderProfile {
+            provider: "qwen",
+            env_endpoint: "QWEN_CHAT_URL",
+            default_endpoint:
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+            request_shape: ApiRequestShape::OpenAiChatCompletions,
+        }),
         "mistral" => Some(ApiProviderProfile {
             provider: "mistral",
             env_endpoint: "MISTRAL_CHAT_URL",
@@ -84,6 +91,7 @@ pub fn default_api_profiles() -> Vec<ApiProviderProfile> {
         "openai",
         "zhipu",
         "minimax",
+        "qwen",
         "mistral",
         "ai21",
         "gemma",
@@ -527,6 +535,8 @@ mod tests {
             "openapi",
             "zhipu",
             "minimax",
+            "qwen",
+            "dashscope",
             "mistral",
             "ai21",
             "gemma",

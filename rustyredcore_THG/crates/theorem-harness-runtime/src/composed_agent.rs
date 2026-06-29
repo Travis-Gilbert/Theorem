@@ -824,6 +824,7 @@ fn env_slug(value: &str) -> String {
 fn normalize_provider(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "openapi" => "openai".to_string(),
+        "dashscope" | "alibaba" | "aliyun" => "qwen".to_string(),
         other => other.to_string(),
     }
 }
@@ -834,8 +835,9 @@ fn default_model_for_provider(provider: &str) -> String {
         "deepseek" => "deepseek-v4-pro".to_string(),
         "gemma" => "gemma3:latest".to_string(),
         "minimax" => "MiniMax-M3".to_string(),
-        "mistral" => "mistral-large-latest".to_string(),
+        "mistral" => "mistral-small-latest".to_string(),
         "openai" => "gpt-4.1-mini".to_string(),
+        "qwen" => "qwen3.7-max".to_string(),
         "zhipu" => "glm-4-plus".to_string(),
         "ai21" => "jamba-large".to_string(),
         other => other.to_string(),
@@ -983,8 +985,12 @@ mod tests {
     #[test]
     fn default_binding_uses_env_configured_api_heads() {
         let _env = ScopedEnv::new([
-            (THEOREM_AGENT_HEADS_ENV, "mistral,openai,minimax,deepseek"),
+            (
+                THEOREM_AGENT_HEADS_ENV,
+                "mistral,qwen,openai,minimax,deepseek",
+            ),
             ("MISTRAL_MODEL", "mistral-small-latest"),
+            ("QWEN_MODEL", "qwen3.7-max"),
             ("OPENAI_MODEL", "gpt-4.1-mini"),
             ("MINIMAX_MODEL", "MiniMax-M3"),
             ("DEEPSEEK_MODEL", "deepseek-v4-pro"),
@@ -994,7 +1000,7 @@ mod tests {
 
         assert_eq!(
             binding.identity.active_head_set,
-            vec!["deepseek", "minimax", "mistral", "openai"]
+            vec!["deepseek", "minimax", "mistral", "openai", "qwen"]
         );
         let mistral = binding.head("mistral").unwrap();
         assert_eq!(mistral.provider, "mistral");
@@ -1011,6 +1017,10 @@ mod tests {
         let deepseek = binding.head("deepseek").unwrap();
         assert_eq!(deepseek.model, "deepseek-v4-pro");
         assert_eq!(deepseek.transport, HeadTransport::Api);
+        let qwen = binding.head("qwen").unwrap();
+        assert_eq!(qwen.provider, "qwen");
+        assert_eq!(qwen.model, "qwen3.7-max");
+        assert_eq!(qwen.credential_ref, "env:QWEN_API_KEY");
     }
 
     #[test]
@@ -1076,8 +1086,7 @@ mod tests {
         // `consensus_below_threshold` guard accepts its publication; the
         // current single-head run still gets the lineage memory threaded.
         let mut prior = default_theorem_binding_with_two_heads("agent:prior-published");
-        prior.identity.composition_hash =
-            theorem_harness_core::composition_hash(&prior);
+        prior.identity.composition_hash = theorem_harness_core::composition_hash(&prior);
         for (event_type, payload) in lineage_v1_lifecycle_events_for_prior() {
             let transition = BindingTransitionInput::new(
                 event_type,
@@ -1369,6 +1378,7 @@ mod tests {
                 THEOREM_AGENT_HEADS_ENV.to_string(),
                 THEOREM_COMPOSED_AGENT_BUDGET_UNITS_ENV.to_string(),
                 "MISTRAL_MODEL".to_string(),
+                "QWEN_MODEL".to_string(),
                 "OPENAI_MODEL".to_string(),
                 "MINIMAX_MODEL".to_string(),
                 "DEEPSEEK_MODEL".to_string(),
@@ -1380,6 +1390,7 @@ mod tests {
                 "MINIMAX_API_KEY".to_string(),
                 "MISTRAL_API_KEY".to_string(),
                 "OPENAI_API_KEY".to_string(),
+                "QWEN_API_KEY".to_string(),
                 "ZHIPU_API_KEY".to_string(),
                 "THEOREM_AGENT_HEAD_OPENAPI_MODEL".to_string(),
                 "THEOREM_AGENT_HEAD_DEEPSEEK_TRANSPORT".to_string(),
