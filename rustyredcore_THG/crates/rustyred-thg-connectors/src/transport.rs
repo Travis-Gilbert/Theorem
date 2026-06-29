@@ -11,6 +11,11 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use rustyred_plugin::{
+    CapabilityProvenance, DeclarativeSkillDefinition, DeclarativeSkillStep, HostFunctionGrant,
+    PluginExportSpec, PluginLimits, WasmPluginSource, WasmPluginSpec,
+};
+
 use crate::{ConnectorError, ConnectorResult};
 
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -28,7 +33,7 @@ pub const CCORE_ENV_KEYS: &[&str] = &[
 ];
 
 /// How to reach an external MCP server.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum ConnectionTarget {
     Stdio {
@@ -45,6 +50,83 @@ pub enum ConnectionTarget {
         #[serde(default)]
         auth: Option<ConnectorAuth>,
     },
+    RustyredPlugin {
+        plugin_id: String,
+        tenant_id: String,
+        source: WasmPluginSource,
+        #[serde(default)]
+        exports: Vec<PluginExportSpec>,
+        #[serde(default)]
+        grants: Vec<HostFunctionGrant>,
+        #[serde(default)]
+        limits: PluginLimits,
+        #[serde(default)]
+        provenance: CapabilityProvenance,
+    },
+    RustyredDeclarativeSkill {
+        skill_id: String,
+        tenant_id: String,
+        title: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        parameters_schema: Value,
+        steps: Vec<DeclarativeSkillStep>,
+        #[serde(default)]
+        provenance: CapabilityProvenance,
+    },
+}
+
+impl ConnectionTarget {
+    pub fn wasm_plugin_spec(&self) -> Option<WasmPluginSpec> {
+        let Self::RustyredPlugin {
+            plugin_id,
+            tenant_id,
+            source,
+            exports,
+            grants,
+            limits,
+            provenance,
+        } = self
+        else {
+            return None;
+        };
+        Some(WasmPluginSpec {
+            plugin_id: plugin_id.clone(),
+            tenant_id: tenant_id.clone(),
+            source: source.clone(),
+            exports: exports.clone(),
+            grants: grants.clone(),
+            limits: limits.clone(),
+            declared_tests: Vec::new(),
+            provenance: provenance.clone(),
+        })
+    }
+
+    pub fn declarative_skill_definition(&self) -> Option<DeclarativeSkillDefinition> {
+        let Self::RustyredDeclarativeSkill {
+            skill_id,
+            tenant_id,
+            title,
+            description,
+            parameters_schema,
+            steps,
+            provenance,
+        } = self
+        else {
+            return None;
+        };
+        Some(DeclarativeSkillDefinition {
+            skill_id: skill_id.clone(),
+            tenant_id: tenant_id.clone(),
+            title: title.clone(),
+            description: description.clone(),
+            parameters_schema: parameters_schema.clone(),
+            steps: steps.clone(),
+            declared_tests: Vec::new(),
+            provenance: provenance.clone(),
+        })
+    }
 }
 
 /// Canonical persisted target for the content-core MCP server.
@@ -462,5 +544,15 @@ pub fn connect_transport(target: &ConnectionTarget) -> ConnectorResult<Connected
     match target {
         ConnectionTarget::Stdio { .. } => spawn_stdio(target).map(ConnectedTransport::Stdio),
         ConnectionTarget::Http { .. } => connect_http(target).map(ConnectedTransport::Http),
+        ConnectionTarget::RustyredPlugin { plugin_id, .. } => Err(ConnectorError::Transport(
+            format!(
+                "rustyred_plugin target {plugin_id} is invoked in-process, not through MCP transport"
+            ),
+        )),
+        ConnectionTarget::RustyredDeclarativeSkill { skill_id, .. } => {
+            Err(ConnectorError::Transport(format!(
+                "rustyred_declarative_skill target {skill_id} is invoked in-process, not through MCP transport"
+            )))
+        }
     }
 }

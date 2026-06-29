@@ -59,6 +59,7 @@ members = [
     "crates/rustyred-thg-reconstruct-harness",
     "crates/rustyred-thg-datawave",
     "crates/rustyred-thg-datawave-harness",
+    "crates/rustyred-plugin",
 ]
 resolver = "2"
 # rustyred-thg-graphblas links native SuiteSparse:GraphBLAS + LAGraph, so it is

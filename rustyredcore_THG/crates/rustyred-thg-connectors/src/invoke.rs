@@ -18,6 +18,9 @@
 // crate-root re-export, so this crate does not depend on a `lib.rs` re-export that
 // is being co-edited by concurrent (charter) work; `registry` is a committed
 // `pub mod`, so the path is stable.
+use rustyred_plugin::{
+    invoke_declarative_skill, DeclarativeAffordanceInvoker, PluginError, PluginHost, ProvenanceFact,
+};
 use rustyred_thg_affordances::registry::connector_connection_target;
 use rustyred_thg_affordances::{
     affordance_node_id, record_invocation, Affordance, AffordanceGraphStore,
@@ -201,6 +204,44 @@ pub fn invoke_affordance<S: AffordanceGraphStore>(
             recorded: None,
         });
     }
+    if planned.connection_target.wasm_plugin_spec().is_some() {
+        let (outcome, recorded) = fire_rustyred_plugin(
+            store,
+            &req.tenant_id,
+            &req.task_type,
+            &planned,
+            req.candidate_affordance_ids,
+            actor,
+        )?;
+        return Ok(InvokeReport {
+            planned,
+            fired: true,
+            dry_run_reason: None,
+            outcome: Some(outcome),
+            recorded: Some(recorded),
+        });
+    }
+    if planned
+        .connection_target
+        .declarative_skill_definition()
+        .is_some()
+    {
+        let (outcome, recorded) = fire_declarative_skill(
+            store,
+            &req.tenant_id,
+            &req.task_type,
+            &planned,
+            req.candidate_affordance_ids,
+            actor,
+        )?;
+        return Ok(InvokeReport {
+            planned,
+            fired: true,
+            dry_run_reason: None,
+            outcome: Some(outcome),
+            recorded: Some(recorded),
+        });
+    }
     let mut transport = connect_transport(&planned.connection_target)?;
     transport.request("initialize", initialize_params())?;
     transport.notify("notifications/initialized", json!({}))?;
@@ -220,4 +261,192 @@ pub fn invoke_affordance<S: AffordanceGraphStore>(
         outcome: Some(outcome),
         recorded: Some(recorded),
     })
+}
+
+fn fire_rustyred_plugin<S: AffordanceGraphStore>(
+    store: &mut S,
+    tenant_id: &str,
+    task_type: &str,
+    planned: &PlannedInvocation,
+    candidate_affordance_ids: Vec<String>,
+    actor: Option<&str>,
+) -> ConnectorResult<(ToolCallOutcome, InvocationRecordResult)> {
+    let spec = planned
+        .connection_target
+        .wasm_plugin_spec()
+        .ok_or_else(|| {
+            ConnectorError::Transport(
+                "planned invocation is not a rustyred_plugin target".to_string(),
+            )
+        })?;
+    let input = serde_json::to_string(&planned.arguments)
+        .map_err(|error| ConnectorError::Protocol(error.to_string()))?;
+    let mut plugin = PluginHost::new()
+        .load(spec)
+        .map_err(|error| ConnectorError::Transport(error.to_string()))?;
+    let outcome = match plugin.invoke(&planned.tool_name, &input) {
+        Ok(text) => ToolCallOutcome {
+            is_error: false,
+            text,
+        },
+        Err(error) => ToolCallOutcome {
+            is_error: true,
+            text: error.to_string(),
+        },
+    };
+    if !outcome.is_error {
+        persist_plugin_fact_writes(store, plugin.runtime_state().fact_writes)?;
+    }
+    let recorded = record_invocation(
+        store,
+        InvocationRecordRequest {
+            tenant_id: tenant_id.to_string(),
+            task_type: task_type.to_string(),
+            candidate_affordance_ids,
+            selected_affordance_id: planned.affordance_id.clone(),
+            outcome_value: if outcome.is_error { 0.0 } else { 1.0 },
+            outcome_weight: 1.0,
+            outcome_label: if outcome.is_error {
+                "plugin_error".to_string()
+            } else {
+                "plugin_ok".to_string()
+            },
+            previous_affordance_id: None,
+            query_text: String::new(),
+            recorded_at_ms: None,
+        },
+        actor,
+    )
+    .map_err(|error| ConnectorError::Registration(format!("{error:?}")))?;
+    Ok((outcome, recorded))
+}
+
+fn persist_plugin_fact_writes<S: AffordanceGraphStore>(
+    store: &mut S,
+    fact_writes: Vec<ProvenanceFact>,
+) -> ConnectorResult<()> {
+    for fact in fact_writes {
+        store
+            .upsert_node(fact.to_node_record())
+            .map_err(|error| ConnectorError::Registration(format!("{error:?}")))?;
+    }
+    Ok(())
+}
+
+fn fire_declarative_skill<S: AffordanceGraphStore>(
+    store: &mut S,
+    tenant_id: &str,
+    task_type: &str,
+    planned: &PlannedInvocation,
+    candidate_affordance_ids: Vec<String>,
+    actor: Option<&str>,
+) -> ConnectorResult<(ToolCallOutcome, InvocationRecordResult)> {
+    let definition = planned
+        .connection_target
+        .declarative_skill_definition()
+        .ok_or_else(|| {
+            ConnectorError::Transport(
+                "planned invocation is not a rustyred_declarative_skill target".to_string(),
+            )
+        })?;
+    let mut invoker = StoreDeclarativeInvoker {
+        store,
+        tenant_id: tenant_id.to_string(),
+        task_type: task_type.to_string(),
+        root_affordance_id: planned.affordance_id.clone(),
+        actor: actor.map(str::to_string),
+    };
+    let outcome = match invoke_declarative_skill(&definition, &mut invoker) {
+        Ok(receipt) => ToolCallOutcome {
+            is_error: false,
+            text: serde_json::to_string(&receipt)
+                .map_err(|error| ConnectorError::Protocol(error.to_string()))?,
+        },
+        Err(error) => ToolCallOutcome {
+            is_error: true,
+            text: error.to_string(),
+        },
+    };
+    let recorded = record_invocation(
+        invoker.store,
+        InvocationRecordRequest {
+            tenant_id: tenant_id.to_string(),
+            task_type: task_type.to_string(),
+            candidate_affordance_ids,
+            selected_affordance_id: planned.affordance_id.clone(),
+            outcome_value: if outcome.is_error { 0.0 } else { 1.0 },
+            outcome_weight: 1.0,
+            outcome_label: if outcome.is_error {
+                "declarative_skill_error".to_string()
+            } else {
+                "declarative_skill_ok".to_string()
+            },
+            previous_affordance_id: None,
+            query_text: String::new(),
+            recorded_at_ms: None,
+        },
+        actor,
+    )
+    .map_err(|error| ConnectorError::Registration(format!("{error:?}")))?;
+    Ok((outcome, recorded))
+}
+
+struct StoreDeclarativeInvoker<'a, S> {
+    store: &'a mut S,
+    tenant_id: String,
+    task_type: String,
+    root_affordance_id: String,
+    actor: Option<String>,
+}
+
+impl<S: AffordanceGraphStore> DeclarativeAffordanceInvoker for StoreDeclarativeInvoker<'_, S> {
+    fn invoke_affordance(
+        &mut self,
+        affordance_id: &str,
+        arguments: Value,
+    ) -> Result<Value, PluginError> {
+        let affordance_id = affordance_id.trim();
+        if affordance_id == self.root_affordance_id {
+            return Err(PluginError::InvalidInput {
+                field: "steps.affordance_id".to_string(),
+                message: "declarative skill cannot invoke itself".to_string(),
+            });
+        }
+        let report = invoke_affordance(
+            self.store,
+            InvokeRequest {
+                tenant_id: self.tenant_id.clone(),
+                task_type: format!("{}.declarative_step", self.task_type),
+                affordance_id: affordance_id.to_string(),
+                arguments,
+                candidate_affordance_ids: vec![affordance_id.to_string()],
+            },
+            &InvokePolicy::FireAllowlist(vec![affordance_id.to_string()]),
+            self.actor.as_deref(),
+        )
+        .map_err(|error| PluginError::InvalidInput {
+            field: "declarative_step".to_string(),
+            message: error.to_string(),
+        })?;
+        let outcome = report.outcome.ok_or_else(|| {
+            PluginError::TestFailed(format!(
+                "declarative skill step {affordance_id} did not fire"
+            ))
+        })?;
+        if outcome.is_error {
+            return Err(PluginError::TestFailed(format!(
+                "declarative skill step {affordance_id} returned error: {}",
+                outcome.text
+            )));
+        }
+        Ok(json!({
+            "affordance_id": affordance_id,
+            "fired": report.fired,
+            "outcome": {
+                "is_error": outcome.is_error,
+                "text": outcome.text,
+            },
+            "recorded": report.recorded,
+        }))
+    }
 }

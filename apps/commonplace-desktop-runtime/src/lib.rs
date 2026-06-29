@@ -26,6 +26,7 @@ mod pairing;
 mod passes;
 mod presence;
 mod process_executor;
+mod programmable;
 mod relay;
 mod runs;
 mod sink;
@@ -70,6 +71,10 @@ pub use runs::{
 };
 pub use process_executor::{
     CommandFactory, ProcessRunExecutor, ResolvedCommand, ShellCommandFactory,
+};
+pub use programmable::{
+    detect_programmable_capability_pickups, ProgrammableCapabilityKind,
+    ProgrammableCapabilityPickup,
 };
 pub use presence::{
     ranges_overlap, AgentPresence, CodeEditFootprint, CodePresenceSnapshot, FileRange,
