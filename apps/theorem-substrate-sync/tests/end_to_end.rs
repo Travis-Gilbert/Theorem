@@ -7,8 +7,11 @@
 //! (PT-012..PT-014) and intentionally skipped here.
 //!
 //! Live mode: set `THEOREM_SYNC_LIVE_E2E=1` along with
-//! `THEOREM_SYNC_RAILWAY_URL` and `THEOREM_SYNC_RAILWAY_TOKEN` to run the
-//! `live_round_against_railway` test against a real Railway tenant.
+//! `THEOREM_SYNC_RAILWAY_URL` and optionally `THEOREM_SYNC_RAILWAY_TOKEN`
+//! to run the stream smoke against a real Railway tenant. Full-pack live
+//! round verification additionally requires `THEOREM_SYNC_LIVE_FULL_PACK_E2E=1`
+//! and should target a fresh/small tenant, not the production Travis-Gilbert
+//! graph.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,6 +42,7 @@ struct FakeState {
     stream_up: Arc<AtomicBool>,
     remote_up: Arc<AtomicBool>,
     publish_count: Arc<AtomicU64>,
+    ref_count: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -56,18 +60,23 @@ impl FakeState {
             stream_up: Arc::new(AtomicBool::new(true)),
             remote_up: Arc::new(AtomicBool::new(true)),
             publish_count: Arc::new(AtomicU64::new(0)),
+            ref_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
     async fn seed_node(&self, id: &str) {
         let mut g = self.inner.lock().await;
-        g.nodes
-            .insert(id.to_string(), make_node_payload(id));
+        g.nodes.insert(id.to_string(), make_node_payload(id));
     }
 
     async fn counts(&self) -> (usize, usize) {
         let g = self.inner.lock().await;
         (g.nodes.len(), g.edges.len())
+    }
+
+    #[allow(dead_code)] // reserved for future round-test assertions; counter is live
+    fn ref_count(&self) -> u64 {
+        self.ref_count.load(Ordering::SeqCst)
     }
 
     /// Inject a stream event as if it were committed on the remote.
@@ -132,6 +141,9 @@ async fn handle_tool_call(
 
     match name {
         "rustyred_thg_graph_version_compile" | "rustyred_thg_graph_version_ref" => {
+            if name == "rustyred_thg_graph_version_ref" {
+                state.ref_count.fetch_add(1, Ordering::SeqCst);
+            }
             let mut objects: Vec<Value> = g
                 .nodes
                 .values()
@@ -342,7 +354,10 @@ async fn step_4_stream_tail_delivers_remote_write_to_local() {
     assert_eq!(applied, 1, "exactly one stream event applied");
 
     let (n_after, _) = local.counts().await;
-    assert_eq!(n_after, 1, "remote-side write reached local via the stream tail");
+    assert_eq!(
+        n_after, 1,
+        "remote-side write reached local via the stream tail"
+    );
 
     let st = status.get().await;
     assert_eq!(st.stream, StreamState::Connected);
@@ -375,6 +390,11 @@ async fn step_5_round_pushes_local_write_to_remote() {
     assert_eq!(
         rn_after, 1,
         "local mutation now visible on remote after one round"
+    );
+    assert_eq!(
+        remote.ref_count(),
+        0,
+        "round must not call graph_version_ref; it is a full-pack write verb"
     );
 }
 
@@ -440,9 +460,7 @@ async fn step_7_outbox_drains_after_offline_window() {
             content_hash: "deadbeef0001".to_string(),
         },
     };
-    outbox
-        .push_event("Travis-Gilbert", event.clone())
-        .unwrap();
+    outbox.push_event("Travis-Gilbert", event.clone()).unwrap();
     assert_eq!(outbox.len("Travis-Gilbert").unwrap(), 1);
 
     let status = handle();
@@ -460,7 +478,10 @@ async fn step_7_outbox_drains_after_offline_window() {
     // Bring remote back up. Next drain succeeds.
     remote.remote_up.store(true, Ordering::SeqCst);
     let popped = drainer.drain_once().await.unwrap();
-    assert!(popped.is_some(), "drain succeeded once remote was reachable");
+    assert!(
+        popped.is_some(),
+        "drain succeeded once remote was reachable"
+    );
     assert_eq!(
         outbox.len("Travis-Gilbert").unwrap(),
         0,
@@ -475,14 +496,22 @@ async fn step_7_outbox_drains_after_offline_window() {
 
 // ----- live mode (gated) -----
 
-/// Helper: build an McpClient against the configured live Railway tenant.
-/// Returns `None` if the live-mode env vars are not set.
-fn live_remote_client() -> Option<McpClient> {
+/// Helper: build an McpClient against the configured live Railway endpoint
+/// using the supplied tenant. Returns `None` if the live-mode gate vars are
+/// not set. Callers that need a fresh empty tenant (e.g. the Role 1 round
+/// test, which proves the `pack.objects`-omitted wire shape) pass an
+/// explicit unique tenant; callers that just need a tenant slot for
+/// stream-scoped writes pass `None` to honor `THEOREM_SYNC_TENANT` (default
+/// `Travis-Gilbert`).
+fn live_remote_client_for(tenant_override: Option<&str>) -> Option<McpClient> {
     if std::env::var("THEOREM_SYNC_LIVE_E2E").as_deref() != Ok("1") {
         return None;
     }
     let url = std::env::var("THEOREM_SYNC_RAILWAY_URL").ok()?;
-    let tenant = std::env::var("THEOREM_SYNC_TENANT").unwrap_or_else(|_| "Travis-Gilbert".into());
+    let tenant = match tenant_override {
+        Some(t) => t.to_string(),
+        None => std::env::var("THEOREM_SYNC_TENANT").unwrap_or_else(|_| "Travis-Gilbert".into()),
+    };
     Some(match std::env::var("THEOREM_SYNC_RAILWAY_TOKEN").ok() {
         Some(token) if !token.is_empty() => McpClient::new(
             url,
@@ -491,6 +520,10 @@ fn live_remote_client() -> Option<McpClient> {
         ),
         _ => McpClient::unauthenticated(url, tenant),
     })
+}
+
+fn live_remote_client() -> Option<McpClient> {
+    live_remote_client_for(None)
 }
 
 /// Live smoke for Role 2 (stream-tail freshness). Exercises the same
@@ -568,21 +601,67 @@ async fn live_stream_smoke_against_railway() {
 }
 
 /// Live Role 1 acceptance: drive a full Prolly round
-/// (compile -> diff -> merge -> apply local -> apply remote -> ref
-/// update) against the real `rustyredcore-theorem-production` server.
-/// The fresh tenant carved out here starts empty, so both sides agree
-/// on an empty merged snapshot and the round converges to the same
-/// hash on local and remote sides. Live verification of the daemon's
-/// Role 1 wire, including the response-shape handling where the
-/// server omits `pack.objects` for empty packs via
-/// `skip_serializing_if = "Vec::is_empty"`.
+/// (compile -> merge -> apply local -> apply remote) against the real
+/// Railway endpoint. This stays behind a separate full-pack opt-in because
+/// full graph compile is not a safe heartbeat shape for the production
+/// Travis-Gilbert graph.
 #[tokio::test]
-#[ignore = "set THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_RAILWAY_URL (and optionally THEOREM_SYNC_RAILWAY_TOKEN, THEOREM_SYNC_TENANT) to run"]
+#[ignore = "set THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_LIVE_FULL_PACK_E2E=1 + THEOREM_SYNC_RAILWAY_URL to run against a throwaway tenant"]
 async fn live_round_against_railway() {
-    let Some(remote) = live_remote_client() else {
+    if std::env::var("THEOREM_SYNC_LIVE_FULL_PACK_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping: full-pack live mode not enabled");
+        return;
+    }
+    // Generate a unique throwaway tenant. The regression this test covers
+    // (server omitting `pack.objects` via `skip_serializing_if =
+    // Vec::is_empty`) only fires on an EMPTY tenant, and we must not
+    // upsert the merged snapshot back into shared production data
+    // (e.g. `Travis-Gilbert`, 12+GB of real graph state). This makes the
+    // test self-contained: it provisions its own slate, proves the
+    // empty-pack wire shape, then leaves the slate behind.
+    let tenant = format!(
+        "substrate-sync-pt015-round-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let Some(remote) = live_remote_client_for(Some(&tenant)) else {
         eprintln!("skipping: live mode env not configured");
         return;
     };
+    eprintln!("live round tenant: {tenant}");
+
+    // Belt-and-suspenders: prove the chosen tenant is empty so the
+    // `pack.objects`-omitted wire path is actually exercised. If a future
+    // namespacing change leaks a non-empty tenant in here this assertion
+    // makes that failure mode loud instead of silently regressing the
+    // regression test.
+    let bootstrap = remote
+        .call_tool(
+            "rustyred_thg_graph_version_compile",
+            json!({ "include_payloads": false }),
+        )
+        .await
+        .expect("compile against fresh tenant must succeed");
+    let manifest = bootstrap
+        .get("pack")
+        .and_then(|p| p.get("manifest"))
+        .expect("bootstrap response must include pack.manifest");
+    let nodes_total = manifest
+        .get("nodes_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let edges_total = manifest
+        .get("edges_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert_eq!(
+        (nodes_total, edges_total),
+        (0, 0),
+        "fresh tenant {tenant} must report zero nodes/edges (the pack.objects-omitted path); got nodes={nodes_total} edges={edges_total}"
+    );
+
     let local_fake = FakeState::new();
     let local_url = spawn_fake(local_fake.clone()).await;
     let local = McpClient::unauthenticated(local_url, "irrelevant");
@@ -601,10 +680,7 @@ async fn live_round_against_railway() {
         receipt.applied_remote,
         "round must mark applied_remote=true (merged snapshot pushed to remote)"
     );
-    assert!(
-        !receipt.merged_hash.is_empty(),
-        "merged_hash must be set"
-    );
+    assert!(!receipt.merged_hash.is_empty(), "merged_hash must be set");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
