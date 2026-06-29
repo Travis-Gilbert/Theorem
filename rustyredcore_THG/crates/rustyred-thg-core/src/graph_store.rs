@@ -16,6 +16,10 @@ use crate::hooks::{changed_property_keys, HookEmitter, MutationEvent, MutationKi
 use crate::object_store::DiskObjectStore;
 use crate::ordered::{OrderedDesignation, OrderedIndex};
 use crate::state::stable_hash;
+use crate::versioned_graph::{snapshot_content_objects, GraphObjectKind};
+use crate::zerocopy::{
+    access_graph_archive, archive_content_object, MappedArchive, ZeroCopyArchiveError,
+};
 
 #[cfg(feature = "vector-accelerated")]
 const VECTOR_INDEX_BIT_WIDTH: usize = 4;
@@ -2455,6 +2459,11 @@ const REDCORE_LOCK_FILE: &str = ".redcore.lock";
 const REDCORE_CURRENT_SNAPSHOT_TMP_FILE: &str = "graph.snapshot.current.tmp";
 const REDCORE_PREVIOUS_SNAPSHOT_TMP_FILE: &str = "graph.snapshot.previous.tmp";
 const REDCORE_MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
+const REDCORE_ARCHIVE_DIR: &str = "graph.archive";
+const REDCORE_ARCHIVE_OBJECT_DIR: &str = "objects";
+const REDCORE_ARCHIVE_MANIFEST_FILE: &str = "manifest.json";
+const REDCORE_ARCHIVE_MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
+const REDCORE_PAYLOAD_POINTER_TYPE: &str = "redcore.payload_pointer.v1";
 
 static REDCORE_PROCESS_LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 static REDCORE_DURABILITY_SYNCER: OnceLock<mpsc::Sender<DurabilitySyncRequest>> = OnceLock::new();
@@ -2579,6 +2588,100 @@ struct RedCoreSnapshotEnvelope {
     graph: GraphSnapshot,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCoreArchiveManifest {
+    pub version: u32,
+    pub graph_version: u64,
+    pub snapshot_txn_id: u64,
+    pub entries: Vec<RedCoreArchiveEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCoreArchiveEntry {
+    pub id: String,
+    pub key: String,
+    pub kind: String,
+    pub object_hash: String,
+    pub archive_hash: String,
+    pub file: String,
+    pub bytes_len: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCoreArchiveResidencyReport {
+    pub manifest_loaded: bool,
+    pub graph_version: u64,
+    pub snapshot_txn_id: u64,
+    pub mapped_objects: usize,
+    pub nodes: usize,
+    pub edges: usize,
+    pub archive_bytes: u64,
+}
+
+struct RedCoreArchiveResidency {
+    manifest: RedCoreArchiveManifest,
+    mapped: BTreeMap<String, MappedArchive>,
+    archive_bytes: u64,
+}
+
+impl std::fmt::Debug for RedCoreArchiveResidency {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedCoreArchiveResidency")
+            .field("graph_version", &self.manifest.graph_version)
+            .field("snapshot_txn_id", &self.manifest.snapshot_txn_id)
+            .field("entries", &self.manifest.entries.len())
+            .field("mapped", &self.mapped.len())
+            .field("archive_bytes", &self.archive_bytes)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCorePayloadPointer {
+    #[serde(rename = "type")]
+    pub pointer_type: String,
+    pub content_hash: String,
+    pub byte_len: usize,
+    pub backend: String,
+}
+
+impl RedCorePayloadPointer {
+    pub fn new(
+        content_hash: impl Into<String>,
+        byte_len: usize,
+        backend: impl Into<String>,
+    ) -> Self {
+        Self {
+            pointer_type: REDCORE_PAYLOAD_POINTER_TYPE.to_string(),
+            content_hash: content_hash.into(),
+            byte_len,
+            backend: backend.into(),
+        }
+    }
+
+    pub fn from_value(value: &Value) -> GraphStoreResult<Self> {
+        let pointer: Self = serde_json::from_value(value.clone())
+            .map_err(|err| GraphStoreError::new("payload_pointer_decode", err.to_string()))?;
+        if pointer.pointer_type != REDCORE_PAYLOAD_POINTER_TYPE {
+            return Err(GraphStoreError::new(
+                "payload_pointer_type_mismatch",
+                format!(
+                    "expected payload pointer type {REDCORE_PAYLOAD_POINTER_TYPE}, got {}",
+                    pointer.pointer_type
+                ),
+            ));
+        }
+        Ok(pointer)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct RedCoreAofFrame {
     magic: String,
@@ -2621,6 +2724,7 @@ impl From<GraphMutation> for RedCoreMutation {
 #[derive(Debug)]
 pub struct RedCoreGraphStore {
     store: InMemoryGraphStore,
+    archive_residency: Option<RedCoreArchiveResidency>,
     data_dir: Option<PathBuf>,
     _directory_lock: Option<RedCoreDirectoryLock>,
     options: RedCoreOptions,
@@ -2675,6 +2779,7 @@ impl RedCoreGraphStore {
     pub fn memory() -> Self {
         Self {
             store: InMemoryGraphStore::new(),
+            archive_residency: None,
             data_dir: None,
             _directory_lock: None,
             options: RedCoreOptions {
@@ -2708,6 +2813,7 @@ impl RedCoreGraphStore {
         let directory_lock = acquire_redcore_directory_lock(&data_dir)?;
         let mut engine = Self {
             store: InMemoryGraphStore::new(),
+            archive_residency: None,
             data_dir: Some(data_dir),
             _directory_lock: Some(directory_lock),
             options,
@@ -2736,6 +2842,33 @@ impl RedCoreGraphStore {
         Ok(engine)
     }
 
+    pub fn archive_residency_report(&self) -> RedCoreArchiveResidencyReport {
+        let Some(residency) = self.archive_residency.as_ref() else {
+            return RedCoreArchiveResidencyReport::default();
+        };
+        let nodes = residency
+            .manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == GraphObjectKind::Node.as_str())
+            .count();
+        let edges = residency
+            .manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == GraphObjectKind::Edge.as_str())
+            .count();
+        RedCoreArchiveResidencyReport {
+            manifest_loaded: true,
+            graph_version: residency.manifest.graph_version,
+            snapshot_txn_id: residency.manifest.snapshot_txn_id,
+            mapped_objects: residency.mapped.len(),
+            nodes,
+            edges,
+            archive_bytes: residency.archive_bytes,
+        }
+    }
+
     pub fn put_cold_document_bytes(&self, body: &[u8]) -> GraphStoreResult<Option<String>> {
         let Some(store) = self.cold_object_store()? else {
             return Ok(None);
@@ -2748,6 +2881,96 @@ impl RedCoreGraphStore {
             return Ok(None);
         };
         store.get_document_bytes(content_hash)
+    }
+
+    pub fn put_payload_bytes(
+        &self,
+        body: &[u8],
+    ) -> GraphStoreResult<Option<RedCorePayloadPointer>> {
+        let Some(hash) = self.put_cold_document_bytes(body)? else {
+            return Ok(None);
+        };
+        Ok(Some(RedCorePayloadPointer::new(
+            hash,
+            body.len(),
+            "local_data_dir",
+        )))
+    }
+
+    pub fn get_payload_bytes(
+        &self,
+        pointer: &RedCorePayloadPointer,
+    ) -> GraphStoreResult<Option<Vec<u8>>> {
+        self.get_cold_document_bytes(&pointer.content_hash)
+    }
+
+    pub fn upsert_node_with_payload_bytes(
+        &mut self,
+        mut node: NodeRecord,
+        property_name: &str,
+        body: &[u8],
+    ) -> GraphStoreResult<GraphWriteResult> {
+        let pointer = self.require_payload_pointer(body)?;
+        insert_payload_pointer_property(&mut node.properties, property_name, pointer)?;
+        self.upsert_node(node)
+    }
+
+    pub fn upsert_edge_with_payload_bytes(
+        &mut self,
+        mut edge: EdgeRecord,
+        property_name: &str,
+        body: &[u8],
+    ) -> GraphStoreResult<GraphWriteResult> {
+        let pointer = self.require_payload_pointer(body)?;
+        insert_payload_pointer_property(&mut edge.properties, property_name, pointer)?;
+        self.upsert_edge(edge)
+    }
+
+    pub fn read_node_payload_bytes(
+        &self,
+        node_id: &str,
+        property_name: &str,
+    ) -> GraphStoreResult<Option<Vec<u8>>> {
+        let Some(node) = self.get_node(node_id)? else {
+            return Ok(None);
+        };
+        self.read_payload_property(&node.properties, property_name)
+    }
+
+    pub fn read_edge_payload_bytes(
+        &self,
+        edge_id: &str,
+        property_name: &str,
+    ) -> GraphStoreResult<Option<Vec<u8>>> {
+        let Some(edge) = self.get_edge(edge_id)? else {
+            return Ok(None);
+        };
+        self.read_payload_property(&edge.properties, property_name)
+    }
+
+    fn require_payload_pointer(&self, body: &[u8]) -> GraphStoreResult<RedCorePayloadPointer> {
+        self.put_payload_bytes(body)?.ok_or_else(|| {
+            GraphStoreError::new(
+                "payload_store_unavailable",
+                "payload offload requires an embedded RedCore data directory",
+            )
+        })
+    }
+
+    fn read_payload_property(
+        &self,
+        properties: &Value,
+        property_name: &str,
+    ) -> GraphStoreResult<Option<Vec<u8>>> {
+        let property_name = normalized_payload_property_name(property_name)?;
+        let Some(value) = properties
+            .as_object()
+            .and_then(|properties| properties.get(&property_name))
+        else {
+            return Ok(None);
+        };
+        let pointer = RedCorePayloadPointer::from_value(value)?;
+        self.get_payload_bytes(&pointer)
     }
 
     fn cold_object_store(&self) -> GraphStoreResult<Option<DiskObjectStore>> {
@@ -3377,6 +3600,22 @@ impl RedCoreGraphStore {
         Ok(self.store.get_node(id).cloned())
     }
 
+    pub fn evict_node(&mut self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        self.store.evict_node(id)
+    }
+
+    pub fn readmit_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        self.store.readmit_node(node)
+    }
+
+    pub fn evict_edge(&mut self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.store.evict_edge(id)
+    }
+
+    pub fn readmit_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        self.store.readmit_edge(edge)
+    }
+
     // ---- TTL primitive (decorator pass-throughs) -----------------------
     //
     // Read paths delegate directly: the TTL filter inside
@@ -3770,6 +4009,7 @@ impl RedCoreGraphStore {
                 ));
             }
         }
+        self.archive_residency = load_archive_residency(&data_dir)?;
         if let Some(envelope) = read_latest_valid_snapshot(&data_dir)? {
             self.snapshot_txn_id = envelope.txn_id;
             self.last_txn_id = self.last_txn_id.max(envelope.txn_id);
@@ -4018,6 +4258,7 @@ impl RedCoreGraphStore {
         if current.exists() {
             preserve_previous_snapshot(data_dir, &current)?;
         }
+        write_archive_for_snapshot(data_dir, txn_id, &envelope.graph)?;
         write_atomic_file(
             data_dir,
             REDCORE_CURRENT_SNAPSHOT_TMP_FILE,
@@ -4398,6 +4639,145 @@ fn read_snapshot_file(
     serde_json::from_str::<RedCoreSnapshotEnvelope>(&raw)
         .map(Some)
         .map_err(|err| GraphStoreError::io(format!("decode RedCore {label}"), err))
+}
+
+fn write_archive_for_snapshot(
+    data_dir: &Path,
+    snapshot_txn_id: u64,
+    snapshot: &GraphSnapshot,
+) -> GraphStoreResult<()> {
+    let archive_dir = data_dir.join(REDCORE_ARCHIVE_DIR);
+    let object_dir = archive_dir.join(REDCORE_ARCHIVE_OBJECT_DIR);
+    fs::create_dir_all(&object_dir)
+        .map_err(|err| GraphStoreError::io("create RedCore archive object directory", err))?;
+
+    let mut entries = Vec::new();
+    for object in snapshot_content_objects(snapshot, true) {
+        let archived = archive_content_object(&object).map_err(zero_copy_error)?;
+        let file_name = format!("{}.rkyv", safe_archive_filename(&archived.hash));
+        let relative_file = format!("{REDCORE_ARCHIVE_OBJECT_DIR}/{file_name}");
+        let object_path = archive_dir.join(&relative_file);
+        if !object_path.exists() {
+            let tmp_name = format!("{REDCORE_ARCHIVE_OBJECT_DIR}/{file_name}.tmp");
+            write_atomic_file(
+                &archive_dir,
+                &tmp_name,
+                &relative_file,
+                &archived.bytes,
+                "RedCore archive object",
+            )?;
+        }
+        entries.push(RedCoreArchiveEntry {
+            id: object_id_from_key(&object.key).to_string(),
+            key: object.key,
+            kind: object.kind.as_str().to_string(),
+            object_hash: object.hash,
+            archive_hash: archived.hash,
+            file: relative_file,
+            bytes_len: archived.bytes.len() as u64,
+            logical_hash: object.logical_hash,
+        });
+    }
+
+    let manifest = RedCoreArchiveManifest {
+        version: REDCORE_MANIFEST_VERSION,
+        graph_version: snapshot.version,
+        snapshot_txn_id,
+        entries,
+    };
+    let raw = serde_json::to_vec_pretty(&manifest)
+        .map_err(|err| GraphStoreError::io("encode RedCore archive manifest", err))?;
+    write_atomic_file(
+        &archive_dir,
+        REDCORE_ARCHIVE_MANIFEST_TMP_FILE,
+        REDCORE_ARCHIVE_MANIFEST_FILE,
+        &raw,
+        "RedCore archive manifest",
+    )
+}
+
+fn load_archive_residency(data_dir: &Path) -> GraphStoreResult<Option<RedCoreArchiveResidency>> {
+    let archive_dir = data_dir.join(REDCORE_ARCHIVE_DIR);
+    let manifest_path = archive_dir.join(REDCORE_ARCHIVE_MANIFEST_FILE);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&manifest_path)
+        .map_err(|err| GraphStoreError::io("read RedCore archive manifest", err))?;
+    let manifest: RedCoreArchiveManifest = serde_json::from_str(&raw)
+        .map_err(|err| GraphStoreError::io("decode RedCore archive manifest", err))?;
+    if !manifest_version_compatible(manifest.version) {
+        return Err(GraphStoreError::new(
+            "redcore_archive_format_too_new",
+            format!(
+                "On-disk RedCore archive manifest version is {}, this build supports up to {}.",
+                manifest.version, CURRENT_FORMAT_VERSION
+            ),
+        ));
+    }
+
+    let mut mapped = BTreeMap::new();
+    let mut archive_bytes = 0_u64;
+    for entry in &manifest.entries {
+        let path = archive_dir.join(&entry.file);
+        let mmap = MappedArchive::open(&path).map_err(zero_copy_error)?;
+        access_graph_archive(mmap.as_bytes()).map_err(zero_copy_error)?;
+        archive_bytes = archive_bytes.saturating_add(entry.bytes_len);
+        mapped.insert(entry.object_hash.clone(), mmap);
+    }
+
+    Ok(Some(RedCoreArchiveResidency {
+        manifest,
+        mapped,
+        archive_bytes,
+    }))
+}
+
+fn zero_copy_error(error: ZeroCopyArchiveError) -> GraphStoreError {
+    GraphStoreError::new(error.code, error.message)
+}
+
+fn safe_archive_filename(hash: &str) -> String {
+    hash.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn object_id_from_key(key: &str) -> &str {
+    key.split_once('/').map(|(_, id)| id).unwrap_or(key)
+}
+
+fn normalized_payload_property_name(property_name: &str) -> GraphStoreResult<String> {
+    let property_name = property_name.trim();
+    if property_name.is_empty() {
+        return Err(GraphStoreError::empty_field("payload.property"));
+    }
+    Ok(property_name.to_string())
+}
+
+fn insert_payload_pointer_property(
+    properties: &mut Value,
+    property_name: &str,
+    pointer: RedCorePayloadPointer,
+) -> GraphStoreResult<()> {
+    let property_name = normalized_payload_property_name(property_name)?;
+    if !properties.is_object() {
+        *properties = Value::Object(serde_json::Map::new());
+    }
+    let Some(object) = properties.as_object_mut() else {
+        return Err(GraphStoreError::new(
+            "payload_properties_invalid",
+            "node or edge properties must be a JSON object to carry a payload pointer",
+        ));
+    };
+    object.insert(property_name, pointer.to_value());
+    Ok(())
 }
 
 pub fn unix_ms() -> u128 {
@@ -5324,6 +5704,22 @@ impl GraphStore for RedCoreGraphStore {
         self.store.rebuild_indexes()
     }
 
+    fn evict_node(&mut self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        RedCoreGraphStore::evict_node(self, id)
+    }
+
+    fn readmit_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        RedCoreGraphStore::readmit_node(self, node)
+    }
+
+    fn evict_edge(&mut self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        RedCoreGraphStore::evict_edge(self, id)
+    }
+
+    fn readmit_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        RedCoreGraphStore::readmit_edge(self, edge)
+    }
+
     // TTL methods intentionally keep the trait defaults: delegating a TTL write
     // to the in-memory mirror would skip the AOF and lose durability. Durable
     // TTL on RedCore is a separate follow-up; until then RedCore reports no TTL
@@ -5976,7 +6372,7 @@ mod tests {
         sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
         GraphSnapshot, GraphStore, InMemoryGraphStore, MemoryDocumentQuery, NeighborQuery,
         NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
-        RedCoreSyncMode,
+        RedCorePayloadPointer, RedCoreSyncMode,
     };
 
     #[test]
@@ -7166,6 +7562,135 @@ mod tests {
         assert_eq!(store.verify().unwrap().ok, true);
 
         std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_snapshot_writes_and_recovers_mmap_archive_residency() {
+        let data_dir = unique_test_dir("redcore-archive-residency");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:a",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 1 }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:b",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 2 }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:ab",
+                    "node:a",
+                    "LINKS",
+                    "node:b",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        let report = store.archive_residency_report();
+        assert!(
+            report.manifest_loaded,
+            "archive manifest should load on open"
+        );
+        assert_eq!(report.graph_version, store.status().graph_version);
+        assert_eq!(report.snapshot_txn_id, store.status().snapshot_txn_id);
+        assert_eq!(report.nodes, 2);
+        assert_eq!(report.edges, 1);
+        assert_eq!(report.mapped_objects, 3);
+        assert!(report.archive_bytes > 0);
+        assert!(store.get_node("node:a").unwrap().is_some());
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_payload_offload_writes_pointer_and_fetches_bytes() {
+        let data_dir = unique_test_dir("redcore-payload-offload");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+        let payload = b"payload bytes live only in cold object storage";
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node_with_payload_bytes(
+                    NodeRecord::new(
+                        "node:payload",
+                        ["Payload"],
+                        json!({ "title": "payload pointer" }),
+                    ),
+                    "payload",
+                    payload,
+                )
+                .unwrap();
+
+            let node = store.get_node("node:payload").unwrap().unwrap();
+            let pointer = RedCorePayloadPointer::from_value(&node.properties["payload"]).unwrap();
+            assert_eq!(pointer.byte_len, payload.len());
+            assert!(pointer.content_hash.starts_with("sha256:"));
+            assert_eq!(pointer.backend, "local_data_dir");
+            assert!(!node.properties.to_string().contains("cold object storage"));
+            assert_eq!(
+                store
+                    .read_node_payload_bytes("node:payload", "payload")
+                    .unwrap()
+                    .unwrap(),
+                payload
+            );
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert_eq!(
+            store
+                .read_node_payload_bytes("node:payload", "payload")
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_residency_eviction_readmit_is_version_neutral() {
+        let mut store = RedCoreGraphStore::memory();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:resident",
+                ["Resident"],
+                json!({ "body": "identical after readmit" }),
+            ))
+            .unwrap();
+        let version = store.status().graph_version;
+
+        let node = store
+            .evict_node("node:resident")
+            .unwrap()
+            .expect("node should evict from hot set");
+        assert!(store.get_node("node:resident").unwrap().is_none());
+        assert_eq!(store.status().graph_version, version);
+
+        store.readmit_node(node).unwrap();
+        assert_eq!(
+            store.get_node("node:resident").unwrap().unwrap().properties["body"],
+            json!("identical after readmit")
+        );
+        assert_eq!(store.status().graph_version, version);
     }
 
     #[test]
