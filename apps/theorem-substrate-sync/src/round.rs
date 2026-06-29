@@ -45,15 +45,6 @@ pub async fn run_round(
 
     apply_snapshot(local, &merged_snapshot).await?;
     apply_snapshot(remote, &merged_snapshot).await?;
-    remote
-        .call_tool(
-            "rustyred_thg_graph_version_ref",
-            json!({
-                "branch": "main",
-                "include_payloads": true
-            }),
-        )
-        .await?;
 
     let receipt = RoundReceipt {
         local_hash,
@@ -77,10 +68,10 @@ pub async fn compile_snapshot(client: &McpClient) -> Result<Value> {
             json!({ "include_payloads": true }),
         )
         .await?;
-    response
-        .get("pack")
-        .and_then(|pack| pack.get("objects"))
-        .ok_or_else(|| SyncError::Mcp("compile response missing pack.objects".to_string()))?;
+    // `pack.manifest` is required (counts + version); `pack.objects` is NOT.
+    // The server's CompiledGraphPack uses `#[serde(skip_serializing_if =
+    // Vec::is_empty)]` on `objects`, so an empty graph (or any payload-less
+    // pack) omits the field entirely on the wire. Treat missing as empty.
     response
         .get("pack")
         .and_then(|pack| pack.get("manifest"))
@@ -120,11 +111,9 @@ pub async fn apply_snapshot(client: &McpClient, snapshot: &Value) -> Result<()> 
 }
 
 fn pack_snapshot(response: &Value) -> Result<Value> {
-    response
-        .get("pack")
-        .and_then(|pack| pack.get("objects"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| SyncError::Mcp("compile response missing objects".to_string()))?;
+    // Manifest is the only required field; `objects` is optional (see
+    // compile_snapshot comment). The iteration below already handles missing
+    // arrays via `as_array().into_iter().flatten()`.
     let checkout_like = response
         .get("pack")
         .and_then(|pack| pack.get("manifest"))

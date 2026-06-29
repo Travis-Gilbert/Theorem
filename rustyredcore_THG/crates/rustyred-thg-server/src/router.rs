@@ -20,6 +20,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyred_hipporag::HippoQuery;
@@ -78,6 +79,8 @@ use theorem_harness_runtime::{
     append_transition_from_store, memory_content_hash, normalize_tenant_slug, publish_skill_pack,
     subscribe_coordination_room_events, MemoryDocumentState, SkillPackPublishInput,
 };
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -1109,25 +1112,43 @@ async fn mcp_post(
     let state_for_mcp = state.clone();
     let config_for_mcp = config.clone();
     let mcp_context_for_call = mcp_context.clone();
-    let call = tokio::task::spawn_blocking(move || {
-        handle_mcp_request_with_context(
-            &state_for_mcp,
-            &config_for_mcp,
-            &mcp_context_for_call,
-            payload,
-        )
-    });
-    let mut response = match tokio::time::timeout(mcp_http_budget(), call).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => mcp_http_error_response(
-            request_id,
-            rustyred_thg_mcp::McpError::internal(format!("MCP handler task failed: {error}")),
-        ),
-        Err(_) => mcp_http_error_response(
-            request_id,
-            rustyred_thg_mcp::McpError::internal("MCP request exceeded the HTTP execution budget"),
-        ),
-    };
+    let permit =
+        match tokio::time::timeout(mcp_http_budget(), mcp_blocking_semaphore().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                let mut response = mcp_http_error_response(
+                    request_id,
+                    rustyred_thg_mcp::McpError::internal(format!(
+                        "MCP execution gate closed before request could start: {error}"
+                    )),
+                );
+                if inject_search_tools {
+                    inject_web_search_graph_tool_definition(&mut response);
+                }
+                return Json(response).into_response();
+            }
+            Err(_) => {
+                let mut response = mcp_http_error_response(
+                    request_id,
+                    rustyred_thg_mcp::McpError::internal(
+                        "MCP request could not start before the HTTP execution budget",
+                    ),
+                );
+                if inject_search_tools {
+                    inject_web_search_graph_tool_definition(&mut response);
+                }
+                return Json(response).into_response();
+            }
+        };
+    let mut response = run_mcp_request_in_place(
+        state_for_mcp,
+        config_for_mcp,
+        mcp_context_for_call,
+        payload,
+        permit,
+    );
     if inject_search_tools {
         inject_web_search_graph_tool_definition(&mut response);
     }
@@ -1228,16 +1249,42 @@ fn theorem_agent_http_timeout() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(12))
 }
 
-/// Per-request HTTP budget for the MCP endpoint.
+fn run_mcp_request_in_place(
+    state: AppState,
+    config: rustyred_thg_mcp::McpServerConfig,
+    mcp_context: McpRequestContext,
+    payload: Value,
+    permit: OwnedSemaphorePermit,
+) -> Value {
+    let run = move || {
+        let _admission_permit = permit;
+        handle_mcp_request_with_context(&state, &config, &mcp_context, payload)
+    };
+    if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    }
+}
+
+fn mcp_blocking_semaphore() -> Arc<Semaphore> {
+    static MCP_BLOCKING_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(MCP_BLOCKING_SEMAPHORE.get_or_init(|| {
+        Arc::new(Semaphore::new(mcp_blocking_concurrency_from_env(
+            std::env::var("THEOREM_MCP_BLOCKING_CONCURRENCY")
+                .ok()
+                .as_deref(),
+        )))
+    }))
+}
+
+/// Admission budget for the MCP endpoint.
 ///
-/// Hard ceiling for any single `POST /mcp` JSON-RPC call. Configurable via
-/// `THEOREM_MCP_HTTP_BUDGET_SECS` so a deployment with a large graph store
-/// (the production tenant carries multi-GB Prolly state) can grant slower
-/// verbs like `rustyred_thg_graph_version_ref` (which snapshots + compiles a
-/// pack) and `harness_kg_status` enough room to return. Defaults to 60s,
-/// up from the prior hardcoded 20s that was tripping on real production
-/// state. Bounded at 1..=300 so a misconfigured value cannot make the
-/// server hold a request open longer than Railway's own edge tolerance.
+/// This intentionally gates *starting* synchronous MCP work instead of timing
+/// out a running `spawn_blocking` task. Tokio cannot cancel a blocking task
+/// after it starts, so dropping a timed-out join handle can strand graph locks
+/// until the process restarts. Once admitted, the handler runs in-place and
+/// releases its semaphore permit when the synchronous call actually returns.
 fn mcp_http_budget() -> Duration {
     std::env::var("THEOREM_MCP_HTTP_BUDGET_SECS")
         .ok()
@@ -1245,6 +1292,13 @@ fn mcp_http_budget() -> Duration {
         .filter(|seconds| (1..=300).contains(seconds))
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(60))
+}
+
+fn mcp_blocking_concurrency_from_env(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|slots| (1..=64).contains(slots))
+        .unwrap_or(4)
 }
 
 fn mcp_payload_tenant(
@@ -2601,7 +2655,11 @@ impl<E: TextEmbedder> rustyred_hipporag::HippoTextEmbedder for HippoWebEmbedder<
         &'a self,
         inputs: &'a [String],
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = rustyred_hipporag::HippoResult<Vec<Vec<f32>>>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = rustyred_hipporag::HippoResult<Vec<Vec<f32>>>>
+                + Send
+                + 'a,
+        >,
     > {
         Box::pin(async move {
             self.0
@@ -9139,12 +9197,13 @@ mod tests {
         is_adapter_command, is_cache_command, is_graph_command, live_search_budget,
         live_search_is_sparse, maybe_handle_browser_use_mcp, maybe_handle_composed_agent_mcp,
         maybe_handle_hippo_retrieve_mcp, maybe_handle_live_search_acquisition_mcp,
-        maybe_handle_web_search_graph_mcp, mcp_origin_allowed, memory_docs_list, public_cypher,
-        required_scope_for_command, search_live, transaction_begin, transaction_commit,
-        transaction_rollback, BulkQuery, CommunitiesBody, ComponentsBody, FullTextSearchBody,
-        HybridSearchBody, InstantKgExplainEdgeBody, InstantKgImpactBody, InstantKgPprBody,
-        InstantKgSearchBody, InstantKgViewBody, LiveSearchRequest, MemoryDocsQuery, PageRankBody,
-        PprBody, PublicCypherBody, TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
+        maybe_handle_web_search_graph_mcp, mcp_blocking_concurrency_from_env, mcp_origin_allowed,
+        memory_docs_list, public_cypher, required_scope_for_command, search_live,
+        transaction_begin, transaction_commit, transaction_rollback, BulkQuery, CommunitiesBody,
+        ComponentsBody, FullTextSearchBody, HybridSearchBody, InstantKgExplainEdgeBody,
+        InstantKgImpactBody, InstantKgPprBody, InstantKgSearchBody, InstantKgViewBody,
+        LiveSearchRequest, MemoryDocsQuery, PageRankBody, PprBody, PublicCypherBody,
+        TransactionBeginBody, TransactionMutationBody, VectorSearchBody,
     };
     use crate::{
         auth::ApiToken,
@@ -9193,6 +9252,15 @@ mod tests {
                 .to_vec(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn mcp_blocking_concurrency_is_bounded() {
+        assert_eq!(mcp_blocking_concurrency_from_env(None), 4);
+        assert_eq!(mcp_blocking_concurrency_from_env(Some("8")), 8);
+        assert_eq!(mcp_blocking_concurrency_from_env(Some("0")), 4);
+        assert_eq!(mcp_blocking_concurrency_from_env(Some("65")), 4);
+        assert_eq!(mcp_blocking_concurrency_from_env(Some("nope")), 4);
     }
 
     fn memory_product_state() -> AppState {

@@ -124,13 +124,7 @@ impl McpClient {
         if self.token.as_str().is_none() && self.base_url.starts_with("https://") {
             return ConnectionState::Disconnected;
         }
-        match self
-            .call_tool(
-                "rustyred_thg_graph_version_compile",
-                json!({"include_payloads": false}),
-            )
-            .await
-        {
+        match self.call_tool("harness_kg_status", json!({})).await {
             Ok(_) => ConnectionState::Connected,
             Err(SyncError::Auth(_)) => ConnectionState::TokenInvalid,
             Err(_) => ConnectionState::Disconnected,
