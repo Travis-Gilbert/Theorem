@@ -48,9 +48,5 @@ async fn doctor_reports_down_when_nothing_listens() {
     )
     .await;
     assert!(!checks.is_empty());
-    assert!(
-        checks.iter().all(|c| !c.ok),
-        "all links down: {:?}",
-        checks
-    );
+    assert!(checks.iter().all(|c| !c.ok), "all links down: {:?}", checks);
 }

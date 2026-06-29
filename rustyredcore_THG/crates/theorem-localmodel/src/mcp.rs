@@ -7,14 +7,14 @@ use serde_json::{json, Value};
 
 use crate::config::McpServerConfig;
 use crate::tools::ToolCatalog;
-use crate::{AgentdError, AgentdResult};
+use crate::{LocalModelError, LocalModelResult};
 
 pub struct McpRouter {
     clients: BTreeMap<String, McpClient>,
 }
 
 impl McpRouter {
-    pub fn from_configs(configs: Vec<McpServerConfig>) -> AgentdResult<Self> {
+    pub fn from_configs(configs: Vec<McpServerConfig>) -> LocalModelResult<Self> {
         let mut clients = BTreeMap::new();
         for config in configs {
             let name = config.name.clone();
@@ -28,13 +28,13 @@ impl McpRouter {
         catalog: &ToolCatalog,
         name: &str,
         arguments: Value,
-    ) -> AgentdResult<Value> {
+    ) -> LocalModelResult<Value> {
         catalog.validate_call(name, &arguments)?;
         let definition = catalog
             .get(name)
-            .ok_or_else(|| AgentdError::Tool(format!("unknown tool '{name}'")))?;
+            .ok_or_else(|| LocalModelError::Tool(format!("unknown tool '{name}'")))?;
         let client = self.clients.get(&definition.server).ok_or_else(|| {
-            AgentdError::Mcp(format!(
+            LocalModelError::Mcp(format!(
                 "tool {name} routes to missing MCP server '{}'",
                 definition.server
             ))
@@ -60,15 +60,15 @@ impl McpRouter {
 /// production implementation.
 pub trait ToolGateway {
     /// Call `name` on the MCP server registered as `server` with `arguments`.
-    fn call_server(&self, server: &str, name: &str, arguments: Value) -> AgentdResult<Value>;
+    fn call_server(&self, server: &str, name: &str, arguments: Value) -> LocalModelResult<Value>;
 }
 
 impl ToolGateway for McpRouter {
-    fn call_server(&self, server: &str, name: &str, arguments: Value) -> AgentdResult<Value> {
+    fn call_server(&self, server: &str, name: &str, arguments: Value) -> LocalModelResult<Value> {
         let client = self
             .clients
             .get(server)
-            .ok_or_else(|| AgentdError::Mcp(format!("no MCP server '{server}' configured")))?;
+            .ok_or_else(|| LocalModelError::Mcp(format!("no MCP server '{server}' configured")))?;
         client.call_tool(name, arguments)
     }
 }
@@ -88,11 +88,11 @@ pub struct McpClient {
 }
 
 impl McpClient {
-    pub fn new(config: McpServerConfig) -> AgentdResult<Self> {
+    pub fn new(config: McpServerConfig) -> LocalModelResult<Self> {
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
-            .map_err(AgentdError::from)?;
+            .map_err(LocalModelError::from)?;
         let token = config
             .token_env
             .as_deref()
@@ -109,7 +109,7 @@ impl McpClient {
         })
     }
 
-    pub fn call_tool(&self, name: &str, mut arguments: Value) -> AgentdResult<Value> {
+    pub fn call_tool(&self, name: &str, mut arguments: Value) -> LocalModelResult<Value> {
         if self.session {
             return self.call_tool_session(name, arguments);
         }
@@ -140,7 +140,7 @@ impl McpClient {
     /// needed, POST tools/call with the `Mcp-Session-Id` header, and parse the
     /// SSE (or JSON) response into the standard MCP `result`. No tenant_slug is
     /// injected here (that is a harness-only convention).
-    fn call_tool_session(&self, name: &str, arguments: Value) -> AgentdResult<Value> {
+    fn call_tool_session(&self, name: &str, arguments: Value) -> LocalModelResult<Value> {
         let session_id = self.ensure_session()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({
@@ -169,7 +169,7 @@ impl McpClient {
     /// Establish (once) and return the MCP session id for this server: POST
     /// `initialize`, read the `mcp-session-id` response header, then POST the
     /// `notifications/initialized` acknowledgement. Cached for reuse.
-    fn ensure_session(&self) -> AgentdResult<String> {
+    fn ensure_session(&self) -> LocalModelResult<String> {
         if let Some(existing) = self.session_id.lock().unwrap().clone() {
             return Ok(existing);
         }
@@ -181,7 +181,7 @@ impl McpClient {
             "params": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": {"name": "theorem-agentd", "version": env!("CARGO_PKG_VERSION")}
+                "clientInfo": {"name": "theorem-localmodel", "version": env!("CARGO_PKG_VERSION")}
             }
         });
         let mut request = self
@@ -199,7 +199,9 @@ impl McpClient {
             .and_then(|value| value.to_str().ok())
             .map(|value| value.to_string())
             .ok_or_else(|| {
-                AgentdError::Mcp("initialize response missing mcp-session-id header".to_string())
+                LocalModelError::Mcp(
+                    "initialize response missing mcp-session-id header".to_string(),
+                )
             })?;
 
         let mut ack = self
@@ -218,9 +220,9 @@ impl McpClient {
     }
 }
 
-pub fn parse_tool_response(value: &Value) -> AgentdResult<Value> {
+pub fn parse_tool_response(value: &Value) -> LocalModelResult<Value> {
     if let Some(error) = value.get("error") {
-        return Err(AgentdError::Mcp(format!("jsonrpc error: {error}")));
+        return Err(LocalModelError::Mcp(format!("jsonrpc error: {error}")));
     }
     let text = value
         .get("result")
@@ -228,7 +230,9 @@ pub fn parse_tool_response(value: &Value) -> AgentdResult<Value> {
         .and_then(|content| content.get(0))
         .and_then(|entry| entry.get("text"))
         .and_then(Value::as_str)
-        .ok_or_else(|| AgentdError::Mcp("response missing result.content[0].text".to_string()))?;
+        .ok_or_else(|| {
+            LocalModelError::Mcp("response missing result.content[0].text".to_string())
+        })?;
     // Some harness tool outputs embed raw control characters (e.g. unescaped
     // newlines inside record bodies), which strict JSON rejects. Fall back to
     // handing back the raw text so the turn stays usable instead of erroring.
@@ -237,7 +241,7 @@ pub fn parse_tool_response(value: &Value) -> AgentdResult<Value> {
         Err(_) => return Ok(json!({ "text": text })),
     };
     if let Some(error) = payload.get("error") {
-        return Err(AgentdError::Mcp(format!("tool error: {error}")));
+        return Err(LocalModelError::Mcp(format!("tool error: {error}")));
     }
     // Harness tools may wrap the backend value in {result: ...} or return it
     // directly (e.g. coordinate returns a receipt with no `result` key). Unwrap
@@ -247,7 +251,7 @@ pub fn parse_tool_response(value: &Value) -> AgentdResult<Value> {
 
 /// Read an MCP HTTP response body as the JSON-RPC envelope, handling both
 /// `application/json` and `text/event-stream` (SSE) content types.
-pub fn read_mcp_response(response: reqwest::blocking::Response) -> AgentdResult<Value> {
+pub fn read_mcp_response(response: reqwest::blocking::Response) -> LocalModelResult<Value> {
     let is_sse = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -258,14 +262,14 @@ pub fn read_mcp_response(response: reqwest::blocking::Response) -> AgentdResult<
     if is_sse {
         parse_sse_envelope(&body)
     } else {
-        serde_json::from_str(&body).map_err(AgentdError::from)
+        serde_json::from_str(&body).map_err(LocalModelError::from)
     }
 }
 
 /// Extract the JSON-RPC envelope from an SSE stream. Servers emit one
 /// `data: <json>` payload per event; prefer the event carrying `result` or
 /// `error` (the response) over interim notifications.
-pub fn parse_sse_envelope(body: &str) -> AgentdResult<Value> {
+pub fn parse_sse_envelope(body: &str) -> LocalModelResult<Value> {
     let mut chosen: Option<Value> = None;
     for line in body.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
@@ -282,19 +286,19 @@ pub fn parse_sse_envelope(body: &str) -> AgentdResult<Value> {
             }
         }
     }
-    chosen.ok_or_else(|| AgentdError::Mcp("SSE response carried no JSON data line".to_string()))
+    chosen.ok_or_else(|| LocalModelError::Mcp("SSE response carried no JSON data line".to_string()))
 }
 
 /// Interpret a standard MCP JSON-RPC envelope: surface JSON-RPC errors and
 /// tool-level `isError` results, otherwise return the `result` object.
-pub fn mcp_result(envelope: &Value) -> AgentdResult<Value> {
+pub fn mcp_result(envelope: &Value) -> LocalModelResult<Value> {
     if let Some(error) = envelope.get("error") {
-        return Err(AgentdError::Mcp(format!("jsonrpc error: {error}")));
+        return Err(LocalModelError::Mcp(format!("jsonrpc error: {error}")));
     }
     let result = envelope
         .get("result")
         .cloned()
-        .ok_or_else(|| AgentdError::Mcp("response missing result envelope".to_string()))?;
+        .ok_or_else(|| LocalModelError::Mcp("response missing result envelope".to_string()))?;
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
         let text = result
             .get("content")
@@ -302,7 +306,7 @@ pub fn mcp_result(envelope: &Value) -> AgentdResult<Value> {
             .and_then(|entry| entry.get("text"))
             .and_then(Value::as_str)
             .unwrap_or("tool reported isError");
-        return Err(AgentdError::Mcp(format!("tool error: {text}")));
+        return Err(LocalModelError::Mcp(format!("tool error: {text}")));
     }
     Ok(result)
 }
@@ -347,7 +351,7 @@ mod tests {
     }
 
     // Live network proof of the MCP streamable-HTTP session transport against the
-    // real TickTick MCP. Run with: `cargo test -p theorem-agentd -- --ignored`.
+    // real TickTick MCP. Run with: `cargo test -p theorem-localmodel -- --ignored`.
     #[test]
     #[ignore = "live network: hits the real TickTick MCP at ticktick-mcp-production"]
     fn live_ticktick_session_round_trip() {

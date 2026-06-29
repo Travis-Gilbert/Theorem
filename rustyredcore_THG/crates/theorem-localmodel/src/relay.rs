@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use crate::capture::{ticktick_json, HARNESS, TICKTICK};
 use crate::mcp::ToolGateway;
 use crate::model::ModelClient;
-use crate::AgentdResult;
+use crate::LocalModelResult;
 
 /// Prefix of a relay marker receipt. A receipt whose text starts with this is the
 /// daemon's own dedup bookkeeping, not a run signal, and is skipped by detection.
@@ -89,7 +89,7 @@ pub fn run_relays(
     gateway: &dyn ToolGateway,
     model: &ModelClient,
     actor: &str,
-) -> AgentdResult<RelayReport> {
+) -> LocalModelResult<RelayReport> {
     let listed = gateway.call_server(HARNESS, "job_list", json!({}))?;
     let jobs = parse_jobs(&listed);
     let mut report = RelayReport::default();
@@ -122,7 +122,7 @@ fn relay_one_job(
     task_id: &str,
     project_id: &str,
     report: &mut RelayReport,
-) -> AgentdResult<()> {
+) -> LocalModelResult<()> {
     let agenda = relay_agenda(job);
     if agenda.is_empty() {
         return Ok(());
@@ -356,7 +356,7 @@ fn mark_relayed(
     actor: &str,
     job_id: &str,
     milestone: &Milestone,
-) -> AgentdResult<()> {
+) -> LocalModelResult<()> {
     gateway.call_server(
         HARNESS,
         "job_note",
@@ -514,7 +514,12 @@ mod tests {
     }
 
     impl ToolGateway for FakeGateway {
-        fn call_server(&self, server: &str, name: &str, arguments: Value) -> AgentdResult<Value> {
+        fn call_server(
+            &self,
+            server: &str,
+            name: &str,
+            arguments: Value,
+        ) -> LocalModelResult<Value> {
             self.calls
                 .borrow_mut()
                 .push((server.to_string(), name.to_string(), arguments));
@@ -562,10 +567,10 @@ mod tests {
         };
         let model = ModelClient::Rule(RuleModelClient {
             default_room_id: "r".to_string(),
-            actor: "theorem-agentd".to_string(),
+            actor: "theorem-localmodel".to_string(),
         });
 
-        let report = run_relays(&gateway, &model, "theorem-agentd").unwrap();
+        let report = run_relays(&gateway, &model, "theorem-localmodel").unwrap();
 
         // CHK012: exactly started, pr_opened, merged relayed; CHK013: completed.
         let kinds: Vec<&str> = report.relayed.iter().map(|(_, k)| k.as_str()).collect();
@@ -614,10 +619,10 @@ mod tests {
         };
         let model = ModelClient::Rule(RuleModelClient {
             default_room_id: "r".to_string(),
-            actor: "theorem-agentd".to_string(),
+            actor: "theorem-localmodel".to_string(),
         });
 
-        let report = run_relays(&gateway, &model, "theorem-agentd").unwrap();
+        let report = run_relays(&gateway, &model, "theorem-localmodel").unwrap();
         assert!(report.completed.is_empty());
         assert!(gateway.calls_to("ticktick_update_task").is_empty());
         assert!(gateway.calls_to("ticktick_complete_task").is_empty());

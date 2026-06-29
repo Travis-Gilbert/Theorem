@@ -263,7 +263,10 @@ mod tests {
     #[test]
     fn ranks_relevant_above_irrelevant_and_drops_zero() {
         let source = VecMemorySource::new(vec![
-            ("planner", "the planner lives in planner.rs and does boolean pushdown"),
+            (
+                "planner",
+                "the planner lives in planner.rs and does boolean pushdown",
+            ),
             ("cats", "cats are nice"),
         ]);
         let hits = source.retrieve("tell me about the planner pushdown", 5);
@@ -289,7 +292,11 @@ mod tests {
             }
         });
         let hits = parse_candidates(&value, 5);
-        assert_eq!(hits.len(), 1, "empty-text and text-less candidates are skipped");
+        assert_eq!(
+            hits.len(),
+            1,
+            "empty-text and text-less candidates are skipped"
+        );
         assert_eq!(hits[0].title, "mem:1");
         assert!(hits[0].body.contains("pushdown"));
         assert_eq!(hits[0].score, 0.9);

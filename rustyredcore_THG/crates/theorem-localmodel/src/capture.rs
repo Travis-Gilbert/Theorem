@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::config::CaptureConfig;
 use crate::mcp::ToolGateway;
-use crate::{AgentdError, AgentdResult};
+use crate::{LocalModelError, LocalModelResult};
 
 /// MCP server name for the harness (jobs, memory, coordination).
 pub const HARNESS: &str = "harness";
@@ -24,7 +24,7 @@ pub const TICKTICK: &str = "ticktick";
 
 /// Marker stamped into a captured task's content so re-sweeps are idempotent and
 /// the operator can see, on the phone, which job a task became.
-pub const STAMP_PREFIX: &str = "[agentd] dispatched as ";
+pub const STAMP_PREFIX: &str = "[localmodel] dispatched as ";
 
 /// One task converted to a job in a sweep.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -63,7 +63,7 @@ pub fn run_capture(
     gateway: &dyn ToolGateway,
     config: &CaptureConfig,
     submitted_by: &str,
-) -> AgentdResult<CaptureReport> {
+) -> LocalModelResult<CaptureReport> {
     let project_id = resolve_agent_queue_id(gateway, config)?;
     let project = gateway.call_server(
         TICKTICK,
@@ -137,7 +137,7 @@ pub fn run_capture(
 fn resolve_agent_queue_id(
     gateway: &dyn ToolGateway,
     config: &CaptureConfig,
-) -> AgentdResult<String> {
+) -> LocalModelResult<String> {
     if let Some(id) = config
         .agent_queue_project_id
         .as_deref()
@@ -150,7 +150,7 @@ fn resolve_agent_queue_id(
         .as_deref()
         .filter(|name| !name.trim().is_empty())
     else {
-        return Err(AgentdError::Config(
+        return Err(LocalModelError::Config(
             "capture.agent_queue_project_id or capture.agent_queue_project_name is required"
                 .to_string(),
         ));
@@ -171,7 +171,7 @@ fn resolve_agent_queue_id(
         .find(|project| project.get("name").and_then(Value::as_str) == Some(name))
         .and_then(|project| project.get("id").and_then(Value::as_str))
         .map(str::to_string)
-        .ok_or_else(|| AgentdError::Config(format!("no TickTick list named '{name}'")))
+        .ok_or_else(|| LocalModelError::Config(format!("no TickTick list named '{name}'")))
 }
 
 /// Build the `job_submit` arguments for one task (CHK005).
@@ -214,7 +214,7 @@ fn stamp_and_dispatch(
     project_id: &str,
     job_id: &str,
     config: &CaptureConfig,
-) -> AgentdResult<()> {
+) -> LocalModelResult<()> {
     let content = task.get("content").and_then(Value::as_str).unwrap_or("");
     let stamped_content = stamped(content, job_id);
     let subtasks = dispatched_subtasks(task, &config.dispatched_subtask_title);
@@ -365,7 +365,12 @@ mod tests {
     }
 
     impl ToolGateway for FakeGateway {
-        fn call_server(&self, server: &str, name: &str, arguments: Value) -> AgentdResult<Value> {
+        fn call_server(
+            &self,
+            server: &str,
+            name: &str,
+            arguments: Value,
+        ) -> LocalModelResult<Value> {
             self.calls
                 .borrow_mut()
                 .push((server.to_string(), name.to_string(), arguments));
@@ -418,7 +423,7 @@ mod tests {
     #[test]
     fn stamp_is_idempotent() {
         let once = stamped("body", "job-1");
-        assert!(once.contains("[agentd] dispatched as job-1"));
+        assert!(once.contains("[localmodel] dispatched as job-1"));
         // Re-stamping content that already carries a stamp is a no-op.
         assert_eq!(stamped(&once, "job-2"), once);
     }
@@ -465,7 +470,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_capture(&gateway, &config, "theorem-agentd").unwrap();
+        let report = run_capture(&gateway, &config, "theorem-localmodel").unwrap();
         assert_eq!(report.captured.len(), 1);
         let captured = &report.captured[0];
         assert_eq!(captured.task_id, "task-1");
@@ -483,7 +488,7 @@ mod tests {
         // CHK006: the task is stamped, its dispatched subtask checked, and moved.
         let update = &gateway.calls_to("ticktick_update_task")[0];
         let content = update["params"]["content"].as_str().unwrap();
-        assert!(content.contains("[agentd] dispatched as job-abc"));
+        assert!(content.contains("[localmodel] dispatched as job-abc"));
         let subtasks = update["params"]["subtasks"].as_array().unwrap();
         assert_eq!(subtasks[0]["title"], "dispatched");
         assert_eq!(subtasks[0]["status"], 1);
@@ -501,7 +506,7 @@ mod tests {
                 "id": "task-1",
                 "projectId": "list-aq",
                 "title": "x",
-                "content": "body\n\n[agentd] dispatched as job-old",
+                "content": "body\n\n[localmodel] dispatched as job-old",
                 "priority": 0,
                 "items": []
             }]
@@ -517,7 +522,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_capture(&gateway, &config, "theorem-agentd").unwrap();
+        let report = run_capture(&gateway, &config, "theorem-localmodel").unwrap();
         assert_eq!(report.captured.len(), 0);
         assert_eq!(report.skipped, 1);
         assert!(gateway.calls_to("job_submit").is_empty());
@@ -543,7 +548,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_capture(&gateway, &config, "theorem-agentd").unwrap();
+        let report = run_capture(&gateway, &config, "theorem-localmodel").unwrap();
         assert_eq!(report.project_id, "list-aq");
         // get_project was called with the resolved id.
         let got = &gateway.calls_to("ticktick_get_project")[0];

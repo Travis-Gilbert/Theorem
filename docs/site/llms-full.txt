@@ -26,13 +26,13 @@ theorem init
 theorem once "hello from Theorem"
 ```
 
-`theorem init` writes a no-secret starter `theorem-agentd.toml`. It uses:
+`theorem init` writes a no-secret starter `theorem-localmodel.toml`. It uses:
 
 - deterministic `rule` model provider
 - local MCP URL `http://127.0.0.1:8380/mcp`
 - tenant slug `Travis-Gilbert`
 - receiver, capture, and relay disabled
-- ledger `.theorem/agentd-token-ledger.jsonl`
+- ledger `.theorem/localmodel-token-ledger.jsonl`
 
 Do not put secrets in TOML, docs, AGENTS.md, or committed files. Hosted sync is
 opt-in. If a live model is needed, set `[model].provider = "openai-compatible"`
@@ -47,7 +47,7 @@ front door. The CLI is for developers and agents; the desktop is for people.
 ## Common build and test oracles
 
 ```bash
-cd rustyredcore_THG && cargo test -p theorem-agentd
+cd rustyredcore_THG && cargo test -p theorem-localmodel
 cd rustyredcore_THG && cargo test -p theorem-harness-core
 cd rustyredcore_THG && cargo test -p theorem-harness-runtime
 cd apps/theorem-harness-node && npm run build:debug && npm run smoke
@@ -67,7 +67,7 @@ code inspection alone.
 
 ## Repository map
 
-- `rustyredcore_THG/crates/theorem-agentd/`: local assistant daemon and MCP tool
+- `rustyredcore_THG/crates/theorem-localmodel/`: local assistant daemon and MCP tool
   host; the `theorem` wrapper starts this.
 - `rustyredcore_THG/crates/theorem-receiver/`: dispatch receiver that launches
   Claude or Codex sessions from jobs.

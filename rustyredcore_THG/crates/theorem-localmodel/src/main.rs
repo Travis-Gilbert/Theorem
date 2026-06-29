@@ -1,28 +1,42 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use theorem_agentd::config::AgentdConfig;
-use theorem_agentd::mcp::McpRouter;
-use theorem_agentd::model::ModelClient;
-use theorem_agentd::receiver_sidecar::spawn_receiver_sidecar;
-use theorem_agentd::tools::ToolCatalog;
-use theorem_agentd::turn_loop::{run_once, run_tick};
-use theorem_agentd::{AgentdError, AgentdResult};
+use theorem_localmodel::config::LocalModelConfig;
+use theorem_localmodel::mcp::McpRouter;
+use theorem_localmodel::model::ModelClient;
+use theorem_localmodel::receiver_sidecar::spawn_receiver_sidecar;
+use theorem_localmodel::tools::ToolCatalog;
+use theorem_localmodel::turn_loop::{run_once, run_tick};
+use theorem_localmodel::{LocalModelError, LocalModelResult};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("[theorem-agentd] fatal: {error}");
+        eprintln!("[theorem-localmodel] fatal: {error}");
         std::process::exit(1);
     }
 }
 
-fn run() -> AgentdResult<()> {
+fn run() -> LocalModelResult<()> {
     let args = Args::parse(std::env::args().skip(1).collect())?;
     let config = if args.config_path_explicit {
-        AgentdConfig::load(&args.config_path)?
+        LocalModelConfig::load(&args.config_path)?
     } else {
-        AgentdConfig::load_or_default(&args.config_path)?
+        LocalModelConfig::load_or_default(&args.config_path)?
     };
+    match args.command {
+        Command::ServeLocalModel => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            return runtime.block_on(theorem_localmodel::local_host::serve(config.local_model));
+        }
+        Command::DoctorLocalModel => {
+            let report = theorem_localmodel::local_host::doctor_report(&config.local_model);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        Command::Loop => {}
+    }
     let catalog = ToolCatalog::default_catalog();
     if args.print_tool_grammar {
         println!("{}", catalog.gbnf_grammar());
@@ -41,7 +55,8 @@ fn run() -> AgentdResult<()> {
 
     // One mechanical Agent Queue capture sweep, then exit. No model required.
     if args.capture_once {
-        let report = theorem_agentd::capture::run_capture(&router, &config.capture, &config.actor)?;
+        let report =
+            theorem_localmodel::capture::run_capture(&router, &config.capture, &config.actor)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -71,6 +86,7 @@ fn run() -> AgentdResult<()> {
 }
 
 struct Args {
+    command: Command,
     config_path: PathBuf,
     config_path_explicit: bool,
     once: Option<String>,
@@ -79,9 +95,17 @@ struct Args {
     capture_once: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    Loop,
+    ServeLocalModel,
+    DoctorLocalModel,
+}
+
 impl Args {
-    fn parse(args: Vec<String>) -> AgentdResult<Self> {
-        let mut config_path = PathBuf::from("theorem-agentd.toml");
+    fn parse(args: Vec<String>) -> LocalModelResult<Self> {
+        let mut command = Command::Loop;
+        let mut config_path = PathBuf::from("theorem-localmodel.toml");
         let mut config_path_explicit = false;
         let mut once = None;
         let mut no_receiver = false;
@@ -90,10 +114,18 @@ impl Args {
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
+                "serve" => {
+                    command = Command::ServeLocalModel;
+                }
+                "doctor" => {
+                    command = Command::DoctorLocalModel;
+                }
                 "--once" => {
                     i += 1;
                     let Some(prompt) = args.get(i) else {
-                        return Err(AgentdError::Config("--once requires a prompt".to_string()));
+                        return Err(LocalModelError::Config(
+                            "--once requires a prompt".to_string(),
+                        ));
                     };
                     once = Some(prompt.clone());
                 }
@@ -111,7 +143,7 @@ impl Args {
                     std::process::exit(0);
                 }
                 value if value.starts_with('-') => {
-                    return Err(AgentdError::Config(format!("unknown flag {value}")));
+                    return Err(LocalModelError::Config(format!("unknown flag {value}")));
                 }
                 value => {
                     config_path = PathBuf::from(value);
@@ -121,6 +153,7 @@ impl Args {
             i += 1;
         }
         Ok(Self {
+            command,
             config_path,
             config_path_explicit,
             once,
@@ -133,7 +166,7 @@ impl Args {
 
 fn print_help() {
     println!(
-        "usage: theorem-agentd [--once <prompt>] [--capture-once] [--no-receiver] [--print-tool-grammar] [config.toml]\n\nIf the implicit theorem-agentd.toml is absent, theorem-agentd starts with no-config local defaults. Explicit config paths must exist."
+        "usage: theorem-localmodel [serve|doctor] [--once <prompt>] [--capture-once] [--no-receiver] [--print-tool-grammar] [config.toml]\n\nCommands:\n  serve   Start the local mistral.rs model host at [local_model].host/port.\n  doctor  Print local mistral.rs/Theorem host diagnostics without loading a model.\n\nIf the implicit theorem-localmodel.toml is absent, theorem-localmodel starts with no-config local defaults. Explicit config paths must exist."
     );
 }
 
@@ -146,11 +179,12 @@ mod tests {
         let args = Args::parse(vec![
             "--once".to_string(),
             "hello".to_string(),
-            "agentd.toml".to_string(),
+            "localmodel.toml".to_string(),
         ])
         .unwrap();
+        assert_eq!(args.command, Command::Loop);
         assert_eq!(args.once, Some("hello".to_string()));
-        assert_eq!(args.config_path, PathBuf::from("agentd.toml"));
+        assert_eq!(args.config_path, PathBuf::from("localmodel.toml"));
         assert!(args.config_path_explicit);
     }
 
@@ -159,5 +193,16 @@ mod tests {
         let args = Args::parse(vec!["--no-receiver".to_string()]).unwrap();
         assert!(args.no_receiver);
         assert!(!args.config_path_explicit);
+    }
+
+    #[test]
+    fn parses_local_model_commands() {
+        let serve = Args::parse(vec!["serve".to_string(), "localmodel.toml".to_string()]).unwrap();
+        assert_eq!(serve.command, Command::ServeLocalModel);
+        assert_eq!(serve.config_path, PathBuf::from("localmodel.toml"));
+
+        let doctor = Args::parse(vec!["doctor".to_string()]).unwrap();
+        assert_eq!(doctor.command, Command::DoctorLocalModel);
+        assert!(!doctor.config_path_explicit);
     }
 }

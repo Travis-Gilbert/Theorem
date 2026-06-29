@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::config::{ModelConfig, ModelProvider};
 use crate::tools::ToolCatalog;
-use crate::{AgentdError, AgentdResult};
+use crate::{LocalModelError, LocalModelResult};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -107,7 +107,7 @@ impl ModelClient {
         config: ModelConfig,
         default_room_id: String,
         actor: String,
-    ) -> AgentdResult<Self> {
+    ) -> LocalModelResult<Self> {
         match config.provider {
             ModelProvider::OpenAiCompatible => Ok(Self::OpenAi(OpenAiModelClient::new(config)?)),
             ModelProvider::Rule => Ok(Self::Rule(RuleModelClient {
@@ -122,7 +122,7 @@ impl ModelClient {
         messages: &[ChatMessage],
         catalog: &ToolCatalog,
         grammar: &str,
-    ) -> AgentdResult<ModelOutput> {
+    ) -> LocalModelResult<ModelOutput> {
         match self {
             Self::OpenAi(client) => client.decide(messages, catalog, grammar),
             Self::Rule(client) => client.decide(messages),
@@ -166,11 +166,11 @@ pub struct OpenAiModelClient {
 }
 
 impl OpenAiModelClient {
-    pub fn new(config: ModelConfig) -> AgentdResult<Self> {
+    pub fn new(config: ModelConfig) -> LocalModelResult<Self> {
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
-            .map_err(AgentdError::from)?;
+            .map_err(LocalModelError::from)?;
         let api_key = config
             .api_key_env
             .as_deref()
@@ -188,7 +188,7 @@ impl OpenAiModelClient {
         messages: &[ChatMessage],
         catalog: &ToolCatalog,
         _grammar: &str,
-    ) -> AgentdResult<ModelOutput> {
+    ) -> LocalModelResult<ModelOutput> {
         let url = chat_completions_url(&self.config.base_url);
         let request_messages = request_messages(messages);
         // Tool-calling models (Gemma via llama-server) return structured
@@ -214,7 +214,7 @@ impl OpenAiModelClient {
     }
 
     /// A no-tools completion that returns the model's text for a milestone line.
-    fn compose_line(&self, instruction: &str) -> AgentdResult<String> {
+    fn compose_line(&self, instruction: &str) -> LocalModelResult<String> {
         let url = chat_completions_url(&self.config.base_url);
         let body = json!({
             "model": self.config.model,
@@ -235,7 +235,7 @@ impl OpenAiModelClient {
         let response = request.send()?.error_for_status()?;
         let value: Value = response.json()?;
         if let Some(error) = value.get("error") {
-            return Err(AgentdError::Model(format!("model error: {error}")));
+            return Err(LocalModelError::Model(format!("model error: {error}")));
         }
         let content = value
             .get("choices")
@@ -256,7 +256,7 @@ pub struct RuleModelClient {
 }
 
 impl RuleModelClient {
-    pub fn decide(&self, messages: &[ChatMessage]) -> AgentdResult<ModelOutput> {
+    pub fn decide(&self, messages: &[ChatMessage]) -> LocalModelResult<ModelOutput> {
         if messages
             .iter()
             .any(|message| message.role == MessageRole::Tool)
@@ -289,7 +289,7 @@ impl RuleModelClient {
                     "message": "@codex Please inspect and fix the failing test on Theorem. Use the room context and leave verification receipts.",
                     "metadata": {
                         "repo": "Theorem",
-                        "source": "theorem-agentd"
+                        "source": "theorem-localmodel"
                     },
                     "urgency": "ask",
                     "wake": true
@@ -319,9 +319,9 @@ fn model_output(decision: ModelDecision) -> ModelOutput {
     }
 }
 
-pub fn parse_chat_completion(value: &Value) -> AgentdResult<ModelOutput> {
+pub fn parse_chat_completion(value: &Value) -> LocalModelResult<ModelOutput> {
     if let Some(error) = value.get("error") {
-        return Err(AgentdError::Model(format!("model error: {error}")));
+        return Err(LocalModelError::Model(format!("model error: {error}")));
     }
     let message = value
         .get("choices")
@@ -329,7 +329,7 @@ pub fn parse_chat_completion(value: &Value) -> AgentdResult<ModelOutput> {
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
         .ok_or_else(|| {
-            AgentdError::Model("chat completion missing choices[0].message".to_string())
+            LocalModelError::Model("chat completion missing choices[0].message".to_string())
         })?;
 
     // Prefer structured tool calls: llama-server parses Gemma's native tool-call
@@ -341,11 +341,11 @@ pub fn parse_chat_completion(value: &Value) -> AgentdResult<ModelOutput> {
     {
         let function = call
             .get("function")
-            .ok_or_else(|| AgentdError::Model("tool_call missing function".to_string()))?;
+            .ok_or_else(|| LocalModelError::Model("tool_call missing function".to_string()))?;
         let name = function
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| AgentdError::Model("tool_call missing function.name".to_string()))?;
+            .ok_or_else(|| LocalModelError::Model("tool_call missing function.name".to_string()))?;
         let arguments = match function.get("arguments") {
             Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or_else(|_| json!({})),
             Some(other) => other.clone(),
@@ -371,7 +371,7 @@ pub fn parse_chat_completion(value: &Value) -> AgentdResult<ModelOutput> {
     })
 }
 
-pub fn parse_model_content(content: &str) -> AgentdResult<ModelDecision> {
+pub fn parse_model_content(content: &str) -> LocalModelResult<ModelDecision> {
     let trimmed = content.trim();
     if trimmed.starts_with('{') {
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
@@ -383,11 +383,11 @@ pub fn parse_model_content(content: &str) -> AgentdResult<ModelDecision> {
             let name = value
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| AgentdError::Model("tool_call missing name".to_string()))?;
+                .ok_or_else(|| LocalModelError::Model("tool_call missing name".to_string()))?;
             let arguments = value
                 .get("arguments")
                 .cloned()
-                .ok_or_else(|| AgentdError::Model("tool_call missing arguments".to_string()))?;
+                .ok_or_else(|| LocalModelError::Model("tool_call missing arguments".to_string()))?;
             return Ok(ModelDecision::ToolCall {
                 name: name.to_string(),
                 arguments,
@@ -611,17 +611,17 @@ mod tests {
     #[test]
     #[ignore = "live smoke: requires llama-server started with --mmproj"]
     fn live_image_turn_against_llama_server() {
-        let Ok(base_url) = std::env::var("THEOREM_AGENTD_LIVE_MODEL_BASE_URL") else {
-            eprintln!("set THEOREM_AGENTD_LIVE_MODEL_BASE_URL to run the live image smoke");
+        let Ok(base_url) = std::env::var("THEOREM_LOCALMODEL_LIVE_MODEL_BASE_URL") else {
+            eprintln!("set THEOREM_LOCALMODEL_LIVE_MODEL_BASE_URL to run the live image smoke");
             return;
         };
-        let model = std::env::var("THEOREM_AGENTD_LIVE_MODEL_NAME")
+        let model = std::env::var("THEOREM_LOCALMODEL_LIVE_MODEL_NAME")
             .unwrap_or_else(|_| "gemma-4-12b-it-q4".to_string());
         let config = ModelConfig {
             provider: ModelProvider::OpenAiCompatible,
             base_url,
             model,
-            api_key_env: std::env::var("THEOREM_AGENTD_LIVE_MODEL_API_KEY_ENV").ok(),
+            api_key_env: std::env::var("THEOREM_LOCALMODEL_LIVE_MODEL_API_KEY_ENV").ok(),
             temperature: 0.0,
             max_tokens: 120,
             request_timeout_secs: 120,

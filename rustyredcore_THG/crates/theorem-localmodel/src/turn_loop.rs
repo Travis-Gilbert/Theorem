@@ -2,13 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::capture::{self, CaptureReport};
-use crate::config::AgentdConfig;
+use crate::config::LocalModelConfig;
 use crate::ledger::{append_ledger_entry, now_unix_ms, LedgerEntry};
 use crate::mcp::McpRouter;
 use crate::model::{ChatMessage, ModelClient, ModelDecision};
 use crate::relay::{self, RelayReport};
 use crate::tools::ToolCatalog;
-use crate::{AgentdError, AgentdResult};
+use crate::{LocalModelError, LocalModelResult};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -56,12 +56,12 @@ impl Transcript {
 }
 
 pub fn run_once(
-    config: &AgentdConfig,
+    config: &LocalModelConfig,
     model: &ModelClient,
     router: &McpRouter,
     catalog: &ToolCatalog,
     prompt: &str,
-) -> AgentdResult<Transcript> {
+) -> LocalModelResult<Transcript> {
     let mut transcript = Transcript::new(prompt);
 
     // Harness gossip scaffolding: heartbeat presence + open a live intent for
@@ -73,7 +73,7 @@ pub fn run_once(
             "actor": config.actor,
             "mode": "heartbeat",
             "status": "working",
-            "surface": "theorem-agentd",
+            "surface": "theorem-localmodel",
             "ttl_seconds": 120
         }),
     );
@@ -84,7 +84,7 @@ pub fn run_once(
             "room_id": config.default_room_id,
             "status": "working",
             "summary": format!(
-                "theorem-agentd turn: {}",
+                "theorem-localmodel turn: {}",
                 prompt.chars().take(160).collect::<String>()
             )
         }),
@@ -143,7 +143,7 @@ pub fn run_once(
                         "room_id": config.default_room_id,
                         "status": "done",
                         "summary": format!(
-                            "theorem-agentd: {}",
+                            "theorem-localmodel: {}",
                             text.chars().take(160).collect::<String>()
                         )
                     }),
@@ -206,10 +206,10 @@ pub fn run_once(
             "actor": config.actor,
             "room_id": config.default_room_id,
             "status": "paused",
-            "summary": "theorem-agentd: max_iterations reached without final reply"
+            "summary": "theorem-localmodel: max_iterations reached without final reply"
         }),
     );
-    Err(AgentdError::Model(format!(
+    Err(LocalModelError::Model(format!(
         "max_iterations {} reached without final reply",
         config.loop_config.max_iterations
     )))
@@ -228,7 +228,7 @@ pub struct TickReport {
 /// TickTick or harness hiccup logs and is skipped rather than stalling the loop;
 /// each is gated by its own config switch.
 pub fn run_tick(
-    config: &AgentdConfig,
+    config: &LocalModelConfig,
     model: &ModelClient,
     router: &McpRouter,
     catalog: &ToolCatalog,
@@ -241,13 +241,13 @@ pub fn run_tick(
             Ok(captured) => {
                 if !captured.captured.is_empty() {
                     eprintln!(
-                        "[theorem-agentd] captured {} Agent Queue task(s) into jobs",
+                        "[theorem-localmodel] captured {} Agent Queue task(s) into jobs",
                         captured.captured.len()
                     );
                 }
                 report.capture = Some(captured);
             }
-            Err(error) => eprintln!("[theorem-agentd] capture error: {error}"),
+            Err(error) => eprintln!("[theorem-localmodel] capture error: {error}"),
         }
     }
 
@@ -256,19 +256,19 @@ pub fn run_tick(
             Ok(relayed) => {
                 if !relayed.relayed.is_empty() {
                     eprintln!(
-                        "[theorem-agentd] relayed {} milestone(s) to TickTick",
+                        "[theorem-localmodel] relayed {} milestone(s) to TickTick",
                         relayed.relayed.len()
                     );
                 }
                 report.relay = Some(relayed);
             }
-            Err(error) => eprintln!("[theorem-agentd] relay error: {error}"),
+            Err(error) => eprintln!("[theorem-localmodel] relay error: {error}"),
         }
     }
 
     match run_once(config, model, router, catalog, prompt) {
         Ok(transcript) => report.transcript = Some(transcript),
-        Err(error) => eprintln!("[theorem-agentd] tick turn error: {error}"),
+        Err(error) => eprintln!("[theorem-localmodel] tick turn error: {error}"),
     }
     report
 }
@@ -308,25 +308,25 @@ fn route_personal_memory_tenant(name: &str, arguments: &mut Value, tenant: &str)
 /// truth; this accumulates a retrievable corpus beside the Claude Code and Codex
 /// traces, namespaced by its own `kind` so it never pollutes belief recall.
 /// Failures are swallowed so the loop never breaks on a mirror.
-fn mirror_ledger_to_graph(config: &AgentdConfig, router: &McpRouter, entry: &LedgerEntry) {
+fn mirror_ledger_to_graph(config: &LocalModelConfig, router: &McpRouter, entry: &LedgerEntry) {
     if !config.ledger.mirror_to_graph {
         return;
     }
     let content = serde_json::to_string(entry).unwrap_or_default();
     let summary = match &entry.tool_name {
-        Some(tool) => format!("agentd turn {} called {tool}", entry.turn_id),
-        None => format!("agentd turn {} final reply", entry.turn_id),
+        Some(tool) => format!("localmodel turn {} called {tool}", entry.turn_id),
+        None => format!("localmodel turn {} final reply", entry.turn_id),
     };
     let _ = router.best_effort_call(
         "self_note",
         json!({
             "actor": config.actor,
-            "kind": "agentd_ledger",
+            "kind": "localmodel_ledger",
             "memory_node_type": "trace",
             "title": entry.turn_id,
             "summary": summary,
             "content": content,
-            "tags": ["agentd", "ledger", "label-factory"],
+            "tags": ["localmodel", "ledger", "label-factory"],
         }),
     );
 }
@@ -373,7 +373,7 @@ mod tests {
         let catalog = ToolCatalog::default_catalog();
         let model = RuleModelClient {
             default_room_id: "repo:theorem:branch:main".to_string(),
-            actor: "theorem-agentd".to_string(),
+            actor: "theorem-localmodel".to_string(),
         };
         let output = model
             .decide(&[ChatMessage::user("have an agent fix the failing test")])

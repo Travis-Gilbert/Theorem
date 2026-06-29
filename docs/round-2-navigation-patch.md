@@ -20,7 +20,7 @@ The `CLAUDE.md` crate table documents 15 of 28 crates. Add these rows:
 | `rustyred-thg-memory` | Graph-native memory recall, consolidation, decay, and validity plugin. |
 | `rustyred-thg-resp-server` | Redis/RESP-protocol server surface over the core. |
 | `scene-os-web` | SceneOS renderer bundle (Lane B): embeds the self-contained canvas renderer and serves a `ScenePackageV2` as one HTML asset, the SERP injection pattern. Lane A is `scene-os-core`. |
-| `theorem-agentd` | Local assistant daemon plus MCP tool host: a resident local model chooses one schema-guarded tool call at a time; `theorem-receiver` stays the only component that launches Claude or Codex sessions. |
+| `theorem-localmodel` | Local assistant daemon plus MCP tool host: a resident local model chooses one schema-guarded tool call at a time; `theorem-receiver` stays the only component that launches Claude or Codex sessions. |
 | `theorem-dispatch` | Postgres hot execution queue for Dispatch v2. Owns only hot execution state: claim leases, retries, completion, dead-letter. The canonical coordination thread stays in the THG Dispatch v2 board. |
 | `theorem-harness` | The `theorem-harness` SDK v2: the idiomatic Rust surface over `theorem-harness-core` and `theorem-harness-runtime`. The source of truth from which the Python, Node, Swift, and WASM bindings are generated, so they cannot drift. |
 
@@ -35,7 +35,7 @@ Also already on disk and worth a status line, not only a table row: `scene-os-co
 | App | What it is |
 |-----|------------|
 | `desktop` | Tauri plus React plus TypeScript desktop client (Vite). |
-| `theorem-agentd` | Local assistant daemon runtime: OpenAI-compatible model loop config, local GGUF models, MCP tool host, receiver sidecar. The deployment side of the `theorem-agentd` crate. |
+| `theorem-localmodel` | Local assistant daemon runtime: OpenAI-compatible model loop config, local GGUF models, MCP tool host, receiver sidecar. The deployment side of the `theorem-localmodel` crate. |
 | `theorem-harness-node` | Node.js (NAPI-RS) binding over the `theorem-harness` Rust SDK. THPS-012 slice 1. |
 | `theorem-harness-swift` | Swift (UniFFI) binding over the `theorem-harness` Rust SDK. Serves the Theorem iOS app. |
 

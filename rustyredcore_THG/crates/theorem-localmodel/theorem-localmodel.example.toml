@@ -1,12 +1,12 @@
-# theorem-agentd configuration.
+# theorem-localmodel configuration.
 #
 # This file is intentionally safe to run as-is: no bearer token, model key, or
 # local data-dir env var is required. It uses the deterministic rule provider so
-# a first `theorem-agentd --once "hello" theorem-agentd.toml` proves the loop,
+# a first `theorem-localmodel --once "hello" theorem-localmodel.toml` proves the loop,
 # ledger, and MCP routing without requiring a resident model.
 
 default_room_id = "repo:theorem:branch:main"
-actor = "theorem-agentd"
+actor = "theorem-localmodel"
 operator_memory_tenant = "Travis-Gilbert"
 
 [model]
@@ -16,19 +16,63 @@ max_tokens = 1200
 request_timeout_secs = 120
 grammar_constrained = true
 
-# To use a resident OpenAI-compatible model, switch to:
+# To use the resident mistral.rs host for model decisions, run
+# `theorem-localmodel serve theorem-localmodel.toml` and switch to:
 #
 # provider = "openai-compatible"
 # base_url = "http://127.0.0.1:8080"
-# model = "gemma-4-12b-it-q4"
-# api_key_env = "THEOREM_MODEL_API_KEY"
+# model = "gemma-4-12b-it-qat"
 #
-# For Gemma vision/image input, start llama-server with the matching multimodal
-# projector, for example:
+# Secrets stay in environment variables or the Hugging Face cache; do not put
+# real keys in this file.
+
+[local_model]
+# Resident local model host. `theorem-localmodel serve theorem-localmodel.toml`
+# builds this through the mistral.rs Rust SDK and serves its upstream router,
+# including `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`,
+# `/v1/models/status`, `/v1/models/unload`, `/v1/models/reload`,
+# `/v1/system/info`, `/v1/system/doctor`, and `/health`.
+host = "127.0.0.1"
+port = 8080
+api_model_id = "gemma-4-12b-it-qat"
+tok_model_id = "google/gemma-4-12B-it"
+quantized_model_id = "apps/theorem-agentd"
+quantized_filename = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
+quantization = "Q4_K_XL"
+token_source = "cache" # cache | none | env:HUGGING_FACE_HUB_TOKEN | path:/...
+cpu = false
+paged_attention = true
+max_seqs = 16
+max_seq_len = 4096
+max_batch_size = 1
+resident_memory_estimate_gb = 9.0
+
+# Optional speculative decoding for Gemma 4 MTP assistant checkpoints. Leave
+# unset until the assistant checkpoint is available locally or in the HF cache.
 #
-# llama-server -m gemma-4-12b-it-q4.gguf --mmproj mmproj-gemma-4-12b-it.gguf -c <ctx>
+# [local_model.drafter]
+# model = "google/gemma-4-12B-it-mtp"
+# n_predict = 4
+
+# Configured larger tiers are documented but not loaded by default. Move one of
+# these into `[[local_model.extra_models]]` to load it beside the default model
+# and expose it through `/v1/models`.
 #
-# Secrets stay in environment variables; do not put real keys in this file.
+# [[local_model.tiers]]
+# model_id = "gemma-4-26b-a4b-qat-q4_0"
+# alias = "gemma-4-26b-a4b"
+# tok_model_id = "google/gemma-4-26B-A4B-it"
+# quantized_model_id = "google/gemma-4-26B-A4B-it-qat-q4_0-gguf"
+# quantized_filename = "gemma-4-26B_q4_0-it.gguf"
+# resident_memory_estimate_gb = 18.0
+#
+# [[local_model.tiers]]
+# model_id = "gemma-4-31b-dense-qat-q4_0"
+# alias = "gemma-4-31b-dense"
+# tok_model_id = "google/gemma-4-31B-it"
+# quantized_model_id = "google/gemma-4-31B-it-qat-q4_0-gguf"
+# quantized_filename = "gemma-4-31B_q4_0-it.gguf"
+# resident_memory_estimate_gb = 24.0
 
 [harness]
 name = "harness"
@@ -58,7 +102,7 @@ tick_interval_secs = 60
 storm_guard_window_secs = 600
 
 [ledger]
-path = ".theorem/agentd-token-ledger.jsonl"
+path = ".theorem/localmodel-token-ledger.jsonl"
 # Mirror each ledger line into the graph as a self_note receipt (the label
 # factory). The JSONL ledger remains the source of truth and is never rotated.
 mirror_to_graph = true

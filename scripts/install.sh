@@ -7,9 +7,9 @@ readonly REPO_URL="${THEOREM_REPO_URL:-https://github.com/Travis-Gilbert/Theorem
 readonly SOURCE_DIR="${THEOREM_SOURCE_DIR:-$HOME/.theorem/source}"
 readonly INSTALL_DIR="${THEOREM_INSTALL_DIR:-$HOME/.local/bin}"
 readonly THEOREM_HOME_DIR="${THEOREM_HOME:-$HOME/.theorem}"
-readonly PID_FILE="$THEOREM_HOME_DIR/agentd.pid"
-readonly OUT_LOG="$THEOREM_HOME_DIR/agentd.out.log"
-readonly ERR_LOG="$THEOREM_HOME_DIR/agentd.err.log"
+readonly PID_FILE="$THEOREM_HOME_DIR/localmodel.pid"
+readonly OUT_LOG="$THEOREM_HOME_DIR/localmodel.out.log"
+readonly ERR_LOG="$THEOREM_HOME_DIR/localmodel.err.log"
 
 log() {
     printf '[theorem-install] %s\n' "$*" >&2
@@ -62,7 +62,7 @@ resolve_source_checkout() {
     printf '%s\n' "$SOURCE_DIR"
 }
 
-agentd_already_running() {
+localmodel_already_running() {
     if [[ ! -f "$PID_FILE" ]]; then
         return 1
     fi
@@ -71,27 +71,27 @@ agentd_already_running() {
     kill -0 "$pid" 2>/dev/null
 }
 
-start_agentd() {
+start_localmodel() {
     local source_checkout=$1
     if [[ "${THEOREM_INSTALL_SKIP_START:-0}" == "1" ]]; then
-        log "skipping agentd start because THEOREM_INSTALL_SKIP_START=1"
+        log "skipping localmodel start because THEOREM_INSTALL_SKIP_START=1"
         return 0
     fi
     if ! command -v cargo >/dev/null 2>&1; then
-        log "cargo not found; installed the CLI but did not start agentd"
+        log "cargo not found; installed the CLI but did not start localmodel"
         return 0
     fi
     mkdir -p "$THEOREM_HOME_DIR"
-    if agentd_already_running; then
-        log "agentd already running with pid $(cat "$PID_FILE")"
+    if localmodel_already_running; then
+        log "localmodel already running with pid $(cat "$PID_FILE")"
         return 0
     fi
 
-    log "starting theorem-agentd in the background"
+    log "starting theorem-localmodel in the background"
     THEOREM_REPO="$source_checkout" nohup "$INSTALL_DIR/theorem" start \
         >"$OUT_LOG" 2>"$ERR_LOG" </dev/null &
     printf '%s\n' "$!" >"$PID_FILE"
-    log "agentd pid $(cat "$PID_FILE")"
+    log "localmodel pid $(cat "$PID_FILE")"
     log "logs: theorem logs"
 }
 
@@ -107,7 +107,7 @@ main() {
         log "add $INSTALL_DIR to PATH to run theorem from any shell"
     fi
 
-    start_agentd "$source_checkout"
+    start_localmodel "$source_checkout"
     log "try: theorem init && theorem once \"hello from Theorem\""
 }
 

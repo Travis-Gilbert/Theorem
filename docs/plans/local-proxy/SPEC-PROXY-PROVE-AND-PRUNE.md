@@ -46,7 +46,7 @@ Acceptance: the proxy serves a random fraction with injection off and records th
 
 | # | Current state | Feature | Location | Action | Desired outcome | Test |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `MEMORY.md` dumped wholesale; `recall` is an MCP tool | Relevance-ranked top-k injection at the suffix; `recall` removed | `apps/theorem-proxy` + retrieval path | Build | Only task-relevant memory injected, cache still hits, no `recall` tool | [~] local proxy/MCP tests green; live provider cache-hit smoke remains |
+| 1 | `MEMORY.md` dumped wholesale; `recall` is an MCP tool | Relevance-ranked top-k injection at the suffix; `recall` removed | `apps/theorem-proxy` + retrieval path | Build | Only task-relevant memory injected, cache still hits, no `recall` tool | [~] local proxy/MCP tests green; provider cache smoke script added; live run needs `ANTHROPIC_API_KEY` |
 | 2 | Dozens of tools advertised, ~4 used per session | Advertise only the action set; context tools move to injection | harness MCP manifest + affordance router | Build | Never-called tools absent from context; cuts backed by the audit | [-] |
 | 3 | Coordination is poll-and-remember; remote degrades | Proxy injects a recency heads-up before an action targets a contended file | `apps/theorem-proxy` + coordination graph | Build | Head A warned of head B's recent edit pre-action, no MCP call | [-] |
 | 4 | Ambient memory never passes through validity; can misdirect | Reference-tracked staleness flagging + periodic memory-CI | `apps/theorem-proxy` + `rustyred-thg-memory` | Build | Stale memory flagged on injection; dead memory marked invalid | [-] |

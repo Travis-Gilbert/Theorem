@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use theorem_proxy::{resolve_memory, run_wrapped, serve, ProxyConfig};
+use theorem_proxy::{resolve_memory, run_wrapped, serve, ProxyConfig, UpstreamAuth};
 
 #[derive(Parser)]
 #[command(
@@ -28,6 +28,13 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "https://api.anthropic.com")]
         upstream: String,
+        /// OpenAI/Codex upstream base URL for /v1/responses.
+        #[arg(
+            long,
+            env = "THEOREM_PROXY_OPENAI_UPSTREAM",
+            default_value = "https://api.openai.com"
+        )]
+        openai_upstream: String,
         /// Live local Theorem node MCP endpoint (e.g. http://127.0.0.1:8790/mcp). When
         /// set, ambient memory is the node's relevance-ranked graph memory
         /// (`hippo_retrieve`). Takes precedence over --memory-dir.
@@ -44,6 +51,28 @@ enum Command {
         /// results are sampled (full output served at /tool_result/{id}). 0 = off.
         #[arg(long, default_value_t = 0)]
         membrane_threshold: usize,
+        /// Upstream Anthropic API key. When set, client auth is stripped and this key
+        /// is sent upstream; useful for Claude Desktop gateway mode.
+        #[arg(long, env = "THEOREM_PROXY_UPSTREAM_API_KEY", hide_env_values = true)]
+        upstream_api_key: Option<String>,
+        /// Upstream bearer/OAuth token. Mutually exclusive with --upstream-api-key.
+        #[arg(
+            long,
+            env = "THEOREM_PROXY_UPSTREAM_AUTH_TOKEN",
+            hide_env_values = true
+        )]
+        upstream_auth_token: Option<String>,
+        /// Force an Anthropic beta header upstream (optional; comma-separated value).
+        #[arg(long, env = "THEOREM_PROXY_UPSTREAM_BETA")]
+        upstream_beta: Option<String>,
+        /// Upstream OpenAI API key. When set, client auth is stripped and this key
+        /// is sent upstream as a bearer token; useful for sidecar/local-key modes.
+        #[arg(
+            long,
+            env = "THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY",
+            hide_env_values = true
+        )]
+        openai_upstream_api_key: Option<String>,
     },
     /// Start the proxy and run a command (e.g. `claude`) pointed at it -- one command,
     /// no manual ANTHROPIC_BASE_URL export. Put the command after `--`.
@@ -52,6 +81,12 @@ enum Command {
         port: u16,
         #[arg(long, default_value = "https://api.anthropic.com")]
         upstream: String,
+        #[arg(
+            long,
+            env = "THEOREM_PROXY_OPENAI_UPSTREAM",
+            default_value = "https://api.openai.com"
+        )]
+        openai_upstream: String,
         #[arg(long, env = "THEOREM_PROXY_MEMORY_URL")]
         memory_url: Option<String>,
         #[arg(long, env = "THEOREM_PROXY_TENANT")]
@@ -61,6 +96,22 @@ enum Command {
         /// D2 membrane threshold in bytes (0 = off). See `proxy --help`.
         #[arg(long, default_value_t = 0)]
         membrane_threshold: usize,
+        #[arg(long, env = "THEOREM_PROXY_UPSTREAM_API_KEY", hide_env_values = true)]
+        upstream_api_key: Option<String>,
+        #[arg(
+            long,
+            env = "THEOREM_PROXY_UPSTREAM_AUTH_TOKEN",
+            hide_env_values = true
+        )]
+        upstream_auth_token: Option<String>,
+        #[arg(long, env = "THEOREM_PROXY_UPSTREAM_BETA")]
+        upstream_beta: Option<String>,
+        #[arg(
+            long,
+            env = "THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY",
+            hide_env_values = true
+        )]
+        openai_upstream_api_key: Option<String>,
         /// The command to run with ANTHROPIC_BASE_URL set (everything after `--`).
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -84,28 +135,42 @@ async fn main() -> std::io::Result<()> {
         Command::Proxy {
             port,
             upstream,
+            openai_upstream,
             memory_url,
             tenant,
             memory_dir,
             membrane_threshold,
+            upstream_api_key,
+            upstream_auth_token,
+            upstream_beta,
+            openai_upstream_api_key,
         } => {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             let (memory, memory_desc) =
                 resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
+            let upstream_auth = upstream_auth(upstream_api_key, upstream_auth_token)?;
             println!("theorem proxy live at http://{addr}");
             println!();
             println!("point Claude Code at it:");
             println!("    export ANTHROPIC_BASE_URL=http://{addr}");
+            println!("point Codex at it:");
+            println!("    codex -c 'openai_base_url=\"http://{addr}/v1\"'");
             println!();
             println!("ambient memory: {memory_desc}");
-            println!("forwarding to {upstream} (CPU-only, no model download)");
+            println!("Anthropic upstream: {upstream}");
+            println!("OpenAI upstream: {openai_upstream}");
+            println!("CPU-only, no model download");
             serve(
                 addr,
                 ProxyConfig {
                     upstream,
+                    openai_upstream,
                     memory,
                     max_memories: 8,
                     membrane_threshold,
+                    upstream_auth,
+                    upstream_beta,
+                    openai_upstream_api_key,
                 },
             )
             .await
@@ -113,24 +178,34 @@ async fn main() -> std::io::Result<()> {
         Command::Wrap {
             port,
             upstream,
+            openai_upstream,
             memory_url,
             tenant,
             memory_dir,
             membrane_threshold,
+            upstream_api_key,
+            upstream_auth_token,
+            upstream_beta,
+            openai_upstream_api_key,
             command,
         } => {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             let (memory, memory_desc) =
                 resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
+            let upstream_auth = upstream_auth(upstream_api_key, upstream_auth_token)?;
             eprintln!("theorem proxy live at http://{addr} (ambient memory: {memory_desc})");
             eprintln!("running: {}", command.join(" "));
             let code = run_wrapped(
                 addr,
                 ProxyConfig {
                     upstream,
+                    openai_upstream,
                     memory,
                     max_memories: 8,
                     membrane_threshold,
+                    upstream_auth,
+                    upstream_beta,
+                    openai_upstream_api_key,
                 },
                 command,
             )
@@ -170,5 +245,20 @@ async fn main() -> std::io::Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+fn upstream_auth(
+    upstream_api_key: Option<String>,
+    upstream_auth_token: Option<String>,
+) -> std::io::Result<Option<UpstreamAuth>> {
+    match (upstream_api_key, upstream_auth_token) {
+        (Some(_), Some(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "set only one of --upstream-api-key or --upstream-auth-token",
+        )),
+        (Some(key), None) => Ok(Some(UpstreamAuth::ApiKey(key))),
+        (None, Some(token)) => Ok(Some(UpstreamAuth::Bearer(token))),
+        (None, None) => Ok(None),
     }
 }

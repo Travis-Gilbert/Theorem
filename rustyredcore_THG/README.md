@@ -134,7 +134,7 @@ Each crate has its own README with the public API surface. Group by role:
 | [`theorem-harness`](crates/theorem-harness) | SDK v2 Rust surface (run handles, sessions, idempotency, cancellation, resumable events, trace export); the source for generated Python/Node/Swift/WASM bindings. |
 | [`theorem-dispatch`](crates/theorem-dispatch) | Postgres hot-execution queue: `FOR UPDATE SKIP LOCKED` claims, leases, retries, dead-letter. |
 | [`theorem-receiver`](crates/theorem-receiver) | Dispatch v2 receiver: an outbound-only loop that spawns the local `claude`/`codex` CLI in a mapped worktree; `HeadAdapter` and `SandboxRuntime` seams. |
-| [`theorem-agentd`](crates/theorem-agentd) | Local assistant daemon: OpenAI-compatible model loop, schema-guarded MCP tool host, receiver sidecar, capture/relay, compute-offload ledger. |
+| [`theorem-localmodel`](crates/theorem-localmodel) | Local assistant daemon and resident model host: schema-guarded MCP loop, receiver sidecar, capture/relay, compute-offload ledger, and a mistral.rs-backed Anthropic Messages surface for local Gemma. |
 | [`theorem-browser-agent`](crates/theorem-browser-agent) | Servo-free browser-use perceive/govern/afford kernel: context command, perception bundle, gated action rail, browsing-run receipt. |
 | [`theorem-copresence`](crates/theorem-copresence) | Headless co-presence peer and surface-adapter seam: structure converges on the graph CRDT, free text on yrs text regions, awareness on the working log. |
 | [`pilot-core`](crates/pilot-core) | Servo-free, Playwright-class browser-automation core: locators, actionability/auto-wait, geometry snapshots, web-first assertions, behind a `BrowserDriver` trait. |

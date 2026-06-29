@@ -38,11 +38,11 @@ rustyred-web
 scene-os-core
 scene-os-web
 theorem-acp
-theorem-agentd
 theorem-browser-agent
 theorem-copresence
 theorem-dispatch
 theorem-harness
 theorem-harness-core
 theorem-harness-runtime
+theorem-localmodel
 theorem-receiver

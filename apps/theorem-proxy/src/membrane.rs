@@ -133,7 +133,10 @@ mod tests {
             .unwrap();
         assert!(new.len() < big.len(), "inline content shrank");
         assert!(new.contains("theorem-membrane"), "stub marker present");
-        assert!(new.contains(&stored[0].0), "stub references the retrieval id");
+        assert!(
+            new.contains(&stored[0].0),
+            "stub references the retrieval id"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{AgentdError, AgentdResult};
+use crate::{LocalModelError, LocalModelResult};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -54,18 +54,18 @@ impl ToolCatalog {
         self.tools.values()
     }
 
-    pub fn validate_call(&self, name: &str, arguments: &Value) -> AgentdResult<()> {
+    pub fn validate_call(&self, name: &str, arguments: &Value) -> LocalModelResult<()> {
         let Some(definition) = self.get(name) else {
-            return Err(AgentdError::Tool(format!("unknown tool '{name}'")));
+            return Err(LocalModelError::Tool(format!("unknown tool '{name}'")));
         };
         let Some(map) = arguments.as_object() else {
-            return Err(AgentdError::Tool(format!(
+            return Err(LocalModelError::Tool(format!(
                 "arguments for {name} must be a JSON object"
             )));
         };
         for required in definition.required_arguments() {
             if !map.contains_key(&required) {
-                return Err(AgentdError::Tool(format!(
+                return Err(LocalModelError::Tool(format!(
                     "arguments for {name} missing required key '{required}'"
                 )));
             }
@@ -541,13 +541,13 @@ mod tests {
     #[test]
     fn validates_required_arguments() {
         let catalog = ToolCatalog::default_catalog();
-        let missing = catalog.validate_call("coordinate", &json!({"actor": "agentd"}));
+        let missing = catalog.validate_call("coordinate", &json!({"actor": "localmodel"}));
         assert!(missing.is_err());
         catalog
             .validate_call(
                 "coordinate",
                 &json!({
-                    "actor": "agentd",
+                    "actor": "localmodel",
                     "room_id": "repo:theorem:branch:main",
                     "message": "@codex fix this",
                     "urgency": "ask"
@@ -560,7 +560,7 @@ mod tests {
     fn system_prompt_contains_the_charter() {
         // CHK032: the charter is inspectable in the prompt the daemon builds.
         let catalog = ToolCatalog::default_catalog();
-        let prompt = catalog.system_prompt("theorem-agentd", "repo:theorem:branch:main");
+        let prompt = catalog.system_prompt("theorem-localmodel", "repo:theorem:branch:main");
         assert!(prompt.contains("Charter:"));
         assert!(prompt.contains("Disagreement is licensed"));
         assert!(prompt.contains("mechanical truth"));

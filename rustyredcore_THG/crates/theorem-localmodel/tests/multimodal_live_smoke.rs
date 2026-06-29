@@ -10,8 +10,8 @@
 //! Run it by hand after that server is up:
 //!
 //! ```text
-//! AGENTD_SMOKE_BASE_URL=http://127.0.0.1:8080/v1 \
-//!   cargo test -p theorem-agentd --test multimodal_live_smoke -- --ignored --nocapture
+//! LOCALMODEL_SMOKE_BASE_URL=http://127.0.0.1:8080/v1 \
+//!   cargo test -p theorem-localmodel --test multimodal_live_smoke -- --ignored --nocapture
 //! ```
 //!
 //! It sends exactly one `ChatMessage::user_with_images` turn carrying a small
@@ -22,9 +22,9 @@
 //! text, because vision output is nondeterministic; the operator reads the
 //! printed completion to confirm it reflects a red image.
 
-use theorem_agentd::config::ModelConfig;
-use theorem_agentd::model::{ChatMessage, InputImage, ModelClient, ModelDecision};
-use theorem_agentd::tools::ToolCatalog;
+use theorem_localmodel::config::ModelConfig;
+use theorem_localmodel::model::{ChatMessage, InputImage, ModelClient, ModelDecision};
+use theorem_localmodel::tools::ToolCatalog;
 
 /// A valid 8x8 solid-red PNG, base64-encoded with no `data:` prefix, generated
 /// from Python stdlib (zlib + struct) so it decodes in any image stack.
@@ -34,10 +34,10 @@ const RED_PNG_BASE64: &str =
 #[test]
 #[ignore = "live: needs a llama-server started with --mmproj (Gemma vision)"]
 fn image_turn_returns_a_completion_from_live_server() {
-    let base_url = std::env::var("AGENTD_SMOKE_BASE_URL")
+    let base_url = std::env::var("LOCALMODEL_SMOKE_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_string());
     let model =
-        std::env::var("AGENTD_SMOKE_MODEL").unwrap_or_else(|_| "gemma-4-12b-it-q4".to_string());
+        std::env::var("LOCALMODEL_SMOKE_MODEL").unwrap_or_else(|_| "gemma-4-12b-it-q4".to_string());
 
     // Build a real openai-compatible client. ModelConfig has serde defaults on
     // every field, so a minimal TOML stays robust if new fields are added.
@@ -49,7 +49,7 @@ fn image_turn_returns_a_completion_from_live_server() {
     let client = ModelClient::from_config(
         config,
         "repo:theorem:branch:main".to_string(),
-        "theorem-agentd".to_string(),
+        "theorem-localmodel".to_string(),
     )
     .expect("openai-compatible model client");
 

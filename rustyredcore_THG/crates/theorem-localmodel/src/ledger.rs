@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ModelUsage;
-use crate::{AgentdError, AgentdResult};
+use crate::{LocalModelError, LocalModelResult};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LedgerEntry {
@@ -40,7 +40,7 @@ impl LedgerEntry {
     }
 }
 
-pub fn append_ledger_entry(path: &Path, entry: &LedgerEntry) -> AgentdResult<()> {
+pub fn append_ledger_entry(path: &Path, entry: &LedgerEntry) -> LocalModelResult<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -50,7 +50,7 @@ pub fn append_ledger_entry(path: &Path, entry: &LedgerEntry) -> AgentdResult<()>
         .create(true)
         .append(true)
         .open(path)
-        .map_err(AgentdError::from)?;
+        .map_err(LocalModelError::from)?;
     serde_json::to_writer(&mut file, entry)?;
     file.write_all(b"\n")?;
     Ok(())
@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn writes_jsonl_ledger() {
         let path = std::env::temp_dir().join(format!(
-            "theorem-agentd-ledger-{}.jsonl",
+            "theorem-localmodel-ledger-{}.jsonl",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

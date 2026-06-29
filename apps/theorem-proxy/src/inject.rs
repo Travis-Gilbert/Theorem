@@ -1,4 +1,4 @@
-//! Cache-stable memory injection into an Anthropic Messages request body
+//! Cache-stable memory injection into model request bodies
 //! (SPEC-LOCAL-PROXY-MVP D3).
 //!
 //! Relevant memory is appended to the LAST user message, so the `system` prefix and
@@ -37,6 +37,34 @@ pub fn inject_memory(body: &[u8], source: &dyn MemorySource, max: usize) -> Vec<
     serde_json::to_vec(&request).unwrap_or_else(|_| body.to_vec())
 }
 
+/// Inject relevant memory into an OpenAI Responses request body. Codex uses the
+/// Responses wire API; its cached prefix still lives before the latest user input,
+/// so this follows the same suffix-only, fail-open rule as Anthropic Messages.
+pub fn inject_openai_responses_memory(
+    body: &[u8],
+    source: &dyn MemorySource,
+    max: usize,
+) -> Vec<u8> {
+    let Ok(mut request) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(input) = request.get("input") else {
+        return body.to_vec();
+    };
+    let query = responses_input_to_text(input);
+    if query.trim().is_empty() {
+        return body.to_vec();
+    }
+    let hits = source.retrieve(&query, max);
+    if hits.is_empty() {
+        return body.to_vec();
+    }
+    if !append_to_openai_input(&mut request, &render_block(&hits)) {
+        return body.to_vec();
+    }
+    serde_json::to_vec(&request).unwrap_or_else(|_| body.to_vec())
+}
+
 fn last_user_text(messages: &[Value]) -> String {
     messages
         .iter()
@@ -52,6 +80,37 @@ fn content_to_text(content: Option<&Value>) -> String {
         Some(Value::Array(blocks)) => blocks
             .iter()
             .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn responses_input_to_text(input: &Value) -> String {
+    match input {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .rev()
+            .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+            .map(|item| openai_content_to_text(item.get("content")))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn openai_content_to_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("input_text") | Some("text")
+                )
+            })
             .filter_map(|block| block.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("\n"),
@@ -84,6 +143,41 @@ fn append_to_last_user(request: &mut Value, block: &str) -> bool {
         return true;
     }
     false
+}
+
+fn append_to_openai_input(request: &mut Value, block: &str) -> bool {
+    let Some(input) = request.get_mut("input") else {
+        return false;
+    };
+    match input {
+        Value::String(text) => {
+            text.push_str("\n\n");
+            text.push_str(block);
+            true
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut().rev() {
+                if item.get("role").and_then(Value::as_str) != Some("user") {
+                    continue;
+                }
+                let content = item
+                    .get_mut("content")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null);
+                let mut blocks = match content {
+                    Value::String(text) => vec![json!({"type": "input_text", "text": text})],
+                    Value::Array(existing) => existing,
+                    Value::Null => Vec::new(),
+                    other => vec![other],
+                };
+                blocks.push(json!({"type": "input_text", "text": block}));
+                item["content"] = Value::Array(blocks);
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 fn render_block(hits: &[MemoryHit]) -> String {
@@ -140,7 +234,10 @@ mod tests {
         let last = serde_json::to_string(&out["messages"][2]).unwrap();
         assert!(last.contains("planner.rs"), "relevant memory injected");
         assert!(!last.contains("cats"), "irrelevant memory excluded");
-        assert!(last.contains("tell me about the planner"), "user text preserved");
+        assert!(
+            last.contains("tell me about the planner"),
+            "user text preserved"
+        );
         assert!(last.contains("theorem-memory"), "injection is delimited");
     }
 
@@ -193,11 +290,54 @@ mod tests {
         let out: Value = serde_json::from_slice(&inject_memory(&body, &source, 5)).unwrap();
 
         // The tool_use turn and the tool_result turn survive untouched.
-        assert_eq!(out["messages"][1], original["messages"][1], "tool_use preserved");
-        assert_eq!(out["messages"][2], original["messages"][2], "tool_result preserved");
+        assert_eq!(
+            out["messages"][1], original["messages"][1],
+            "tool_use preserved"
+        );
+        assert_eq!(
+            out["messages"][2], original["messages"][2],
+            "tool_result preserved"
+        );
         // Injection landed only in the last user text turn.
         let last = serde_json::to_string(&out["messages"][3]).unwrap();
-        assert!(last.contains("planner.rs"), "memory injected into last user turn");
+        assert!(
+            last.contains("planner.rs"),
+            "memory injected into last user turn"
+        );
         assert!(last.contains("theorem-memory"), "injection delimited");
+    }
+
+    #[test]
+    fn injects_openai_responses_memory_at_latest_user_input() {
+        let original = json!({
+            "model": "gpt-5.5",
+            "tools": [{"type": "function", "name": "shell"}],
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "SYSTEM"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "tell me about planner pushdown"}]}
+            ]
+        });
+        let body = serde_json::to_vec(&original).unwrap();
+        let source = VecMemorySource::new(vec![("planner", "planner.rs pushdown")]);
+        let out: Value =
+            serde_json::from_slice(&inject_openai_responses_memory(&body, &source, 5)).unwrap();
+
+        assert_eq!(out["tools"], original["tools"]);
+        assert_eq!(out["input"][0], original["input"][0]);
+        let last = serde_json::to_string(&out["input"][1]).unwrap();
+        assert!(last.contains("tell me about planner"));
+        assert!(last.contains("planner.rs"));
+        assert!(last.contains("theorem-memory"));
+    }
+
+    #[test]
+    fn openai_responses_memory_fails_open_when_no_relevant_hit() {
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let source = VecMemorySource::new(vec![("planner", "planner.rs pushdown")]);
+        assert_eq!(inject_openai_responses_memory(&body, &source, 5), body);
     }
 }

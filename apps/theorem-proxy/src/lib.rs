@@ -1,4 +1,4 @@
-//! theorem-proxy: local Anthropic Messages passthrough proxy.
+//! theorem-proxy: local model-path proxy for Claude and Codex.
 //!
 //! SPEC-LOCAL-PROXY-MVP deliverable 1. A faithful local reverse proxy that sits on
 //! every Claude Code (or any Anthropic-Messages client) turn: `POST /v1/messages`
@@ -7,6 +7,8 @@
 //! stream preserved byte-for-byte. Nothing in the request or response is parsed or
 //! mutated here -- so `tool_use` ids, the `anthropic-beta` header (including the
 //! OAuth subscription capability), and prompt-cache breakpoints all survive intact.
+//! Codex/OpenAI clients use the sibling `POST /v1/responses` route, forwarded to
+//! `https://api.openai.com` by default with the same local-memory suffix injection.
 //!
 //! This is the foundation. The native-tool membrane (D2) and ambient memory /
 //! directive injection (D3) extend the request path on top of this passthrough; the
@@ -24,7 +26,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
@@ -34,6 +36,8 @@ use axum::Router;
 pub struct ProxyConfig {
     /// Upstream base URL the `/v1/messages` path is forwarded to.
     pub upstream: String,
+    /// Upstream base URL the `/v1/responses` OpenAI/Codex path is forwarded to.
+    pub openai_upstream: String,
     /// Ambient memory source (D3). `None` is faithful passthrough (D1); `Some`
     /// injects relevant memory at the cache-stable suffix of each turn.
     pub memory: Option<Arc<dyn memory::MemorySource>>,
@@ -43,15 +47,39 @@ pub struct ProxyConfig {
     /// oversized results are sampled to a head+tail stub (full output served at
     /// `/tool_result/{id}`). `0` disables the membrane (the default).
     pub membrane_threshold: usize,
+    /// Optional upstream credential override. When unset, auth headers from the
+    /// client pass through unchanged (Claude Code OAuth/API-key mode). When set,
+    /// the proxy strips any client auth and applies this credential instead,
+    /// which lets Claude Desktop use a harmless local gateway key while the proxy
+    /// owns the upstream secret.
+    pub upstream_auth: Option<UpstreamAuth>,
+    /// Optional Anthropic beta header to force upstream. This is mainly for
+    /// non-Claude-Code clients that do not know to send subscription/OAuth betas.
+    pub upstream_beta: Option<String>,
+    /// Optional OpenAI API key override. When unset, Codex/OpenAI auth headers pass
+    /// through unchanged. When set, client auth is stripped and this bearer token is
+    /// sent upstream.
+    pub openai_upstream_api_key: Option<String>,
+}
+
+/// Credential the proxy applies to upstream requests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpstreamAuth {
+    ApiKey(String),
+    Bearer(String),
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             upstream: "https://api.anthropic.com".to_string(),
+            openai_upstream: "https://api.openai.com".to_string(),
             memory: None,
             max_memories: 8,
             membrane_threshold: 0,
+            upstream_auth: None,
+            upstream_beta: None,
+            openai_upstream_api_key: None,
         }
     }
 }
@@ -60,16 +88,22 @@ impl Default for ProxyConfig {
 struct ProxyState {
     client: reqwest::Client,
     upstream: String,
+    openai_upstream: String,
     memory: Option<Arc<dyn memory::MemorySource>>,
     max_memories: usize,
     membrane_threshold: usize,
+    upstream_auth: Option<UpstreamAuth>,
+    upstream_beta: Option<String>,
+    openai_upstream_api_key: Option<String>,
     /// Full content of tool_result blocks the membrane elided, keyed by retrieval id,
     /// served at `GET /tool_result/{id}`.
     tool_results: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Build the proxy router (exposed for tests and for embedding behind another
-/// listener). `/healthz` is liveness; `/v1/messages` is the passthrough.
+/// listener). `/healthz` is liveness; `/v1/messages` is required by the
+/// Anthropic Messages surface; `/v1/models` supports gateway clients that
+/// discover available models at launch.
 pub fn router(config: ProxyConfig) -> Router {
     let client = reqwest::Client::builder()
         // A model turn can stream for minutes; do not impose a short timeout.
@@ -79,14 +113,24 @@ pub fn router(config: ProxyConfig) -> Router {
     let state = ProxyState {
         client,
         upstream: config.upstream.trim_end_matches('/').to_string(),
+        openai_upstream: config.openai_upstream.trim_end_matches('/').to_string(),
         memory: config.memory,
         max_memories: config.max_memories,
         membrane_threshold: config.membrane_threshold,
+        upstream_auth: config.upstream_auth,
+        upstream_beta: config.upstream_beta,
+        openai_upstream_api_key: config.openai_upstream_api_key,
         tool_results: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/messages", any(proxy_messages))
+        .route("/v1/models", any(proxy_models))
+        .route("/v1/responses", any(proxy_openai_responses))
+        .route("/v1/chat/completions", any(proxy_openai_passthrough))
+        .route("/openai/v1/responses", any(proxy_openai_responses))
+        .route("/openai/v1/chat/completions", any(proxy_openai_passthrough))
+        .route("/openai/v1/models", any(proxy_openai_models))
         .route("/tool_result/{id}", get(serve_tool_result))
         .with_state(state)
 }
@@ -129,7 +173,61 @@ async fn proxy_messages(
         )),
         None => body,
     };
-    let url = format!("{}/v1/messages", state.upstream);
+    forward_upstream(state, method, headers, body, "/v1/messages").await
+}
+
+async fn proxy_models(
+    State(state): State<ProxyState>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    forward_upstream(state, method, headers, body, "/v1/models").await
+}
+
+async fn proxy_openai_responses(
+    State(state): State<ProxyState>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body = match &state.memory {
+        Some(source) => Bytes::from(crate::inject::inject_openai_responses_memory(
+            &body,
+            source.as_ref(),
+            state.max_memories,
+        )),
+        None => body,
+    };
+    forward_openai_upstream(state, method, headers, body, "/v1/responses").await
+}
+
+async fn proxy_openai_passthrough(
+    State(state): State<ProxyState>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    forward_openai_upstream(state, method, headers, body, "/v1/chat/completions").await
+}
+
+async fn proxy_openai_models(
+    State(state): State<ProxyState>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    forward_openai_upstream(state, method, headers, body, "/v1/models").await
+}
+
+async fn forward_upstream(
+    state: ProxyState,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+    path: &str,
+) -> Response {
+    let url = format!("{}{}", state.upstream, path);
     // Forward the client's request headers verbatim, except hop-by-hop headers and
     // the ones reqwest must recompute for the new connection. Crucially this keeps
     // `authorization` / `x-api-key`, `anthropic-version`, and `anthropic-beta`.
@@ -140,7 +238,16 @@ async fn proxy_messages(
             forward.append(name.clone(), value.clone());
         }
     }
-    let builder = state.client.request(method, &url).headers(forward).body(body);
+    apply_upstream_auth(
+        &mut forward,
+        state.upstream_auth.as_ref(),
+        state.upstream_beta.as_deref(),
+    );
+    let builder = state
+        .client
+        .request(method, &url)
+        .headers(forward)
+        .body(body);
 
     let upstream = match builder.send().await {
         Ok(response) => response,
@@ -156,8 +263,8 @@ async fn proxy_messages(
     // Faithful response passthrough: status, headers (minus hop-by-hop), and the
     // body streamed straight through. For an SSE turn this pipes events as they
     // arrive; it is never buffered.
-    let status = StatusCode::from_u16(upstream.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response_headers = HeaderMap::new();
     for (name, value) in upstream.headers().iter() {
         if is_hop_by_hop(name) {
@@ -170,13 +277,101 @@ async fn proxy_messages(
     response
 }
 
+async fn forward_openai_upstream(
+    state: ProxyState,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+    path: &str,
+) -> Response {
+    let url = format!("{}{}", state.openai_upstream, path);
+    let mut forward = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if !is_hop_by_hop(name) {
+            forward.append(name.clone(), value.clone());
+        }
+    }
+    apply_openai_upstream_auth(&mut forward, state.openai_upstream_api_key.as_deref());
+    let builder = state
+        .client
+        .request(method, &url)
+        .headers(forward)
+        .body(body);
+
+    let upstream = match builder.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("theorem-proxy: OpenAI upstream request failed: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response_headers = HeaderMap::new();
+    for (name, value) in upstream.headers().iter() {
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        response_headers.insert(name.clone(), value.clone());
+    }
+    let mut response = (status, Body::from_stream(upstream.bytes_stream())).into_response();
+    *response.headers_mut() = response_headers;
+    response
+}
+
+fn apply_upstream_auth(
+    headers: &mut HeaderMap,
+    upstream_auth: Option<&UpstreamAuth>,
+    upstream_beta: Option<&str>,
+) {
+    if let Some(auth) = upstream_auth {
+        headers.remove("authorization");
+        headers.remove("x-api-key");
+        match auth {
+            UpstreamAuth::ApiKey(key) => {
+                if let Ok(value) = HeaderValue::from_str(key) {
+                    headers.insert(HeaderName::from_static("x-api-key"), value);
+                }
+            }
+            UpstreamAuth::Bearer(token) => {
+                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                    headers.insert(HeaderName::from_static("authorization"), value);
+                }
+            }
+        }
+    }
+    if let Some(beta) = upstream_beta.and_then(|value| HeaderValue::from_str(value).ok()) {
+        headers.insert(HeaderName::from_static("anthropic-beta"), beta);
+    }
+}
+
+fn apply_openai_upstream_auth(headers: &mut HeaderMap, upstream_api_key: Option<&str>) {
+    let Some(key) = upstream_api_key else {
+        return;
+    };
+    headers.remove("authorization");
+    headers.remove("x-api-key");
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}")) {
+        headers.insert(HeaderName::from_static("authorization"), value);
+    }
+}
+
 /// Serve the full content of a tool_result the membrane elided (D2). Out-of-band
 /// retrieval: the truncated stub points here. 404 if unknown or already evicted.
 async fn serve_tool_result(
     State(state): State<ProxyState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    match state.tool_results.lock().ok().and_then(|store| store.get(&id).cloned()) {
+    match state
+        .tool_results
+        .lock()
+        .ok()
+        .and_then(|store| store.get(&id).cloned())
+    {
         Some(content) => content.into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -210,7 +405,10 @@ pub fn resolve_memory(
 ) -> (Option<Arc<dyn memory::MemorySource>>, String) {
     if let Some(url) = memory_url {
         (
-            Some(Arc::new(memory::HttpMemorySource::new(url.to_string(), tenant))),
+            Some(Arc::new(memory::HttpMemorySource::new(
+                url.to_string(),
+                tenant,
+            ))),
             format!("live local node memory at {url}"),
         )
     } else if let Some(dir) = memory_dir {
@@ -317,7 +515,10 @@ pub async fn doctor(
     if let Some(url) = memory_url {
         let base = url.strip_suffix("/mcp").unwrap_or(url);
         let ready = client.get(format!("{base}/ready")).send().await;
-        let ready_ok = ready.as_ref().map(|r| r.status().is_success()).unwrap_or(false);
+        let ready_ok = ready
+            .as_ref()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
         checks.push(Check::new(
             "node",
             ready_ok,
@@ -354,7 +555,10 @@ pub async fn doctor(
     if let Some(url) = proxy_url {
         let base = url.trim_end_matches('/');
         let health = client.get(format!("{base}/healthz")).send().await;
-        let ok = health.as_ref().map(|r| r.status().is_success()).unwrap_or(false);
+        let ok = health
+            .as_ref()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
         checks.push(Check::new(
             "proxy",
             ok,

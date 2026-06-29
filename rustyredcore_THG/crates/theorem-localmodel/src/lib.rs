@@ -1,4 +1,4 @@
-//! theorem-agentd: local assistant daemon plus MCP tool host.
+//! theorem-localmodel: local assistant daemon plus MCP tool host.
 //!
 //! The daemon is intentionally small at the process boundary. A resident local
 //! model chooses one schema-guarded tool call at a time, MCP servers execute the
@@ -9,6 +9,7 @@ pub mod capture;
 pub mod config;
 pub mod constrained_decoding;
 pub mod ledger;
+pub mod local_host;
 pub mod mcp;
 pub mod model;
 pub mod receiver_sidecar;
@@ -18,10 +19,10 @@ pub mod turn_loop;
 
 use std::fmt;
 
-pub type AgentdResult<T> = Result<T, AgentdError>;
+pub type LocalModelResult<T> = Result<T, LocalModelError>;
 
 #[derive(Debug)]
-pub enum AgentdError {
+pub enum LocalModelError {
     Config(String),
     Io(std::io::Error),
     Http(String),
@@ -31,7 +32,7 @@ pub enum AgentdError {
     Tool(String),
 }
 
-impl fmt::Display for AgentdError {
+impl fmt::Display for LocalModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(message) => write!(f, "config error: {message}"),
@@ -45,21 +46,21 @@ impl fmt::Display for AgentdError {
     }
 }
 
-impl std::error::Error for AgentdError {}
+impl std::error::Error for LocalModelError {}
 
-impl From<std::io::Error> for AgentdError {
+impl From<std::io::Error> for LocalModelError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
 }
 
-impl From<serde_json::Error> for AgentdError {
+impl From<serde_json::Error> for LocalModelError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
     }
 }
 
-impl From<reqwest::Error> for AgentdError {
+impl From<reqwest::Error> for LocalModelError {
     fn from(error: reqwest::Error) -> Self {
         Self::Http(error.to_string())
     }
