@@ -9,13 +9,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustyred_thg_affordances::{theorem_grpc_timeout_ms, AffordanceGraphStore};
 use rustyred_thg_core::store::RedisThgStore;
 use rustyred_thg_core::{
-    make_fulltext_backend, make_spatial_backend, sanitize_tenant_segment, EdgeRecord,
-    EpistemicType, FullTextBackend, FullTextDesignation, GraphMutation, GraphMutationBatch,
-    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphTransaction, GraphWriteResult, HookDispatcher, HookDispatcherConfig, HookRegistration,
-    HookStoreAccess, HybridScoringConfig, InMemoryGraphStore, MemoryDocumentQuery, NeighborHit,
-    NeighborQuery, NodeQuery, NodeRecord, PluginRegistry, RedCoreGraphStore, RedCoreOptions,
-    RedisGraphStore, SpatialBackend, SpatialDesignation, VectorDesignation, VerifyReport,
+    make_fulltext_backend, make_spatial_backend, EdgeRecord, EpistemicType, FullTextBackend,
+    FullTextDesignation, GraphMutation, GraphMutationBatch, GraphRebuildReport, GraphSnapshot,
+    GraphStats, GraphStore, GraphStoreError, GraphStoreResult, GraphTransaction, GraphWriteResult,
+    HookDispatcher, HookDispatcherConfig, HookRegistration, HookStoreAccess, HybridScoringConfig,
+    InMemoryGraphStore, MemoryDocumentQuery, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
+    PluginRegistry, RedCoreGraphStore, RedCoreOptions, RedisGraphStore, SpatialBackend,
+    SpatialDesignation, VectorDesignation, VerifyReport,
 };
 use rustyred_thg_datawave_harness::{DatawaveIngestPlugin, INGEST_CAPABILITY_PACK};
 use rustyred_thg_mcp::{
@@ -42,6 +42,7 @@ use crate::browser_pool::{BrowserLiveSessionRecord, LiveBrowserPool, RemoteBrows
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
 use crate::observability::Observability;
+use crate::tenant_router::{tenant_data_dir, tenant_key_segment, TenantId};
 use crate::ttl_sweep::TtlSweepState;
 
 const GRAPH_TRANSACTION_TTL_MS: u64 = 5 * 60 * 1000;
@@ -65,6 +66,97 @@ type SpatialIndexes = BTreeMap<String, BTreeMap<(String, String, String), Box<dy
 /// (label, property).
 type FullTextIndexes = BTreeMap<String, BTreeMap<(String, String), Box<dyn FullTextBackend>>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantEngineState {
+    Cold,
+    Warm,
+    Hot,
+}
+
+impl TenantEngineState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Warm => "warm",
+            Self::Hot => "hot",
+        }
+    }
+
+    pub fn gauge_value(self) -> u8 {
+        match self {
+            Self::Cold => 0,
+            Self::Warm => 1,
+            Self::Hot => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TenantEngineMeta {
+    tenant_id: String,
+    state: TenantEngineState,
+    data_dir: Option<String>,
+    last_accessed_ms: u64,
+    opened_at_ms: Option<u64>,
+}
+
+impl TenantEngineMeta {
+    fn new(
+        tenant_id: impl Into<String>,
+        state: TenantEngineState,
+        data_dir: Option<String>,
+        now_ms: u64,
+    ) -> Self {
+        let opened_at_ms =
+            matches!(state, TenantEngineState::Warm | TenantEngineState::Hot).then_some(now_ms);
+        Self {
+            tenant_id: tenant_id.into(),
+            state,
+            data_dir,
+            last_accessed_ms: now_ms,
+            opened_at_ms,
+        }
+    }
+
+    fn touch_hot(&mut self, now_ms: u64, data_dir: Option<String>) {
+        self.state = TenantEngineState::Hot;
+        self.last_accessed_ms = now_ms;
+        self.opened_at_ms.get_or_insert(now_ms);
+        if data_dir.is_some() {
+            self.data_dir = data_dir;
+        }
+    }
+
+    fn mark_warm(&mut self) {
+        self.state = TenantEngineState::Warm;
+    }
+
+    fn mark_cold(&mut self) {
+        self.state = TenantEngineState::Cold;
+        self.opened_at_ms = None;
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TenantEngineReport {
+    pub tenant: String,
+    pub state: TenantEngineState,
+    pub state_value: u8,
+    pub last_accessed_ms: u64,
+    pub idle_ms: u64,
+    pub opened_at_ms: Option<u64>,
+    pub resident_memory_bytes: usize,
+    pub data_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct TenantLifecycleSweepReport {
+    pub cooled_to_warm: usize,
+    pub cooled_to_cold: usize,
+    pub warm_pool_size: usize,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -76,6 +168,7 @@ pub struct AppState {
     /// without an Option check.
     pub ttl_sweep: Arc<TtlSweepState>,
     redcore_stores: Arc<Mutex<BTreeMap<String, Arc<RedCoreTenantExecutor>>>>,
+    tenant_engines: Arc<Mutex<BTreeMap<String, TenantEngineMeta>>>,
     graph_caches: Arc<Mutex<BTreeMap<String, Arc<GraphCacheTenant>>>>,
     graph_transactions: Arc<Mutex<BTreeMap<String, GraphTransactionContext>>>,
     live_fetch_cascade: Arc<FetchCascade>,
@@ -121,6 +214,7 @@ impl AppState {
             observability,
             ttl_sweep: Arc::new(TtlSweepState::new()),
             redcore_stores: Arc::new(Mutex::new(BTreeMap::new())),
+            tenant_engines: Arc::new(Mutex::new(BTreeMap::new())),
             graph_caches: Arc::new(Mutex::new(BTreeMap::new())),
             graph_transactions: Arc::new(Mutex::new(BTreeMap::new())),
             live_fetch_cascade: Arc::new(live_fetch_cascade),
@@ -619,8 +713,14 @@ impl AppState {
     }
 
     pub fn tenant_state_key(&self, tenant_id: &str) -> String {
-        let safe_tenant = sanitize_tenant_segment(tenant_id);
-        format!("{}:{}:state:v1", self.config.redis_key_prefix, safe_tenant)
+        match TenantId::new(tenant_id) {
+            Ok(tenant_id) => format!(
+                "{}:{}:state:v1",
+                self.config.redis_key_prefix,
+                tenant_key_segment(&tenant_id)
+            ),
+            Err(_) => format!("{}:tenant-invalid:state:v1", self.config.redis_key_prefix),
+        }
     }
 
     pub fn tenant_graph_store(
@@ -629,9 +729,12 @@ impl AppState {
     ) -> Result<TenantGraphStore, StoreAccessError> {
         self.config.validate().map_err(StoreAccessError::internal)?;
         match self.config.storage_mode {
-            StorageMode::Embedded => Ok(TenantGraphStore::RedCore(
-                self.redcore_store_for_tenant(tenant_id)?,
-            )),
+            StorageMode::Embedded => {
+                self.sweep_idle_tenant_engines_at(now_millis())?;
+                Ok(TenantGraphStore::RedCore(
+                    self.redcore_store_for_tenant(tenant_id)?,
+                ))
+            }
             StorageMode::Memory => Ok(TenantGraphStore::RedCore(
                 self.memory_store_for_tenant(tenant_id)?,
             )),
@@ -726,11 +829,180 @@ impl AppState {
             .collect()
     }
 
+    pub fn sweep_idle_tenant_engines(
+        &self,
+    ) -> Result<TenantLifecycleSweepReport, StoreAccessError> {
+        self.sweep_idle_tenant_engines_at(now_millis())
+    }
+
+    pub fn sweep_idle_tenant_engines_at(
+        &self,
+        now_ms: u64,
+    ) -> Result<TenantLifecycleSweepReport, StoreAccessError> {
+        if self.config.storage_mode != StorageMode::Embedded {
+            return Ok(TenantLifecycleSweepReport {
+                warm_pool_size: self.config.tenant_warm_pool_size,
+                ..TenantLifecycleSweepReport::default()
+            });
+        }
+
+        let mut stores = self
+            .redcore_stores
+            .lock()
+            .map_err(|_| StoreAccessError::internal("redcore tenant map lock poisoned"))?;
+        let mut engines = self
+            .tenant_engines
+            .lock()
+            .map_err(|_| StoreAccessError::internal("tenant engine state lock poisoned"))?;
+
+        let mut idle = engines
+            .iter()
+            .filter(|(tenant_key, meta)| {
+                stores.contains_key(*tenant_key)
+                    && now_ms.saturating_sub(meta.last_accessed_ms) >= self.config.tenant_idle_ms
+            })
+            .map(|(tenant_key, meta)| (tenant_key.clone(), meta.last_accessed_ms))
+            .collect::<Vec<_>>();
+        idle.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let keep_warm = idle
+            .iter()
+            .take(self.config.tenant_warm_pool_size)
+            .map(|(tenant_key, _)| tenant_key.clone())
+            .collect::<BTreeSet<_>>();
+
+        let mut report = TenantLifecycleSweepReport {
+            warm_pool_size: self.config.tenant_warm_pool_size,
+            ..TenantLifecycleSweepReport::default()
+        };
+        let mut cold_keys = Vec::new();
+        for (tenant_key, _) in idle {
+            if keep_warm.contains(&tenant_key) {
+                if let Some(store) = stores.get(&tenant_key) {
+                    store.clear_hot_caches();
+                }
+                if let Some(meta) = engines.get_mut(&tenant_key) {
+                    meta.mark_warm();
+                }
+                report.cooled_to_warm += 1;
+            } else {
+                if let Some(store) = stores.get(&tenant_key) {
+                    store.clear_hot_caches();
+                }
+                stores.remove(&tenant_key);
+                cold_keys.push(tenant_key);
+                report.cooled_to_cold += 1;
+            }
+        }
+        drop(stores);
+
+        if !cold_keys.is_empty() {
+            let mut caches = self
+                .graph_caches
+                .lock()
+                .map_err(|_| StoreAccessError::internal("graph cache tenant map lock poisoned"))?;
+            for tenant_key in &cold_keys {
+                caches.remove(tenant_key);
+            }
+        }
+
+        for tenant_key in cold_keys {
+            if let Some(meta) = engines.get_mut(&tenant_key) {
+                meta.mark_cold();
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn tenant_engine_reports(&self) -> Result<Vec<TenantEngineReport>, StoreAccessError> {
+        self.tenant_engine_reports_at(now_millis())
+    }
+
+    pub fn tenant_engine_reports_at(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<TenantEngineReport>, StoreAccessError> {
+        let stores = self
+            .redcore_stores
+            .lock()
+            .map_err(|_| StoreAccessError::internal("redcore tenant map lock poisoned"))?
+            .iter()
+            .map(|(tenant, store)| (tenant.clone(), store.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let engines = self
+            .tenant_engines
+            .lock()
+            .map_err(|_| StoreAccessError::internal("tenant engine state lock poisoned"))?;
+        Ok(engines
+            .iter()
+            .map(|(tenant_key, meta)| {
+                let resident_memory_bytes = match meta.state {
+                    TenantEngineState::Cold => 0,
+                    TenantEngineState::Warm | TenantEngineState::Hot => stores
+                        .get(tenant_key)
+                        .and_then(|store| store.cheap_stats().ok())
+                        .map(|stats| stats.memory_bytes)
+                        .unwrap_or(0),
+                };
+                TenantEngineReport {
+                    tenant: meta.tenant_id.clone(),
+                    state: meta.state,
+                    state_value: meta.state.gauge_value(),
+                    last_accessed_ms: meta.last_accessed_ms,
+                    idle_ms: now_ms.saturating_sub(meta.last_accessed_ms),
+                    opened_at_ms: meta.opened_at_ms,
+                    resident_memory_bytes,
+                    data_dir: meta.data_dir.clone(),
+                }
+            })
+            .collect())
+    }
+
+    pub fn tenant_engine_state(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<TenantEngineState>, StoreAccessError> {
+        let tenant_id = TenantId::new(tenant_id)
+            .map_err(|error| StoreAccessError::internal(format!("invalid tenant id: {error}")))?;
+        let safe_tenant = tenant_key_segment(&tenant_id);
+        let engines = self
+            .tenant_engines
+            .lock()
+            .map_err(|_| StoreAccessError::internal("tenant engine state lock poisoned"))?;
+        Ok(engines.get(&safe_tenant).map(|meta| meta.state))
+    }
+
+    pub fn render_tenant_engine_prometheus(&self) -> Result<String, StoreAccessError> {
+        let reports = self.tenant_engine_reports()?;
+        let mut out = String::new();
+        out.push_str(
+            "# HELP rustyred_thg_tenant_engine_state Tenant engine state: 0=cold, 1=warm, 2=hot\n",
+        );
+        out.push_str("# TYPE rustyred_thg_tenant_engine_state gauge\n");
+        out.push_str("# HELP rustyred_thg_tenant_engine_resident_bytes Estimated resident bytes for this tenant engine\n");
+        out.push_str("# TYPE rustyred_thg_tenant_engine_resident_bytes gauge\n");
+        for report in reports {
+            let tenant = prometheus_label_value(&report.tenant);
+            out.push_str(&format!(
+                "rustyred_thg_tenant_engine_state{{tenant=\"{tenant}\",state=\"{}\"}} {}\n",
+                report.state.as_str(),
+                report.state_value
+            ));
+            out.push_str(&format!(
+                "rustyred_thg_tenant_engine_resident_bytes{{tenant=\"{tenant}\",state=\"{}\"}} {}\n",
+                report.state.as_str(),
+                report.resident_memory_bytes
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn tenant_graph_cache(
         &self,
         tenant_id: &str,
     ) -> Result<Arc<GraphCacheTenant>, StoreAccessError> {
-        let safe_tenant = sanitize_tenant_segment(tenant_id);
+        let tenant_id = TenantId::new(tenant_id)
+            .map_err(|error| StoreAccessError::internal(format!("invalid tenant id: {error}")))?;
+        let safe_tenant = tenant_key_segment(&tenant_id);
         let mut caches = self
             .graph_caches
             .lock()
@@ -747,18 +1019,25 @@ impl AppState {
         &self,
         tenant_id: &str,
     ) -> Result<Arc<RedCoreTenantExecutor>, StoreAccessError> {
-        let safe_tenant = sanitize_tenant_segment(tenant_id);
+        let tenant_id = TenantId::new(tenant_id)
+            .map_err(|error| StoreAccessError::internal(format!("invalid tenant id: {error}")))?;
+        let safe_tenant = tenant_key_segment(&tenant_id);
+        let data_dir = tenant_data_dir(&self.config.data_dir, &tenant_id);
+        let data_dir_label = Some(data_dir.display().to_string());
         let mut stores = self
             .redcore_stores
             .lock()
             .map_err(|_| StoreAccessError::internal("redcore tenant map lock poisoned"))?;
         if let Some(store) = stores.get(&safe_tenant) {
+            self.touch_tenant_engine(
+                &safe_tenant,
+                tenant_id.as_str(),
+                data_dir_label,
+                now_millis(),
+            )?;
             return Ok(store.clone());
         }
-        let data_dir = PathBuf::from(&self.config.data_dir)
-            .join("tenants")
-            .join(&safe_tenant);
-        let tenant_config = self.config.tenant_config(tenant_id);
+        let tenant_config = self.config.tenant_config(tenant_id.as_str());
         let options = RedCoreOptions {
             durability: tenant_config.durability,
             snapshot_interval_writes: tenant_config.snapshot_interval_writes,
@@ -768,14 +1047,27 @@ impl AppState {
             RedCoreGraphStore::open(data_dir, options)?,
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id)
-        {
+        if let Err(err) = store.enable_graph_hooks(
+            tenant_hook_registrations(tenant_id.as_str()),
+            tenant_id.as_str(),
+        ) {
             eprintln!(
-                "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                "[theorem] enable graph hooks failed for {}: {}",
+                tenant_id.as_str(),
                 err.message
             );
         }
         stores.insert(safe_tenant, store.clone());
+        self.touch_tenant_engine(
+            &tenant_key_segment(&tenant_id),
+            tenant_id.as_str(),
+            Some(
+                tenant_data_dir(&self.config.data_dir, &tenant_id)
+                    .display()
+                    .to_string(),
+            ),
+            now_millis(),
+        )?;
         Ok(store)
     }
 
@@ -783,28 +1075,60 @@ impl AppState {
         &self,
         tenant_id: &str,
     ) -> Result<Arc<RedCoreTenantExecutor>, StoreAccessError> {
-        let safe_tenant = sanitize_tenant_segment(tenant_id);
+        let tenant_id = TenantId::new(tenant_id)
+            .map_err(|error| StoreAccessError::internal(format!("invalid tenant id: {error}")))?;
+        let safe_tenant = tenant_key_segment(&tenant_id);
         let mut stores = self
             .redcore_stores
             .lock()
             .map_err(|_| StoreAccessError::internal("redcore tenant map lock poisoned"))?;
         if let Some(store) = stores.get(&safe_tenant) {
+            self.touch_tenant_engine(&safe_tenant, tenant_id.as_str(), None, now_millis())?;
             return Ok(store.clone());
         }
-        let tenant_config = self.config.tenant_config(tenant_id);
+        let tenant_config = self.config.tenant_config(tenant_id.as_str());
         let store = Arc::new(RedCoreTenantExecutor::new(
             RedCoreGraphStore::memory(),
             tenant_config.tenant_memory_quota_bytes,
         )?);
-        if let Err(err) = store.enable_graph_hooks(tenant_hook_registrations(tenant_id), tenant_id)
-        {
+        if let Err(err) = store.enable_graph_hooks(
+            tenant_hook_registrations(tenant_id.as_str()),
+            tenant_id.as_str(),
+        ) {
             eprintln!(
-                "[theorem] enable graph hooks failed for {tenant_id}: {}",
+                "[theorem] enable graph hooks failed for {}: {}",
+                tenant_id.as_str(),
                 err.message
             );
         }
         stores.insert(safe_tenant, store.clone());
+        self.touch_tenant_engine(
+            &tenant_key_segment(&tenant_id),
+            tenant_id.as_str(),
+            None,
+            now_millis(),
+        )?;
         Ok(store)
+    }
+
+    fn touch_tenant_engine(
+        &self,
+        tenant_key: &str,
+        tenant_id: &str,
+        data_dir: Option<String>,
+        now_ms: u64,
+    ) -> Result<(), StoreAccessError> {
+        let mut engines = self
+            .tenant_engines
+            .lock()
+            .map_err(|_| StoreAccessError::internal("tenant engine state lock poisoned"))?;
+        engines
+            .entry(tenant_key.to_string())
+            .and_modify(|meta| meta.touch_hot(now_ms, data_dir.clone()))
+            .or_insert_with(|| {
+                TenantEngineMeta::new(tenant_id, TenantEngineState::Hot, data_dir, now_ms)
+            });
+        Ok(())
     }
 
     /// Snapshot of every RedCore tenant currently materialized in the
@@ -999,7 +1323,6 @@ mod standing_pass_activation_tests {
 #[derive(Debug)]
 pub struct RedCoreTenantExecutor {
     writer: Mutex<RedCoreGraphStore>,
-    committed_snapshot: RwLock<InMemoryGraphStore>,
     tenant_memory_quota_bytes: usize,
     /// §P6-A pa6.1: cached `(graph_version, edges)` pair. Algorithm endpoints
     /// share the underlying allocation across concurrent calls; any mutation
@@ -1026,104 +1349,24 @@ impl HookStoreAccess for ExecutorHookStore {
 
 impl RedCoreTenantExecutor {
     fn new(store: RedCoreGraphStore, tenant_memory_quota_bytes: usize) -> GraphStoreResult<Self> {
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(store.graph_snapshot())?;
         Ok(Self {
             writer: Mutex::new(store),
-            committed_snapshot: RwLock::new(committed_snapshot),
             tenant_memory_quota_bytes,
             cached_edges: RwLock::new(None),
             hook_dispatcher: Mutex::new(None),
         })
     }
 
-    /// Run a coalesced hook batch under the writer lock, then advance the read
-    /// mirror with the hook's committed node/edge records. Hook handlers write
-    /// through the writer, bypassing `RedCoreTenantExecutor::commit_batch`, so
-    /// the writer records committed mutations while this bridge is active. Rare
-    /// hook writes that cannot be represented as node/edge upserts fall back to a
-    /// full refresh. Never unwraps a lock (fails open on poison).
+    /// Run a coalesced hook batch under the writer lock. The executor no longer
+    /// keeps a second committed read mirror, so hook writes become visible
+    /// through the single writer store as soon as they commit.
     fn run_hook_batch(&self, f: &mut dyn FnMut(&mut RedCoreGraphStore)) -> bool {
         let mut writer = match self.writer.lock() {
             Ok(writer) => writer,
             Err(_) => return false,
         };
-        let before = writer.status();
-        writer.start_recording_committed_mutations();
         f(&mut writer);
-        let recorded = writer.take_recorded_committed_mutations();
-        let after = writer.status();
-        if let Some(batch) = recorded {
-            if !batch.mutations.is_empty() {
-                if let Err(error) = self.apply_committed_batch_or_refresh(&writer, batch) {
-                    tracing::warn!(
-                        error_code = %error.code,
-                        error_message = %error.message,
-                        "hook committed snapshot refresh failed"
-                    );
-                }
-            } else if (after.graph_version, after.last_txn_id)
-                != (before.graph_version, before.last_txn_id)
-            {
-                if let Err(error) = self.refresh_committed_snapshot_from_writer(&writer) {
-                    tracing::warn!(
-                        error_code = %error.code,
-                        error_message = %error.message,
-                        "hook changed RedCore without recordable mutations; full snapshot refresh failed"
-                    );
-                }
-            }
-        }
         true
-    }
-
-    fn refresh_committed_snapshot_from_writer(
-        &self,
-        writer: &RedCoreGraphStore,
-    ) -> GraphStoreResult<()> {
-        let committed_snapshot = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
-        *self.committed_snapshot.write().map_err(|_| {
-            GraphStoreError::new(
-                "redcore_snapshot_lock_poisoned",
-                "RedCore committed snapshot lock poisoned",
-            )
-        })? = committed_snapshot;
-        Ok(())
-    }
-
-    fn apply_committed_batch_to_snapshot(&self, batch: GraphMutationBatch) -> GraphStoreResult<()> {
-        let mut snapshot = self.committed_snapshot.write().map_err(|_| {
-            GraphStoreError::new(
-                "redcore_snapshot_lock_poisoned",
-                "RedCore committed snapshot lock poisoned",
-            )
-        })?;
-        for mutation in batch.mutations {
-            match mutation {
-                GraphMutation::NodeUpsert(node) => {
-                    snapshot.upsert_node(node)?;
-                }
-                GraphMutation::EdgeUpsert(edge) => {
-                    snapshot.upsert_edge(edge)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_committed_batch_or_refresh(
-        &self,
-        writer: &RedCoreGraphStore,
-        batch: GraphMutationBatch,
-    ) -> GraphStoreResult<()> {
-        if let Err(error) = self.apply_committed_batch_to_snapshot(batch) {
-            tracing::warn!(
-                error_code = %error.code,
-                error_message = %error.message,
-                "incremental committed snapshot refresh failed; rebuilding from writer"
-            );
-            self.refresh_committed_snapshot_from_writer(writer)?;
-        }
-        Ok(())
     }
 
     /// Attach a hook dispatcher to this tenant store: start the worker over the
@@ -1182,7 +1425,7 @@ impl RedCoreTenantExecutor {
                 }
             }
         }
-        let edges = self.with_snapshot(|snapshot| snapshot.snapshot().edges)?;
+        let edges = self.lock_writer()?.graph_snapshot().edges;
         let arc = Arc::new(edges);
         let mut guard = self.cached_edges.write().map_err(|_| {
             GraphStoreError::new(
@@ -1195,23 +1438,9 @@ impl RedCoreTenantExecutor {
     }
 
     pub fn commit_batch(&self, batch: GraphMutationBatch) -> GraphStoreResult<GraphTransaction> {
-        let fallback_batch = batch.clone();
         let mut writer = self.lock_writer()?;
         self.enforce_tenant_memory_quota(&writer, &batch)?;
-        writer.start_recording_committed_mutations();
-        let transaction = match writer.commit_batch(batch) {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                let _ = writer.take_recorded_committed_mutations();
-                return Err(error);
-            }
-        };
-        let snapshot_batch = writer
-            .take_recorded_committed_mutations()
-            .filter(|batch| !batch.mutations.is_empty())
-            .unwrap_or(fallback_batch);
-        self.apply_committed_batch_or_refresh(&writer, snapshot_batch)?;
-        Ok(transaction)
+        writer.commit_batch(batch)
     }
 
     pub fn upsert_node(&self, node: NodeRecord) -> GraphStoreResult<GraphWriteResult> {
@@ -1236,42 +1465,38 @@ impl RedCoreTenantExecutor {
     }
 
     pub fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
-        self.with_snapshot(|snapshot| snapshot.get_node(id).cloned())
+        self.lock_writer()?.get_node(id)
     }
 
     pub fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
-        self.with_snapshot(|snapshot| snapshot.get_edge(id).cloned())
+        self.lock_writer()?.get_edge(id)
     }
 
     pub fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
-        self.with_snapshot(|snapshot| snapshot.query_nodes(query))
+        self.lock_writer()?.query_nodes(query)
     }
 
     pub fn memory_documents_by_updated_at(
         &self,
         query: MemoryDocumentQuery,
     ) -> GraphStoreResult<Vec<NodeRecord>> {
-        self.with_snapshot(|snapshot| snapshot.memory_documents_by_updated_at(query))
+        self.lock_writer()?.memory_documents_by_updated_at(query)
     }
 
     pub fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
-        self.with_snapshot(|snapshot| snapshot.neighbors(query))
+        self.lock_writer()?.neighbors(query)
     }
 
     pub fn stats(&self) -> GraphStoreResult<GraphStats> {
-        self.with_snapshot(|snapshot| {
-            let mut stats = snapshot.stats();
-            stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
-            stats
-        })
+        let mut stats = self.lock_writer()?.stats()?;
+        stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
+        Ok(stats)
     }
 
     pub fn cheap_stats(&self) -> GraphStoreResult<GraphStats> {
-        self.with_snapshot(|snapshot| {
-            let mut stats = snapshot.stats_without_memory_estimate();
-            stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
-            stats
-        })
+        let mut stats = self.lock_writer()?.stats()?;
+        stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
+        Ok(stats)
     }
 
     pub fn cached_edges_diagnostics(&self) -> Value {
@@ -1299,23 +1524,26 @@ impl RedCoreTenantExecutor {
         }
     }
 
+    pub fn clear_hot_caches(&self) {
+        if let Ok(mut guard) = self.cached_edges.write() {
+            *guard = None;
+        }
+    }
+
     pub fn verify(&self) -> GraphStoreResult<VerifyReport> {
-        self.with_snapshot(|snapshot| snapshot.verify())
+        self.lock_writer()?.verify()
     }
 
     pub fn rebuild_indexes(&self) -> GraphStoreResult<GraphRebuildReport> {
         let mut writer = self.lock_writer()?;
-        let report = writer.rebuild_indexes()?;
-        self.refresh_committed_snapshot_from_writer(&writer)?;
-        Ok(report)
+        writer.rebuild_indexes()
     }
 
     // ---- TTL surface (TTL-04) ---------------------------------------
     //
-    // These methods wrap the inherent TTL methods on RedCoreGraphStore
-    // with the same writer-then-refresh-snapshot pattern as commit_batch
-    // and rebuild_indexes, so reads against `committed_snapshot` reflect
-    // the new state immediately after the write returns.
+    // These methods wrap the inherent TTL methods on RedCoreGraphStore through
+    // the single tenant writer, so there is no second resident read mirror to
+    // keep in sync.
 
     /// Set or clear `_ttl_expires_at_ms` on an existing node. Routes
     /// through RedCoreGraphStore::set_node_ttl which journals the change
@@ -1326,75 +1554,58 @@ impl RedCoreTenantExecutor {
         expires_at_ms: Option<i64>,
     ) -> GraphStoreResult<GraphWriteResult> {
         let mut writer = self.lock_writer()?;
-        let write = writer.set_node_ttl(id, expires_at_ms)?;
-        match writer.get_node_including_expired(&write.id)? {
-            Some(node) => {
-                self.apply_committed_batch_or_refresh(
-                    &writer,
-                    GraphMutationBatch::new([GraphMutation::NodeUpsert(node)]),
-                )?;
-            }
-            None => self.refresh_committed_snapshot_from_writer(&writer)?,
-        }
-        Ok(write)
+        writer.set_node_ttl(id, expires_at_ms)
     }
 
-    /// Read a node regardless of TTL window. Reads through the writer
-    /// directly because committed_snapshot's filter would hide expired
-    /// nodes from the forensic path. Used by admin / debug surfaces.
+    /// Read a node regardless of TTL window. Used by admin / debug surfaces.
     pub fn get_node_including_expired(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
         let writer = self.lock_writer()?;
         writer.get_node_including_expired(id)
     }
 
     /// Return nodes whose `_ttl_expires_at_ms <= ts_ms`, ordered by
-    /// expiration. Read-only -- uses the committed snapshot.
+    /// expiration. Read-only.
     pub fn nodes_expiring_before(
         &self,
         ts_ms: i64,
         limit: usize,
     ) -> GraphStoreResult<Vec<NodeRecord>> {
-        self.with_snapshot(|snapshot| snapshot.nodes_expiring_before(ts_ms, limit))
+        Ok(self.lock_writer()?.nodes_expiring_before(ts_ms, limit))
     }
 
     /// Number of TTL-bearing live nodes in this tenant's graph.
     pub fn ttl_active_count(&self) -> GraphStoreResult<usize> {
-        self.with_snapshot(|snapshot| snapshot.ttl_active_count())
+        Ok(self.lock_writer()?.ttl_active_count())
     }
 
     /// Sweep expired nodes from this tenant's graph durably. Locks the
-    /// writer, journals each expired node as a NodeDelete AOF op,
-    /// refreshes the committed snapshot when needed. Returns the count purged.
-    /// Called by the background sweep task.
+    /// writer and journals each expired node as a NodeDelete AOF op. Returns
+    /// the count purged. Called by the background sweep task.
     pub fn purge_expired_nodes(&self) -> GraphStoreResult<usize> {
         let mut writer = self.lock_writer()?;
-        let purged = writer.purge_expired_nodes()?;
-        if purged > 0 {
-            self.refresh_committed_snapshot_from_writer(&writer)?;
-        }
-        Ok(purged)
+        writer.purge_expired_nodes()
     }
 
     pub fn labels(&self) -> GraphStoreResult<Vec<String>> {
-        self.with_snapshot(|snapshot| snapshot.labels())
+        self.lock_writer()?.labels()
     }
 
     pub fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
-        self.with_snapshot(|snapshot| snapshot.edge_types())
+        self.lock_writer()?.edge_types()
     }
 
     pub fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
-        self.with_snapshot(|snapshot| snapshot.property_keys())
+        self.lock_writer()?.property_keys()
     }
 
     /// Phase 6: snapshot all live edges for graph-algorithm endpoints.
     /// Returns a clone of the edge vector; caller must not hold a lock.
     pub fn list_edges(&self) -> GraphStoreResult<Vec<EdgeRecord>> {
-        self.with_snapshot(|snapshot| snapshot.snapshot().edges)
+        Ok(self.lock_writer()?.graph_snapshot().edges)
     }
 
     pub fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
-        self.with_snapshot(|snapshot| snapshot.snapshot())
+        Ok(self.lock_writer()?.graph_snapshot())
     }
 
     pub fn epistemic_neighbors(
@@ -1404,9 +1615,12 @@ impl RedCoreTenantExecutor {
         min_confidence: Option<f64>,
         max_depth: Option<usize>,
     ) -> GraphStoreResult<Vec<(EdgeRecord, NodeRecord)>> {
-        self.with_snapshot(|snapshot| {
-            snapshot.epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
-        })
+        Ok(self.lock_writer()?.epistemic_neighbors(
+            node_id,
+            epistemic_types,
+            min_confidence,
+            max_depth,
+        ))
     }
 
     pub fn designate_vector_property(
@@ -1416,17 +1630,7 @@ impl RedCoreTenantExecutor {
         dimension: usize,
     ) -> GraphStoreResult<()> {
         let mut writer = self.lock_writer()?;
-        writer.designate_vector_property(label, property_name, dimension)?;
-        self.committed_snapshot
-            .write()
-            .map_err(|_| {
-                GraphStoreError::new(
-                    "redcore_snapshot_lock_poisoned",
-                    "RedCore committed snapshot lock poisoned",
-                )
-            })?
-            .designate_vector_property(label, property_name, dimension)?;
-        Ok(())
+        writer.designate_vector_property(label, property_name, dimension)
     }
 
     pub fn vector_designations(&self) -> GraphStoreResult<Vec<VectorDesignation>> {
@@ -1490,16 +1694,6 @@ impl RedCoreTenantExecutor {
         })
     }
 
-    fn with_snapshot<T>(&self, read: impl FnOnce(&InMemoryGraphStore) -> T) -> GraphStoreResult<T> {
-        let snapshot = self.committed_snapshot.read().map_err(|_| {
-            GraphStoreError::new(
-                "redcore_snapshot_lock_poisoned",
-                "RedCore committed snapshot lock poisoned",
-            )
-        })?;
-        Ok(read(&snapshot))
-    }
-
     fn enforce_tenant_memory_quota(
         &self,
         writer: &RedCoreGraphStore,
@@ -1541,6 +1735,18 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1721,7 +1927,7 @@ impl TenantGraphStore {
 
     pub fn snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
         match self {
-            Self::RedCore(store) => store.with_snapshot(|snapshot| snapshot.snapshot()),
+            Self::RedCore(store) => store.graph_snapshot(),
             Self::Redis(_) => Err(GraphStoreError::new(
                 "unsupported_operation",
                 "adapter routing requires a RedCore graph snapshot",
@@ -2984,10 +3190,11 @@ impl McpGraphProvider for AppState {
 #[cfg(test)]
 mod tests {
     use crate::config::{Config, StorageMode};
+    use crate::tenant_router::{tenant_data_dir, tenant_key_segment, TenantId};
 
     use super::{
-        app_affordance_response_json, normalize_grpc_endpoint, AppState,
-        InvokeAppAffordanceGrpcResponse, RedCoreTenantExecutor,
+        app_affordance_response_json, normalize_grpc_endpoint, now_millis, AppState,
+        InvokeAppAffordanceGrpcResponse, RedCoreTenantExecutor, TenantEngineState,
     };
     use rustyred_thg_core::{
         EdgeRecord, GraphMutation, GraphMutationBatch, NeighborQuery, NodeRecord,
@@ -3190,11 +3397,16 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         });
 
         assert_eq!(
             state.tenant_state_key("Tenant.One!"),
-            "rusty-red:pct_Tenant.One%21:state:v1"
+            format!(
+                "rusty-red:{}:state:v1",
+                tenant_key_segment(&TenantId::new("Tenant.One!").unwrap())
+            )
         );
     }
 
@@ -3271,6 +3483,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         };
         {
             let state = AppState::new(config.clone());
@@ -3291,6 +3505,185 @@ mod tests {
             store.get_node("node:embedded").unwrap().unwrap().labels,
             vec!["Embedded".to_string()]
         );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn embedded_front_door_keeps_historical_tenant_colliders_separate_after_restart() {
+        let data_dir = unique_test_dir("rusty-red-tenant-router");
+        let mut config = Config::default_for_tests();
+        config.storage_mode = StorageMode::Embedded;
+        config.data_dir = data_dir.display().to_string();
+        config.durability = RedCoreDurability::AofAlways;
+        config.snapshot_interval_writes = 100;
+
+        let tenant_a = TenantId::new("acme/prod").unwrap();
+        let tenant_b = TenantId::new("acme.prod").unwrap();
+        assert_ne!(
+            tenant_data_dir(&data_dir, &tenant_a),
+            tenant_data_dir(&data_dir, &tenant_b)
+        );
+
+        {
+            let state = AppState::new(config.clone());
+            let mut store = state.tenant_graph_store(tenant_a.as_str()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:payload",
+                    ["Payload"],
+                    json!({ "body": "byte-identical" }),
+                ))
+                .unwrap();
+        }
+
+        let state = AppState::new(config);
+        let tenant_a_store = state.tenant_graph_store(tenant_a.as_str()).unwrap();
+        let tenant_b_store = state.tenant_graph_store(tenant_b.as_str()).unwrap();
+
+        assert_eq!(
+            tenant_a_store
+                .get_node("node:payload")
+                .unwrap()
+                .unwrap()
+                .properties["body"],
+            json!("byte-identical")
+        );
+        assert!(
+            tenant_b_store.get_node("node:payload").unwrap().is_none(),
+            "historically colliding tenant must open an empty separate graph"
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn embedded_tenant_lifecycle_cold_hot_cold_reopens_on_request() {
+        let data_dir = unique_test_dir("rusty-red-tenant-lifecycle");
+        let mut config = Config::default_for_tests();
+        config.storage_mode = StorageMode::Embedded;
+        config.data_dir = data_dir.display().to_string();
+        config.durability = RedCoreDurability::AofAlways;
+        config.snapshot_interval_writes = 100;
+        config.tenant_idle_ms = 1;
+        config.tenant_warm_pool_size = 0;
+        let state = AppState::new(config);
+
+        assert_eq!(state.tenant_engine_state("tenant-life").unwrap(), None);
+        {
+            let mut store = state.tenant_graph_store("tenant-life").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:life",
+                    ["Lifecycle"],
+                    json!({ "body": "survives cold suspend" }),
+                ))
+                .unwrap();
+            assert_eq!(
+                state.tenant_engine_state("tenant-life").unwrap(),
+                Some(TenantEngineState::Hot)
+            );
+            assert_eq!(state.iter_redcore_tenants().unwrap().len(), 1);
+        }
+
+        let sweep = state
+            .sweep_idle_tenant_engines_at(now_millis().saturating_add(10))
+            .unwrap();
+        assert_eq!(sweep.cooled_to_cold, 1);
+        assert_eq!(
+            state.tenant_engine_state("tenant-life").unwrap(),
+            Some(TenantEngineState::Cold)
+        );
+        assert_eq!(state.iter_redcore_tenants().unwrap().len(), 0);
+        let cold_report = state
+            .tenant_engine_reports()
+            .unwrap()
+            .into_iter()
+            .find(|report| report.tenant == "tenant-life")
+            .unwrap();
+        assert_eq!(cold_report.resident_memory_bytes, 0);
+
+        let store = state.tenant_graph_store("tenant-life").unwrap();
+        assert_eq!(
+            store.get_node("node:life").unwrap().unwrap().properties["body"],
+            json!("survives cold suspend")
+        );
+        assert_eq!(
+            state.tenant_engine_state("tenant-life").unwrap(),
+            Some(TenantEngineState::Hot)
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn embedded_tenant_lifecycle_respects_warm_pool_limit() {
+        let data_dir = unique_test_dir("rusty-red-tenant-warm-pool");
+        let mut config = Config::default_for_tests();
+        config.storage_mode = StorageMode::Embedded;
+        config.data_dir = data_dir.display().to_string();
+        config.durability = RedCoreDurability::AofAlways;
+        config.snapshot_interval_writes = 100;
+        config.tenant_idle_ms = 1;
+        config.tenant_warm_pool_size = 1;
+        let state = AppState::new(config);
+
+        {
+            let mut first = state.tenant_graph_store("tenant-warm-a").unwrap();
+            first
+                .upsert_node(NodeRecord::new("node:a", ["Warm"], json!({})))
+                .unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        {
+            let mut second = state.tenant_graph_store("tenant-warm-b").unwrap();
+            second
+                .upsert_node(NodeRecord::new("node:b", ["Warm"], json!({})))
+                .unwrap();
+        }
+
+        let sweep = state
+            .sweep_idle_tenant_engines_at(now_millis().saturating_add(10))
+            .unwrap();
+        assert_eq!(sweep.cooled_to_warm, 1);
+        assert_eq!(sweep.cooled_to_cold, 1);
+        assert_eq!(state.iter_redcore_tenants().unwrap().len(), 1);
+        let reports = state.tenant_engine_reports().unwrap();
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| report.state == TenantEngineState::Warm)
+                .count(),
+            1
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| report.state == TenantEngineState::Cold)
+                .count(),
+            1
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn tenant_engine_prometheus_exposes_per_tenant_state() {
+        let data_dir = unique_test_dir("rusty-red-tenant-metrics");
+        let mut config = Config::default_for_tests();
+        config.storage_mode = StorageMode::Embedded;
+        config.data_dir = data_dir.display().to_string();
+        config.durability = RedCoreDurability::AofAlways;
+        config.snapshot_interval_writes = 100;
+        let state = AppState::new(config);
+
+        let _store = state.tenant_graph_store("tenant-metrics").unwrap();
+        let metrics = state.render_tenant_engine_prometheus().unwrap();
+
+        assert!(metrics.contains(
+            "rustyred_thg_tenant_engine_state{tenant=\"tenant-metrics\",state=\"hot\"} 2"
+        ));
+        assert!(metrics.contains("rustyred_thg_tenant_engine_resident_bytes"));
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -3331,6 +3724,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         });
 
         let error = state.store_ready().unwrap_err();
@@ -3375,6 +3770,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         });
 
         let report = state.store_ready().unwrap();
@@ -3422,7 +3819,7 @@ mod tests {
     }
 
     #[test]
-    fn redcore_executor_reads_only_committed_snapshots() {
+    fn redcore_executor_publishes_only_successful_commits() {
         let executor = RedCoreTenantExecutor::new(RedCoreGraphStore::memory(), 0).unwrap();
         let error = executor
             .commit_batch(GraphMutationBatch::new([
@@ -3926,6 +4323,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         }
     }
 
@@ -3974,6 +4373,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         })
     }
 

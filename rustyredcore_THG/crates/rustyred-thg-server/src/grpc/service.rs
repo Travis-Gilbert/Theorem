@@ -1676,6 +1676,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1_000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         }
     }
 

@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, env, fs};
 
 use crate::auth::ApiToken;
+use crate::tenant_router::{tenant_key_segment, TenantId};
 use rustyred_thg_core::{default_hybrid_edge_type_weights, HybridScoringConfig, RedCoreDurability};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,12 @@ pub struct Config {
     /// precision but more CPU; higher = cheaper but expired nodes
     /// linger longer in storage (reads filter them either way).
     pub ttl_sweep_ms: u64,
+    /// Per-tenant idle interval before a hosted RedCore engine is eligible to
+    /// leave the hot set. Env: `RUSTY_RED_TENANT_IDLE_MS`.
+    pub tenant_idle_ms: u64,
+    /// Number of idle hosted RedCore engines to retain warm. Env:
+    /// `RUSTY_RED_TENANT_WARM_POOL_SIZE`.
+    pub tenant_warm_pool_size: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -259,6 +266,21 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1000);
+        let tenant_idle_ms =
+            env_first(&["RUSTY_RED_TENANT_IDLE_MS", "RUSTYRED_THG_TENANT_IDLE_MS"])
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300_000);
+        let (tenant_warm_pool_size, warm_pool_error) = env_usize(
+            &[
+                "RUSTY_RED_TENANT_WARM_POOL_SIZE",
+                "RUSTYRED_THG_TENANT_WARM_POOL_SIZE",
+            ],
+            0,
+        );
+        if tenant_config_error.is_none() {
+            tenant_config_error = warm_pool_error;
+        }
 
         Self {
             host,
@@ -294,6 +316,8 @@ impl Config {
             mcp_default_tenant,
             mcp_graphql_default_surface,
             ttl_sweep_ms,
+            tenant_idle_ms,
+            tenant_warm_pool_size,
         }
     }
 
@@ -338,6 +362,8 @@ impl Config {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 50,
+            tenant_idle_ms: 50,
+            tenant_warm_pool_size: 0,
         }
     }
 
@@ -357,6 +383,9 @@ impl Config {
         }
         if self.ttl_sweep_ms == 0 {
             return Err("RUSTYRED_THG_TTL_SWEEP_MS must be greater than 0".to_string());
+        }
+        if self.tenant_idle_ms == 0 {
+            return Err("RUSTY_RED_TENANT_IDLE_MS must be greater than 0".to_string());
         }
         if self.storage_mode == StorageMode::Embedded
             && self.require_volume
@@ -404,11 +433,13 @@ impl Config {
     }
 
     pub fn tenant_config(&self, tenant_id: &str) -> EffectiveTenantConfig {
-        let key = rustyred_thg_core::sanitize_tenant_segment(tenant_id);
-        let override_config = self
-            .tenant_config_overrides
-            .get(tenant_id)
-            .or_else(|| self.tenant_config_overrides.get(&key));
+        let key = TenantId::new(tenant_id)
+            .ok()
+            .map(|tenant_id| tenant_key_segment(&tenant_id));
+        let override_config = self.tenant_config_overrides.get(tenant_id).or_else(|| {
+            key.as_ref()
+                .and_then(|key| self.tenant_config_overrides.get(key))
+        });
         let mut hybrid_scoring = self.hybrid_scoring.clone();
         if hybrid_scoring.edge_type_weights.is_empty() {
             hybrid_scoring.edge_type_weights = default_hybrid_edge_type_weights();
@@ -572,6 +603,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         }
     }
 

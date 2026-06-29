@@ -1791,20 +1791,40 @@ fn memory_node_node(node: &MemoryNodeState) -> MemoryResult<NodeRecord> {
 }
 
 fn document_from_node(node: NodeRecord) -> MemoryResult<MemoryDocumentState> {
-    serde_json::from_value::<MemoryDocumentState>(node.properties)
-        .map_err(|error| MemoryError::Deserialization(error.to_string()))
+    let (document, _) = document_with_properties_from_node(node)?;
+    Ok(document)
+}
+
+fn document_with_properties_from_node(
+    node: NodeRecord,
+) -> MemoryResult<(MemoryDocumentState, Map<String, Value>)> {
+    let properties = node.properties;
+    let graph_properties = properties.as_object().cloned().unwrap_or_default();
+    let document = serde_json::from_value::<MemoryDocumentState>(properties)
+        .map_err(|error| MemoryError::Deserialization(error.to_string()))?;
+    Ok((document, graph_properties))
 }
 
 fn node_from_node(node: NodeRecord) -> MemoryResult<MemoryNodeState> {
-    serde_json::from_value::<MemoryNodeState>(node.properties)
-        .map_err(|error| MemoryError::Deserialization(error.to_string()))
+    let (memory_node, _) = memory_node_with_properties_from_node(node)?;
+    Ok(memory_node)
 }
 
-fn load_memory_documents<S: MemoryGraphStore>(
+fn memory_node_with_properties_from_node(
+    node: NodeRecord,
+) -> MemoryResult<(MemoryNodeState, Map<String, Value>)> {
+    let properties = node.properties;
+    let graph_properties = properties.as_object().cloned().unwrap_or_default();
+    let memory_node = serde_json::from_value::<MemoryNodeState>(properties)
+        .map_err(|error| MemoryError::Deserialization(error.to_string()))?;
+    Ok((memory_node, graph_properties))
+}
+
+fn load_memory_document_records<S: MemoryGraphStore>(
     store: &S,
     tenant_slug: &str,
     include_inactive: bool,
-) -> MemoryResult<Vec<MemoryDocumentState>> {
+) -> MemoryResult<Vec<(MemoryDocumentState, Map<String, Value>)>> {
     let tenant_slug = normalize_tenant_slug(tenant_slug);
     let mut seen_nodes = BTreeSet::new();
     let mut documents = Vec::new();
@@ -1819,9 +1839,11 @@ fn load_memory_documents<S: MemoryGraphStore>(
             if !seen_nodes.insert(node_id.clone()) {
                 continue;
             }
-            match document_from_node(node) {
-                Ok(document) if include_inactive || document.status == DEFAULT_STATUS => {
-                    documents.push(document)
+            match document_with_properties_from_node(node) {
+                Ok((document, properties))
+                    if include_inactive || document.status == DEFAULT_STATUS =>
+                {
+                    documents.push((document, properties))
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -1835,15 +1857,28 @@ fn load_memory_documents<S: MemoryGraphStore>(
             }
         }
     }
-    documents.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    documents.sort_by(|(left, _), (right, _)| right.updated_at.cmp(&left.updated_at));
     Ok(documents)
 }
 
-fn load_memory_nodes<S: MemoryGraphStore>(
+fn load_memory_documents<S: MemoryGraphStore>(
     store: &S,
     tenant_slug: &str,
     include_inactive: bool,
-) -> MemoryResult<Vec<MemoryNodeState>> {
+) -> MemoryResult<Vec<MemoryDocumentState>> {
+    Ok(
+        load_memory_document_records(store, tenant_slug, include_inactive)?
+            .into_iter()
+            .map(|(document, _)| document)
+            .collect(),
+    )
+}
+
+fn load_memory_node_records<S: MemoryGraphStore>(
+    store: &S,
+    tenant_slug: &str,
+    include_inactive: bool,
+) -> MemoryResult<Vec<(MemoryNodeState, Map<String, Value>)>> {
     let tenant_slug = normalize_tenant_slug(tenant_slug);
     let mut seen_nodes = BTreeSet::new();
     let mut nodes = Vec::new();
@@ -1858,8 +1893,10 @@ fn load_memory_nodes<S: MemoryGraphStore>(
             if !seen_nodes.insert(node_id.clone()) {
                 continue;
             }
-            match node_from_node(record) {
-                Ok(node) if include_inactive || node.status == DEFAULT_STATUS => nodes.push(node),
+            match memory_node_with_properties_from_node(record) {
+                Ok((node, properties)) if include_inactive || node.status == DEFAULT_STATUS => {
+                    nodes.push((node, properties))
+                }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -1872,7 +1909,7 @@ fn load_memory_nodes<S: MemoryGraphStore>(
             }
         }
     }
-    nodes.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    nodes.sort_by(|(left, _), (right, _)| right.updated_at.cmp(&left.updated_at));
     Ok(nodes)
 }
 
@@ -2033,6 +2070,7 @@ struct RecallAtom {
     graph_id: String,
     item: MemoryRecallItem,
     text: String,
+    properties: Map<String, Value>,
 }
 
 #[derive(Clone, Default)]
@@ -2052,7 +2090,7 @@ fn load_recall_atoms<S: MemoryGraphStore>(
     include_low_fitness: bool,
 ) -> MemoryResult<Vec<RecallAtom>> {
     let mut atoms = Vec::new();
-    for document in load_memory_documents(store, tenant_slug, false)? {
+    for (document, properties) in load_memory_document_records(store, tenant_slug, false)? {
         if !document_matches_recall(
             &document,
             "",
@@ -2070,9 +2108,10 @@ fn load_recall_atoms<S: MemoryGraphStore>(
             graph_id,
             item: recall_item_for_document(document),
             text,
+            properties,
         });
     }
-    for node in load_memory_nodes(store, tenant_slug, false)? {
+    for (node, properties) in load_memory_node_records(store, tenant_slug, false)? {
         if !node_matches_recall(
             &node,
             "",
@@ -2090,6 +2129,7 @@ fn load_recall_atoms<S: MemoryGraphStore>(
             graph_id,
             item: recall_item_for_node(node),
             text,
+            properties,
         });
     }
     Ok(atoms)
@@ -2183,14 +2223,15 @@ fn load_recall_atom_by_graph_id<S: MemoryGraphStore>(
     };
     let node_id = record.id.clone();
     if record.labels.iter().any(|label| label == "MemoryDocument") {
-        match document_from_node(record) {
-            Ok(document) => {
+        match document_with_properties_from_node(record) {
+            Ok((document, properties)) => {
                 let graph_id = memory_document_node_id(&document.tenant_slug, &document.doc_id);
                 let text = memory_document_text(&document);
                 Ok(Some(RecallAtom {
                     graph_id,
                     item: recall_item_for_document(document),
                     text,
+                    properties,
                 }))
             }
             Err(error) => {
@@ -2204,14 +2245,15 @@ fn load_recall_atom_by_graph_id<S: MemoryGraphStore>(
             }
         }
     } else if record.labels.iter().any(|label| label == "MemoryNode") {
-        match node_from_node(record) {
-            Ok(node) => {
+        match memory_node_with_properties_from_node(record) {
+            Ok((node, properties)) => {
                 let graph_id = memory_node_node_id(&node.tenant_slug, &node.node_id);
                 let text = memory_node_text(&node);
                 Ok(Some(RecallAtom {
                     graph_id,
                     item: recall_item_for_node(node),
                     text,
+                    properties,
                 }))
             }
             Err(error) => {
@@ -3025,10 +3067,17 @@ fn atom_embedding_score(atom: &RecallAtom, query_embedding: &[f32], property: &s
         property.trim()
     };
     let embedding = atom
-        .item
-        .document
-        .as_ref()
-        .and_then(|document| embedding_from_metadata(&document.metadata, property))
+        .properties
+        .get(property)
+        .or_else(|| atom.properties.get("embedding"))
+        .or_else(|| atom.properties.get("vector"))
+        .and_then(float_array)
+        .or_else(|| {
+            atom.item
+                .document
+                .as_ref()
+                .and_then(|document| embedding_from_metadata(&document.metadata, property))
+        })
         .or_else(|| {
             atom.item
                 .node
@@ -3443,6 +3492,7 @@ pub fn recompute_memory_community_summaries<S: MemoryGraphStore>(
             graph_id: memory_document_node_id(&tenant_slug, &document.doc_id),
             item: recall_item_for_document(document.clone()),
             text: memory_document_text(document),
+            properties: Map::new(),
         })
         .collect::<Vec<_>>();
     let top = community_summary_document(
@@ -4820,6 +4870,61 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, document.doc_id);
         assert_eq!(results[0].served_tier, "abstract");
+    }
+
+    #[test]
+    fn recall_vector_score_reads_root_graph_embedding_property() {
+        let mut store = InMemoryGraphStore::new();
+        let document = create_memory_document(
+            &mut store,
+            MemoryWriteInput {
+                tenant_slug: TENANT.to_string(),
+                kind: "decision".to_string(),
+                title: "Root vector recall".to_string(),
+                content: "The memory embedding is indexed on the graph node root.".to_string(),
+                created_at: T1.to_string(),
+                ..MemoryWriteInput::default()
+            },
+        )
+        .unwrap();
+        let graph_id = memory_document_node_id(TENANT, &document.doc_id);
+        let mut record = store.get_node(&graph_id).cloned().unwrap();
+        record
+            .properties
+            .as_object_mut()
+            .unwrap()
+            .insert("embedding".to_string(), json!([1.0, 0.0, 0.0]));
+        store.upsert_node(record).unwrap();
+        store
+            .designate_vector_property("MemoryDocument", "embedding", 3)
+            .unwrap();
+
+        let results = recall_memory(
+            &mut store,
+            RecallMemoryInput {
+                tenant_slug: TENANT.to_string(),
+                query: "root vector recall".to_string(),
+                query_time: T2.to_string(),
+                limit: 1,
+                query_embedding: vec![1.0, 0.0, 0.0],
+                embedding_property: "embedding".to_string(),
+                ..RecallMemoryInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, document.doc_id);
+        assert!(
+            results[0].rank_signals["vector_seed_score"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
+        assert!(
+            results[0].rank_signals["vector_score"].as_f64().unwrap() > 0.99,
+            "per-item vector score should read the root graph embedding"
+        );
     }
 
     #[test]

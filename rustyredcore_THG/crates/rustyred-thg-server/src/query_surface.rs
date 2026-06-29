@@ -2568,6 +2568,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         });
         let mut store = state.tenant_graph_store("tenant-a").unwrap();
         store
