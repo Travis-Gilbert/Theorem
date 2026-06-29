@@ -1,0 +1,141 @@
+/* ============================================================
+   Marketing surface theme. Rescopes the console's existing token
+   NAMES (--bg, --ox, --elev-*, consumed by the shadcn @theme bridge
+   and the .material card) to the warm parchment brand + Amarna, so
+   shadcn <Button>/<Card> inherit the brand with zero per-component
+   restyling. Scoped to .marketing; the console theme is untouched.
+   ============================================================ */
+.marketing {
+  /* --- parchment value ramp --- */
+  --bg: #f5e6d2;
+  --surface: #fbf0e2;
+  --surface-2: #ebd8c0;
+  --raise: #fffaf2;
+  --recess: #f1e0c8;
+  --ink: #2a2420;
+  --muted: #6a5e52;
+  --faint: #9a8e82;
+  --line: rgba(42, 36, 32, 0.12);
+  --line-strong: rgba(42, 36, 32, 0.2);
+
+  /* --- warm multi-accent (rescopes --ox/--live; adds teal/gold) --- */
+  --ox: #a8301e; /* oxblood — deeper, redder than the old terracotta */
+  --ox-hover: #861e16;
+  --ox-tint: rgba(168, 48, 30, 0.1);
+  --ox-ring: rgba(45, 95, 107, 0.45); /* teal focus ring */
+  --live: #5a7a4a;
+  --warn: #9a6a1e;
+  --teal: #2d5f6b;
+  --gold: #c49a4a;
+  --green: #5a7a4a;
+  --blue: #4a7a9a;
+  --cta-1: #a8301e; /* oxblood CTA — white text 6.6:1 */
+  --cta-2: #861e16;
+
+  /* --- depth: override console elevation with the warm two-layer + light-from-above --- */
+  --elev-1: inset 0 1px 0 rgba(255, 253, 247, 0.85), 0 1px 1px rgba(42, 36, 32, 0.06), 0 2px 6px rgba(42, 36, 32, 0.07);
+  --elev-2: inset 0 1px 0 rgba(255, 253, 247, 0.85), 0 2px 3px rgba(42, 36, 32, 0.1), 0 8px 18px rgba(42, 36, 32, 0.12), 0 18px 36px rgba(42, 36, 32, 0.1);
+  --elev-3: inset 0 1px 0 rgba(255, 253, 247, 0.85), 0 3px 6px rgba(42, 36, 32, 0.14), 0 16px 30px rgba(42, 36, 32, 0.16), 0 38px 66px rgba(42, 36, 32, 0.2);
+  --inset: inset 0 2px 3px rgba(42, 36, 32, 0.13), inset 0 1px 1px rgba(42, 36, 32, 0.07);
+  --grain-opacity: 0.04;
+  /* dotted background grid: ink-derived dot, tiled on an 8px-grid cell */
+  --dot: rgba(42, 36, 32, 0.08);
+  --dot-step: 1.5rem;
+
+  /* --- fonts --- */
+  --font-title: var(--font-amarna), Georgia, serif;
+  --font-body: var(--font-plex-sans-reg), ui-sans-serif, system-ui, sans-serif;
+
+  min-height: 100vh;
+  color: var(--ink);
+  font-family: var(--font-body);
+  /* kerning + ligatures, site-wide on the marketing surface */
+  font-kerning: normal;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+  text-rendering: optimizeLegibility;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(120% 70% at 84% -8%, rgba(196, 154, 74, 0.2), transparent 46%),
+    radial-gradient(80% 60% at -6% 36%, rgba(45, 95, 107, 0.1), transparent 50%),
+    radial-gradient(var(--dot) 1px, transparent 1.5px);
+  background-size: cover, cover, var(--dot-step) var(--dot-step);
+  background-repeat: no-repeat, no-repeat, repeat;
+}
+
+/* paper grain over the whole surface (depth Layer 2) */
+.marketing::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: var(--grain-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.marketing > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* headings render in Amarna within the marketing surface */
+.marketing h1,
+.marketing h2,
+.marketing h3,
+.marketing .font-title {
+  font-family: var(--font-title);
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+.marketing .ink-accent {
+  color: var(--ox);
+  font-weight: 500;
+}
+
+/* eyebrow label (mono) */
+.mk-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--teal);
+}
+.mk-eyebrow::before {
+  content: "";
+  width: 22px;
+  height: 1px;
+  background: var(--teal);
+  opacity: 0.6;
+}
+
+/* the bespoke gradient-glow CTA (one per surface) */
+.mk-cta {
+  background: linear-gradient(180deg, var(--cta-1), var(--cta-2));
+  color: #fff7f0;
+  box-shadow: 0 0 0 1px rgba(184, 98, 61, 0.32), 0 10px 26px rgba(158, 72, 36, 0.34);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+.mk-cta:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 0 0 1px rgba(184, 98, 61, 0.45), 0 14px 32px rgba(158, 72, 36, 0.42);
+}
+
+/* recessed (debossed) input — depth contrast against the raised CTA */
+.mk-field {
+  background: var(--recess);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--inset);
+}
+.mk-field:focus-within {
+  border-color: var(--teal);
+  box-shadow: var(--inset), 0 0 0 3px rgba(45, 95, 107, 0.12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mk-cta {
+    transition: none;
+  }
+}
