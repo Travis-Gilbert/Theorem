@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::graph_store::{
     unix_ms, EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, NodeRecord,
 };
+use crate::merge_registry::MergeRegistry;
 use crate::state::stable_hash;
 use crate::zerocopy::{archive_content_object, archive_content_objects, GraphArchiveObjectBytes};
 
@@ -1366,6 +1367,22 @@ pub fn merge_graph_snapshots(
     theirs: &GraphSnapshot,
     options: GraphMergeOptions,
 ) -> GraphMergeResult {
+    merge_graph_snapshots_with_registry(
+        base,
+        ours,
+        theirs,
+        options,
+        &MergeRegistry::substrate_sync_defaults(),
+    )
+}
+
+pub fn merge_graph_snapshots_with_registry(
+    base: &GraphSnapshot,
+    ours: &GraphSnapshot,
+    theirs: &GraphSnapshot,
+    options: GraphMergeOptions,
+    registry: &MergeRegistry,
+) -> GraphMergeResult {
     let base_tree = build_prolly_tree(&snapshot_content_objects(base, false));
     let ours_tree = build_prolly_tree(&snapshot_content_objects(ours, false));
     let theirs_tree = build_prolly_tree(&snapshot_content_objects(theirs, false));
@@ -1396,6 +1413,7 @@ pub fn merge_graph_snapshots(
             theirs_record,
             &options.strategy,
             options.min_confidence_delta,
+            registry,
         ) {
             MergeDecision::Resolved {
                 selected,
@@ -1997,6 +2015,7 @@ fn resolve_merge_record(
     theirs: Option<&MergeRecord>,
     strategy: &GraphMergeStrategy,
     min_confidence_delta: f64,
+    registry: &MergeRegistry,
 ) -> MergeDecision {
     let base_hash = base.map(MergeRecord::hash);
     let ours_hash = ours.map(MergeRecord::hash);
@@ -2024,6 +2043,12 @@ fn resolve_merge_record(
         };
     }
 
+    if matches!(strategy, GraphMergeStrategy::AutoConfidence) {
+        if let Some(decision) = resolve_registry_merge(base, ours, theirs, registry) {
+            return decision;
+        }
+    }
+
     match strategy {
         GraphMergeStrategy::PreferOurs => MergeDecision::Resolved {
             selected: ours.map(|_| GraphMergeSide::Ours),
@@ -2046,6 +2071,28 @@ fn resolve_merge_record(
             reason: "manual_resolution_required".to_string(),
         },
     }
+}
+
+fn resolve_registry_merge(
+    base: Option<&MergeRecord>,
+    ours: Option<&MergeRecord>,
+    theirs: Option<&MergeRecord>,
+    registry: &MergeRegistry,
+) -> Option<MergeDecision> {
+    let (Some(MergeRecord::Node(ours)), Some(MergeRecord::Node(theirs))) = (ours, theirs) else {
+        return None;
+    };
+    let base = match base {
+        Some(MergeRecord::Node(node)) => Some(node),
+        Some(MergeRecord::Edge(_)) => return None,
+        None => None,
+    };
+    let resolution = registry.resolve_node(base, ours, theirs)?;
+    Some(MergeDecision::Resolved {
+        selected: None,
+        record: Some(MergeRecord::Node(resolution.node)),
+        reason: resolution.reason,
+    })
 }
 
 fn resolve_confidence_merge(
@@ -2106,6 +2153,31 @@ mod tests {
     use crate::graph_store::{
         EdgeRecord, GraphMutation, GraphMutationBatch, GraphSnapshot, NodeRecord,
     };
+    use crate::{ActorId, Hlc, MergeRegistry};
+
+    fn hlc(actor: &str, physical_ms: i64) -> Hlc {
+        Hlc::new(physical_ms, 0, ActorId::from_label(actor))
+    }
+
+    fn memory_node(status: &str, tags: &[&str], stamp: Hlc) -> NodeRecord {
+        NodeRecord::new(
+            "mem:a",
+            ["MemoryDocument"],
+            json!({
+                "status": status,
+                "confidence": 0.5,
+                "tags": tags,
+                "_crdt_hlc": {
+                    "record": stamp,
+                    "properties": {
+                        "status": stamp,
+                        "confidence": stamp,
+                        "tags": stamp
+                    }
+                }
+            }),
+        )
+    }
 
     #[test]
     fn compiler_builds_stable_tree_independent_of_record_order() {
@@ -2515,5 +2587,99 @@ mod tests {
         assert_eq!(merged.status, "conflicted");
         assert!(merged.merged_snapshot.is_none());
         assert_eq!(merged.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn empty_merge_registry_preserves_predecessor_node_conflict() {
+        let base = GraphSnapshot {
+            version: 1,
+            nodes: vec![NodeRecord::new(
+                "mem:a",
+                ["MemoryDocument"],
+                json!({"status": "active"}),
+            )],
+            edges: Vec::new(),
+        };
+        let ours = GraphSnapshot {
+            version: 2,
+            nodes: vec![NodeRecord::new(
+                "mem:a",
+                ["MemoryDocument"],
+                json!({"status": "archived"}),
+            )],
+            edges: Vec::new(),
+        };
+        let theirs = GraphSnapshot {
+            version: 3,
+            nodes: vec![NodeRecord::new(
+                "mem:a",
+                ["MemoryDocument"],
+                json!({"status": "deleted"}),
+            )],
+            edges: Vec::new(),
+        };
+
+        let merged = merge_graph_snapshots_with_registry(
+            &base,
+            &ours,
+            &theirs,
+            GraphMergeOptions::default(),
+            &MergeRegistry::default(),
+        );
+
+        assert_eq!(merged.status, "conflicted");
+        assert_eq!(merged.conflicts[0].reason, "both_sides_changed");
+    }
+
+    #[test]
+    fn merge_registry_lww_resolves_memory_status_by_latest_hlc() {
+        let base = GraphSnapshot {
+            version: 1,
+            nodes: vec![memory_node("active", &[], hlc("base", 10))],
+            edges: Vec::new(),
+        };
+        let ours = GraphSnapshot {
+            version: 2,
+            nodes: vec![memory_node("archived", &[], hlc("local", 20))],
+            edges: Vec::new(),
+        };
+        let theirs = GraphSnapshot {
+            version: 3,
+            nodes: vec![memory_node("deleted", &[], hlc("railway", 30))],
+            edges: Vec::new(),
+        };
+
+        let merged = merge_graph_snapshots(&base, &ours, &theirs, GraphMergeOptions::default());
+
+        assert_eq!(merged.status, "clean");
+        assert!(merged.resolved[0].reason.contains("status:lww"));
+        let node = &merged.merged_snapshot.unwrap().nodes[0];
+        assert_eq!(node.properties["status"].as_str(), Some("deleted"));
+    }
+
+    #[test]
+    fn merge_registry_or_set_keeps_concurrent_tag_readd() {
+        let base = GraphSnapshot {
+            version: 1,
+            nodes: vec![memory_node("active", &["A"], hlc("base", 10))],
+            edges: Vec::new(),
+        };
+        let ours = GraphSnapshot {
+            version: 2,
+            nodes: vec![memory_node("active", &[], hlc("local", 20))],
+            edges: Vec::new(),
+        };
+        let theirs = GraphSnapshot {
+            version: 3,
+            nodes: vec![memory_node("active", &["A"], hlc("railway", 30))],
+            edges: Vec::new(),
+        };
+
+        let merged = merge_graph_snapshots(&base, &ours, &theirs, GraphMergeOptions::default());
+
+        assert_eq!(merged.status, "clean");
+        let node = &merged.merged_snapshot.unwrap().nodes[0];
+        let tags = node.properties["tags"].as_array().expect("tags array");
+        assert_eq!(tags, &vec![json!("A")]);
     }
 }

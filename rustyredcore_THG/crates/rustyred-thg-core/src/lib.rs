@@ -41,6 +41,7 @@ pub mod index_registry;
 pub mod instant_kg;
 pub mod labeled_training_run;
 pub mod map_artifact;
+pub mod merge_registry;
 pub mod object_store;
 pub mod ordered;
 pub mod planner;
@@ -151,9 +152,10 @@ pub use graph_store::{
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
 pub use hooks::{
-    coalesce_per_id, CoalesceKeyFn, HookContext, HookDispatcher, HookDispatcherConfig,
-    HookDispatcherStats, HookEmitter, HookError, HookHandler, HookOutcome, HookRegistration,
-    HookStoreAccess, MutationEvent, MutationKind, MutationMatcher,
+    coalesce_per_id, substrate_sync_hook, CoalesceKeyFn, HookContext, HookDispatcher,
+    HookDispatcherConfig, HookDispatcherStats, HookEmitter, HookError, HookHandler, HookOutcome,
+    HookRegistration, HookStoreAccess, MutationEvent, MutationKind, MutationMatcher,
+    SubstrateSyncEvent, SubstrateSyncOutbox,
 };
 pub use identity_index::{
     IdentityIndex, IdentityIndexDefinition, IdentityIndexKey, IdentityInsertOutcome,
@@ -179,6 +181,9 @@ pub use labeled_training_run::{
     TrainingTaskType, ValidatorResult,
 };
 pub use map_artifact::{MapArtifact, MapArtifactDiff, MapArtifactType, MapSection};
+pub use merge_registry::{
+    MergeRegistry, MergeRegistryEntry, MergeRegistryResolution, MergeRegistryStrategy,
+};
 pub use object_store::{ColdObjectStore, DiskObjectStore, InMemoryObjectStore};
 pub use ordered::{
     EvictionFrontier, OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember,
@@ -266,9 +271,10 @@ pub use versioned_graph::{
     build_prolly_tree_incremental, checkout_graph_version, compile_graph_pack,
     compile_graph_pack_incremental, diff_graph_snapshots, diff_graph_trees,
     edge_from_content_object, edge_to_content_object, graph_version_log, merge_graph_snapshots,
-    node_from_content_object, node_to_content_object, object_bytes, prolly_validation_enabled,
-    resolve_auto_confidence_edge, snapshot_content_objects, update_graph_ref, update_graph_ref_cas,
-    CommitCost, CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
+    merge_graph_snapshots_with_registry, node_from_content_object, node_to_content_object,
+    object_bytes, prolly_validation_enabled, resolve_auto_confidence_edge,
+    snapshot_content_objects, update_graph_ref, update_graph_ref_cas, CommitCost,
+    CompiledGraphPack, GraphCheckoutResult, GraphCommit, GraphCompileOptions,
     GraphCompilerCapability, GraphContentObject, GraphDiffEntry, GraphMergeConflict,
     GraphMergeOptions, GraphMergeResolution, GraphMergeResult, GraphMergeSide, GraphMergeStrategy,
     GraphObjectKind, GraphPackManifest, GraphProllyTree, GraphRefConflict, GraphRefUpdate,

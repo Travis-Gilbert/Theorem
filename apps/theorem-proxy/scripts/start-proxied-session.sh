@@ -16,12 +16,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE_PORT="${RUSTY_RED_PORT:-8380}"
 PROXY_PORT="${THEOREM_PROXY_PORT:-8788}"
 PROXY="${THEOREM_PROXY_BIN:-$HOME/.cargo/bin/theorem-proxy}"
+SYNC="${THEOREM_SYNC_BIN:-$HOME/.cargo/bin/theorem-substrate-sync}"
 PROJECT_KEY="$(printf '%s' "$PWD" | sed 's#/#-#g')"
 MEM_DIR="${THEOREM_MEMORY_DIR:-$HOME/.claude/projects/$PROJECT_KEY/memory}"
 NODE_LOG="${THEOREM_NODE_LOG:-$(mktemp -t theorem-node.XXXXXX.log)}"
+SYNC_LOG="${THEOREM_SYNC_LOG:-$(mktemp -t theorem-sync.XXXXXX.log)}"
 NODE_PID=""
+SYNC_PID=""
 
 cleanup() {
+  if [ -n "$SYNC_PID" ] && kill -0 "$SYNC_PID" >/dev/null 2>&1; then
+    kill "$SYNC_PID" >/dev/null 2>&1 || true
+    wait "$SYNC_PID" >/dev/null 2>&1 || true
+  fi
   if [ -n "$NODE_PID" ] && kill -0 "$NODE_PID" >/dev/null 2>&1; then
     kill "$NODE_PID" >/dev/null 2>&1 || true
     wait "$NODE_PID" >/dev/null 2>&1 || true
@@ -66,6 +73,13 @@ echo "node up (embedded RedCore) at 127.0.0.1:$NODE_PORT"
 if [ "${THEOREM_SEED:-0}" = "1" ]; then
   THEOREM_NODE_URL="http://127.0.0.1:$NODE_PORT/mcp" python3 "$HERE/seed-node.py" \
     || echo "seed had issues (continuing)" >&2
+fi
+
+if [ "${THEOREM_SYNC_ENABLED:-0}" = "1" ]; then
+  THEOREM_SYNC_LOCAL_URL="${THEOREM_SYNC_LOCAL_URL:-http://127.0.0.1:$NODE_PORT/mcp}" \
+    "$SYNC" serve >"$SYNC_LOG" 2>&1 &
+  SYNC_PID=$!
+  echo "substrate sync up (default-off tier seam enabled) at 127.0.0.1:${THEOREM_SYNC_STATUS_PORT:-8790}; log $SYNC_LOG"
 fi
 
 if [ "$#" -eq 0 ]; then
