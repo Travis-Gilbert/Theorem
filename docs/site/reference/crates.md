@@ -13,6 +13,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `rustyred-code-embedding` | Shared code embedding seam for RustyRed file and CodeCrawler write paths. |
 | `rustyred-hipporag` | HippoRAG 2 candidate generation with RAPTOR-style graph hubs for RustyRed THG. |
 | `rustyred-membrane` | Shared context admission and eviction membrane for RustyRed graph-backed context. |
+| `rustyred-plugin` | Programmable Harness plugin host: declarative skill plugins and Extism-backed WASM capabilities. |
 | `rustyred-proxy` | Local RustyRed proxy for Anthropic Messages clients and Theorem room protocol. |
 | `rustyred-rerank` | Reranker scorer implementations for RustyRed membrane admission. |
 | `rustyred-thg-adapters` | LoRA adapter catalog and routing over RustyRedCore-THG graph records. |

@@ -50,6 +50,7 @@ This file is the navigation map. Read it first. Order of truth: this map, then t
 | `rustyred-web` | RustyWeb crawler/search: URL canon, page->graph emission, browser-use web primitives; trust-ahead-of-relevance ranking. |
 | `rustyred-hipporag` | HippoRAG 2 candidate generation (`Page`/`Phrase`/`Hub`, query-specific PPR, RAPTOR summary hubs). |
 | `rustyred-membrane` | Context admission/eviction membrane (admits candidates before they enter graph-backed context). |
+| `rustyred-plugin` | Programmable Harness plugin host: declarative skill plugins, Extism-backed WASM capabilities, host-function grants, declared-test exposure gates, and corpus-pattern crystallization. |
 | `rustyred-code-embedding` | Shared code-embedding seam: `hash` default, feature-gated `http` + `local` (Candle BGE `bge-small-en-v1.5`, D=384). |
 | `rustyred-rerank` | Reranker scorers for membrane admission (lexical cross-encoder seam). |
 | `rustyred-thg-adapters` | Adapters into the core. |
@@ -57,7 +58,7 @@ This file is the navigation map. Read it first. Order of truth: this map, then t
 | `rustyred-thg-binformat` | Binary-reconstruction loader (artifact/section/symbol/string/reloc/entrypoint facts -> GraphStore). |
 | `rustyred-thg-behavior-ir` | Language-neutral feature-port contracts: source slice, behavior IR, target plan, patch set, and validation receipt shapes for reverse-engineer emit. |
 | `rustyred-thg-code` | Code graph and compiler runtime: source -> code KG, code spec/features/obligations/drift, reverse-engineer compose, Datawave projection, and behavior-IR feature-port scaffolds. |
-| `rustyred-thg-connectors` | Live outbound MCP transport: connect over stdio, walk `tools/list`, register each as a learnable `Affordance`; invoke bridge gated by `InvokePolicy`. |
+| `rustyred-thg-connectors` | Live outbound MCP transport: connect over stdio, walk `tools/list`, register each as a learnable `Affordance`; invoke bridge gated by `InvokePolicy`, including in-process `rustyred_plugin` targets. |
 | `rustyred-thg-disasm` | Binary-reconstruction decoder (`iced-x86` -> `InstructionFact` nodes). |
 | `rustyred-thg-lift` | Binary-reconstruction THIR lifter (instructions -> SSA-like `ThirFunction`). |
 | `rustyred-thg-reconstruct` | Binary-reconstruction compiler (semantic-role/component hypotheses + validation receipts). |

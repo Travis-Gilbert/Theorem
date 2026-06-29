@@ -14,12 +14,17 @@
 //! `theorem-harness-runtime`.
 
 pub mod outcomes;
+pub mod programmable;
 pub mod registry;
 pub mod selection;
 pub mod training;
 pub mod types;
 
 pub use outcomes::{affordance_nodes, effective_affordance_fitness_from_node, record_invocation};
+pub use programmable::{
+    register_declarative_skill_plugin, register_wasm_plugin_exports, DECLARATIVE_SKILL_FAMILY,
+    PROGRAMMABLE_PLUGIN_FAMILY, PROGRAMMABLE_PLUGIN_TRANSPORT,
+};
 pub use registry::{
     register_builtin_affordances, register_connector, register_theseus_app_affordances,
     theorem_grpc_allows_extended_timeout, theorem_grpc_default_timeout_ms, theorem_grpc_timeout_ms,

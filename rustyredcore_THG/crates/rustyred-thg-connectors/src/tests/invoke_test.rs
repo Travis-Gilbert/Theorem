@@ -5,6 +5,8 @@ use std::thread::{self, JoinHandle};
 
 use serde_json::{json, Value};
 
+use rustyred_plugin::{CapabilityProvenance, PluginExportSpec, PluginLimits, WasmPluginSource};
+use rustyred_thg_affordances::register_wasm_plugin_exports;
 use rustyred_thg_core::InMemoryGraphStore;
 
 use crate::bridge::{connect_and_register, connect_and_register_with_target};
@@ -140,6 +142,23 @@ fn http_target(url: String) -> ConnectionTarget {
     }
 }
 
+fn wasm_echo_wat() -> String {
+    r#"
+        (module
+            (import "extism:host/env" "input_offset" (func $input_offset (result i64)))
+            (import "extism:host/env" "length" (func $length (param i64) (result i64)))
+            (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
+            (func (export "run") (result i32)
+                (local $input i64)
+                (local.set $input (call $input_offset))
+                (call $output_set (local.get $input) (call $length (local.get $input)))
+                (i32.const 0)
+            )
+        )
+    "#
+    .to_string()
+}
+
 /// Register the fake server's tools WITH a persisted connection target, so the
 /// invoke bridge can resolve a reach back to the server.
 fn registered_store() -> InMemoryGraphStore {
@@ -195,6 +214,68 @@ fn register_with_http_target_persists_the_reach_for_planning() {
         .expect("plan resolves a persisted http target");
     assert_eq!(planned.tool_name, "add");
     assert_eq!(planned.connection_target, target);
+}
+
+#[test]
+fn allowlist_can_fire_rustyred_plugin_target_and_record_outcome() {
+    let mut store = InMemoryGraphStore::default();
+    register_wasm_plugin_exports(
+        &mut store,
+        &rustyred_plugin::WasmPluginSpec {
+            plugin_id: "test.echo".to_string(),
+            tenant_id: "acme".to_string(),
+            source: WasmPluginSource::Wat(wasm_echo_wat()),
+            exports: vec![PluginExportSpec {
+                name: "run".to_string(),
+                label: "Run".to_string(),
+                description: "Echo JSON input through Extism.".to_string(),
+                input_schema: json!({"type": "object"}),
+                permissions: vec![],
+                writeback_policy: "read-only".to_string(),
+                tags: vec!["echo".to_string()],
+            }],
+            grants: vec![],
+            limits: PluginLimits::default(),
+            declared_tests: vec![],
+            provenance: CapabilityProvenance::default(),
+        },
+        Some("operator"),
+    )
+    .expect("register wasm plugin");
+
+    let affordance_id = "wasm_plugin:test.echo.run";
+    let planned = plan_invocation(&store, "acme", affordance_id, json!({"message": "hello"}))
+        .expect("plan plugin invocation");
+    assert!(matches!(
+        planned.connection_target,
+        ConnectionTarget::RustyredPlugin { .. }
+    ));
+
+    let report = invoke_affordance(
+        &mut store,
+        InvokeRequest {
+            tenant_id: "acme".to_string(),
+            task_type: "programmable.echo".to_string(),
+            affordance_id: affordance_id.to_string(),
+            arguments: json!({"message": "hello"}),
+            candidate_affordance_ids: vec![affordance_id.to_string()],
+        },
+        &InvokePolicy::FireAllowlist(vec![affordance_id.to_string()]),
+        Some("operator"),
+    )
+    .expect("invoke plugin");
+
+    assert!(report.fired);
+    let outcome = report.outcome.expect("plugin outcome");
+    assert!(!outcome.is_error, "{outcome:?}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&outcome.text).expect("json output"),
+        json!({"message": "hello"})
+    );
+    assert!(
+        report.recorded.is_some(),
+        "plugin invocation should record a normal affordance receipt"
+    );
 }
 
 #[test]

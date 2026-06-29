@@ -18,6 +18,7 @@
 // crate-root re-export, so this crate does not depend on a `lib.rs` re-export that
 // is being co-edited by concurrent (charter) work; `registry` is a committed
 // `pub mod`, so the path is stable.
+use rustyred_plugin::PluginHost;
 use rustyred_thg_affordances::registry::connector_connection_target;
 use rustyred_thg_affordances::{
     affordance_node_id, record_invocation, Affordance, AffordanceGraphStore,
@@ -201,6 +202,23 @@ pub fn invoke_affordance<S: AffordanceGraphStore>(
             recorded: None,
         });
     }
+    if planned.connection_target.wasm_plugin_spec().is_some() {
+        let (outcome, recorded) = fire_rustyred_plugin(
+            store,
+            &req.tenant_id,
+            &req.task_type,
+            &planned,
+            req.candidate_affordance_ids,
+            actor,
+        )?;
+        return Ok(InvokeReport {
+            planned,
+            fired: true,
+            dry_run_reason: None,
+            outcome: Some(outcome),
+            recorded: Some(recorded),
+        });
+    }
     let mut transport = connect_transport(&planned.connection_target)?;
     transport.request("initialize", initialize_params())?;
     transport.notify("notifications/initialized", json!({}))?;
@@ -220,4 +238,59 @@ pub fn invoke_affordance<S: AffordanceGraphStore>(
         outcome: Some(outcome),
         recorded: Some(recorded),
     })
+}
+
+fn fire_rustyred_plugin<S: AffordanceGraphStore>(
+    store: &mut S,
+    tenant_id: &str,
+    task_type: &str,
+    planned: &PlannedInvocation,
+    candidate_affordance_ids: Vec<String>,
+    actor: Option<&str>,
+) -> ConnectorResult<(ToolCallOutcome, InvocationRecordResult)> {
+    let spec = planned
+        .connection_target
+        .wasm_plugin_spec()
+        .ok_or_else(|| {
+            ConnectorError::Transport(
+                "planned invocation is not a rustyred_plugin target".to_string(),
+            )
+        })?;
+    let input = serde_json::to_string(&planned.arguments)
+        .map_err(|error| ConnectorError::Protocol(error.to_string()))?;
+    let mut plugin = PluginHost::new()
+        .load(spec)
+        .map_err(|error| ConnectorError::Transport(error.to_string()))?;
+    let outcome = match plugin.invoke(&planned.tool_name, &input) {
+        Ok(text) => ToolCallOutcome {
+            is_error: false,
+            text,
+        },
+        Err(error) => ToolCallOutcome {
+            is_error: true,
+            text: error.to_string(),
+        },
+    };
+    let recorded = record_invocation(
+        store,
+        InvocationRecordRequest {
+            tenant_id: tenant_id.to_string(),
+            task_type: task_type.to_string(),
+            candidate_affordance_ids,
+            selected_affordance_id: planned.affordance_id.clone(),
+            outcome_value: if outcome.is_error { 0.0 } else { 1.0 },
+            outcome_weight: 1.0,
+            outcome_label: if outcome.is_error {
+                "plugin_error".to_string()
+            } else {
+                "plugin_ok".to_string()
+            },
+            previous_affordance_id: None,
+            query_text: String::new(),
+            recorded_at_ms: None,
+        },
+        actor,
+    )
+    .map_err(|error| ConnectorError::Registration(format!("{error:?}")))?;
+    Ok((outcome, recorded))
 }

@@ -9,6 +9,11 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
+pub const TIER_ONE_ACTION: &str = "tier_one";
+pub const TIER_TWO_ACTION: &str = "tier_two";
+pub const TIER_THREE_ACTION: &str = "tier_three";
+pub const PROGRAMMABLE_CAPABILITY_ACTION_TIER: &str = TIER_TWO_ACTION;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BindingError {
     Guard(Box<GuardViolation>),
@@ -828,9 +833,13 @@ impl BindingCapabilityScope {
             confirmation_gated_tools: Vec::new(),
             binding_private_tools: Vec::new(),
             action_tiers: vec![
-                ActionTierPolicy::new("tier_one", "reversible substrate action", false),
-                ActionTierPolicy::new("tier_two", "consequential commit action", true),
-                ActionTierPolicy::new("tier_three", "irreversible external action", true),
+                ActionTierPolicy::new(TIER_ONE_ACTION, "reversible substrate action", false),
+                ActionTierPolicy::new(
+                    TIER_TWO_ACTION,
+                    "consequential commit or capability registration action",
+                    true,
+                ),
+                ActionTierPolicy::new(TIER_THREE_ACTION, "irreversible external action", true),
             ],
         }
     }

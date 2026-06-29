@@ -1,0 +1,21 @@
+[package]
+name = "rustyred-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Programmable Harness plugin host: declarative skill plugins and Extism-backed WASM capabilities."
+license = "MIT"
+repository = "https://github.com/Travis-Gilbert/Theorem"
+documentation = "https://docs.rs/rustyred-plugin"
+rust-version = "1.85"
+
+[dependencies]
+extism = { version = "1.30.0", default-features = false, features = ["register-filesystem", "wasmtime-default-features"] }
+rustyred-thg-core = { version = "0.5.0", path = "../rustyred-thg-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+theorem-harness-core = { version = "0.1.0", path = "../theorem-harness-core" }
+wat = "1.252"
+
+[dev-dependencies]
+tempfile = "3"
