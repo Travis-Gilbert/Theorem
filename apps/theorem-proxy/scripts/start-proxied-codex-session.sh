@@ -12,8 +12,13 @@ NODE_PORT="${RUSTY_RED_PORT:-8380}"
 PROXY_PORT="${THEOREM_PROXY_PORT:-8788}"
 PROXY="${THEOREM_PROXY_BIN:-$HOME/.cargo/bin/theorem-proxy}"
 CODEX="${CODEX_BIN:-codex}"
-PROJECT_KEY="$(printf '%s' "$PWD" | sed 's#/#-#g')"
-MEM_DIR="${THEOREM_MEMORY_DIR:-$HOME/.claude/projects/$PROJECT_KEY/memory}"
+PROJECT_KEY="$(printf '%s' "$PWD" | sed 's#/#-#g; s# #-#g')"
+LEGACY_PROJECT_KEY="$(printf '%s' "$PWD" | sed 's#/#-#g')"
+DEFAULT_MEM_DIR="$HOME/.claude/projects/$PROJECT_KEY/memory"
+if [ ! -d "$DEFAULT_MEM_DIR" ] && [ -d "$HOME/.claude/projects/$LEGACY_PROJECT_KEY/memory" ]; then
+  DEFAULT_MEM_DIR="$HOME/.claude/projects/$LEGACY_PROJECT_KEY/memory"
+fi
+MEM_DIR="${THEOREM_MEMORY_DIR:-$DEFAULT_MEM_DIR}"
 NODE_LOG="${THEOREM_NODE_LOG:-$(mktemp -t theorem-node.XXXXXX.log)}"
 PROXY_LOG="${THEOREM_PROXY_LOG:-$(mktemp -t theorem-proxy-codex.XXXXXX.log)}"
 OWN_NODE=0

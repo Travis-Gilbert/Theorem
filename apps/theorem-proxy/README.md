@@ -54,6 +54,24 @@ This repo also has a one-shot launcher:
 apps/theorem-proxy/scripts/start-proxied-codex-session.sh
 ```
 
+For Codex Desktop, the app opener starts or reuses the local RustyRed node and
+proxy, then opens this workspace:
+
+```bash
+apps/theorem-proxy/scripts/start-proxied-codex-app.sh --restart-codex
+```
+
+The `--restart-codex` flag quits Codex first so the workspace open happens from
+a clean app process. On current Codex Desktop 0.142.3, `codex app -c openai_base_url=...`
+does not route model traffic. Desktop routing belongs in the GraphQL-contract-first
+`theorem connect codex` path, which will write reversible user-level Codex config
+and verify `/status.openai_responses_seen`. You can also double-click the
+transitional opener:
+
+```text
+apps/theorem-proxy/scripts/RustyRed-Codex.command
+```
+
 By default, Codex keeps using its normal OpenAI auth and the proxy forwards that
 credential only to `https://api.openai.com`. For sidecar/local-key modes, set the
 proxy-owned upstream key and let the client send a harmless local bearer:
@@ -62,6 +80,22 @@ proxy-owned upstream key and let the client send a harmless local bearer:
 export THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY=...
 theorem-proxy proxy --memory-url http://127.0.0.1:8380/mcp
 ```
+
+### Resident provider participants
+
+Qwen and Mistral can also be loaded as room participants for the harness runner,
+separate from routing Codex or Claude through the proxy. Keep the private keys in
+`~/.theorem-proxy/qwen.env` and `~/.theorem-proxy/mistral.env`, then source:
+
+```bash
+source apps/theorem-proxy/scripts/agent-room-participants-env.sh
+```
+
+The helper exports `THEOREM_AGENT_HEADS=qwen,mistral`,
+`THEOREM_AGENT_ROOM_RUNNER=1`, `QWEN_MODEL=qwen3.7-max`, and
+`MISTRAL_MODEL=mistral-small-latest` for the current shell. Start the harness
+server or local room from that same shell; a room mention to `@theorem` can then
+wake the configured binding and publish a room contribution.
 
 ### Claude Desktop gateway mode
 

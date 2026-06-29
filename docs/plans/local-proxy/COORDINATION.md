@@ -40,6 +40,17 @@ Codex = Phase B + resident-capabilities; CC = Phase A remainder + Phase C.)
   retrieves over the node (`hippo_retrieve`); B.1's "wire ranked injection to substrate retrieval"
   is the same seam. Reuse `HttpMemorySource`, do not fork a second retrieval path. `recall`-tool
   removal is B.1's (the MCP manifest in `rustyred-thg-mcp` / the plugin), Codex's lane.
+- **GraphQL-contract-first capability + CLI connect is the canonical next lane.**
+  `SPEC-GRAPHQL-CONTRACT-AND-CLI.md` supersedes the REST-first plan. GraphQL schema execution and
+  shared handlers are now the capability contract; REST `/cap/<name>` is allowed only as a generated
+  compatibility facade over GraphQL, not a second behavior surface. The spec also owns `theorem
+  connect <agent>`. Do not create a separate Codex Desktop launcher lane: the 2026-06-29 Codex
+  research showed `codex app -c openai_base_url=...` opens a `codex://threads/new?path=...` deep
+  link and does not route Desktop model traffic. `theorem connect codex` must write user-level Codex
+  config, restart/open Desktop, and verify through `/status.openai_responses_seen`.
+  Subscription-native Codex routing is an explicit gate in that spec, separate from API/local
+  Responses routing. The Anthropic Messages proxy path is working; still verify future changes with
+  `/status.anthropic_messages_seen`.
 
 ## Local mode clarification (Codex smoke, 2026-06-28)
 

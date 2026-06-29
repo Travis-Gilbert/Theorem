@@ -4,7 +4,7 @@ use crate::binding_store::{
 };
 use crate::overlap::{detect_and_emit_overlap_tensions, Footprint};
 use crate::tenant::{normalize_actor_id, normalize_tenant_slug, tenant_slug_aliases};
-use crate::{default_theorem_binding, writing_style, DEFAULT_BINDING_ID};
+use crate::{writing_style, DEFAULT_BINDING_ID};
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, HarnessInstantKg, NodeQuery,
     NodeRecord, SessionDelta,
@@ -1277,26 +1277,35 @@ fn default_coordination_binding(
     binding_id: &str,
     actor_id: &str,
 ) -> Result<AgentBinding, BindingError> {
-    if normalize_agent_id(agent_id) == "theorem" {
-        return default_theorem_binding(binding_id);
-    }
-
-    let actor_head = session_actor_head(actor_id);
+    let normalized_agent_id = normalize_agent_id(agent_id);
+    let (active_head_set, heads) = if normalized_agent_id == "theorem" {
+        let heads = ["claude", "codex", "deepseek"]
+            .into_iter()
+            .map(session_actor_head)
+            .collect::<Vec<_>>();
+        let active_head_set = heads.iter().map(|head| head.head_id.clone()).collect();
+        (active_head_set, heads)
+    } else {
+        let actor_head = session_actor_head(actor_id);
+        (vec![actor_head.head_id.clone()], vec![actor_head])
+    };
     let mut binding = AgentBinding::new(
         BindingIdentity {
-            agent_id: normalize_agent_id(agent_id),
+            agent_id: normalized_agent_id.clone(),
             owner_id: "travis".to_string(),
-            agent_name: agent_id.to_string(),
+            agent_name: if normalized_agent_id == "theorem" {
+                "Theorem".to_string()
+            } else {
+                agent_id.to_string()
+            },
             composition_hash: String::new(),
             version: 1,
             trust_tier: "first_party".to_string(),
-            active_head_set: vec![actor_head.head_id.clone()],
+            active_head_set,
             agent_constitution: None,
         },
-        BindingComposition {
-            heads: vec![actor_head],
-        },
-        BindingBudgetScope::new(&normalize_agent_id(agent_id), 32_000.0, 8),
+        BindingComposition { heads },
+        BindingBudgetScope::new(&normalized_agent_id, 32_000.0, 8),
     )?;
     binding.lifecycle.run_id = binding_id.to_string();
     Ok(binding)
