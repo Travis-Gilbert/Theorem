@@ -16,7 +16,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE_PORT="${RUSTY_RED_PORT:-8380}"
 PROXY_PORT="${THEOREM_PROXY_PORT:-8788}"
 PROXY="${THEOREM_PROXY_BIN:-$HOME/.cargo/bin/theorem-proxy}"
-MEM_DIR="${THEOREM_MEMORY_DIR:-$HOME/.claude/projects/-Users-travisgilbert-Tech-Dev-Local-Creative-Website-Theorem/memory}"
+PROJECT_KEY="$(printf '%s' "$PWD" | sed 's#/#-#g')"
+MEM_DIR="${THEOREM_MEMORY_DIR:-$HOME/.claude/projects/$PROJECT_KEY/memory}"
+NODE_LOG="${THEOREM_NODE_LOG:-$(mktemp -t theorem-node.XXXXXX.log)}"
 NODE_PID=""
 
 cleanup() {
@@ -50,11 +52,11 @@ up() {
 # Local node (embedded RedCore = RustyRed). Serves the harness MCP tools the plugin now
 # points at, plus the optional node graph memory.
 if ! curl -fsS "http://127.0.0.1:$NODE_PORT/ready" >/dev/null 2>&1; then
-  RUSTY_RED_PORT="$NODE_PORT" bash "$HERE/node-local.sh" >/tmp/theorem-node.log 2>&1 &
+  RUSTY_RED_PORT="$NODE_PORT" bash "$HERE/node-local.sh" >"$NODE_LOG" 2>&1 &
   NODE_PID=$!
 fi
 up "http://127.0.0.1:$NODE_PORT/ready" || {
-  echo "node failed to start; see /tmp/theorem-node.log" >&2
+  echo "node failed to start; see $NODE_LOG" >&2
   exit 1
 }
 echo "node up (embedded RedCore) at 127.0.0.1:$NODE_PORT"

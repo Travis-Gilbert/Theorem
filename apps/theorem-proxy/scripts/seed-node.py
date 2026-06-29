@@ -14,11 +14,10 @@ import os
 import urllib.request
 
 NODE = os.environ.get("THEOREM_NODE_URL", "http://127.0.0.1:8380/mcp")
+PROJECT_KEY = os.getcwd().replace(os.sep, "-")
 MEM_DIR = os.environ.get(
     "THEOREM_MEMORY_DIR",
-    os.path.expanduser(
-        "~/.claude/projects/-Users-travisgilbert-Tech-Dev-Local-Creative-Website-Theorem/memory"
-    ),
+    os.path.expanduser(f"~/.claude/projects/{PROJECT_KEY}/memory"),
 )
 TENANT = os.environ.get("THEOREM_TENANT", "default")
 
@@ -36,7 +35,13 @@ def call(name, arguments, timeout=20):
         NODE, data=body, headers={"Content-Type": "application/json"}
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.load(response)
+        payload = json.load(response)
+    if "error" in payload:
+        raise RuntimeError(payload["error"])
+    result = payload.get("result")
+    if isinstance(result, dict) and result.get("isError"):
+        raise RuntimeError(result)
+    return payload
 
 
 def main():
@@ -45,7 +50,8 @@ def main():
     files = sorted(f for f in os.listdir(MEM_DIR) if f.endswith(".md"))
     ok = 0
     for name in files:
-        content = open(os.path.join(MEM_DIR, name), encoding="utf-8").read()
+        with open(os.path.join(MEM_DIR, name), encoding="utf-8") as file:
+            content = file.read()
         title = name[:-3]
         try:
             resp = call(
@@ -61,7 +67,7 @@ def main():
                     "content": content,
                 },
             )
-            good = "result" in resp and "error" not in resp
+            good = "result" in resp
             print(f"{'ok ' if good else 'ERR'} {title}")
             ok += 1 if good else 0
         except Exception as error:  # noqa: BLE001 - report and continue

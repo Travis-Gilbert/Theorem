@@ -35,7 +35,7 @@ enum Command {
             default_value = "https://api.openai.com"
         )]
         openai_upstream: String,
-        /// Live local Theorem node MCP endpoint (e.g. http://127.0.0.1:8790/mcp). When
+        /// Live local Theorem node MCP endpoint (e.g. http://127.0.0.1:8380/mcp). When
         /// set, ambient memory is the node's relevance-ranked graph memory
         /// (`hippo_retrieve`). Takes precedence over --memory-dir.
         #[arg(long, env = "THEOREM_PROXY_MEMORY_URL")]
@@ -124,8 +124,8 @@ enum Command {
         #[arg(long, env = "ANTHROPIC_BASE_URL")]
         proxy_url: Option<String>,
         /// Valkey warm-tier `host:port` to check.
-        #[arg(long, default_value = "127.0.0.1:6391")]
-        valkey_addr: String,
+        #[arg(long)]
+        valkey_addr: Option<String>,
     },
 }
 
@@ -149,7 +149,7 @@ async fn main() -> std::io::Result<()> {
             let (memory, memory_desc) =
                 resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
             let upstream_auth = upstream_auth(upstream_api_key, upstream_auth_token)?;
-            println!("theorem proxy live at http://{addr}");
+            println!("theorem-proxy live at http://{addr}");
             println!();
             println!("point Claude Code at it:");
             println!("    export ANTHROPIC_BASE_URL=http://{addr}");
@@ -193,7 +193,7 @@ async fn main() -> std::io::Result<()> {
             let (memory, memory_desc) =
                 resolve_memory(memory_url.as_deref(), tenant, memory_dir.as_deref());
             let upstream_auth = upstream_auth(upstream_api_key, upstream_auth_token)?;
-            eprintln!("theorem proxy live at http://{addr} (ambient memory: {memory_desc})");
+            eprintln!("theorem-proxy live at http://{addr} (ambient memory: {memory_desc})");
             eprintln!("running: {}", command.join(" "));
             let code = run_wrapped(
                 addr,
@@ -220,7 +220,7 @@ async fn main() -> std::io::Result<()> {
             let checks = theorem_proxy::doctor(
                 memory_url.as_deref(),
                 proxy_url.as_deref(),
-                Some(&valkey_addr),
+                valkey_addr.as_deref(),
             )
             .await;
             let mut all_ok = true;

@@ -110,9 +110,9 @@ apps/theorem-proxy/scripts/start-desktop-gateway.sh
   the harness ambient *well* and *measurable*: relevance-ranked memory injection
   (retire wholesale `MEMORY.md`, remove `recall`), tool-surface pruning, proxy-mediated
   proactive coordination, staleness-aware memory + memory CI, and built-in measurement
-  with a value readout in `theorem doctor`.
-- `SPEC-ONECLICK-ONBOARDING.md` -- the one-click distribution (brew, site, `theorem
-  login` / `theorem doctor`) around the binary; chrome that needs this binary first.
+  with a value readout in `theorem-proxy doctor`.
+- `SPEC-ONECLICK-ONBOARDING.md` -- the one-click distribution (brew, site,
+  `theorem-proxy doctor`, and account login) around the binary; chrome that needs this binary first.
 
 ## Notes
 

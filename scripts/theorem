@@ -82,6 +82,12 @@ localmodel_config_arg() {
         return 0
     fi
 
+    if [[ -f "$PWD/theorem-agentd.toml" ]]; then
+        log "using legacy theorem-agentd.toml; rename it to theorem-localmodel.toml when convenient"
+        printf '%s\n' "$PWD/theorem-agentd.toml"
+        return 0
+    fi
+
     return 1
 }
 
@@ -138,7 +144,7 @@ host = "127.0.0.1"
 port = 8080
 api_model_id = "gemma-4-12b-it-qat"
 tok_model_id = "google/gemma-4-12B-it"
-quantized_model_id = "apps/theorem-agentd"
+quantized_model_id = "apps/theorem-localmodel"
 quantized_filename = "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
 quantization = "Q4_K_XL"
 token_source = "cache"

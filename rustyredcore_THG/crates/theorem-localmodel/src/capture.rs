@@ -25,6 +25,7 @@ pub const TICKTICK: &str = "ticktick";
 /// Marker stamped into a captured task's content so re-sweeps are idempotent and
 /// the operator can see, on the phone, which job a task became.
 pub const STAMP_PREFIX: &str = "[localmodel] dispatched as ";
+const LEGACY_STAMP_PREFIX: &str = "[agentd] dispatched as ";
 
 /// One task converted to a job in a sweep.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -234,7 +235,7 @@ fn stamp_and_dispatch(
 
 /// Append the dispatch stamp to the content unless it is already present.
 fn stamped(content: &str, job_id: &str) -> String {
-    if content.contains(STAMP_PREFIX) {
+    if content.contains(STAMP_PREFIX) || content.contains(LEGACY_STAMP_PREFIX) {
         return content.to_string();
     }
     let stamp = format!("{STAMP_PREFIX}{job_id}");
@@ -275,7 +276,7 @@ fn dispatched_subtasks(task: &Value, dispatched_title: &str) -> Value {
 fn is_already_captured(task: &Value, _config: &CaptureConfig) -> bool {
     task.get("content")
         .and_then(Value::as_str)
-        .map(|content| content.contains(STAMP_PREFIX))
+        .map(|content| content.contains(STAMP_PREFIX) || content.contains(LEGACY_STAMP_PREFIX))
         .unwrap_or(false)
 }
 
@@ -426,6 +427,8 @@ mod tests {
         assert!(once.contains("[localmodel] dispatched as job-1"));
         // Re-stamping content that already carries a stamp is a no-op.
         assert_eq!(stamped(&once, "job-2"), once);
+        let legacy = "body\n\n[agentd] dispatched as job-old";
+        assert_eq!(stamped(legacy, "job-2"), legacy);
     }
 
     #[test]

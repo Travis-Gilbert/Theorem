@@ -11,6 +11,11 @@ use serde::Serialize;
 use crate::config::{LocalModelHostConfig, LocalModelTierConfig};
 use crate::{LocalModelError, LocalModelResult};
 
+const MAX_GGUF_METADATA_COUNT: u64 = 1_000_000;
+const MAX_GGUF_STRING_LEN: u64 = 16 * 1024 * 1024;
+const MAX_GGUF_ARRAY_LEN: u64 = 1_000_000;
+const MAX_GGUF_ARRAY_DEPTH: usize = 8;
+
 #[derive(Debug, Serialize)]
 pub struct LocalModelDoctorReport {
     pub endpoint: String,
@@ -48,8 +53,8 @@ pub struct LocalModelDrafterDoctor {
 
 pub async fn serve(config: LocalModelHostConfig) -> LocalModelResult<()> {
     let bind = format!("{}:{}", config.host, config.port);
-    let router = build_router(&config).await?;
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let router = build_router(&config).await?;
     eprintln!(
         "[theorem-localmodel] serving local model host at http://{}",
         bind
@@ -101,7 +106,8 @@ pub fn doctor_report(config: &LocalModelHostConfig) -> LocalModelDoctorReport {
 async fn build_router(config: &LocalModelHostConfig) -> LocalModelResult<axum::Router> {
     preflight_primary_gguf(config)?;
     let mut builder = base_builder(config)?;
-    if config.extra_models.is_empty() {
+    let has_tiers = !config.tiers.is_empty() || !config.extra_models.is_empty();
+    if !has_tiers {
         builder = builder
             .with_model(model_selected(
                 config.tok_model_id.clone(),
@@ -132,7 +138,7 @@ async fn build_router(config: &LocalModelHostConfig) -> LocalModelResult<axum::R
         builder = builder
             .with_model_config(primary)
             .with_default_model_id(config.api_model_id.clone());
-        for tier in &config.extra_models {
+        for tier in config.tiers.iter().chain(config.extra_models.iter()) {
             builder = builder.with_model_config(tier_model_config(tier));
         }
     }
@@ -172,7 +178,11 @@ fn preflight_primary_gguf(config: &LocalModelHostConfig) -> LocalModelResult<()>
 
 fn local_primary_gguf_path(config: &LocalModelHostConfig) -> Option<PathBuf> {
     let base = Path::new(&config.quantized_model_id);
-    if !(base.exists() || base.is_absolute() || config.quantized_model_id.starts_with('.')) {
+    let looks_like_path = base.is_absolute()
+        || config.quantized_model_id.starts_with('.')
+        || config.quantized_model_id.contains('/')
+        || config.quantized_model_id.contains('\\');
+    if !(base.exists() || looks_like_path) {
         return None;
     }
     let filename = config
@@ -215,6 +225,11 @@ fn read_gguf_architecture(path: &Path) -> LocalModelResult<Option<String>> {
     let _version = read_u32(&mut file)?;
     let _tensor_count = read_u64(&mut file)?;
     let metadata_count = read_u64(&mut file)?;
+    if metadata_count > MAX_GGUF_METADATA_COUNT {
+        return Err(LocalModelError::Config(format!(
+            "GGUF metadata count {metadata_count} exceeds safety limit {MAX_GGUF_METADATA_COUNT}"
+        )));
+    }
     for _ in 0..metadata_count {
         let key = read_gguf_string(&mut file)?;
         let value_type = read_u32(&mut file)?;
@@ -242,7 +257,7 @@ fn read_u64(reader: &mut impl Read) -> std::io::Result<u64> {
 }
 
 fn read_gguf_string(reader: &mut impl Read) -> std::io::Result<String> {
-    let len = read_u64(reader)? as usize;
+    let len = read_bounded_len(reader, MAX_GGUF_STRING_LEN, "GGUF string")?;
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes)?;
     String::from_utf8(bytes)
@@ -250,19 +265,33 @@ fn read_gguf_string(reader: &mut impl Read) -> std::io::Result<String> {
 }
 
 fn skip_gguf_value(reader: &mut (impl Read + Seek), value_type: u32) -> std::io::Result<()> {
+    skip_gguf_value_at_depth(reader, value_type, 0)
+}
+
+fn skip_gguf_value_at_depth(
+    reader: &mut (impl Read + Seek),
+    value_type: u32,
+    depth: usize,
+) -> std::io::Result<()> {
     match value_type {
         0 | 1 | 7 => skip_bytes(reader, 1),
         2 | 3 => skip_bytes(reader, 2),
         4 | 5 | 6 => skip_bytes(reader, 4),
         8 => {
-            let len = read_u64(reader)?;
+            let len = read_bounded_len(reader, MAX_GGUF_STRING_LEN, "GGUF string")? as u64;
             skip_bytes(reader, len)
         }
         9 => {
+            if depth >= MAX_GGUF_ARRAY_DEPTH {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "GGUF metadata array nesting exceeds safety limit",
+                ));
+            }
             let nested_type = read_u32(reader)?;
-            let len = read_u64(reader)?;
+            let len = read_bounded_u64(reader, MAX_GGUF_ARRAY_LEN, "GGUF array")?;
             for _ in 0..len {
-                skip_gguf_value(reader, nested_type)?;
+                skip_gguf_value_at_depth(reader, nested_type, depth + 1)?;
             }
             Ok(())
         }
@@ -274,8 +303,35 @@ fn skip_gguf_value(reader: &mut (impl Read + Seek), value_type: u32) -> std::io:
     }
 }
 
+fn read_bounded_len(reader: &mut impl Read, max_len: u64, label: &str) -> std::io::Result<usize> {
+    let len = read_bounded_u64(reader, max_len, label)?;
+    usize::try_from(len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} length {len} does not fit in usize"),
+        )
+    })
+}
+
+fn read_bounded_u64(reader: &mut impl Read, max_len: u64, label: &str) -> std::io::Result<u64> {
+    let len = read_u64(reader)?;
+    if len > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} length {len} exceeds safety limit {max_len}"),
+        ));
+    }
+    Ok(len)
+}
+
 fn skip_bytes(reader: &mut impl Seek, len: u64) -> std::io::Result<()> {
-    reader.seek(std::io::SeekFrom::Current(len as i64))?;
+    let offset = i64::try_from(len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("GGUF skip length {len} exceeds seek limit"),
+        )
+    })?;
+    reader.seek(std::io::SeekFrom::Current(offset))?;
     Ok(())
 }
 
@@ -400,6 +456,35 @@ mod tests {
         let error = preflight_primary_gguf(&config).unwrap_err().to_string();
         assert!(error.contains("cannot load GGUF architecture `gemma4`"));
         assert!(error.contains("llama-server"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn path_like_relative_quantized_id_is_preflighted() {
+        let mut config = LocalModelHostConfig::default();
+        config.quantized_model_id = "models/gemma".to_string();
+        config.quantized_filename = "model.gguf".to_string();
+
+        let path = local_primary_gguf_path(&config).expect("path-like id is local");
+        assert_eq!(path, PathBuf::from("models/gemma").join("model.gguf"));
+    }
+
+    #[test]
+    fn rejects_absurd_gguf_string_lengths() {
+        let path = std::env::temp_dir().join(format!(
+            "theorem-localmodel-long-string-{}.gguf",
+            std::process::id()
+        ));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&(MAX_GGUF_STRING_LEN + 1).to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = read_gguf_architecture(&path).unwrap_err().to_string();
+        assert!(error.contains("exceeds safety limit"));
         let _ = std::fs::remove_file(path);
     }
 

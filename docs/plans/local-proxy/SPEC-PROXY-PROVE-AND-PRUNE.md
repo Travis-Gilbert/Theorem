@@ -39,7 +39,7 @@ Build: each memory records the files / symbols / flags it references. On injecti
 Acceptance: a memory citing a since-changed file is flagged when injected; memory-CI marks invalid a memory whose named symbol no longer exists in the tree; a fresh memory is untouched. Verify by mutating a referenced file and re-injecting, and by running memory-CI over a known-stale memory. This converts silent misdirection (a confidently-recalled but outdated fact) into a visible warning.
 
 ### 5. Built-in measurement and a value readout in `doctor`
-Build: the proxy measures the harness honestly because it sees every prompt, response, and token count. It A/Bs itself -- a random arm served with injection off -- and tracks: rediscovery rate (a prompt asks what an existing-but-not-injected memory answers, a miss that should have hit), collisions prevented (deliverable 3 fired before a clobber), and tokens spent vs the no-inject arm. `theorem doctor` reports the value, not only connectivity: "this session: injected 3 relevant memories, flagged 1 stale, prevented 1 collision, ~Xk tokens saved vs the no-inject arm."
+Build: the proxy measures the harness honestly because it sees every prompt, response, and token count. It A/Bs itself -- a random arm served with injection off -- and tracks: rediscovery rate (a prompt asks what an existing-but-not-injected memory answers, a miss that should have hit), collisions prevented (deliverable 3 fired before a clobber), and tokens spent vs the no-inject arm. `theorem-proxy doctor` reports the value, not only connectivity: "this session: injected 3 relevant memories, flagged 1 stale, prevented 1 collision, ~Xk tokens saved vs the no-inject arm."
 Acceptance: the proxy serves a random fraction with injection off and records the paired comparison; `doctor` prints the per-session value readout; rediscovery and collisions-prevented are counted over a session; and the A/B never alters a turn's returned result. Verify the off-arm assignment, the counters, and the doctor output.
 
 ## Build Table
@@ -50,7 +50,7 @@ Acceptance: the proxy serves a random fraction with injection off and records th
 | 2 | Dozens of tools advertised, ~4 used per session | Advertise only the action set; context tools move to injection | harness MCP manifest + affordance router | Build | Never-called tools absent from context; cuts backed by the audit | [-] |
 | 3 | Coordination is poll-and-remember; remote degrades | Proxy injects a recency heads-up before an action targets a contended file | `apps/theorem-proxy` + coordination graph | Build | Head A warned of head B's recent edit pre-action, no MCP call | [-] |
 | 4 | Ambient memory never passes through validity; can misdirect | Reference-tracked staleness flagging + periodic memory-CI | `apps/theorem-proxy` + `rustyred-thg-memory` | Build | Stale memory flagged on injection; dead memory marked invalid | [-] |
-| 5 | No way to measure if the harness helps | Proxy A/B + rediscovery / collisions / tokens counters + `doctor` readout | `apps/theorem-proxy` + `theorem doctor` | Build | The benefit is a number per session, not a vibe | [-] |
+| 5 | No way to measure if the harness helps | Proxy A/B + rediscovery / collisions / tokens counters + `doctor` readout | `apps/theorem-proxy` + `theorem-proxy doctor` | Build | The benefit is a number per session, not a vibe | [-] |
 
 Test legend: `[-]` open, `[x]` verified against the acceptance criterion, `[~]` deferred with a reason that names a real external blocker.
 
@@ -60,15 +60,15 @@ Test legend: `[-]` open, `[x]` verified against the acceptance criterion, `[~]` 
 - D2 needs the usage audit (in progress on a separate head's branch); the cut is evidence-gated, not by gut.
 - D3 needs the proxy seeing multi-head traffic plus a recency index of edits (the notify watcher keeps the graph fresh).
 - D4 wires the existing bitemporal validity layer to the ambient path; the memory-CI is new but cheap.
-- D5 builds on D1 and D3; the `doctor` readout extends the onboarding `theorem doctor` command (`SPEC-ONECLICK-ONBOARDING` deliverable 5).
+- D5 builds on D1 and D3; the `doctor` readout extends the onboarding `theorem-proxy doctor` command (`SPEC-ONECLICK-ONBOARDING` deliverable 5).
 
 ## Verify first
 
-Confirm before building: the `hippo_retrieve` / index-context retrieval signature and the relevance score it returns; the `rustyred-thg-memory` validity-edge API (`valid_at_ms` / `invalid_at_ms`) and how `include_expired` filters on the read path; the harness MCP manifest source and which tools the affordance router can resolve without advertisement; the coordination stream / recency surface the proxy reads for D3; and the `theorem doctor` command surface the readout extends. Build against the real surfaces.
+Confirm before building: the `hippo_retrieve` / index-context retrieval signature and the relevance score it returns; the `rustyred-thg-memory` validity-edge API (`valid_at_ms` / `invalid_at_ms`) and how `include_expired` filters on the read path; the harness MCP manifest source and which tools the affordance router can resolve without advertisement; the coordination stream / recency surface the proxy reads for D3; and the `theorem-proxy doctor` command surface the readout extends. Build against the real surfaces.
 
 ## Where it lands
 
 - Ranking, injection, A/B, counters, proactive pushes, staleness flagging: `apps/theorem-proxy`.
 - Retrieval and bitemporal validity: `rustyred-thg-memory` and the index-context path.
 - Tool pruning: the harness MCP manifest and the affordance router.
-- Doctor readout: the `theorem doctor` command (`SPEC-ONECLICK-ONBOARDING`).
+- Doctor readout: the `theorem-proxy doctor` command (`SPEC-ONECLICK-ONBOARDING`).

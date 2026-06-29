@@ -16,11 +16,17 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
-mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "15986c037bbe3ee31085d1c73abd2ea3cb11f094", default-features = false, features = ["metal"] }
-mistralrs-server-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "15986c037bbe3ee31085d1c73abd2ea3cb11f094", default-features = false, features = ["metal"] }
 reqwest = { version = "0.12.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 theorem-receiver = { path = "../theorem-receiver" }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 toml = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "15986c037bbe3ee31085d1c73abd2ea3cb11f094", default-features = false, features = ["metal"] }
+mistralrs-server-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "15986c037bbe3ee31085d1c73abd2ea3cb11f094", default-features = false, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "15986c037bbe3ee31085d1c73abd2ea3cb11f094", default-features = false }
+mistralrs-server-core = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "15986c037bbe3ee31085d1c73abd2ea3cb11f094", default-features = false }

@@ -341,6 +341,7 @@ struct CommonplaceRuntime {
 struct ProxyRuntime {
     endpoint: String,
     port: u16,
+    running: Arc<AtomicBool>,
     handle: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
@@ -1380,6 +1381,7 @@ fn stop_local_node(state: &tauri::State<'_, Mutex<DesktopBackendState>>) {
             }
         }
         if let Some(mut proxy) = backend.proxy.take() {
+            proxy.running.store(false, Ordering::SeqCst);
             if let Some(handle) = proxy.handle.take() {
                 handle.abort();
             }
@@ -1402,27 +1404,29 @@ struct ProxyStatus {
 
 /// Spawn theorem-proxy in-process on `THEOREM_PROXY_PORT`, injecting ambient memory from
 /// the desktop's local node (`/mcp`). The spawn handle is stored for teardown.
-fn start_theorem_proxy(
-    state: &tauri::State<'_, Mutex<DesktopBackendState>>,
-) -> Result<(), String> {
+fn start_theorem_proxy(state: &tauri::State<'_, Mutex<DesktopBackendState>>) -> Result<(), String> {
     let memory_url = format!("http://127.0.0.1:{LOCAL_NODE_PORT}/mcp");
     let (memory, _desc) = theorem_proxy::resolve_memory(Some(&memory_url), None, None);
     let config = theorem_proxy::ProxyConfig {
-        upstream: "https://api.anthropic.com".to_string(),
         memory,
         max_memories: 8,
         membrane_threshold: 0,
+        ..Default::default()
     };
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], THEOREM_PROXY_PORT).into();
+    let running = Arc::new(AtomicBool::new(true));
+    let running_task = Arc::clone(&running);
     let handle = tauri::async_runtime::spawn(async move {
         if let Err(error) = theorem_proxy::serve(addr, config).await {
             eprintln!("[theorem-desktop] theorem-proxy stopped: {error}");
         }
+        running_task.store(false, Ordering::SeqCst);
     });
     let mut backend = state.lock().map_err(|error| error.to_string())?;
     backend.proxy = Some(ProxyRuntime {
         endpoint: format!("http://127.0.0.1:{THEOREM_PROXY_PORT}"),
         port: THEOREM_PROXY_PORT,
+        running,
         handle: Some(handle),
     });
     Ok(())
@@ -1436,7 +1440,10 @@ fn theorem_proxy_status(
     let (proxy_up, endpoint, port) = backend
         .proxy
         .as_ref()
-        .map(|proxy| (true, proxy.endpoint.clone(), proxy.port))
+        .map(|proxy| {
+            let proxy_up = proxy.running.load(Ordering::SeqCst);
+            (proxy_up, proxy.endpoint.clone(), proxy.port)
+        })
         .unwrap_or((
             false,
             format!("http://127.0.0.1:{THEOREM_PROXY_PORT}"),
@@ -1495,17 +1502,18 @@ fn set_claude_base_url(value: Option<&str>) -> Result<(), String> {
     let path = claude_settings_path()?;
     let mut root: serde_json::Value = if path.exists() {
         let raw = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
+        serde_json::from_str(&raw)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?
     } else {
         serde_json::json!({})
     };
     if !root.is_object() {
-        root = serde_json::json!({});
+        return Err(format!("{} must contain a JSON object", path.display()));
     }
     let object = root.as_object_mut().expect("root is an object");
     let env = object.entry("env").or_insert_with(|| serde_json::json!({}));
     if !env.is_object() {
-        *env = serde_json::json!({});
+        return Err(format!("{}.env must contain a JSON object", path.display()));
     }
     let env = env.as_object_mut().expect("env is an object");
     match value {

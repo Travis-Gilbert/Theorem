@@ -48,29 +48,49 @@ pub fn apply_membrane(body: &[u8], threshold: usize) -> (Vec<u8>, Vec<(String, S
 }
 
 fn truncate_tool_result(block: &mut Value, threshold: usize, stored: &mut Vec<(String, String)>) {
-    let full = match block.get("content") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => return,
+    let Some(content) = block.get("content") else {
+        return;
     };
-    if full.len() <= threshold {
+    let Some(sample) = content_text_projection(content) else {
+        return;
+    };
+    if sample.len() <= threshold {
         return;
     }
+    let full = match content {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| sample.clone()),
+    };
     let id = content_id(&full);
     let half = threshold / 2;
-    let head = safe_prefix(&full, half);
-    let tail = safe_suffix(&full, half);
-    let elided = full.len() - head.len() - tail.len();
+    let head = safe_prefix(&sample, half);
+    let tail = safe_suffix(&sample, half);
+    let elided = sample.len() - head.len() - tail.len();
     let stub = format!(
         "{head}\n[theorem-membrane: elided {elided} bytes; full tool output at GET /tool_result/{id}]\n{tail}"
     );
     block["content"] = Value::String(stub);
     stored.push((id, full));
+}
+
+fn content_text_projection(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Session-scoped retrieval id. Not cryptographic: the proxy stores and serves within one
@@ -145,6 +165,30 @@ mod tests {
         let (out, stored) = apply_membrane(&original, 1000);
         assert!(stored.is_empty());
         assert_eq!(out, original, "small result: body unchanged");
+    }
+
+    #[test]
+    fn preserves_raw_structured_tool_result_out_of_band() {
+        let big = "X".repeat(5000);
+        let raw_content = json!([
+            {"type": "text", "text": big},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+        ]);
+        let original = serde_json::to_vec(&json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": raw_content.clone()}]}
+            ]
+        }))
+        .unwrap();
+        let (_out, stored) = apply_membrane(&original, 1000);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored[0].1).unwrap(),
+            raw_content,
+            "full structured content preserved for retrieval"
+        );
     }
 
     #[test]

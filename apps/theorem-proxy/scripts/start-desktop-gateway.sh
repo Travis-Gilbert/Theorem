@@ -9,6 +9,8 @@ NODE_PORT="${RUSTY_RED_PORT:-8380}"
 PROXY_PORT="${THEOREM_PROXY_PORT:-8788}"
 PROXY="${THEOREM_PROXY_BIN:-$HOME/.cargo/bin/theorem-proxy}"
 OWN_NODE=0
+NODE_PID=""
+NODE_LOG="${THEOREM_NODE_LOG:-$(mktemp -t theorem-node.XXXXXX.log)}"
 
 if [ -n "${THEOREM_PROXY_UPSTREAM_API_KEY:-}" ] && [ -n "${THEOREM_PROXY_UPSTREAM_AUTH_TOKEN:-}" ]; then
   echo "set only one of THEOREM_PROXY_UPSTREAM_API_KEY or THEOREM_PROXY_UPSTREAM_AUTH_TOKEN" >&2
@@ -29,8 +31,9 @@ EOF
 fi
 
 cleanup() {
-  if [ "$OWN_NODE" = "1" ]; then
-    pkill -f "rustyred-thg-server" >/dev/null 2>&1 || true
+  if [ "$OWN_NODE" = "1" ] && [ -n "$NODE_PID" ] && kill -0 "$NODE_PID" >/dev/null 2>&1; then
+    kill "$NODE_PID" >/dev/null 2>&1 || true
+    wait "$NODE_PID" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -44,11 +47,12 @@ up() {
 }
 
 if ! curl -fsS "http://127.0.0.1:$NODE_PORT/ready" >/dev/null 2>&1; then
-  RUSTY_RED_PORT="$NODE_PORT" bash "$HERE/node-local.sh" >/tmp/theorem-node.log 2>&1 &
+  RUSTY_RED_PORT="$NODE_PORT" bash "$HERE/node-local.sh" >"$NODE_LOG" 2>&1 &
+  NODE_PID=$!
   OWN_NODE=1
 fi
 up "http://127.0.0.1:$NODE_PORT/ready" || {
-  echo "node failed to start; see /tmp/theorem-node.log" >&2
+  echo "node failed to start; see $NODE_LOG" >&2
   exit 1
 }
 echo "node up (embedded RedCore) at 127.0.0.1:$NODE_PORT"
@@ -60,6 +64,6 @@ fi
 
 echo "Claude Desktop gateway: http://127.0.0.1:$PROXY_PORT"
 echo "ambient memory: node graph at http://127.0.0.1:$NODE_PORT/mcp"
-exec "$PROXY" proxy \
+"$PROXY" proxy \
   --port "$PROXY_PORT" \
   --memory-url "http://127.0.0.1:$NODE_PORT/mcp"

@@ -19,7 +19,7 @@ two heads do not overwrite each other. Update it when a lane changes hands.
 | Phase B.5 built-in measurement + `doctor` readout | Codex | open |
 | Phase C.1 install ergonomics (brew/curl/`wrap claude`) | CC | DONE local (`wrap` + `doctor` + `scripts/install.sh` from-source); brew tap + release-binary `curl\|sh` is the outward-facing publish step (gated) |
 | Phase C.2 remaining MVP (D2 membrane, D4 parity, D6 sidecar, D7 two-token) | CC | DONE (D2 + D4 + D7 + D6 desktop sidecar all landed) |
-| Phase C.3 one-click onboarding | CC | IN PROGRESS (`theorem doctor` chain-check done; site download / `theorem login` remaining) |
+| Phase C.3 one-click onboarding | CC | IN PROGRESS (`theorem-proxy doctor` chain-check done; site download / `theorem login` remaining) |
 | Phase C.4 resident capabilities (affordance exec, cascade, verify offload) | Codex | has `proxy-resident-capabilities` (merged #67) |
 | `fix-proxy-timeout-mcp-latency` -> main | Codex | branch `5df900607`, unmerged |
 
@@ -84,8 +84,8 @@ Nothing is pushed yet; push topology is Travis's call.
 - **C.3 `theorem login` + site download + Connect-button parity:** `login` needs an account ->
   substrate-key backend to authenticate against (the harness remote, currently degraded); the
   site download needs a web distribution surface. Both depend on external infra, not local code.
-  `theorem doctor` (the chain-check half of C.3) is done; B.5 will add its value readout (Codex).
+  `theorem-proxy doctor` (the chain-check half of C.3) is done; B.5 will add its value readout (Codex).
 - **C.4 resident capabilities (affordance exec / cascade / verify offload):** Codex owns it
   (`proxy-resident-capabilities`, merged #67).
 - **Binary naming:** reconciled -- the CLI entry is `theorem-proxy` (`proxy` / `wrap` / `doctor`);
-  the specs' `rustyred proxy` wording predates the crate. No code change; specs lag the binary.
+  the local-proxy specs now use that command surface.

@@ -19,7 +19,9 @@ async fn wrap_sets_anthropic_base_url_and_runs_the_command() {
     let command = vec![
         "sh".to_string(),
         "-c".to_string(),
-        format!("printf '%s' \"$ANTHROPIC_BASE_URL\" > '{}'", tmp.display()),
+        "printf '%s' \"$ANTHROPIC_BASE_URL\" > \"$1\"".to_string(),
+        "write-url".to_string(),
+        tmp.to_string_lossy().to_string(),
     ];
     let code = run_wrapped(addr, ProxyConfig::default(), command)
         .await

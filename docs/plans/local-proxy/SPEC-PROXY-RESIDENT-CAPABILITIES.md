@@ -12,9 +12,9 @@ The proxy resolves and checks; it does not block by default. An affordance the p
 
 ## What exists (do not rebuild)
 
-- The launch proxy (`rustyred-proxy`): the Messages surface, the native-tool membrane, ambient injection, the cache-stable suffix, the two-token separation.
+- The launch proxy (`theorem-proxy`): the Messages surface, the native-tool membrane, ambient injection, the cache-stable suffix, the two-token separation.
 - The affordance router: `rustyred-thg-affordances` with `tool_search` and `invoke`, the same surface the federated MCP exposes.
-- The local model host (renamed from `theorem-agentd`): the local Gemma inference loop, always running with the local node.
+- The local model host (`theorem-localmodel`): the local Gemma inference loop, always running with the local node.
 - The matrix and symbolic core: `rustyred-thg-graphblas`, where graph consistency and Datalog-style reachability run as matrix operations.
 - The phone authorization surface and the binding action tiers in `theorem-harness-core/src/agent_binding.rs`.
 - The behavior corpus (`SPEC-BEHAVIOR-CORPUS.md`), which produces the scored difficulty and outcome labels the cascade calibrates on.
@@ -37,9 +37,9 @@ Acceptance: a model output containing a claim the graph contradicts produces an 
 
 | # | Current state | Feature | Location | Action | Desired outcome | Test |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Affordances reachable only via installed MCP | Proxy injects and resolves affordances itself, tier-2/3 to phone | `rustyred-proxy` + `rustyred-thg-affordances` + `agent_binding.rs` | Build | No-MCP session uses harness affordances; tier-3 holds for phone | [-] |
-| 2 | All turns hit upstream | Cascade to local model with corpus-calibrated escalation | `rustyred-proxy` + local model host + `rustyred-thg-ml` | Build | Easy turn served locally, hard turn escalated, one coherent response | [-] |
-| 3 | No output check | Advisory verification against graph and symbolic layer | `rustyred-proxy` + `rustyred-thg-graphblas` | Build | Contradicted claim gets an advisory finding, turn not blocked | [-] |
+| 1 | Affordances reachable only via installed MCP | Proxy injects and resolves affordances itself, tier-2/3 to phone | `theorem-proxy` + `rustyred-thg-affordances` + `agent_binding.rs` | Build | No-MCP session uses harness affordances; tier-3 holds for phone | [-] |
+| 2 | All turns hit upstream | Cascade to local model with corpus-calibrated escalation | `theorem-proxy` + local model host + `rustyred-thg-ml` | Build | Easy turn served locally, hard turn escalated, one coherent response | [-] |
+| 3 | No output check | Advisory verification against graph and symbolic layer | `theorem-proxy` + `rustyred-thg-graphblas` | Build | Contradicted claim gets an advisory finding, turn not blocked | [-] |
 
 Test legend: `[-]` open, `[x]` verified against the acceptance criterion, `[~]` deferred with a reason that names a real external blocker.
 
@@ -53,7 +53,7 @@ Confirm the `rustyred-thg-affordances` `invoke` contract the proxy will call, th
 
 ## Where it lands
 
-- Affordance injection and resolution, cascade routing, verification orchestration: `rustyred-proxy`.
+- Affordance injection and resolution, cascade routing, verification orchestration: `theorem-proxy`.
 - Affordance execution: `rustyred-thg-affordances`.
 - Local model routing target: the renamed local model host.
 - Calibration: `rustyred-thg-ml`, fit on the behavior corpus.

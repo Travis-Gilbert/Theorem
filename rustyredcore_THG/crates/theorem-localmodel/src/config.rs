@@ -84,7 +84,7 @@ fn default_gemma_12b_tok_model_id() -> Option<String> {
 }
 
 fn default_local_gemma_12b_qat_dir() -> String {
-    "apps/theorem-agentd".to_string()
+    "apps/theorem-localmodel".to_string()
 }
 
 fn default_local_gemma_12b_qat_filename() -> String {
@@ -454,6 +454,18 @@ impl LocalModelTierConfig {
                 self.model_id
             )));
         }
+        if self.max_seq_len == 0 {
+            return Err(LocalModelError::Config(format!(
+                "local_model tier {} max_seq_len must be greater than zero",
+                self.model_id
+            )));
+        }
+        if self.max_batch_size == 0 {
+            return Err(LocalModelError::Config(format!(
+                "local_model tier {} max_batch_size must be greater than zero",
+                self.model_id
+            )));
+        }
         Ok(())
     }
 }
@@ -705,7 +717,10 @@ url = "https://example.test/mcp"
         assert_eq!(config.capture.repo, "Travis-Gilbert/theorem");
         assert_eq!(config.capture.dispatched_subtask_title, "dispatched");
         assert!(config.ledger.mirror_to_graph);
-        assert_eq!(config.local_model.quantized_model_id, "apps/theorem-agentd");
+        assert_eq!(
+            config.local_model.quantized_model_id,
+            "apps/theorem-localmodel"
+        );
         assert_eq!(
             config.local_model.quantized_filename,
             "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
@@ -730,6 +745,28 @@ url = "https://example.test/mcp"
         assert!(!config.receiver.enabled);
         assert!(!config.capture.enabled);
         assert!(!config.relay.enabled);
+    }
+
+    #[test]
+    fn rejects_zero_tier_dimensions() {
+        let raw = r#"
+actor = "localmodel"
+
+[model]
+provider = "rule"
+
+[harness]
+name = "harness"
+url = "https://example.test/mcp"
+
+[[local_model.tiers]]
+model_id = "tier-a"
+quantized_model_id = "repo/model"
+quantized_filename = "model.gguf"
+max_seq_len = 0
+"#;
+        let error = LocalModelConfig::from_toml(raw).unwrap_err().to_string();
+        assert!(error.contains("max_seq_len must be greater than zero"));
     }
 
     #[test]

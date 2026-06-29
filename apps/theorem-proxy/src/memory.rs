@@ -46,6 +46,9 @@ fn relevance(query_tokens: &BTreeSet<String>, memory_text: &str) -> f64 {
 }
 
 fn rank(items: impl Iterator<Item = MemoryHit>, query: &str, limit: usize) -> Vec<MemoryHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let query_tokens = tokens(query);
     if query_tokens.is_empty() {
         return Vec::new();
@@ -63,7 +66,7 @@ fn rank(items: impl Iterator<Item = MemoryHit>, query: &str, limit: usize) -> Ve
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.title.cmp(&b.title))
     });
-    scored.truncate(limit.max(1));
+    scored.truncate(limit);
     scored
 }
 
@@ -148,7 +151,7 @@ impl MemorySource for DirectoryMemorySource {
 /// hits, so the turn is forwarded unchanged. The agent's short read timeout guarantees
 /// a hung node can never delay a model turn.
 pub struct HttpMemorySource {
-    /// The node's MCP endpoint, e.g. `http://127.0.0.1:8790/mcp`.
+    /// The node's MCP endpoint, e.g. `http://127.0.0.1:8380/mcp`.
     endpoint: String,
     /// Optional tenant slug; omitted uses the node's default tenant.
     tenant: Option<String>,
@@ -175,12 +178,14 @@ impl HttpMemorySource {
     /// JSON-RPC `tools/call` for `hippo_retrieve` against the node. `None` on any
     /// transport/parse failure (the caller maps that to no hits -> passthrough).
     fn query(&self, query: &str, limit: usize) -> Option<Vec<MemoryHit>> {
+        if limit == 0 {
+            return Some(Vec::new());
+        }
         // auto_index_memory=false keeps this a pure read: indexing the corpus re-scans
         // every memory and far exceeds the agent's read timeout, so the hot path must
         // query the already-warm index. Building/warming the index is the seed step's job
         // (scripts/seed-node.py), not the per-turn retrieval's.
-        let mut arguments =
-            json!({ "query": query, "top_k": limit.max(1), "auto_index_memory": false });
+        let mut arguments = json!({ "query": query, "top_k": limit, "auto_index_memory": false });
         if let Some(tenant) = &self.tenant {
             arguments["tenant"] = json!(tenant);
         }
@@ -205,12 +210,9 @@ impl HttpMemorySource {
 
 impl MemorySource for HttpMemorySource {
     fn retrieve(&self, query: &str, limit: usize) -> Vec<MemoryHit> {
-        if query.trim().is_empty() {
+        if query.trim().is_empty() || limit == 0 {
             return Vec::new();
         }
-        // ponytail: blocking HTTP on the async worker, bounded by the agent read
-        // timeout so a hung node cannot delay a turn. If localhost latency ever shows,
-        // make MemorySource async or wrap this in spawn_blocking.
         self.query(query, limit).unwrap_or_default()
     }
 }
@@ -220,6 +222,9 @@ impl MemorySource for HttpMemorySource {
 /// at `result.candidates` or the top level. All are tolerated. A candidate without text
 /// is skipped.
 fn parse_candidates(value: &Value, limit: usize) -> Vec<MemoryHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let result = value.get("result");
     let candidates = result
         .and_then(|result| result.get("structuredContent"))
@@ -231,7 +236,7 @@ fn parse_candidates(value: &Value, limit: usize) -> Vec<MemoryHit> {
         return Vec::new();
     };
     let mut hits: Vec<MemoryHit> = candidates.iter().filter_map(candidate_to_hit).collect();
-    hits.truncate(limit.max(1));
+    hits.truncate(limit);
     hits
 }
 
@@ -278,6 +283,16 @@ mod tests {
     fn empty_query_returns_nothing() {
         let source = VecMemorySource::new(vec![("a", "b")]);
         assert!(source.retrieve("", 5).is_empty());
+    }
+
+    #[test]
+    fn zero_limit_returns_nothing() {
+        let source = VecMemorySource::new(vec![("planner", "planner pushdown")]);
+        assert!(source
+            .retrieve("tell me about planner pushdown", 0)
+            .is_empty());
+        let value = json!({"result": {"candidates": [{"node_id": "mem:1", "text": "hit"}]}});
+        assert!(parse_candidates(&value, 0).is_empty());
     }
 
     #[test]

@@ -165,15 +165,28 @@ async fn proxy_messages(
     // D3: inject relevant memory at the cache-stable suffix (the last user turn),
     // never into system or tools. Fail open -- an unparseable body, or one with no
     // relevant memory, is forwarded unchanged.
-    let body = match &state.memory {
-        Some(source) => Bytes::from(crate::inject::inject_memory(
-            &body,
-            source.as_ref(),
-            state.max_memories,
-        )),
+    let body = match state.memory.clone() {
+        Some(source) => inject_anthropic_memory(body, source, state.max_memories).await,
         None => body,
     };
     forward_upstream(state, method, headers, body, "/v1/messages").await
+}
+
+async fn inject_anthropic_memory(
+    body: Bytes,
+    source: Arc<dyn memory::MemorySource>,
+    max_memories: usize,
+) -> Bytes {
+    let fallback = body.clone();
+    tokio::task::spawn_blocking(move || {
+        Bytes::from(crate::inject::inject_memory(
+            &body,
+            source.as_ref(),
+            max_memories,
+        ))
+    })
+    .await
+    .unwrap_or(fallback)
 }
 
 async fn proxy_models(
@@ -191,15 +204,28 @@ async fn proxy_openai_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let body = match &state.memory {
-        Some(source) => Bytes::from(crate::inject::inject_openai_responses_memory(
-            &body,
-            source.as_ref(),
-            state.max_memories,
-        )),
+    let body = match state.memory.clone() {
+        Some(source) => inject_openai_responses_memory(body, source, state.max_memories).await,
         None => body,
     };
     forward_openai_upstream(state, method, headers, body, "/v1/responses").await
+}
+
+async fn inject_openai_responses_memory(
+    body: Bytes,
+    source: Arc<dyn memory::MemorySource>,
+    max_memories: usize,
+) -> Bytes {
+    let fallback = body.clone();
+    tokio::task::spawn_blocking(move || {
+        Bytes::from(crate::inject::inject_openai_responses_memory(
+            &body,
+            source.as_ref(),
+            max_memories,
+        ))
+    })
+    .await
+    .unwrap_or(fallback)
 }
 
 async fn proxy_openai_passthrough(
@@ -370,7 +396,7 @@ async fn serve_tool_result(
         .tool_results
         .lock()
         .ok()
-        .and_then(|store| store.get(&id).cloned())
+        .and_then(|mut store| store.remove(&id))
     {
         Some(content) => content.into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -441,7 +467,18 @@ pub async fn run_wrapped(
         .status()
         .await?;
     server.abort();
-    Ok(status.code().unwrap_or(0))
+    if let Some(code) = status.code() {
+        return Ok(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return Ok(128 + signal);
+        }
+    }
+    Ok(1)
 }
 
 /// Poll `/healthz` until the proxy answers (bounded ~5s). Best-effort: if it never comes
@@ -477,7 +514,7 @@ impl Check {
     }
 }
 
-/// Probe the local stack (roadmap C.3 `theorem doctor`): the Valkey warm tier, the local
+/// Probe the local stack (roadmap C.3 `theorem-proxy doctor`): the Valkey warm tier, the local
 /// node (`/ready` + a real memory retrieval round-trip), and a running proxy. Each link
 /// is probed independently; a down link is reported, never fatal. This is also where
 /// B.5's value readout will hang. `valkey_addr` is `host:port`.
