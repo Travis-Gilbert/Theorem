@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use theorem_substrate_sync::bootstrap::bootstrap_from_remote;
+use theorem_substrate_sync::bootstrap::{
+    bootstrap_from_remote, bootstrap_memory_documents_from_remote,
+};
 use theorem_substrate_sync::config::SyncConfig;
 use theorem_substrate_sync::cursor::{CursorStore, ValkeyCursorStore};
 use theorem_substrate_sync::drainer::{retry_after, OutboxDrainer};
@@ -64,6 +66,7 @@ async fn main() -> Result<()> {
                     "connected": connection.as_connected_bool(),
                     "connection": connection,
                     "sync_enabled": config.sync_enabled,
+                    "full_pack_rounds_enabled": config.full_pack_rounds_enabled,
                     "tenant": config.tenant,
                 }))?
             );
@@ -71,14 +74,21 @@ async fn main() -> Result<()> {
         }
         Command::Once => {
             ensure_enabled(&config)?;
+            ensure_full_pack_rounds_enabled(&config)?;
             let receipt = run_round(&local, &remote, &status).await?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             Ok(())
         }
         Command::Bootstrap => {
             ensure_enabled(&config)?;
-            let receipt = bootstrap_from_remote(&local, &remote, &status).await?;
-            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            if config.full_pack_rounds_enabled {
+                let receipt = bootstrap_from_remote(&local, &remote, &status).await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            } else {
+                let receipt =
+                    bootstrap_memory_documents_from_remote(&local, &remote, &status).await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
             Ok(())
         }
         Command::Serve => serve(config, local, remote, status).await,
@@ -109,6 +119,10 @@ async fn serve(
     if matches!(connection, ConnectionState::TokenInvalid) {
         return Err(SyncError::Auth("remote token invalid".to_string()));
     }
+    if !config.full_pack_rounds_enabled {
+        mark_full_pack_rounds_disabled(&status, &config).await;
+        eprintln!("{}", full_pack_disabled_message(&config));
+    }
 
     let outbox: Arc<dyn OutboxStore> = Arc::new(ValkeyOutbox::new(&config.valkey_url)?);
     let cursors: Arc<dyn CursorStore> = Arc::new(ValkeyCursorStore::new(&config.valkey_url)?);
@@ -136,13 +150,13 @@ async fn serve(
             .await;
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                if let Err(error) = run_round(&local, &remote, &status).await {
+                if let Err(error) = run_round_if_enabled(&config, &local, &remote, &status).await {
                     eprintln!("sync round failed: {error}");
                 }
             }
             Some(()) = trigger_rx.recv() => {
                 scheduler.note_activity(Instant::now());
-                if let Err(error) = run_round(&local, &remote, &status).await {
+                if let Err(error) = run_round_if_enabled(&config, &local, &remote, &status).await {
                     eprintln!("manual sync round failed: {error}");
                 }
             }
@@ -210,4 +224,44 @@ fn ensure_enabled(config: &SyncConfig) -> Result<()> {
             "sync is disabled; set THEOREM_SYNC_ENABLED=1".to_string(),
         ))
     }
+}
+
+fn ensure_full_pack_rounds_enabled(config: &SyncConfig) -> Result<()> {
+    if config.full_pack_rounds_enabled {
+        Ok(())
+    } else {
+        Err(SyncError::Config(full_pack_disabled_message(config)))
+    }
+}
+
+async fn run_round_if_enabled(
+    config: &SyncConfig,
+    local: &McpClient,
+    remote: &McpClient,
+    status: &StatusHandle,
+) -> Result<()> {
+    if !config.full_pack_rounds_enabled {
+        mark_full_pack_rounds_disabled(status, config).await;
+        return Ok(());
+    }
+    run_round(local, remote, status).await.map(|_| ())
+}
+
+async fn mark_full_pack_rounds_disabled(status: &StatusHandle, config: &SyncConfig) {
+    let warning = full_pack_disabled_message(config);
+    status
+        .update(|status| {
+            status.last_round = Some("round:skipped:full-pack-disabled".to_string());
+            if !status.warnings.iter().any(|existing| existing == &warning) {
+                status.warnings.push(warning);
+            }
+        })
+        .await;
+}
+
+fn full_pack_disabled_message(config: &SyncConfig) -> String {
+    format!(
+        "full-pack substrate rounds are disabled for tenant {} at {}; set THEOREM_SYNC_FULL_PACK_ROUNDS=1 to opt in",
+        config.tenant, config.remote_mcp_url
+    )
 }

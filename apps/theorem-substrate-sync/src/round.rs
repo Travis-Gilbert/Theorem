@@ -45,15 +45,6 @@ pub async fn run_round(
 
     apply_snapshot(local, &merged_snapshot).await?;
     apply_snapshot(remote, &merged_snapshot).await?;
-    remote
-        .call_tool(
-            "rustyred_thg_graph_version_ref",
-            json!({
-                "branch": "main",
-                "include_payloads": true
-            }),
-        )
-        .await?;
 
     let receipt = RoundReceipt {
         local_hash,

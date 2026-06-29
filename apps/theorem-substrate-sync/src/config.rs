@@ -6,6 +6,7 @@ use std::time::Duration;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncConfig {
     pub sync_enabled: bool,
+    pub full_pack_rounds_enabled: bool,
     pub tenant: String,
     pub remote_mcp_url: String,
     pub local_mcp_url: String,
@@ -20,14 +21,21 @@ pub struct SyncConfig {
 impl SyncConfig {
     pub fn from_env() -> Self {
         let status_port = env_u16("THEOREM_SYNC_STATUS_PORT", 8790);
+        let tenant = env::var("THEOREM_SYNC_TENANT")
+            .or_else(|_| env::var("THEOREM_PROXY_TENANT"))
+            .unwrap_or_else(|_| "Travis-Gilbert".to_string());
+        let remote_mcp_url =
+            env::var("THEOREM_SYNC_REMOTE_URL").unwrap_or_else(|_| default_remote_mcp_url());
+        let full_pack_rounds_enabled = full_pack_rounds_enabled_for(
+            &tenant,
+            &remote_mcp_url,
+            env::var("THEOREM_SYNC_FULL_PACK_ROUNDS").ok().as_deref(),
+        );
         Self {
             sync_enabled: truthy_env("THEOREM_SYNC_ENABLED"),
-            tenant: env::var("THEOREM_SYNC_TENANT")
-                .or_else(|_| env::var("THEOREM_PROXY_TENANT"))
-                .unwrap_or_else(|_| "Travis-Gilbert".to_string()),
-            remote_mcp_url: env::var("THEOREM_SYNC_REMOTE_URL").unwrap_or_else(|_| {
-                "https://rustyredcore-theorem-production.up.railway.app/mcp".to_string()
-            }),
+            full_pack_rounds_enabled,
+            tenant,
+            remote_mcp_url,
             local_mcp_url: env::var("THEOREM_SYNC_LOCAL_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8380/mcp".to_string()),
             token_path: env::var("THEOREM_SYNC_TENANT_TOKEN_FILE")
@@ -45,6 +53,22 @@ impl SyncConfig {
     }
 }
 
+pub fn full_pack_rounds_enabled_for(
+    tenant: &str,
+    remote_mcp_url: &str,
+    override_value: Option<&str>,
+) -> bool {
+    if let Some(value) = override_value.and_then(parse_bool_env_value) {
+        return value;
+    }
+    !is_default_production_travis_gilbert_target(tenant, remote_mcp_url)
+}
+
+pub fn is_default_production_travis_gilbert_target(tenant: &str, remote_mcp_url: &str) -> bool {
+    tenant.eq_ignore_ascii_case("Travis-Gilbert")
+        && remote_mcp_url.contains("rustyredcore-theorem-production.up.railway.app")
+}
+
 pub fn truthy_env(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
@@ -54,6 +78,14 @@ pub fn truthy_env(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn parse_bool_env_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn env_u16(name: &str, default: u16) -> u16 {
@@ -77,6 +109,10 @@ fn default_token_path() -> PathBuf {
     home.join(".theorem-substrate-sync").join("tenant-token")
 }
 
+fn default_remote_mcp_url() -> String {
+    "https://rustyredcore-theorem-production.up.railway.app/mcp".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +124,29 @@ mod tests {
         std::env::set_var("THEOREM_SYNC_TEST_TRUTHY", "0");
         assert!(!truthy_env("THEOREM_SYNC_TEST_TRUTHY"));
         std::env::remove_var("THEOREM_SYNC_TEST_TRUTHY");
+    }
+
+    #[test]
+    fn full_pack_rounds_are_off_for_default_production_tenant() {
+        assert!(!full_pack_rounds_enabled_for(
+            "Travis-Gilbert",
+            "https://rustyredcore-theorem-production.up.railway.app/mcp",
+            None
+        ));
+        assert!(full_pack_rounds_enabled_for(
+            "Travis-Gilbert",
+            "https://rustyredcore-theorem-production.up.railway.app/mcp",
+            Some("1")
+        ));
+        assert!(full_pack_rounds_enabled_for(
+            "small-tenant",
+            "https://rustyredcore-theorem-production.up.railway.app/mcp",
+            None
+        ));
+        assert!(full_pack_rounds_enabled_for(
+            "Travis-Gilbert",
+            "http://127.0.0.1:8380/mcp",
+            None
+        ));
     }
 }

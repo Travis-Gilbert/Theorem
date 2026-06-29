@@ -25,7 +25,9 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use theorem_substrate_sync::bootstrap::bootstrap_from_remote;
+use theorem_substrate_sync::bootstrap::{
+    bootstrap_from_remote, bootstrap_memory_documents_from_remote,
+};
 use theorem_substrate_sync::cursor::{CursorStore, InMemoryCursorStore};
 use theorem_substrate_sync::drainer::OutboxDrainer;
 use theorem_substrate_sync::outbox::{InMemoryOutbox, OutboxStore, QueuedOutboxEvent};
@@ -266,6 +268,66 @@ async fn handle_tool_call(
                 }
             }
         })),
+        "memory_documents_dump" => {
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(500) as usize;
+            let before = args
+                .get("before")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut nodes: Vec<Value> = g.nodes.values().cloned().collect();
+            nodes.sort_by(|left, right| {
+                let left_updated_at = left
+                    .get("properties")
+                    .and_then(|properties| properties.get("updated_at"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let right_updated_at = right
+                    .get("properties")
+                    .and_then(|properties| properties.get("updated_at"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                right_updated_at.cmp(left_updated_at)
+            });
+            if !before.is_empty() {
+                nodes.retain(|node| {
+                    node.get("properties")
+                        .and_then(|properties| properties.get("updated_at"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        < before
+                });
+            }
+            let truncated = nodes.len() > limit;
+            if truncated {
+                nodes.truncate(limit);
+            }
+            let next_before = if truncated {
+                nodes
+                    .last()
+                    .and_then(|node| node.get("properties"))
+                    .and_then(|properties| properties.get("updated_at"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let docs = nodes
+                .iter()
+                .filter_map(|node| node.get("properties").cloned())
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "structuredContent": {
+                    "tenant": "Travis-Gilbert",
+                    "count": docs.len(),
+                    "limit": limit,
+                    "truncated": truncated,
+                    "next_before": next_before,
+                    "docs": docs,
+                    "nodes": nodes
+                }
+            }))
+        }
         _ => Ok(json!({
             "structuredContent": { "ok": false, "warning": format!("unhandled verb: {name}") }
         })),
@@ -289,7 +351,8 @@ fn make_node_payload(id: &str) -> Value {
         "id": id,
         "labels": ["MemoryDocument"],
         "properties": {
-            "created_at_ms": 1
+            "created_at_ms": 1,
+            "updated_at": id
         }
     })
 }
@@ -324,6 +387,36 @@ async fn step_1_3_bootstrap_is_atomic_from_remote_head() {
 
     let (n_after, _) = local.counts().await;
     assert_eq!(n_after, 3, "all remote nodes applied locally");
+}
+
+#[tokio::test]
+async fn step_1_3_bootstrap_can_use_paginated_memory_documents() {
+    let remote = FakeState::new();
+    let local = FakeState::new();
+    for idx in 0..501 {
+        remote
+            .seed_node(&format!("2026-06-27T00:00:{idx:04}Z"))
+            .await;
+    }
+
+    let remote_url = spawn_fake(remote.clone()).await;
+    let local_url = spawn_fake(local.clone()).await;
+
+    let r = McpClient::unauthenticated(remote_url, "Travis-Gilbert");
+    let l = McpClient::unauthenticated(local_url, "Travis-Gilbert");
+
+    let receipt = bootstrap_memory_documents_from_remote(&l, &r, &handle())
+        .await
+        .unwrap();
+    assert_eq!(receipt.remote_nodes_total, 501);
+    assert_eq!(receipt.pages, 2);
+    assert!(receipt.applied);
+
+    let (n_after, _) = local.counts().await;
+    assert_eq!(
+        n_after, 501,
+        "all paged memory document nodes applied locally"
+    );
 }
 
 /// Step 4: a remote-side write reaches the local node via the stream tail

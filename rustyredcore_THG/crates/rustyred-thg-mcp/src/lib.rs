@@ -47,10 +47,10 @@ use rustyred_thg_core::{
     EpistemicEnricher, EpistemicEnrichmentError, EpistemicEnrichmentMode, EpistemicType,
     FusionPolicy, GraphCompileOptions, GraphMergeOptions, GraphSnapshot, GraphStats, GraphStore,
     GraphStoreError, GraphStoreResult, GraphVersionRepository, GraphqlSelection, HarnessInstantKg,
-    HybridScoringConfig, InMemoryGraphStore, ModalityResolver, NeighborHit, NeighborQuery,
-    NodeQuery, NodeRecord, PluginRegistry, QueryIr, RankOutcome, RankedRow, RedCoreGraphStore,
-    RelationalStore, SessionDelta, StreamEvent, StreamLog, StreamUrgency, UserSubgraph,
-    VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
+    HybridScoringConfig, InMemoryGraphStore, MemoryDocumentQuery, ModalityResolver, NeighborHit,
+    NeighborQuery, NodeQuery, NodeRecord, PluginRegistry, QueryIr, RankOutcome, RankedRow,
+    RedCoreGraphStore, RelationalStore, SessionDelta, StreamEvent, StreamLog, StreamUrgency,
+    UserSubgraph, VectorDesignation, VerifyReport, EPISTEMIC_SHADOW_LABEL, EPISTEMIC_SUPPORTS,
     HAS_EPISTEMIC_SHADOW, SAME_ECLASS, UNDERCUTS,
 };
 use rustyred_thg_datawave_harness::{DatawaveIngestPlugin, INGEST_CAPABILITY_PACK};
@@ -105,6 +105,8 @@ const MULTIHEAD_RUN_LABEL: &str = "MultiheadRun";
 const MULTIHEAD_PATCH_LABEL: &str = "MultiheadPatch";
 const MULTIHEAD_PROOF_LABEL: &str = "MultiheadProofReceipt";
 const DEFAULT_MULTIHEAD_LEASE_TTL_MS: Millis = 90_000;
+const MEMORY_DOCUMENTS_DUMP_DEFAULT_LIMIT: usize = 500;
+const MEMORY_DOCUMENTS_DUMP_MAX_LIMIT: usize = 1_000;
 
 #[allow(clippy::too_many_arguments)]
 /// Request to fire a GitHub Actions `repository_dispatch` that spawns a session. The MCP crate
@@ -311,6 +313,54 @@ pub trait McpGraphBackend {
             nodes,
             edges,
         })
+    }
+    fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        let limit = query.limit.filter(|limit| *limit > 0).unwrap_or(500);
+        let mut node_query = NodeQuery::label("MemoryDocument")
+            .with_property("tenant_slug", Value::String(query.tenant_slug.clone()))
+            .with_limit(10_000);
+        if let Some(status) = query.status.clone() {
+            node_query = node_query.with_property("status", Value::String(status));
+        }
+        let since = query.since.as_deref().map(str::trim).unwrap_or_default();
+        let before = query.before.as_deref().map(str::trim).unwrap_or_default();
+        let mut nodes = self.query_nodes(node_query)?;
+        nodes.retain(|node| {
+            let status = node
+                .properties
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !query.include_deleted && status == "deleted" {
+                return false;
+            }
+            let updated_at = node
+                .properties
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (since.is_empty() || updated_at >= since) && (before.is_empty() || updated_at < before)
+        });
+        nodes.sort_by(|left, right| {
+            let left_updated_at = left
+                .properties
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let right_updated_at = right
+                .properties
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            right_updated_at
+                .cmp(left_updated_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        nodes.truncate(limit);
+        Ok(nodes)
     }
     fn upsert_node(&mut self, _node: NodeRecord) -> GraphStoreResult<()> {
         Err(GraphStoreError::new(
@@ -803,6 +853,12 @@ impl<S: McpGraphBackend> McpGraphBackend for SharedStore<S> {
     }
     fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
         self.0.borrow().graph_snapshot()
+    }
+    fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.0.borrow().memory_documents_by_updated_at(query)
     }
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
         self.0.borrow_mut().upsert_node(node)
@@ -2083,6 +2139,9 @@ fn call_tool<P: McpGraphProvider>(
                 })));
             }
             recall_memory_payload(&tenant, &mut backend, &arguments, consume_handoffs)?
+        }
+        "memory_documents_dump" | "theorem_harness_memory_documents_dump" => {
+            memory_documents_dump_payload(&tenant, &backend, &arguments)?
         }
         "relate" | "theorem_harness_relate" => {
             relate_memory_payload(&tenant, &backend, &arguments)?
@@ -8089,6 +8148,88 @@ fn recall_memory_payload(
     }))
 }
 
+fn memory_documents_dump_payload(
+    tenant: &str,
+    backend: &impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let tenant_slug = normalize_tenant_slug(tenant);
+    let limit = argument_u64(arguments, &["limit"])
+        .map(|limit| limit as usize)
+        .unwrap_or(MEMORY_DOCUMENTS_DUMP_DEFAULT_LIMIT)
+        .clamp(1, MEMORY_DOCUMENTS_DUMP_MAX_LIMIT);
+    let include_inactive = arguments
+        .get("include_inactive")
+        .or_else(|| arguments.get("includeInactive"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_deleted = arguments
+        .get("include_deleted")
+        .or_else(|| arguments.get("includeDeleted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = argument_text(arguments, &["status"]);
+
+    let mut query = MemoryDocumentQuery::tenant(tenant_slug.clone()).with_limit(limit + 1);
+    if let Some(since) = argument_text(arguments, &["since"]) {
+        query = query.with_since(since);
+    }
+    if let Some(before) = argument_text(arguments, &["before"]) {
+        query = query.with_before(before);
+    }
+    if let Some(status) = status {
+        query = query.with_status(status);
+    } else if !include_inactive {
+        query = query.with_status("active");
+    }
+    query.include_deleted = include_deleted;
+
+    let mut nodes = backend
+        .memory_documents_by_updated_at(query)
+        .map_err(McpError::from)?;
+    let truncated = nodes.len() > limit;
+    if truncated {
+        nodes.truncate(limit);
+    }
+    let max_updated_at = nodes
+        .iter()
+        .filter_map(|node| node.properties.get("updated_at").and_then(Value::as_str))
+        .max()
+        .unwrap_or_default()
+        .to_string();
+    let next_before = if truncated {
+        nodes
+            .last()
+            .and_then(|node| node.properties.get("updated_at"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        String::new()
+    };
+    let docs = nodes
+        .iter()
+        .map(|node| node.properties.clone())
+        .collect::<Vec<_>>();
+    let node_values = nodes
+        .iter()
+        .map(|node| {
+            serde_json::to_value(node).map_err(|error| McpError::internal(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(json!({
+        "tenant": tenant_slug,
+        "count": docs.len(),
+        "limit": limit,
+        "truncated": truncated,
+        "next_before": next_before,
+        "max_updated_at": max_updated_at,
+        "docs": docs,
+        "nodes": node_values
+    }))
+}
+
 fn relate_memory_payload(
     tenant: &str,
     backend: &impl McpGraphBackend,
@@ -13570,6 +13711,25 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "memory_documents_dump",
+            "Page raw MemoryDocument nodes by updated_at for sync/bootstrap lanes without compiling the full tenant graph.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "since": { "type": "string" },
+                    "before": { "type": "string" },
+                    "status": { "type": "string" },
+                    "include_inactive": { "type": "boolean", "default": false },
+                    "includeInactive": { "type": "boolean", "default": false },
+                    "include_deleted": { "type": "boolean", "default": false },
+                    "includeDeleted": { "type": "boolean", "default": false },
+                    "limit": { "type": "integer", "default": MEMORY_DOCUMENTS_DUMP_DEFAULT_LIMIT, "maximum": MEMORY_DOCUMENTS_DUMP_MAX_LIMIT }
+                }
+            }),
+        ),
+        tool(
             "epistemic_dirty_frontier",
             "Return content nodes whose EpistemicShadow is absent, explicitly dirty, or stale, expanded by k hops.",
             json!({
@@ -15165,6 +15325,15 @@ impl McpGraphBackend for InMemoryGraphStore {
         Ok(self.snapshot())
     }
 
+    fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        Ok(InMemoryGraphStore::memory_documents_by_updated_at(
+            self, query,
+        ))
+    }
+
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
         InMemoryGraphStore::upsert_node(self, node).map(|_| ())
     }
@@ -15345,6 +15514,13 @@ impl McpGraphBackend for RedCoreGraphStore {
 
     fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
         Ok(RedCoreGraphStore::graph_snapshot(self))
+    }
+
+    fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        RedCoreGraphStore::memory_documents_by_updated_at(self, query)
     }
 
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
@@ -19182,8 +19358,8 @@ mod tests {
         assert_eq!(first.scratchpad_seq, 1);
 
         let first_revision_node = super::scratchpad_revision_node_id("scratchpad:theorem", 1);
-        let first_revision_edge = "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000001"
-            .to_string();
+        let first_revision_edge =
+            "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000001".to_string();
         let second_revision_node = super::scratchpad_revision_node_id("scratchpad:theorem", 2);
         let second_revision_edge =
             "harness:edge:scratchrev-of:scratchpad:theorem:00000000000000000002".to_string();
@@ -22612,6 +22788,118 @@ mod tests {
             merge["result"]["structuredContent"]["merge"]["status"],
             "clean"
         );
+    }
+
+    #[test]
+    fn memory_documents_dump_pages_indexed_memory_nodes() {
+        let (provider, config) = fixture();
+        {
+            let mut store = provider.0.borrow_mut();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:doc:smoke:older-active",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "smoke",
+                        "doc_id": "older-active",
+                        "kind": "note",
+                        "title": "Older",
+                        "content": "older body",
+                        "status": "active",
+                        "created_at": "2026-06-27T00:00:01Z",
+                        "updated_at": "2026-06-27T00:00:01Z"
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:doc:smoke:archived",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "smoke",
+                        "doc_id": "archived",
+                        "kind": "note",
+                        "title": "Archived",
+                        "content": "archived body",
+                        "status": "archived",
+                        "created_at": "2026-06-27T00:00:02Z",
+                        "updated_at": "2026-06-27T00:00:02Z"
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:doc:smoke:newer-active",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "smoke",
+                        "doc_id": "newer-active",
+                        "kind": "note",
+                        "title": "Newer",
+                        "content": "newer body",
+                        "status": "active",
+                        "created_at": "2026-06-27T00:00:03Z",
+                        "updated_at": "2026-06-27T00:00:03Z"
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:doc:smoke:deleted",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "smoke",
+                        "doc_id": "deleted",
+                        "kind": "note",
+                        "title": "Deleted",
+                        "content": "deleted body",
+                        "status": "deleted",
+                        "created_at": "2026-06-27T00:00:04Z",
+                        "updated_at": "2026-06-27T00:00:04Z"
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let first = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "memory-dump-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_documents_dump",
+                    "arguments": { "tenant": "smoke", "limit": 1 }
+                }
+            }),
+        );
+
+        let page = &first["result"]["structuredContent"];
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["docs"][0]["doc_id"], "newer-active");
+        assert_eq!(page["nodes"][0]["id"], "mem:doc:smoke:newer-active");
+        let next_before = page["next_before"].as_str().expect("next_before set");
+
+        let second = handle_mcp_request(
+            &provider,
+            &config,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "memory-dump-2",
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_documents_dump",
+                    "arguments": { "tenant": "smoke", "before": next_before, "limit": 10 }
+                }
+            }),
+        );
+
+        let page = &second["result"]["structuredContent"];
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["truncated"], false);
+        assert_eq!(page["docs"][0]["doc_id"], "older-active");
     }
 
     #[test]

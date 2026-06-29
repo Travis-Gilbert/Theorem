@@ -1940,6 +1940,13 @@ impl McpGraphBackend for TenantGraphStore {
         TenantGraphStore::graph_snapshot(self)
     }
 
+    fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        TenantGraphStore::memory_documents_by_updated_at(self, query)
+    }
+
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
         TenantGraphStore::upsert_node(self, node).map(|_| ())
     }
@@ -2316,6 +2323,13 @@ impl McpGraphBackend for ProductMcpBackend {
 
     fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
         self.store.graph_snapshot()
+    }
+
+    fn memory_documents_by_updated_at(
+        &self,
+        query: MemoryDocumentQuery,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        self.store.memory_documents_by_updated_at(query)
     }
 
     fn upsert_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
