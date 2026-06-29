@@ -2,6 +2,7 @@ use crate::alignment::evaluate_publication;
 use crate::budget::{apply_contribution_charge, check_contribution_budget, BindingBudgetState};
 use crate::state_hash::stable_value_hash;
 use crate::types::{now_string, prefixed_id, GuardViolation, Payload};
+use crate::user_model::{user_model_hash, UserModel};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -35,6 +36,15 @@ pub struct BindingIdentity {
     pub trust_tier: String,
     #[serde(default)]
     pub active_head_set: Vec<String>,
+    /// Optional persona/voice text that conditions every head contribution this
+    /// binding produces. The text is owned by the caller that constructs the
+    /// binding; loading it from disk (e.g. from
+    /// `docs/plans/agent-theorem/constitution.md`) is a higher-layer concern.
+    /// When present, the intra-agent loop threads it through every head
+    /// invocation request so proposal, critique, synthesis, and verification
+    /// share one voice.
+    #[serde(default)]
+    pub agent_constitution: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -472,6 +482,7 @@ impl ScratchpadDocument {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_with_links(
         &mut self,
         actor_head_id: impl Into<String>,
@@ -481,6 +492,61 @@ impl ScratchpadDocument {
         parent_revision_ids: Vec<String>,
         links: Vec<ScratchpadRevisionLink>,
         created_at: impl Into<String>,
+    ) -> ScratchpadRevision {
+        self.append_internal(
+            actor_head_id.into(),
+            summary.into(),
+            content_hash.into(),
+            payload,
+            parent_revision_ids,
+            links,
+            created_at.into(),
+            prefixed_id("scratchrev"),
+            prefixed_id("scratchop"),
+        )
+    }
+
+    /// Append a revision with caller-provided deterministic `revision_id` and
+    /// `op_id`, bypassing the UUID-based generators used by `append` /
+    /// `append_with_links`. Used by the binding-mount path so identical
+    /// `(agent_id, user_model_hash, created_at)` inputs always produce the
+    /// same scratchpad state hash on replay (PR #72 P1 fix).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_with_deterministic_ids(
+        &mut self,
+        actor_head_id: impl Into<String>,
+        summary: impl Into<String>,
+        content_hash: impl Into<String>,
+        payload: Payload,
+        revision_id: String,
+        op_id: String,
+        created_at: impl Into<String>,
+    ) -> ScratchpadRevision {
+        self.append_internal(
+            actor_head_id.into(),
+            summary.into(),
+            content_hash.into(),
+            payload,
+            Vec::new(),
+            Vec::new(),
+            created_at.into(),
+            revision_id,
+            op_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_internal(
+        &mut self,
+        actor_head_id: String,
+        summary: String,
+        content_hash: String,
+        payload: Payload,
+        parent_revision_ids: Vec<String>,
+        links: Vec<ScratchpadRevisionLink>,
+        created_at: String,
+        revision_id: String,
+        op_id: String,
     ) -> ScratchpadRevision {
         let parent_revision_ids = if parent_revision_ids.is_empty() {
             self.revisions
@@ -496,23 +562,20 @@ impl ScratchpadDocument {
             .and_then(|_| parent_revision_ids.first().cloned())
             .unwrap_or_default();
         self.version += 1;
-        let revision_id = prefixed_id("scratchrev");
-        let actor_head_id = actor_head_id.into();
-        let created_at = created_at.into();
         let revision = ScratchpadRevision {
             revision_id: revision_id.clone(),
             parent_revision_id,
             parent_revision_ids,
             seq: self.version,
             actor_head_id: actor_head_id.clone(),
-            summary: summary.into(),
-            content_hash: content_hash.into(),
+            summary,
+            content_hash,
             payload,
             created_at: created_at.clone(),
         };
         self.revisions.push(revision.clone());
         self.crdt_ops.push(ScratchpadCrdtOperation {
-            op_id: prefixed_id("scratchop"),
+            op_id,
             actor_head_id: actor_head_id.clone(),
             revision_id: revision_id.clone(),
             op_kind: "upsert_revision".to_string(),
@@ -546,16 +609,11 @@ impl ScratchpadDocument {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScratchpadCrdtKind {
+    #[default]
     GraphCrdtYrsRegions,
-}
-
-impl Default for ScratchpadCrdtKind {
-    fn default() -> Self {
-        Self::GraphCrdtYrsRegions
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1345,7 +1403,7 @@ pub struct BindingTransitionResult {
 
 pub fn apply_binding_transition(
     mut binding: AgentBinding,
-    transition: BindingTransitionInput,
+    mut transition: BindingTransitionInput,
 ) -> Result<BindingTransitionResult, BindingError> {
     validate_binding(&binding)?;
     if binding_target_status(&transition.event_type).is_empty() {
@@ -1388,7 +1446,7 @@ pub fn apply_binding_transition(
 
     let before_status = binding.lifecycle.status.clone();
     let before_hash = hash_agent_binding(&binding);
-    apply_binding_payload(&mut binding, &transition)?;
+    apply_binding_payload(&mut binding, &mut transition)?;
     binding.lifecycle.status = binding_target_status(&transition.event_type).to_string();
     binding.lifecycle.last_event_seq += 1;
     binding.lifecycle.updated_at = transition.created_at.clone();
@@ -1537,11 +1595,97 @@ fn validate_binding(binding: &AgentBinding) -> Result<(), BindingError> {
 
 fn apply_binding_payload(
     binding: &mut AgentBinding,
-    transition: &BindingTransitionInput,
+    transition: &mut BindingTransitionInput,
 ) -> Result<(), BindingError> {
     match transition.event_type.as_str() {
         "BINDING.RESOLVED" => {
             binding.identity.composition_hash = composition_hash(binding);
+        }
+        "MEMORY_SCOPE.MOUNTED" => {
+            // S2: Optional `user_model` field. If present, ground every head's
+            // turn on the same picture of the user by appending a Context
+            // revision to the scratchpad before HEADS.CONTRIBUTE fires, and
+            // stamp the model's content hash onto the stored event payload so
+            // the receipt records which model was mounted. Absent payload
+            // field => no-op (back-compat with the pre-S2 lifecycle).
+            if let Some(value) = transition.payload.get("user_model") {
+                match serde_json::from_value::<UserModel>(value.clone()) {
+                    Ok(user_model) => {
+                        let hash = user_model_hash(&user_model);
+                        let model_value = serde_json::to_value(&user_model)
+                            .expect("UserModel serialization should be infallible");
+                        let mut payload = Payload::new();
+                        payload.insert("kind".to_string(), Value::String("context".to_string()));
+                        payload.insert("source".to_string(), Value::String("user_model".to_string()));
+                        payload.insert("user_model".to_string(), model_value);
+                        payload.insert("user_model_hash".to_string(), Value::String(hash.clone()));
+                        // Deterministic revision/op ids so that replay or fork of
+                        // an identical (agent_id, user_model_hash, created_at) input
+                        // produces the same scratchpad state -- and therefore the
+                        // same `state_hash_after` -- as the original apply. Without
+                        // these the UUID-based generators in `ScratchpadDocument`
+                        // would drift the binding state hash on every replay,
+                        // breaking deterministic binding receipts for mounted
+                        // user-model runs. See PR #72 P1.
+                        let id_seed = stable_value_hash(&json!([
+                            "memory_scope.mounted.user_model",
+                            &binding.identity.agent_id,
+                            &hash,
+                            &transition.created_at,
+                        ]));
+                        let revision_id = format!("scratchrev:mount:{id_seed}");
+                        let op_id = format!("scratchop:mount:{id_seed}");
+                        binding
+                            .working_memory_scope
+                            .scratchpad
+                            .append_with_deterministic_ids(
+                                "binding:mount",
+                                "user model mounted",
+                                hash.clone(),
+                                payload,
+                                revision_id,
+                                op_id,
+                                transition.created_at.clone(),
+                            );
+                        transition
+                            .payload
+                            .insert("user_model_hash".to_string(), Value::String(hash));
+                    }
+                    Err(error) => {
+                        return Err(guard_violation(
+                            "invalid_user_model_payload",
+                            format!(
+                                "MEMORY_SCOPE.MOUNTED user_model field could not be parsed: {error}"
+                            ),
+                            "user_model",
+                            "invalid_user_model",
+                            vec!["user_model".to_string()],
+                            Payload::new(),
+                        ));
+                    }
+                }
+            }
+            // S3: when the runtime threads lineage memory into the mount
+            // payload, project each entry as a scratchpad Context revision
+            // before the binding's heads start contributing. The revisions are
+            // attributed to a synthetic `lineage:agent_published` actor (a
+            // kernel-injected source, not a head contribution) so the binding's
+            // head/budget guards do not fire. Empty / absent lineage is a
+            // no-op, which preserves the legacy MOUNTED behaviour. S2's
+            // user_model path and S3's lineage_memory path are independent:
+            // both fire when both payloads are present.
+            let entries = payload_lineage_memory_entries(transition.payload.get("lineage_memory"));
+            for entry in entries {
+                let payload = entry.into_payload();
+                let content_hash = stable_value_hash(&Value::Object(payload.clone()));
+                binding.working_memory_scope.scratchpad.append(
+                    "lineage:agent_published",
+                    "lineage agent_published memory",
+                    content_hash,
+                    payload,
+                    transition.created_at.clone(),
+                );
+            }
         }
         "CHARTER.COMPILED" => {
             binding.capability_scope.charter_hash =
@@ -2065,6 +2209,81 @@ fn remaining_run_budget_units(scope: &BindingBudgetScope, state: &BindingBudgetS
         scope.shared_budget_units
     };
     (run_cap - state.spent_total).max(0.0)
+}
+
+/// A single lineage memory record threaded into `MEMORY_SCOPE.MOUNTED` so a
+/// new binding inherits Context from the agent's prior published memory. The
+/// runtime computes these from the `binding_lineage` walk and the kernel
+/// injects each as a scratchpad revision; no field is required, which keeps
+/// the legacy `{scope_id, scratchpad_id}` MOUNTED payload byte-compatible.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingLineageMemoryEntry {
+    #[serde(default)]
+    pub source_binding_id: String,
+    #[serde(default)]
+    pub source_composition_hash: String,
+    #[serde(default)]
+    pub source_version: u32,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub patch_ids: Vec<String>,
+    #[serde(default)]
+    pub substrate_receipt_id: String,
+    #[serde(default)]
+    pub published_at: String,
+}
+
+impl BindingLineageMemoryEntry {
+    pub fn into_payload(self) -> Payload {
+        let mut payload = Payload::new();
+        payload.insert("kind".to_string(), Value::String("lineage_memory".to_string()));
+        payload.insert(
+            "source_binding_id".to_string(),
+            Value::String(self.source_binding_id),
+        );
+        payload.insert(
+            "source_composition_hash".to_string(),
+            Value::String(self.source_composition_hash),
+        );
+        payload.insert(
+            "source_version".to_string(),
+            Value::Number(self.source_version.into()),
+        );
+        payload.insert("summary".to_string(), Value::String(self.summary));
+        payload.insert(
+            "patch_ids".to_string(),
+            Value::Array(self.patch_ids.into_iter().map(Value::String).collect()),
+        );
+        payload.insert(
+            "substrate_receipt_id".to_string(),
+            Value::String(self.substrate_receipt_id),
+        );
+        payload.insert("published_at".to_string(), Value::String(self.published_at));
+        payload
+    }
+}
+
+fn payload_lineage_memory_entries(value: Option<&Value>) -> Vec<BindingLineageMemoryEntry> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| serde_json::from_value::<BindingLineageMemoryEntry>(item.clone()).ok())
+            // `BindingLineageMemoryEntry` carries `#[serde(default)]` on every
+            // field so it round-trips legacy payloads, but that means an empty
+            // `{}` element parses into a default-everything entry. Reject
+            // entries missing the join key (`source_binding_id`) OR any
+            // concrete payload signal (`substrate_receipt_id` / `patch_ids`).
+            // Without this guard, MOUNTED would synthesize empty
+            // `lineage:agent_published` revisions for stray empty items.
+            .filter(|entry| {
+                !entry.source_binding_id.trim().is_empty()
+                    && (!entry.substrate_receipt_id.trim().is_empty()
+                        || !entry.patch_ids.is_empty())
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn payload_array_strings(value: Option<&Value>) -> Vec<String> {
@@ -2943,6 +3162,7 @@ mod tests {
                 version: 1,
                 trust_tier: "first_party".to_string(),
                 active_head_set: vec!["claude".to_string(), "deepseek".to_string()],
+                agent_constitution: None,
             },
             BindingComposition {
                 heads: vec![
@@ -2992,5 +3212,161 @@ mod tests {
         match error {
             BindingError::Guard(violation) => assert_eq!(violation.code, expected_code),
         }
+    }
+
+    // ---- S3: MOUNTED arm projects lineage memory as Context revisions ----
+
+    #[test]
+    fn mounted_with_lineage_memory_appends_scratchpad_context_revisions() {
+        let binding = fixture_binding();
+        let binding = apply(
+            binding,
+            "BINDING.RESOLVED",
+            json!({ "binding_id": "agent:theorem", "composition_hash": "ignored" }),
+        );
+        let binding = apply(
+            binding.binding,
+            "HEADS.PROBED",
+            json!({ "probed_head_set": ["claude", "deepseek", "mistral_ocr"] }),
+        );
+        let revisions_before = binding.binding.working_memory_scope.scratchpad.revisions.len();
+        let mounted = apply(
+            binding.binding,
+            "MEMORY_SCOPE.MOUNTED",
+            json!({
+                "scope_id": "bindingscope:theorem",
+                "scratchpad_id": "scratchpad:theorem",
+                "lineage_size": 2,
+                "lineage_memory": [
+                    {
+                        "source_binding_id": "harness:binding:agent:theorem:v1",
+                        "source_composition_hash": "hash:v1",
+                        "source_version": 1,
+                        "summary": "prior v1 published",
+                        "patch_ids": ["patch:1", "patch:2"],
+                        "substrate_receipt_id": "substrate:v1",
+                        "published_at": "2026-06-01T00:00:00Z"
+                    },
+                    {
+                        "source_binding_id": "harness:binding:agent:theorem:v2",
+                        "source_composition_hash": "hash:v2",
+                        "source_version": 2,
+                        "summary": "prior v2 published",
+                        "patch_ids": ["patch:3"],
+                        "substrate_receipt_id": "substrate:v2",
+                        "published_at": "2026-06-02T00:00:00Z"
+                    }
+                ]
+            }),
+        );
+        let scratchpad = &mounted.binding.working_memory_scope.scratchpad;
+        let lineage_revs = scratchpad
+            .revisions
+            .iter()
+            .filter(|revision| revision.actor_head_id == "lineage:agent_published")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lineage_revs.len(),
+            2,
+            "MOUNTED with lineage_memory must append one revision per entry"
+        );
+        assert_eq!(
+            scratchpad.revisions.len(),
+            revisions_before + 2,
+            "no other revisions should be touched"
+        );
+        // Order is preserved: array index N maps to revision N (in append order).
+        assert_eq!(
+            lineage_revs[0]
+                .payload
+                .get("source_version")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            lineage_revs[0]
+                .payload
+                .get("substrate_receipt_id")
+                .and_then(Value::as_str),
+            Some("substrate:v1")
+        );
+        assert_eq!(
+            lineage_revs[1]
+                .payload
+                .get("source_version")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            lineage_revs[1]
+                .payload
+                .get("source_binding_id")
+                .and_then(Value::as_str),
+            Some("harness:binding:agent:theorem:v2")
+        );
+    }
+
+    #[test]
+    fn mounted_without_lineage_memory_leaves_scratchpad_untouched() {
+        let binding = fixture_binding();
+        let binding = apply(
+            binding,
+            "BINDING.RESOLVED",
+            json!({ "binding_id": "agent:theorem", "composition_hash": "ignored" }),
+        );
+        let binding = apply(
+            binding.binding,
+            "HEADS.PROBED",
+            json!({ "probed_head_set": ["claude", "deepseek", "mistral_ocr"] }),
+        );
+        let revisions_before = binding.binding.working_memory_scope.scratchpad.revisions.len();
+        let mounted = apply(
+            binding.binding,
+            "MEMORY_SCOPE.MOUNTED",
+            json!({
+                "scope_id": "bindingscope:theorem",
+                "scratchpad_id": "scratchpad:theorem"
+            }),
+        );
+        assert_eq!(
+            mounted.binding.working_memory_scope.scratchpad.revisions.len(),
+            revisions_before,
+            "legacy MOUNTED payload must not synthesize any scratchpad revisions"
+        );
+        assert_eq!(mounted.binding.lifecycle.status, "memory_scope_mounted");
+    }
+
+    // ---- F1: payload_lineage_memory_entries filters synthetic empties ----
+
+    #[test]
+    fn payload_lineage_memory_entries_filters_empty_and_keyless_entries() {
+        let array = json!([
+            // Pure empty entry (every field defaults via serde(default)).
+            {},
+            // Missing the join key entirely.
+            {"source_binding_id": "", "patch_ids": ["patch:1"]},
+            // Has join key but no payload signal at all.
+            {"source_binding_id": "b1", "patch_ids": [], "substrate_receipt_id": ""},
+            // Valid: join key + a substrate receipt.
+            {
+                "source_binding_id": "b-keep-receipt",
+                "substrate_receipt_id": "substrate:1",
+                "patch_ids": []
+            },
+            // Valid: join key + patch ids.
+            {
+                "source_binding_id": "b-keep-patches",
+                "substrate_receipt_id": "",
+                "patch_ids": ["patch:1"]
+            }
+        ]);
+        let entries = payload_lineage_memory_entries(Some(&array));
+        assert_eq!(
+            entries.len(),
+            2,
+            "only entries with join key AND a payload signal must survive"
+        );
+        assert_eq!(entries[0].source_binding_id, "b-keep-receipt");
+        assert_eq!(entries[1].source_binding_id, "b-keep-patches");
     }
 }

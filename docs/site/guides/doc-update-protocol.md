@@ -14,7 +14,7 @@ The map is first because it is the cheapest correct orientation. It is also the 
 
 ## What counts as drift
 
-A crate exists in `rustyredcore_THG/crates/` but is not in the `CLAUDE.md` crate table. An app exists in `apps/` but is not in the app table. A crate or module was renamed or removed and the map still names the old one. The README `Last sync` line is stale after a re-sync with Theseus.
+A crate exists in `rustyredcore_THG/crates/` but has no `README.md` at its base. An app exists in `apps/` but has no base `README.md`. A crate or module was renamed or removed and the `CLAUDE.md` map still names the old one. The README `Last sync` line is stale after a re-sync with Theseus. The drift signal is the base README (the doc next to the code); `CLAUDE.md` is the navigation map, kept current by the same discipline but checked by eye, not by the hook.
 
 ## The end-of-session checklist
 
@@ -31,10 +31,10 @@ This is the same discipline `CLAUDE.md` already states ("update this file before
 
 ## The hook
 
-`scripts/check-doc-drift.sh` compares crates and apps on disk against the `CLAUDE.md` map and against a baseline snapshot in `.harness/`.
+`scripts/check-doc-drift.sh` checks crates and apps on disk for a `README.md` at their base, tracked against a baseline snapshot in `.harness/`. Generate missing crate READMEs from `Cargo.toml` + `//!` docs with `scripts/gen-crate-readmes.sh`.
 
-- `scripts/check-doc-drift.sh` (default, `--new-only`) reports directories that appeared since the baseline and are not in the map.
-- `scripts/check-doc-drift.sh --full` reports the whole standing backlog: everything on disk not yet in the map.
+- `scripts/check-doc-drift.sh` (default, `--new-only`) reports directories that appeared since the baseline and still lack a base README.
+- `scripts/check-doc-drift.sh --full` reports the whole standing backlog: everything on disk without a base README.
 - `scripts/check-doc-drift.sh --refresh` rewrites the baseline to the current disk state. Run it after you update the map.
 
 Two Claude Code hooks wire this in, in `.claude/settings.local.json`:

@@ -1,4 +1,6 @@
-use crate::coordination::{write_record, WriteRecordInput};
+use crate::coordination::{
+    read_records_for_room, write_record, CoordinationRecordState, WriteRecordInput,
+};
 use crate::event_log::{append_transition_from_store, load_events};
 use crate::memory::{
     encode_memory, list_memory_documents_since, load_memory_document, memory_document_node_id,
@@ -140,6 +142,40 @@ pub struct CompoundStandingReceipt {
     pub positive_count: u64,
     pub hard_axis_regressions: u64,
     pub last_outcome: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompoundActionItem {
+    pub action_id: String,
+    pub action_type: String,
+    pub title: String,
+    pub summary: String,
+    pub severity: String,
+    #[serde(default)]
+    pub cluster_key: String,
+    #[serde(default)]
+    pub supporting_capture_doc_ids: Vec<String>,
+    #[serde(default)]
+    pub supporting_record_ids: Vec<String>,
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompoundEngineeringSummary {
+    pub tenant_slug: String,
+    pub config_hash: String,
+    pub config: CompoundConfig,
+    pub run_counter: u64,
+    pub capture_count: usize,
+    pub record_count: usize,
+    pub action_count: usize,
+    #[serde(default)]
+    pub captures: Vec<MemoryDocumentState>,
+    #[serde(default)]
+    pub records: Vec<CoordinationRecordState>,
+    #[serde(default)]
+    pub action_items: Vec<CompoundActionItem>,
 }
 
 pub trait CompoundingArtifact {
@@ -402,6 +438,55 @@ pub fn list_compound_captures<S: GraphStore>(
         .collect())
 }
 
+/// Read the full agent-visible Compound Engineering surface.
+///
+/// The run-close hook is deliberately passive: it banks captures, fitness, gate
+/// proposals, and tensions. This summary is the read/action membrane over that
+/// passive substrate. It keeps the model context slim by returning bounded
+/// records, while still surfacing reviewable action items such as repeated
+/// failures in the same cluster or pending promotion/demotion records.
+pub fn compound_engineering_summary<S: GraphStore>(
+    store: &S,
+    tenant: &str,
+    cluster_key: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+) -> RuntimeResult<CompoundEngineeringSummary> {
+    let tenant = normalize_tenant(tenant);
+    let limit = bounded_summary_limit(limit);
+    let config = load_compound_config(store, &tenant)?;
+    let config_hash = compound_config_hash(&config);
+    let run_counter = compound_run_counter(store, &tenant);
+    let cluster_filter = cluster_key.map(str::trim).filter(|value| !value.is_empty());
+
+    let mut captures = list_compound_captures(store, &tenant, cluster_filter, None, since)?;
+    captures.truncate(limit);
+
+    let mut records = read_records_for_room(store, &tenant, COMPOUND_ROOM_ID, &[], limit)
+        .map_err(|error| HarnessRuntimeError::Serialization(error.to_string()))?;
+    if let Some(cluster) = cluster_filter {
+        records.retain(|record| {
+            record_cluster_key(record)
+                .map(|value| value == cluster)
+                .unwrap_or(false)
+        });
+    }
+
+    let action_items = compound_action_items(&captures, &records);
+    Ok(CompoundEngineeringSummary {
+        tenant_slug: tenant,
+        config_hash,
+        config,
+        run_counter,
+        capture_count: captures.len(),
+        record_count: records.len(),
+        action_count: action_items.len(),
+        captures,
+        records,
+        action_items,
+    })
+}
+
 fn document_is_compound_capture(document: &MemoryDocumentState) -> bool {
     document
         .tags
@@ -658,6 +743,7 @@ fn append_compound_event<S: GraphStore>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_run_if_qualifies<S: GraphStore>(
     store: &mut S,
     run: &RunState,
@@ -787,6 +873,7 @@ fn run_qualifies_for_capture(events: &[EventState], config: &CompoundConfig) -> 
     has_outcome && (has_validation || has_contribution || events.len() >= config.capture_step_floor)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_usage_fitness<S: GraphStore>(
     store: &mut S,
     tenant: &str,
@@ -803,7 +890,15 @@ fn apply_usage_fitness<S: GraphStore>(
     if *outcome == OutcomeClass::Negative
         && (!used.packs.is_empty() || !used.memory_doc_ids.is_empty())
     {
-        write_negative_tension(store, tenant, run_id, config_hash, used, trigger)?;
+        write_negative_tension(
+            store,
+            tenant,
+            run_id,
+            config_hash,
+            cluster_key,
+            used,
+            trigger,
+        )?;
     }
 
     let mut proposals = Vec::new();
@@ -838,6 +933,7 @@ fn apply_usage_fitness<S: GraphStore>(
                 "to": "advisory",
                 "reason": "benchmark gate passed",
                 "run_id": run_id,
+                "cluster_key": cluster_key,
             });
             write_gate_record(store, tenant, "promotion proposal", &proposal, trigger)?;
             proposals.push(proposal);
@@ -852,6 +948,7 @@ fn apply_usage_fitness<S: GraphStore>(
                 "to": "validated",
                 "reason": "configured positive run threshold passed with no hard regressions",
                 "run_id": run_id,
+                "cluster_key": cluster_key,
             });
             write_gate_record(store, tenant, "promotion proposal", &proposal, trigger)?;
             proposals.push(proposal);
@@ -868,6 +965,7 @@ fn apply_usage_fitness<S: GraphStore>(
                 "to": "advisory",
                 "reason": "hard gate axis regressed",
                 "run_id": run_id,
+                "cluster_key": cluster_key,
             });
             write_demotion_tension(store, tenant, &demotion, trigger)?;
             demotions.push(demotion);
@@ -1429,6 +1527,7 @@ fn write_negative_tension<S: GraphStore>(
     tenant: &str,
     run_id: &str,
     config_hash: &str,
+    cluster_key: &str,
     used: &UsedItems,
     trigger: &EventState,
 ) -> RuntimeResult<()> {
@@ -1448,6 +1547,10 @@ fn write_negative_tension<S: GraphStore>(
             metadata: Map::from_iter([
                 ("run_id".to_string(), Value::String(run_id.to_string())),
                 ("config_hash".to_string(), Value::String(config_hash.to_string())),
+                (
+                    "cluster_key".to_string(),
+                    Value::String(cluster_key.to_string()),
+                ),
                 (
                     "used_pack_hashes".to_string(),
                     Value::Array(
@@ -1716,6 +1819,147 @@ fn compound_last_used_counter(fitness: Option<&Value>) -> u64 {
         .and_then(|value| value.get("last_used_run_counter"))
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+fn compound_run_counter<S: GraphStore>(store: &S, tenant: &str) -> u64 {
+    store
+        .get_node(&compound_state_node_id(tenant))
+        .and_then(|node| node.properties.get("run_counter"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn bounded_summary_limit(limit: usize) -> usize {
+    if limit == 0 {
+        50
+    } else {
+        limit.min(500)
+    }
+}
+
+fn compound_action_items(
+    captures: &[MemoryDocumentState],
+    records: &[CoordinationRecordState],
+) -> Vec<CompoundActionItem> {
+    let mut items = recurring_failure_items(captures);
+    items.extend(records.iter().filter_map(record_action_item));
+    items
+}
+
+fn recurring_failure_items(captures: &[MemoryDocumentState]) -> Vec<CompoundActionItem> {
+    let mut clusters: BTreeMap<String, Vec<&MemoryDocumentState>> = BTreeMap::new();
+    for capture in captures {
+        if !capture.kind.eq_ignore_ascii_case("postmortem") {
+            continue;
+        }
+        let cluster = capture_cluster_key(capture).unwrap_or_else(|| "unknown".to_string());
+        clusters.entry(cluster).or_default().push(capture);
+    }
+
+    clusters
+        .into_iter()
+        .filter(|(_, captures)| captures.len() >= 2)
+        .map(|(cluster_key, captures)| {
+            let supporting_capture_doc_ids = captures
+                .iter()
+                .map(|capture| capture.doc_id.clone())
+                .collect::<Vec<_>>();
+            let latest = captures
+                .iter()
+                .filter_map(|capture| {
+                    (!capture.updated_at.trim().is_empty()).then_some(capture.updated_at.clone())
+                })
+                .max()
+                .unwrap_or_default();
+            CompoundActionItem {
+                action_id: format!("compound:action:recurring-failure:{cluster_key}"),
+                action_type: "open_fix_task".to_string(),
+                title: "Recurring compound failure".to_string(),
+                summary: format!(
+                    "{} failed captures share cluster {}; open a fix task or backlog item.",
+                    supporting_capture_doc_ids.len(),
+                    cluster_key
+                ),
+                severity: "high".to_string(),
+                cluster_key: cluster_key.clone(),
+                supporting_capture_doc_ids,
+                supporting_record_ids: Vec::new(),
+                metadata: Map::from_iter([
+                    (
+                        "failure_count".to_string(),
+                        Value::Number((captures.len() as u64).into()),
+                    ),
+                    ("latest_updated_at".to_string(), Value::String(latest)),
+                ]),
+            }
+        })
+        .collect()
+}
+
+fn record_action_item(record: &CoordinationRecordState) -> Option<CompoundActionItem> {
+    let (action_type, title, severity, payload) =
+        if let Some(proposal) = record.metadata.get("proposal") {
+            (
+                "review_promotion_proposal",
+                "Review compound promotion proposal",
+                "medium",
+                proposal.clone(),
+            )
+        } else if let Some(demotion) = record.metadata.get("demotion") {
+            (
+                "review_demotion",
+                "Review compound demotion",
+                "high",
+                demotion.clone(),
+            )
+        } else if record.record_type == "tension" {
+            (
+                "review_tension",
+                record.title.as_str(),
+                "medium",
+                Value::Object(record.metadata.clone()),
+            )
+        } else {
+            return None;
+        };
+
+    Some(CompoundActionItem {
+        action_id: format!("compound:action:{}:{}", action_type, record.record_id),
+        action_type: action_type.to_string(),
+        title: title.to_string(),
+        summary: record.summary.clone(),
+        severity: severity.to_string(),
+        cluster_key: record_cluster_key(record).unwrap_or_default(),
+        supporting_capture_doc_ids: Vec::new(),
+        supporting_record_ids: vec![record.record_id.clone()],
+        metadata: Map::from_iter([("source_record".to_string(), payload)]),
+    })
+}
+
+fn capture_cluster_key(document: &MemoryDocumentState) -> Option<String> {
+    document
+        .metadata
+        .get("cluster_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            document.tags.iter().find_map(|tag| {
+                tag.trim()
+                    .strip_prefix(COMPOUND_CLUSTER_TAG_PREFIX)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn record_cluster_key(record: &CoordinationRecordState) -> Option<String> {
+    first_text_by_keys(
+        &Value::Object(record.metadata.clone()),
+        &["cluster_key", "cluster"],
+    )
 }
 
 fn collect_strings(value: Option<&Value>, output: &mut BTreeSet<String>) {
@@ -2440,6 +2684,50 @@ mod tests {
         assert_eq!(after.fitness, before_fitness);
         assert_eq!(after.updated_at, before_updated_at);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn summary_surfaces_recurring_failures_as_action_items() {
+        let mut store = InMemoryGraphStore::new();
+        publish_writing_pack(&mut store, "shadow", true);
+
+        close_failed_qualifying_run_at(
+            &mut store,
+            "run-repeat-fail-1",
+            "Fix recurring harness regression",
+            "test failed first time",
+            "2026-06-08T01:00:00Z",
+        );
+        close_failed_qualifying_run_at(
+            &mut store,
+            "run-repeat-fail-2",
+            "Fix recurring harness regression",
+            "test failed second time",
+            "2026-06-08T02:00:00Z",
+        );
+
+        let summary = compound_engineering_summary(&store, "default", None, None, 20).unwrap();
+
+        assert_eq!(summary.run_counter, 2);
+        assert_eq!(summary.capture_count, 2);
+        assert!(summary
+            .captures
+            .iter()
+            .all(|capture| capture.kind == "postmortem"));
+        let recurring = summary
+            .action_items
+            .iter()
+            .find(|item| item.action_type == "open_fix_task")
+            .expect("recurring failure action");
+        assert_eq!(recurring.severity, "high");
+        assert_eq!(recurring.supporting_capture_doc_ids.len(), 2);
+        assert!(recurring.summary.contains("failed captures"));
+
+        let scoped =
+            compound_engineering_summary(&store, "default", Some(&recurring.cluster_key), None, 20)
+                .unwrap();
+        assert_eq!(scoped.capture_count, 2);
+        assert_eq!(scoped.action_count, 1);
     }
 
     #[test]

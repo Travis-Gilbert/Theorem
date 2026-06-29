@@ -3,6 +3,13 @@
 //! payload handlers through the scoped invoker; the nested live state stays JSON
 //! so GraphQL remains a faithful transport facade over the canonical handlers.
 
+// async-graphql `#[Object]` generates resolver functions whose argument count
+// mirrors each GraphQL field's argument count; the lint fires on that generated
+// code (not the source method), so method-level allows do not reach it. Grouping
+// these into input structs would change the public GraphQL schema, so scope the
+// allow to this transport-facade module.
+#![allow(clippy::too_many_arguments)]
+
 use async_graphql::{Object, Result as GqlResult, SimpleObject};
 use serde_json::{json, Value};
 

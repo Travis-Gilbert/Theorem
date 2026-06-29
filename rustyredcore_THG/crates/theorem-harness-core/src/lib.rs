@@ -55,6 +55,7 @@ pub mod state_hash;
 pub mod state_machine;
 pub mod toolgraph;
 pub mod types;
+pub mod user_model;
 pub mod work_graph;
 pub mod work_graph_verify;
 
@@ -66,13 +67,14 @@ pub use agent_binding::{
     apply_binding_transition, composition_hash, hash_agent_binding, ActionTierPolicy, AgentBinding,
     AgentHead, BindingBudgetDecision, BindingBudgetScope, BindingCapabilityScope,
     BindingComposition, BindingError, BindingEventState, BindingHeadOutcome, BindingIdentity,
-    BindingLifecycleState, BindingMemoryScope, BindingRoutingDecision, BindingSubtask,
-    BindingTraceScope, BindingTransitionInput, BindingTransitionResult, BindingVerificationOutcome,
-    BindingVerificationReceipt, HeadBudgetLimit, HeadCapabilityReliability, HeadContributionRecord,
-    HeadCostProfile, HeadKind, HeadReliabilityProfile, HeadTransport, MemoryZone, MemoryZoneKind,
-    PublishedScope, ScratchpadAwarenessEntry, ScratchpadCrdtBacking, ScratchpadCrdtKind,
-    ScratchpadCrdtOperation, ScratchpadDocument, ScratchpadRelationKind, ScratchpadRevision,
-    ScratchpadRevisionLink, ScratchpadRevisionRelation, ScratchpadTextRegion, TraceTier,
+    BindingLifecycleState, BindingLineageMemoryEntry, BindingMemoryScope, BindingRoutingDecision,
+    BindingSubtask, BindingTraceScope, BindingTransitionInput, BindingTransitionResult,
+    BindingVerificationOutcome, BindingVerificationReceipt, HeadBudgetLimit,
+    HeadCapabilityReliability, HeadContributionRecord, HeadCostProfile, HeadKind,
+    HeadReliabilityProfile, HeadTransport, MemoryZone, MemoryZoneKind, PublishedScope,
+    ScratchpadAwarenessEntry, ScratchpadCrdtBacking, ScratchpadCrdtKind, ScratchpadCrdtOperation,
+    ScratchpadDocument, ScratchpadRelationKind, ScratchpadRevision, ScratchpadRevisionLink,
+    ScratchpadRevisionRelation, ScratchpadTextRegion, TraceTier,
 };
 pub use agent_head_registry::{
     AgentHeadEndpoint, AgentHeadKindSummary, AgentHeadRegistry, AgentHeadRegistryError,
@@ -168,6 +170,9 @@ pub use toolgraph::{
 pub use types::{
     AgentRunState, AgentStepState, EventState, GuardViolation, Payload, PolicyCheck,
     PolicyDecision, PolicyLayer, RunState, TransitionInput, TransitionResult,
+};
+pub use user_model::{
+    user_model_hash, UserModel, UserModelNote, UserModelProjectRef, UserModelReference,
 };
 pub use work_graph::{
     claim_task_node, heartbeat_task_node, ClaimLease, ClaimOutcome, Millis, NodeStatus, Receipt,

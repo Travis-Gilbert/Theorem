@@ -1,0 +1,263 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+use theorem_agentd::config::AgentdConfig;
+use theorem_agentd::mcp::McpRouter;
+use theorem_agentd::model::ModelClient;
+use theorem_agentd::proxy::{ProxyCli, ProxyConfig};
+use theorem_agentd::receiver_sidecar::spawn_receiver_sidecar;
+use theorem_agentd::tools::ToolCatalog;
+use theorem_agentd::turn_loop::{run_once, run_tick};
+use theorem_agentd::{AgentdError, AgentdResult};
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("[theorem-agentd] fatal: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> AgentdResult<()> {
+    let args = Args::parse(std::env::args().skip(1).collect())?;
+    let config = if args.config_path_explicit {
+        AgentdConfig::load(&args.config_path)?
+    } else {
+        AgentdConfig::load_or_default(&args.config_path)?
+    };
+    let catalog = ToolCatalog::default_catalog();
+    if args.print_tool_grammar {
+        println!("{}", catalog.gbnf_grammar());
+        return Ok(());
+    }
+    if let Some(proxy) = &args.proxy {
+        let proxy_config = ProxyConfig::from_agentd(&config, proxy);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(theorem_agentd::proxy::serve_proxy(proxy_config));
+    }
+    let _receiver = if config.receiver.enabled
+        && !args.no_receiver
+        && args.once.is_none()
+        && !args.capture_once
+    {
+        Some(spawn_receiver_sidecar(&config.receiver.config_path)?)
+    } else {
+        None
+    };
+    let router = McpRouter::from_configs(config.all_mcp_servers())?;
+
+    // One mechanical Agent Queue capture sweep, then exit. No model required.
+    if args.capture_once {
+        let report = theorem_agentd::capture::run_capture(&router, &config.capture, &config.actor)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let model = ModelClient::from_config(
+        config.model.clone(),
+        config.default_room_id.clone(),
+        config.actor.clone(),
+    )?;
+
+    if let Some(prompt) = args.once {
+        let transcript = run_once(&config, &model, &router, &catalog, &prompt)?;
+        println!("{}", serde_json::to_string_pretty(&transcript)?);
+        return Ok(());
+    }
+
+    loop {
+        // Each tick: capture Agent Queue tasks into jobs, relay run milestones
+        // back to TickTick, then take a proactive coordination turn.
+        let prompt = "timer tick: poll coordination room and inbox for proactive work";
+        let report = run_tick(&config, &model, &router, &catalog, prompt);
+        if let Some(transcript) = &report.transcript {
+            println!("{}", serde_json::to_string(transcript)?);
+        }
+        std::thread::sleep(Duration::from_secs(config.loop_config.tick_interval_secs));
+    }
+}
+
+struct Args {
+    config_path: PathBuf,
+    config_path_explicit: bool,
+    once: Option<String>,
+    no_receiver: bool,
+    print_tool_grammar: bool,
+    capture_once: bool,
+    proxy: Option<ProxyCli>,
+}
+
+impl Args {
+    fn parse(args: Vec<String>) -> AgentdResult<Self> {
+        let mut config_path = PathBuf::from("theorem-agentd.toml");
+        let mut config_path_explicit = false;
+        let mut once = None;
+        let mut no_receiver = false;
+        let mut print_tool_grammar = false;
+        let mut capture_once = false;
+        let mut proxy: Option<ProxyCli> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--once" => {
+                    i += 1;
+                    let Some(prompt) = args.get(i) else {
+                        return Err(AgentdError::Config("--once requires a prompt".to_string()));
+                    };
+                    once = Some(prompt.clone());
+                }
+                "--no-receiver" => {
+                    no_receiver = true;
+                }
+                "--capture-once" => {
+                    capture_once = true;
+                }
+                "--proxy" => {
+                    proxy.get_or_insert_with(ProxyCli::default);
+                }
+                "--proxy-port" => {
+                    i += 1;
+                    let Some(port) = args.get(i).and_then(|value| value.parse::<u16>().ok()) else {
+                        return Err(AgentdError::Config(
+                            "--proxy-port requires a TCP port".to_string(),
+                        ));
+                    };
+                    proxy.get_or_insert_with(ProxyCli::default).port = Some(port);
+                }
+                "--proxy-bind" => {
+                    i += 1;
+                    let Some(bind) = args.get(i).and_then(|value| value.parse().ok()) else {
+                        return Err(AgentdError::Config(
+                            "--proxy-bind requires an IP address".to_string(),
+                        ));
+                    };
+                    proxy.get_or_insert_with(ProxyCli::default).bind = Some(bind);
+                }
+                "--proxy-data-dir" => {
+                    i += 1;
+                    let Some(path) = args.get(i) else {
+                        return Err(AgentdError::Config(
+                            "--proxy-data-dir requires a path".to_string(),
+                        ));
+                    };
+                    proxy.get_or_insert_with(ProxyCli::default).data_dir =
+                        Some(PathBuf::from(path));
+                }
+                "--proxy-upstream" => {
+                    i += 1;
+                    let Some(url) = args.get(i) else {
+                        return Err(AgentdError::Config(
+                            "--proxy-upstream requires a base URL".to_string(),
+                        ));
+                    };
+                    proxy
+                        .get_or_insert_with(ProxyCli::default)
+                        .upstream_base_url = Some(url.clone());
+                }
+                "--proxy-harness-url" => {
+                    i += 1;
+                    let Some(url) = args.get(i) else {
+                        return Err(AgentdError::Config(
+                            "--proxy-harness-url requires a URL".to_string(),
+                        ));
+                    };
+                    proxy.get_or_insert_with(ProxyCli::default).harness_mcp_url = Some(url.clone());
+                }
+                "--proxy-room-id" => {
+                    i += 1;
+                    let Some(room_id) = args.get(i) else {
+                        return Err(AgentdError::Config(
+                            "--proxy-room-id requires a room id".to_string(),
+                        ));
+                    };
+                    proxy.get_or_insert_with(ProxyCli::default).room_id = Some(room_id.clone());
+                }
+                "--proxy-no-ambient" => {
+                    proxy.get_or_insert_with(ProxyCli::default).enable_ambient = Some(false);
+                }
+                "--print-tool-grammar" => {
+                    print_tool_grammar = true;
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    return Err(AgentdError::Config(format!("unknown flag {value}")));
+                }
+                value => {
+                    config_path = PathBuf::from(value);
+                    config_path_explicit = true;
+                }
+            }
+            i += 1;
+        }
+        Ok(Self {
+            config_path,
+            config_path_explicit,
+            once,
+            no_receiver,
+            print_tool_grammar,
+            capture_once,
+            proxy,
+        })
+    }
+}
+
+fn print_help() {
+    println!(
+        "usage: theorem-agentd [--once <prompt>] [--capture-once] [--proxy] [--proxy-port <port>] [--proxy-room-id <room>] [--proxy-data-dir <path>] [--no-receiver] [--print-tool-grammar] [config.toml]\n\nIf the implicit theorem-agentd.toml is absent, theorem-agentd starts with no-config local defaults. Explicit config paths must exist."
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_once_and_config_path() {
+        let args = Args::parse(vec![
+            "--once".to_string(),
+            "hello".to_string(),
+            "agentd.toml".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args.once, Some("hello".to_string()));
+        assert_eq!(args.config_path, PathBuf::from("agentd.toml"));
+        assert!(args.config_path_explicit);
+    }
+
+    #[test]
+    fn parses_no_receiver() {
+        let args = Args::parse(vec!["--no-receiver".to_string()]).unwrap();
+        assert!(args.no_receiver);
+        assert!(!args.config_path_explicit);
+    }
+
+    #[test]
+    fn parses_proxy_args() {
+        let args = Args::parse(vec![
+            "--proxy".to_string(),
+            "--proxy-port".to_string(),
+            "9494".to_string(),
+            "--proxy-data-dir".to_string(),
+            "/tmp/theorem-proxy".to_string(),
+        ])
+        .unwrap();
+        let proxy = args.proxy.unwrap();
+        assert_eq!(proxy.port, Some(9494));
+        assert_eq!(proxy.data_dir, Some(PathBuf::from("/tmp/theorem-proxy")));
+    }
+
+    #[test]
+    fn parses_proxy_room_id() {
+        let args = Args::parse(vec![
+            "--proxy".to_string(),
+            "--proxy-room-id".to_string(),
+            "room:codex".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args.proxy.unwrap().room_id, Some("room:codex".to_string()));
+    }
+}

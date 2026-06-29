@@ -444,7 +444,7 @@ fn relationship_active_at(edge: &Value, as_of_ms: i64) -> bool {
     }
     let superseded_at = int_prop(edge, &["properties", "superseded_at_ms"])
         .or_else(|| int_prop(edge, &["properties", "supersededAtMs"]));
-    !superseded_at.is_some_and(|superseded_at| superseded_at <= as_of_ms)
+    superseded_at.is_none_or(|superseded_at| superseded_at > as_of_ms)
 }
 
 fn hydrate_evidence_ref(evidence_ref: String) -> GqlResult<EpistemicEvidenceView> {
@@ -1528,9 +1528,11 @@ fn graph_aware_search_hits(
     } else {
         rank_rules.into_iter().map(Into::into).collect::<Vec<_>>()
     };
-    let mut query = QueryContext::default();
-    query.as_of_ms = as_of_ms;
-    query.recency_reference_ms = as_of_ms;
+    let query = QueryContext {
+        as_of_ms,
+        recency_reference_ms: as_of_ms,
+        ..Default::default()
+    };
 
     let mut components_by_embedding = BTreeMap::new();
     let candidates = scores

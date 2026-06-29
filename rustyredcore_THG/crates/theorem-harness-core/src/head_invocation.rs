@@ -102,7 +102,13 @@ impl ContextMembranePrime {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RevisionContext {
     pub revision_id: String,
-    pub kind: HeadInvocationKind,
+    /// The scratchpad revision's `kind` payload field as a stable string.
+    /// Carries the standard turn kinds (`"proposal"`, `"critique"`,
+    /// `"synthesis"`, `"verification"`) plus `"context"` for grounding
+    /// revisions like the binding-mount user-model entry (PR #72 P2). Kept
+    /// as a plain string so context revisions can ride `prior_context` to
+    /// downstream heads without widening `HeadInvocationKind`.
+    pub kind: String,
     pub output_summary: String,
     #[serde(default)]
     pub payload: Payload,
@@ -130,6 +136,15 @@ pub struct HeadInvocationRequest {
     pub policy_decision: Option<PolicyDecision>,
     #[serde(default)]
     pub context_membrane: Vec<ContextMembranePrime>,
+    /// Optional persona/voice text (the binding's agent constitution) that
+    /// rides every invocation so the head's contribution lands in Theorem's
+    /// voice. Threaded in by the intra-agent loop from
+    /// `binding.identity.agent_constitution` on every step
+    /// (proposal/critique/synthesis/verification) so the voice stays
+    /// consistent across contributions, with synthesis being the most
+    /// load-bearing surface. `None` keeps invocations backward-compatible.
+    #[serde(default)]
+    pub constitution: Option<String>,
     pub created_at: String,
 }
 
@@ -180,10 +195,20 @@ impl HeadInvocationRequest {
             claims,
             policy_decision: None,
             context_membrane: Vec::new(),
+            constitution: None,
             created_at: created_at.into(),
         };
         request.invocation_id = request.computed_invocation_id();
         request
+    }
+
+    /// Attach the binding's agent constitution (persona/voice) so the head's
+    /// contribution lands in Theorem's voice. The intra-agent loop calls this
+    /// on every step when `binding.identity.agent_constitution` is `Some(...)`.
+    pub fn with_constitution(mut self, constitution: Option<String>) -> Self {
+        self.constitution = constitution;
+        self.invocation_id = self.computed_invocation_id();
+        self
     }
 
     pub fn with_policy_decision(mut self, policy_decision: PolicyDecision) -> Self {
@@ -211,23 +236,33 @@ impl HeadInvocationRequest {
     }
 
     pub fn computed_invocation_id(&self) -> String {
-        format!(
-            "headinvoke:{}",
-            stable_value_hash(&json!({
-                "head_id": self.head.head_id,
-                "kind": self.kind,
-                "head_system_prompt": self.head_system_prompt,
-                "task": self.task,
-                "scratchpad_version": self.scratchpad_version,
-                "scratchpad_crdt": self.scratchpad_crdt,
-                "prior_revision_ids": self.prior_revision_ids,
-                "prior_context": self.prior_context,
-                "claims": self.claims,
-                "policy_decision": self.policy_decision,
-                "context_membrane": self.context_membrane,
-                "created_at": self.created_at,
-            }))
-        )
+        // The `constitution` field is included only when present so that
+        // existing receipts (and the corresponding 24/34 parity tests)
+        // continue to hash to their established invocation ids when the
+        // binding has no constitution attached. Once a binding carries a
+        // constitution, that text changes the invocation id so it is
+        // visible to replay/fork.
+        let mut envelope = json!({
+            "head_id": self.head.head_id,
+            "kind": self.kind,
+            "head_system_prompt": self.head_system_prompt,
+            "task": self.task,
+            "scratchpad_version": self.scratchpad_version,
+            "scratchpad_crdt": self.scratchpad_crdt,
+            "prior_revision_ids": self.prior_revision_ids,
+            "prior_context": self.prior_context,
+            "claims": self.claims,
+            "policy_decision": self.policy_decision,
+            "context_membrane": self.context_membrane,
+            "created_at": self.created_at,
+        });
+        if let Some(constitution) = self.constitution.as_ref() {
+            envelope
+                .as_object_mut()
+                .expect("invocation envelope is a JSON object")
+                .insert("constitution".to_string(), Value::String(constitution.clone()));
+        }
+        format!("headinvoke:{}", stable_value_hash(&envelope))
     }
 }
 
@@ -463,6 +498,12 @@ impl HeadInvoker for FakeHeadInvoker {
             "claims": request.claims,
             "context_membrane": request.context_membrane,
         }));
+        if let Some(constitution) = request.constitution.as_ref() {
+            payload.insert(
+                "constitution".to_string(),
+                Value::String(constitution.clone()),
+            );
+        }
         if request.kind == HeadInvocationKind::Verification {
             payload.insert(
                 "attempted_failure_modes".to_string(),

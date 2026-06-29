@@ -2941,6 +2941,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "theorem-agentd",
  "theorem-proxy",
  "theorem-receiver",
  "tokio",
@@ -8154,6 +8155,7 @@ dependencies = [
  "rustyred-thg-ml",
  "rustyred-thg-offload",
  "rustyred-thg-reconstruct-harness",
+ "rustyred-web",
  "serde",
  "serde_json",
  "theorem-harness-core",
@@ -8231,6 +8233,7 @@ dependencies = [
  "rustyred-thg-affordances",
  "rustyred-thg-connectors",
  "rustyred-thg-core",
+ "rustyred-thg-datawave-harness",
  "rustyred-thg-fractal",
  "rustyred-thg-mcp",
  "rustyred-web",
@@ -8265,6 +8268,7 @@ dependencies = [
  "rustyred-membrane",
  "rustyred-rerank",
  "rustyred-thg-core",
+ "rustyred-thg-datawave",
  "serde",
  "serde_json",
  "texting_robots",
@@ -9763,6 +9767,22 @@ dependencies = [
  "theorem-receiver",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "theorem-agentd"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "futures-util",
+ "reqwest 0.12.28",
+ "rustyred-thg-core",
+ "serde",
+ "serde_json",
+ "theorem-copresence",
+ "theorem-receiver",
+ "tokio",
+ "toml 0.8.2",
 ]
 
 [[package]]

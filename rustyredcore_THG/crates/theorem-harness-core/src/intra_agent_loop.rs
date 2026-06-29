@@ -8,9 +8,9 @@
 
 use crate::agent_binding::{
     apply_binding_transition, AgentBinding, BindingBudgetDecision, BindingError, BindingEventState,
-    BindingHeadOutcome, BindingRoutingDecision, BindingSubtask, BindingTransitionInput,
-    BindingTransitionResult, BindingVerificationOutcome, HeadKind, ScratchpadRelationKind,
-    ScratchpadRevision, ScratchpadRevisionLink,
+    BindingHeadOutcome, BindingLineageMemoryEntry, BindingRoutingDecision, BindingSubtask,
+    BindingTransitionInput, BindingTransitionResult, BindingVerificationOutcome, HeadKind,
+    ScratchpadRelationKind, ScratchpadRevision, ScratchpadRevisionLink,
 };
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
 use crate::constitution::Constitution;
@@ -20,6 +20,7 @@ use crate::head_invocation::{
 };
 use crate::state_hash::stable_value_hash;
 use crate::types::Payload;
+use crate::user_model::UserModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -102,8 +103,20 @@ pub struct FakeIntraAgentLoopInput {
     pub expected_value_units: f64,
     #[serde(default = "default_expected_invocation_cost_units")]
     pub expected_invocation_cost_units: f64,
+    #[serde(default)]
+    pub user_model: Option<UserModel>,
     pub started_at: String,
     pub closed_by: String,
+    /// S3 memory continuity: prior `AgentPublished` memory entries to thread
+    /// into the binding's `MEMORY_SCOPE.MOUNTED` event so the new binding
+    /// inherits Context from its lineage. `#[serde(default)]` keeps existing
+    /// JSON inputs (which never carried this field) deserializable. Callers
+    /// that compute lineage off a `GraphStore` (e.g. the runtime's
+    /// `lineage_memory_for_binding`) populate this before running the loop;
+    /// the loop dispatches it through MOUNTED so the kernel projects each
+    /// entry as a scratchpad revision before `HEADS.CONTRIBUTE`.
+    #[serde(default)]
+    pub lineage_memory: Vec<BindingLineageMemoryEntry>,
 }
 
 impl FakeIntraAgentLoopInput {
@@ -130,8 +143,10 @@ impl FakeIntraAgentLoopInput {
             uncertainty_escalation_threshold: default_uncertainty_escalation_threshold(),
             expected_value_units: default_expected_value_units(),
             expected_invocation_cost_units: default_expected_invocation_cost_units(),
+            user_model: None,
             started_at: "2026-06-02T00:00:00Z".to_string(),
             closed_by: "fake-loop".to_string(),
+            lineage_memory: Vec::new(),
         }
     }
 }
@@ -226,17 +241,95 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
 
     let scope_id = binding.working_memory_scope.scope_id.clone();
     let scratchpad_id = binding.working_memory_scope.scratchpad.document_id.clone();
+    // Build the MOUNTED payload, merging in both S2's optional `user_model`
+    // and S3's optional `lineage_memory`. Both arms are independent: the
+    // payload may carry either, both, or neither.
+    let mut mount_payload = object_payload(json!({
+        "scope_id": scope_id,
+        "scratchpad_id": scratchpad_id
+    }));
+    if let Some(user_model) = &input.user_model {
+        mount_payload.insert(
+            "user_model".to_string(),
+            serde_json::to_value(user_model)
+                .expect("UserModel serialization should be infallible"),
+        );
+    }
+    if !input.lineage_memory.is_empty() {
+        let lineage_array = input
+            .lineage_memory
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(entry)
+                    .expect("BindingLineageMemoryEntry serialization should be infallible")
+            })
+            .collect::<Vec<_>>();
+        mount_payload.insert(
+            "lineage_size".to_string(),
+            Value::Number(serde_json::Number::from(input.lineage_memory.len())),
+        );
+        mount_payload.insert("lineage_memory".to_string(), Value::Array(lineage_array));
+    }
+    // Pin the scratchpad length BEFORE MOUNTED runs so the post-MOUNTED
+    // captures iterate ONLY the newly appended revisions. Without this
+    // anchor, a binding loaded with pre-existing `binding:mount` or
+    // `lineage:agent_published` revisions on its scratchpad (e.g. from a
+    // previous run that persisted state) would re-add those stale revisions
+    // to the loop's local `revisions` vec.
+    let mounted_revision_start = binding.working_memory_scope.scratchpad.revisions.len();
     binding = apply_step(
         binding,
         "MEMORY_SCOPE.MOUNTED",
-        object_payload(json!({
-            "scope_id": scope_id,
-            "scratchpad_id": scratchpad_id
-        })),
+        mount_payload,
         &input.started_at,
         &mut events,
     )?
     .binding;
+    // PR #72 P2 (S2): when a user_model was mounted, the MOUNTED arm
+    // appended a `binding:mount` Context revision to the binding's
+    // scratchpad inside `apply_binding_payload`. The local `revisions` vec
+    // is what later `invoke_head` calls use to build `prior_revision_ids`
+    // and `prior_context`, so propagate the just-appended mount revision
+    // here -- otherwise the proposal/critique/synthesis/verification heads
+    // never see the user_model and the slice's purpose is defeated. Search
+    // only the slice appended in this MOUNTED call so we never re-capture
+    // a stale mount revision from a prior run on the same binding.
+    if input.user_model.is_some() {
+        if let Some(last) = binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .skip(mounted_revision_start)
+            .rev()
+            .find(|revision| revision.actor_head_id == "binding:mount")
+        {
+            revisions.push(last.clone());
+        }
+    }
+    // P1 (S3): when MOUNTED projected lineage_memory entries as scratchpad
+    // revisions (attributed to the synthetic `lineage:agent_published`
+    // actor), capture them onto the loop's local `revisions` vec so the
+    // first proposal/critique/synthesis `invoke_head` call surfaces them in
+    // `prior_revision_ids` (and the kernel sees them as prior context the
+    // heads must read). Without this, the kernel mounts the memory into
+    // the binding but the heads never see it. Iterate only the slice
+    // appended in this MOUNTED call so any pre-existing
+    // `lineage:agent_published` revisions on the loaded binding are left
+    // alone.
+    if !input.lineage_memory.is_empty() {
+        for revision in binding
+            .working_memory_scope
+            .scratchpad
+            .revisions
+            .iter()
+            .skip(mounted_revision_start)
+        {
+            if revision.actor_head_id == "lineage:agent_published" {
+                revisions.push(revision.clone());
+            }
+        }
+    }
 
     binding = apply_step(
         binding,
@@ -362,7 +455,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             &heads,
             HeadInvocationKind::Critique,
             &input.domain,
-            &[primary.head_id.clone()],
+            std::slice::from_ref(&primary.head_id),
             input.routing_explore_token.saturating_add(round_index),
         )?;
         let critic = critic_route.0;
@@ -436,7 +529,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
             &heads,
             HeadInvocationKind::Verification,
             &input.domain,
-            &[synthesis.head_id.clone()],
+            std::slice::from_ref(&synthesis.head_id),
             input.routing_explore_token.saturating_add(round_index),
         )?;
         let verifier = verifier_route.0;
@@ -926,6 +1019,11 @@ fn invoke_head<I: HeadInvoker>(
         .collect();
     let prior_context = revisions.iter().filter_map(revision_context).collect();
     let policy_decision = constitution.head_turn_decision(binding, &head.head_id, kind);
+    // Thread the binding's agent constitution (persona/voice) through every
+    // head invocation: proposal, critique, synthesis, and verification. The
+    // synthesis step (DRAFTS.SYNTHESIZED) is where voice matters most, but
+    // carrying it on every step keeps tone consistent across all contributions
+    // and gives the verifier the same voice context to judge against.
     let request = HeadInvocationRequest::new_with_context(
         head,
         kind,
@@ -938,34 +1036,28 @@ fn invoke_head<I: HeadInvoker>(
     )
     .with_policy_decision(policy_decision)
     .with_scratchpad_crdt(binding.working_memory_scope.scratchpad.crdt.clone())
-    .with_context_membrane(input.context_membrane.clone());
+    .with_context_membrane(input.context_membrane.clone())
+    .with_constitution(binding.identity.agent_constitution.clone());
     invoker
         .invoke(request)
         .map_err(IntraAgentLoopError::Invocation)
 }
 
 fn revision_context(revision: &ScratchpadRevision) -> Option<RevisionContext> {
-    let kind = revision
-        .payload
-        .get("kind")
-        .and_then(Value::as_str)
-        .and_then(parse_invocation_kind)?;
+    let kind = revision.payload.get("kind").and_then(Value::as_str)?;
+    // Surface the standard turn kinds AND `"context"` so grounding revisions
+    // (e.g. the binding-mount user-model entry) reach downstream heads through
+    // `prior_context`. Unknown kinds are still filtered out.
+    let kind_str = match kind {
+        "proposal" | "critique" | "synthesis" | "verification" | "context" => kind.to_string(),
+        _ => return None,
+    };
     Some(RevisionContext {
         revision_id: revision.revision_id.clone(),
-        kind,
+        kind: kind_str,
         output_summary: revision.summary.clone(),
         payload: revision.payload.clone(),
     })
-}
-
-fn parse_invocation_kind(kind: &str) -> Option<HeadInvocationKind> {
-    match kind {
-        "proposal" => Some(HeadInvocationKind::Proposal),
-        "critique" => Some(HeadInvocationKind::Critique),
-        "synthesis" => Some(HeadInvocationKind::Synthesis),
-        "verification" => Some(HeadInvocationKind::Verification),
-        _ => None,
-    }
 }
 
 fn contribute_from_receipt(

@@ -36,7 +36,7 @@ The shared room where several heads see each other's work.
 | `coordinate` | Post a direct message, optionally with @mentions and a wake. |
 | `coordination_record` | Write a durable record (event, decision, tension, reflection). |
 | `coordination_contribution` | Capture a contribution as an event record. |
-| `coordination_context` | Read a bundled context packet for turn-start injection. |
+| `coordination_context` | Read a bundled context packet for turn-start injection, including ambient code and RustyWeb evidence when available. |
 | `presence` | Read, refresh, or end an actor's presence. |
 | `mentions` | Read pending @mentions for an actor. |
 | `read_intents_for_room` | Read intents for a room. |
@@ -60,7 +60,7 @@ Prepare context, run, and inspect the typed event log.
 
 | Tool | What it does |
 |---|---|
-| `harness_prepare` | Compose a context brief from capability selection plus memory recall. |
+| `harness_prepare` | Compose a context brief from capability selection, memory recall, ambient code, and ambient RustyWeb evidence. |
 | `harness_run` | Read a run and its ordered event log. |
 | `harness_append_transition` | Append a transition to a run's event log. |
 | `composed_agent_run` | Run one composed-agent turn through the scratchpad and alignment gate. |
@@ -163,6 +163,7 @@ Fetch, search, and drive the web into the graph.
 | Tool | What it does |
 |---|---|
 | `web_consume` | Fetch, observe, and optionally ingest one page. |
+| `web_query` | Query tenant-scoped RustyWeb DATAWAVE page facts with planner receipts and hydrate matching page nodes; `coordination_context` and `harness_prepare` use the same read path for ambient run-start web evidence. Legacy calls to `web.query` are still accepted, but the advertised MCP tool name is host-safe for Claude. |
 | `browse_with_me` | Supervised co-browse with pre-action preview. |
 | `browse_for_me` | Autonomous browse bounded by policy. |
 | `web_search_graph` | Search that returns graph-shaped results. |

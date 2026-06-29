@@ -9,6 +9,12 @@ The Vite/React files under `src/` are not the primary product surface anymore.
 Keep them only as a typed command-contract/reference harness for Tauri invoke
 commands while the CommonPlace panels live in the Next.js app.
 
+On launch, the Rust backend starts the local Theorem MCP node, the CommonPlace
+API loopback server, the ambient watcher, and the Anthropic Messages proxy. The
+Settings surface exposes proxy status and a Claude Code connect action; on
+macOS it opens a Terminal session with `ANTHROPIC_BASE_URL` pointed at the local
+proxy and `ENABLE_TOOL_SEARCH=true`.
+
 ## Recommended IDE Setup
 
 - [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)

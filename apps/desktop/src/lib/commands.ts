@@ -201,6 +201,21 @@ export interface CommonplaceStatus {
   storePath: string;
 }
 
+export interface ProxyStatus {
+  nodeUp: boolean;
+  endpoint: string;
+  port: number;
+  storePath: string;
+  ambientEnabled: boolean;
+}
+
+export interface ProxyConnectReceipt {
+  status: "ok" | "error";
+  endpoint: string;
+  command: string;
+  message: string;
+}
+
 export interface ReceiverStatus {
   enabled: boolean;
   state: "off" | "configured" | "running" | "error";
@@ -233,29 +248,27 @@ export async function commonplaceStatus(): Promise<CommonplaceStatus> {
   };
 }
 
-/** Status of the in-process local proxy + whether Claude Code is pointed at it (D6). */
-export interface ProxyStatus {
-  proxyUp: boolean;
-  connected: boolean;
-  endpoint: string;
-  port: number;
+/** Rust: `proxy_status() -> ProxyStatus`. */
+export async function proxyStatus(): Promise<ProxyStatus> {
+  if (isTauri()) return invoke<ProxyStatus>("proxy_status");
+  return {
+    nodeUp: false,
+    endpoint: "http://127.0.0.1:8484",
+    port: 8484,
+    storePath: "~/Library/Application Support/Theorem/store/proxy",
+    ambientEnabled: true,
+  };
 }
 
-/** Rust: `theorem_proxy_status() -> ProxyStatus`. */
-export async function theoremProxyStatus(): Promise<ProxyStatus> {
-  if (isTauri()) return invoke<ProxyStatus>("theorem_proxy_status");
-  return { proxyUp: false, connected: false, endpoint: "http://127.0.0.1:17891", port: 17891 };
-}
-
-/** Rust: `connect_claude_code() -> String`. Writes ANTHROPIC_BASE_URL into ~/.claude/settings.json. */
-export async function connectClaudeCode(): Promise<string> {
-  if (isTauri()) return invoke<string>("connect_claude_code");
-  return "http://127.0.0.1:17891";
-}
-
-/** Rust: `disconnect_claude_code()`. Removes ANTHROPIC_BASE_URL from ~/.claude/settings.json. */
-export async function disconnectClaudeCode(): Promise<void> {
-  if (isTauri()) return invoke("disconnect_claude_code");
+/** Rust: `proxy_connect_claude() -> ProxyConnectReceipt`. */
+export async function proxyConnectClaude(): Promise<ProxyConnectReceipt> {
+  if (isTauri()) return invoke<ProxyConnectReceipt>("proxy_connect_claude");
+  return {
+    status: "error",
+    endpoint: "http://127.0.0.1:8484",
+    command: "ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ENABLE_TOOL_SEARCH=true claude",
+    message: "Claude Code connection is available in the desktop app.",
+  };
 }
 
 /** Rust: `receiver_settings_get() -> ReceiverSettings`. */

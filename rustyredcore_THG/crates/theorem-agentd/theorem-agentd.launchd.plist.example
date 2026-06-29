@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.theorem.agentd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/theorem-agentd</string>
+    <string>/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG/theorem-agentd.toml</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/travisgilbert/Tech Dev Local/Creative/Website/Theorem/rustyredcore_THG</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>THEOREM_HARNESS_TOKEN</key>
+    <string>set-in-launchctl-not-in-this-file</string>
+    <key>THEOREM_MODEL_API_KEY</key>
+    <string>set-in-launchctl-not-in-this-file</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/theorem-agentd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/theorem-agentd.err.log</string>
+</dict>
+</plist>

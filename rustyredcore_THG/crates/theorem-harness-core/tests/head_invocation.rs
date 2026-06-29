@@ -67,13 +67,13 @@ fn invocation_request_carries_prior_revision_context() {
         vec![
             RevisionContext {
                 revision_id: "scratchrev:proposal".to_string(),
-                kind: HeadInvocationKind::Proposal,
+                kind: HeadInvocationKind::Proposal.as_str().to_string(),
                 output_summary: "proposal summary".to_string(),
                 payload: object_payload(json!({ "text": "proposal body" })),
             },
             RevisionContext {
                 revision_id: "scratchrev:critique".to_string(),
-                kind: HeadInvocationKind::Critique,
+                kind: HeadInvocationKind::Critique.as_str().to_string(),
                 output_summary: "critique summary".to_string(),
                 payload: object_payload(json!({ "text": "critique body" })),
             },
@@ -196,6 +196,7 @@ fn fixture_binding() -> AgentBinding {
             version: 1,
             trust_tier: "first_party".to_string(),
             active_head_set: vec!["claude".to_string(), "mistral_ocr".to_string()],
+            agent_constitution: None,
         },
         BindingComposition {
             heads: vec![

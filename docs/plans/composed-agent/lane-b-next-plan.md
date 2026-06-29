@@ -1,6 +1,20 @@
 # Composed Agent Lane B: Next Execution Plan
 
-Status: LB-1 pure registry, LB-2 deterministic fake-head loop, and LB-3 fake invocation seam implemented locally; runtime/provider execution is wired for API-backed heads. North Star binding stages 1-6 are landed in the deterministic loop: scratchpad DAG/relation edges, per-capability reliability routing, synthesis verification receipts, marginal-value budget decisions, bounded convergence rounds, and outcome-fed reliability compounding. Charter-surface reintegration and remaining live app affordances remain open.
+Status: **Lane B model layer COMPLETE.** S4 audit on 2026-06-28 confirmed LB-1 (runtime credential resolver), LB-2 (live model invocation), and the live `theorem_grpc.*` app affordance adapter all shipped — see ## "S4 audit verdict (2026-06-28)" below. Charter-surface reintegration is the remaining named-open item.
+
+LB-1 pure registry + runtime/provider credential resolver, LB-2 deterministic fake-head loop + `ProviderHeadInvoker` production default, and the live tonic dispatch to `apps/theorem-grpc` for Theseus app affordances are all shipped on `main`. North Star binding stages 1-6 are landed in the deterministic loop: scratchpad DAG/relation edges, per-capability reliability routing, synthesis verification receipts, marginal-value budget decisions, bounded convergence rounds, and outcome-fed reliability compounding.
+
+## S4 audit verdict (2026-06-28)
+
+A focused audit-first slice (Agent Theorem S4) verified that all three Lane B "live model layer" deliverables are already shipped on `main`. No new code was written; this is a status-only update.
+
+| Sub-deliverable | Verdict | Evidence |
+| --- | --- | --- |
+| LB-1 runtime/provider credential resolver | DONE | `theorem-harness-runtime/src/head_invoker/credentials.rs` — `CredentialResolver` supports `env:` / `secret:` / `secret-store:` refs with typed `CredentialResolutionError` (InvalidReference / MissingCredential / UnsupportedReference). Tested via `head_invoker::tests::credential_resolver_supports_env_and_secret_store_refs`. Credentials never enter GraphStore. |
+| LB-2 live model invocation in production | DONE | `ProviderHeadInvoker` = `RealHeadInvoker` is the production default in `rustyred-thg-mcp::composed_agent_run_to_store` (gated by `ComposedAgentInvokerMode::Real` unless `THEOREM_HEAD_INVOKER=fake\|test` or `cfg!(test)`), `rustyred-thg-server::TenantGraphStore::composed_agent_run` (unconditional `ProviderHeadInvoker::from_env()`), and `apps/commonplace-api/src/schema.rs`. All transports (Api/Mcp/Local/Hosted) route through credential resolution; missing credential at call time yields a typed `HeadInvocationError::ProviderError`. Tests still inject `FakeHeadInvoker` via the `<I: HeadInvoker>` generic. |
+| Live `theorem_grpc.*` app affordance adapter | DONE | `TenantGraphStore::invoke_app_affordance` in `rustyred-thg-server/src/state.rs:2618-2810` — real tonic dispatch via `tonic::transport::Channel::from_shared` against `/theorem_grpc.AppAffordanceService/InvokeAffordance` with endpoint resolution through `THEOREM_APP_AFFORDANCE_GRPC_URL` → `THEOREM_GRPC_URL` → `THEOREM_SEARCH_URL` → `THESEUS_BRIDGE_URL`. Routed helpers `invoke_code_search` + `invoke_reconstruct_binary` compose the affordance IDs; test fixtures at `rustyred-thg-mcp/src/lib.rs:15895-15910` exercise the trait without a live server; MCP route tests at 17736 / 17769 / 17773 / 17796 prove ID routing. |
+
+Validation at audit time: `cargo test -p theorem-harness-core` all green; `cargo test -p theorem-harness-runtime` 164 pass + the 1 pre-existing env-dependent failure (`coordination::tests::write_intent_replaces_live_actor_record_and_preserves_started_at`, hardcoded fixture out of date with live registry); both clippy clean.
 
 Source plan: `implementation-plan.md`, Lane B checklist CA-B1 through CA-B4.
 
@@ -40,7 +54,7 @@ Acceptance criteria:
 - Done locally: distinguish reasoning cores, skill plugins, and specialized coders in the resolved registry view.
 - Done locally: reject inactive or unknown heads before any model call.
 - Done locally: unit tests cover each transport kind with fake targets and no network.
-- Open: runtime/provider adapter and GraphStore node mapping for the live registry must keep credential values out of persisted nodes.
+- DONE: runtime/provider adapter shipped — `theorem-harness-runtime/src/head_invoker/credentials.rs::CredentialResolver`. Credentials resolved at call time only; never persisted to GraphStore. See S4 audit verdict above.
 
 Validation:
 
@@ -82,7 +96,7 @@ Acceptance criteria:
 - Done locally: `DRAFTS.SYNTHESIZED` records at least two distinct contributing heads for publication.
 - Done locally: `POLICY.CHECKED` payload includes grounded `claims: [{ text, provenance }]`.
 - Done locally: claimless or ungrounded publications fail loudly through the existing strict grounding guard.
-- Open: replace fake-head receipts with runtime model invocation receipts.
+- DONE: production paths default to `ProviderHeadInvoker` (real model invocation receipts). `FakeHeadInvoker` is only used in tests via the `<I: HeadInvoker>` generic. See S4 audit verdict above.
 - Done locally: learned/router moderation now selects proposal, critique, synthesis, and verification heads by per-capability reliability while keeping the deterministic scaffold replayable.
 - Done locally: value-aware budget decisions estimate marginal value for each role and for continuing another round before the hard budget guard charges spend.
 - Done locally: iterative rounds continue after a verifier defect and stop on convergence, budget/value stop, or `max_rounds`.
@@ -109,7 +123,7 @@ Local state: implemented in `theorem-harness-core/src/head_invocation.rs` as a f
 Acceptance criteria:
 
 - Done locally: the loop can run against fake invokers in tests.
-- Open: real invokers behind an explicit runtime adapter.
+- DONE: `ProviderHeadInvoker` (= `RealHeadInvoker`) is the runtime adapter. See S4 audit verdict above.
 - Done locally: fake outputs are converted into structured scratchpad revisions and contribution receipts.
 - Done locally: publication proposals carry grounded claims; ungrounded fake output fails through the existing strict grounding guard.
 - Done locally: skill-plugin heads are rejected by the invocation seam rather than joined as reasoning heads.

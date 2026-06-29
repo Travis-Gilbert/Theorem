@@ -1,0 +1,15 @@
+[package]
+name = "rustyred-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Local RustyRed proxy for Anthropic Messages clients and Theorem room protocol."
+license = "MIT"
+rust-version = "1.85"
+
+[[bin]]
+name = "rustyred-proxy"
+path = "src/main.rs"
+
+[dependencies]
+theorem-agentd = { path = "../theorem-agentd" }
+tokio = { version = "1", features = ["rt-multi-thread"] }

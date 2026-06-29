@@ -1,0 +1,86 @@
+# theorem-agentd configuration.
+#
+# This file is intentionally safe to run as-is: no bearer token, model key, or
+# local data-dir env var is required. It uses the deterministic rule provider so
+# a first `theorem-agentd --once "hello" theorem-agentd.toml` proves the loop,
+# ledger, and MCP routing without requiring a resident model.
+
+default_room_id = "repo:theorem:branch:main"
+actor = "theorem-agentd"
+operator_memory_tenant = "Travis-Gilbert"
+
+[model]
+provider = "rule"
+temperature = 0.2
+max_tokens = 1200
+request_timeout_secs = 120
+grammar_constrained = true
+
+# To use a resident OpenAI-compatible model, switch to:
+#
+# provider = "openai-compatible"
+# base_url = "http://127.0.0.1:8080"
+# model = "gemma-4-12b-it-q4"
+# api_key_env = "THEOREM_MODEL_API_KEY"
+#
+# For Gemma vision/image input, start llama-server with the matching multimodal
+# projector, for example:
+#
+# llama-server -m gemma-4-12b-it-q4.gguf --mmproj mmproj-gemma-4-12b-it.gguf -c <ctx>
+#
+# Secrets stay in environment variables; do not put real keys in this file.
+
+[harness]
+name = "harness"
+url = "http://127.0.0.1:8380/mcp"
+tenant_slug = "Travis-Gilbert"
+
+# Hosted sync is opt-in. For the hosted Theorem MCP, change url to:
+# url = "https://rustyredcore-theorem-production.up.railway.app/mcp"
+
+# Bucket B local tools can be added here. Set session = true for any
+# spec-compliant streamable-HTTP MCP server (initialize -> mcp-session-id ->
+# notifications/initialized -> tools/call over SSE).
+#
+# [[mcp_servers]]
+# name = "filesystem"
+# url = "http://127.0.0.1:7334/mcp"
+# session = true
+# tenant_slug = "Travis-Gilbert"
+
+[receiver]
+enabled = false
+config_path = "theorem-receiver.toml"
+
+[loop_config]
+max_iterations = 8
+tick_interval_secs = 60
+storm_guard_window_secs = 600
+
+[ledger]
+path = ".theorem/agentd-token-ledger.jsonl"
+# Mirror each ledger line into the graph as a self_note receipt (the label
+# factory). The JSONL ledger remains the source of truth and is never rotated.
+mirror_to_graph = true
+
+# Agent Queue capture: the local loop's inbound edge. A dedicated TickTick list
+# is the ONLY capture trigger; tasks anywhere else are never converted. On each
+# tick every task here becomes a job (title -> title, content -> spec_inline,
+# TickTick priority -> P0/P1/P2), the job id is stamped into the task, its
+# `dispatched` subtask is checked, and it is moved to the product list.
+[capture]
+enabled = false
+# agent_queue_project_id = "..."                       # the "Agent Queue" list
+# agent_queue_project_name = "Agent Queue"             # resolve the id by name instead
+# dispatched_project_id = "..."                        # "Work in Progress"
+repo = "Travis-Gilbert/theorem"
+# target_head = "either"                               # claude | codex | either
+dispatched_subtask_title = "dispatched"
+
+# Milestone relay: the local loop's return edge. The daemon relays the sparse
+# milestones a run produces - started, PR-opened (with the PR link), merged,
+# failed - onto the originating task, and completes the task only when the job
+# records the merge. The milestone prose is model-written; the transitions,
+# dedup, and completion are mechanical.
+[relay]
+enabled = false
