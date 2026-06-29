@@ -31,7 +31,8 @@ fn spawn_server() -> u16 {
 /// Connect a real `tokio-postgres` client (trust auth, TLS disabled) and drive
 /// its connection task in the background.
 async fn connect(port: u16) -> Client {
-    let conn_str = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres sslmode=disable");
+    let conn_str =
+        format!("host=127.0.0.1 port={port} user=postgres dbname=postgres sslmode=disable");
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .expect("tokio-postgres connects to the rustyred pg-wire surface");
@@ -51,7 +52,10 @@ async fn ac1_driver_connects_and_selects_native_view() {
         .await
         .expect("select over native memory view");
     assert_eq!(rows.len(), 2, "two planning memories in the demo view");
-    let topics: Vec<String> = rows.iter().map(|row| row.get::<_, String>("topic")).collect();
+    let topics: Vec<String> = rows
+        .iter()
+        .map(|row| row.get::<_, String>("topic"))
+        .collect();
     assert!(topics.iter().all(|topic| topic == "planning"));
 }
 
@@ -80,7 +84,11 @@ async fn ac2_simple_and_extended_protocols() {
         .await
         .expect("extended-protocol prepare");
     let rows = client.query(&statement, &[]).await.expect("extended query");
-    assert_eq!(rows.len(), 3, "extended query returns all three memory rows");
+    assert_eq!(
+        rows.len(),
+        3,
+        "extended query returns all three memory rows"
+    );
 }
 
 /// AC #3: a query joining two native views lowers to the planner IR and executes
@@ -97,7 +105,10 @@ async fn ac3_join_of_two_native_views() {
         .expect("join across memory and epistemic views");
     assert!(!rows.is_empty(), "the join must return matched rows");
     // mem:1 (planning) -> supports, mem:3 (planning) -> undercuts.
-    let stances: Vec<String> = rows.iter().map(|row| row.get::<_, String>("stance")).collect();
+    let stances: Vec<String> = rows
+        .iter()
+        .map(|row| row.get::<_, String>("stance"))
+        .collect();
     assert!(stances.contains(&"supports".to_string()));
     assert!(stances.contains(&"undercuts".to_string()));
 }
@@ -191,7 +202,10 @@ async fn ac7_boundary_native_views_yes_auth_billing_no() {
     let client = connect(spawn_server()).await;
 
     // Native epistemic + memory views resolve.
-    assert!(client.query("SELECT stance FROM epistemic", &[]).await.is_ok());
+    assert!(client
+        .query("SELECT stance FROM epistemic", &[])
+        .await
+        .is_ok());
     assert!(client.query("SELECT topic FROM memory", &[]).await.is_ok());
 
     // Auth/billing are not native wire views -> undefined relation. The app
@@ -236,8 +250,14 @@ async fn select_star_join_keeps_both_ids_over_the_wire() {
     let values: Vec<String> = (0..row.columns().len())
         .filter_map(|i| row.get(i).map(ToString::to_string))
         .collect();
-    assert!(values.iter().any(|v| v.starts_with("mem:")), "memory id survived: {values:?}");
-    assert!(values.iter().any(|v| v.starts_with("ep:")), "epistemic id survived: {values:?}");
+    assert!(
+        values.iter().any(|v| v.starts_with("mem:")),
+        "memory id survived: {values:?}"
+    );
+    assert!(
+        values.iter().any(|v| v.starts_with("ep:")),
+        "epistemic id survived: {values:?}"
+    );
 }
 
 /// `count(DISTINCT topic)` returns the distinct count (2), not the row count (3).
@@ -250,4 +270,226 @@ async fn count_distinct_over_the_wire() {
         .expect("count distinct");
     let n: i64 = rows[0].get("n");
     assert_eq!(n, 2, "two distinct topics");
+}
+
+/// dbt debug/parse front door: the Postgres adapter's debug query, current
+/// database/schema functions, and catalog reads resolve over the same wire.
+#[tokio::test]
+async fn dbt_debug_and_catalog_introspection_resolve() {
+    let client = connect(spawn_server()).await;
+    let debug = client
+        .query("select 1 as id", &[])
+        .await
+        .expect("dbt debug query");
+    assert_eq!(debug[0].get::<_, i64>("id"), 1);
+
+    let context = client
+        .query(
+            "select current_database() as database, current_schema() as schema",
+            &[],
+        )
+        .await
+        .expect("current database/schema");
+    assert_eq!(context[0].get::<_, String>("database"), "postgres");
+    assert_eq!(context[0].get::<_, String>("schema"), "public");
+
+    let columns = client
+        .query(
+            "select column_name, data_type, character_maximum_length, numeric_precision, numeric_scale \
+             from information_schema.columns \
+             where table_name = 'memory' and table_schema = 'public' \
+             order by ordinal_position",
+            &[],
+        )
+        .await
+        .expect("information_schema.columns for native view");
+    let names: Vec<String> = columns.iter().map(|row| row.get("column_name")).collect();
+    assert!(names.contains(&"id".to_string()));
+    assert!(names.contains(&"topic".to_string()));
+
+    let relations = client
+        .query(
+            "select 'postgres' as database, tablename as name, schemaname as schema, 'table' as type \
+             from pg_tables where schemaname ilike 'public' \
+             union all \
+             select 'postgres' as database, viewname as name, schemaname as schema, 'view' as type \
+             from pg_views where schemaname ilike 'public'",
+            &[],
+        )
+        .await
+        .expect("pg_tables/pg_views relation listing");
+    let relation_names: Vec<String> = relations.iter().map(|row| row.get("name")).collect();
+    assert!(relation_names.contains(&"memory".to_string()));
+}
+
+/// dbt run materializations: table, view, and append-style incremental SQL land
+/// as queryable substrate relations, with lineage and provenance receipts.
+#[tokio::test]
+async fn dbt_materializations_land_as_relations_with_lineage() {
+    let client = connect(spawn_server()).await;
+
+    client
+        .simple_query(
+            r#"
+            create table "postgres"."public"."dbt_table_model__dbt_tmp" as (
+                select id, topic from "postgres"."public"."memory"
+            );
+            alter table "postgres"."public"."dbt_table_model__dbt_tmp" rename to "dbt_table_model";
+            create view "postgres"."public"."dbt_topic_counts__dbt_tmp" as (
+                select topic, count(*) as n_records from memory group by topic
+            );
+            alter view "postgres"."public"."dbt_topic_counts__dbt_tmp" rename to "dbt_topic_counts";
+            create table "postgres"."public"."dbt_incremental" as (
+                select id, topic, created_ms from memory where created_ms >= 2000
+            );
+            create temporary table "dbt_incremental__dbt_tmp" as (
+                select id, topic, created_ms from memory where created_ms >= 3000
+            );
+            insert into "postgres"."public"."dbt_incremental" ("id", "topic", "created_ms") (
+                select id, topic, created_ms from "dbt_incremental__dbt_tmp"
+            );
+            "#,
+        )
+        .await
+        .expect("dbt materialization SQL");
+
+    let table_count = client
+        .query(
+            r#"select count(*) as n from "postgres"."public"."dbt_table_model""#,
+            &[],
+        )
+        .await
+        .expect("table model query");
+    assert_eq!(table_count[0].get::<_, i64>("n"), 3);
+
+    let view_rows = client
+        .query(
+            r#"select topic, n_records from "postgres"."public"."dbt_topic_counts" order by topic"#,
+            &[],
+        )
+        .await
+        .expect("view model query");
+    assert_eq!(view_rows.len(), 2);
+
+    let incremental_count = client
+        .query(
+            r#"select count(*) as n from "postgres"."public"."dbt_incremental""#,
+            &[],
+        )
+        .await
+        .expect("incremental model query");
+    assert_eq!(incremental_count[0].get::<_, i64>("n"), 3);
+
+    let lineage = client
+        .query(
+            "select target_relation, source_relation from dbt_model_lineage \
+             where target_relation = 'public.dbt_table_model'",
+            &[],
+        )
+        .await
+        .expect("dbt lineage facts");
+    assert!(
+        lineage
+            .iter()
+            .any(|row| row.get::<_, String>("source_relation") == "public.memory")
+            || lineage
+                .iter()
+                .any(|row| row.get::<_, String>("source_relation") == "memory")
+    );
+
+    let provenance = client
+        .query(
+            "select target_relation, provenance_kind from dbt_substrate_provenance \
+             where target_relation = 'public.dbt_table_model'",
+            &[],
+        )
+        .await
+        .expect("substrate provenance facts");
+    assert!(provenance.iter().any(|row| {
+        row.get::<_, String>("provenance_kind") == "substrate_relational_materialization"
+    }));
+}
+
+/// dbt test grounding: a passing generic test and a deliberately failing
+/// accepted-values test return the right failure counts and record both
+/// outcomes as grounding facts.
+#[tokio::test]
+async fn dbt_generic_tests_record_pass_and_fail_grounding_facts() {
+    let client = connect(spawn_server()).await;
+
+    let pass = client
+        .query(
+            "select count(*) as failures, count(*) != 0 as should_warn, count(*) != 0 as should_error \
+             from (select id from memory where id is null) dbt_internal_test",
+            &[],
+        )
+        .await
+        .expect("passing not_null-style dbt test");
+    assert_eq!(pass[0].get::<_, i64>("failures"), 0);
+    assert!(!pass[0].get::<_, bool>("should_error"));
+
+    let fail = client
+        .query(
+            "select count(*) as failures, count(*) != 0 as should_warn, count(*) != 0 as should_error \
+             from ( \
+               with all_values as ( \
+                 select topic as value_field, count(*) as n_records from memory group by topic \
+               ) \
+               select * from all_values where value_field not in ('planning') \
+             ) dbt_internal_test",
+            &[],
+        )
+        .await
+        .expect("failing accepted_values-style dbt test");
+    assert_eq!(fail[0].get::<_, i64>("failures"), 1);
+    assert!(fail[0].get::<_, bool>("should_error"));
+
+    let relationships = client
+        .query(
+            r#"select count(*) as failures, count(*) != 0 as should_warn, count(*) != 0 as should_error
+               from (
+                 with child as (
+                   select id as from_field
+                   from "postgres"."public_public"."stg_memory"
+                   where id is not null
+                 ),
+                 parent as (
+                   select id as to_field
+                   from "postgres"."public"."memory"
+                 )
+                 select from_field
+                 from child
+                 left join parent on child.from_field = parent.to_field
+                 where parent.to_field is null
+               ) dbt_internal_test"#,
+            &[],
+        )
+        .await
+        .expect("passing relationships-style dbt test");
+    assert_eq!(relationships[0].get::<_, i64>("failures"), 0);
+
+    let facts = client
+        .query(
+            "select model_id, assertion, outcome, observed_count \
+             from dbt_grounding_facts order by outcome, assertion",
+            &[],
+        )
+        .await
+        .expect("grounding facts");
+    assert!(facts.iter().any(|row| {
+        row.get::<_, String>("assertion") == "not_null"
+            && row.get::<_, String>("outcome") == "pass"
+            && row.get::<_, i64>("observed_count") == 0
+    }));
+    assert!(facts.iter().any(|row| {
+        row.get::<_, String>("assertion") == "relationships"
+            && row.get::<_, String>("outcome") == "pass"
+            && row.get::<_, String>("model_id") == "public_public.stg_memory"
+            && row.get::<_, i64>("observed_count") == 0
+    }));
+    assert!(facts.iter().any(|row| {
+        row.get::<_, String>("assertion") == "accepted_values"
+            && row.get::<_, String>("outcome") == "fail"
+            && row.get::<_, i64>("observed_count") == 1
+    }));
 }

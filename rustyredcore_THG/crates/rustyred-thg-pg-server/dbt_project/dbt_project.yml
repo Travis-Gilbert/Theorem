@@ -1,0 +1,14 @@
+name: rustyred_pgwire
+version: "1.0"
+config-version: 2
+profile: rustyred_pgwire
+
+model-paths: ["models"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  rustyred_pgwire:
+    +schema: public
+    +materialized: view

@@ -28,26 +28,35 @@
 //! - `ORDER BY`, `LIMIT`/`OFFSET`, and `GROUP BY` with `count/sum/min/max/avg`
 //!   handled in the wire frontend (the planner is conjunctive scan+join only).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use postgres_types::Type;
+use rustyred_thg_core::relational::Relation;
 use rustyred_thg_core::{
-    execute_query, JoinPredicate, Predicate, QueryIr, QueryRelation, RelationalStore, ScalarBound,
-    ScalarValue,
+    execute_query, ColumnSchema, JoinPredicate, Predicate, QueryIr, QueryRelation, RelationSchema,
+    RelationalRow, RelationalStore, ScalarBound, ScalarValue,
 };
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind,
-    Query, Select, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
+    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::{PgColumn, PgQueryResult};
+
+const DB_NAME: &str = "postgres";
+const DEFAULT_SCHEMA: &str = "public";
+const RELATION_META: &str = "__dbt_relation_meta";
+const GROUNDING_FACTS: &str = "dbt_grounding_facts";
+const MODEL_LINEAGE: &str = "dbt_model_lineage";
+const SUBSTRATE_PROVENANCE: &str = "dbt_substrate_provenance";
 
 /// The native-views relational store the wire surface serves, shared across
 /// connections. Reads are short critical sections (lock, plan, collect, unlock).
@@ -99,7 +108,10 @@ type PgResult<T> = Result<T, PgError>;
 // ----------------------------------------------------------------------------
 
 /// Serve the native-views pg-wire surface over `listener`, backed by `store`.
-pub fn serve_relational(listener: TcpListener, store: SharedRelationalStore) -> std::io::Result<()> {
+pub fn serve_relational(
+    listener: TcpListener,
+    store: SharedRelationalStore,
+) -> std::io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         let store = Arc::clone(&store);
@@ -128,6 +140,12 @@ pub fn handle_relational_stream(
     let mut portals: BTreeMap<String, (String, Vec<i16>)> = BTreeMap::new();
 
     while let Some(message) = read_frontend_message(&mut stream)? {
+        if std::env::var_os("RUSTYRED_THG_PG_TRACE").is_some() {
+            eprintln!(
+                "RUSTYRED_THG_PG_FRONTEND {}",
+                frontend_message_name(&message)
+            );
+        }
         let mut out = Vec::new();
         match message {
             FrontendMessage::Query(sql) => {
@@ -141,8 +159,18 @@ pub fn handle_relational_stream(
                 }
                 out.extend(ready_for_query());
             }
-            FrontendMessage::Parse { name, query, param_oids } => {
-                prepared.insert(name, PreparedStmt { sql: query, param_oids });
+            FrontendMessage::Parse {
+                name,
+                query,
+                param_oids,
+            } => {
+                prepared.insert(
+                    name,
+                    PreparedStmt {
+                        sql: query,
+                        param_oids,
+                    },
+                );
                 out.extend(parse_complete());
             }
             FrontendMessage::Bind {
@@ -205,18 +233,22 @@ pub fn handle_relational_stream(
                         let probe = probe_sql_for_describe(&sql);
                         let run_target = probe.as_deref().unwrap_or(sql.as_str());
                         match run_sql(run_target, &store) {
+                            Ok(result) if result.columns.is_empty() => out.extend(no_data()),
                             Ok(result) => out.extend(row_description(&result.columns)),
                             Err(error) => out.extend(error_response(&error)),
                         }
                     }
                 } else {
                     // Portal describe: the SQL is already param-substituted.
-                    let sql = portals.get(&name).map(|(sql, _)| sql.clone()).unwrap_or_default();
+                    let (sql, formats) = portals.get(&name).cloned().unwrap_or_default();
                     if sql.trim().is_empty() {
                         out.extend(no_data());
                     } else {
                         match run_sql(&sql, &store) {
-                            Ok(result) => out.extend(row_description(&result.columns)),
+                            Ok(result) if result.columns.is_empty() => out.extend(no_data()),
+                            Ok(result) => {
+                                out.extend(row_description_typed(&result.columns, &formats))
+                            }
                             Err(error) => out.extend(error_response(&error)),
                         }
                     }
@@ -258,15 +290,1467 @@ pub fn handle_relational_stream(
 }
 
 fn run_sql(sql: &str, store: &SharedRelationalStore) -> PgResult<PgQueryResult> {
-    let guard = store
+    let mut guard = store
         .lock()
         .map_err(|_| PgError::internal("relational store mutex poisoned"))?;
-    execute_native_sql(sql, &guard)
+    execute_dbt_sql(sql, &mut guard)
 }
 
 // ----------------------------------------------------------------------------
 // SQL -> planner QueryIr -> rows.
 // ----------------------------------------------------------------------------
+
+/// dbt-facing SQL dispatcher. It keeps the native SELECT planner path intact,
+/// while adding the Postgres adapter surface dbt relies on: catalog reads,
+/// transaction statements, schema/table/view materialization, incremental
+/// inserts, and constraint-test receipts.
+pub fn execute_dbt_sql(sql: &str, store: &mut RelationalStore) -> PgResult<PgQueryResult> {
+    let cleaned = clean_sql(sql);
+    let statements = split_statements(&cleaned);
+    if statements.is_empty() {
+        return Ok(command_result("EMPTY", 0));
+    }
+
+    let mut last = command_result("OK", 0);
+    for statement in statements {
+        last = execute_dbt_statement(&statement, store)?;
+    }
+    Ok(last)
+}
+
+fn execute_dbt_statement(sql: &str, store: &mut RelationalStore) -> PgResult<PgQueryResult> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return Ok(command_result("EMPTY", 0));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if matches!(
+        lower.as_str(),
+        "begin" | "commit" | "rollback" | "start transaction"
+    ) || lower.starts_with("begin ")
+        || lower.starts_with("commit ")
+        || lower.starts_with("rollback ")
+        || lower.starts_with("savepoint ")
+        || lower.starts_with("release savepoint ")
+    {
+        return Ok(command_result("OK", 0));
+    }
+    if lower.starts_with("set ")
+        || lower.starts_with("reset ")
+        || lower.starts_with("analyze ")
+        || lower.starts_with("vacuum ")
+        || lower.starts_with("comment on ")
+        || lower.starts_with("create index ")
+        || lower.starts_with("create unique index ")
+        || lower.starts_with("drop index ")
+    {
+        return Ok(command_result("OK", 0));
+    }
+    if lower.starts_with("show ") {
+        return Ok(show_result(trimmed));
+    }
+    if lower.starts_with("create schema ") || lower.starts_with("drop schema ") {
+        return Ok(command_result("OK", 0));
+    }
+    if lower.starts_with("drop table ")
+        || lower.starts_with("drop view ")
+        || lower.starts_with("drop materialized view ")
+    {
+        return drop_relation_statement(trimmed, store);
+    }
+    if lower.starts_with("alter table ")
+        || lower.starts_with("alter view ")
+        || lower.starts_with("alter materialized view ")
+    {
+        return rename_relation_statement(trimmed, store);
+    }
+    if lower.starts_with("create ") && lower.contains(" table ") && lower.contains(" as") {
+        return create_relation_as_statement(trimmed, store, "BASE TABLE");
+    }
+    if lower.starts_with("create ") && lower.contains(" view ") && lower.contains(" as") {
+        return create_relation_as_statement(trimmed, store, "VIEW");
+    }
+    if lower.starts_with("insert into ") {
+        return insert_into_statement(trimmed, store);
+    }
+    if let Some(result) = catalog_query(trimmed, store)? {
+        return Ok(result);
+    }
+    if let Some(result) = dbt_test_wrapper(trimmed, store)? {
+        return Ok(result);
+    }
+    if let Some(result) = constant_select(trimmed)? {
+        return Ok(result);
+    }
+
+    execute_native_sql(trimmed, store)
+}
+
+fn clean_sql(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut in_block_comment = false;
+    let mut in_line_comment = false;
+    let mut in_string = false;
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        let next = bytes.get(index + 1).copied().map(char::from);
+        if in_block_comment {
+            if ch == '*' && next == Some('/') {
+                in_block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                out.push('\n');
+            }
+            index += 1;
+            continue;
+        }
+        if in_string {
+            out.push(ch);
+            if ch == '\'' {
+                if next == Some('\'') {
+                    out.push('\'');
+                    index += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' {
+            in_string = true;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            in_block_comment = true;
+            index += 2;
+            continue;
+        }
+        if ch == '-' && next == Some('-') {
+            in_line_comment = true;
+            index += 2;
+            continue;
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
+}
+
+fn split_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut paren_depth = 0usize;
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        let next = bytes.get(index + 1).copied().map(char::from);
+        current.push(ch);
+        if in_string {
+            if ch == '\'' {
+                if next == Some('\'') {
+                    current.push('\'');
+                    index += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+        } else {
+            match ch {
+                '\'' => in_string = true,
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                ';' if paren_depth == 0 => {
+                    let statement = current.trim().trim_end_matches(';').trim();
+                    if !statement.is_empty() {
+                        statements.push(statement.to_string());
+                    }
+                    current.clear();
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    let statement = current.trim().trim_end_matches(';').trim();
+    if !statement.is_empty() {
+        statements.push(statement.to_string());
+    }
+    statements
+}
+
+fn command_result(tag: impl Into<String>, rows: usize) -> PgQueryResult {
+    PgQueryResult {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        command_tag: format!("{} {}", tag.into(), rows),
+        trace: None,
+    }
+}
+
+fn show_result(sql: &str) -> PgQueryResult {
+    let lower = sql.to_ascii_lowercase();
+    let (name, value) = if lower.contains("search_path") {
+        ("search_path", DEFAULT_SCHEMA)
+    } else if lower.contains("server_version") {
+        ("server_version", "15.0-rustyred")
+    } else {
+        ("value", "")
+    };
+    PgQueryResult {
+        columns: vec![PgColumn::text(name)],
+        rows: vec![vec![Some(value.to_string())]],
+        command_tag: "SHOW 1".to_string(),
+        trace: None,
+    }
+}
+
+fn constant_select(sql: &str) -> PgResult<Option<PgQueryResult>> {
+    let trimmed = sql.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("select ") {
+        return Ok(None);
+    }
+    let statements = Parser::parse_sql(&GenericDialect {}, trimmed)
+        .map_err(|error| PgError::syntax(error.to_string()))?;
+    let Some(Statement::Query(query)) = statements.first() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if !select.from.is_empty() {
+        return Ok(None);
+    }
+    let mut columns = Vec::new();
+    let mut row = Vec::new();
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(ident_name(alias))),
+            _ => return Ok(None),
+        };
+        let alias = alias.unwrap_or_else(|| "?column?".to_string());
+        match expr {
+            Expr::Function(function) => {
+                let name = object_name_lower(&function.name);
+                match name.as_str() {
+                    "current_database" => {
+                        columns.push(PgColumn::text(alias));
+                        row.push(Some(DB_NAME.to_string()));
+                    }
+                    "current_schema" => {
+                        columns.push(PgColumn::text(alias));
+                        row.push(Some(DEFAULT_SCHEMA.to_string()));
+                    }
+                    "version" => {
+                        columns.push(PgColumn::text(alias));
+                        row.push(Some("RustyRed PG-wire dbt surface".to_string()));
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            Expr::Value(value) => {
+                let Some(value) = value_to_scalar(&value.value) else {
+                    return Ok(None);
+                };
+                columns.push(column_for_scalar(&alias, &value));
+                row.push(Some(scalar_to_text(&value)));
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(PgQueryResult {
+        columns,
+        rows: vec![row],
+        command_tag: "SELECT 1".to_string(),
+        trace: None,
+    }))
+}
+
+fn drop_relation_statement(sql: &str, store: &mut RelationalStore) -> PgResult<PgQueryResult> {
+    let mut rest = strip_keyword_ci(sql, "drop materialized view")
+        .or_else(|| strip_keyword_ci(sql, "drop table"))
+        .or_else(|| strip_keyword_ci(sql, "drop view"))
+        .ok_or_else(|| PgError::syntax("expected DROP relation statement"))?;
+    rest = strip_keyword_ci(rest.trim(), "if exists")
+        .unwrap_or(rest)
+        .trim();
+    let relation_token = read_relation_token(rest)
+        .ok_or_else(|| PgError::syntax("DROP requires a relation name"))?;
+    let relation = canonical_relation_name(&relation_token);
+    let _ = store
+        .drop_relation(&relation)
+        .map_err(|err| PgError::internal(err.message))?;
+    let _ = store.delete_row(RELATION_META, &relation);
+    Ok(command_result("DROP", 0))
+}
+
+fn rename_relation_statement(sql: &str, store: &mut RelationalStore) -> PgResult<PgQueryResult> {
+    let rest = strip_keyword_ci(sql, "alter materialized view")
+        .or_else(|| strip_keyword_ci(sql, "alter table"))
+        .or_else(|| strip_keyword_ci(sql, "alter view"))
+        .ok_or_else(|| PgError::syntax("expected ALTER relation statement"))?
+        .trim();
+    let from_token =
+        read_relation_token(rest).ok_or_else(|| PgError::syntax("ALTER requires a relation"))?;
+    let after_from = rest[from_token.len()..].trim();
+    let to_token = strip_keyword_ci(after_from, "rename to")
+        .and_then(|rest| read_relation_token(rest.trim()))
+        .ok_or_else(|| PgError::syntax("ALTER ... RENAME TO requires a target"))?;
+    let from = canonical_relation_name(&from_token);
+    let (_, table) = relation_parts(&to_token);
+    let (schema, _) = relation_parts(&from);
+    let to = if to_token.contains('.') {
+        canonical_relation_name(&to_token)
+    } else {
+        format!("{schema}.{table}")
+    };
+    store
+        .rename_relation(&from, &to)
+        .map_err(|err| PgError::internal(err.message))?;
+    move_relation_meta(store, &from, &to)?;
+    move_relation_receipts(store, &from, &to)?;
+    Ok(command_result("ALTER", 0))
+}
+
+fn create_relation_as_statement(
+    sql: &str,
+    store: &mut RelationalStore,
+    kind: &str,
+) -> PgResult<PgQueryResult> {
+    let lower = sql.to_ascii_lowercase();
+    let marker = if kind == "VIEW" { " view " } else { " table " };
+    let marker_pos = lower
+        .find(marker)
+        .ok_or_else(|| PgError::syntax("CREATE relation is missing TABLE/VIEW"))?;
+    let mut rest = sql[marker_pos + marker.len()..].trim();
+    rest = strip_keyword_ci(rest, "if not exists")
+        .unwrap_or(rest)
+        .trim();
+    let relation_token = read_relation_token(rest)
+        .ok_or_else(|| PgError::syntax("CREATE relation requires a name"))?;
+    let relation = canonical_relation_name(&relation_token);
+    let after_relation = rest[relation_token.len()..].trim();
+    let select_sql = extract_as_select(after_relation)
+        .ok_or_else(|| PgError::syntax("CREATE relation requires AS (SELECT ...)"))?;
+    materialize_select_as_relation(store, &relation, kind, &select_sql)?;
+    Ok(command_result("CREATE", 0))
+}
+
+fn insert_into_statement(sql: &str, store: &mut RelationalStore) -> PgResult<PgQueryResult> {
+    let rest = strip_keyword_ci(sql, "insert into")
+        .ok_or_else(|| PgError::syntax("expected INSERT INTO"))?
+        .trim();
+    let relation_token =
+        read_relation_token(rest).ok_or_else(|| PgError::syntax("INSERT requires a target"))?;
+    let relation = canonical_relation_name(&relation_token);
+    let after_relation = rest[relation_token.len()..].trim();
+    let (columns, after_columns) = if after_relation.starts_with('(') {
+        let (inside, remainder) = take_balanced(after_relation)
+            .ok_or_else(|| PgError::syntax("INSERT column list is not balanced"))?;
+        (
+            split_csv(&inside)
+                .into_iter()
+                .map(|column| unquote_ident(column.trim()))
+                .collect::<Vec<_>>(),
+            remainder.trim(),
+        )
+    } else {
+        (Vec::new(), after_relation)
+    };
+    let select_sql = unwrap_outer_parens(after_columns.trim());
+    let result = execute_dbt_statement(&select_sql, store)?;
+    append_result_rows(store, &relation, &columns, &result)?;
+    Ok(command_result("INSERT", result.rows.len()))
+}
+
+fn materialize_select_as_relation(
+    store: &mut RelationalStore,
+    relation: &str,
+    kind: &str,
+    select_sql: &str,
+) -> PgResult<()> {
+    let result = execute_dbt_statement(select_sql, store)?;
+    let schema = RelationSchema {
+        relation: relation.to_string(),
+        graph_backed: false,
+        columns: result
+            .columns
+            .iter()
+            .map(|column| ColumnSchema {
+                name: column.name.clone(),
+                nullable: true,
+                indexed: true,
+            })
+            .collect(),
+    };
+    let rows = result_rows_to_relational(relation, &result, 0);
+    store
+        .replace_relation(schema, rows)
+        .map_err(|err| PgError::internal(err.message))?;
+    record_relation_meta(store, relation, kind, Some(select_sql))?;
+    record_lineage(store, relation, select_sql)?;
+    Ok(())
+}
+
+fn append_result_rows(
+    store: &mut RelationalStore,
+    relation: &str,
+    columns: &[String],
+    result: &PgQueryResult,
+) -> PgResult<()> {
+    let start = store
+        .relation(relation)
+        .map(|relation| relation.rows().count())
+        .unwrap_or(0);
+    for (index, row) in result.rows.iter().enumerate() {
+        let mut values = BTreeMap::new();
+        for (col_index, value) in row.iter().enumerate() {
+            let name = columns
+                .get(col_index)
+                .cloned()
+                .or_else(|| {
+                    result
+                        .columns
+                        .get(col_index)
+                        .map(|column| column.name.clone())
+                })
+                .unwrap_or_else(|| format!("column_{col_index}"));
+            if let Some(value) = value {
+                let column = result.columns.get(col_index);
+                values.insert(name, scalar_from_pg_text(value, column));
+            }
+        }
+        let row_id = format!("{relation}:append:{}", start + index);
+        store
+            .upsert_row(RelationalRow::new(relation, row_id, values))
+            .map_err(|err| PgError::internal(err.message))?;
+    }
+    Ok(())
+}
+
+fn result_rows_to_relational(
+    relation: &str,
+    result: &PgQueryResult,
+    start: usize,
+) -> Vec<RelationalRow> {
+    result
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut values = BTreeMap::new();
+            for (col_index, value) in row.iter().enumerate() {
+                let Some(column) = result.columns.get(col_index) else {
+                    continue;
+                };
+                if let Some(value) = value {
+                    values.insert(
+                        column.name.clone(),
+                        scalar_from_pg_text(value, Some(column)),
+                    );
+                }
+            }
+            let natural_id = values
+                .get("id")
+                .map(scalar_to_text)
+                .unwrap_or_else(|| format!("{relation}:row:{}", start + index));
+            RelationalRow::new(relation, natural_id, values)
+        })
+        .collect()
+}
+
+fn catalog_query(sql: &str, store: &RelationalStore) -> PgResult<Option<PgQueryResult>> {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("from pg_catalog.pg_namespace sch")
+        && lower.contains("join pg_catalog.pg_class tbl")
+    {
+        return Ok(Some(pg_catalog_relations(store)));
+    }
+    if lower.contains("from pg_rewrite")
+        || lower.contains("from pg_depend")
+        || lower.contains("from pg_catalog.pg_depend")
+    {
+        return Ok(Some(PgQueryResult {
+            columns: vec![
+                PgColumn::text("referenced_schema"),
+                PgColumn::text("referenced_name"),
+                PgColumn::text("dependent_schema"),
+                PgColumn::text("dependent_name"),
+            ],
+            rows: Vec::new(),
+            command_tag: "SELECT 0".to_string(),
+            trace: None,
+        }));
+    }
+    if lower.contains("from information_schema.columns") {
+        return Ok(Some(information_schema_columns(sql, store)));
+    }
+    if lower.contains("from information_schema.tables") {
+        return Ok(Some(information_schema_tables(sql, store)));
+    }
+    if lower.contains("from information_schema.schemata") {
+        return Ok(Some(information_schema_schemata(store)));
+    }
+    if lower.contains("from information_schema.role_table_grants") {
+        return Ok(Some(PgQueryResult {
+            columns: vec![PgColumn::text("grantee"), PgColumn::text("privilege_type")],
+            rows: Vec::new(),
+            command_tag: "SELECT 0".to_string(),
+            trace: None,
+        }));
+    }
+    if lower.contains("from pg_tables") || lower.contains("from pg_views") {
+        return Ok(Some(pg_table_views_union(sql, store)));
+    }
+    if lower.contains("from pg_matviews") {
+        return Ok(Some(PgQueryResult {
+            columns: vec![
+                PgColumn::text("database"),
+                PgColumn::text("name"),
+                PgColumn::text("schema"),
+                PgColumn::text("type"),
+            ],
+            rows: Vec::new(),
+            command_tag: "SELECT 0".to_string(),
+            trace: None,
+        }));
+    }
+    if lower.contains("from pg_namespace") {
+        return Ok(Some(pg_namespace_query(sql, store)));
+    }
+    if lower.contains("from pg_index")
+        || lower.contains("from pg_class")
+        || lower.contains("from pg_attribute")
+        || lower.contains("from pg_type")
+    {
+        return Ok(Some(PgQueryResult {
+            columns: vec![PgColumn::text("name")],
+            rows: Vec::new(),
+            command_tag: "SELECT 0".to_string(),
+            trace: None,
+        }));
+    }
+    Ok(None)
+}
+
+fn information_schema_columns(sql: &str, store: &RelationalStore) -> PgQueryResult {
+    let table_filter = literal_after(sql, "table_name");
+    let schema_filter = literal_after(sql, "table_schema");
+    let mut rows = Vec::new();
+    for relation in user_relations(store) {
+        let (schema, table) = relation_parts(&relation.schema.relation);
+        if table_filter
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case(&table))
+        {
+            continue;
+        }
+        if schema_filter
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case(&schema))
+        {
+            continue;
+        }
+        for (index, column) in relation.schema.columns.iter().enumerate() {
+            rows.push(vec![
+                Some(column.name.clone()),
+                Some("text".to_string()),
+                None,
+                None,
+                None,
+                Some((index + 1).to_string()),
+                Some(schema.clone()),
+                Some(table.clone()),
+            ]);
+        }
+    }
+    PgQueryResult {
+        columns: vec![
+            PgColumn::text("column_name"),
+            PgColumn::text("data_type"),
+            PgColumn::int8("character_maximum_length"),
+            PgColumn::int8("numeric_precision"),
+            PgColumn::int8("numeric_scale"),
+            PgColumn::int8("ordinal_position"),
+            PgColumn::text("table_schema"),
+            PgColumn::text("table_name"),
+        ],
+        command_tag: format!("SELECT {}", rows.len()),
+        rows,
+        trace: None,
+    }
+}
+
+fn information_schema_tables(sql: &str, store: &RelationalStore) -> PgQueryResult {
+    let schema_filter = literal_after(sql, "table_schema");
+    let mut rows = Vec::new();
+    for relation in user_relations(store) {
+        let (schema, table) = relation_parts(&relation.schema.relation);
+        if schema_filter
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case(&schema))
+        {
+            continue;
+        }
+        rows.push(vec![
+            Some(DB_NAME.to_string()),
+            Some(schema),
+            Some(table),
+            Some(relation_kind(store, &relation.schema.relation)),
+        ]);
+    }
+    PgQueryResult {
+        columns: vec![
+            PgColumn::text("table_catalog"),
+            PgColumn::text("table_schema"),
+            PgColumn::text("table_name"),
+            PgColumn::text("table_type"),
+        ],
+        command_tag: format!("SELECT {}", rows.len()),
+        rows,
+        trace: None,
+    }
+}
+
+fn information_schema_schemata(store: &RelationalStore) -> PgQueryResult {
+    let rows = schema_names(store)
+        .into_iter()
+        .map(|schema| vec![Some(DB_NAME.to_string()), Some(schema)])
+        .collect::<Vec<_>>();
+    PgQueryResult {
+        columns: vec![
+            PgColumn::text("catalog_name"),
+            PgColumn::text("schema_name"),
+        ],
+        command_tag: format!("SELECT {}", rows.len()),
+        rows,
+        trace: None,
+    }
+}
+
+fn pg_namespace_query(sql: &str, store: &RelationalStore) -> PgQueryResult {
+    let schemas = schema_names(store);
+    if sql.to_ascii_lowercase().contains("count(*)") {
+        let filter = literal_after(sql, "nspname");
+        let count = filter
+            .as_deref()
+            .map(|value| {
+                schemas
+                    .iter()
+                    .filter(|schema| schema.eq_ignore_ascii_case(value))
+                    .count()
+            })
+            .unwrap_or(schemas.len());
+        return PgQueryResult {
+            columns: vec![PgColumn::int8("count")],
+            rows: vec![vec![Some(count.to_string())]],
+            command_tag: "SELECT 1".to_string(),
+            trace: None,
+        };
+    }
+    let rows = schemas
+        .into_iter()
+        .enumerate()
+        .map(|(index, schema)| vec![Some(schema), Some((index + 1).to_string())])
+        .collect::<Vec<_>>();
+    PgQueryResult {
+        columns: vec![PgColumn::text("nspname"), PgColumn::int8("oid")],
+        command_tag: format!("SELECT {}", rows.len()),
+        rows,
+        trace: None,
+    }
+}
+
+fn pg_table_views_union(sql: &str, store: &RelationalStore) -> PgQueryResult {
+    let schema_filter = last_literal_after(sql, "schemaname ilike")
+        .or_else(|| last_literal_after(sql, "schemaname ="))
+        .or_else(|| last_literal_after(sql, "schemaname"));
+    let mut rows = Vec::new();
+    for relation in user_relations(store) {
+        let kind = relation_kind(store, &relation.schema.relation);
+        let (schema, table) = relation_parts(&relation.schema.relation);
+        if schema_filter
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case(&schema))
+        {
+            continue;
+        }
+        if kind == "VIEW" {
+            rows.push(vec![
+                Some(DB_NAME.to_string()),
+                Some(table),
+                Some(schema),
+                Some("view".to_string()),
+            ]);
+        } else {
+            rows.push(vec![
+                Some(DB_NAME.to_string()),
+                Some(table),
+                Some(schema),
+                Some("table".to_string()),
+            ]);
+        }
+    }
+    PgQueryResult {
+        columns: vec![
+            PgColumn::text("database"),
+            PgColumn::text("name"),
+            PgColumn::text("schema"),
+            PgColumn::text("type"),
+        ],
+        command_tag: format!("SELECT {}", rows.len()),
+        rows,
+        trace: None,
+    }
+}
+
+fn pg_catalog_relations(store: &RelationalStore) -> PgQueryResult {
+    let mut rows = Vec::new();
+    for relation in user_relations(store) {
+        let (schema, table) = relation_parts(&relation.schema.relation);
+        let table_type = relation_kind(store, &relation.schema.relation);
+        for (index, column) in relation.schema.columns.iter().enumerate() {
+            rows.push(vec![
+                Some(DB_NAME.to_string()),
+                Some(schema.clone()),
+                Some(table.clone()),
+                Some(table_type.clone()),
+                None,
+                Some(column.name.clone()),
+                Some((index + 1).to_string()),
+                Some("text".to_string()),
+                None,
+                Some("rustyred".to_string()),
+            ]);
+        }
+    }
+    PgQueryResult {
+        columns: vec![
+            PgColumn::text("table_database"),
+            PgColumn::text("table_schema"),
+            PgColumn::text("table_name"),
+            PgColumn::text("table_type"),
+            PgColumn::text("table_comment"),
+            PgColumn::text("column_name"),
+            PgColumn::int8("column_index"),
+            PgColumn::text("column_type"),
+            PgColumn::text("column_comment"),
+            PgColumn::text("table_owner"),
+        ],
+        command_tag: format!("SELECT {}", rows.len()),
+        rows,
+        trace: None,
+    }
+}
+
+fn dbt_test_wrapper(sql: &str, store: &mut RelationalStore) -> PgResult<Option<PgQueryResult>> {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains(" as failures") || !lower.contains("dbt_internal_test") {
+        return Ok(None);
+    }
+    let Some(inner) = extract_first_subquery_after_from(sql) else {
+        return Ok(None);
+    };
+    let failures = evaluate_generic_test(&inner, store)?;
+    record_grounding_fact(store, &inner, failures)?;
+    let should_fail = failures > 0;
+    Ok(Some(PgQueryResult {
+        columns: vec![
+            PgColumn::int8("failures"),
+            PgColumn::bool("should_warn"),
+            PgColumn::bool("should_error"),
+        ],
+        rows: vec![vec![
+            Some(failures.to_string()),
+            Some(should_fail.to_string()),
+            Some(should_fail.to_string()),
+        ]],
+        command_tag: "SELECT 1".to_string(),
+        trace: None,
+    }))
+}
+
+fn evaluate_generic_test(sql: &str, store: &RelationalStore) -> PgResult<i64> {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("left join") && lower.contains("parent") && lower.contains("child") {
+        let child = parse_cte_projection_relation(sql, "child")
+            .ok_or_else(|| PgError::syntax("relationships child CTE not recognized"))?;
+        let parent = parse_cte_projection_relation(sql, "parent")
+            .ok_or_else(|| PgError::syntax("relationships parent CTE not recognized"))?;
+        let parent_values = relation_rows(store, &parent.0)
+            .into_iter()
+            .filter_map(|row| row.values.get(&parent.1).map(scalar_to_text))
+            .collect::<BTreeSet<_>>();
+        return Ok(relation_rows(store, &child.0)
+            .into_iter()
+            .filter_map(|row| row.values.get(&child.1).map(scalar_to_text))
+            .filter(|value| !parent_values.contains(value))
+            .count() as i64);
+    }
+    if lower.contains(" is null") {
+        let (relation, column) = parse_simple_model_column(sql, "where")
+            .ok_or_else(|| PgError::syntax("not_null test shape not recognized"))?;
+        return Ok(relation_rows(store, &relation)
+            .into_iter()
+            .filter(|row| !row.values.contains_key(&column))
+            .count() as i64);
+    }
+    if lower.contains("having count(*) > 1") {
+        let (relation, column) = parse_simple_model_column(sql, "from")
+            .ok_or_else(|| PgError::syntax("unique test shape not recognized"))?;
+        let mut counts = BTreeMap::<String, usize>::new();
+        for row in relation_rows(store, &relation) {
+            if let Some(value) = row.values.get(&column) {
+                *counts.entry(scalar_to_text(value)).or_default() += 1;
+            }
+        }
+        return Ok(counts.values().filter(|count| **count > 1).count() as i64);
+    }
+    if lower.contains("value_field not in") {
+        let (relation, column) = parse_cte_projection_relation(sql, "all_values")
+            .or_else(|| parse_simple_model_column(sql, "from"))
+            .ok_or_else(|| PgError::syntax("accepted_values test shape not recognized"))?;
+        let accepted = values_in_not_in(sql);
+        return Ok(relation_rows(store, &relation)
+            .into_iter()
+            .filter_map(|row| row.values.get(&column))
+            .filter(|value| !accepted.contains(&scalar_to_text(value)))
+            .count() as i64);
+    }
+
+    let result = execute_native_sql(sql, store)?;
+    Ok(result.rows.len() as i64)
+}
+
+#[derive(Clone, Debug)]
+struct GenericTestInfo {
+    assertion: String,
+    relation: String,
+    column: String,
+    reference_relation: Option<String>,
+    reference_column: Option<String>,
+}
+
+fn record_grounding_fact(store: &mut RelationalStore, sql: &str, failures: i64) -> PgResult<()> {
+    let status = if failures == 0 { "pass" } else { "fail" };
+    let info = generic_test_info(sql);
+    let row_id = format!("grounding:{}:{}", status, stable_sql_id(sql));
+    let mut values = BTreeMap::new();
+    values.insert("id".to_string(), ScalarValue::String(row_id.clone()));
+    values.insert(
+        "test_sql_hash".to_string(),
+        ScalarValue::String(stable_sql_id(sql)),
+    );
+    values.insert(
+        "status".to_string(),
+        ScalarValue::String(status.to_string()),
+    );
+    values.insert(
+        "outcome".to_string(),
+        ScalarValue::String(status.to_string()),
+    );
+    values.insert("failures".to_string(), ScalarValue::I64(failures));
+    values.insert("observed_count".to_string(), ScalarValue::I64(failures));
+    values.insert(
+        "authority".to_string(),
+        ScalarValue::String("dbt_generic_test".to_string()),
+    );
+    if let Some(info) = info {
+        values.insert("assertion".to_string(), ScalarValue::String(info.assertion));
+        values.insert(
+            "model_id".to_string(),
+            ScalarValue::String(info.relation.clone()),
+        );
+        values.insert(
+            "relation_name".to_string(),
+            ScalarValue::String(info.relation),
+        );
+        values.insert("column_name".to_string(), ScalarValue::String(info.column));
+        if let Some(reference_relation) = info.reference_relation {
+            values.insert(
+                "reference_relation".to_string(),
+                ScalarValue::String(reference_relation),
+            );
+        }
+        if let Some(reference_column) = info.reference_column {
+            values.insert(
+                "reference_column".to_string(),
+                ScalarValue::String(reference_column),
+            );
+        }
+    } else {
+        values.insert(
+            "assertion".to_string(),
+            ScalarValue::String("custom".to_string()),
+        );
+        values.insert(
+            "model_id".to_string(),
+            ScalarValue::String("unknown".to_string()),
+        );
+    }
+    store
+        .upsert_row(RelationalRow::new(GROUNDING_FACTS, row_id, values))
+        .map_err(|err| PgError::internal(err.message))?;
+    record_relation_meta(store, GROUNDING_FACTS, "BASE TABLE", None)?;
+    Ok(())
+}
+
+fn generic_test_info(sql: &str) -> Option<GenericTestInfo> {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("left join") && lower.contains("parent") && lower.contains("child") {
+        let child = parse_cte_projection_relation(sql, "child")?;
+        let parent = parse_cte_projection_relation(sql, "parent")?;
+        return Some(GenericTestInfo {
+            assertion: "relationships".to_string(),
+            relation: child.0,
+            column: child.1,
+            reference_relation: Some(parent.0),
+            reference_column: Some(parent.1),
+        });
+    }
+    if lower.contains(" is null") {
+        let (relation, column) = parse_simple_model_column(sql, "where")?;
+        return Some(GenericTestInfo {
+            assertion: "not_null".to_string(),
+            relation,
+            column,
+            reference_relation: None,
+            reference_column: None,
+        });
+    }
+    if lower.contains("having count(*) > 1") {
+        let (relation, column) = parse_simple_model_column(sql, "from")?;
+        return Some(GenericTestInfo {
+            assertion: "unique".to_string(),
+            relation,
+            column,
+            reference_relation: None,
+            reference_column: None,
+        });
+    }
+    if lower.contains("value_field not in") {
+        let (relation, column) = parse_cte_projection_relation(sql, "all_values")
+            .or_else(|| parse_simple_model_column(sql, "from"))?;
+        return Some(GenericTestInfo {
+            assertion: "accepted_values".to_string(),
+            relation,
+            column,
+            reference_relation: None,
+            reference_column: None,
+        });
+    }
+    None
+}
+
+fn record_lineage(store: &mut RelationalStore, target: &str, sql: &str) -> PgResult<()> {
+    let sources = source_relations(sql);
+    for source in sources {
+        let row_id = format!("lineage:{}:{}", target, source);
+        let mut values = BTreeMap::new();
+        values.insert("id".to_string(), ScalarValue::String(row_id.clone()));
+        values.insert(
+            "target_relation".to_string(),
+            ScalarValue::String(target.to_string()),
+        );
+        values.insert(
+            "source_relation".to_string(),
+            ScalarValue::String(source.clone()),
+        );
+        values.insert(
+            "lineage_kind".to_string(),
+            ScalarValue::String("dbt_model".to_string()),
+        );
+        store
+            .upsert_row(RelationalRow::new(MODEL_LINEAGE, row_id.clone(), values))
+            .map_err(|err| PgError::internal(err.message.clone()))?;
+
+        let provenance_id = format!("provenance:{}:{}", target, source);
+        let mut provenance = BTreeMap::new();
+        provenance.insert("id".to_string(), ScalarValue::String(provenance_id.clone()));
+        provenance.insert(
+            "target_relation".to_string(),
+            ScalarValue::String(target.to_string()),
+        );
+        provenance.insert("source_relation".to_string(), ScalarValue::String(source));
+        provenance.insert(
+            "provenance_kind".to_string(),
+            ScalarValue::String("substrate_relational_materialization".to_string()),
+        );
+        store
+            .upsert_row(RelationalRow::new(
+                SUBSTRATE_PROVENANCE,
+                provenance_id,
+                provenance,
+            ))
+            .map_err(|err| PgError::internal(err.message))?;
+    }
+    record_relation_meta(store, MODEL_LINEAGE, "BASE TABLE", None)?;
+    record_relation_meta(store, SUBSTRATE_PROVENANCE, "BASE TABLE", None)?;
+    Ok(())
+}
+
+fn record_relation_meta(
+    store: &mut RelationalStore,
+    relation: &str,
+    kind: &str,
+    source_sql: Option<&str>,
+) -> PgResult<()> {
+    if relation == RELATION_META {
+        return Ok(());
+    }
+    let (schema, table) = relation_parts(relation);
+    let mut values = BTreeMap::new();
+    values.insert("id".to_string(), ScalarValue::String(relation.to_string()));
+    values.insert(
+        "relation".to_string(),
+        ScalarValue::String(relation.to_string()),
+    );
+    values.insert("schema".to_string(), ScalarValue::String(schema));
+    values.insert("name".to_string(), ScalarValue::String(table));
+    values.insert("kind".to_string(), ScalarValue::String(kind.to_string()));
+    if let Some(sql) = source_sql {
+        values.insert(
+            "source_sql".to_string(),
+            ScalarValue::String(sql.to_string()),
+        );
+    }
+    store
+        .upsert_row(RelationalRow::new(RELATION_META, relation, values))
+        .map_err(|err| PgError::internal(err.message))?;
+    Ok(())
+}
+
+fn move_relation_meta(store: &mut RelationalStore, from: &str, to: &str) -> PgResult<()> {
+    let kind = relation_kind(store, from);
+    let source_sql = relation_meta_value(store, from, "source_sql");
+    let _ = store.delete_row(RELATION_META, from);
+    record_relation_meta(store, to, &kind, source_sql.as_deref())
+}
+
+fn move_relation_receipts(store: &mut RelationalStore, from: &str, to: &str) -> PgResult<()> {
+    for relation_name in [MODEL_LINEAGE, SUBSTRATE_PROVENANCE] {
+        let rows = store
+            .relation(relation_name)
+            .map(|relation| relation.rows().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for row in rows {
+            let target = row.values.get("target_relation").map(scalar_to_text);
+            if target.as_deref() != Some(from) {
+                continue;
+            }
+            let mut values = row.values.clone();
+            values.insert(
+                "target_relation".to_string(),
+                ScalarValue::String(to.to_string()),
+            );
+            let source = values
+                .get("source_relation")
+                .map(scalar_to_text)
+                .unwrap_or_default();
+            let prefix = if relation_name == MODEL_LINEAGE {
+                "lineage"
+            } else {
+                "provenance"
+            };
+            let row_id = format!("{prefix}:{to}:{source}");
+            values.insert("id".to_string(), ScalarValue::String(row_id.clone()));
+            store
+                .upsert_row(RelationalRow::new(relation_name, row_id, values))
+                .map_err(|err| PgError::internal(err.message))?;
+        }
+    }
+    Ok(())
+}
+
+fn relation_kind(store: &RelationalStore, relation: &str) -> String {
+    relation_meta_value(store, relation, "kind").unwrap_or_else(|| "BASE TABLE".to_string())
+}
+
+fn relation_meta_value(store: &RelationalStore, relation: &str, column: &str) -> Option<String> {
+    store
+        .relation(RELATION_META)?
+        .get(relation)?
+        .values
+        .get(column)
+        .map(scalar_to_text)
+}
+
+fn user_relations<'a>(store: &'a RelationalStore) -> impl Iterator<Item = &'a Relation> {
+    store
+        .relations()
+        .filter(|relation| !matches!(relation.schema.relation.as_str(), RELATION_META))
+}
+
+fn schema_names(store: &RelationalStore) -> Vec<String> {
+    let mut schemas = user_relations(store)
+        .map(|relation| relation_parts(&relation.schema.relation).0)
+        .collect::<BTreeSet<_>>();
+    schemas.insert(DEFAULT_SCHEMA.to_string());
+    schemas.into_iter().collect()
+}
+
+fn relation_rows<'a>(store: &'a RelationalStore, relation: &str) -> Vec<&'a RelationalRow> {
+    let canonical = canonical_relation_name(relation);
+    let fallback = relation_schema_table(&canonical).and_then(|(schema, table)| {
+        if schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+            Some(table)
+        } else {
+            None
+        }
+    });
+    store
+        .relation(&canonical)
+        .or_else(|| {
+            fallback
+                .as_deref()
+                .and_then(|relation| store.relation(relation))
+        })
+        .map(|relation| relation.rows().collect())
+        .unwrap_or_default()
+}
+
+fn relation_parts(relation: &str) -> (String, String) {
+    relation_schema_table(relation)
+        .unwrap_or_else(|| (DEFAULT_SCHEMA.to_string(), unquote_ident(relation)))
+}
+
+fn relation_schema_table(relation: &str) -> Option<(String, String)> {
+    let parts = split_relation_parts(relation);
+    match parts.as_slice() {
+        [schema, table] => Some((schema.clone(), table.clone())),
+        [_, schema, table] => Some((schema.clone(), table.clone())),
+        _ => None,
+    }
+}
+
+fn canonical_relation_name(raw: &str) -> String {
+    let parts = split_relation_parts(raw);
+    match parts.as_slice() {
+        [single] => single.clone(),
+        [schema, table] => format!("{schema}.{table}"),
+        [_, schema, table] => format!("{schema}.{table}"),
+        _ => parts.join("."),
+    }
+}
+
+fn split_relation_parts(raw: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in raw.trim().chars() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            '.' if !in_quote => {
+                if !current.trim().is_empty() {
+                    parts.push(unquote_ident(current.trim()));
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(unquote_ident(current.trim()));
+    }
+    parts
+}
+
+fn unquote_ident(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches(';').trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+fn read_relation_token(rest: &str) -> Option<String> {
+    let mut token = String::new();
+    let mut in_quote = false;
+    for ch in rest.trim_start().chars() {
+        if ch == '"' {
+            in_quote = !in_quote;
+            token.push(ch);
+            continue;
+        }
+        if !in_quote && (ch.is_whitespace() || ch == '(' || ch == ';') {
+            break;
+        }
+        token.push(ch);
+    }
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn extract_as_select(rest: &str) -> Option<String> {
+    let after = strip_keyword_ci(rest, "as").or_else(|| {
+        let lower = rest.to_ascii_lowercase();
+        let pos = lower.find(" as ")?;
+        Some(rest[pos + 4..].trim())
+    })?;
+    Some(unwrap_outer_parens(after).trim().to_string())
+}
+
+fn unwrap_outer_parens(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches(';').trim();
+    if trimmed.starts_with('(') {
+        if let Some((inside, remainder)) = take_balanced(trimmed) {
+            if remainder.trim().is_empty() {
+                return inside;
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn take_balanced(value: &str) -> Option<(String, &str)> {
+    let trimmed = value.trim_start();
+    if !trimmed.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut start = 0usize;
+    for (idx, ch) in trimmed.char_indices() {
+        if idx == 0 {
+            depth = 1;
+            start = 1;
+            continue;
+        }
+        if in_string {
+            if ch == '\'' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((trimmed[start..idx].to_string(), &trimmed[idx + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut in_quote = false;
+    let mut depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\'' if !in_quote => {
+                in_string = !in_string;
+                current.push(ch);
+            }
+            '"' if !in_string => {
+                in_quote = !in_quote;
+                current.push(ch);
+            }
+            '(' if !in_string && !in_quote => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_string && !in_quote => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if !in_string && !in_quote && depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn strip_keyword_ci<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = value.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let keyword = keyword.to_ascii_lowercase();
+    let rest = lower.strip_prefix(&keyword)?;
+    if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) {
+        Some(&trimmed[keyword.len()..])
+    } else {
+        None
+    }
+}
+
+fn literal_after(sql: &str, name: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let pos = lower.find(&name)?;
+    let after = &sql[pos + name.len()..];
+    let quote_pos = after.find('\'')?;
+    let rest = &after[quote_pos + 1..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn last_literal_after(sql: &str, name: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let pos = lower.rfind(&name)?;
+    let after = &sql[pos + name.len()..];
+    let quote_pos = after.find('\'')?;
+    let rest = &after[quote_pos + 1..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_first_subquery_after_from(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let from_pos = lower.find("from")?;
+    let after = sql[from_pos + 4..].trim();
+    take_balanced(after).map(|(inside, _)| inside)
+}
+
+fn parse_simple_model_column(sql: &str, relation_marker: &str) -> Option<(String, String)> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let Statement::Query(query) = statements.first()? else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let item = select.projection.first()?;
+    let column = match item {
+        SelectItem::UnnamedExpr(expr) => column_ref(expr, "")?.1,
+        SelectItem::ExprWithAlias { expr, .. } => column_ref(expr, "")?.1,
+        _ => return None,
+    };
+    let relation = select.from.first().and_then(|from| match &from.relation {
+        TableFactor::Table { name, .. } => Some(canonical_object_name(name)),
+        _ => None,
+    })?;
+    if relation_marker == "where" && select.selection.is_none() {
+        return None;
+    }
+    Some((relation, column))
+}
+
+fn values_in_not_in(sql: &str) -> BTreeSet<String> {
+    let lower = sql.to_ascii_lowercase();
+    let Some(pos) = lower.find("not in") else {
+        return BTreeSet::new();
+    };
+    let after = sql[pos + "not in".len()..].trim();
+    take_balanced(after)
+        .map(|(inside, _)| {
+            split_csv(&inside)
+                .into_iter()
+                .map(|value| value.trim().trim_matches('\'').to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_cte_projection_relation(sql: &str, cte: &str) -> Option<(String, String)> {
+    let lower = sql.to_ascii_lowercase();
+    let cte_pos = lower.find(&format!("{cte} as"))?;
+    let after_name = sql[cte_pos + cte.len()..].trim();
+    let after = strip_keyword_ci(after_name, "as")?.trim();
+    let (inner, _) = take_balanced(after)?;
+    parse_simple_model_column(&inner, "from")
+}
+
+fn source_relations(sql: &str) -> BTreeSet<String> {
+    let mut sources = BTreeSet::new();
+    let tokens = tokenize_sql(sql);
+    for window in tokens.windows(2) {
+        if matches!(window[0].as_str(), "from" | "join") {
+            sources.insert(canonical_relation_name(&window[1]));
+        }
+    }
+    sources
+}
+
+fn tokenize_sql(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in sql.chars() {
+        match ch {
+            '"' => {
+                in_quote = !in_quote;
+                current.push(ch);
+            }
+            ch if !in_quote && (ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | ';')) => {
+                if !current.trim().is_empty() {
+                    tokens.push(current.trim().to_ascii_lowercase());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        tokens.push(current.trim().to_ascii_lowercase());
+    }
+    tokens
+}
+
+fn stable_sql_id(sql: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn scalar_from_pg_text(value: &str, column: Option<&PgColumn>) -> ScalarValue {
+    match column.map(|column| column.type_oid) {
+        Some(oid) if oid == Type::INT8.oid() || oid == Type::INT4.oid() => value
+            .parse::<i64>()
+            .map(ScalarValue::I64)
+            .unwrap_or_else(|_| ScalarValue::String(value.to_string())),
+        Some(oid) if oid == Type::FLOAT8.oid() || oid == Type::FLOAT4.oid() => value
+            .parse::<f64>()
+            .map(ScalarValue::F64)
+            .unwrap_or_else(|_| ScalarValue::String(value.to_string())),
+        Some(oid) if oid == Type::BOOL.oid() => {
+            ScalarValue::Bool(matches!(value, "t" | "true" | "TRUE" | "1"))
+        }
+        _ => ScalarValue::String(value.to_string()),
+    }
+}
+
+fn column_for_scalar(name: &str, value: &ScalarValue) -> PgColumn {
+    match value {
+        ScalarValue::I64(_) => PgColumn::int8(name),
+        ScalarValue::F64(_) => PgColumn::float8(name),
+        ScalarValue::Bool(_) => PgColumn::bool(name),
+        ScalarValue::String(_) => PgColumn::text(name),
+    }
+}
 
 /// Parse `sql`, lower it to the planner IR, execute through the access-method
 /// seam, and shape the result into typed Postgres rows. `EXPLAIN <select>`
@@ -294,15 +1778,29 @@ pub fn execute_native_sql(sql: &str, store: &RelationalStore) -> PgResult<PgQuer
         }
     };
 
-    let plan = lower_query(query)?;
-    let result = execute_query(store, plan.ir.clone())
-        .map_err(|error| PgError::internal(error.message))?;
+    let mut plan = lower_query(query)?;
+    resolve_plan_relations(&mut plan, store);
+    let result =
+        execute_query(store, plan.ir.clone()).map_err(|error| PgError::internal(error.message))?;
 
     if explain {
         return Ok(explain_result(&result));
     }
 
     shape_result(plan, result)
+}
+
+fn resolve_plan_relations(plan: &mut LoweredQuery, store: &RelationalStore) {
+    for relation in &mut plan.ir.relations {
+        if store.relation(&relation.relation).is_some() {
+            continue;
+        }
+        if let Some((schema, bare)) = relation_schema_table(&relation.relation) {
+            if schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) && store.relation(&bare).is_some() {
+                relation.relation = bare;
+            }
+        }
+    }
 }
 
 /// A lowered query: the planner IR plus the wire-frontend post-processing
@@ -392,7 +1890,9 @@ fn lower_query(query: &Query) -> PgResult<LoweredQuery> {
             _ => return Err(PgError::unsupported("only INNER JOIN is supported")),
         };
         let JoinConstraint::On(on) = constraint else {
-            return Err(PgError::unsupported("JOIN requires an ON <a.x = b.y> clause"));
+            return Err(PgError::unsupported(
+                "JOIN requires an ON <a.x = b.y> clause",
+            ));
         };
         let (left, right) = equi_join_columns(on, &root_alias, &alias)?;
         relations.push(QueryRelation {
@@ -417,7 +1917,9 @@ fn lower_query(query: &Query) -> PgResult<LoweredQuery> {
                 .iter_mut()
                 .find(|relation| relation.alias == alias)
                 .ok_or_else(|| {
-                    PgError::syntax(format!("predicate references unknown relation alias '{alias}'"))
+                    PgError::syntax(format!(
+                        "predicate references unknown relation alias '{alias}'"
+                    ))
                 })?;
             target.predicates.push(predicate);
         }
@@ -436,7 +1938,9 @@ fn lower_query(query: &Query) -> PgResult<LoweredQuery> {
                 projection.push(output_column(expr, Some(ident_name(alias)), &root_alias)?)
             }
             SelectItem::ExprWithAliases { .. } => {
-                return Err(PgError::unsupported("multi-alias projection is not supported"))
+                return Err(PgError::unsupported(
+                    "multi-alias projection is not supported",
+                ))
             }
         }
     }
@@ -450,9 +1954,7 @@ fn lower_query(query: &Query) -> PgResult<LoweredQuery> {
                     .ok_or_else(|| PgError::syntax("GROUP BY must reference a column"))
             })
             .collect::<PgResult<Vec<_>>>()?,
-        GroupByExpr::All(_) => {
-            return Err(PgError::unsupported("GROUP BY ALL is not supported"))
-        }
+        GroupByExpr::All(_) => return Err(PgError::unsupported("GROUP BY ALL is not supported")),
     };
 
     let order_by = lower_order_by(query, &root_alias)?;
@@ -522,7 +2024,11 @@ fn output_column(expr: &Expr, alias: Option<String>, root: &str) -> PgResult<Out
         let display = alias.unwrap_or_else(|| aggregate_name(kind).to_string());
         return Ok(OutputColumn {
             display,
-            source: ColumnSource::Aggregate { kind, arg, distinct },
+            source: ColumnSource::Aggregate {
+                kind,
+                arg,
+                distinct,
+            },
         });
     }
     let (col_alias, column) = column_ref(expr, root)
@@ -567,9 +2073,10 @@ fn aggregate_call(
     {
         return Ok(Some((kind, None, distinct)));
     }
-    let column_expr = args.iter().find_map(unnamed_expr).ok_or_else(|| {
-        PgError::syntax(format!("aggregate {name} expects a column argument"))
-    })?;
+    let column_expr = args
+        .iter()
+        .find_map(unnamed_expr)
+        .ok_or_else(|| PgError::syntax(format!("aggregate {name} expects a column argument")))?;
     let (alias, column) = column_ref(column_expr, root)
         .ok_or_else(|| PgError::syntax(format!("aggregate {name} argument must be a column")))?;
     Ok(Some((kind, Some(format!("{alias}.{column}")), distinct)))
@@ -579,18 +2086,21 @@ fn aggregate_call(
 // WHERE -> predicates (scalar + modality functions).
 // ----------------------------------------------------------------------------
 
-fn decompose_where(
-    expr: &Expr,
-    root: &str,
-    out: &mut Vec<(String, Predicate)>,
-) -> PgResult<()> {
+fn decompose_where(expr: &Expr, root: &str, out: &mut Vec<(String, Predicate)>) -> PgResult<()> {
     match expr {
         Expr::Nested(inner) => decompose_where(inner, root, out),
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             decompose_where(left, root, out)?;
             decompose_where(right, root, out)
         }
-        Expr::BinaryOp { op: BinaryOperator::Or, .. } => Err(PgError::unsupported(
+        Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            ..
+        } => Err(PgError::unsupported(
             "OR is not supported; the planner conjuncts predicates",
         )),
         Expr::BinaryOp { left, op, right } => {
@@ -598,7 +2108,12 @@ fn decompose_where(
             out.push((alias, predicate));
             Ok(())
         }
-        Expr::Between { expr, negated: false, low, high } => {
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        } => {
             let (alias, column) = column_ref(expr, root)
                 .ok_or_else(|| PgError::syntax("BETWEEN must apply to a column"))?;
             let lo = scalar_literal(low)?;
@@ -613,7 +2128,12 @@ fn decompose_where(
             ));
             Ok(())
         }
-        Expr::Like { expr, pattern, negated: false, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            negated: false,
+            ..
+        } => {
             let (alias, column) = column_ref(expr, root)
                 .ok_or_else(|| PgError::syntax("LIKE must apply to a column"))?;
             let prefix = like_prefix(pattern)?;
@@ -643,9 +2163,15 @@ fn comparison_predicate(
     } else if let Some((alias, column)) = column_ref(right, root) {
         (alias, column, scalar_literal(left)?, true)
     } else {
-        return Err(PgError::syntax("comparison must involve a column and a literal"));
+        return Err(PgError::syntax(
+            "comparison must involve a column and a literal",
+        ));
     };
-    let op = if flipped { flip_operator(op) } else { op.clone() };
+    let op = if flipped {
+        flip_operator(op)
+    } else {
+        op.clone()
+    };
     let predicate = match op {
         BinaryOperator::Eq => Predicate::Equals { column, value },
         BinaryOperator::Gt => Predicate::Range {
@@ -669,7 +2195,9 @@ fn comparison_predicate(
             hi: ScalarBound::Included(value),
         },
         BinaryOperator::NotEq => {
-            return Err(PgError::unsupported("<> is not supported by the ordered index"))
+            return Err(PgError::unsupported(
+                "<> is not supported by the ordered index",
+            ))
         }
         other => {
             return Err(PgError::unsupported(format!(
@@ -712,9 +2240,7 @@ fn modality_predicate(expr: &Expr, root: &str) -> PgResult<(String, Predicate)> 
             let (alias, column) = args
                 .first()
                 .and_then(|expr| column_ref(expr, root))
-                .ok_or_else(|| {
-                    PgError::syntax("time_range() first argument must be a column")
-                })?;
+                .ok_or_else(|| PgError::syntax("time_range() first argument must be a column"))?;
             Ok((
                 alias,
                 Predicate::TimeRange {
@@ -776,25 +2302,27 @@ fn shape_result(
     // shaped rows are POSITIONAL: each inner vec aligns 1:1 with `output`, so two
     // output columns that share a display name (e.g. a join's two `id` columns)
     // never collide.
-    let mut shaped: Vec<Vec<Option<ScalarValue>>> =
-        if has_aggregate || !plan.group_by.is_empty() {
-            let mut grouped = aggregate_rows(&raw_rows, &output, &plan.group_by)?;
-            if !plan.order_by.is_empty() {
-                sort_positional(&mut grouped, &positional_order_terms(&plan.order_by, &output));
-            }
-            grouped
-        } else {
-            let mut rows = raw_rows;
-            if !plan.order_by.is_empty() {
-                let order: Vec<(String, bool)> = plan
-                    .order_by
-                    .iter()
-                    .map(|term| (term.key.clone(), term.descending))
-                    .collect();
-                sort_raw(&mut rows, &order);
-            }
-            rows.iter().map(|row| project_row(row, &output)).collect()
-        };
+    let mut shaped: Vec<Vec<Option<ScalarValue>>> = if has_aggregate || !plan.group_by.is_empty() {
+        let mut grouped = aggregate_rows(&raw_rows, &output, &plan.group_by)?;
+        if !plan.order_by.is_empty() {
+            sort_positional(
+                &mut grouped,
+                &positional_order_terms(&plan.order_by, &output),
+            );
+        }
+        grouped
+    } else {
+        let mut rows = raw_rows;
+        if !plan.order_by.is_empty() {
+            let order: Vec<(String, bool)> = plan
+                .order_by
+                .iter()
+                .map(|term| (term.key.clone(), term.descending))
+                .collect();
+            sort_raw(&mut rows, &order);
+        }
+        rows.iter().map(|row| project_row(row, &output)).collect()
+    };
 
     // OFFSET / LIMIT.
     if plan.offset > 0 {
@@ -808,7 +2336,11 @@ fn shape_result(
     let columns = infer_columns(&output, &shaped);
     let rows: Vec<Vec<Option<String>>> = shaped
         .iter()
-        .map(|row| row.iter().map(|value| value.as_ref().map(scalar_to_text)).collect())
+        .map(|row| {
+            row.iter()
+                .map(|value| value.as_ref().map(scalar_to_text))
+                .collect()
+        })
         .collect();
 
     Ok(PgQueryResult {
@@ -821,10 +2353,7 @@ fn shape_result(
 
 /// `SELECT *`: derive the column set from the union of keys in the result rows.
 fn star_columns(rows: &[BTreeMap<String, ScalarValue>]) -> Vec<OutputColumn> {
-    let mut keys: Vec<String> = rows
-        .iter()
-        .flat_map(|row| row.keys().cloned())
-        .collect();
+    let mut keys: Vec<String> = rows.iter().flat_map(|row| row.keys().cloned()).collect();
     keys.sort();
     keys.dedup();
     keys.into_iter()
@@ -880,9 +2409,11 @@ fn aggregate_rows(
         let row: Vec<Option<ScalarValue>> = output
             .iter()
             .map(|column| match &column.source {
-                ColumnSource::Aggregate { kind, arg, distinct } => {
-                    Some(aggregate_value(*kind, arg.as_deref(), *distinct, &members))
-                }
+                ColumnSource::Aggregate {
+                    kind,
+                    arg,
+                    distinct,
+                } => Some(aggregate_value(*kind, arg.as_deref(), *distinct, &members)),
                 ColumnSource::Key(key) => members.first().and_then(|row| row.get(key).cloned()),
             })
             .collect();
@@ -974,7 +2505,11 @@ fn sort_raw(rows: &mut [BTreeMap<String, ScalarValue>], order: &[(String, bool)]
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
             };
-            let ordering = if *descending { ordering.reverse() } else { ordering };
+            let ordering = if *descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
             }
@@ -995,7 +2530,11 @@ fn sort_positional(rows: &mut [Vec<Option<ScalarValue>>], order: &[(usize, bool)
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
             };
-            let ordering = if *descending { ordering.reverse() } else { ordering };
+            let ordering = if *descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
             }
@@ -1008,7 +2547,9 @@ fn sort_positional(rows: &mut [Vec<Option<ScalarValue>>], order: &[(usize, bool)
 fn positional_order_terms(order_by: &[OrderTerm], output: &[OutputColumn]) -> Vec<(usize, bool)> {
     order_by
         .iter()
-        .filter_map(|term| output_index_for_key(&term.key, output).map(|idx| (idx, term.descending)))
+        .filter_map(|term| {
+            output_index_for_key(&term.key, output).map(|idx| (idx, term.descending))
+        })
         .collect()
 }
 
@@ -1022,7 +2563,9 @@ fn output_index_for_key(key: &str, output: &[OutputColumn]) -> Option<usize> {
 
 fn compare_scalar(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     match (a.as_f64(), b.as_f64()) {
-        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(left), Some(right)) => left
+            .partial_cmp(&right)
+            .unwrap_or(std::cmp::Ordering::Equal),
         _ => scalar_to_text(a).cmp(&scalar_to_text(b)),
     }
 }
@@ -1034,7 +2577,11 @@ fn infer_columns(output: &[OutputColumn], rows: &[Vec<Option<ScalarValue>>]) -> 
         .enumerate()
         .map(|(index, column)| {
             // count(*) is always int8 even over zero rows.
-            if let ColumnSource::Aggregate { kind: AggregateKind::Count, .. } = column.source {
+            if let ColumnSource::Aggregate {
+                kind: AggregateKind::Count,
+                ..
+            } = column.source
+            {
                 return PgColumn::int8(&column.display);
             }
             let mut seen_int = false;
@@ -1084,7 +2631,10 @@ fn explain_result(result: &rustyred_thg_core::QueryResult) -> PgQueryResult {
         trace.full_relation_scans,
         trace.bitmap_intersections,
         trace.used_roaring_bitmaps,
-        trace.join_algorithm.clone().unwrap_or_else(|| "none".to_string()),
+        trace
+            .join_algorithm
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
         trace.joined_rows,
     ));
     let rows = lines
@@ -1106,9 +2656,11 @@ fn explain_result(result: &rustyred_thg_core::QueryResult) -> PgQueryResult {
 
 fn table_factor(factor: &TableFactor) -> PgResult<(String, String)> {
     let TableFactor::Table { name, alias, .. } = factor else {
-        return Err(PgError::unsupported("only plain table relations are supported"));
+        return Err(PgError::unsupported(
+            "only plain table relations are supported",
+        ));
     };
-    let relation = object_name_lower(name);
+    let relation = canonical_object_name(name);
     if relation.is_empty() {
         return Err(PgError::undefined_table("empty relation name"));
     }
@@ -1124,7 +2676,12 @@ fn equi_join_columns(
     left_alias: &str,
     right_alias: &str,
 ) -> PgResult<((String, String), (String, String))> {
-    let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = on else {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = on
+    else {
         return Err(PgError::unsupported("JOIN ON must be a single equality"));
     };
     let lhs = column_ref(left, left_alias)
@@ -1158,7 +2715,10 @@ fn literal(expr: &Expr) -> Option<ScalarValue> {
     match expr {
         Expr::Value(value) => value_to_scalar(&value.value),
         Expr::Nested(inner) => literal(inner),
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match literal(expr)? {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match literal(expr)? {
             ScalarValue::I64(value) => Some(ScalarValue::I64(-value)),
             ScalarValue::F64(value) => Some(ScalarValue::F64(-value)),
             _ => None,
@@ -1247,6 +2807,10 @@ fn object_name_lower(name: &ObjectName) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn canonical_object_name(name: &ObjectName) -> String {
+    canonical_relation_name(&object_name_lower(name))
 }
 
 fn aggregate_name(kind: AggregateKind) -> &'static str {
@@ -1480,13 +3044,33 @@ enum FrontendMessage {
         param_values: Vec<Option<Vec<u8>>>,
         result_formats: Vec<i16>,
     },
-    Describe { target: u8, name: String },
-    Execute { portal: String },
+    Describe {
+        target: u8,
+        name: String,
+    },
+    Execute {
+        portal: String,
+    },
     Sync,
     Flush,
     Close,
     Terminate,
     Password(String),
+}
+
+fn frontend_message_name(message: &FrontendMessage) -> &'static str {
+    match message {
+        FrontendMessage::Query(_) => "Query",
+        FrontendMessage::Parse { .. } => "Parse",
+        FrontendMessage::Bind { .. } => "Bind",
+        FrontendMessage::Describe { .. } => "Describe",
+        FrontendMessage::Execute { .. } => "Execute",
+        FrontendMessage::Sync => "Sync",
+        FrontendMessage::Flush => "Flush",
+        FrontendMessage::Close => "Close",
+        FrontendMessage::Terminate => "Terminate",
+        FrontendMessage::Password(_) => "Password",
+    }
 }
 
 /// Returns Ok(false) if the client closed before completing startup.
@@ -1626,7 +3210,10 @@ fn parse_frontend_message(tag: u8, body: &[u8]) -> std::io::Result<FrontendMessa
 fn startup_response() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend(authentication_ok());
-    out.extend(parameter_status("server_version", "16.0 (rustyred-pg-wire)"));
+    out.extend(parameter_status(
+        "server_version",
+        "16.0 (rustyred-pg-wire)",
+    ));
     out.extend(parameter_status("server_encoding", "UTF8"));
     out.extend(parameter_status("client_encoding", "UTF8"));
     out.extend(parameter_status("DateStyle", "ISO, MDY"));
@@ -1639,9 +3226,11 @@ fn startup_response() -> Vec<u8> {
 
 fn encode_query_result(result: &PgQueryResult) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend(row_description(&result.columns));
-    for row in &result.rows {
-        out.extend(data_row(row));
+    if !result.columns.is_empty() {
+        out.extend(row_description(&result.columns));
+        for row in &result.rows {
+            out.extend(data_row(row));
+        }
     }
     out.extend(command_complete(&result.command_tag));
     out
@@ -1699,16 +3288,25 @@ fn parameter_description(oids: &[u32]) -> Vec<u8> {
 }
 
 fn row_description(columns: &[PgColumn]) -> Vec<u8> {
+    row_description_typed(columns, &[])
+}
+
+fn row_description_typed(columns: &[PgColumn], formats: &[i16]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend((columns.len() as i16).to_be_bytes());
-    for column in columns {
+    for (index, column) in columns.iter().enumerate() {
         write_cstr(&mut body, &column.name);
         body.extend(0_u32.to_be_bytes()); // table oid
         body.extend(0_i16.to_be_bytes()); // attribute number
         body.extend(column.type_oid.to_be_bytes());
         body.extend(column.type_size.to_be_bytes());
         body.extend((-1_i32).to_be_bytes()); // type modifier
-        body.extend(0_i16.to_be_bytes()); // text format
+        let format = if result_format_is_binary(formats, index) {
+            1_i16
+        } else {
+            0_i16
+        };
+        body.extend(format.to_be_bytes());
     }
     message(b'T', &body)
 }
@@ -1881,12 +3479,21 @@ pub fn demo_native_store() -> RelationalStore {
         values.insert("created_ms".to_string(), ScalarValue::I64(ts));
         let _ = store.upsert_row(RelationalRow::new("memory", id, values));
     }
-    let epistemic_rows = [("ep:1", "mem:1", "supports"), ("ep:2", "mem:3", "undercuts")];
+    let epistemic_rows = [
+        ("ep:1", "mem:1", "supports"),
+        ("ep:2", "mem:3", "undercuts"),
+    ];
     for (id, content_id, stance) in epistemic_rows {
         let mut values = BTreeMap::new();
         values.insert("id".to_string(), ScalarValue::String(id.to_string()));
-        values.insert("content_id".to_string(), ScalarValue::String(content_id.to_string()));
-        values.insert("stance".to_string(), ScalarValue::String(stance.to_string()));
+        values.insert(
+            "content_id".to_string(),
+            ScalarValue::String(content_id.to_string()),
+        );
+        values.insert(
+            "stance".to_string(),
+            ScalarValue::String(stance.to_string()),
+        );
         let _ = store.upsert_row(RelationalRow::new("epistemic", id, values));
     }
     store
@@ -1902,9 +3509,11 @@ mod tests {
 
     #[test]
     fn lowers_scalar_select_and_infers_text_oid() {
-        let result =
-            execute_native_sql("SELECT id, topic FROM memory WHERE topic = 'planning'", &store())
-                .unwrap();
+        let result = execute_native_sql(
+            "SELECT id, topic FROM memory WHERE topic = 'planning'",
+            &store(),
+        )
+        .unwrap();
         assert_eq!(result.columns.len(), 2);
         assert_eq!(result.columns[0].type_oid, Type::TEXT.oid());
         assert_eq!(result.rows.len(), 2);
@@ -1954,16 +3563,22 @@ mod tests {
         .unwrap();
         // two topics: planning (2) and review (1)
         assert_eq!(result.rows.len(), 2);
-        let counts: Vec<String> = result.rows.iter().filter_map(|row| row[1].clone()).collect();
+        let counts: Vec<String> = result
+            .rows
+            .iter()
+            .filter_map(|row| row[1].clone())
+            .collect();
         assert!(counts.contains(&"2".to_string()));
         assert!(counts.contains(&"1".to_string()));
     }
 
     #[test]
     fn order_by_and_limit_apply() {
-        let result =
-            execute_native_sql("SELECT id FROM memory ORDER BY created_ms DESC LIMIT 1", &store())
-                .unwrap();
+        let result = execute_native_sql(
+            "SELECT id FROM memory ORDER BY created_ms DESC LIMIT 1",
+            &store(),
+        )
+        .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Some("mem:3".to_string()));
     }
@@ -1987,6 +3602,77 @@ mod tests {
     }
 
     #[test]
+    fn dbt_incremental_create_and_append_path() {
+        let mut store = store();
+        execute_dbt_sql(
+            r#"create table "postgres"."public"."dbt_incremental" as (
+                select id, topic, created_ms from memory where created_ms >= 2000
+            )"#,
+            &mut store,
+        )
+        .unwrap();
+        let initial = execute_dbt_sql(
+            r#"select count(*) as n from "postgres"."public"."dbt_incremental""#,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(initial.rows[0][0], Some("2".to_string()));
+
+        execute_dbt_sql(
+            r#"create temporary table "dbt_incremental__dbt_tmp" as (
+                select id, topic, created_ms from memory where created_ms >= 3000
+            )"#,
+            &mut store,
+        )
+        .unwrap();
+        execute_dbt_sql(
+            r#"insert into "postgres"."public"."dbt_incremental" ("id", "topic", "created_ms") (
+                select id, topic, created_ms from "dbt_incremental__dbt_tmp"
+            )"#,
+            &mut store,
+        )
+        .unwrap();
+        let final_count = execute_dbt_sql(
+            r#"select count(*) as n from "postgres"."public"."dbt_incremental""#,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(final_count.rows[0][0], Some("3".to_string()));
+    }
+
+    #[test]
+    fn dbt_multistatement_batch_preserves_incremental_target() {
+        let mut store = store();
+        let batch = r#"
+            create table "postgres"."public"."dbt_table_model__dbt_tmp" as (
+                select id, topic from "postgres"."public"."memory"
+            );
+            alter table "postgres"."public"."dbt_table_model__dbt_tmp" rename to "dbt_table_model";
+            create view "postgres"."public"."dbt_topic_counts__dbt_tmp" as (
+                select topic, count(*) as n_records from memory group by topic
+            );
+            alter view "postgres"."public"."dbt_topic_counts__dbt_tmp" rename to "dbt_topic_counts";
+            create table "postgres"."public"."dbt_incremental" as (
+                select id, topic, created_ms from memory where created_ms >= 2000
+            );
+            create temporary table "dbt_incremental__dbt_tmp" as (
+                select id, topic, created_ms from memory where created_ms >= 3000
+            );
+            insert into "postgres"."public"."dbt_incremental" ("id", "topic", "created_ms") (
+                select id, topic, created_ms from "dbt_incremental__dbt_tmp"
+            );
+            "#;
+        assert_eq!(split_statements(&clean_sql(batch)).len(), 7);
+        execute_dbt_sql(batch, &mut store).unwrap();
+        let final_count = execute_dbt_sql(
+            r#"select count(*) as n from "postgres"."public"."dbt_incremental""#,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(final_count.rows[0][0], Some("3".to_string()));
+    }
+
+    #[test]
     fn select_star_join_keeps_both_id_columns() {
         // m.id and e.id both render as display "id"; positional shaping must keep
         // them distinct rather than collapsing on the shared name.
@@ -1998,8 +3684,14 @@ mod tests {
         let id_columns = result.columns.iter().filter(|c| c.name == "id").count();
         assert_eq!(id_columns, 2, "the join exposes two id columns");
         let values: Vec<String> = result.rows[0].iter().filter_map(|v| v.clone()).collect();
-        assert!(values.iter().any(|v| v.starts_with("mem:")), "memory id kept: {values:?}");
-        assert!(values.iter().any(|v| v.starts_with("ep:")), "epistemic id kept: {values:?}");
+        assert!(
+            values.iter().any(|v| v.starts_with("mem:")),
+            "memory id kept: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.starts_with("ep:")),
+            "epistemic id kept: {values:?}"
+        );
     }
 
     #[test]
@@ -2010,7 +3702,10 @@ mod tests {
             "SELECT id FROM memory WHERE geo_within(topic, 0, 0, 1, 1)",
         ] {
             let error = execute_native_sql(sql, &store()).unwrap_err();
-            assert_eq!(error.sqlstate, "0A000", "must refuse unindexed modality: {sql}");
+            assert_eq!(
+                error.sqlstate, "0A000",
+                "must refuse unindexed modality: {sql}"
+            );
         }
     }
 
@@ -2026,7 +3721,10 @@ mod tests {
 
     #[test]
     fn renders_params_by_format_and_type() {
-        assert_eq!(render_param(Some(&1000_i64.to_be_bytes()), 1, Type::INT8.oid()), "1000");
+        assert_eq!(
+            render_param(Some(&1000_i64.to_be_bytes()), 1, Type::INT8.oid()),
+            "1000"
+        );
         assert_eq!(render_param(Some(b"a'b"), 0, Type::TEXT.oid()), "'a''b'");
         assert_eq!(render_param(Some(b"1000"), 0, Type::INT8.oid()), "1000");
         assert_eq!(render_param(None, 1, Type::INT8.oid()), "NULL");

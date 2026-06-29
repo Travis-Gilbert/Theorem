@@ -676,12 +676,22 @@ impl AccessMethod for OrderedAccessMethod {
     fn on_write(&self, change: &RowChange) -> AmResult<()> {
         let mut state = self.state.lock().map_err(poisoned)?;
         if change.kind == RowChangeKind::Delete {
-            for index in state.numeric.values_mut() {
-                index.zrem(change.row_id.as_bytes());
+            for column in change.values.keys() {
+                if let Some(index) = state
+                    .numeric
+                    .get_mut(&(change.relation.clone(), column.clone()))
+                {
+                    index.zrem(change.row_id.as_bytes());
+                }
             }
-            for index in state.text.values_mut() {
-                for rows in index.values_mut() {
-                    rows.remove(&change.row_id);
+            for column in change.values.keys() {
+                if let Some(index) = state
+                    .text
+                    .get_mut(&(change.relation.clone(), column.clone()))
+                {
+                    for rows in index.values_mut() {
+                        rows.remove(&change.row_id);
+                    }
                 }
             }
             return Ok(());
@@ -782,8 +792,10 @@ impl AccessMethod for TimeSeriesAccessMethod {
     fn on_write(&self, change: &RowChange) -> AmResult<()> {
         let mut state = self.state.lock().map_err(poisoned)?;
         if change.kind == RowChangeKind::Delete {
-            for index in state.values_mut() {
-                index.zrem(change.row_id.as_bytes());
+            for column in change.values.keys() {
+                if let Some(index) = state.get_mut(&(change.relation.clone(), column.clone())) {
+                    index.zrem(change.row_id.as_bytes());
+                }
             }
             return Ok(());
         }

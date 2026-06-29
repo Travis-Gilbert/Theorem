@@ -72,7 +72,7 @@ This file is the navigation map. Read it first. Order of truth: this map, then t
 | `rustyred-thg-offload` | Compute-offload planner (operation algebra, reuse cache, pushdown/fusion, cascade routing); one routed affordance `compute_offload.route_operation`. |
 | `rustyred-thg-graphblas` | GraphBLAS sparse-matrix compute core (SuiteSparse v9.4.5 + LAGraph v1.2.1 FFI/safe layer, masked `mxv`/`mxm`, the 7 LAGraph algorithms). NOT a workspace member; pulled via core's optional `graphblas` feature. Build needs `RUSTYRED_GRAPHBLAS_PREFIX` + `LIBCLANG_PATH`; downstream binaries need `DYLD_FALLBACK_LIBRARY_PATH`. |
 | `rustyred-thg-memory` | Graph-native memory: PPR-seeded `recall`, `consolidate`, `decay`, validity/contradiction, project-scope bias; cold-tier eviction/rehydrate (`ColdTier`, `evict_decayed`, `recall_with_cold_tier`, park/unpark scope). |
-| `rustyred-thg-pg-server` | Postgres wire-protocol server over native views (simple + extended query, SQL->`QueryIr`). |
+| `rustyred-thg-pg-server` | Postgres wire-protocol server over native views (simple + extended query, SQL->`QueryIr`) plus dbt/Postgres-adapter catalog, materialization, grounding, and lineage receipts. |
 | `rustyred-thg-resp-server` | RESP (Redis-shaped) command loop over `OrderedIndexRegistry`. |
 | `rustyred-thg-server` | Product HTTP/gRPC/MCP surface: tenant graph routes, query/Cypher, harness coordination, browser actions, fractal expansion, TTL, adaptive-index routes. The runnable node (embedded RedCore on a data dir). |
 | `rustyred-proxy` | First-class local Anthropic Messages proxy binary; reuses `theorem-agentd`'s proxy module (`/v1/messages`, tool-result sampling, ambient injection, `/v1/presence*`) without the local model loop. |

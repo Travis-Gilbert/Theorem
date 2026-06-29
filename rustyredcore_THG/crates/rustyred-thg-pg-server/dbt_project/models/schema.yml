@@ -1,0 +1,48 @@
+version: 2
+
+sources:
+  - name: substrate
+    database: postgres
+    schema: public
+    tables:
+      - name: memory
+      - name: epistemic
+
+models:
+  - name: stg_memory
+    columns:
+      - name: id
+        tests:
+          - not_null:
+              name: stg_memory_id_not_null
+          - unique:
+              name: stg_memory_id_unique
+          - relationships:
+              name: stg_memory_id_relationships_memory
+              arguments:
+                to: source('substrate', 'memory')
+                field: id
+      - name: topic
+        tests:
+          - accepted_values:
+              name: stg_memory_topic_accepted_values
+              arguments:
+                values: ['planning', 'review']
+          - accepted_values:
+              name: stg_memory_topic_deliberate_failure
+              arguments:
+                values: ['planning']
+
+  - name: topic_counts
+    columns:
+      - name: topic
+        tests:
+          - not_null:
+              name: topic_counts_topic_not_null
+
+  - name: incremental_memory
+    columns:
+      - name: id
+        tests:
+          - not_null:
+              name: incremental_memory_id_not_null
