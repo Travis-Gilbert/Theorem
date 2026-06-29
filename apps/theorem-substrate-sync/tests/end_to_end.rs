@@ -567,23 +567,18 @@ async fn live_stream_smoke_against_railway() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// Live Role 1 (Prolly round) is BLOCKED by a daemon-vs-production-server
-/// schema mismatch. The daemon's `round::compile_snapshot` expects
-/// `pack.objects` (a flat array of `{kind, payload}`) but the live
-/// `rustyred_thg_graph_version_compile` returns the pack as
-/// `{ manifest, commit, tree: { root_hash, root_level, entries_total,
-/// nodes: [{hash, level, first_key, last_key}, ...] }, capabilities }`.
-/// The graph objects live behind the Prolly tree's content-addressed
-/// hashes and must be fetched separately. Closing this gap requires
-/// either updating `compile_snapshot` to walk the tree + fetch objects
-/// by hash, or having the server bundle objects with the pack on
-/// request. Out of scope for the substrate-sync-daemon initial cut;
-/// tracked as a documented blocker in `.harness/checklist.json` PT-015's
-/// verification line. This test stays here so the gap is visible in
-/// `cargo test --ignored` until the daemon is updated.
+/// Live Role 1 acceptance: drive a full Prolly round
+/// (compile -> diff -> merge -> apply local -> apply remote -> ref
+/// update) against the real `rustyredcore-theorem-production` server.
+/// The fresh tenant carved out here starts empty, so both sides agree
+/// on an empty merged snapshot and the round converges to the same
+/// hash on local and remote sides. Live verification of the daemon's
+/// Role 1 wire, including the response-shape handling where the
+/// server omits `pack.objects` for empty packs via
+/// `skip_serializing_if = "Vec::is_empty"`.
 #[tokio::test]
-#[ignore = "BLOCKED on daemon-vs-server pack-shape mismatch; see test doc + PT-015 verification line"]
-async fn live_round_blocked_on_pack_shape() {
+#[ignore = "set THEOREM_SYNC_LIVE_E2E=1 + THEOREM_SYNC_RAILWAY_URL (and optionally THEOREM_SYNC_RAILWAY_TOKEN, THEOREM_SYNC_TENANT) to run"]
+async fn live_round_against_railway() {
     let Some(remote) = live_remote_client() else {
         eprintln!("skipping: live mode env not configured");
         return;
@@ -593,33 +588,23 @@ async fn live_round_blocked_on_pack_shape() {
     let local = McpClient::unauthenticated(local_url, "irrelevant");
 
     let status = handle();
-    let result = run_round(&local, &remote, &status).await;
+    let receipt = run_round(&local, &remote, &status)
+        .await
+        .expect("live round must complete end-to-end");
+    eprintln!("live round receipt: {receipt:?}");
 
-    match result {
-        Err(e) if format!("{e}").contains("pack.objects") => {
-            eprintln!(
-                "EXPECTED FAILURE — daemon pack-shape mismatch persists; see test doc: {e}"
-            );
-        }
-        Err(other) => {
-            let msg = format!("{other}");
-            assert!(
-                !msg.contains("HTTP execution budget"),
-                "live Railway hitting HTTP execution budget; bump did not take effect: {msg}"
-            );
-            panic!("unexpected live failure (was expecting pack.objects schema gap): {msg}");
-        }
-        Ok(receipt) => {
-            // If this branch runs the daemon has been updated to handle the
-            // live pack shape. Flip the test from blocked to expected-success
-            // and update PT-015's verification line.
-            eprintln!("live round receipt: {receipt:?}");
-            panic!(
-                "live round now passes — daemon pack-shape gap closed; \
-                 remove #[ignore] + drop the blocked-on-pack-shape framing"
-            );
-        }
-    }
+    assert!(
+        receipt.applied_local,
+        "round must mark applied_local=true (snapshot applied to local)"
+    );
+    assert!(
+        receipt.applied_remote,
+        "round must mark applied_remote=true (merged snapshot pushed to remote)"
+    );
+    assert!(
+        !receipt.merged_hash.is_empty(),
+        "merged_hash must be set"
+    );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
