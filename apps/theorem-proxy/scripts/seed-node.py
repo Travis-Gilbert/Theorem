@@ -7,7 +7,8 @@ empty store. Stdlib only.
 
 Env: THEOREM_NODE_URL (default http://127.0.0.1:8380/mcp),
      THEOREM_MEMORY_DIR (default the CC project memory dir),
-     THEOREM_TENANT (default "default").
+     THEOREM_TENANT (default "default"),
+     THEOREM_HIPPO_SEED_INDEX_LIMIT (optional warmup page limit).
 """
 import json
 import os
@@ -77,7 +78,16 @@ def main():
     # path never has to index). The first warm over a large corpus is slow (minutes);
     # later runs are quick once the index is built.
     try:
-        call("hippo_retrieve", {"tenant": TENANT, "query": "warm the index", "top_k": 1}, timeout=600)
+        warm_args = {
+            "tenant": TENANT,
+            "query": "warm the index",
+            "top_k": 1,
+            "auto_index_memory": True,
+        }
+        seed_index_limit = os.environ.get("THEOREM_HIPPO_SEED_INDEX_LIMIT")
+        if seed_index_limit:
+            warm_args["index_limit"] = int(seed_index_limit)
+        call("hippo_retrieve", warm_args, timeout=600)
         print("index warmed")
     except Exception as error:  # noqa: BLE001
         print(f"warm step (first run is slow over a large corpus): {error}")
