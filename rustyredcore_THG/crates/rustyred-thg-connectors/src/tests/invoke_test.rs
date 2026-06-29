@@ -5,9 +5,12 @@ use std::thread::{self, JoinHandle};
 
 use serde_json::{json, Value};
 
-use rustyred_plugin::{CapabilityProvenance, PluginExportSpec, PluginLimits, WasmPluginSource};
-use rustyred_thg_affordances::register_wasm_plugin_exports;
-use rustyred_thg_core::InMemoryGraphStore;
+use rustyred_plugin::{
+    CapabilityProvenance, DeclarativeSkillDefinition, DeclarativeSkillStep, HostFunctionGrant,
+    PluginExportSpec, PluginLimits, WasmPluginSource,
+};
+use rustyred_thg_affordances::{register_declarative_skill_plugin, register_wasm_plugin_exports};
+use rustyred_thg_core::{InMemoryGraphStore, NodeQuery};
 
 use crate::bridge::{connect_and_register, connect_and_register_with_target};
 use crate::invoke::{
@@ -159,6 +162,27 @@ fn wasm_echo_wat() -> String {
     .to_string()
 }
 
+fn wasm_host_call_wat(function: &str) -> String {
+    format!(
+        r#"
+        (module
+            (import "extism:host/env" "input_offset" (func $input_offset (result i64)))
+            (import "extism:host/env" "length" (func $length (param i64) (result i64)))
+            (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
+            (import "extism:host/user" "{function}" (func $host (param i64) (result i64)))
+            (func (export "run") (result i32)
+                (local $input i64)
+                (local $output i64)
+                (local.set $input (call $input_offset))
+                (local.set $output (call $host (local.get $input)))
+                (call $output_set (local.get $output) (call $length (local.get $output)))
+                (i32.const 0)
+            )
+        )
+    "#
+    )
+}
+
 /// Register the fake server's tools WITH a persisted connection target, so the
 /// invoke bridge can resolve a reach back to the server.
 fn registered_store() -> InMemoryGraphStore {
@@ -275,6 +299,152 @@ fn allowlist_can_fire_rustyred_plugin_target_and_record_outcome() {
     assert!(
         report.recorded.is_some(),
         "plugin invocation should record a normal affordance receipt"
+    );
+}
+
+#[test]
+fn rustyred_plugin_fact_writes_are_persisted_before_success_receipt() {
+    let mut store = InMemoryGraphStore::default();
+    register_wasm_plugin_exports(
+        &mut store,
+        &rustyred_plugin::WasmPluginSpec {
+            plugin_id: "test.fact".to_string(),
+            tenant_id: "acme".to_string(),
+            source: WasmPluginSource::Wat(wasm_host_call_wat("thg_fact_write")),
+            exports: vec![PluginExportSpec {
+                name: "run".to_string(),
+                label: "Run".to_string(),
+                description: "Write one provenance fact.".to_string(),
+                input_schema: json!({"type": "object"}),
+                permissions: vec!["graph.write".to_string()],
+                writeback_policy: "writes-facts".to_string(),
+                tags: vec!["fact".to_string()],
+            }],
+            grants: vec![HostFunctionGrant::FactWrite],
+            limits: PluginLimits::default(),
+            declared_tests: vec![],
+            provenance: CapabilityProvenance {
+                corpus_segment_ids: vec!["seg:test".to_string()],
+                source_refs: vec!["test".to_string()],
+                authored_by: "test".to_string(),
+            },
+        },
+        Some("operator"),
+    )
+    .expect("register fact plugin");
+
+    let affordance_id = "wasm_plugin:test.fact.run";
+    let report = invoke_affordance(
+        &mut store,
+        InvokeRequest {
+            tenant_id: "acme".to_string(),
+            task_type: "programmable.fact".to_string(),
+            affordance_id: affordance_id.to_string(),
+            arguments: json!({
+                "subject": "capability",
+                "predicate": "emits",
+                "object": "fact"
+            }),
+            candidate_affordance_ids: vec![affordance_id.to_string()],
+        },
+        &InvokePolicy::FireAllowlist(vec![affordance_id.to_string()]),
+        Some("operator"),
+    )
+    .expect("invoke fact plugin");
+
+    assert!(report.fired);
+    assert!(!report.outcome.expect("plugin outcome").is_error);
+    let fact_nodes = store.query_nodes(NodeQuery::label("PluginFact"));
+    assert_eq!(fact_nodes.len(), 1);
+    assert_eq!(fact_nodes[0].properties["fact"]["subject"], "capability");
+    assert_eq!(fact_nodes[0].properties["fact"]["predicate"], "emits");
+    assert_eq!(fact_nodes[0].properties["fact"]["object"], "fact");
+    assert_eq!(
+        fact_nodes[0].properties["fact"]["provenance"]["corpus_segment_ids"][0],
+        "seg:test"
+    );
+}
+
+#[test]
+fn declarative_skill_target_decodes_and_invokes_declared_steps() {
+    let mut store = InMemoryGraphStore::default();
+    register_wasm_plugin_exports(
+        &mut store,
+        &rustyred_plugin::WasmPluginSpec {
+            plugin_id: "test.echo".to_string(),
+            tenant_id: "acme".to_string(),
+            source: WasmPluginSource::Wat(wasm_echo_wat()),
+            exports: vec![PluginExportSpec {
+                name: "run".to_string(),
+                label: "Run".to_string(),
+                description: "Echo JSON input through Extism.".to_string(),
+                input_schema: json!({"type": "object"}),
+                permissions: vec![],
+                writeback_policy: "read-only".to_string(),
+                tags: vec!["echo".to_string()],
+            }],
+            grants: vec![],
+            limits: PluginLimits::default(),
+            declared_tests: vec![],
+            provenance: CapabilityProvenance::default(),
+        },
+        Some("operator"),
+    )
+    .expect("register wasm plugin");
+    let definition = DeclarativeSkillDefinition {
+        skill_id: "skill.echo".to_string(),
+        tenant_id: "acme".to_string(),
+        title: "Echo skill".to_string(),
+        description: "Invoke the echo plugin.".to_string(),
+        parameters_schema: json!({"type": "object"}),
+        steps: vec![DeclarativeSkillStep {
+            affordance_id: "wasm_plugin:test.echo.run".to_string(),
+            arguments: json!({"message": "from-skill"}),
+        }],
+        declared_tests: vec![],
+        provenance: CapabilityProvenance::default(),
+    };
+    register_declarative_skill_plugin(&mut store, &definition, Some("operator"))
+        .expect("register declarative skill");
+
+    let affordance_id = "declarative_skill:skill.echo.invoke";
+    let planned =
+        plan_invocation(&store, "acme", affordance_id, json!({})).expect("plan declarative skill");
+    assert!(matches!(
+        planned.connection_target,
+        ConnectionTarget::RustyredDeclarativeSkill { .. }
+    ));
+
+    let report = invoke_affordance(
+        &mut store,
+        InvokeRequest {
+            tenant_id: "acme".to_string(),
+            task_type: "programmable.declarative".to_string(),
+            affordance_id: affordance_id.to_string(),
+            arguments: json!({}),
+            candidate_affordance_ids: vec![affordance_id.to_string()],
+        },
+        &InvokePolicy::FireAllowlist(vec![affordance_id.to_string()]),
+        Some("operator"),
+    )
+    .expect("invoke declarative skill");
+
+    assert!(report.fired);
+    let outcome = report.outcome.expect("skill outcome");
+    assert!(!outcome.is_error, "{outcome:?}");
+    let receipt: Value = serde_json::from_str(&outcome.text).expect("json receipt");
+    assert_eq!(receipt["status"], "applied");
+    assert_eq!(
+        receipt["step_results"][0]["affordance_id"],
+        "wasm_plugin:test.echo.run"
+    );
+    assert_eq!(
+        receipt["step_results"][0]["outcome"]["text"],
+        r#"{"message":"from-skill"}"#
+    );
+    assert!(
+        report.recorded.is_some(),
+        "declarative skill should record a top-level invocation receipt"
     );
 }
 

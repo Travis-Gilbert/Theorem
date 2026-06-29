@@ -23,7 +23,7 @@ pub mod types;
 pub use outcomes::{affordance_nodes, effective_affordance_fitness_from_node, record_invocation};
 pub use programmable::{
     register_declarative_skill_plugin, register_wasm_plugin_exports, DECLARATIVE_SKILL_FAMILY,
-    PROGRAMMABLE_PLUGIN_FAMILY, PROGRAMMABLE_PLUGIN_TRANSPORT,
+    DECLARATIVE_SKILL_TRANSPORT, PROGRAMMABLE_PLUGIN_FAMILY, PROGRAMMABLE_PLUGIN_TRANSPORT,
 };
 pub use registry::{
     register_builtin_affordances, register_connector, register_theseus_app_affordances,

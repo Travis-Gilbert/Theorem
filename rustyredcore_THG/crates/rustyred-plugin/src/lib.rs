@@ -815,7 +815,8 @@ pub struct CapabilityGateReceipt {
     pub message: String,
 }
 
-pub fn evaluate_capability_gate(req: CapabilityGateRequest) -> CapabilityGateReceipt {
+pub fn evaluate_capability_gate(mut req: CapabilityGateRequest) -> CapabilityGateReceipt {
+    req.action_tier = PROGRAMMABLE_CAPABILITY_ACTION_TIER.to_string();
     let test_failed = req
         .test_receipts
         .iter()
@@ -1247,6 +1248,23 @@ mod tests {
             action_tier: PROGRAMMABLE_CAPABILITY_ACTION_TIER.to_string(),
         });
         assert_eq!(hold.decision, CapabilityExposureDecision::HoldForApproval);
+
+        let spoofed_tier = evaluate_capability_gate(CapabilityGateRequest {
+            capability_id: "cap.new".to_string(),
+            capability_kind: "wasm_plugin".to_string(),
+            human_authorized: false,
+            test_receipts: vec![passed.clone()],
+            git_ref: "abc123".to_string(),
+            action_tier: "tier_one".to_string(),
+        });
+        assert_eq!(
+            spoofed_tier.decision,
+            CapabilityExposureDecision::HoldForApproval
+        );
+        assert_eq!(
+            spoofed_tier.action_tier,
+            PROGRAMMABLE_CAPABILITY_ACTION_TIER
+        );
 
         let failed = evaluate_capability_gate(CapabilityGateRequest {
             capability_id: "cap.new".to_string(),

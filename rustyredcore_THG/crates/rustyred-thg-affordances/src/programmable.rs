@@ -11,6 +11,7 @@ use crate::types::{
 use rustyred_thg_core::ThgResult;
 
 pub const PROGRAMMABLE_PLUGIN_TRANSPORT: &str = "rustyred_plugin";
+pub const DECLARATIVE_SKILL_TRANSPORT: &str = "rustyred_declarative_skill";
 pub const PROGRAMMABLE_PLUGIN_FAMILY: &str = "wasm_plugin";
 pub const DECLARATIVE_SKILL_FAMILY: &str = "declarative_skill";
 
@@ -74,9 +75,12 @@ pub fn register_declarative_skill_plugin<S: AffordanceGraphStore>(
         }],
     };
     let connection_target = json!({
-        "transport": PROGRAMMABLE_PLUGIN_TRANSPORT,
-        "kind": DECLARATIVE_SKILL_FAMILY,
+        "transport": DECLARATIVE_SKILL_TRANSPORT,
         "skill_id": definition.skill_id,
+        "tenant_id": definition.tenant_id,
+        "title": definition.title,
+        "description": definition.description,
+        "parameters_schema": definition.parameters_schema,
         "steps": definition.steps,
         "provenance": definition.provenance,
     });
@@ -204,6 +208,9 @@ mod tests {
             connector_connection_target(&store, "tenant", "declarative_skill:skill.graph-note")
                 .unwrap()
                 .unwrap();
+        assert_eq!(target["transport"], DECLARATIVE_SKILL_TRANSPORT);
+        assert_eq!(target["tenant_id"], "tenant");
+        assert_eq!(target["skill_id"], "skill.graph-note");
         assert_eq!(target["steps"].as_array().unwrap().len(), 2);
     }
 }

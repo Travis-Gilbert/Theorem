@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use rustyred_plugin::{
-    CapabilityProvenance, HostFunctionGrant, PluginExportSpec, PluginLimits, WasmPluginSource,
-    WasmPluginSpec,
+    CapabilityProvenance, DeclarativeSkillDefinition, DeclarativeSkillStep, HostFunctionGrant,
+    PluginExportSpec, PluginLimits, WasmPluginSource, WasmPluginSpec,
 };
 
 use crate::{ConnectorError, ConnectorResult};
@@ -63,6 +63,18 @@ pub enum ConnectionTarget {
         #[serde(default)]
         provenance: CapabilityProvenance,
     },
+    RustyredDeclarativeSkill {
+        skill_id: String,
+        tenant_id: String,
+        title: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        parameters_schema: Value,
+        steps: Vec<DeclarativeSkillStep>,
+        #[serde(default)]
+        provenance: CapabilityProvenance,
+    },
 }
 
 impl ConnectionTarget {
@@ -86,6 +98,31 @@ impl ConnectionTarget {
             exports: exports.clone(),
             grants: grants.clone(),
             limits: limits.clone(),
+            declared_tests: Vec::new(),
+            provenance: provenance.clone(),
+        })
+    }
+
+    pub fn declarative_skill_definition(&self) -> Option<DeclarativeSkillDefinition> {
+        let Self::RustyredDeclarativeSkill {
+            skill_id,
+            tenant_id,
+            title,
+            description,
+            parameters_schema,
+            steps,
+            provenance,
+        } = self
+        else {
+            return None;
+        };
+        Some(DeclarativeSkillDefinition {
+            skill_id: skill_id.clone(),
+            tenant_id: tenant_id.clone(),
+            title: title.clone(),
+            description: description.clone(),
+            parameters_schema: parameters_schema.clone(),
+            steps: steps.clone(),
             declared_tests: Vec::new(),
             provenance: provenance.clone(),
         })
@@ -512,5 +549,10 @@ pub fn connect_transport(target: &ConnectionTarget) -> ConnectorResult<Connected
                 "rustyred_plugin target {plugin_id} is invoked in-process, not through MCP transport"
             ),
         )),
+        ConnectionTarget::RustyredDeclarativeSkill { skill_id, .. } => {
+            Err(ConnectorError::Transport(format!(
+                "rustyred_declarative_skill target {skill_id} is invoked in-process, not through MCP transport"
+            )))
+        }
     }
 }
