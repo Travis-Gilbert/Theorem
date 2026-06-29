@@ -21,10 +21,8 @@ use crate::zerocopy::{
     access_graph_archive, archive_content_object, MappedArchive, ZeroCopyArchiveError,
 };
 
-#[cfg(feature = "vector-accelerated")]
-const VECTOR_INDEX_BIT_WIDTH: usize = 4;
-#[cfg(feature = "vector-accelerated")]
-const VECTOR_EAGER_REBUILD_LIMIT: usize = 64;
+pub const DEFAULT_VECTOR_INDEX_BIT_WIDTH: usize = 4;
+const SUPPORTED_VECTOR_INDEX_BIT_WIDTHS: [usize; 2] = [2, 4];
 
 #[derive(Clone, Debug)]
 pub struct VectorPoint(Vec<f32>);
@@ -45,21 +43,37 @@ impl VectorPoint {
 }
 
 pub struct VectorIndex {
+    #[cfg(not(feature = "vector-accelerated"))]
     points: Vec<VectorPoint>,
+    #[cfg(not(feature = "vector-accelerated"))]
     node_ids: Vec<String>,
     #[cfg(feature = "vector-accelerated")]
-    turbovec: Option<IdMapIndex>,
+    node_to_vector_id: HashMap<String, u64>,
+    #[cfg(feature = "vector-accelerated")]
+    vector_id_to_node: HashMap<u64, String>,
+    #[cfg(feature = "vector-accelerated")]
+    next_vector_id: u64,
+    #[cfg(feature = "vector-accelerated")]
+    turbovec: IdMapIndex,
     pub dimension: usize,
+    bit_width: usize,
 }
 
 impl Clone for VectorIndex {
     fn clone(&self) -> Self {
-        Self {
-            points: self.points.clone(),
-            node_ids: self.node_ids.clone(),
-            #[cfg(feature = "vector-accelerated")]
-            turbovec: None,
-            dimension: self.dimension,
+        #[cfg(feature = "vector-accelerated")]
+        {
+            return Self::with_bit_width(self.dimension, self.bit_width)
+                .expect("existing vector index configuration should remain valid");
+        }
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            Self {
+                points: self.points.clone(),
+                node_ids: self.node_ids.clone(),
+                dimension: self.dimension,
+                bit_width: self.bit_width,
+            }
         }
     }
 }
@@ -68,92 +82,155 @@ impl std::fmt::Debug for VectorIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VectorIndex")
             .field("dimension", &self.dimension)
-            .field("count", &self.points.len())
+            .field("count", &self.len())
+            .field("bit_width", &self.bit_width)
+            .field("accelerated", &self.is_accelerated())
             .finish()
     }
 }
 
 impl VectorIndex {
-    fn new(dimension: usize) -> Self {
-        Self {
-            points: Vec::new(),
-            node_ids: Vec::new(),
-            #[cfg(feature = "vector-accelerated")]
-            turbovec: None,
-            dimension,
+    pub fn new(dimension: usize) -> Self {
+        Self::with_bit_width(dimension, DEFAULT_VECTOR_INDEX_BIT_WIDTH)
+            .expect("default vector index configuration should be valid")
+    }
+
+    pub fn with_bit_width(dimension: usize, bit_width: usize) -> GraphStoreResult<Self> {
+        validate_vector_index_configuration(dimension, bit_width)?;
+        #[cfg(feature = "vector-accelerated")]
+        {
+            return Ok(Self {
+                node_to_vector_id: HashMap::new(),
+                vector_id_to_node: HashMap::new(),
+                next_vector_id: 0,
+                turbovec: IdMapIndex::new(dimension, bit_width).map_err(|err| {
+                    GraphStoreError::new(
+                        "unsupported_vector_dimension",
+                        format!(
+                            "dimension {dimension} is not supported by TurboVec at {bit_width} bits: {err}"
+                        ),
+                    )
+                })?,
+                dimension,
+                bit_width,
+            });
+        }
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            Ok(Self {
+                points: Vec::new(),
+                node_ids: Vec::new(),
+                dimension,
+                bit_width,
+            })
         }
     }
 
-    fn insert(&mut self, node_id: &str, vector: &[f32]) {
-        if let Some(pos) = self.node_ids.iter().position(|id| id == node_id) {
-            self.points[pos] = VectorPoint::new(vector);
-        } else {
-            self.points.push(VectorPoint::new(vector));
-            self.node_ids.push(node_id.to_string());
+    fn insert(&mut self, node_id: &str, vector: &[f32]) -> GraphStoreResult<()> {
+        if vector.len() != self.dimension {
+            return Err(GraphStoreError::new(
+                "dimension_mismatch",
+                format!(
+                    "expected {} dimensions, got {}",
+                    self.dimension,
+                    vector.len()
+                ),
+            ));
         }
+        validate_vector_values(vector)?;
         #[cfg(feature = "vector-accelerated")]
         {
-            // Rebuilding the accelerated index on every insert turns large AOF
-            // replay and bulk designation into repeated whole-index construction.
-            // Keep eager acceleration for tiny indexes; exact search remains
-            // available when the accelerated index is absent.
-            if self.points.len() <= VECTOR_EAGER_REBUILD_LIMIT {
-                self.rebuild();
+            let point = VectorPoint::new(vector);
+            let existing_id = self.node_to_vector_id.get(node_id).copied();
+            let vector_id = existing_id.unwrap_or(self.next_vector_id);
+            if existing_id.is_none() {
+                self.next_vector_id = self.next_vector_id.saturating_add(1);
             } else {
-                self.turbovec = None;
+                self.turbovec.remove(vector_id);
             }
+            self.turbovec
+                .add_with_ids(point.as_slice(), &[vector_id])
+                .map_err(|err| {
+                    GraphStoreError::new(
+                        "vector_index_insert_failed",
+                        format!(
+                            "TurboVec insert failed for {node_id} at {} dimensions and {} bits: {err}",
+                            self.dimension, self.bit_width
+                        ),
+                    )
+                })?;
+            if existing_id.is_none() {
+                self.node_to_vector_id
+                    .insert(node_id.to_string(), vector_id);
+                self.vector_id_to_node
+                    .insert(vector_id, node_id.to_string());
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            if let Some(pos) = self.node_ids.iter().position(|id| id == node_id) {
+                self.points[pos] = VectorPoint::new(vector);
+            } else {
+                self.points.push(VectorPoint::new(vector));
+                self.node_ids.push(node_id.to_string());
+            }
+            Ok(())
         }
     }
 
-    #[cfg(feature = "vector-accelerated")]
-    fn rebuild(&mut self) {
-        if self.points.is_empty() {
-            self.turbovec = None;
-            return;
+    fn remove(&mut self, node_id: &str) -> bool {
+        #[cfg(feature = "vector-accelerated")]
+        {
+            let Some(vector_id) = self.node_to_vector_id.remove(node_id) else {
+                return false;
+            };
+            self.vector_id_to_node.remove(&vector_id);
+            return self.turbovec.remove(vector_id);
         }
-        let mut vectors = Vec::with_capacity(self.points.len() * self.dimension);
-        for point in &self.points {
-            vectors.extend_from_slice(point.as_slice());
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            let Some(pos) = self.node_ids.iter().position(|id| id == node_id) else {
+                return false;
+            };
+            self.node_ids.swap_remove(pos);
+            self.points.swap_remove(pos);
+            true
         }
-        let ids = (0..self.node_ids.len())
-            .map(|index| index as u64)
-            .collect::<Vec<_>>();
-        let mut index = match IdMapIndex::new(self.dimension, VECTOR_INDEX_BIT_WIDTH) {
-            Ok(index) => index,
-            Err(_) => {
-                self.turbovec = None;
-                return;
-            }
-        };
-        if index.add_with_ids(&vectors, &ids).is_err() {
-            self.turbovec = None;
-            return;
-        }
-        self.turbovec = Some(index);
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
-        if k == 0 || query.iter().any(|value| !value.is_finite()) {
-            return Vec::new();
+    fn search(&self, query: &[f32], k: usize) -> GraphStoreResult<Vec<(String, f32)>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if query.len() != self.dimension {
+            return Err(GraphStoreError::new(
+                "dimension_mismatch",
+                format!(
+                    "query dimension {} does not match index dimension {}",
+                    query.len(),
+                    self.dimension
+                ),
+            ));
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Ok(Vec::new());
         }
         #[cfg(feature = "vector-accelerated")]
         {
-            let Some(index) = &self.turbovec else {
-                return self.exact_search(query, k);
-            };
+            if self.turbovec.is_empty() {
+                return Ok(Vec::new());
+            }
             let query_point = VectorPoint::new(query);
-            let recall_k = k.saturating_mul(4).max(k).min(self.node_ids.len());
-            let (_scores, ids) = index.search(query_point.as_slice(), recall_k);
-            let mut results = ids
+            let recall_k = k.min(self.turbovec.len());
+            let (scores, ids) = self.turbovec.search(query_point.as_slice(), recall_k);
+            let mut results = scores
                 .into_iter()
-                .filter_map(|id| {
-                    let index = id as usize;
-                    let node_id = self.node_ids.get(index)?;
-                    let point = self.points.get(index)?;
-                    Some((
-                        node_id.clone(),
-                        cosine_distance(query_point.as_slice(), point.as_slice()),
-                    ))
+                .zip(ids)
+                .filter_map(|(score, vector_id)| {
+                    let node_id = self.vector_id_to_node.get(&vector_id)?;
+                    let distance = 1.0 - score.clamp(-1.0, 1.0);
+                    Some((node_id.clone(), distance))
                 })
                 .collect::<Vec<_>>();
             results.sort_by(|a, b| {
@@ -162,14 +239,52 @@ impl VectorIndex {
                     .then_with(|| a.0.cmp(&b.0))
             });
             results.truncate(k);
-            return results;
+            return Ok(results);
         }
         #[cfg(not(feature = "vector-accelerated"))]
         {
-            self.exact_search(query, k)
+            Ok(self.exact_search(query, k))
         }
     }
 
+    fn len(&self) -> usize {
+        #[cfg(feature = "vector-accelerated")]
+        {
+            return self.turbovec.len();
+        }
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            self.points.len()
+        }
+    }
+
+    pub fn bit_width(&self) -> usize {
+        self.bit_width
+    }
+
+    pub fn resident_vector_bytes(&self) -> usize {
+        quantized_vector_bytes_bound(self.len(), self.dimension, self.bit_width)
+    }
+
+    pub fn resident_full_precision_bytes(&self) -> usize {
+        #[cfg(feature = "vector-accelerated")]
+        {
+            0
+        }
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            self.points
+                .len()
+                .saturating_mul(self.dimension)
+                .saturating_mul(std::mem::size_of::<f32>())
+        }
+    }
+
+    pub fn is_accelerated(&self) -> bool {
+        cfg!(feature = "vector-accelerated")
+    }
+
+    #[cfg(not(feature = "vector-accelerated"))]
     fn exact_search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
         let query_point = VectorPoint::new(query);
         let mut results = self
@@ -193,6 +308,67 @@ impl VectorIndex {
     }
 }
 
+fn validate_vector_index_configuration(dimension: usize, bit_width: usize) -> GraphStoreResult<()> {
+    if dimension == 0 {
+        return Err(GraphStoreError::new(
+            "invalid_vector_designation",
+            "dimension must be > 0".to_string(),
+        ));
+    }
+    validate_vector_bit_width(bit_width)?;
+    #[cfg(feature = "vector-accelerated")]
+    {
+        IdMapIndex::new(dimension, bit_width).map_err(|err| {
+            GraphStoreError::new(
+                "unsupported_vector_dimension",
+                format!(
+                    "dimension {dimension} is not supported by TurboVec at {bit_width} bits: {err}"
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+pub fn validate_vector_bit_width(bit_width: usize) -> GraphStoreResult<()> {
+    if SUPPORTED_VECTOR_INDEX_BIT_WIDTHS.contains(&bit_width) {
+        Ok(())
+    } else {
+        Err(GraphStoreError::new(
+            "invalid_vector_bit_width",
+            format!("vector bit width must be 2 or 4, got {bit_width}"),
+        ))
+    }
+}
+
+pub fn default_vector_index_bit_width() -> usize {
+    DEFAULT_VECTOR_INDEX_BIT_WIDTH
+}
+
+fn validate_vector_values(vector: &[f32]) -> GraphStoreResult<()> {
+    if let Some((index, value)) = vector
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || value.abs() >= 1e16)
+    {
+        return Err(GraphStoreError::new(
+            "invalid_vector_value",
+            format!("vector coordinate {index} is not indexable: {value}"),
+        ));
+    }
+    Ok(())
+}
+
+fn quantized_vector_bytes_bound(count: usize, dimension: usize, bit_width: usize) -> usize {
+    count
+        .saturating_mul(dimension)
+        .saturating_mul(bit_width)
+        .saturating_add(7)
+        / 8
+}
+
+#[cfg(not(feature = "vector-accelerated"))]
 fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
     let dot = left
         .iter()
@@ -208,6 +384,20 @@ pub struct VectorDesignation {
     pub label: String,
     pub property: String,
     pub dimension: usize,
+    #[serde(default = "default_vector_index_bit_width")]
+    pub bit_width: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VectorIndexManifest {
+    pub label: String,
+    pub property: String,
+    pub dimension: usize,
+    pub bit_width: usize,
+    pub indexed_vectors: usize,
+    pub resident_vector_bytes: usize,
+    pub resident_full_precision_bytes: usize,
+    pub accelerated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1038,7 +1228,7 @@ pub struct GraphRebuildReport {
     pub after: VerifyReport,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct InMemoryGraphStore {
     version: u64,
     nodes: BTreeMap<String, NodeRecord>,
@@ -1049,7 +1239,9 @@ pub struct InMemoryGraphStore {
     edge_type_index: BTreeMap<String, BTreeSet<String>>,
     property_index: BTreeMap<(String, String), BTreeSet<String>>,
     vector_designations: HashMap<(String, String), usize>,
+    vector_bit_widths: HashMap<(String, String), usize>,
     vector_indexes: HashMap<(String, String), VectorIndex>,
+    vector_bit_width: usize,
     ordered_indexes: BTreeMap<(String, String), OrderedIndex>,
     memory_document_updated_at_index: BTreeMap<String, BTreeSet<MemoryDocumentIndexEntry>>,
     memory_document_status_updated_at_index:
@@ -1074,7 +1266,9 @@ impl Default for InMemoryGraphStore {
             edge_type_index: BTreeMap::new(),
             property_index: BTreeMap::new(),
             vector_designations: HashMap::new(),
+            vector_bit_widths: HashMap::new(),
             vector_indexes: HashMap::new(),
+            vector_bit_width: DEFAULT_VECTOR_INDEX_BIT_WIDTH,
             ordered_indexes: BTreeMap::new(),
             memory_document_updated_at_index: BTreeMap::new(),
             memory_document_status_updated_at_index: BTreeMap::new(),
@@ -1083,9 +1277,69 @@ impl Default for InMemoryGraphStore {
     }
 }
 
+impl Clone for InMemoryGraphStore {
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            version: self.version,
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            out_adjacency: self.out_adjacency.clone(),
+            in_adjacency: self.in_adjacency.clone(),
+            label_index: self.label_index.clone(),
+            edge_type_index: self.edge_type_index.clone(),
+            property_index: self.property_index.clone(),
+            vector_designations: self.vector_designations.clone(),
+            vector_bit_widths: self.vector_bit_widths.clone(),
+            vector_indexes: HashMap::new(),
+            vector_bit_width: self.vector_bit_width,
+            ordered_indexes: self.ordered_indexes.clone(),
+            memory_document_updated_at_index: self.memory_document_updated_at_index.clone(),
+            memory_document_status_updated_at_index: self
+                .memory_document_status_updated_at_index
+                .clone(),
+            ttl_index: self.ttl_index.clone(),
+        };
+        cloned
+            .rebuild_vector_indexes_from_records()
+            .expect("cloned graph store should rebuild valid vector indexes");
+        cloned
+    }
+}
+
 impl InMemoryGraphStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_vector_bit_width(bit_width: usize) -> GraphStoreResult<Self> {
+        validate_vector_bit_width(bit_width)?;
+        Ok(Self {
+            vector_bit_width: bit_width,
+            ..Self::default()
+        })
+    }
+
+    pub fn vector_bit_width(&self) -> usize {
+        self.vector_bit_width
+    }
+
+    fn vector_bit_width_for_key(&self, key: &(String, String)) -> usize {
+        self.vector_bit_widths
+            .get(key)
+            .copied()
+            .unwrap_or(self.vector_bit_width)
+    }
+
+    pub fn set_vector_bit_width(&mut self, bit_width: usize) -> GraphStoreResult<()> {
+        validate_vector_bit_width(bit_width)?;
+        if self.vector_bit_width == bit_width {
+            return Ok(());
+        }
+        self.vector_bit_width = bit_width;
+        for existing in self.vector_bit_widths.values_mut() {
+            *existing = bit_width;
+        }
+        self.rebuild_vector_indexes_from_records()
     }
 
     pub fn snapshot(&self) -> GraphSnapshot {
@@ -1143,7 +1397,7 @@ impl InMemoryGraphStore {
         let id = node.id.clone();
         if !node.tombstone {
             self.add_node_indexes(&node);
-            self.auto_index_vectors(&node);
+            self.auto_index_vectors(&node)?;
         }
         self.nodes.insert(id.clone(), node);
 
@@ -1231,7 +1485,7 @@ impl InMemoryGraphStore {
         }
         if !node.tombstone {
             self.add_node_indexes(&node);
-            self.auto_index_vectors(&node);
+            self.auto_index_vectors(&node)?;
         }
         self.version = self.version.max(node.version);
         self.nodes.insert(node.id.clone(), node);
@@ -1568,28 +1822,29 @@ impl InMemoryGraphStore {
         property_name: &str,
         dimension: usize,
     ) -> GraphStoreResult<()> {
+        self.designate_vector_property_with_bit_width(
+            label,
+            property_name,
+            dimension,
+            self.vector_bit_width,
+        )
+    }
+
+    pub fn designate_vector_property_with_bit_width(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+        bit_width: usize,
+    ) -> GraphStoreResult<()> {
         if label.trim().is_empty() || property_name.trim().is_empty() {
             return Err(GraphStoreError::new(
                 "invalid_vector_designation",
                 "label and property_name must be non-empty".to_string(),
             ));
         }
-        if dimension == 0 {
-            return Err(GraphStoreError::new(
-                "invalid_vector_designation",
-                "dimension must be > 0".to_string(),
-            ));
-        }
+        let mut index = VectorIndex::with_bit_width(dimension, bit_width)?;
         let key = (label.to_string(), property_name.to_string());
-        let previous_dimension = self.vector_designations.insert(key.clone(), dimension);
-        if previous_dimension != Some(dimension) {
-            self.vector_indexes
-                .insert(key.clone(), VectorIndex::new(dimension));
-        } else {
-            self.vector_indexes
-                .entry(key.clone())
-                .or_insert_with(|| VectorIndex::new(dimension));
-        }
         for node in self.nodes.values() {
             if node.tombstone {
                 continue;
@@ -1599,13 +1854,13 @@ impl InMemoryGraphStore {
             }
             if let Some(arr) = extract_float_array(&node.properties, property_name) {
                 if arr.len() == dimension {
-                    let idx_key = (label.to_string(), property_name.to_string());
-                    if let Some(idx) = self.vector_indexes.get_mut(&idx_key) {
-                        idx.insert(&node.id, &arr);
-                    }
+                    index.insert(&node.id, &arr)?;
                 }
             }
         }
+        self.vector_designations.insert(key.clone(), dimension);
+        self.vector_bit_widths.insert(key.clone(), bit_width);
+        self.vector_indexes.insert(key, index);
         Ok(())
     }
 
@@ -1616,8 +1871,32 @@ impl InMemoryGraphStore {
                 label: label.clone(),
                 property: property.clone(),
                 dimension,
+                bit_width: self.vector_bit_width_for_key(&(label.clone(), property.clone())),
             })
             .collect()
+    }
+
+    pub fn vector_index_manifest(&self) -> Vec<VectorIndexManifest> {
+        let mut manifests = self
+            .vector_indexes
+            .iter()
+            .map(|((label, property), index)| VectorIndexManifest {
+                label: label.clone(),
+                property: property.clone(),
+                dimension: index.dimension,
+                bit_width: index.bit_width(),
+                indexed_vectors: index.len(),
+                resident_vector_bytes: index.resident_vector_bytes(),
+                resident_full_precision_bytes: index.resident_full_precision_bytes(),
+                accelerated: index.is_accelerated(),
+            })
+            .collect::<Vec<_>>();
+        manifests.sort_by(|a, b| {
+            a.label
+                .cmp(&b.label)
+                .then_with(|| a.property.cmp(&b.property))
+        });
+        manifests
     }
 
     pub fn designate_ordered_property(
@@ -1726,12 +2005,12 @@ impl InMemoryGraphStore {
                 format!("expected {expected_dim} dimensions, got {}", vector.len()),
             ));
         }
-        let idx = self
-            .vector_indexes
-            .entry(key)
-            .or_insert_with(|| VectorIndex::new(expected_dim));
-        idx.insert(node_id, vector);
-        Ok(())
+        let bit_width = self.vector_bit_width_for_key(&key);
+        let idx = self.vector_indexes.entry(key).or_insert_with(|| {
+            VectorIndex::with_bit_width(expected_dim, bit_width)
+                .expect("stored vector designation should remain valid")
+        });
+        idx.insert(node_id, vector)
     }
 
     pub fn vector_search(
@@ -1771,7 +2050,7 @@ impl InMemoryGraphStore {
                     continue;
                 }
             }
-            results.extend(idx.search(query, k));
+            results.extend(idx.search(query, k)?);
         }
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
@@ -1882,7 +2161,7 @@ impl InMemoryGraphStore {
         best
     }
 
-    fn auto_index_vectors(&mut self, node: &NodeRecord) {
+    fn auto_index_vectors(&mut self, node: &NodeRecord) -> GraphStoreResult<()> {
         let designations: Vec<((String, String), usize)> = self
             .vector_designations
             .iter()
@@ -1895,14 +2174,16 @@ impl InMemoryGraphStore {
             if let Some(arr) = extract_float_array(&node.properties, &property) {
                 if arr.len() == dimension {
                     let key = (label, property);
-                    let idx = self
-                        .vector_indexes
-                        .entry(key)
-                        .or_insert_with(|| VectorIndex::new(dimension));
-                    idx.insert(&node.id, &arr);
+                    let bit_width = self.vector_bit_width_for_key(&key);
+                    let idx = self.vector_indexes.entry(key).or_insert_with(|| {
+                        VectorIndex::with_bit_width(dimension, bit_width)
+                            .expect("stored vector designation should remain valid")
+                    });
+                    idx.insert(&node.id, &arr)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn auto_index_ordered(&mut self, node: &NodeRecord) -> GraphStoreResult<()> {
@@ -2105,7 +2386,7 @@ impl InMemoryGraphStore {
 
     pub fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
         let before = self.verify();
-        self.rebuild_indexes_from_records();
+        self.rebuild_indexes_from_records()?;
         let after = self.verify();
         Ok(GraphRebuildReport {
             repaired: !before.ok && after.ok,
@@ -2114,7 +2395,7 @@ impl InMemoryGraphStore {
         })
     }
 
-    fn rebuild_indexes_from_records(&mut self) {
+    fn rebuild_indexes_from_records(&mut self) -> GraphStoreResult<()> {
         self.out_adjacency.clear();
         self.in_adjacency.clear();
         self.label_index.clear();
@@ -2122,6 +2403,7 @@ impl InMemoryGraphStore {
         self.property_index.clear();
         self.memory_document_updated_at_index.clear();
         self.memory_document_status_updated_at_index.clear();
+        self.rebuild_vector_indexes_from_records()?;
         let ordered_designations = self.ordered_designations();
         self.ordered_indexes.clear();
         for designation in ordered_designations {
@@ -2148,6 +2430,35 @@ impl InMemoryGraphStore {
                 self.add_edge_indexes(&edge);
             }
         }
+        Ok(())
+    }
+
+    fn rebuild_vector_indexes_from_records(&mut self) -> GraphStoreResult<()> {
+        let designations = self.vector_designations.clone();
+        let mut indexes = HashMap::new();
+        for ((label, property), dimension) in &designations {
+            let key = (label.clone(), property.clone());
+            let bit_width = self.vector_bit_width_for_key(&key);
+            indexes.insert(key, VectorIndex::with_bit_width(*dimension, bit_width)?);
+        }
+        for node in self.nodes.values().filter(|node| !node.tombstone) {
+            for ((label, property), dimension) in &designations {
+                if !node.labels.iter().any(|candidate| candidate == label) {
+                    continue;
+                }
+                let Some(arr) = extract_float_array(&node.properties, property) else {
+                    continue;
+                };
+                if arr.len() != *dimension {
+                    continue;
+                }
+                if let Some(index) = indexes.get_mut(&(label.clone(), property.clone())) {
+                    index.insert(&node.id, &arr)?;
+                }
+            }
+        }
+        self.vector_indexes = indexes;
+        Ok(())
     }
 
     // ---- TTL primitive methods (design v2) ----
@@ -2275,7 +2586,7 @@ impl InMemoryGraphStore {
         }
         if !node.tombstone {
             self.add_node_indexes(&node);
-            self.auto_index_vectors(&node);
+            self.auto_index_vectors(&node)?;
         }
         self.nodes.insert(node.id.clone(), node);
         Ok(())
@@ -2414,6 +2725,9 @@ impl InMemoryGraphStore {
             }
         }
         self.remove_memory_document_index(node);
+        for index in self.vector_indexes.values_mut() {
+            index.remove(&node.id);
+        }
         for index in self.ordered_indexes.values_mut() {
             index.zrem(node.id.as_bytes());
         }
@@ -3820,14 +4134,35 @@ impl RedCoreGraphStore {
         property_name: &str,
         dimension: usize,
     ) -> GraphStoreResult<()> {
+        self.designate_vector_property_with_bit_width(
+            label,
+            property_name,
+            dimension,
+            self.store.vector_bit_width(),
+        )
+    }
+
+    pub fn designate_vector_property_with_bit_width(
+        &mut self,
+        label: &str,
+        property_name: &str,
+        dimension: usize,
+        bit_width: usize,
+    ) -> GraphStoreResult<()> {
         let designation = VectorDesignation {
             label: label.to_string(),
             property: property_name.to_string(),
             dimension,
+            bit_width,
         };
         let txn_id = self.last_txn_id + 1;
         let mut staged = self.store.clone();
-        staged.designate_vector_property(label, property_name, dimension)?;
+        staged.designate_vector_property_with_bit_width(
+            label,
+            property_name,
+            dimension,
+            bit_width,
+        )?;
         let graph_version = staged.stats().version;
         let prepublished_snapshot_txn_id = self.persist_before_publish(
             txn_id,
@@ -3890,6 +4225,10 @@ impl RedCoreGraphStore {
 
     pub fn vector_designations(&self) -> Vec<VectorDesignation> {
         self.store.vector_designations()
+    }
+
+    pub fn vector_index_manifest(&self) -> Vec<VectorIndexManifest> {
+        self.store.vector_index_manifest()
     }
 
     pub fn designate_ordered_property(
@@ -4107,8 +4446,12 @@ impl RedCoreGraphStore {
                 Ok(())
             }
             RedCoreMutation::VectorDesignation(d) => {
-                self.store
-                    .designate_vector_property(&d.label, &d.property, d.dimension)
+                self.store.designate_vector_property_with_bit_width(
+                    &d.label,
+                    &d.property,
+                    d.dimension,
+                    d.bit_width,
+                )
             }
             RedCoreMutation::OrderedDesignation(d) => {
                 self.store.designate_ordered_property(&d.label, &d.property)
@@ -7735,13 +8078,16 @@ mod tests {
         );
         assert!(store.verify().unwrap().ok);
         assert!(store.rebuild_indexes().unwrap().after.ok);
-        store
-            .designate_vector_property("Doc", "embedding", 2)
-            .unwrap();
-        let vector_hits = store
-            .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 2)
-            .unwrap();
-        assert_eq!(vector_hits[0].0, "doc:a");
+        #[cfg(not(feature = "vector-accelerated"))]
+        {
+            store
+                .designate_vector_property("Doc", "embedding", 2)
+                .unwrap();
+            let vector_hits = store
+                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 2)
+                .unwrap();
+            assert_eq!(vector_hits[0].0, "doc:a");
+        }
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -7906,6 +8252,13 @@ mod tests {
         std::env::temp_dir().join(format!("{label}-{unique}"))
     }
 
+    fn embedding8(x: f32, y: f32) -> Vec<f32> {
+        let mut vector = vec![0.0_f32; 8];
+        vector[0] = x;
+        vector[1] = y;
+        vector
+    }
+
     #[test]
     fn in_memory_stats_version_increments_per_upsert() {
         let mut store = InMemoryGraphStore::default();
@@ -7947,13 +8300,13 @@ mod tests {
     fn vector_designate_and_search_returns_nearest() {
         let mut store = InMemoryGraphStore::default();
         store
-            .designate_vector_property("Doc", "embedding", 3)
+            .designate_vector_property("Doc", "embedding", 8)
             .unwrap();
 
         for (id, vec) in [
-            ("doc:1", vec![1.0_f32, 0.0, 0.0]),
-            ("doc:2", vec![0.0, 1.0, 0.0]),
-            ("doc:3", vec![0.7, 0.7, 0.0]),
+            ("doc:1", embedding8(1.0, 0.0)),
+            ("doc:2", embedding8(0.0, 1.0)),
+            ("doc:3", embedding8(0.7, 0.7)),
         ] {
             store
                 .upsert_node(NodeRecord::new(id, ["Doc"], json!({ "embedding": vec })))
@@ -7961,10 +8314,11 @@ mod tests {
         }
 
         let results = store
-            .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 2)
+            .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 2)
             .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "doc:1");
+        #[cfg(not(feature = "vector-accelerated"))]
         assert!(
             results[0].1 < 0.01,
             "exact match should have near-zero distance"
@@ -7981,29 +8335,72 @@ mod tests {
         let mut beta = vec![0.0_f32; 128];
         beta[1] = 1.0;
 
-        index.insert("doc:alpha", &alpha);
-        index.insert("doc:beta", &beta);
+        index.insert("doc:alpha", &alpha).unwrap();
+        index.insert("doc:beta", &beta).unwrap();
 
-        assert!(
-            index.turbovec.is_some(),
-            "supported embedding dimensions should use Turbovec"
-        );
-        let results = index.search(&alpha, 1);
+        assert!(index.is_accelerated());
+        assert_eq!(index.bit_width(), 4);
+        assert_eq!(index.resident_full_precision_bytes(), 0);
+        let results = index.search(&alpha, 1).unwrap();
         assert_eq!(results[0].0, "doc:alpha");
-        assert!(results[0].1 < 0.01);
+    }
+
+    #[cfg(feature = "vector-accelerated")]
+    #[test]
+    fn vector_index_manifest_records_configured_bit_width_and_quantized_residency() {
+        let mut store = InMemoryGraphStore::default();
+        store
+            .designate_vector_property_with_bit_width("Doc", "embedding", 8, 2)
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:a",
+                ["Doc"],
+                json!({ "embedding": embedding8(1.0, 0.0) }),
+            ))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "doc:b",
+                ["Doc"],
+                json!({ "embedding": embedding8(0.0, 1.0) }),
+            ))
+            .unwrap();
+
+        let manifest = store.vector_index_manifest();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].bit_width, 2);
+        assert_eq!(manifest[0].indexed_vectors, 2);
+        assert_eq!(manifest[0].resident_vector_bytes, 4);
+        assert_eq!(manifest[0].resident_full_precision_bytes, 0);
+        assert!(manifest[0].accelerated);
+
+        let cloned_manifest = store.clone().vector_index_manifest();
+        assert_eq!(cloned_manifest[0].bit_width, 2);
+        assert_eq!(cloned_manifest[0].resident_full_precision_bytes, 0);
+    }
+
+    #[cfg(feature = "vector-accelerated")]
+    #[test]
+    fn vector_accelerated_rejects_unsupported_dimension_without_fallback() {
+        let mut store = InMemoryGraphStore::default();
+        let err = store
+            .designate_vector_property("Doc", "embedding", 3)
+            .unwrap_err();
+        assert_eq!(err.code, "unsupported_vector_dimension");
     }
 
     #[test]
     fn vector_search_dimension_mismatch_errors() {
         let mut store = InMemoryGraphStore::default();
         store
-            .designate_vector_property("Doc", "embedding", 3)
+            .designate_vector_property("Doc", "embedding", 8)
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "doc:1",
                 ["Doc"],
-                json!({ "embedding": [1.0, 0.0, 0.0] }),
+                json!({ "embedding": embedding8(1.0, 0.0) }),
             ))
             .unwrap();
 
@@ -8021,43 +8418,45 @@ mod tests {
     fn vector_redesignate_rebuilds_index_for_new_dimension() {
         let mut store = InMemoryGraphStore::default();
         store
-            .designate_vector_property("Doc", "embedding", 3)
+            .designate_vector_property("Doc", "embedding", 8)
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "doc:old",
                 ["Doc"],
-                json!({ "embedding": [1.0, 0.0, 0.0] }),
+                json!({ "embedding": embedding8(1.0, 0.0) }),
             ))
             .unwrap();
         assert_eq!(
             store
-                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 1)
+                .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 1)
                 .unwrap()[0]
                 .0,
             "doc:old"
         );
 
         store
-            .designate_vector_property("Doc", "embedding", 2)
+            .designate_vector_property("Doc", "embedding", 16)
             .unwrap();
         assert!(
             store
-                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 1)
+                .vector_search(Some("Doc"), "embedding", &vec![1.0_f32; 16], 1)
                 .unwrap()
                 .is_empty(),
-            "old 3-d vector must not survive the 2-d designation rebuild"
+            "old 8-d vector must not survive the 16-d designation rebuild"
         );
+        let mut new_embedding = vec![0.0_f32; 16];
+        new_embedding[0] = 1.0;
         store
             .upsert_node(NodeRecord::new(
                 "doc:new",
                 ["Doc"],
-                json!({ "embedding": [1.0, 0.0] }),
+                json!({ "embedding": new_embedding.clone() }),
             ))
             .unwrap();
         assert_eq!(
             store
-                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0], 1)
+                .vector_search(Some("Doc"), "embedding", &new_embedding, 1)
                 .unwrap()[0]
                 .0,
             "doc:new"
@@ -8068,26 +8467,26 @@ mod tests {
     fn vector_auto_index_on_upsert() {
         let mut store = InMemoryGraphStore::default();
         store
-            .designate_vector_property("Doc", "embedding", 2)
+            .designate_vector_property("Doc", "embedding", 8)
             .unwrap();
 
         store
             .upsert_node(NodeRecord::new(
                 "doc:a",
                 ["Doc"],
-                json!({ "embedding": [1.0, 0.0] }),
+                json!({ "embedding": embedding8(1.0, 0.0) }),
             ))
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "doc:b",
                 ["Doc"],
-                json!({ "embedding": [0.0, 1.0] }),
+                json!({ "embedding": embedding8(0.0, 1.0) }),
             ))
             .unwrap();
 
         let results = store
-            .vector_search(Some("Doc"), "embedding", &[0.0, 1.0], 1)
+            .vector_search(Some("Doc"), "embedding", &embedding8(0.0, 1.0), 1)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "doc:b");
@@ -8097,28 +8496,28 @@ mod tests {
     fn hybrid_search_blends_vector_and_graph() {
         let mut store = InMemoryGraphStore::default();
         store
-            .designate_vector_property("Doc", "embedding", 2)
+            .designate_vector_property("Doc", "embedding", 8)
             .unwrap();
 
         store
             .upsert_node(NodeRecord::new(
                 "doc:a",
                 ["Doc"],
-                json!({ "embedding": [1.0, 0.0] }),
+                json!({ "embedding": embedding8(1.0, 0.0) }),
             ))
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "doc:b",
                 ["Doc"],
-                json!({ "embedding": [0.9, 0.1] }),
+                json!({ "embedding": embedding8(0.9, 0.1) }),
             ))
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "doc:c",
                 ["Doc"],
-                json!({ "embedding": [0.0, 1.0] }),
+                json!({ "embedding": embedding8(0.0, 1.0) }),
             ))
             .unwrap();
 
@@ -8130,7 +8529,7 @@ mod tests {
             .hybrid_search(
                 Some("Doc"),
                 "embedding",
-                &[1.0, 0.0],
+                &embedding8(1.0, 0.0),
                 3,
                 &["doc:c".to_string()],
                 2,
@@ -8150,27 +8549,27 @@ mod tests {
     fn hybrid_search_can_penalize_contradicting_edges() {
         let mut store = InMemoryGraphStore::default();
         store
-            .designate_vector_property("Claim", "embedding", 2)
+            .designate_vector_property("Claim", "embedding", 8)
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "claim:seed",
                 ["Claim"],
-                json!({ "embedding": [1.0, 0.0] }),
+                json!({ "embedding": embedding8(1.0, 0.0) }),
             ))
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "claim:support",
                 ["Claim"],
-                json!({ "embedding": [0.95, 0.05] }),
+                json!({ "embedding": embedding8(0.95, 0.05) }),
             ))
             .unwrap();
         store
             .upsert_node(NodeRecord::new(
                 "claim:against",
                 ["Claim"],
-                json!({ "embedding": [0.95, 0.05] }),
+                json!({ "embedding": embedding8(0.95, 0.05) }),
             ))
             .unwrap();
         store
@@ -8199,7 +8598,7 @@ mod tests {
             .hybrid_search(
                 Some("Claim"),
                 "embedding",
-                &[1.0, 0.0],
+                &embedding8(1.0, 0.0),
                 3,
                 &["claim:seed".to_string()],
                 1,
@@ -8337,17 +8736,17 @@ mod tests {
         {
             let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
             store
-                .designate_vector_property("Doc", "embedding", 3)
+                .designate_vector_property_with_bit_width("Doc", "embedding", 8, 2)
                 .unwrap();
             store
                 .upsert_node(NodeRecord::new(
                     "doc:1",
                     ["Doc"],
-                    json!({ "embedding": [1.0, 0.0, 0.0] }),
+                    json!({ "embedding": embedding8(1.0, 0.0) }),
                 ))
                 .unwrap();
             let results = store
-                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 1)
+                .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 1)
                 .unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, "doc:1");
@@ -8358,10 +8757,12 @@ mod tests {
             let desigs = store.vector_designations();
             assert_eq!(desigs.len(), 1);
             assert_eq!(desigs[0].label, "Doc");
-            assert_eq!(desigs[0].dimension, 3);
+            assert_eq!(desigs[0].dimension, 8);
+            assert_eq!(desigs[0].bit_width, 2);
+            assert_eq!(store.vector_index_manifest()[0].bit_width, 2);
 
             let results = store
-                .vector_search(Some("Doc"), "embedding", &[1.0, 0.0, 0.0], 1)
+                .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 1)
                 .unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, "doc:1");

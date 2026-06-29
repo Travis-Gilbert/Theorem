@@ -22,7 +22,7 @@ Every modality lives on, or is reachable through, the core `GraphStore`. The sto
 | Modality | What you get | Where it lives |
 |----------|--------------|----------------|
 | Property graph | `NodeRecord`/`EdgeRecord` with confidence-weighted epistemic edges; PageRank, personalized PageRank (cached), connected components, communities, bounded/weighted paths | `rustyred-thg-core` (`graph_store.rs`, `graph.rs`, `ppr_cache.rs`) |
-| Vector | First-class designations: `designate_vector_property`, `vector_search`, `hybrid_search`. Exact normalized cosine by default; optional TurboVec acceleration. Not HNSW. | `rustyred-thg-core` (`graph_store.rs`; `vector-accelerated` feature) |
+| Vector | First-class designations: `designate_vector_property`, `vector_search`, `hybrid_search`. The default build keeps exact normalized cosine for local/dev use; `vector-accelerated` uses resident TurboVec quantized indexes at configured 2- or 4-bit widths with no resident full-precision corpus. Not HNSW. | `rustyred-thg-core` (`graph_store.rs`; `vector-accelerated` feature) |
 | Relational / SQL | Native planner (`QueryIr`, `execute_query`, roaring-bitmap intersections, `PlanTrace`), pluggable access methods, `NativeCatalog`, rank fusion (`FusionPolicy`: RRF default, weighted, cascade). A Postgres wire server lowers SQL to this planner. | `rustyred-thg-core` (`relational.rs`, `planner.rs`, `access_method.rs`, `ranking.rs`); `rustyred-thg-pg-server` |
 | Full-text | Hand-rolled BM25 inverted index (`FullTextIndex`); optional Tantivy backend | `rustyred-thg-core` (`fulltext.rs`; `tantivy` feature) |
 | Spatial | H3-cell index (`SpatialIndex`, via h3o); optional S2 backend; radius and bbox search | `rustyred-thg-core` (`spatial.rs`; `s2` feature); composed with time in `rustyred-thg-geotemporal` |
@@ -179,7 +179,7 @@ python -m pytest tests/            # test_*_parity.py, test_smoke.py
 
 Notable Cargo features:
 
-- `rustyred-thg-core`: `redis-store` (the Redis backend), `vector-accelerated` (TurboVec), `tantivy` (alternative full-text backend), `s2` (alternative spatial backend). All default-off; the default build is exact cosine, hand-rolled BM25, and H3.
+- `rustyred-thg-core`: `redis-store` (the Redis backend), `vector-accelerated` (TurboVec quantized vector residency), `tantivy` (alternative full-text backend), `s2` (alternative spatial backend). All default-off; the default build is exact cosine, hand-rolled BM25, and H3.
 - `rustyred-thg-adapters`: `pairformer-burn-cubecl` pulls Burn 0.21 / CubeCL 0.10, which need rustc 1.92 or newer (above the crate's declared MSRV). The default build is the deterministic reference path and builds on 1.85.
 
 The release binary is `rustyred-thg-server`; the `Dockerfile` builds only that crate and copy-renames it to `rusty-red-graph-server` for the Railway service.

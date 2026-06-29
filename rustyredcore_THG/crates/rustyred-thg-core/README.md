@@ -2,7 +2,7 @@
 
 The substrate engine: a multimodal, in-process, graph-native database with no Django, Python, network-server, or tokio dependency. Every Theorem surface (the PyO3 module, the product server, the Postgres-wire server, direct Rust callers) executes this crate.
 
-It is a property-graph core plus durable file-backed storage, a content-addressed cold-tier storage spine, a copy-on-write document/folder tree, a native relational/SQL planner with pluggable access methods and rank fusion, exact vector search, BM25 full-text and H3 spatial primitives, temporal/TTL facilities, git-style versioned-graph commits, post-commit reactive hooks, a CRDT layer, stream logs, and a family of symbolic engines.
+It is a property-graph core plus durable file-backed storage, a content-addressed cold-tier storage spine, a copy-on-write document/folder tree, a native relational/SQL planner with pluggable access methods and rank fusion, TurboVec quantized vector search for accelerated builds, BM25 full-text and H3 spatial primitives, temporal/TTL facilities, git-style versioned-graph commits, post-commit reactive hooks, a CRDT layer, stream logs, and a family of symbolic engines.
 
 ## The three GraphStore impls
 
@@ -17,7 +17,7 @@ UFCS gotcha: `RedCoreGraphStore` and `RedisGraphStore` define inherent `get_node
 ## Modalities and key API
 
 - Graph: `NodeRecord`, `EdgeRecord` (`confidence`, `epistemic_type`, `provenance`, `content_hash`, `parent_hashes`), `NeighborQuery`, `NodeQuery`, `GraphStats`. Algorithms (`graph.rs`): `pagerank`, `personalized_pagerank`, `connected_components`, `label_propagation_communities`, `expand_bounded[_weighted]`, `paths_shortest[_weighted]`. Cached PPR in `ppr_cache.rs` (`cached_personalized_pagerank`, keyed on `stats().version`). CSR adjacency in `graph_csr.rs`.
-- Vector: `designate_vector_property(label, property, dimension)`, `vector_search(label, property, query, k)`, `hybrid_search` / `hybrid_search_with_config` (`HybridScoringConfig`). Default is exact normalized cosine. The `vector-accelerated` feature adds a TurboVec binary-quantized index above a 64-point threshold, re-ranked by exact cosine. This is not HNSW.
+- Vector: `designate_vector_property(label, property, dimension)`, `vector_search(label, property, query, k)`, `hybrid_search` / `hybrid_search_with_config` (`HybridScoringConfig`). The default build keeps the legacy exact normalized-cosine path for local/dev use. The `vector-accelerated` feature is the resident production path: every vector designation builds a TurboVec quantized index at a configured 2- or 4-bit width, records that width in the index manifest, rejects unsupported dimensions at designation time, and does not retain a resident full-precision corpus or exact rerank fallback. This is not HNSW.
 - Relational / SQL: `relational.rs` (`RelationalStore`, `RelationSchema`, `NativeCatalog`, `from_graph_snapshot`), `access_method.rs` (`AccessMethod`, `AccessMethodRegistry::with_native_defaults`, `Predicate`, `ModalityResolver`), `planner.rs` (`QueryIr`, `execute_query`, `execute_query_with_resolver`, `compile_graphql_selection`, `FusionPolicy::{Rrf, Weighted, Cascade}`), `ranking.rs` (`RankingRule`, `apply_cascade`, `EpistemicGate`).
 - Full-text: `fulltext.rs` (`FullTextIndex`, BM25 k1=1.2 b=0.75; `make_fulltext_backend`). A standalone primitive reached via `ModalityResolver`, not a store method. Optional `tantivy` backend.
 - Spatial: `spatial.rs` (`SpatialIndex` over h3o, `radius_search`/`bbox_search`). Standalone primitive via `ModalityResolver`. Optional `s2` backend.
