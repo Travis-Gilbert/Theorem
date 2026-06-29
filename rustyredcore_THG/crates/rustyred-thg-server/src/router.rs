@@ -1301,6 +1301,34 @@ fn mcp_blocking_concurrency_from_env(value: Option<&str>) -> usize {
         .unwrap_or(4)
 }
 
+fn hippo_auto_index_memory_default() -> bool {
+    std::env::var("THEOREM_HIPPO_AUTO_INDEX_MEMORY")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn hippo_memory_index_limit_default() -> u64 {
+    std::env::var("THEOREM_HIPPO_MEMORY_INDEX_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|limit| (1..=5_000).contains(limit))
+        .unwrap_or(50)
+}
+
+fn hippo_memory_page_text_limit_chars() -> usize {
+    std::env::var("THEOREM_HIPPO_MEMORY_TEXT_LIMIT_CHARS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| (1_000..=256_000).contains(limit))
+        .unwrap_or(24_000)
+}
+
 fn mcp_payload_tenant(
     config: &rustyred_thg_mcp::McpServerConfig,
     payload: &Value,
@@ -2579,7 +2607,7 @@ async fn hippo_retrieve_payload(
         .get("auto_index_memory")
         .or_else(|| arguments.get("autoIndexMemory"))
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or_else(hippo_auto_index_memory_default);
     let hippo_query_vector = hippo_query_vector_from_env(&query).await?;
 
     let mut store = state.tenant_graph_store(&tenant).map_err(|error| {
@@ -2676,7 +2704,7 @@ async fn warm_hippo_memory_index(
     arguments: &Value,
 ) -> Result<Value, Value> {
     let index_limit = argument_u64_any(arguments, &["index_limit", "indexLimit"])
-        .unwrap_or(200)
+        .unwrap_or_else(hippo_memory_index_limit_default)
         .clamp(1, 5_000) as usize;
     let existing_phrases = store
         .query_nodes(NodeQuery::label(rustyred_hipporag::schema::LABEL_PHRASE).with_limit(1))
@@ -2689,6 +2717,7 @@ async fn warm_hippo_memory_index(
     let mut passages_indexed = 0usize;
     let mut phrases_upserted = 0usize;
     let mut contains_edges = 0usize;
+    let mut texts_truncated = 0usize;
     let mut source_page_ids = Vec::new();
     let tenant_aliases = hippo_tenant_slug_aliases(tenant);
     let mut source_ids_seen = BTreeSet::new();
@@ -2722,9 +2751,12 @@ async fn warm_hippo_memory_index(
                 if !source_ids_seen.insert(node.id.clone()) {
                     continue;
                 }
-                let text = hippo_memory_page_text(&node);
+                let (text, truncated) = bounded_hippo_memory_page_text(&node);
                 if text.trim().is_empty() {
                     continue;
+                }
+                if truncated {
+                    texts_truncated += 1;
                 }
                 memory_sources_seen += 1;
                 let page_id = format!("hippo:page:memory:{}", stable_hash(&node.id));
@@ -2804,6 +2836,7 @@ async fn warm_hippo_memory_index(
         "passages_indexed": passages_indexed,
         "phrases_upserted": phrases_upserted,
         "contains_edges": contains_edges,
+        "texts_truncated": texts_truncated,
         "hubs": hub_stats
     }))
 }
@@ -2841,6 +2874,15 @@ fn hippo_memory_page_text(node: &NodeRecord) -> String {
         .filter(|value| !value.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn bounded_hippo_memory_page_text(node: &NodeRecord) -> (String, bool) {
+    let text = hippo_memory_page_text(node);
+    let limit = hippo_memory_page_text_limit_chars();
+    if text.chars().count() <= limit {
+        return (text, false);
+    }
+    (text.chars().take(limit).collect(), true)
 }
 
 fn hippo_index_store_error(error: GraphStoreError) -> Value {
@@ -10222,7 +10264,8 @@ mod tests {
                     "arguments": {
                         "tenant": "Travis-Gilbert",
                         "query": "Commonplace wedge associative recall",
-                        "top_k": 4
+                        "top_k": 4,
+                        "auto_index_memory": true
                     }
                 }
             }),
@@ -10238,6 +10281,55 @@ mod tests {
         assert!(payload["candidates"].as_array().unwrap().len() >= 1);
         assert_eq!(payload["trace"]["ran_query_ppr"], true);
         assert!(payload["stats"]["seeds"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_hippo_retrieve_does_not_auto_index_memory_by_default() {
+        let state = memory_product_state();
+        {
+            let mut store = state.tenant_graph_store("Travis-Gilbert").unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "mem:doc:hippo-default-off",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "travis-gilbert",
+                        "doc_id": "doc-hippo-default-off",
+                        "kind": "decision",
+                        "title": "Default off Hippo",
+                        "summary": "Hippo memory indexing should not run during ordinary retrieval.",
+                        "content": "Ordinary Hippo retrieval must not expand memory documents unless auto indexing is explicit.",
+                        "status": "active"
+                    }),
+                ))
+                .unwrap();
+        }
+        let config = state.mcp_config();
+        let response = maybe_handle_hippo_retrieve_mcp(
+            &state,
+            &config,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "hippo-retrieve-default-off",
+                "method": "tools/call",
+                "params": {
+                    "name": "hippo_retrieve",
+                    "arguments": {
+                        "tenant": "Travis-Gilbert",
+                        "query": "Default off Hippo retrieval",
+                        "top_k": 4
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("hippo_retrieve MCP route should be intercepted by the async server");
+
+        let payload = &response["result"]["structuredContent"];
+        assert_eq!(payload["tenant"], "Travis-Gilbert");
+        assert_eq!(payload["indexing"]["ran"], false);
+        assert_eq!(payload["indexing"]["reason"], "disabled_by_request");
+        assert_eq!(payload["stats"]["memory_index_pages_upserted"], 0);
     }
 
     #[tokio::test]
