@@ -2536,7 +2536,13 @@ pub fn reconcile(
     root: impl AsRef<Path>,
     prefix: &str,
 ) -> Result<IndexReceipt, WorkspaceError> {
-    reconcile_with_max_file_bytes(engine, root, prefix, DEFAULT_MAX_FILE_BYTES)
+    reconcile_with_limits(
+        engine,
+        root,
+        prefix,
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
 }
 
 pub fn reconcile_with_options(
@@ -2544,7 +2550,13 @@ pub fn reconcile_with_options(
     root: impl AsRef<Path>,
     options: &MirrorImportOptions,
 ) -> Result<IndexReceipt, WorkspaceError> {
-    reconcile_with_max_file_bytes(engine, root, &options.prefix, options.max_file_bytes)
+    reconcile_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
 }
 
 fn reconcile_with_max_file_bytes(
@@ -2553,8 +2565,24 @@ fn reconcile_with_max_file_bytes(
     prefix: &str,
     max_file_bytes: u64,
 ) -> Result<IndexReceipt, WorkspaceError> {
+    reconcile_with_limits(
+        engine,
+        root,
+        prefix,
+        max_file_bytes,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
+}
+
+fn reconcile_with_limits(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<IndexReceipt, WorkspaceError> {
     let root = canonical_root(root.as_ref())?;
-    let snapshot = filesystem_hashes(&root, prefix, max_file_bytes)?;
+    let snapshot = filesystem_hashes(&root, prefix, max_file_bytes, max_total_bytes)?;
     let disk = snapshot.files;
     let doc = doctree_paths(engine, prefix)?;
     let files = file_node_paths(engine, prefix)?;
@@ -2643,7 +2671,13 @@ pub fn rebuild_code_index_with_options(
     root: impl AsRef<Path>,
     options: &MirrorImportOptions,
 ) -> Result<IndexReceipt, WorkspaceError> {
-    rebuild_code_index_with_max_file_bytes(engine, root, &options.prefix, options.max_file_bytes)
+    rebuild_code_index_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
 }
 
 fn rebuild_code_index_with_max_file_bytes(
@@ -2661,6 +2695,22 @@ fn rebuild_code_index_with_max_file_bytes(
     Ok(rebuilt)
 }
 
+fn rebuild_code_index_with_limits(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<IndexReceipt, WorkspaceError> {
+    let dropped = drop_code_index(engine, prefix)?;
+    let mut rebuilt = reconcile_with_limits(engine, root, prefix, max_file_bytes, max_total_bytes)?;
+    rebuilt.files_removed = rebuilt.files_removed.saturating_add(dropped.files_removed);
+    rebuilt.paths.extend(dropped.paths);
+    rebuilt.paths.sort();
+    rebuilt.paths.dedup();
+    Ok(rebuilt)
+}
+
 /// Consistency oracle. It reads the live filesystem fresh on every call and
 /// compares it to the downstream File nodes plus DocTree entries.
 pub fn audit_consistency(
@@ -2668,7 +2718,13 @@ pub fn audit_consistency(
     root: impl AsRef<Path>,
     prefix: &str,
 ) -> Result<Divergence, WorkspaceError> {
-    audit_consistency_with_max_file_bytes(engine, root, prefix, DEFAULT_MAX_FILE_BYTES)
+    audit_consistency_with_limits(
+        engine,
+        root,
+        prefix,
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
 }
 
 pub fn audit_consistency_with_options(
@@ -2676,17 +2732,24 @@ pub fn audit_consistency_with_options(
     root: impl AsRef<Path>,
     options: &MirrorImportOptions,
 ) -> Result<Divergence, WorkspaceError> {
-    audit_consistency_with_max_file_bytes(engine, root, &options.prefix, options.max_file_bytes)
+    audit_consistency_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
 }
 
-fn audit_consistency_with_max_file_bytes(
+fn audit_consistency_with_limits(
     engine: &Engine,
     root: impl AsRef<Path>,
     prefix: &str,
     max_file_bytes: u64,
+    max_total_bytes: u64,
 ) -> Result<Divergence, WorkspaceError> {
     let root = canonical_root(root.as_ref())?;
-    let disk = filesystem_hashes(&root, prefix, max_file_bytes)?.files;
+    let disk = filesystem_hashes(&root, prefix, max_file_bytes, max_total_bytes)?.files;
     let doc = doctree_paths(engine, prefix)?;
     let files = file_node_paths(engine, prefix)?;
     let mut all_indexed = BTreeSet::new();
@@ -2736,7 +2799,13 @@ pub fn audit(
     root: impl AsRef<Path>,
     prefix: &str,
 ) -> Result<AuditReceipt, WorkspaceError> {
-    audit_with_max_file_bytes(engine, root, prefix, DEFAULT_MAX_FILE_BYTES)
+    audit_with_limits(
+        engine,
+        root,
+        prefix,
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
 }
 
 pub fn audit_with_options(
@@ -2744,17 +2813,25 @@ pub fn audit_with_options(
     root: impl AsRef<Path>,
     options: &MirrorImportOptions,
 ) -> Result<AuditReceipt, WorkspaceError> {
-    audit_with_max_file_bytes(engine, root, &options.prefix, options.max_file_bytes)
+    audit_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
 }
 
-fn audit_with_max_file_bytes(
+fn audit_with_limits(
     engine: &Engine,
     root: impl AsRef<Path>,
     prefix: &str,
     max_file_bytes: u64,
+    max_total_bytes: u64,
 ) -> Result<AuditReceipt, WorkspaceError> {
     let root = canonical_root(root.as_ref())?;
-    let divergence = audit_consistency_with_max_file_bytes(engine, &root, prefix, max_file_bytes)?;
+    let divergence =
+        audit_consistency_with_limits(engine, &root, prefix, max_file_bytes, max_total_bytes)?;
     Ok(AuditReceipt {
         root,
         divergence_count: divergence.count(),
@@ -3093,6 +3170,7 @@ pub struct WorkspaceMirrorWatcher {
     root: PathBuf,
     prefix: String,
     max_file_bytes: u64,
+    max_total_bytes: u64,
     rx: Receiver<DebounceEventResult>,
     #[cfg(test)]
     tx: Sender<DebounceEventResult>,
@@ -3105,7 +3183,13 @@ impl WorkspaceMirrorWatcher {
         prefix: &str,
         debounce: Duration,
     ) -> Result<Self, WorkspaceError> {
-        Self::start_with_max_file_bytes(root, prefix, DEFAULT_MAX_FILE_BYTES, debounce)
+        Self::start_with_limits(
+            root,
+            prefix,
+            DEFAULT_MAX_FILE_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES,
+            debounce,
+        )
     }
 
     pub fn start_with_options(
@@ -3113,13 +3197,20 @@ impl WorkspaceMirrorWatcher {
         options: &MirrorImportOptions,
         debounce: Duration,
     ) -> Result<Self, WorkspaceError> {
-        Self::start_with_max_file_bytes(root, &options.prefix, options.max_file_bytes, debounce)
+        Self::start_with_limits(
+            root,
+            &options.prefix,
+            options.max_file_bytes,
+            options.max_total_bytes,
+            debounce,
+        )
     }
 
-    fn start_with_max_file_bytes(
+    fn start_with_limits(
         root: impl AsRef<Path>,
         prefix: &str,
         max_file_bytes: u64,
+        max_total_bytes: u64,
         debounce: Duration,
     ) -> Result<Self, WorkspaceError> {
         let root = canonical_root(root.as_ref())?;
@@ -3135,6 +3226,7 @@ impl WorkspaceMirrorWatcher {
             root,
             prefix: prefix.trim_matches('/').to_string(),
             max_file_bytes,
+            max_total_bytes,
             rx,
             #[cfg(test)]
             tx: test_tx,
@@ -3182,7 +3274,13 @@ impl WorkspaceMirrorWatcher {
             }
         }
         if saw_event {
-            reconcile_with_max_file_bytes(engine, &self.root, &self.prefix, self.max_file_bytes)
+            reconcile_with_limits(
+                engine,
+                &self.root,
+                &self.prefix,
+                self.max_file_bytes,
+                self.max_total_bytes,
+            )
         } else {
             Ok(IndexReceipt {
                 root: self.root.clone(),
@@ -3196,7 +3294,13 @@ impl WorkspaceMirrorWatcher {
     }
 
     pub fn force_rescan(&mut self, engine: &Engine) -> Result<IndexReceipt, WorkspaceError> {
-        reconcile_with_max_file_bytes(engine, &self.root, &self.prefix, self.max_file_bytes)
+        reconcile_with_limits(
+            engine,
+            &self.root,
+            &self.prefix,
+            self.max_file_bytes,
+            self.max_total_bytes,
+        )
     }
 
     #[cfg(test)]
@@ -3205,7 +3309,13 @@ impl WorkspaceMirrorWatcher {
     }
 
     pub fn audit(&self, engine: &Engine) -> Result<AuditReceipt, WorkspaceError> {
-        audit_with_max_file_bytes(engine, &self.root, &self.prefix, self.max_file_bytes)
+        audit_with_limits(
+            engine,
+            &self.root,
+            &self.prefix,
+            self.max_file_bytes,
+            self.max_total_bytes,
+        )
     }
 
     pub fn audit_prometheus(&self, engine: &Engine) -> Result<String, WorkspaceError> {
@@ -3221,11 +3331,12 @@ impl WorkspaceMirrorWatcher {
         let started = Instant::now();
         loop {
             self.drain(engine)?;
-            let divergence = audit_consistency_with_max_file_bytes(
+            let divergence = audit_consistency_with_limits(
                 engine,
                 &self.root,
                 &self.prefix,
                 self.max_file_bytes,
+                self.max_total_bytes,
             )?;
             if divergence.is_empty() {
                 return Ok(divergence);
@@ -3646,8 +3757,12 @@ fn prepare_mirror_root(
     workspace_root: Option<&Path>,
     options: &MirrorImportOptions,
 ) -> Result<(PathBuf, CopyReceipt), WorkspaceError> {
+    let repo = fs::canonicalize(repo).map_err(|error| WorkspaceError::Io {
+        path: repo.to_path_buf(),
+        message: error.to_string(),
+    })?;
     let Some(root) = workspace_root else {
-        return Ok((repo.to_path_buf(), CopyReceipt::default()));
+        return Ok((repo, CopyReceipt::default()));
     };
     fs::create_dir_all(root).map_err(|error| WorkspaceError::Io {
         path: root.to_path_buf(),
@@ -3660,9 +3775,10 @@ fn prepare_mirror_root(
     if repo == root {
         return Ok((root, CopyReceipt::default()));
     }
+    clear_directory_contents(&root)?;
 
     let mut receipt = CopyReceipt::default();
-    let mut builder = WalkBuilder::new(repo);
+    let mut builder = WalkBuilder::new(&repo);
     builder
         .hidden(false)
         .git_ignore(true)
@@ -3672,7 +3788,7 @@ fn prepare_mirror_root(
         let entry = entry.map_err(|error| WorkspaceError::Walk(error.to_string()))?;
         let path = entry.path();
         let relative = path
-            .strip_prefix(repo)
+            .strip_prefix(&repo)
             .map_err(|error| WorkspaceError::Path(error.to_string()))?;
         if should_skip(relative) {
             receipt.files_skipped += 1;
@@ -3723,12 +3839,43 @@ fn prepare_mirror_root(
     Ok((root, receipt))
 }
 
+fn clear_directory_contents(root: &Path) -> Result<(), WorkspaceError> {
+    for entry in fs::read_dir(root).map_err(|error| WorkspaceError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| WorkspaceError::Io {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| WorkspaceError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        if file_type.is_dir() {
+            fs::remove_dir_all(&path).map_err(|error| WorkspaceError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+        } else {
+            fs::remove_file(&path).map_err(|error| WorkspaceError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn filesystem_hashes(
     root: &Path,
     prefix: &str,
     max_file_bytes: u64,
+    max_total_bytes: u64,
 ) -> Result<FilesystemSnapshot, WorkspaceError> {
     let mut snapshot = FilesystemSnapshot::default();
+    let mut bytes_seen = 0u64;
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -3771,10 +3918,24 @@ fn filesystem_hashes(
             snapshot.files_skipped += 1;
             continue;
         }
+        let next_total = bytes_seen.saturating_add(metadata.len());
+        if next_total > max_total_bytes {
+            return Err(WorkspaceError::Limit(format!(
+                "mirror scan exceeds max_total_bytes {max_total_bytes} at {:?}",
+                relative
+            )));
+        }
         let Some(body) = read_stable_file(&canonical, max_file_bytes) else {
             snapshot.files_skipped += 1;
             continue;
         };
+        bytes_seen = bytes_seen.saturating_add(body.len() as u64);
+        if bytes_seen > max_total_bytes {
+            return Err(WorkspaceError::Limit(format!(
+                "mirror scan exceeds max_total_bytes {max_total_bytes} at {:?}",
+                relative
+            )));
+        }
         let engine_path = import_path(prefix, relative)?;
         snapshot.files.insert(
             engine_path,
@@ -6715,6 +6876,56 @@ mod tests {
                 .is_empty(),
             "oversized files are outside the captured mirror region"
         );
+    }
+
+    #[test]
+    fn reconcile_with_options_enforces_total_byte_limit() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(checkout.path().join("src/a.rs"), "aaaa\n");
+        write(checkout.path().join("src/b.rs"), "bbbb\n");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let error = reconcile_with_options(
+            &engine,
+            checkout.path(),
+            &MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                max_total_bytes: 5,
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect_err("reconcile should enforce max_total_bytes");
+        assert!(
+            error.to_string().contains("max_total_bytes"),
+            "expected max_total_bytes error, got {error}"
+        );
+    }
+
+    #[test]
+    fn mirror_copy_cleans_stale_workspace_files_before_reconcile() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(checkout.path().join("src/new.rs"), "pub fn new() {}\n");
+        let workspace = TempDir::new().expect("workspace tempdir");
+        write(workspace.path().join("src/stale.rs"), "pub fn stale() {}\n");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                workspace_root: Some(workspace.path().to_path_buf()),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        assert!(workspace.path().join("src/new.rs").is_file());
+        assert!(!workspace.path().join("src/stale.rs").exists());
+        let paths = engine
+            .list_paths("repos/demo")
+            .expect("list mirrored paths");
+        assert_eq!(paths, vec!["repos/demo/src/new.rs".to_string()]);
     }
 
     #[test]

@@ -224,6 +224,7 @@ async fn prepare_loopback_server(
     data_dir: impl AsRef<Path>,
     api_key: impl Into<String>,
     instance: impl Into<String>,
+    repository_connector: Option<RepositoryConnectorRef>,
 ) -> Result<(Router, tokio::net::TcpListener), String> {
     let data_dir = data_dir.as_ref();
     let store = redcore_store(data_dir).map_err(|error| {
@@ -233,7 +234,6 @@ async fn prepare_loopback_server(
         )
     })?;
     let registry = Arc::new(ApiKeyRegistry::new().with_key(api_key.into(), instance.into()));
-    let repository_connector = connector_from_env()?;
     let app = build_loopback_router_from_schema(
         build_schema_with_model_and_repository_connector(
             store,
@@ -256,7 +256,7 @@ pub async fn serve_loopback(
     instance: impl Into<String>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
-    let (app, listener) = prepare_loopback_server(addr, data_dir, api_key, instance).await?;
+    let (app, listener) = prepare_loopback_server(addr, data_dir, api_key, instance, None).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
@@ -271,7 +271,7 @@ pub async fn serve_loopback_with_ready(
     ready: SyncSender<Result<(), String>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
-    match prepare_loopback_server(addr, data_dir, api_key, instance).await {
+    match prepare_loopback_server(addr, data_dir, api_key, instance, None).await {
         Ok((app, listener)) => {
             let _ = ready.send(Ok(()));
             axum::serve(listener, app)
@@ -318,6 +318,7 @@ mod tests {
             &data_dir,
             "loopback-test-key",
             "default",
+            None,
         )
         .await
         .expect("prepare loopback server");

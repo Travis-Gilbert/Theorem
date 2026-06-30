@@ -158,19 +158,6 @@ impl EngineRepositoryConnector {
         let mut installation_id = github_installation_id;
 
         if let Some(credential_ref) = credential_ref {
-            if let Some(env_name) = credential_ref.strip_prefix("env:") {
-                let env_name = env_name.trim();
-                if env_name.is_empty() {
-                    return Err("credentialRef env: requires a variable name".to_string());
-                }
-                let token = std::env::var(env_name)
-                    .map_err(|_| format!("credentialRef env:{env_name} is not set"))?;
-                let token = token.trim().to_string();
-                if token.is_empty() {
-                    return Err(format!("credentialRef env:{env_name} is empty"));
-                }
-                return Ok(Some(GitCredential::BearerToken(token)));
-            }
             if let Some(raw_id) = credential_ref.strip_prefix("github-installation:") {
                 let parsed = raw_id.trim().parse::<u64>().map_err(|error| {
                     format!("credentialRef github-installation requires a numeric id: {error}")
@@ -184,9 +171,20 @@ impl EngineRepositoryConnector {
                     }
                 }
                 installation_id = Some(parsed);
+            } else if credential_ref == "server:default" || credential_ref == "default" {
+                let resolver = self.credential_resolver.as_ref().ok_or_else(|| {
+                    "no repository credential resolver configured for server default credential"
+                        .to_string()
+                })?;
+                return resolver
+                    .resolve(repo_url)
+                    .ok_or_else(|| {
+                        "credential resolver returned no server default credential".to_string()
+                    })
+                    .map(Some);
             } else {
                 return Err(
-                    "unsupported credentialRef; expected env:NAME or github-installation:ID"
+                    "unsupported credentialRef; expected server:default or github-installation:ID"
                         .to_string(),
                 );
             }

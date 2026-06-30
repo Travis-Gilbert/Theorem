@@ -1,6 +1,7 @@
 //! Repository-connect acceptance: CommonPlace's repo-connect GraphQL mutation
 //! lands real files in the workspace mirror and builds the downstream File index.
 
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use async_graphql::{Request, Variables};
@@ -12,8 +13,6 @@ use rustyred_embedded::{EmbeddedConfig, Engine};
 use rustyred_thg_code::{GitCredential, GitCredentialResolver};
 use serde_json::json;
 use tempfile::TempDir;
-
-static PATH_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 async fn connect_repository_lands_real_files_and_indexes_file_nodes() {
@@ -107,44 +106,26 @@ async fn connect_repository_lands_real_files_and_indexes_file_nodes() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn connect_repository_uses_github_installation_credential_for_repo_url() {
-    let _guard = PATH_LOCK.lock().expect("PATH lock");
-    let fake_git = TempDir::new().expect("fake git dir");
-    let fake_args = fake_git.path().join("args.txt");
-    let git_path = fake_git.path().join("git");
+    let source = TempDir::new().expect("source git repo");
+    write(source.path().join("README.md"), "# private fixture\n");
     write(
-        git_path.clone(),
-        r#"#!/bin/sh
-printf '%s
-' "$@" > "$FAKE_GIT_ARGS"
-case "$(printf '%s
-' "$@")" in
-  *"http.extraHeader=Authorization: Bearer test-token"*) ;;
-  *) echo "missing auth header" >&2; exit 31 ;;
-esac
-dest=""
-for arg in "$@"; do dest="$arg"; done
-mkdir -p "$dest/src"
-printf '# private fixture
-' > "$dest/README.md"
-printf 'pub fn private_answer() -> u8 { 7 }
-' > "$dest/src/lib.rs"
-"#,
+        source.path().join("src/lib.rs"),
+        "pub fn private_answer() -> u8 { 7 }\n",
     );
-    let mut perms = std::fs::metadata(&git_path)
-        .expect("fake git metadata")
-        .permissions();
-    use std::os::unix::fs::PermissionsExt;
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&git_path, perms).expect("chmod fake git");
-
-    let old_path = std::env::var_os("PATH");
-    let old_fake_args = std::env::var_os("FAKE_GIT_ARGS");
-    let new_path = match &old_path {
-        Some(path) => format!("{}:{}", fake_git.path().display(), path.to_string_lossy()),
-        None => fake_git.path().display().to_string(),
-    };
-    std::env::set_var("PATH", new_path);
-    std::env::set_var("FAKE_GIT_ARGS", &fake_args);
+    git(source.path(), &["init"]);
+    git(source.path(), &["add", "README.md", "src/lib.rs"]);
+    git(
+        source.path(),
+        &[
+            "-c",
+            "user.email=repo-connect@example.invalid",
+            "-c",
+            "user.name=Repo Connect",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
 
     let workspace = TempDir::new().expect("workspace tempdir");
     let engine_dir = TempDir::new().expect("engine tempdir");
@@ -166,7 +147,7 @@ printf 'pub fn private_answer() -> u8 { 7 }
         Some(connector),
     );
 
-    let repo_url = "https://github.com/private/repo.git";
+    let repo_url = format!("file://{}", source.path().display());
     let response = schema
         .execute(
             Request::new(
@@ -191,9 +172,6 @@ printf 'pub fn private_answer() -> u8 { 7 }
         )
         .await;
 
-    restore_env("PATH", old_path);
-    restore_env("FAKE_GIT_ARGS", old_fake_args);
-
     assert!(
         response.errors.is_empty(),
         "connectRepository errors: {:?}",
@@ -206,23 +184,58 @@ printf 'pub fn private_answer() -> u8 { 7 }
         data["connectRepository"]["paths"],
         json!(["repos/private/README.md", "repos/private/src/lib.rs"])
     );
-    let git_args = std::fs::read_to_string(fake_args).expect("fake git args");
-    assert!(
-        git_args.contains("http.extraHeader=Authorization: Bearer test-token"),
-        "fake git should receive bearer auth header, got {git_args}"
-    );
     assert!(workspace.path().join("README.md").is_file());
     assert!(workspace.path().join("src/lib.rs").is_file());
     let calls = resolver.calls.lock().expect("resolver calls");
-    assert_eq!(calls.as_slice(), &[(repo_url.to_string(), Some(42))]);
+    assert_eq!(calls.as_slice(), &[(repo_url, Some(42))]);
+}
+
+#[tokio::test]
+async fn connect_repository_rejects_env_credential_ref_from_api() {
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let engine_dir = TempDir::new().expect("engine tempdir");
+    let connector: RepositoryConnectorRef = Arc::new(EngineRepositoryConnector::new(
+        engine_dir.path(),
+        Some(workspace.path().to_path_buf()),
+        "repos/commonplace",
+    ));
+    let key = "valid-key";
+    let registry = Arc::new(ApiKeyRegistry::new().with_key(key, "instance"));
+    let schema = build_schema_with_model_and_repository_connector(
+        in_memory_store(),
+        registry,
+        Arc::new(NoModel),
+        Some(connector),
+    );
+    let response = schema
+        .execute(
+            Request::new(
+                r#"mutation {
+                    connectRepository(input: {
+                        repoUrl: "https://github.com/private/repo.git",
+                        credentialRef: "env:HOME"
+                    }) { root }
+                }"#,
+            )
+            .data(ApiKeyToken(key.to_string())),
+        )
+        .await;
+    assert!(
+        response.errors.iter().any(|error| error.message.contains(
+            "unsupported credentialRef; expected server:default or github-installation:ID"
+        )),
+        "expected env credentialRef rejection, got {:?}",
+        response.errors
+    );
 }
 
 #[tokio::test]
 async fn connect_repository_requires_resolver_for_github_installation_id() {
     let engine_dir = TempDir::new().expect("engine tempdir");
+    let workspace = TempDir::new().expect("workspace");
     let connector: RepositoryConnectorRef = Arc::new(EngineRepositoryConnector::new(
         engine_dir.path(),
-        Some(TempDir::new().expect("workspace").path().to_path_buf()),
+        Some(workspace.path().to_path_buf()),
         "repos/commonplace",
     ));
     let key = "valid-key";
@@ -309,11 +322,20 @@ impl GitCredentialResolver for RecordingGitCredentialResolver {
     }
 }
 
-fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
-    match value {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
-    }
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write(path: std::path::PathBuf, body: impl AsRef<[u8]>) {

@@ -8,6 +8,7 @@
 use imbl::OrdMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Read;
 
 use crate::cold_index::ColdTierKind;
 use crate::graph_store::{GraphStoreError, GraphStoreResult, NodeRecord};
@@ -310,12 +311,44 @@ fn resolve_entry_body(
         };
     }
     if let Some(real_path) = entry.real_path.as_ref() {
-        return std::fs::read(real_path).map_err(|error| {
+        let metadata = std::fs::metadata(real_path).map_err(|error| {
             GraphStoreError::new(
                 "real_doc_entry_read",
-                format!("reading mirrored body {real_path}: {error}"),
+                format!("stat mirrored body {real_path}: {error}"),
             )
-        });
+        })?;
+        if metadata.len() > entry.size {
+            return Err(GraphStoreError::new(
+                "real_doc_entry_read",
+                format!(
+                    "mirrored body {real_path} grew from {} to {} bytes",
+                    entry.size,
+                    metadata.len()
+                ),
+            ));
+        }
+        let file = std::fs::File::open(real_path).map_err(|error| {
+            GraphStoreError::new(
+                "real_doc_entry_read",
+                format!("opening mirrored body {real_path}: {error}"),
+            )
+        })?;
+        let mut body = Vec::with_capacity(metadata.len() as usize);
+        file.take(entry.size.saturating_add(1))
+            .read_to_end(&mut body)
+            .map_err(|error| {
+                GraphStoreError::new(
+                    "real_doc_entry_read",
+                    format!("reading mirrored body {real_path}: {error}"),
+                )
+            })?;
+        if body.len() as u64 > entry.size {
+            return Err(GraphStoreError::new(
+                "real_doc_entry_read",
+                format!("mirrored body {real_path} grew while reading"),
+            ));
+        }
+        return Ok(body);
     }
     let Some(hash) = entry.content_hash.as_ref() else {
         return Err(GraphStoreError::new(
@@ -459,6 +492,33 @@ mod tests {
         assert!(store
             .document_path(large_entry.content_hash.as_ref().unwrap())
             .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_file_entry_refuses_to_read_past_indexed_size() {
+        let (dir, store) = temp_store("doc-tree-real-file-size");
+        let real_path = dir.join("mirror.rs");
+        std::fs::write(&real_path, b"small").unwrap();
+        let mut tree = DocTree::new(8);
+        let path = PathKey::from_slash_path("tenant/project/src/mirror.rs").unwrap();
+        tree.put_real_file(
+            path.clone(),
+            real_path.to_string_lossy().into_owned(),
+            content_hash_bytes(b"small"),
+            5,
+            ColdTierKind::Cold,
+            10,
+            None,
+        );
+
+        std::fs::write(&real_path, b"small but now much larger").unwrap();
+        let error = tree.resolve_body(&path, &store).unwrap_err();
+        assert_eq!(error.code, "real_doc_entry_read");
+        assert!(
+            error.message.contains("grew"),
+            "expected growth guard, got {error:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

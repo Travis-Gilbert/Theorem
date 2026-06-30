@@ -167,7 +167,7 @@ pub struct RepositoryConnectInputGql {
     /// Clone URL for a public or already-authenticated repository.
     pub repo_url: Option<String>,
     /// Optional credential reference for a private repo clone.
-    /// Supported forms are `env:NAME` and `github-installation:ID`.
+    /// Supported forms are `server:default` and `github-installation:ID`.
     pub credential_ref: Option<String>,
     /// GitHub App installation id to resolve at clone time.
     pub github_installation_id: Option<i64>,
@@ -1114,8 +1114,10 @@ where
             .data_opt::<RepositoryConnectorRef>()
             .ok_or_else(|| Error::new("repository connector is not configured"))?;
         let input = RepositoryConnectInput::try_from(input)?;
-        let receipt = connector
-            .connect_repository(input)
+        let connector = Arc::clone(connector);
+        let receipt = tokio::task::spawn_blocking(move || connector.connect_repository(input))
+            .await
+            .map_err(|error| Error::new(format!("repository connect task failed: {error}")))?
             .map_err(|error| Error::new(format!("repository connect failed: {error}")))?;
         Ok(RepositoryConnectReceiptGql::from(receipt))
     }
