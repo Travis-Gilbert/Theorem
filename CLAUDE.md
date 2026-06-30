@@ -86,6 +86,7 @@ This file is the navigation map. Read it first. Order of truth: this map, then t
 | `prose-check` | Deterministic writing-engineering style checker + skill-pack. |
 | `theorem-copresence` | Headless co-presence peer + surface-adapter seam: structure on a graph CRDT, free text in `yrs` `TextRegion`s, awareness on the `working_log`; note + code adapters (code merges through W2 git, not Yrs). |
 | `theorem-harness-core` | Rust-native harness kernel: pure run state, transition executor, guards, state hashing, replay/fork receipts. Parity-tested vs Python corpora. |
+| `theorem-prompt` | Cache-aware render layer for Theorem head invocations: `PromptSpec`, renderer trait, provider messages, cache prefix/suffix assembly, and exemplar placement. |
 | `theorem-harness-runtime` | GraphStore-backed harness runtime: persists transition receipts as `HarnessRun`/`HarnessEvent`; holds `job_queue` (Dispatch v2 board); live provider heads include Mistral Small and Qwen via OpenAI-compatible provider profiles, and `agent_runner` wakes configured heads from room mentions. |
 | `theorem-harness` | SDK v2 surface (run handles, sessions-as-scopes, idempotency, cancellation, replay, trace export). Source for the Node/Swift/WASM bindings. |
 | `theorem-acp` | CommonPlace ACP host for external coding agents (spawns ACP subprocesses over stdio, injects the Harness MCP, stages writes/PTY as approval cards). |

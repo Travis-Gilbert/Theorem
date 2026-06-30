@@ -1,6 +1,6 @@
 use crate::head_invoker::{
-    object_payload, prompt_for_request, provider_send_error, provider_summary, truncate_detail,
-    CredentialResolver, EndpointMap,
+    object_payload, provider_prompt_for_request, provider_send_error, provider_summary,
+    truncate_detail, CredentialResolver, EndpointMap,
 };
 use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::{json, Value};
@@ -18,7 +18,7 @@ pub fn invoke_mcp_head(
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
     let endpoint = mcp_endpoint(endpoints, &request)?;
     let tool_name = mcp_tool_name(&request);
-    let prompt = prompt_for_request(&request);
+    let prompt = provider_prompt_for_request(&request);
     let mut builder = http.post(&endpoint).json(&json!({
         "jsonrpc": "2.0",
         "id": request.invocation_id,
@@ -26,8 +26,8 @@ pub fn invoke_mcp_head(
         "params": {
             "name": tool_name,
             "arguments": {
-                "prompt": prompt,
-                "system_prompt": request.head_system_prompt,
+                "prompt": prompt.user_prompt,
+                "system_prompt": prompt.system_prompt,
                 "task": request.task,
                 "kind": request.kind.as_str(),
                 "scratchpad_crdt": request.scratchpad_crdt,

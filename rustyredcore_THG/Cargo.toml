@@ -33,6 +33,7 @@ members = [
     "crates/scene-os-core",
     "crates/scene-os-web",
     "crates/theorem-harness-core",
+    "crates/theorem-prompt",
     "crates/theorem-harness-runtime",
     "crates/theorem-harness",
     "crates/theorem-dispatch",

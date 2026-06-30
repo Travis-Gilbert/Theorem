@@ -2,9 +2,9 @@ use std::cell::RefCell;
 
 use serde_json::json;
 use theorem_harness_core::{
-    default_authority_order, run_fake_intra_agent_loop, user_model_hash, AgentBinding, AgentHead,
-    BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
-    BindingLineageMemoryEntry, BindingVerificationOutcome, ContextMembranePrime,
+    default_authority_order, prompt_instruction_key, run_fake_intra_agent_loop, user_model_hash,
+    AgentBinding, AgentHead, BindingBudgetScope, BindingComposition, BindingError, BindingIdentity,
+    BindingLineageMemoryEntry, BindingVerificationOutcome, ConfigState, ContextMembranePrime,
     FakeIntraAgentLoopInput, GroundedClaim, HeadCapabilityReliability, HeadCostProfile,
     HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt, HeadInvocationRequest,
     HeadInvoker, HeadKind, HeadReliabilityProfile, HeadTransport, IntraAgentLoopError,
@@ -164,6 +164,35 @@ fn synthesis_receives_proposal_and_critique_context() {
             .map(|decision| decision.authority_order == default_authority_order())
             .unwrap_or(false)
     }));
+}
+
+#[test]
+fn config_sourced_instruction_reaches_request_and_invocation_id() {
+    let invoker = RecordingInvoker::default();
+    let mut input =
+        FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
+    let key = prompt_instruction_key(&HeadKind::ReasoningCore, HeadInvocationKind::Synthesis);
+    input.config_state = ConfigState {
+        values: std::collections::BTreeMap::from([(
+            key,
+            json!("configured synthesis instruction"),
+        )]),
+        graph_version_id: None,
+    };
+
+    theorem_harness_core::run_intra_agent_loop_with_invoker(fixture_binding(), input, &invoker)
+        .unwrap();
+
+    let requests = invoker.requests.into_inner();
+    let synthesis = requests
+        .iter()
+        .find(|request| request.kind == HeadInvocationKind::Synthesis)
+        .unwrap();
+    assert_eq!(
+        synthesis.head_system_prompt,
+        "configured synthesis instruction"
+    );
+    assert_eq!(synthesis.invocation_id, synthesis.computed_invocation_id());
 }
 
 #[test]
@@ -479,10 +508,9 @@ fn mounted_with_user_model_is_replayable_with_stable_state_hash() {
     model
         .preferences
         .insert("voice".to_string(), "spare".to_string());
-    model.style_notes.push(UserModelNote::new(
-        "no em-dashes",
-        "2026-06-28T00:00:00Z",
-    ));
+    model
+        .style_notes
+        .push(UserModelNote::new("no em-dashes", "2026-06-28T00:00:00Z"));
     let user_model_value = serde_json::to_value(&model).unwrap();
     let created_at = "2026-06-28T00:00:00Z".to_string();
 
@@ -526,16 +554,8 @@ fn mounted_with_user_model_is_replayable_with_stable_state_hash() {
 
         let mut resolved_payload = serde_json::Map::new();
         resolved_payload.insert("binding_id".to_string(), json!("agent:theorem"));
-        resolved_payload.insert(
-            "composition_hash".to_string(),
-            json!("computed-by-kernel"),
-        );
-        let binding = apply_transition(
-            binding,
-            "BINDING.RESOLVED",
-            resolved_payload,
-            &created_at,
-        );
+        resolved_payload.insert("composition_hash".to_string(), json!("computed-by-kernel"));
+        let binding = apply_transition(binding, "BINDING.RESOLVED", resolved_payload, &created_at);
 
         let binding = apply_transition(
             binding,
@@ -935,12 +955,9 @@ fn fake_loop_threads_lineage_memory_into_head_requests() {
     };
     input.lineage_memory = vec![lineage_entry.clone()];
 
-    let result = theorem_harness_core::run_intra_agent_loop_with_invoker(
-        fixture_binding(),
-        input,
-        &invoker,
-    )
-    .unwrap();
+    let result =
+        theorem_harness_core::run_intra_agent_loop_with_invoker(fixture_binding(), input, &invoker)
+            .unwrap();
 
     // The kernel must have appended one synthetic lineage:agent_published
     // revision into the binding scratchpad (the existing P1 invariant on the
@@ -1087,12 +1104,9 @@ fn fake_loop_omits_lineage_memory_revisions_when_input_has_none() {
         FakeIntraAgentLoopInput::new("publish", vec![GroundedClaim::new("grounded", "source:1")]);
     assert!(input.lineage_memory.is_empty());
 
-    let result = theorem_harness_core::run_intra_agent_loop_with_invoker(
-        fixture_binding(),
-        input,
-        &invoker,
-    )
-    .unwrap();
+    let result =
+        theorem_harness_core::run_intra_agent_loop_with_invoker(fixture_binding(), input, &invoker)
+            .unwrap();
 
     let lineage_count = result
         .binding

@@ -52,6 +52,7 @@ Every crate directory under `rustyredcore_THG/crates/`. One line each, taken fro
 | `theorem-copresence` | Headless co-presence peer and surface-adapter seam over the RustyRed substrate. |
 | `theorem-dispatch` | Postgres hot execution queue for Theorem Dispatch v2. |
 | `theorem-harness-core` | Rust-native Theorem harness run controller: state transitions, guards, hashes, and replay/fork contracts. |
+| `theorem-prompt` | Cache-aware prompt rendering for Theorem head invocations. |
 | `theorem-harness-runtime` | Rust-native Theorem harness runtime: GraphStore-backed event log/run persistence, live provider invocation, and configured room-runner wake handling for resident heads such as Mistral Small and Qwen. |
 | `theorem-harness` | theorem-harness SDK v2: the idiomatic Rust surface over theorem-harness-core and theorem-harness-runtime. |
 | `theorem-receiver` | Dispatch-queue receiver: an outbound-only claim loop against the cloud harness that spawns the locally-installed claude/codex CLI in a mapped worktree. |

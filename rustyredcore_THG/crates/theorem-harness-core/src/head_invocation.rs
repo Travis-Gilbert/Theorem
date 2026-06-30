@@ -56,6 +56,18 @@ pub const VERIFIER_HEAD_PROMPT_ADDENDUM: &str = r#"Your task is to try to break 
 
 pub const MODALITY_HEAD_PROMPT_ADDENDUM: &str = r#"You are engaged because the task needs your modality, not because of its difficulty. Do that modality job precisely and write the grounded result into the shared document for the reasoning heads to use. Do not reason about the whole task unless explicitly invoked as a reasoning head."#;
 
+pub const PROPOSAL_ROLE_INSTRUCTION: &str =
+    "attempt the whole task now and write a complete first answer into the shared document.";
+
+pub const CRITIQUE_ROLE_INSTRUCTION: &str =
+    "attempt the whole task through criticism; name concrete gaps, errors, and unsupported claims.";
+
+pub const SYNTHESIS_ROLE_INSTRUCTION: &str =
+    "attempt the whole task by producing the best converged answer from the shared document.";
+
+pub const VERIFICATION_ROLE_INSTRUCTION: &str =
+    "try to falsify the converged answer before publication.";
+
 impl HeadInvocationKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -384,6 +396,12 @@ impl HeadInvocationReceipt {
         };
         receipt.receipt_hash = receipt.computed_receipt_hash();
         receipt
+    }
+
+    pub fn with_claims(mut self, claims: Vec<GroundedClaim>) -> Self {
+        self.claims = claims;
+        self.receipt_hash = self.computed_receipt_hash();
+        self
     }
 
     pub fn contribution_id(&self) -> String {
