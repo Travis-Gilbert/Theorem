@@ -1,12 +1,12 @@
 # Railway deploy config for the harness-console Next.js app.
 # Set the Railway service Root Directory to apps/harness-console so this file and
-# the app's package.json are the build root. Nixpacks auto-detects Next.js
-# (npm ci + next build); `next start` binds 0.0.0.0:$PORT (Railway provides PORT).
+# the Dockerfile are the build root (the repo root has no package.json, so
+# auto-detect mis-reads the monorepo). The Dockerfile owns build + start.
 [build]
-builder = "NIXPACKS"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "npm run start"
 healthcheckPath = "/"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
