@@ -7,6 +7,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [dependencies]
+fff = { package = "fff-search", git = "https://github.com/dmtrKovalenko/fff.git", rev = "e0a9e08a3a6467ebb8d4b2889f1c21c3b36ba3e6", default-features = false }
 ignore = "0.4"
 object = { version = "0.37.3", default-features = false, features = ["read", "std"] }
 rayon = "1.10"

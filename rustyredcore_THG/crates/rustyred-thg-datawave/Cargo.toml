@@ -11,8 +11,12 @@ rust-version = "1.85"
 # so large integers past f64's 53-bit mantissa do not collapse.
 bigdecimal = "0.4"
 fuzzyhash = "0.2"
+liteparse = { git = "https://github.com/run-llama/liteparse.git", rev = "a8288d09cb6bf93c2f7b5257e9634afd26a4566b", default-features = false }
 rustyred-thg-core = { path = "../rustyred-thg-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Content hashing for dedup; same sha256 convention as rustyred-thg-binformat.
 sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

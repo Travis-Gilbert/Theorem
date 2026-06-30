@@ -36,6 +36,7 @@ mod datawave_projection;
 pub mod engineering;
 mod ensure;
 mod feature_port;
+mod fff_search;
 mod ingest_jobs;
 mod map_projection;
 mod repo_fetch;
@@ -176,6 +177,11 @@ pub use feature_port::{
     feature_slice_from_reconstruction_spec, patch_set_from_behavior_ir,
     port_patch_set_from_reconstruction_spec, target_plan_from_behavior_ir,
     target_plan_input_from_value, validate_patch_set, FeatureSliceInput, TargetPlanInput,
+};
+pub use fff_search::{
+    fff_then_search_code_in_store, FffCodeSearchInput, FffCodeSearchOutput, FffContentHit,
+    FffContentSearchOutput, FffPathHit, FffPathSearchOutput, FffRepoSearch, FffSearchConfig,
+    FffSearchError,
 };
 pub use ingest_jobs::{
     IngestJobEvent, IngestJobEventKind, IngestJobRegistry, IngestJobRequest, IngestJobState,
@@ -1409,7 +1415,15 @@ pub fn search_code_in_store(
     store: &mut RedCoreGraphStore,
     input: SearchCodeInput,
 ) -> Result<SearchCodeOutput, CodeIndexError> {
-    search_code_with_store(store, input)
+    search_code_with_store_candidate_paths(store, input, None)
+}
+
+pub(crate) fn search_code_with_store_candidate_paths(
+    store: &mut RedCoreGraphStore,
+    input: SearchCodeInput,
+    candidate_paths: Option<&[String]>,
+) -> Result<SearchCodeOutput, CodeIndexError> {
+    search_code_with_store_filtered(store, input, candidate_paths)
 }
 
 /// Fix-handoff F8: a read-only inventory of the code repos indexed in a tenant.
@@ -3555,12 +3569,27 @@ fn search_code_with_store(
     store: &mut RedCoreGraphStore,
     input: SearchCodeInput,
 ) -> Result<SearchCodeOutput, CodeIndexError> {
+    search_code_with_store_filtered(store, input, None)
+}
+
+fn search_code_with_store_filtered(
+    store: &mut RedCoreGraphStore,
+    input: SearchCodeInput,
+    candidate_paths: Option<&[String]>,
+) -> Result<SearchCodeOutput, CodeIndexError> {
     let started = std::time::Instant::now();
     let tenant_id = normalize_tenant(&input.tenant_id);
     let query = input.query.trim().to_string();
     let limit = bounded_limit(input.limit);
     let kinds = normalize_set(input.kinds);
     let latest = latest_repo_generations_for_tenant(store, &tenant_id)?;
+    let candidate_paths = candidate_paths.map(|paths| {
+        paths
+            .iter()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .collect::<HashSet<_>>()
+    });
 
     let mut node_query = NodeQuery::label(CODE_SYMBOL_LABEL)
         .with_property("tenant_id", json!(tenant_id.as_str()))
@@ -3586,6 +3615,11 @@ fn search_code_with_store(
         }
         if !path_prefix.is_empty() && !hit.file_path.starts_with(path_prefix) {
             continue;
+        }
+        if let Some(candidate_paths) = &candidate_paths {
+            if !candidate_paths.contains(&hit.file_path) {
+                continue;
+            }
         }
         if !kinds.is_empty() && !kinds.contains(&hit.kind.to_ascii_lowercase()) {
             continue;
@@ -3615,6 +3649,7 @@ fn search_code_with_store(
         "query": query,
         "repo_id": input.repo_id,
         "path_prefix": input.path_prefix,
+        "candidate_paths": candidate_paths.as_ref().map(HashSet::len),
         "kinds": kinds,
         "total_admitted": total_admitted,
         "total_returned": hits.len(),

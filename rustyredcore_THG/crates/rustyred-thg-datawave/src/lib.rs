@@ -55,6 +55,7 @@
 //! ```
 
 pub mod dictionary;
+pub mod document;
 pub mod edge;
 pub mod field;
 pub mod hash;
@@ -66,6 +67,11 @@ pub mod training;
 
 pub use dictionary::{
     data_dictionary, edge_dictionary, write_dictionary, DataDictionaryEntry, EdgeDictionaryEntry,
+};
+pub use document::{
+    document_datawave_ingest, document_field_config, document_record_value, ingest_document_record,
+    parse_document_with_liteparse, DocumentComplexityPage, DocumentParseError, DocumentParseInput,
+    DocumentParseRecord, DocumentParseState, DOCUMENT_DATA_TYPE, DOCUMENT_PARSE_VERSION,
 };
 pub use edge::{derive_edges, DerivedEdge, EdgeCondition, EdgeDef};
 pub use field::{
