@@ -37,6 +37,8 @@ pub mod context_manager;
 pub mod context_web;
 pub mod epistemic_fitness;
 pub mod federated_signals;
+pub mod gepa_feedback;
+pub mod gepa_proposer;
 pub mod head_fitness;
 pub mod head_invocation;
 pub mod improvement_rate;
@@ -116,6 +118,22 @@ pub use federated_signals::{
     assert_no_raw_content, extract_structural_signal, observed_count_bucket,
     receive_federated_signal, success_rate_bucket, FederatedSignal, PrivacyViolation,
     StructuralSignalInput,
+};
+pub use gepa_feedback::{
+    fitness_gate_from_observations, gepa_feedback_point, reservoir_feedback_from_observations,
+    FeedbackPoint, GepaFeedbackInput, ReservoirFeedback,
+};
+pub use gepa_proposer::{
+    configured_head_system_prompt, default_gepa_instruction_registry, export_trainset_for_intent,
+    gepa_val_subscores, head_role_instruction_key, ingest_gepa_candidate,
+    route_gepa_candidate_through_gate, serve_user_prompt_improver,
+    serve_user_prompt_improver_with_head, trainset_jsonl, GepaGateRouteInput, GepaGateRouteResult,
+    GepaInstructionCandidate, GepaProposalError, GepaTrainSession, InstructionKeyRegistry,
+    InstructionKeySpec, InstructionSource, TrainExample, UserPromptImproverReceipt,
+    UserPromptImproverRequest, HEAD_ADDENDUM_FAST_FIRST_KEY, HEAD_ADDENDUM_MODALITY_KEY,
+    HEAD_ADDENDUM_VERIFIER_KEY, HEAD_ROLE_CRITIQUE_KEY, HEAD_ROLE_PROPOSAL_KEY,
+    HEAD_ROLE_SYNTHESIS_KEY, HEAD_ROLE_VERIFICATION_KEY, HEAD_SYSTEM_CORE_KEY,
+    INSTRUCTION_KEY_PREFIX, USER_PROMPT_IMPROVER_KEY, USER_PROMPT_IMPROVER_SEED_INSTRUCTION,
 };
 pub use head_fitness::{FitnessCounter, HeadFitness, NodeResult, RoutingPolicy};
 pub use head_invocation::{

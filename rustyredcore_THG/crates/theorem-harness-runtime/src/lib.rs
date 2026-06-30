@@ -41,6 +41,7 @@ pub mod coordination_push;
 pub mod coordination_v2;
 pub mod engineering_packs;
 pub mod event_log;
+pub mod gepa_runtime;
 pub mod governor;
 pub mod head_invoker;
 pub mod job_queue;
@@ -160,6 +161,10 @@ pub use event_log::{
     append_transition, append_transition_from_store, event_node_id, load_events, load_run,
     persist_transition_result, replay_persisted_run, run_node_id, HarnessRuntimeError,
     RuntimeResult,
+};
+pub use gepa_runtime::{
+    gepa_train_sessions_for_intent, gepa_trainset_for_intent, gepa_trainset_json_for_intent,
+    gepa_trainset_jsonl_for_intent,
 };
 pub use governor::{
     encode_governor_receipt, govern_turn, CostlyCheck, GovernorCandidate, GovernorConfig,

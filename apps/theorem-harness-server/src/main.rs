@@ -51,9 +51,9 @@ use theorem_harness_runtime::{
 };
 use theorem_harness_server::push::write_room_message;
 use theorem_harness_server::{
-    compound_engineering_json, connectors_json, github_router, intents_json, map_json, maps_json,
-    mentions_json, openapi_document, presence_json, push_router, records_json, room_json, run_json,
-    runs_json, spawn_wake_listener, Delivery, GithubApp, GithubWebhookState,
+    compound_engineering_json, connectors_json, gepa_trainset_json, github_router, intents_json,
+    map_json, maps_json, mentions_json, openapi_document, presence_json, push_router, records_json,
+    room_json, run_json, runs_json, spawn_wake_listener, Delivery, GithubApp, GithubWebhookState,
     GraphStoreMapArtifactSink, MessagePost, PushState, RoomBus, DEFAULT_BUS_CAPACITY,
 };
 
@@ -218,6 +218,7 @@ async fn main() {
         .route("/openapi.json", get(openapi_json))
         .route("/harness/runs", get(list_runs))
         .route("/harness/runs/:run_id", get(get_run))
+        .route("/harness/gepa/trainsets/:intent_id", get(get_gepa_trainset))
         .route("/harness/maps", get(list_maps))
         .route("/harness/maps/:map_id", get(get_map))
         .route("/harness/rooms/:room_id", get(get_room))
@@ -490,6 +491,16 @@ async fn get_run(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+async fn get_gepa_trainset(
+    State(store): State<SharedStore>,
+    Path(intent_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let store = store.lock().expect("store lock");
+    gepa_trainset_json(&*store, &intent_id)
+        .map(Json)
+        .map_err(runtime_status)
 }
 
 async fn get_room(

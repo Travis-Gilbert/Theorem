@@ -58,6 +58,7 @@ pub fn openapi_document() -> Value {
         "tags": [
             { "name": "operations", "description": "Liveness and the OpenAPI document." },
             { "name": "runs", "description": "Harness run read contract (typed event log per run)." },
+            { "name": "gepa", "description": "GEPA trainset export for instruction proposal." },
             { "name": "maps", "description": "Codebase map artifacts projected into the graph." },
             { "name": "rooms", "description": "Coordination rooms: presence, intents, records, messages, live stream." },
             { "name": "compound", "description": "Compound Engineering captures, fitness records, and read-only action candidates." },
@@ -119,6 +120,30 @@ pub fn openapi_document() -> Value {
                             } } }
                         },
                         "404": { "description": "Unknown run_id." }
+                    }
+                }
+            },
+            "/harness/gepa/trainsets/{intent_id}": {
+                "get": {
+                    "tags": ["gepa"],
+                    "summary": "Export a GEPA trainset for one intent",
+                    "description": "Returns captured harness runs for the intent as GEPA TrainExample records. The response is generated from persisted run/event state and is empty when no matching runs are present.",
+                    "parameters": [{ "$ref": "#/components/parameters/IntentId" }],
+                    "responses": {
+                        "200": {
+                            "description": "GEPA trainset examples for the intent.",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "intent_id": { "type": "string" },
+                                    "count": { "type": "integer" },
+                                    "examples": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+                                },
+                                "required": ["intent_id", "count", "examples"]
+                            } } }
+                        },
+                        "400": { "description": "The matching run data could not be exported as a trainset." },
+                        "500": { "description": "The underlying graph store failed." }
                     }
                 }
             },
@@ -529,6 +554,7 @@ pub fn openapi_document() -> Value {
                     "description": "Tenant slug. Alias `tenant_slug` is also accepted. Required unless the server has a non-default tenant env configured."
                 },
                 "RunId": { "name": "run_id", "in": "path", "required": true, "schema": { "type": "string" } },
+                "IntentId": { "name": "intent_id", "in": "path", "required": true, "schema": { "type": "string" } },
                 "MapId": { "name": "map_id", "in": "path", "required": true, "schema": { "type": "string" } },
                 "RoomId": {
                     "name": "room_id", "in": "path", "required": true, "schema": { "type": "string" },
@@ -725,6 +751,7 @@ mod tests {
             "/openapi.json",
             "/harness/runs",
             "/harness/runs/{run_id}",
+            "/harness/gepa/trainsets/{intent_id}",
             "/harness/maps",
             "/harness/rooms/{room_id}/messages",
             "/harness/rooms/{room_id}/stream",

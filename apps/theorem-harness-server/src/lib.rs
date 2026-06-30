@@ -38,9 +38,10 @@ use theorem_harness_core::{
     MapArtifactState,
 };
 use theorem_harness_runtime::{
-    compound_engineering_summary, list_presence, load_events, load_run, read_intents_for_room,
-    read_mentions_for_actor, read_mentions_for_actor_with_urgencies, read_records_for_room,
-    room_status, CoordinationError, HarnessRuntimeError,
+    compound_engineering_summary, gepa_trainset_json_for_intent, list_presence, load_events,
+    load_run, read_intents_for_room, read_mentions_for_actor,
+    read_mentions_for_actor_with_urgencies, read_records_for_room, room_status, CoordinationError,
+    HarnessRuntimeError,
 };
 
 /// Node label the runtime persists run state under (`event_log::run_node`).
@@ -182,6 +183,15 @@ pub fn compound_engineering_json<S: GraphStore>(
         "tenant": summary.tenant_slug,
         "compound_engineering": summary,
     }))
+}
+
+/// GEPA trainset export for one accumulated intent. This is the runtime-owned
+/// bridge from persisted harness sessions to the offline proposer sidecar.
+pub fn gepa_trainset_json<S: GraphStore>(
+    store: &S,
+    intent_id: &str,
+) -> Result<Value, HarnessRuntimeError> {
+    gepa_trainset_json_for_intent(store, intent_id)
 }
 
 /// Server-side bridge from code-KG projections to persisted `MapArtifact` nodes.

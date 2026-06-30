@@ -1,6 +1,14 @@
 {
   "components": {
     "parameters": {
+      "IntentId": {
+        "in": "path",
+        "name": "intent_id",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
       "MapId": {
         "in": "path",
         "name": "map_id",
@@ -854,6 +862,58 @@
         ]
       }
     },
+    "/harness/gepa/trainsets/{intent_id}": {
+      "get": {
+        "description": "Returns captured harness runs for the intent as GEPA TrainExample records. The response is generated from persisted run/event state and is empty when no matching runs are present.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IntentId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    },
+                    "examples": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "intent_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "intent_id",
+                    "count",
+                    "examples"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "GEPA trainset examples for the intent."
+          },
+          "400": {
+            "description": "The matching run data could not be exported as a trainset."
+          },
+          "500": {
+            "description": "The underlying graph store failed."
+          }
+        },
+        "summary": "Export a GEPA trainset for one intent",
+        "tags": [
+          "gepa"
+        ]
+      }
+    },
     "/harness/jobs": {
       "post": {
         "description": "Creates or upserts a pending Job. The tenant must be supplied as `tenant`/`tenant_slug` unless the server has a non-default tenant env configured. Defaults: room -> repo:theorem:branch:main, submitted_by -> theorem-harness-server. If THEOREM_DISPATCH_DATABASE_URL is set, the job is mirrored into the Postgres dispatch queue and a wake event is emitted to the target head.",
@@ -1468,6 +1528,10 @@
     {
       "description": "Harness run read contract (typed event log per run).",
       "name": "runs"
+    },
+    {
+      "description": "GEPA trainset export for instruction proposal.",
+      "name": "gepa"
     },
     {
       "description": "Codebase map artifacts projected into the graph.",
