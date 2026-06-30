@@ -4,9 +4,9 @@ Theorem is a **Graph based  programmable ML runtime written in rust ** that mirr
 
 This file is the navigation truth for the repo. Read it first. Order of truth: this map, then the actual code, then the plan docs (plans lag code). If a session changes architecture (new crate, renamed module, removed subsystem, new entrypoint), update this file before ending the session.
 
-## The Mirror Rule 
+# Theorem is a verb
 
-- **Theseus is a noun. Theorem is a verb** 
+Theorem is a verb
 Theseus = the Python + Memgraph + Postgres application/runtime (separate repo: `github.com/Travis-Gilbert/Theseus`, the local `Index-API` checkout). Theorem is where lab experiments become products. The are bridge contracts so Rust-side work can move at its own cadence while staying auditable against the source workspace.
 - **Do not let Theorem and Theseus diverge silently.** The Python files here (`apps/notebook/`, `apps/orchestrate/`) are mirrors of their Theseus counterparts. Changes that affect the contract (parity receipts, affordance gates, the PyO3 surface) must stay reconciled with Theseus.
 - Last sync recorded in `README.md` (2026-06-29): `apps/theorem-substrate-sync` landed as the standalone local-to-hosted substrate sync daemon. It adds default-off launcher integration, `/status` and `/trigger`, Railway bearer-token MCP auth, Valkey outbox/cursors, stream drainer/subscriber seams, Prolly round/bootstrap drivers over existing MCP/GraphQL surfaces, and a core `MergeRegistry` with LWW/OR-set policy for contested memory fields.
