@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "vector-accelerated")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,6 +25,9 @@ use crate::zerocopy::{
 
 pub const DEFAULT_VECTOR_INDEX_BIT_WIDTH: usize = 4;
 const SUPPORTED_VECTOR_INDEX_BIT_WIDTHS: [usize; 2] = [2, 4];
+
+#[cfg(feature = "vector-accelerated")]
+static VECTOR_INDEX_CLONE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct VectorPoint(Vec<f32>);
@@ -63,8 +68,14 @@ impl Clone for VectorIndex {
     fn clone(&self) -> Self {
         #[cfg(feature = "vector-accelerated")]
         {
-            return Self::with_bit_width(self.dimension, self.bit_width)
-                .expect("existing vector index configuration should remain valid");
+            return Self {
+                node_to_vector_id: self.node_to_vector_id.clone(),
+                vector_id_to_node: self.vector_id_to_node.clone(),
+                next_vector_id: self.next_vector_id,
+                turbovec: clone_turbovec_index(&self.turbovec),
+                dimension: self.dimension,
+                bit_width: self.bit_width,
+            };
         }
         #[cfg(not(feature = "vector-accelerated"))]
         {
@@ -76,6 +87,21 @@ impl Clone for VectorIndex {
             }
         }
     }
+}
+
+#[cfg(feature = "vector-accelerated")]
+fn clone_turbovec_index(index: &IdMapIndex) -> IdMapIndex {
+    let sequence = VECTOR_INDEX_CLONE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "theorem-vector-index-clone-{}-{sequence}.tvim",
+        std::process::id()
+    ));
+    index
+        .write(&path)
+        .expect("temporary TurboVec clone write should succeed");
+    let cloned = IdMapIndex::load(&path).expect("temporary TurboVec clone load should succeed");
+    fs::remove_file(&path).expect("temporary TurboVec clone file should be removed");
+    cloned
 }
 
 impl std::fmt::Debug for VectorIndex {
@@ -1380,6 +1406,9 @@ impl InMemoryGraphStore {
                 .clone()
                 .unwrap_or_else(|| existing.checksum())
         });
+        if !node.tombstone {
+            self.validate_auto_index_vectors(&node)?;
+        }
         if let Some(existing) = self.nodes.get(&node.id).cloned() {
             self.remove_node_indexes(&existing);
         }
@@ -1479,6 +1508,9 @@ impl InMemoryGraphStore {
         node.labels = normalize_labels(node.labels);
         if node.content_hash.is_none() {
             node.content_hash = Some(node.checksum());
+        }
+        if !node.tombstone {
+            self.validate_auto_index_vectors(&node)?;
         }
         if let Some(existing) = self.nodes.get(&node.id).cloned() {
             self.remove_node_indexes(&existing);
@@ -2186,6 +2218,20 @@ impl InMemoryGraphStore {
         Ok(())
     }
 
+    fn validate_auto_index_vectors(&self, node: &NodeRecord) -> GraphStoreResult<()> {
+        for ((label, property), dimension) in &self.vector_designations {
+            if !node.labels.iter().any(|candidate| candidate == label) {
+                continue;
+            }
+            if let Some(arr) = extract_float_array(&node.properties, property) {
+                if arr.len() == *dimension {
+                    validate_vector_values(&arr)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn auto_index_ordered(&mut self, node: &NodeRecord) -> GraphStoreResult<()> {
         let designations = self
             .ordered_indexes
@@ -2580,6 +2626,9 @@ impl InMemoryGraphStore {
         node.labels = normalize_labels(node.labels);
         if node.content_hash.is_none() {
             node.content_hash = Some(node.checksum());
+        }
+        if !node.tombstone {
+            self.validate_auto_index_vectors(&node)?;
         }
         if let Some(existing) = self.nodes.get(&node.id).cloned() {
             self.remove_node_indexes(&existing);
@@ -3841,6 +3890,9 @@ impl RedCoreGraphStore {
             return Err(GraphStoreError::empty_field("node.id"));
         }
         node.labels = normalize_labels(node.labels);
+        if !node.tombstone {
+            self.store.validate_auto_index_vectors(&node)?;
+        }
         let parent_hash = staged_nodes
             .get(&node.id)
             .or_else(|| self.store.nodes.get(&node.id))
@@ -8347,6 +8399,25 @@ mod tests {
 
     #[cfg(feature = "vector-accelerated")]
     #[test]
+    fn vector_index_clone_preserves_turbovec_entries() {
+        let mut index = VectorIndex::new(128);
+        let mut alpha = vec![0.0_f32; 128];
+        alpha[0] = 1.0;
+        let mut beta = vec![0.0_f32; 128];
+        beta[1] = 1.0;
+
+        index.insert("doc:alpha", &alpha).unwrap();
+        index.insert("doc:beta", &beta).unwrap();
+
+        let cloned = index.clone();
+        assert_eq!(cloned.len(), 2);
+        assert_eq!(cloned.resident_full_precision_bytes(), 0);
+        assert_eq!(cloned.search(&alpha, 1).unwrap()[0].0, "doc:alpha");
+        assert_eq!(cloned.search(&beta, 1).unwrap()[0].0, "doc:beta");
+    }
+
+    #[cfg(feature = "vector-accelerated")]
+    #[test]
     fn vector_index_manifest_records_configured_bit_width_and_quantized_residency() {
         let mut store = InMemoryGraphStore::default();
         store
@@ -8766,6 +8837,57 @@ mod tests {
                 .unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, "doc:1");
+        }
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_rejects_invalid_indexed_vector_before_aof_append() {
+        let data_dir = unique_test_dir("vec-invalid-aof");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 100,
+            strict_acid: false,
+        };
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .designate_vector_property("Doc", "embedding", 8)
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "doc:good",
+                    ["Doc"],
+                    json!({ "embedding": embedding8(1.0, 0.0) }),
+                ))
+                .unwrap();
+            let before = store.status();
+
+            let err = store
+                .upsert_node(NodeRecord::new(
+                    "doc:good",
+                    ["Doc"],
+                    json!({ "embedding": [1.0e16, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] }),
+                ))
+                .unwrap_err();
+            assert_eq!(err.code, "invalid_vector_value");
+            assert_eq!(store.status().last_txn_id, before.last_txn_id);
+            let results = store
+                .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 1)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, "doc:good");
+        }
+
+        {
+            let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+            let results = store
+                .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 1)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, "doc:good");
         }
 
         std::fs::remove_dir_all(data_dir).ok();
