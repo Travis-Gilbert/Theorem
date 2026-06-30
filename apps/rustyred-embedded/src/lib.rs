@@ -30,13 +30,12 @@ use rustyred_thg_mcp::{handle_mcp_request, McpServerConfig, SharedStore};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// Local, single-tenant embedded configuration (E0.4 will also load this from a
+const LOCAL_ENGINE_TENANT: &str = "local";
+
+/// Local embedded configuration (E0.4 will also load this from a
 /// `theorem.toml`). Defaults to durable everysec, GraphQL as the default surface.
 #[derive(Clone, Debug)]
 pub struct EmbeddedConfig {
-    /// The single local tenant. The GraphQL surface rejects an empty tenant, so
-    /// this must be non-empty; defaults to `local`.
-    pub tenant: String,
     /// AOF durability mode for the local store.
     pub durability: RedCoreDurability,
     /// Advertise GraphQL as the default agent path (hide the covered flat tools
@@ -51,7 +50,6 @@ pub struct EmbeddedConfig {
 impl Default for EmbeddedConfig {
     fn default() -> Self {
         Self {
-            tenant: "local".to_string(),
             durability: RedCoreDurability::AofEverysec,
             graphql_default_surface: true,
             code_embedding: CodeEmbeddingConfig::hash(FILE_EMBEDDING_DIM),
@@ -64,7 +62,6 @@ impl Default for EmbeddedConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TomlConfig {
-    tenant: Option<String>,
     durability: Option<String>,
     graphql_default_surface: Option<bool>,
     code_embedding: Option<TomlCodeEmbeddingConfig>,
@@ -94,18 +91,11 @@ fn parse_durability(value: &str) -> Result<RedCoreDurability, EngineError> {
 impl EmbeddedConfig {
     /// Parse a `theorem.toml` body, overlaying any present fields onto the
     /// defaults. Missing fields keep their default; an unknown durability string
-    /// or malformed TOML is a clean `Err` (never a panic). A non-empty tenant is
-    /// enforced (the GraphQL surface rejects an empty tenant).
+    /// or malformed TOML is a clean `Err` (never a panic).
     pub fn from_toml_str(body: &str) -> Result<Self, EngineError> {
         let raw: TomlConfig =
             toml::from_str(body).map_err(|error| EngineError::Config(error.to_string()))?;
         let mut config = EmbeddedConfig::default();
-        if let Some(tenant) = raw.tenant {
-            if tenant.trim().is_empty() {
-                return Err(EngineError::Config("tenant must be non-empty".to_string()));
-            }
-            config.tenant = tenant;
-        }
         if let Some(durability) = raw.durability {
             config.durability = parse_durability(&durability)?;
         }
@@ -293,7 +283,6 @@ where
 pub struct Engine {
     store: SharedStore<RedCoreGraphStore>,
     config: McpServerConfig,
-    tenant: String,
     // E0.5 folder tier: the CoW path-keyed document tree (B3's DocTree) is the
     // agent's working filesystem. Persisted as a JSON snapshot beside the store;
     // overflow bodies live in the disk object store. Behind a RefCell so the
@@ -345,7 +334,7 @@ impl Engine {
             .map_err(|error| EngineError::Config(format!("code embedding: {error}")))?;
         let file_embedding_dimension = file_embedder.dimension();
         let mcp_config = McpServerConfig {
-            default_tenant: config.tenant.clone(),
+            default_tenant: LOCAL_ENGINE_TENANT.to_string(),
             read_only: false,
             graphql_default_surface: config.graphql_default_surface,
             // Embedded callers want the full payload inline, never a fetch handle.
@@ -355,7 +344,6 @@ impl Engine {
         let engine = Self {
             store: SharedStore::new(store),
             config: mcp_config,
-            tenant: config.tenant,
             doc_tree: RefCell::new(doc_tree),
             object_store,
             doc_tree_path,
@@ -372,11 +360,6 @@ impl Engine {
         );
         let _ = engine.mutate(&mutation, json!({}));
         Ok(engine)
-    }
-
-    /// The single local tenant this engine is scoped to.
-    pub fn tenant(&self) -> &str {
-        &self.tenant
     }
 
     /// Run a closure with mutable access to the durable graph store backing this
@@ -433,7 +416,10 @@ impl Engine {
 
     /// The schema SDL (`graphql_introspect`).
     pub fn introspect(&self) -> Result<Value, EngineError> {
-        let response = self.call("graphql_introspect", json!({ "tenant": self.tenant }));
+        let response = self.call(
+            "graphql_introspect",
+            json!({ "tenant": LOCAL_ENGINE_TENANT }),
+        );
         structured(&response)
     }
 
@@ -791,7 +777,7 @@ impl Engine {
     }
 
     fn run(&self, tool: &str, gql: &str, variables: Option<Value>) -> Result<Value, EngineError> {
-        let mut arguments = json!({ "tenant": self.tenant, "query": gql });
+        let mut arguments = json!({ "tenant": LOCAL_ENGINE_TENANT, "query": gql });
         if let Some(variables) = variables {
             arguments["variables"] = variables;
         }
@@ -1011,15 +997,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // E0.4: theorem.toml overlays the defaults; empty file -> default; an invalid
-    // durability or an empty tenant is a clean Err, never a panic.
+    // E0.4: theorem.toml overlays the defaults; empty file -> default; invalid
+    // fields are clean Errs, never panics.
     #[test]
     fn embedded_config_parses_toml() {
         let cfg = EmbeddedConfig::from_toml_str(
-            "tenant = \"acme\"\ndurability = \"always\"\ngraphql_default_surface = false\n",
+            "durability = \"always\"\ngraphql_default_surface = false\n",
         )
         .expect("parse toml");
-        assert_eq!(cfg.tenant, "acme");
         assert!(
             matches!(cfg.durability, RedCoreDurability::AofAlways),
             "durability: {:?}",
@@ -1032,7 +1017,6 @@ mod tests {
     fn embedded_config_empty_toml_is_default() {
         let cfg = EmbeddedConfig::from_toml_str("").expect("empty toml");
         let default = EmbeddedConfig::default();
-        assert_eq!(cfg.tenant, default.tenant);
         assert!(matches!(cfg.durability, RedCoreDurability::AofEverysec));
         assert_eq!(cfg.graphql_default_surface, default.graphql_default_surface);
     }
@@ -1047,12 +1031,30 @@ mod tests {
     }
 
     #[test]
-    fn embedded_config_empty_tenant_rejected() {
-        let err = EmbeddedConfig::from_toml_str("tenant = \"\"\n");
+    fn embedded_config_rejects_tenant_field() {
+        let err = EmbeddedConfig::from_toml_str("tenant = \"acme\"\n");
         assert!(
             matches!(err, Err(EngineError::Config(_))),
-            "empty tenant must be rejected: {err:?}"
+            "embedded config must not expose tenant: {err:?}"
         );
+    }
+
+    #[test]
+    fn embedded_public_surface_does_not_expose_tenant() {
+        let source = include_str!("lib.rs");
+        let forbidden = [
+            concat!("pub ", "tenant"),
+            concat!("pub fn ", "tenant"),
+            concat!("pub(crate) ", "tenant"),
+            concat!("pub struct ", "Tenant"),
+            concat!("pub enum ", "Tenant"),
+        ];
+        for needle in forbidden {
+            assert!(
+                !source.contains(needle),
+                "embedded public surface must stay tenancy-blind; found {needle:?}"
+            );
+        }
     }
 
     // E1: the stream-coordination transport answers through the embedded engine.

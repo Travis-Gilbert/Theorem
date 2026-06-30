@@ -3555,6 +3555,13 @@ impl RedCoreGraphStore {
         Ok(self.store.stats())
     }
 
+    /// Stats without the O(nodes+edges) resident-memory estimate. Callers that
+    /// only need counts/version (diagnostics, hot-path metrics) use this to
+    /// avoid walking the whole graph under the writer lock.
+    pub fn stats_without_memory_estimate(&self) -> GraphStoreResult<GraphStats> {
+        Ok(self.store.stats_without_memory_estimate())
+    }
+
     pub fn verify(&self) -> GraphStoreResult<VerifyReport> {
         Ok(self.store.verify())
     }

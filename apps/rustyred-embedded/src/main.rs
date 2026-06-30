@@ -25,7 +25,7 @@ fn data_dir() -> PathBuf {
 
 fn main() -> std::io::Result<()> {
     let dir = data_dir();
-    // Load {dir}/theorem.toml if present, else the single-tenant local default. A
+    // Load {dir}/theorem.toml if present, else the local default. A
     // malformed config is surfaced (not silently ignored) but does not abort: fall
     // back to the default so the engine still starts.
     let config = EmbeddedConfig::load_for_dir(&dir).unwrap_or_else(|error| {
@@ -40,8 +40,7 @@ fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
     eprintln!(
-        "rustyred-embedded: serving MCP over stdio (tenant={}, data_dir={}); newline-delimited JSON-RPC",
-        engine.tenant(),
+        "rustyred-embedded: serving MCP over stdio (data_dir={}); newline-delimited JSON-RPC",
         dir.display()
     );
 

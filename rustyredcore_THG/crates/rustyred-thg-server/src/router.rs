@@ -9252,6 +9252,7 @@ mod tests {
         config::{Config, StorageMode, TenantConfigOverride},
         metrics::{diagnostics_config, diagnostics_memory},
         state::AppState,
+        tenant_router::{tenant_key_segment, TenantId},
     };
     use rustyred_thg_affordances::registry::register_connector_with_target;
     use rustyred_thg_affordances::{ConnectorManifest, ToolManifest, CONNECTOR_FAMILY};
@@ -9360,6 +9361,8 @@ mod tests {
                 mcp_default_tenant: "default".to_string(),
                 mcp_graphql_default_surface: false,
                 ttl_sweep_ms: 1000,
+                tenant_idle_ms: 300_000,
+                tenant_warm_pool_size: 0,
             },
             search_providers,
         )
@@ -10910,6 +10913,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         });
 
         let response =
@@ -11506,6 +11511,8 @@ mod tests {
             mcp_default_tenant: "default".to_string(),
             mcp_graphql_default_surface: false,
             ttl_sweep_ms: 1000,
+            tenant_idle_ms: 300_000,
+            tenant_warm_pool_size: 0,
         });
 
         let response = diagnostics_config(axum::extract::State(state), HeaderMap::new())
@@ -11589,16 +11596,17 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_payload_json(response).await;
+        let tenant_key = tenant_key_segment(&TenantId::new(tenant_id).unwrap());
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["redcore_tenant_count"], 1);
-        assert_eq!(payload["redcore_tenants"][0]["tenant"], "pct_tenant-memory");
+        assert_eq!(payload["redcore_tenants"][0]["tenant"], tenant_key);
         assert_eq!(payload["redcore_tenants"][0]["stats"]["nodes_total"], 1);
         assert_eq!(
             payload["redcore_tenants"][0]["cached_edges"]["present"],
             false
         );
         assert_eq!(payload["graph_cache_tenant_count"], 1);
-        assert_eq!(payload["graph_caches"][0]["tenant"], "pct_tenant-memory");
+        assert_eq!(payload["graph_caches"][0]["tenant"], tenant_key);
         assert_eq!(payload["graph_caches"][0]["cache"]["entries_total"], 1);
         assert!(payload["ppr_cache"]["scoped_entries"].is_u64());
         assert!(payload["process"]["available"].is_boolean());

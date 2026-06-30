@@ -26,7 +26,10 @@ pub async fn metrics(
         "admin:read",
         state.config.require_auth,
     )?;
-    let body = state.observability.render_prometheus();
+    let mut body = state.observability.render_prometheus();
+    if let Ok(tenant_metrics) = state.render_tenant_engine_prometheus() {
+        body.push_str(&tenant_metrics);
+    }
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -146,6 +149,8 @@ pub async fn diagnostics_config(
         "tenant_memory_quota_supported": tenant_memory_quota_supported,
         "tenant_memory_quota_enforced": tenant_memory_quota_supported
             && state.config.tenant_memory_quota_bytes > 0,
+        "tenant_idle_ms": state.config.tenant_idle_ms,
+        "tenant_warm_pool_size": state.config.tenant_warm_pool_size,
         "slow_query_threshold_nanos": state.config.slow_query_threshold_nanos,
         "slow_query_capacity": state.config.slow_query_capacity,
         "slow_query_log_enabled": state.config.slow_query_log.is_some(),
@@ -241,6 +246,9 @@ pub async fn diagnostics_memory(
             }
         })
         .collect::<Vec<_>>();
+    let tenant_engines = state
+        .tenant_engine_reports()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(json!({
         "service": state.config.service_name.as_str(),
@@ -252,6 +260,8 @@ pub async fn diagnostics_memory(
         },
         "redcore_tenant_count": tenant_reports.len(),
         "redcore_tenants": tenant_reports,
+        "tenant_engine_count": tenant_engines.len(),
+        "tenant_engines": tenant_engines,
         "graph_cache_tenant_count": cache_reports.len(),
         "graph_caches": cache_reports,
     })))
