@@ -15,6 +15,7 @@ use rustyred_thg_core::{
     GraphMutationBatch, GraphSnapshot, GraphStoreError, GraphStoreResult, GraphTransaction,
     GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery, NodeRecord,
     Provenance, RedCoreGraphStore, ThgError, ThgResult, VectorDesignation,
+    DEFAULT_VECTOR_INDEX_BIT_WIDTH,
 };
 use theorem_harness_core::AffordanceContract;
 
@@ -629,6 +630,7 @@ pub fn affordance_vector_designation(dimension: usize) -> VectorDesignation {
         label: AFFORDANCE_LABEL.to_string(),
         property: "embedding".to_string(),
         dimension,
+        bit_width: DEFAULT_VECTOR_INDEX_BIT_WIDTH,
     }
 }
 

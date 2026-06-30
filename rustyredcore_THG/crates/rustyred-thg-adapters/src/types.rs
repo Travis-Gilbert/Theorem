@@ -6,6 +6,7 @@ use rustyred_thg_core::{
     GraphMutationBatch, GraphSnapshot, GraphStats, GraphStoreError, GraphStoreResult,
     GraphTransaction, GraphWriteResult, InMemoryGraphStore, NeighborHit, NeighborQuery, NodeQuery,
     NodeRecord, RedCoreGraphStore, ThgError, ThgResult, VectorDesignation,
+    DEFAULT_VECTOR_INDEX_BIT_WIDTH,
 };
 
 pub const LORA_ADAPTER_LABEL: &str = "LoraAdapter";
@@ -376,6 +377,7 @@ pub fn adapter_vector_designation(dimension: usize) -> VectorDesignation {
         label: LORA_ADAPTER_LABEL.to_string(),
         property: "embedding".to_string(),
         dimension,
+        bit_width: DEFAULT_VECTOR_INDEX_BIT_WIDTH,
     }
 }
 

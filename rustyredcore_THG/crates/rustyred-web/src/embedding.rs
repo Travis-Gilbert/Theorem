@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use rustyred_hipporag::{HippoError, HippoResult, HippoTextEmbedder};
-use rustyred_thg_core::{GraphMutation, VectorDesignation};
+use rustyred_thg_core::{GraphMutation, VectorDesignation, DEFAULT_VECTOR_INDEX_BIT_WIDTH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -61,6 +61,7 @@ impl EmbeddingModelContract {
             label: self.label.clone(),
             property: self.property.clone(),
             dimension: self.dimension,
+            bit_width: DEFAULT_VECTOR_INDEX_BIT_WIDTH,
         }
     }
 }
@@ -471,6 +472,7 @@ pub async fn embed_crawl_graph_pages(
         label: LABEL_PAGE.to_string(),
         property: embedder.property().to_string(),
         dimension: embedder.dimension(),
+        bit_width: DEFAULT_VECTOR_INDEX_BIT_WIDTH,
     };
     Ok(CrawlEmbeddingReceipt {
         model_id: embedder.model_id().to_string(),
@@ -753,6 +755,7 @@ mod tests {
                 label: LABEL_PAGE.to_string(),
                 property: SEMANTIC_VECTOR_PROPERTY.to_string(),
                 dimension: QWEN3_EMBEDDING_4B_DIMENSION,
+                bit_width: DEFAULT_VECTOR_INDEX_BIT_WIDTH,
             }
         );
     }

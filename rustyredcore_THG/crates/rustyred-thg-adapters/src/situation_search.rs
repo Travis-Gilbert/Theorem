@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use rustyred_thg_core::{
     now_ms, stable_hash, GraphMutation, GraphMutationBatch, GraphStoreResult, GraphTransaction,
     InMemoryGraphStore, NodeRecord, RedCoreGraphStore, ThgError, ThgResult, VectorDesignation,
+    DEFAULT_VECTOR_INDEX_BIT_WIDTH,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -333,6 +334,7 @@ pub fn semantic_vector_designations() -> Vec<VectorDesignation> {
         label: label.to_string(),
         property: property.to_string(),
         dimension,
+        bit_width: DEFAULT_VECTOR_INDEX_BIT_WIDTH,
     })
     .collect()
 }
