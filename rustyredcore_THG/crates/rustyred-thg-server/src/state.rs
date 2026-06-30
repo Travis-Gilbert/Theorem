@@ -939,7 +939,7 @@ impl AppState {
                     TenantEngineState::Cold => 0,
                     TenantEngineState::Warm | TenantEngineState::Hot => stores
                         .get(tenant_key)
-                        .and_then(|store| store.cheap_stats().ok())
+                        .and_then(|store| store.stats().ok())
                         .map(|stats| stats.memory_bytes)
                         .unwrap_or(0),
                 };
@@ -1494,7 +1494,7 @@ impl RedCoreTenantExecutor {
     }
 
     pub fn cheap_stats(&self) -> GraphStoreResult<GraphStats> {
-        let mut stats = self.lock_writer()?.stats()?;
+        let mut stats = self.lock_writer()?.stats_without_memory_estimate()?;
         stats.memory_quota_bytes = self.tenant_memory_quota_bytes;
         Ok(stats)
     }
