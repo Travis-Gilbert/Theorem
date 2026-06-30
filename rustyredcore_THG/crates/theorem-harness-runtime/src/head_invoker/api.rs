@@ -342,7 +342,8 @@ fn openai_chat_text(body: &Value) -> String {
     ]) {
         return text;
     }
-    body.get("choices")
+    let choice_text = body
+        .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| {
             choices.iter().find_map(|choice| {
@@ -355,8 +356,11 @@ fn openai_chat_text(body: &Value) -> String {
                 });
                 message_text.or_else(|| first_nonempty_text([choice.get("text")]))
             })
-        })
-        .unwrap_or_default()
+        });
+    if let Some(text) = choice_text {
+        return text;
+    }
+    openai_reasoning_text(body)
 }
 
 fn openai_reasoning_text(body: &Value) -> String {
@@ -616,6 +620,12 @@ mod tests {
                 "choices": [{ "text": "legacy choice text" }]
             })),
             "legacy choice text"
+        );
+        assert_eq!(
+            openai_chat_text(&json!({
+                "choices": [{ "message": { "content": "", "reasoning_content": "reasoning only text" } }]
+            })),
+            "reasoning only text"
         );
     }
 
