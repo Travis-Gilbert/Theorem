@@ -9,7 +9,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 use rkyv::{
-    api::high::{access, HighSerializer, HighValidator},
+    api::high::{access, deserialize, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
     rancor::Error as RkyvError,
     ser::allocator::ArenaHandle,
@@ -169,6 +169,14 @@ pub fn access_graph_archive(
     bytes: &[u8],
 ) -> Result<&ArchivedGraphArchiveEnvelope, ZeroCopyArchiveError> {
     access_archive::<ArchivedGraphArchiveEnvelope>(bytes)
+}
+
+pub fn deserialize_graph_archive(
+    bytes: &[u8],
+) -> Result<GraphArchiveEnvelope, ZeroCopyArchiveError> {
+    let archived = access_graph_archive(bytes)?;
+    deserialize::<GraphArchiveEnvelope, RkyvError>(archived)
+        .map_err(|error| ZeroCopyArchiveError::new("archive_deserialize", error.to_string()))
 }
 
 pub fn archive_hash(bytes: &[u8]) -> String {

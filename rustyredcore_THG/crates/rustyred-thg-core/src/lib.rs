@@ -145,9 +145,11 @@ pub use graph_store::{
     GraphMutationBatch, GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
     GraphStoreResult, GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore,
     MemoryDocumentQuery, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, Provenance,
-    RedCoreDurability, RedCoreGraphStore, RedCoreManifest, RedCoreOptions, RedCoreStatus,
-    TimeInterval, VectorDesignation, VectorIndex, VectorIndexManifest, VectorPoint, VerifyProblem,
-    VerifyReport, CURRENT_FORMAT_VERSION, DEFAULT_VECTOR_INDEX_BIT_WIDTH, TTL_PROPERTY,
+    RedCoreDurability, RedCoreGraphStore, RedCoreManifest, RedCoreOptions, RedCorePayloadBackend,
+    RedCorePayloadPointer, RedCoreStatus, TimeInterval, VectorDesignation, VectorIndex,
+    VectorIndexManifest, VectorPoint, VerifyProblem, VerifyReport, CURRENT_FORMAT_VERSION,
+    DEFAULT_VECTOR_INDEX_BIT_WIDTH, REDCORE_LOCAL_PAYLOAD_BACKEND,
+    REDCORE_RAILWAY_BUCKETS_PAYLOAD_BACKEND, TTL_PROPERTY,
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
