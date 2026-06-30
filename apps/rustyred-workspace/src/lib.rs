@@ -5,28 +5,41 @@
 //! filters build artifacts, batches the source files through `Engine`, and
 //! leaves later units to maintain the code graph and execution bridge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
+use notify_debouncer_full::notify::RecursiveMode;
+use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use rustyred_embedded::{
-    DirectoryRemoveDisposition, Engine, EngineError, FileWrite, FileWriteReceipt,
+    DirectoryRemoveDisposition, EmbeddedConfig, Engine, EngineError, FileWrite, FileWriteReceipt,
 };
 use rustyred_thg_code::{
     index_source_file_write_in_store, stage_repo_for_ingest_with_credential, FetchedRepo,
     GitCredential, IngestCodebaseInput, RepoFetchCaps, SourceFileWriteIndexInput,
 };
+use rustyred_thg_core::{NodeQuery, DOC_TREE_CONTENT_HASH_PROPERTY, DOC_TREE_PATH_PROPERTY};
 use theorem_receiver::{
-    ProofPlan, ProofReceipt, SandboxCancelToken, SandboxFile, SandboxProvisionRequest,
-    SandboxRuntime, SandboxStreamEvent,
+    build_spawn_plan, ProofPlan, ProofReceipt, SandboxCancelToken, SandboxFile,
+    SandboxProvisionRequest, SandboxRuntime, SandboxStreamEvent, SpawnPlan,
 };
 
 const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_MIRROR_DEBOUNCE: Duration = Duration::from_millis(200);
+pub const DEFAULT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_MIRROR_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
+const LOCAL_WORKSPACE_TENANT: &str = "local";
 
 /// Import controls for a checkout-to-DocTree batch.
 #[derive(Clone, Debug)]
@@ -81,6 +94,81 @@ pub struct SyncBackReceipt {
     pub code_edges_indexed: u64,
     pub code_edges_retired: u64,
     pub code_bucket_lookups: u64,
+}
+
+/// Import controls for a real filesystem mirror.
+#[derive(Clone, Debug)]
+pub struct MirrorImportOptions {
+    /// Optional destination prefix inside the engine DocTree/index namespace.
+    pub prefix: String,
+    /// Optional workspace root. When absent, a local checkout is used in place
+    /// and a URL import keeps the staged clone as the mirror root.
+    pub workspace_root: Option<PathBuf>,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+impl Default for MirrorImportOptions {
+    fn default() -> Self {
+        Self {
+            prefix: String::new(),
+            workspace_root: None,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MirrorImportReceipt {
+    pub root: PathBuf,
+    pub files_mirrored: usize,
+    pub files_skipped: usize,
+    pub bytes_mirrored: u64,
+    pub paths: Vec<String>,
+    pub index: IndexReceipt,
+    pub clone_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexReceipt {
+    pub root: PathBuf,
+    pub files_indexed: usize,
+    pub files_removed: usize,
+    pub files_skipped: usize,
+    pub bytes_indexed: u64,
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditReceipt {
+    pub root: PathBuf,
+    pub divergence_count: usize,
+    pub divergence: Divergence,
+}
+
+/// Live-filesystem-vs-index divergence returned by the consistency oracle.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Divergence {
+    pub missing_from_index: Vec<String>,
+    pub indexed_but_missing_on_disk: Vec<String>,
+    pub hash_mismatches: Vec<String>,
+    pub excluded_index_paths: Vec<String>,
+    pub doctree_without_real_file: Vec<String>,
+}
+
+impl Divergence {
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    pub fn count(&self) -> usize {
+        self.missing_from_index.len()
+            + self.indexed_but_missing_on_disk.len()
+            + self.hash_mismatches.len()
+            + self.excluded_index_paths.len()
+            + self.doctree_without_real_file.len()
+    }
 }
 
 /// File type exposed by the W6 DocTree mount core.
@@ -2112,7 +2200,7 @@ pub fn install_code_index_file_write_hook(engine: &Engine, options: CodeIndexOpt
                         index_source_file_write_in_store(
                             store,
                             SourceFileWriteIndexInput {
-                                tenant_id: engine.tenant().to_string(),
+                                tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                                 repo_id: options.repo_id.clone(),
                                 repo_root_display: options.repo_root_display.clone(),
                                 file_path: write.path.clone(),
@@ -2253,6 +2341,7 @@ pub enum WorkspaceError {
     Path(String),
     Run(String),
     Sandbox(String),
+    Watch(String),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -2266,6 +2355,7 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::Path(message) => write!(f, "path: {message}"),
             WorkspaceError::Run(message) => write!(f, "run: {message}"),
             WorkspaceError::Sandbox(message) => write!(f, "sandbox: {message}"),
+            WorkspaceError::Watch(message) => write!(f, "watch: {message}"),
         }
     }
 }
@@ -2297,7 +2387,7 @@ pub fn import_repo_url(
 ) -> Result<ImportReceipt, WorkspaceError> {
     let caps = RepoFetchCaps::from_requested(options.max_total_bytes);
     let input = IngestCodebaseInput {
-        tenant_id: engine.tenant().to_string(),
+        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
         max_total_bytes: options.max_total_bytes,
         actor: "rustyred-workspace".to_string(),
         ..IngestCodebaseInput::default()
@@ -2307,6 +2397,960 @@ pub fn import_repo_url(
             .map_err(|error| WorkspaceError::Code(error.to_string()))?;
     let _fetched: Option<FetchedRepo> = fetched;
     import_checkout_with_clone_ms(engine, Path::new(&staged.repo_path), options, clone_ms)
+}
+
+/// Use an existing checkout as the canonical real filesystem mirror and rebuild
+/// the downstream DocTree/File index from it.
+pub fn import_checkout_mirror(
+    engine: &Engine,
+    repo: impl AsRef<Path>,
+    options: MirrorImportOptions,
+) -> Result<MirrorImportReceipt, WorkspaceError> {
+    import_checkout_mirror_with_clone_ms(engine, repo.as_ref(), options, 0)
+}
+
+/// Clone a remote repository, keep or copy the real files as the workspace
+/// mirror, and rebuild the downstream DocTree/File index from that directory.
+pub fn import_repo_url_mirror(
+    engine: &Engine,
+    url: &str,
+    options: MirrorImportOptions,
+    credential: Option<&GitCredential>,
+) -> Result<MirrorImportReceipt, WorkspaceError> {
+    let caps = RepoFetchCaps::from_requested(options.max_total_bytes);
+    let input = IngestCodebaseInput {
+        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
+        max_total_bytes: options.max_total_bytes,
+        actor: "rustyred-workspace".to_string(),
+        ..IngestCodebaseInput::default()
+    };
+    let (staged, clone_ms, fetched) =
+        stage_repo_for_ingest_with_credential(input, Some((url, &caps)), credential)
+            .map_err(|error| WorkspaceError::Code(error.to_string()))?;
+    let repo = if options.workspace_root.is_none() {
+        fetched
+            .map(FetchedRepo::keep)
+            .unwrap_or_else(|| PathBuf::from(&staged.repo_path))
+    } else {
+        PathBuf::from(&staged.repo_path)
+    };
+    import_checkout_mirror_with_clone_ms(engine, &repo, options, clone_ms)
+}
+
+/// CommonPlace repo-connect front door: one call lands real files in the
+/// workspace mirror and creates the downstream File index.
+pub fn connect_commonplace_repo_mirror(
+    engine: &Engine,
+    repo: impl AsRef<Path>,
+    options: MirrorImportOptions,
+) -> Result<MirrorImportReceipt, WorkspaceError> {
+    import_checkout_mirror(engine, repo, options)
+}
+
+/// Build an agent session entry that works directly in the real mirror root.
+/// There is no materialize step: the spawned CLI's cwd is the canonical
+/// workspace directory and notify/reconcile can keep the index fresh.
+pub fn agent_session_plan(
+    root: impl AsRef<Path>,
+    lane: &str,
+    intent: &str,
+) -> Result<SpawnPlan, WorkspaceError> {
+    let root = canonical_root(root.as_ref())?;
+    build_spawn_plan(lane, intent, &root)
+        .ok_or_else(|| WorkspaceError::Run(format!("unknown agent lane {lane:?}")))
+}
+
+pub fn index_path(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    path: impl AsRef<Path>,
+) -> Result<Option<FileWriteReceipt>, WorkspaceError> {
+    index_path_with_max_file_bytes(engine, root, prefix, path, DEFAULT_MAX_FILE_BYTES)
+}
+
+fn index_path_with_max_file_bytes(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    path: impl AsRef<Path>,
+    max_file_bytes: u64,
+) -> Result<Option<FileWriteReceipt>, WorkspaceError> {
+    let root = canonical_root(root.as_ref())?;
+    let input_path = path.as_ref();
+    let (path, relative) = if input_path.is_absolute() {
+        let relative = input_path
+            .strip_prefix(&root)
+            .map_err(|error| WorkspaceError::Path(error.to_string()))?
+            .to_path_buf();
+        (input_path.to_path_buf(), relative)
+    } else {
+        let relative = safe_relative_path(input_path.to_string_lossy().as_ref())?;
+        (root.join(&relative), relative)
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let engine_path = import_path(prefix, &relative)?;
+    if should_skip(&relative) || !path.exists() {
+        engine.fs_remove_file_index(&engine_path)?;
+        return Ok(None);
+    }
+    let canonical = fs::canonicalize(&path).map_err(|error| WorkspaceError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if !canonical.starts_with(&root) {
+        engine.fs_remove_file_index(&engine_path)?;
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&canonical).map_err(|error| WorkspaceError::Io {
+        path: canonical.clone(),
+        message: error.to_string(),
+    })?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let Some(body) = read_stable_file(&canonical, max_file_bytes) else {
+        engine.fs_remove_file_index(&engine_path)?;
+        return Ok(None);
+    };
+    engine
+        .fs_link_real_file(&engine_path, &canonical, &body)
+        .map(Some)
+        .map_err(WorkspaceError::Engine)
+}
+
+pub fn index_tree(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+) -> Result<IndexReceipt, WorkspaceError> {
+    reconcile(engine, root, prefix)
+}
+
+/// Runtime reconcile: rescan the captured region, index fresh/changed files,
+/// and remove stale downstream File nodes and DocTree entries.
+pub fn reconcile(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+) -> Result<IndexReceipt, WorkspaceError> {
+    reconcile_with_limits(
+        engine,
+        root,
+        prefix,
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
+}
+
+pub fn reconcile_with_options(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    options: &MirrorImportOptions,
+) -> Result<IndexReceipt, WorkspaceError> {
+    reconcile_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
+}
+
+fn reconcile_with_max_file_bytes(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+) -> Result<IndexReceipt, WorkspaceError> {
+    reconcile_with_limits(
+        engine,
+        root,
+        prefix,
+        max_file_bytes,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
+}
+
+fn reconcile_with_limits(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<IndexReceipt, WorkspaceError> {
+    let root = canonical_root(root.as_ref())?;
+    let snapshot = filesystem_hashes(&root, prefix, max_file_bytes, max_total_bytes)?;
+    let disk = snapshot.files;
+    let doc = doctree_paths(engine, prefix)?;
+    let files = file_node_paths(engine, prefix)?;
+    let mut indexed = BTreeSet::new();
+    indexed.extend(doc.keys().cloned());
+    indexed.extend(files.keys().cloned());
+    let mut files_removed = 0usize;
+    for path in &indexed {
+        if !disk.contains_key(path) {
+            if engine.fs_remove_file_index(path)? {
+                files_removed += 1;
+            }
+        }
+    }
+
+    let mut files_indexed = 0usize;
+    let mut bytes_indexed = 0u64;
+    let mut paths = Vec::new();
+    for (engine_path, file) in disk {
+        let doc_matches = doc
+            .get(&engine_path)
+            .is_some_and(|entry| entry.content_hash == file.content_hash);
+        let file_node_matches = files
+            .get(&engine_path)
+            .is_some_and(|hash| hash == &file.content_hash);
+        if doc_matches && file_node_matches {
+            continue;
+        }
+        let receipt = engine.fs_link_real_file(&engine_path, &file.real_path, &file.body)?;
+        bytes_indexed = bytes_indexed.saturating_add(file.body.len() as u64);
+        files_indexed += 1;
+        paths.push(receipt.path);
+    }
+    paths.sort();
+    Ok(IndexReceipt {
+        root,
+        files_indexed,
+        files_removed,
+        files_skipped: snapshot.files_skipped,
+        bytes_indexed,
+        paths,
+    })
+}
+
+/// Drop the downstream code projection under `prefix`.
+///
+/// This removes mirrored DocTree/File entries while leaving unrelated graph
+/// content intact. Use `rebuild_code_index` when the desired end state is a
+/// fresh projection of the live checkout.
+pub fn drop_code_index(engine: &Engine, prefix: &str) -> Result<IndexReceipt, WorkspaceError> {
+    let doc = doctree_paths(engine, prefix)?;
+    let files = file_node_paths(engine, prefix)?;
+    let mut paths = BTreeSet::new();
+    paths.extend(doc.keys().cloned());
+    paths.extend(files.keys().cloned());
+
+    let mut files_removed = 0usize;
+    let mut removed_paths = Vec::new();
+    for path in paths {
+        if engine.fs_remove_file_index(&path)? {
+            files_removed += 1;
+            removed_paths.push(path);
+        }
+    }
+    Ok(IndexReceipt {
+        root: PathBuf::new(),
+        files_indexed: 0,
+        files_removed,
+        files_skipped: 0,
+        bytes_indexed: 0,
+        paths: removed_paths,
+    })
+}
+
+/// Rebuild the downstream code projection from the real mirror root.
+pub fn rebuild_code_index(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+) -> Result<IndexReceipt, WorkspaceError> {
+    rebuild_code_index_with_max_file_bytes(engine, root, prefix, DEFAULT_MAX_FILE_BYTES)
+}
+
+pub fn rebuild_code_index_with_options(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    options: &MirrorImportOptions,
+) -> Result<IndexReceipt, WorkspaceError> {
+    rebuild_code_index_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
+}
+
+fn rebuild_code_index_with_max_file_bytes(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+) -> Result<IndexReceipt, WorkspaceError> {
+    let dropped = drop_code_index(engine, prefix)?;
+    let mut rebuilt = reconcile_with_max_file_bytes(engine, root, prefix, max_file_bytes)?;
+    rebuilt.files_removed = rebuilt.files_removed.saturating_add(dropped.files_removed);
+    rebuilt.paths.extend(dropped.paths);
+    rebuilt.paths.sort();
+    rebuilt.paths.dedup();
+    Ok(rebuilt)
+}
+
+fn rebuild_code_index_with_limits(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<IndexReceipt, WorkspaceError> {
+    let dropped = drop_code_index(engine, prefix)?;
+    let mut rebuilt = reconcile_with_limits(engine, root, prefix, max_file_bytes, max_total_bytes)?;
+    rebuilt.files_removed = rebuilt.files_removed.saturating_add(dropped.files_removed);
+    rebuilt.paths.extend(dropped.paths);
+    rebuilt.paths.sort();
+    rebuilt.paths.dedup();
+    Ok(rebuilt)
+}
+
+/// Consistency oracle. It reads the live filesystem fresh on every call and
+/// compares it to the downstream File nodes plus DocTree entries.
+pub fn audit_consistency(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+) -> Result<Divergence, WorkspaceError> {
+    audit_consistency_with_limits(
+        engine,
+        root,
+        prefix,
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
+}
+
+pub fn audit_consistency_with_options(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    options: &MirrorImportOptions,
+) -> Result<Divergence, WorkspaceError> {
+    audit_consistency_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
+}
+
+fn audit_consistency_with_limits(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<Divergence, WorkspaceError> {
+    let root = canonical_root(root.as_ref())?;
+    let disk = filesystem_hashes(&root, prefix, max_file_bytes, max_total_bytes)?.files;
+    let doc = doctree_paths(engine, prefix)?;
+    let files = file_node_paths(engine, prefix)?;
+    let mut all_indexed = BTreeSet::new();
+    all_indexed.extend(doc.keys().cloned());
+    all_indexed.extend(files.keys().cloned());
+
+    let mut divergence = Divergence::default();
+    for (path, disk_file) in &disk {
+        let doc_hash = doc.get(path).map(|entry| entry.content_hash.as_str());
+        let file_hash = files.get(path).map(String::as_str);
+        if doc_hash.is_none() || file_hash.is_none() {
+            divergence.missing_from_index.push(path.clone());
+            continue;
+        }
+        if doc_hash != Some(disk_file.content_hash.as_str())
+            || file_hash != Some(disk_file.content_hash.as_str())
+        {
+            divergence.hash_mismatches.push(path.clone());
+        }
+    }
+    for path in &all_indexed {
+        let relative = materialized_relative_path(prefix, path)?;
+        if should_skip(&relative) {
+            divergence.excluded_index_paths.push(path.clone());
+        }
+        if !disk.contains_key(path) {
+            divergence.indexed_but_missing_on_disk.push(path.clone());
+        }
+    }
+    for (path, entry) in &doc {
+        match entry.real_path.as_ref() {
+            Some(real_path) if Path::new(real_path).is_file() => {}
+            _ => divergence.doctree_without_real_file.push(path.clone()),
+        }
+    }
+    divergence.missing_from_index.sort();
+    divergence.indexed_but_missing_on_disk.sort();
+    divergence.hash_mismatches.sort();
+    divergence.excluded_index_paths.sort();
+    divergence.doctree_without_real_file.sort();
+    Ok(divergence)
+}
+
+/// Runtime audit: report divergence without changing state.
+pub fn audit(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+) -> Result<AuditReceipt, WorkspaceError> {
+    audit_with_limits(
+        engine,
+        root,
+        prefix,
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_TOTAL_BYTES,
+    )
+}
+
+pub fn audit_with_options(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    options: &MirrorImportOptions,
+) -> Result<AuditReceipt, WorkspaceError> {
+    audit_with_limits(
+        engine,
+        root,
+        &options.prefix,
+        options.max_file_bytes,
+        options.max_total_bytes,
+    )
+}
+
+fn audit_with_limits(
+    engine: &Engine,
+    root: impl AsRef<Path>,
+    prefix: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<AuditReceipt, WorkspaceError> {
+    let root = canonical_root(root.as_ref())?;
+    let divergence =
+        audit_consistency_with_limits(engine, &root, prefix, max_file_bytes, max_total_bytes)?;
+    Ok(AuditReceipt {
+        root,
+        divergence_count: divergence.count(),
+        divergence,
+    })
+}
+
+/// Render a small Prometheus-compatible metric block for periodic mirror audits.
+pub fn render_audit_prometheus(receipt: &AuditReceipt, prefix: &str) -> String {
+    let root = prometheus_label_value(&receipt.root.to_string_lossy());
+    let prefix = prometheus_label_value(prefix.trim_matches('/'));
+    let mut out = String::new();
+    out.push_str("# HELP rustyred_workspace_mirror_divergence_count Live workspace mirror divergence count.\n");
+    out.push_str("# TYPE rustyred_workspace_mirror_divergence_count gauge\n");
+    out.push_str(&format!(
+        "rustyred_workspace_mirror_divergence_count{{root=\"{root}\",prefix=\"{prefix}\"}} {}\n",
+        receipt.divergence_count
+    ));
+    out.push_str("# HELP rustyred_workspace_mirror_divergence_paths Live workspace mirror divergence by class.\n");
+    out.push_str("# TYPE rustyred_workspace_mirror_divergence_paths gauge\n");
+    for (class, count) in [
+        (
+            "missing_from_index",
+            receipt.divergence.missing_from_index.len(),
+        ),
+        (
+            "indexed_but_missing_on_disk",
+            receipt.divergence.indexed_but_missing_on_disk.len(),
+        ),
+        ("hash_mismatches", receipt.divergence.hash_mismatches.len()),
+        (
+            "excluded_index_paths",
+            receipt.divergence.excluded_index_paths.len(),
+        ),
+        (
+            "doctree_without_real_file",
+            receipt.divergence.doctree_without_real_file.len(),
+        ),
+    ] {
+        out.push_str(&format!(
+            "rustyred_workspace_mirror_divergence_paths{{root=\"{root}\",prefix=\"{prefix}\",class=\"{class}\"}} {count}\n"
+        ));
+    }
+    out
+}
+
+#[derive(Clone, Debug)]
+pub struct MirrorAuditTarget {
+    pub root: PathBuf,
+    pub options: MirrorImportOptions,
+}
+
+impl MirrorAuditTarget {
+    pub fn new(root: impl Into<PathBuf>, options: MirrorImportOptions) -> Self {
+        Self {
+            root: root.into(),
+            options,
+        }
+    }
+
+    fn key(&self) -> String {
+        format!(
+            "{}\0{}",
+            self.root.display(),
+            self.options.prefix.trim_matches('/')
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MirrorAuditSnapshot {
+    pub prometheus: String,
+    pub receipts: Vec<AuditReceipt>,
+    pub errors: Vec<String>,
+    pub runs: u64,
+}
+
+struct MirrorAuditState {
+    targets: BTreeMap<String, MirrorAuditTarget>,
+    latest: MirrorAuditSnapshot,
+}
+
+impl MirrorAuditState {
+    fn new(targets: Vec<MirrorAuditTarget>) -> Self {
+        let targets = targets
+            .into_iter()
+            .map(|target| (target.key(), target))
+            .collect();
+        Self {
+            targets,
+            latest: MirrorAuditSnapshot::default(),
+        }
+    }
+}
+
+/// Periodic runtime self-audit for real filesystem mirrors.
+///
+/// The monitor opens the embedded engine on its worker thread, runs the same
+/// filesystem oracle used by tests, and caches Prometheus text for whichever
+/// HTTP/service surface already owns observability.
+pub struct WorkspaceMirrorAuditMonitor {
+    engine_dir: PathBuf,
+    engine_lock: Arc<Mutex<()>>,
+    state: Arc<Mutex<MirrorAuditState>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl WorkspaceMirrorAuditMonitor {
+    pub fn start(
+        engine_dir: impl Into<PathBuf>,
+        targets: Vec<MirrorAuditTarget>,
+        interval: Duration,
+    ) -> Result<Self, WorkspaceError> {
+        Self::start_with_engine_lock(engine_dir, targets, interval, Arc::new(Mutex::new(())))
+    }
+
+    pub fn start_with_engine_lock(
+        engine_dir: impl Into<PathBuf>,
+        targets: Vec<MirrorAuditTarget>,
+        interval: Duration,
+        engine_lock: Arc<Mutex<()>>,
+    ) -> Result<Self, WorkspaceError> {
+        let engine_dir = engine_dir.into();
+        let state = Arc::new(Mutex::new(MirrorAuditState::new(targets)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_state = Arc::clone(&state);
+        let thread_stop = Arc::clone(&stop);
+        let thread_engine_dir = engine_dir.clone();
+        let thread_engine_lock = Arc::clone(&engine_lock);
+        let sleep_interval = interval.max(Duration::from_millis(1));
+        let handle = thread::Builder::new()
+            .name("workspace-mirror-audit".to_string())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    run_monitor_cycle(&thread_engine_dir, &thread_engine_lock, &thread_state);
+                    sleep_interruptibly(sleep_interval, &thread_stop);
+                }
+            })
+            .map_err(|error| WorkspaceError::Run(format!("spawn mirror audit: {error}")))?;
+        let monitor = Self {
+            engine_dir,
+            engine_lock,
+            state,
+            stop,
+            handle: Some(handle),
+        };
+        monitor.run_once();
+        Ok(monitor)
+    }
+
+    pub fn add_target(&self, target: MirrorAuditTarget) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.targets.insert(target.key(), target);
+        }
+    }
+
+    pub fn run_once(&self) -> MirrorAuditSnapshot {
+        run_monitor_cycle(&self.engine_dir, &self.engine_lock, &self.state)
+    }
+
+    pub fn snapshot(&self) -> MirrorAuditSnapshot {
+        self.state
+            .lock()
+            .map(|guard| guard.latest.clone())
+            .unwrap_or_else(|_| MirrorAuditSnapshot {
+                prometheus: render_monitor_error_prometheus(
+                    0,
+                    "workspace mirror audit state lock poisoned",
+                ),
+                receipts: Vec::new(),
+                errors: vec!["workspace mirror audit state lock poisoned".to_string()],
+                runs: 0,
+            })
+    }
+
+    pub fn latest_prometheus(&self) -> String {
+        self.snapshot().prometheus
+    }
+
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for WorkspaceMirrorAuditMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_monitor_cycle(
+    engine_dir: &Path,
+    engine_lock: &Arc<Mutex<()>>,
+    state: &Arc<Mutex<MirrorAuditState>>,
+) -> MirrorAuditSnapshot {
+    let (targets, previous_runs) = match state.lock() {
+        Ok(guard) => (
+            guard.targets.values().cloned().collect::<Vec<_>>(),
+            guard.latest.runs,
+        ),
+        Err(_) => {
+            return MirrorAuditSnapshot {
+                prometheus: render_monitor_error_prometheus(
+                    0,
+                    "workspace mirror audit state lock poisoned",
+                ),
+                receipts: Vec::new(),
+                errors: vec!["workspace mirror audit state lock poisoned".to_string()],
+                runs: 0,
+            };
+        }
+    };
+    let runs = previous_runs.saturating_add(1);
+    let mut snapshot = match engine_lock.lock() {
+        Ok(_guard) => match EmbeddedConfig::load_for_dir(engine_dir)
+            .and_then(|config| Engine::open(engine_dir, config))
+        {
+            Ok(engine) => audit_targets(&engine, &targets, runs),
+            Err(error) => MirrorAuditSnapshot {
+                prometheus: render_monitor_error_prometheus(runs, &format!("open engine: {error}")),
+                receipts: Vec::new(),
+                errors: vec![format!("open engine: {error}")],
+                runs,
+            },
+        },
+        Err(_) => MirrorAuditSnapshot {
+            prometheus: render_monitor_error_prometheus(
+                runs,
+                "workspace mirror audit engine lock poisoned",
+            ),
+            receipts: Vec::new(),
+            errors: vec!["workspace mirror audit engine lock poisoned".to_string()],
+            runs,
+        },
+    };
+    if targets.is_empty() && snapshot.prometheus.is_empty() {
+        snapshot.prometheus = render_monitor_summary_prometheus(runs, 0, 0, 0);
+    }
+    if let Ok(mut guard) = state.lock() {
+        guard.latest = snapshot.clone();
+    }
+    snapshot
+}
+
+fn audit_targets(engine: &Engine, targets: &[MirrorAuditTarget], runs: u64) -> MirrorAuditSnapshot {
+    let mut receipts = Vec::new();
+    let mut errors = Vec::new();
+    let mut prometheus = String::new();
+    for target in targets {
+        match audit_with_options(engine, &target.root, &target.options) {
+            Ok(receipt) => {
+                prometheus.push_str(&render_audit_prometheus(&receipt, &target.options.prefix));
+                receipts.push(receipt);
+            }
+            Err(error) => errors.push(format!(
+                "{}:{}: {error}",
+                target.root.display(),
+                target.options.prefix
+            )),
+        }
+    }
+    prometheus.push_str(&render_monitor_summary_prometheus(
+        runs,
+        targets.len(),
+        receipts
+            .iter()
+            .map(|receipt| receipt.divergence_count)
+            .sum(),
+        errors.len(),
+    ));
+    for error in &errors {
+        prometheus.push_str(&render_monitor_error_prometheus(runs, error));
+    }
+    MirrorAuditSnapshot {
+        prometheus,
+        receipts,
+        errors,
+        runs,
+    }
+}
+
+fn render_monitor_summary_prometheus(
+    runs: u64,
+    targets: usize,
+    divergence_count: usize,
+    errors: usize,
+) -> String {
+    format!(
+        "# HELP rustyred_workspace_mirror_audit_runs_total Periodic workspace mirror audit cycles run.\n\
+# TYPE rustyred_workspace_mirror_audit_runs_total counter\n\
+rustyred_workspace_mirror_audit_runs_total {runs}\n\
+# HELP rustyred_workspace_mirror_audit_targets Number of workspace mirror audit targets.\n\
+# TYPE rustyred_workspace_mirror_audit_targets gauge\n\
+rustyred_workspace_mirror_audit_targets {targets}\n\
+# HELP rustyred_workspace_mirror_audit_divergence_count Total divergence across all periodic audit targets.\n\
+# TYPE rustyred_workspace_mirror_audit_divergence_count gauge\n\
+rustyred_workspace_mirror_audit_divergence_count {divergence_count}\n\
+# HELP rustyred_workspace_mirror_audit_errors Number of audit targets that failed during the last cycle.\n\
+# TYPE rustyred_workspace_mirror_audit_errors gauge\n\
+rustyred_workspace_mirror_audit_errors {errors}\n"
+    )
+}
+
+fn render_monitor_error_prometheus(runs: u64, error: &str) -> String {
+    let error = prometheus_label_value(error);
+    format!(
+        "# HELP rustyred_workspace_mirror_audit_error Last workspace mirror audit error by message.\n\
+# TYPE rustyred_workspace_mirror_audit_error gauge\n\
+rustyred_workspace_mirror_audit_error{{message=\"{error}\"}} 1\n\
+# HELP rustyred_workspace_mirror_audit_runs_total Periodic workspace mirror audit cycles run.\n\
+# TYPE rustyred_workspace_mirror_audit_runs_total counter\n\
+rustyred_workspace_mirror_audit_runs_total {runs}\n"
+    )
+}
+
+fn sleep_interruptibly(interval: Duration, stop: &AtomicBool) {
+    let started = Instant::now();
+    while started.elapsed() < interval && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(10).min(interval - started.elapsed()));
+    }
+}
+
+type MirrorDebouncer =
+    Debouncer<notify_debouncer_full::notify::RecommendedWatcher, RecommendedCache>;
+
+/// Debounced notify watcher over a real workspace mirror. The watcher owns the
+/// OS subscription; callers drain events on the engine-owning thread.
+pub struct WorkspaceMirrorWatcher {
+    root: PathBuf,
+    prefix: String,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    rx: Receiver<DebounceEventResult>,
+    #[cfg(test)]
+    tx: Sender<DebounceEventResult>,
+    debouncer: MirrorDebouncer,
+}
+
+impl WorkspaceMirrorWatcher {
+    pub fn start(
+        root: impl AsRef<Path>,
+        prefix: &str,
+        debounce: Duration,
+    ) -> Result<Self, WorkspaceError> {
+        Self::start_with_limits(
+            root,
+            prefix,
+            DEFAULT_MAX_FILE_BYTES,
+            DEFAULT_MAX_TOTAL_BYTES,
+            debounce,
+        )
+    }
+
+    pub fn start_with_options(
+        root: impl AsRef<Path>,
+        options: &MirrorImportOptions,
+        debounce: Duration,
+    ) -> Result<Self, WorkspaceError> {
+        Self::start_with_limits(
+            root,
+            &options.prefix,
+            options.max_file_bytes,
+            options.max_total_bytes,
+            debounce,
+        )
+    }
+
+    fn start_with_limits(
+        root: impl AsRef<Path>,
+        prefix: &str,
+        max_file_bytes: u64,
+        max_total_bytes: u64,
+        debounce: Duration,
+    ) -> Result<Self, WorkspaceError> {
+        let root = canonical_root(root.as_ref())?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        #[cfg(test)]
+        let test_tx = tx.clone();
+        let mut debouncer = new_debouncer(debounce, None, tx)
+            .map_err(|error| WorkspaceError::Watch(error.to_string()))?;
+        debouncer
+            .watch(&root, RecursiveMode::Recursive)
+            .map_err(|error| WorkspaceError::Watch(error.to_string()))?;
+        Ok(Self {
+            root,
+            prefix: prefix.trim_matches('/').to_string(),
+            max_file_bytes,
+            max_total_bytes,
+            rx,
+            #[cfg(test)]
+            tx: test_tx,
+            debouncer,
+        })
+    }
+
+    pub fn start_reconciled(
+        engine: &Engine,
+        root: impl AsRef<Path>,
+        prefix: &str,
+        debounce: Duration,
+    ) -> Result<(Self, IndexReceipt), WorkspaceError> {
+        let options = MirrorImportOptions {
+            prefix: prefix.to_string(),
+            ..MirrorImportOptions::default()
+        };
+        Self::start_reconciled_with_options(engine, root, &options, debounce)
+    }
+
+    pub fn start_reconciled_with_options(
+        engine: &Engine,
+        root: impl AsRef<Path>,
+        options: &MirrorImportOptions,
+        debounce: Duration,
+    ) -> Result<(Self, IndexReceipt), WorkspaceError> {
+        let root = canonical_root(root.as_ref())?;
+        let receipt = reconcile_with_options(engine, &root, options)?;
+        let watcher = Self::start_with_options(&root, options, debounce)?;
+        Ok((watcher, receipt))
+    }
+
+    pub fn drain(&mut self, engine: &Engine) -> Result<IndexReceipt, WorkspaceError> {
+        let mut saw_event = false;
+        loop {
+            match self.rx.try_recv() {
+                Ok(Ok(_events)) => saw_event = true,
+                Ok(Err(_errors)) => saw_event = true,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(WorkspaceError::Watch(
+                        "workspace mirror watcher channel disconnected".to_string(),
+                    ));
+                }
+            }
+        }
+        if saw_event {
+            reconcile_with_limits(
+                engine,
+                &self.root,
+                &self.prefix,
+                self.max_file_bytes,
+                self.max_total_bytes,
+            )
+        } else {
+            Ok(IndexReceipt {
+                root: self.root.clone(),
+                files_indexed: 0,
+                files_removed: 0,
+                files_skipped: 0,
+                bytes_indexed: 0,
+                paths: Vec::new(),
+            })
+        }
+    }
+
+    pub fn force_rescan(&mut self, engine: &Engine) -> Result<IndexReceipt, WorkspaceError> {
+        reconcile_with_limits(
+            engine,
+            &self.root,
+            &self.prefix,
+            self.max_file_bytes,
+            self.max_total_bytes,
+        )
+    }
+
+    #[cfg(test)]
+    fn inject_event_result_for_test(&self, result: DebounceEventResult) {
+        self.tx.send(result).expect("inject watcher event result");
+    }
+
+    pub fn audit(&self, engine: &Engine) -> Result<AuditReceipt, WorkspaceError> {
+        audit_with_limits(
+            engine,
+            &self.root,
+            &self.prefix,
+            self.max_file_bytes,
+            self.max_total_bytes,
+        )
+    }
+
+    pub fn audit_prometheus(&self, engine: &Engine) -> Result<String, WorkspaceError> {
+        let receipt = self.audit(engine)?;
+        Ok(render_audit_prometheus(&receipt, &self.prefix))
+    }
+
+    pub fn wait_until_consistent(
+        &mut self,
+        engine: &Engine,
+        timeout: Duration,
+    ) -> Result<Divergence, WorkspaceError> {
+        let started = Instant::now();
+        loop {
+            self.drain(engine)?;
+            let divergence = audit_consistency_with_limits(
+                engine,
+                &self.root,
+                &self.prefix,
+                self.max_file_bytes,
+                self.max_total_bytes,
+            )?;
+            if divergence.is_empty() {
+                return Ok(divergence);
+            }
+            if started.elapsed() >= timeout {
+                return Ok(divergence);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    pub fn stop(self) {
+        self.debouncer.stop();
+    }
 }
 
 /// Project an engine workspace subtree into a real OS directory.
@@ -2520,7 +3564,7 @@ fn sync_back_sources_inner(
                 index_source_file_write_in_store(
                     store,
                     SourceFileWriteIndexInput {
-                        tenant_id: engine.tenant().to_string(),
+                        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                         repo_id: options.repo_id.clone(),
                         repo_root_display: options.repo_root_display.clone(),
                         file_path: code_path.clone(),
@@ -2656,6 +3700,375 @@ pub fn run_workspace_in_sandbox_streaming<R: SandboxRuntime>(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
+}
+
+#[derive(Clone, Debug)]
+struct DiskFile {
+    real_path: PathBuf,
+    body: Vec<u8>,
+    content_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct DocIndexEntry {
+    content_hash: String,
+    real_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FilesystemSnapshot {
+    files: BTreeMap<String, DiskFile>,
+    files_skipped: usize,
+}
+
+fn import_checkout_mirror_with_clone_ms(
+    engine: &Engine,
+    repo: &Path,
+    options: MirrorImportOptions,
+    clone_ms: u64,
+) -> Result<MirrorImportReceipt, WorkspaceError> {
+    let repo = fs::canonicalize(repo).map_err(|error| WorkspaceError::Io {
+        path: repo.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let (root, copied) = prepare_mirror_root(&repo, options.workspace_root.as_deref(), &options)?;
+    let index = reconcile_with_options(engine, &root, &options)?;
+    let files_skipped = copied.files_skipped.saturating_add(index.files_skipped);
+    Ok(MirrorImportReceipt {
+        root,
+        files_mirrored: copied.files_mirrored,
+        files_skipped,
+        bytes_mirrored: copied.bytes_mirrored,
+        paths: index.paths.clone(),
+        index,
+        clone_ms,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct CopyReceipt {
+    files_mirrored: usize,
+    files_skipped: usize,
+    bytes_mirrored: u64,
+}
+
+fn prepare_mirror_root(
+    repo: &Path,
+    workspace_root: Option<&Path>,
+    options: &MirrorImportOptions,
+) -> Result<(PathBuf, CopyReceipt), WorkspaceError> {
+    let repo = fs::canonicalize(repo).map_err(|error| WorkspaceError::Io {
+        path: repo.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let Some(root) = workspace_root else {
+        return Ok((repo, CopyReceipt::default()));
+    };
+    fs::create_dir_all(root).map_err(|error| WorkspaceError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let root = fs::canonicalize(root).map_err(|error| WorkspaceError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if repo == root {
+        return Ok((root, CopyReceipt::default()));
+    }
+    clear_directory_contents(&root)?;
+
+    let mut receipt = CopyReceipt::default();
+    let mut builder = WalkBuilder::new(&repo);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true);
+    for entry in builder.build() {
+        let entry = entry.map_err(|error| WorkspaceError::Walk(error.to_string()))?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(&repo)
+            .map_err(|error| WorkspaceError::Path(error.to_string()))?;
+        if should_skip(relative) {
+            receipt.files_skipped += 1;
+            continue;
+        }
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            fs::create_dir_all(root.join(relative)).map_err(|error| WorkspaceError::Io {
+                path: root.join(relative),
+                message: error.to_string(),
+            })?;
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|error| WorkspaceError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        if metadata.len() > options.max_file_bytes {
+            receipt.files_skipped += 1;
+            continue;
+        }
+        let next_total = receipt.bytes_mirrored.saturating_add(metadata.len());
+        if next_total > options.max_total_bytes {
+            return Err(WorkspaceError::Limit(format!(
+                "mirror exceeds max_total_bytes {} at {:?}",
+                options.max_total_bytes, relative
+            )));
+        }
+        if let Some(parent) = root.join(relative).parent() {
+            fs::create_dir_all(parent).map_err(|error| WorkspaceError::Io {
+                path: parent.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        }
+        let bytes = fs::copy(path, root.join(relative)).map_err(|error| WorkspaceError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        receipt.files_mirrored += 1;
+        receipt.bytes_mirrored = receipt.bytes_mirrored.saturating_add(bytes);
+    }
+    Ok((root, receipt))
+}
+
+fn clear_directory_contents(root: &Path) -> Result<(), WorkspaceError> {
+    for entry in fs::read_dir(root).map_err(|error| WorkspaceError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| WorkspaceError::Io {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| WorkspaceError::Io {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        if file_type.is_dir() {
+            fs::remove_dir_all(&path).map_err(|error| WorkspaceError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+        } else {
+            fs::remove_file(&path).map_err(|error| WorkspaceError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn filesystem_hashes(
+    root: &Path,
+    prefix: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<FilesystemSnapshot, WorkspaceError> {
+    let mut snapshot = FilesystemSnapshot::default();
+    let mut bytes_seen = 0u64;
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .follow_links(true);
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Err(WorkspaceError::Walk(error.to_string()));
+            }
+        };
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| WorkspaceError::Path(error.to_string()))?;
+        if relative.as_os_str().is_empty() || should_skip(relative) {
+            if !relative.as_os_str().is_empty() {
+                snapshot.files_skipped += 1;
+            }
+            continue;
+        }
+        let canonical = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(_error) => continue,
+        };
+        if !canonical.starts_with(root) {
+            continue;
+        }
+        let metadata = match fs::metadata(&canonical) {
+            Ok(metadata) => metadata,
+            Err(_error) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if metadata.len() > max_file_bytes {
+            snapshot.files_skipped += 1;
+            continue;
+        }
+        let next_total = bytes_seen.saturating_add(metadata.len());
+        if next_total > max_total_bytes {
+            return Err(WorkspaceError::Limit(format!(
+                "mirror scan exceeds max_total_bytes {max_total_bytes} at {:?}",
+                relative
+            )));
+        }
+        let Some(body) = read_stable_file(&canonical, max_file_bytes) else {
+            snapshot.files_skipped += 1;
+            continue;
+        };
+        bytes_seen = bytes_seen.saturating_add(body.len() as u64);
+        if bytes_seen > max_total_bytes {
+            return Err(WorkspaceError::Limit(format!(
+                "mirror scan exceeds max_total_bytes {max_total_bytes} at {:?}",
+                relative
+            )));
+        }
+        let engine_path = import_path(prefix, relative)?;
+        snapshot.files.insert(
+            engine_path,
+            DiskFile {
+                real_path: canonical,
+                content_hash: Engine::file_content_hash(&body),
+                body,
+            },
+        );
+    }
+    Ok(snapshot)
+}
+
+fn doctree_paths(
+    engine: &Engine,
+    prefix: &str,
+) -> Result<BTreeMap<String, DocIndexEntry>, WorkspaceError> {
+    let prefix = prefix.trim_matches('/').to_string();
+    engine.with_doc_tree(|tree| {
+        let entries = if prefix.is_empty() {
+            tree.range_prefix(b"")
+                .map(|(key, entry)| (key.to_slash_path(), entry.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            let segments = prefix.split('/').filter(|part| !part.is_empty());
+            let prefix_key = match rustyred_thg_core::PathKey::prefix_from_segments(segments) {
+                Ok(key) => key,
+                Err(error) => return Err(WorkspaceError::Path(error.message)),
+            };
+            tree.range_prefix(prefix_key.as_bytes())
+                .map(|(key, entry)| (key.to_slash_path(), entry.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut out = BTreeMap::new();
+        for (path, entry) in entries {
+            if let Some(content_hash) = entry.content_hash {
+                out.insert(
+                    path,
+                    DocIndexEntry {
+                        content_hash,
+                        real_path: entry.real_path,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    })
+}
+
+fn file_node_paths(
+    engine: &Engine,
+    prefix: &str,
+) -> Result<BTreeMap<String, String>, WorkspaceError> {
+    let prefix = prefix.trim_matches('/').to_string();
+    engine.with_store(|store| {
+        let nodes = store
+            .query_nodes(NodeQuery::label("File").with_limit(100_000))
+            .map_err(|error| WorkspaceError::Engine(EngineError::Graphql(error.message)))?;
+        let mut out = BTreeMap::new();
+        for node in nodes {
+            let Some(path) = node
+                .properties
+                .get(DOC_TREE_PATH_PROPERTY)
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            if !path_in_prefix(path, &prefix) {
+                continue;
+            }
+            let Some(hash) = node
+                .properties
+                .get(DOC_TREE_CONTENT_HASH_PROPERTY)
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            out.insert(path.to_string(), hash.to_string());
+        }
+        Ok(out)
+    })
+}
+
+fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceError> {
+    fs::create_dir_all(root).map_err(|error| WorkspaceError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    fs::canonicalize(root).map_err(|error| WorkspaceError::Io {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })
+}
+
+fn path_in_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn read_stable_file(path: &Path, max_file_bytes: u64) -> Option<Vec<u8>> {
+    let mut last_body = None;
+    for attempt in 0..5 {
+        let before = fs::metadata(path).ok()?;
+        if !before.is_file() || before.len() > max_file_bytes {
+            return None;
+        }
+        let body = fs::read(path).ok()?;
+        let after = fs::metadata(path).ok()?;
+        if !after.is_file() || after.len() > max_file_bytes {
+            return None;
+        }
+        if before.len() == after.len() && metadata_modified_equal(&before, &after) {
+            return Some(body);
+        }
+        last_body = Some(body);
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    last_body
+}
+
+fn metadata_modified_equal(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    match (left.modified(), right.modified()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn import_checkout_with_clone_ms(
@@ -3039,6 +4452,9 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    const MIRROR_FUZZ_OPERATION_KINDS: usize = 11;
+    const MIRROR_FUZZ_MIN_OPERATIONS: usize = 33;
 
     #[test]
     fn imports_checkout_with_gitignore_artifact_filter_restart_proof() {
@@ -4696,7 +6112,7 @@ mod tests {
                 rustyred_thg_code::search_code_in_store(
                     store,
                     rustyred_thg_code::SearchCodeInput {
-                        tenant_id: engine.tenant().to_string(),
+                        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                         query: "caller".to_string(),
                         repo_id: "repo:workspace-sync".to_string(),
                         path_prefix: String::new(),
@@ -4712,7 +6128,7 @@ mod tests {
                 rustyred_thg_code::explore_code_in_store(
                     store,
                     rustyred_thg_code::ExploreCodeInput {
-                        tenant_id: engine.tenant().to_string(),
+                        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                         node_id: caller.hits[0].node_id.clone(),
                         query: String::new(),
                         repo_id: "repo:workspace-sync".to_string(),
@@ -4759,7 +6175,7 @@ mod tests {
                 rustyred_thg_code::search_code_in_store(
                     store,
                     rustyred_thg_code::SearchCodeInput {
-                        tenant_id: engine.tenant().to_string(),
+                        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                         query: "caller".to_string(),
                         repo_id: "repo:file-write-hook".to_string(),
                         path_prefix: String::new(),
@@ -4775,7 +6191,7 @@ mod tests {
                 rustyred_thg_code::explore_code_in_store(
                     store,
                     rustyred_thg_code::ExploreCodeInput {
-                        tenant_id: engine.tenant().to_string(),
+                        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                         node_id: caller.hits[0].node_id.clone(),
                         query: String::new(),
                         repo_id: "repo:file-write-hook".to_string(),
@@ -4798,7 +6214,7 @@ mod tests {
                 index_source_file_write_in_store(
                     store,
                     SourceFileWriteIndexInput {
-                        tenant_id: engine.tenant().to_string(),
+                        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                         repo_id: repo_id.to_string(),
                         repo_root_display: format!("embedded://{repo_id}"),
                         file_path: path.to_string(),
@@ -4818,7 +6234,7 @@ mod tests {
                 rustyred_thg_code::explore_code_in_store(
                     store,
                     rustyred_thg_code::ExploreCodeInput {
-                        tenant_id: engine.tenant().to_string(),
+                        tenant_id: LOCAL_WORKSPACE_TENANT.to_string(),
                         node_id: String::new(),
                         query: "helper".to_string(),
                         repo_id: repo_id.to_string(),
@@ -5054,10 +6470,1348 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mirror_import_indexes_real_files_and_oracle_is_clean() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(checkout.path().join("README.md"), "# fixture\n");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        );
+        write(checkout.path().join("target/debug/app"), "artifact\n");
+        write(checkout.path().join(".git/config"), "[core]\n");
+
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let receipt = import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        assert_eq!(receipt.index.files_indexed, 2);
+        assert!(checkout.path().join("src/lib.rs").is_file());
+        assert_eq!(
+            engine
+                .fs_read("repos/demo/src/lib.rs")
+                .expect("fs_read")
+                .as_deref(),
+            Some(&b"pub fn answer() -> u8 { 42 }\n"[..]),
+            "engine fs_read resolves the real mirrored file"
+        );
+        assert_eq!(
+            engine.list_paths("repos/demo").expect("list paths"),
+            vec![
+                "repos/demo/README.md".to_string(),
+                "repos/demo/src/lib.rs".to_string(),
+            ]
+        );
+        let node = engine
+            .query("query{ graphNode(id:\"file:repos/demo/src/lib.rs\") }")
+            .expect("graph node");
+        assert!(!node["graphNode"].is_null(), "File node is queryable");
+        assert!(
+            audit_consistency(&engine, checkout.path(), "repos/demo")
+                .expect("audit")
+                .is_empty(),
+            "fresh mirror import is consistent"
+        );
+    }
+
+    #[test]
+    fn oracle_detects_manual_change_and_reconcile_repairs_it() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 2 }\n",
+        );
+        let divergence =
+            audit_consistency(&engine, checkout.path(), "repos/demo").expect("audit dirty");
+        assert_eq!(
+            divergence.hash_mismatches,
+            vec!["repos/demo/src/lib.rs".to_string()],
+            "oracle reads fresh filesystem bytes and spots the stale hash"
+        );
+
+        reconcile(&engine, checkout.path(), "repos/demo").expect("reconcile");
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit clean")
+            .is_empty());
+        assert_eq!(
+            engine
+                .fs_read("repos/demo/src/lib.rs")
+                .expect("read repaired")
+                .as_deref(),
+            Some(&b"pub fn answer() -> u8 { 2 }\n"[..])
+        );
+    }
+
+    #[test]
+    fn index_path_accepts_paths_relative_to_the_mirror_root() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+
+        index_path(&engine, checkout.path(), "repos/demo", "src/lib.rs")
+            .expect("index relative path")
+            .expect("indexed file");
+
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit")
+            .is_empty());
+        assert_eq!(
+            engine
+                .fs_read("repos/demo/src/lib.rs")
+                .expect("read")
+                .as_deref(),
+            Some(&b"pub fn answer() -> u8 { 1 }\n"[..])
+        );
+    }
+
+    #[test]
+    fn agent_session_plan_points_at_real_mirror_root() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        let plan = agent_session_plan(checkout.path(), "codex", "edit directly")
+            .expect("agent session plan");
+        assert_eq!(plan.program, "codex");
+        assert_eq!(plan.cwd, fs::canonicalize(checkout.path()).unwrap());
+        assert_eq!(
+            plan.args,
+            vec!["exec".to_string(), "edit directly".to_string()]
+        );
+        assert!(
+            plan.strip_env.iter().any(|key| key == "ANTHROPIC_API_KEY"),
+            "agent session inherits receiver secret stripping"
+        );
+    }
+
+    #[test]
+    fn reconcile_removes_stray_file_node_and_preserves_first_class_content() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+        engine
+            .mutate(
+                "mutation($n:JSON!){ bulkNodes(nodes:$n){ inserted } }",
+                serde_json::json!({
+                    "n": [{
+                        "id": "mem:keep",
+                        "labels": ["Memory"],
+                        "properties": { "body": "first-class content" }
+                    }]
+                }),
+            )
+            .expect("insert memory node");
+        let before = engine
+            .query("query{ graphNode(id:\"mem:keep\") }")
+            .expect("memory before");
+
+        engine
+            .fs_write("repos/demo/ghost.rs", b"pub fn ghost() {}\n")
+            .expect("stray old-style File node");
+        let divergence =
+            audit_consistency(&engine, checkout.path(), "repos/demo").expect("audit stray");
+        assert_eq!(
+            divergence.indexed_but_missing_on_disk,
+            vec!["repos/demo/ghost.rs".to_string()]
+        );
+        assert_eq!(
+            divergence.doctree_without_real_file,
+            vec!["repos/demo/ghost.rs".to_string()]
+        );
+
+        let repaired = reconcile(&engine, checkout.path(), "repos/demo").expect("reconcile");
+        assert_eq!(repaired.files_removed, 1);
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit clean")
+            .is_empty());
+        let after = engine
+            .query("query{ graphNode(id:\"mem:keep\") }")
+            .expect("memory after");
+        assert_eq!(before, after, "code-index rebuild leaves Memory untouched");
+    }
+
+    #[test]
+    fn watcher_reconciles_create_modify_delete_and_rename() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+        let mut watcher = WorkspaceMirrorWatcher::start(
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(100),
+        )
+        .expect("start watcher");
+
+        write(checkout.path().join("src/new.rs"), "pub fn created() {}\n");
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("created convergence")
+            .is_empty());
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 3 }\n",
+        );
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("modify convergence")
+            .is_empty());
+        fs::rename(
+            checkout.path().join("src/new.rs"),
+            checkout.path().join("src/renamed.rs"),
+        )
+        .expect("rename");
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("rename convergence")
+            .is_empty());
+        fs::remove_file(checkout.path().join("src/renamed.rs")).expect("delete");
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("delete convergence")
+            .is_empty());
+        watcher.stop();
+
+        let paths = engine.list_paths("repos/demo").expect("list after watch");
+        assert_eq!(paths, vec!["repos/demo/src/lib.rs".to_string()]);
+        assert_eq!(
+            engine
+                .fs_read("repos/demo/src/lib.rs")
+                .expect("read modified")
+                .as_deref(),
+            Some(&b"pub fn answer() -> u8 { 3 }\n"[..])
+        );
+    }
+
+    #[test]
+    fn watcher_start_reconciled_repairs_changes_missed_while_stopped() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 99 }\n",
+        );
+        let (watcher, receipt) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(100),
+        )
+        .expect("start reconciled");
+        assert_eq!(receipt.files_indexed, 1);
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit")
+            .is_empty());
+        watcher.stop();
+    }
+
+    #[test]
+    fn mirror_handles_binary_file_without_crashing() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(checkout.path().join("src/blob.bin"), b"\0binary\0bytes");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit")
+            .is_empty());
+        assert_eq!(
+            engine
+                .fs_read("repos/demo/src/blob.bin")
+                .expect("binary read")
+                .as_deref(),
+            Some(&b"\0binary\0bytes"[..])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mirror_symlink_cannot_escape_workspace_root() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        write(outside.path().join("secret.rs"), "pub fn secret() {}\n");
+        fs::create_dir_all(checkout.path().join("src")).expect("mkdir src");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            checkout.path().join("src/secret.rs"),
+        )
+        .expect("symlink");
+        write(checkout.path().join("src/lib.rs"), "pub fn visible() {}\n");
+
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit")
+            .is_empty());
+        assert_eq!(
+            engine.list_paths("repos/demo").expect("list"),
+            vec!["repos/demo/src/lib.rs".to_string()],
+            "escaping symlink is not indexed"
+        );
+    }
+
+    #[test]
+    fn mirror_options_skip_oversized_file_and_remove_stale_projection() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(checkout.path().join("src/blob.txt"), "tiny\n");
+        let options = MirrorImportOptions {
+            prefix: "repos/demo".to_string(),
+            max_file_bytes: 8,
+            ..MirrorImportOptions::default()
+        };
+
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(&engine, checkout.path(), options.clone()).expect("mirror import");
+        assert_eq!(
+            engine.list_paths("repos/demo").expect("list"),
+            vec!["repos/demo/src/blob.txt".to_string()]
+        );
+
+        write(
+            checkout.path().join("src/blob.txt"),
+            "this is now larger than the mirror limit\n",
+        );
+        let dirty =
+            audit_consistency_with_options(&engine, checkout.path(), &options).expect("audit");
+        assert_eq!(
+            dirty.indexed_but_missing_on_disk,
+            vec!["repos/demo/src/blob.txt".to_string()]
+        );
+
+        let repaired = reconcile_with_options(&engine, checkout.path(), &options)
+            .expect("reconcile with limit");
+        assert_eq!(repaired.files_removed, 1);
+        assert!(
+            audit_consistency_with_options(&engine, checkout.path(), &options)
+                .expect("clean audit")
+                .is_empty()
+        );
+        assert!(
+            engine
+                .list_paths("repos/demo")
+                .expect("list after oversized")
+                .is_empty(),
+            "oversized files are outside the captured mirror region"
+        );
+    }
+
+    #[test]
+    fn reconcile_with_options_enforces_total_byte_limit() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(checkout.path().join("src/a.rs"), "aaaa\n");
+        write(checkout.path().join("src/b.rs"), "bbbb\n");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let error = reconcile_with_options(
+            &engine,
+            checkout.path(),
+            &MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                max_total_bytes: 5,
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect_err("reconcile should enforce max_total_bytes");
+        assert!(
+            error.to_string().contains("max_total_bytes"),
+            "expected max_total_bytes error, got {error}"
+        );
+    }
+
+    #[test]
+    fn mirror_copy_cleans_stale_workspace_files_before_reconcile() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(checkout.path().join("src/new.rs"), "pub fn new() {}\n");
+        let workspace = TempDir::new().expect("workspace tempdir");
+        write(workspace.path().join("src/stale.rs"), "pub fn stale() {}\n");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                workspace_root: Some(workspace.path().to_path_buf()),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        assert!(workspace.path().join("src/new.rs").is_file());
+        assert!(!workspace.path().join("src/stale.rs").exists());
+        let paths = engine
+            .list_paths("repos/demo")
+            .expect("list mirrored paths");
+        assert_eq!(paths, vec!["repos/demo/src/new.rs".to_string()]);
+    }
+
+    #[test]
+    fn drop_and_rebuild_code_index_preserves_non_file_graph_content() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        write(checkout.path().join("src/other.rs"), "pub fn other() {}\n");
+
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+        engine
+            .mutate(
+                "mutation($n:JSON!){ bulkNodes(nodes:$n){ inserted } }",
+                serde_json::json!({
+                    "n": [{
+                        "id": "mem:keep",
+                        "labels": ["Memory"],
+                        "properties": { "body": "first-class content" }
+                    }]
+                }),
+            )
+            .expect("insert memory node");
+        let before = engine
+            .query("query{ graphNode(id:\"mem:keep\") }")
+            .expect("memory before");
+
+        let dropped = drop_code_index(&engine, "repos/demo").expect("drop code index");
+        assert_eq!(dropped.files_removed, 2);
+        assert!(engine
+            .list_paths("repos/demo")
+            .expect("list after drop")
+            .is_empty());
+        let missing = audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit dropped projection");
+        assert_eq!(
+            missing.missing_from_index,
+            vec![
+                "repos/demo/src/lib.rs".to_string(),
+                "repos/demo/src/other.rs".to_string(),
+            ]
+        );
+
+        let rebuilt =
+            rebuild_code_index(&engine, checkout.path(), "repos/demo").expect("rebuild index");
+        assert_eq!(rebuilt.files_indexed, 2);
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("clean audit")
+            .is_empty());
+        let after = engine
+            .query("query{ graphNode(id:\"mem:keep\") }")
+            .expect("memory after");
+        assert_eq!(before, after, "non-File graph content survives rebuild");
+    }
+
+    #[test]
+    fn audit_prometheus_reports_divergence_classes() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 2 }\n",
+        );
+        let receipt = audit(&engine, checkout.path(), "repos/demo").expect("audit receipt");
+        let metrics = render_audit_prometheus(&receipt, "repos/demo");
+        assert!(metrics.contains("rustyred_workspace_mirror_divergence_count"));
+        assert!(metrics.contains("prefix=\"repos/demo\""));
+        assert!(metrics.contains("class=\"hash_mismatches\"} 1"));
+    }
+
+    #[test]
+    fn periodic_audit_monitor_reports_drift_and_recovery_metrics() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine_lock = Arc::new(Mutex::new(()));
+        let options = MirrorImportOptions {
+            prefix: "repos/demo".to_string(),
+            ..MirrorImportOptions::default()
+        };
+        {
+            let _guard = engine_lock.lock().expect("engine lock");
+            let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+            import_checkout_mirror(&engine, checkout.path(), options.clone())
+                .expect("mirror import");
+        }
+        let monitor = WorkspaceMirrorAuditMonitor::start_with_engine_lock(
+            data.path(),
+            vec![MirrorAuditTarget::new(checkout.path(), options.clone())],
+            Duration::from_millis(20),
+            Arc::clone(&engine_lock),
+        )
+        .expect("start audit monitor");
+
+        let clean_metrics = wait_for_prometheus_contains(
+            &monitor,
+            "rustyred_workspace_mirror_audit_divergence_count 0",
+        );
+        assert!(clean_metrics.contains("rustyred_workspace_mirror_audit_targets 1"));
+
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 2 }\n",
+        );
+        let dirty_metrics = wait_for_prometheus_contains(
+            &monitor,
+            "rustyred_workspace_mirror_audit_divergence_count 1",
+        );
+        assert!(dirty_metrics.contains("class=\"hash_mismatches\"} 1"));
+
+        {
+            let _guard = engine_lock.lock().expect("engine lock");
+            let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+            reconcile_with_options(&engine, checkout.path(), &options)
+                .expect("reconcile dirty file");
+        }
+        let recovered_metrics = wait_for_prometheus_contains(
+            &monitor,
+            "rustyred_workspace_mirror_audit_divergence_count 0",
+        );
+        assert!(recovered_metrics.contains("rustyred_workspace_mirror_audit_errors 0"));
+        monitor.stop();
+    }
+
+    #[test]
+    fn watcher_force_rescan_repairs_event_overflow_style_gap() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let (mut watcher, _) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(100),
+        )
+        .expect("start reconciled");
+
+        write(
+            checkout.path().join("src/missed.rs"),
+            "pub fn missed() {}\n",
+        );
+        let forced = watcher.force_rescan(&engine).expect("force rescan");
+        assert_eq!(forced.files_indexed, 1);
+        assert!(watcher
+            .audit(&engine)
+            .expect("watcher audit")
+            .divergence
+            .is_empty());
+        watcher.stop();
+    }
+
+    #[test]
+    fn watcher_debouncer_error_repairs_event_overflow_gap() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let (mut watcher, _) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(100),
+        )
+        .expect("start reconciled");
+
+        write(
+            checkout.path().join("src/missed_after_overflow.rs"),
+            "pub fn missed_after_overflow() {}\n",
+        );
+        watcher.inject_event_result_for_test(Err(vec![
+            notify_debouncer_full::notify::Error::generic("simulated event overflow"),
+        ]));
+
+        let repaired = watcher.drain(&engine).expect("overflow drain repairs");
+        assert_eq!(repaired.files_indexed, 1);
+        assert!(watcher
+            .audit(&engine)
+            .expect("watcher audit")
+            .divergence
+            .is_empty());
+        watcher.stop();
+    }
+
+    #[test]
+    fn watcher_converges_atomic_save_bursts_and_subtree_moves() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let (mut watcher, _) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(50),
+        )
+        .expect("start reconciled");
+
+        write(
+            checkout.path().join("src/lib.rs.tmp"),
+            "pub fn answer() -> u8 { 7 }\n",
+        );
+        fs::rename(
+            checkout.path().join("src/lib.rs.tmp"),
+            checkout.path().join("src/lib.rs"),
+        )
+        .expect("atomic rename");
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("atomic save convergence")
+            .is_empty());
+        assert_eq!(
+            engine
+                .fs_read("repos/demo/src/lib.rs")
+                .expect("read atomic")
+                .as_deref(),
+            Some(&b"pub fn answer() -> u8 { 7 }\n"[..])
+        );
+        assert!(!engine
+            .list_paths("repos/demo")
+            .expect("list atomic")
+            .contains(&"repos/demo/src/lib.rs.tmp".to_string()));
+
+        for i in 0..25 {
+            write(
+                checkout.path().join(format!("src/burst_{i}.rs")),
+                format!("pub fn burst_{i}() -> u8 {{ {i} }}\n"),
+            );
+        }
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("burst convergence")
+            .is_empty());
+
+        write(checkout.path().join("src/tree/a.rs"), "pub fn a() {}\n");
+        write(checkout.path().join("src/tree/b.rs"), "pub fn b() {}\n");
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("tree convergence")
+            .is_empty());
+        fs::rename(
+            checkout.path().join("src/tree"),
+            checkout.path().join("src/moved"),
+        )
+        .expect("subtree rename");
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("subtree move convergence")
+            .is_empty());
+        assert!(engine
+            .list_paths("repos/demo")
+            .expect("list moved")
+            .contains(&"repos/demo/src/moved/a.rs".to_string()));
+        assert!(!engine
+            .list_paths("repos/demo")
+            .expect("list old tree")
+            .contains(&"repos/demo/src/tree/a.rs".to_string()));
+
+        fs::remove_dir_all(checkout.path().join("src/moved")).expect("subtree delete");
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("subtree delete convergence")
+            .is_empty());
+        assert!(!engine
+            .list_paths("repos/demo")
+            .expect("list delete")
+            .contains(&"repos/demo/src/moved/a.rs".to_string()));
+        watcher.stop();
+    }
+
+    #[test]
+    fn deterministic_mirror_fuzz_harness_converges() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let (mut watcher, _) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(25),
+        )
+        .expect("start reconciled");
+
+        for step in 0..30 {
+            match step % 6 {
+                0 => write(
+                    checkout.path().join(format!("src/fuzz_{step}.rs")),
+                    format!("pub fn fuzz_{step}() -> usize {{ {step} }}\n"),
+                ),
+                1 => write(
+                    checkout.path().join("src/shared.rs"),
+                    format!("pub fn shared() -> usize {{ {step} }}\n"),
+                ),
+                2 => {
+                    let from = checkout.path().join("src/shared.rs");
+                    if from.exists() {
+                        fs::rename(from, checkout.path().join("src/shared_renamed.rs"))
+                            .expect("rename shared");
+                    }
+                }
+                3 => {
+                    let path = checkout.path().join("src/shared_renamed.rs");
+                    if path.exists() {
+                        fs::remove_file(path).expect("remove renamed shared");
+                    }
+                }
+                4 => write(
+                    checkout.path().join("target/ignored.rs"),
+                    "pub fn ignored() {}\n",
+                ),
+                _ => {
+                    write(
+                        checkout.path().join("src/atomic.tmp"),
+                        format!("pub fn atomic() -> usize {{ {step} }}\n"),
+                    );
+                    fs::rename(
+                        checkout.path().join("src/atomic.tmp"),
+                        checkout.path().join("src/atomic.rs"),
+                    )
+                    .expect("atomic fuzz rename");
+                }
+            }
+            assert!(watcher
+                .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+                .expect("fuzz convergence")
+                .is_empty());
+        }
+
+        let paths = engine.list_paths("repos/demo").expect("list fuzz");
+        assert!(!paths.iter().any(|path| path.contains("/target/")));
+        watcher.stop();
+    }
+
+    #[test]
+    fn randomized_mirror_property_harness_covers_full_operation_space() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/delete_me.rs"),
+            "pub fn delete_me() {}\n",
+        );
+        write(
+            checkout.path().join("src/rename_pool.rs"),
+            "pub fn rename_pool() {}\n",
+        );
+        write(
+            checkout.path().join("src/tree_pool/a.rs"),
+            "pub fn tree_a() {}\n",
+        );
+        write(
+            checkout.path().join("src/tree_pool/b.rs"),
+            "pub fn tree_b() {}\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let options = MirrorImportOptions {
+            prefix: "repos/demo".to_string(),
+            max_file_bytes: 128,
+            ..MirrorImportOptions::default()
+        };
+        let (mut watcher, _) = WorkspaceMirrorWatcher::start_reconciled_with_options(
+            &engine,
+            checkout.path(),
+            &options,
+            Duration::from_millis(25),
+        )
+        .expect("start reconciled");
+
+        let mut rng = FuzzRng::new(0x7072_6f70_6675_7a7a);
+        let mut covered = [false; MIRROR_FUZZ_OPERATION_KINDS];
+        for step in 0..MIRROR_FUZZ_MIN_OPERATIONS {
+            let op = if step < MIRROR_FUZZ_OPERATION_KINDS {
+                step
+            } else {
+                rng.next_usize(MIRROR_FUZZ_OPERATION_KINDS)
+            };
+            covered[op] = true;
+            let op_name = apply_generated_mirror_operation(checkout.path(), step, op, &mut rng);
+            let divergence = watcher
+                .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+                .unwrap_or_else(|error| panic!("fuzz op {op_name} at step {step}: {error}"));
+            assert!(
+                divergence.is_empty(),
+                "fuzz op {op_name} at step {step} left divergence: {divergence:?}"
+            );
+        }
+
+        assert!(
+            covered.iter().all(|seen| *seen),
+            "fuzz harness must cover every configured operation kind"
+        );
+        watcher.stop();
+    }
+
+    #[test]
+    fn fuzz_harness_leaves_first_class_graph_content_untouched() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        engine
+            .mutate(
+                "mutation($n:JSON!){ bulkNodes(nodes:$n){ inserted } }",
+                serde_json::json!({
+                    "n": [
+                        {
+                            "id": "mem:fuzz-keep",
+                            "labels": ["Memory", "Coordination"],
+                            "properties": { "body": "first-class fuzz sentinel" }
+                        },
+                        {
+                            "id": "item:fuzz-keep",
+                            "labels": ["Item", "Epistemic"],
+                            "properties": { "body": "item sentinel", "cluster": "alpha" }
+                        }
+                    ]
+                }),
+            )
+            .expect("insert first-class nodes");
+        let before = engine
+            .query(
+                "query{ a: graphNode(id:\"mem:fuzz-keep\") b: graphNode(id:\"item:fuzz-keep\") }",
+            )
+            .expect("first-class before");
+        let (mut watcher, _) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(25),
+        )
+        .expect("start reconciled");
+
+        let mut rng = FuzzRng::new(0x5eed_f00d);
+        for step in 0..40 {
+            match rng.next_usize(8) {
+                0 => write(
+                    checkout.path().join(format!("src/rand_{step}.rs")),
+                    format!("pub fn rand_{step}() -> usize {{ {step} }}\n"),
+                ),
+                1 => write(
+                    checkout.path().join("src/random_shared.rs"),
+                    format!("pub fn random_shared() -> usize {{ {step} }}\n"),
+                ),
+                2 => {
+                    let from = checkout.path().join("src/random_shared.rs");
+                    if from.exists() {
+                        fs::rename(from, checkout.path().join("src/random_moved.rs"))
+                            .expect("rename random shared");
+                    }
+                }
+                3 => {
+                    let path = checkout.path().join("src/random_moved.rs");
+                    if path.exists() {
+                        fs::remove_file(path).expect("remove random moved");
+                    }
+                }
+                4 => {
+                    write(
+                        checkout.path().join("src/random_tree/a.rs"),
+                        "pub fn a() {}\n",
+                    );
+                    write(
+                        checkout.path().join("src/random_tree/b.rs"),
+                        "pub fn b() {}\n",
+                    );
+                    let moved = checkout.path().join("src/random_tree_moved");
+                    if moved.exists() {
+                        fs::remove_dir_all(&moved).expect("clear previous moved tree");
+                    }
+                    fs::rename(checkout.path().join("src/random_tree"), moved)
+                        .expect("move random tree");
+                }
+                5 => write(
+                    checkout.path().join("node_modules/pkg/ignored.js"),
+                    "module.exports = 1;\n",
+                ),
+                6 => write(
+                    checkout.path().join(format!("src/blob_{step}.bin")),
+                    [0u8, 159, 146, step as u8, 0],
+                ),
+                _ => {
+                    write(
+                        checkout.path().join("src/random_atomic.tmp"),
+                        format!("pub fn random_atomic() -> usize {{ {step} }}\n"),
+                    );
+                    fs::rename(
+                        checkout.path().join("src/random_atomic.tmp"),
+                        checkout.path().join("src/random_atomic.rs"),
+                    )
+                    .expect("random atomic rename");
+                }
+            }
+            assert!(watcher
+                .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+                .expect("random fuzz convergence")
+                .is_empty());
+            let current = engine
+                .query("query{ a: graphNode(id:\"mem:fuzz-keep\") b: graphNode(id:\"item:fuzz-keep\") }")
+                .expect("first-class during fuzz");
+            assert_eq!(before, current, "fuzz changed first-class graph content");
+        }
+        watcher.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_is_skipped_and_rest_of_tree_stays_consistent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/readable.rs"),
+            "pub fn readable() {}\n",
+        );
+        let unreadable = checkout.path().join("src/unreadable.rs");
+        write(unreadable.clone(), "pub fn hidden() {}\n");
+        let original_permissions = fs::metadata(&unreadable)
+            .expect("metadata before chmod")
+            .permissions();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("chmod unreadable");
+        if fs::read(&unreadable).is_ok() {
+            fs::set_permissions(&unreadable, original_permissions).expect("restore permissions");
+            return;
+        }
+
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let receipt = import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+        assert!(receipt.files_skipped >= 1);
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("audit")
+            .is_empty());
+        assert_eq!(
+            engine.list_paths("repos/demo").expect("list"),
+            vec!["repos/demo/src/readable.rs".to_string()]
+        );
+        fs::set_permissions(&unreadable, original_permissions).expect("restore permissions");
+    }
+
+    #[test]
+    fn startup_reconcile_repairs_crash_gaps_on_both_sides() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        write(
+            checkout.path().join("src/after_crash.rs"),
+            "pub fn after() {}\n",
+        );
+        let (watcher, receipt) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(25),
+        )
+        .expect("start reconciled after missed file write");
+        assert_eq!(receipt.files_indexed, 1);
+        watcher.stop();
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("clean after file-side crash")
+            .is_empty());
+
+        assert!(engine
+            .fs_remove_file_index("repos/demo/src/lib.rs")
+            .expect("remove index while file remains"));
+        let divergence =
+            audit_consistency(&engine, checkout.path(), "repos/demo").expect("audit missing index");
+        assert_eq!(
+            divergence.missing_from_index,
+            vec!["repos/demo/src/lib.rs".to_string()]
+        );
+        let (watcher, receipt) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(25),
+        )
+        .expect("start reconciled after index-side crash");
+        assert_eq!(receipt.files_indexed, 1);
+        watcher.stop();
+        assert!(audit_consistency(&engine, checkout.path(), "repos/demo")
+            .expect("clean after index-side crash")
+            .is_empty());
+    }
+
+    #[test]
+    fn concurrent_edit_during_index_converges_to_final_bytes() {
+        use std::io::{Seek as _, Write as _};
+
+        let checkout = TempDir::new().expect("checkout tempdir");
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        let (mut watcher, _) = WorkspaceMirrorWatcher::start_reconciled(
+            &engine,
+            checkout.path(),
+            "repos/demo",
+            Duration::from_millis(25),
+        )
+        .expect("start reconciled");
+        let path = checkout.path().join("src/concurrent.rs");
+        let final_body = "pub fn concurrent() -> usize { 2 }\n".repeat(128);
+        let writer_path = path.clone();
+        let writer_body = final_body.clone();
+        let handle = std::thread::spawn(move || {
+            if let Some(parent) = writer_path.parent() {
+                fs::create_dir_all(parent).expect("create concurrent parent");
+            }
+            let mut file = fs::File::create(&writer_path).expect("create concurrent file");
+            file.write_all(b"pub fn concurrent() -> usize { 1 }\n")
+                .expect("write first half");
+            file.flush().expect("flush first half");
+            std::thread::sleep(Duration::from_millis(75));
+            file.set_len(0).expect("truncate concurrent file");
+            file.rewind().expect("rewind concurrent file");
+            file.write_all(writer_body.as_bytes())
+                .expect("write final body");
+            file.flush().expect("flush final body");
+        });
+        handle.join().expect("writer joins");
+
+        assert!(watcher
+            .wait_until_consistent(&engine, DEFAULT_CONVERGENCE_TIMEOUT)
+            .expect("concurrent edit convergence")
+            .is_empty());
+        assert_eq!(
+            engine
+                .fs_read("repos/demo/src/concurrent.rs")
+                .expect("read concurrent")
+                .as_deref(),
+            Some(final_body.as_bytes())
+        );
+        watcher.stop();
+    }
+
+    #[test]
+    fn oracle_catches_injected_rename_modify_defect() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        write(
+            checkout.path().join("src/old.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        );
+        let data = TempDir::new().expect("engine tempdir");
+        let engine = Engine::open(data.path(), EmbeddedConfig::default()).expect("open engine");
+        import_checkout_mirror(
+            &engine,
+            checkout.path(),
+            MirrorImportOptions {
+                prefix: "repos/demo".to_string(),
+                ..MirrorImportOptions::default()
+            },
+        )
+        .expect("mirror import");
+
+        fs::rename(
+            checkout.path().join("src/old.rs"),
+            checkout.path().join("src/new.rs"),
+        )
+        .expect("rename");
+        write(
+            checkout.path().join("src/new.rs"),
+            "pub fn value() -> u8 { 9 }\n",
+        );
+
+        let divergence =
+            audit_consistency(&engine, checkout.path(), "repos/demo").expect("audit injected bug");
+        assert_eq!(
+            divergence.indexed_but_missing_on_disk,
+            vec!["repos/demo/src/old.rs".to_string()]
+        );
+        assert_eq!(
+            divergence.missing_from_index,
+            vec!["repos/demo/src/new.rs".to_string()]
+        );
+    }
+
+    fn apply_generated_mirror_operation(
+        root: &Path,
+        step: usize,
+        op: usize,
+        rng: &mut FuzzRng,
+    ) -> &'static str {
+        match op {
+            0 => {
+                write(
+                    root.join(format!("src/generated_{step}.rs")),
+                    format!("pub fn generated_{step}() -> usize {{ {step} }}\n"),
+                );
+                "create"
+            }
+            1 => {
+                write(
+                    root.join("src/shared_generated.rs"),
+                    format!("pub fn shared_generated() -> usize {{ {step} }}\n"),
+                );
+                "modify"
+            }
+            2 => {
+                let path = root.join("src/delete_me.rs");
+                if !path.exists() {
+                    write(path.clone(), "pub fn delete_me() {}\n");
+                }
+                fs::remove_file(path).expect("delete generated file");
+                "delete"
+            }
+            3 => {
+                let from = root.join("src/rename_pool.rs");
+                if !from.exists() {
+                    write(from.clone(), "pub fn rename_pool() {}\n");
+                }
+                let to = root.join(format!("src/renamed_{step}.rs"));
+                if to.exists() {
+                    fs::remove_file(&to).expect("remove old rename target");
+                }
+                fs::rename(from, to).expect("rename generated file");
+                "rename"
+            }
+            4 => {
+                let from = root.join("src/tree_pool");
+                if !from.exists() {
+                    write(from.join("a.rs"), "pub fn tree_a() {}\n");
+                    write(from.join("b.rs"), "pub fn tree_b() {}\n");
+                }
+                let to = root.join(format!("src/tree_moved_{step}"));
+                if to.exists() {
+                    fs::remove_dir_all(&to).expect("remove old moved tree");
+                }
+                fs::rename(from, to).expect("move generated subtree");
+                "move_subtree"
+            }
+            5 => {
+                let tmp = root.join("src/atomic_generated.rs.tmp");
+                write(
+                    tmp.clone(),
+                    format!("pub fn atomic_generated() -> usize {{ {step} }}\n"),
+                );
+                fs::rename(tmp, root.join("src/atomic_generated.rs"))
+                    .expect("atomic generated save");
+                "atomic_save"
+            }
+            6 => {
+                for item in 0..8 {
+                    write(
+                        root.join(format!("src/burst_{step}_{item}.rs")),
+                        format!("pub fn burst_{step}_{item}() -> usize {{ {item} }}\n"),
+                    );
+                }
+                "burst"
+            }
+            7 => {
+                write(
+                    root.join(format!("src/large_{step}.bin")),
+                    vec![b'x'; 129 + rng.next_usize(32)],
+                );
+                "large_file"
+            }
+            8 => {
+                write(
+                    root.join(format!("src/binary_{step}.bin")),
+                    [0, 159, 146, (step % 255) as u8, 0],
+                );
+                "binary_file"
+            }
+            9 => {
+                let path = root.join(format!("src/symlink_{step}.rs"));
+                if path.exists() {
+                    fs::remove_file(&path).expect("remove old symlink");
+                }
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink("/etc/passwd", &path)
+                        .expect("create generated symlink");
+                }
+                #[cfg(not(unix))]
+                {
+                    write(path, "pub fn symlink_placeholder() {}\n");
+                }
+                "symlink"
+            }
+            10 => {
+                write(
+                    root.join(format!("node_modules/pkg/ignored_{step}.js")),
+                    "module.exports = 1;\n",
+                );
+                write(
+                    root.join(format!("target/debug/ignored_{step}.rs")),
+                    "pub fn ignored() {}\n",
+                );
+                "excluded_region"
+            }
+            _ => unreachable!("operation index is bounded by MIRROR_FUZZ_OPERATION_KINDS"),
+        }
+    }
+
     fn write(path: PathBuf, body: impl AsRef<[u8]>) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create parent");
         }
         fs::write(path, body).expect("write fixture");
+    }
+
+    fn wait_for_prometheus_contains(monitor: &WorkspaceMirrorAuditMonitor, needle: &str) -> String {
+        let started = Instant::now();
+        let mut latest = String::new();
+        while started.elapsed() < DEFAULT_CONVERGENCE_TIMEOUT {
+            latest = monitor.latest_prometheus();
+            if latest.contains(needle) {
+                return latest;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for metric `{needle}`; latest metrics:\n{latest}");
+    }
+
+    struct FuzzRng {
+        state: u64,
+    }
+
+    impl FuzzRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_usize(&mut self, modulo: usize) -> usize {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((self.state >> 32) as usize) % modulo
+        }
     }
 }

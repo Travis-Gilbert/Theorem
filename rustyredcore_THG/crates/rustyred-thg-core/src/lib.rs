@@ -184,6 +184,7 @@ pub use map_artifact::{MapArtifact, MapArtifactDiff, MapArtifactType, MapSection
 pub use merge_registry::{
     MergeRegistry, MergeRegistryEntry, MergeRegistryResolution, MergeRegistryStrategy,
 };
+pub use object_store::content_hash_bytes;
 pub use object_store::{ColdObjectStore, DiskObjectStore, InMemoryObjectStore};
 pub use ordered::{
     EvictionFrontier, OrderedDesignation, OrderedIndex, OrderedIndexRegistry, OrderedMember,

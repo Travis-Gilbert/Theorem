@@ -11,8 +11,11 @@ description = "RustyRed code-workspace import seam: bring a git checkout into th
 [dependencies]
 fuser = { version = "0.17.0", optional = true, features = ["macos-no-mount"] }
 ignore = "0.4"
+notify-debouncer-full = "0.5"
 rustyred-embedded = { path = "../rustyred-embedded" }
 rustyred-thg-code = { path = "../../rustyredcore_THG/crates/rustyred-thg-code" }
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+serde_json = "1"
 theorem-receiver = { path = "../../rustyredcore_THG/crates/theorem-receiver" }
 
 [dev-dependencies]

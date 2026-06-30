@@ -229,7 +229,7 @@ pub(crate) fn safe_filename(hash: &str) -> String {
         .collect()
 }
 
-pub(crate) fn content_hash_bytes(bytes: &[u8]) -> String {
+pub fn content_hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }

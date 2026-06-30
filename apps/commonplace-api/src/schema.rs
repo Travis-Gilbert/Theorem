@@ -38,6 +38,9 @@ use crate::organize::{
     OrganizeItem, OrganizeSnapshot, OrganizedToday, Subtask, Timeframe,
 };
 use crate::portability::{self, ExportDocument};
+use crate::repo_connect::{
+    RepositoryConnectInput, RepositoryConnectReceipt, RepositoryConnectorRef,
+};
 use crate::retrieve::{
     answer_from_provenance, retrieve_grounding, AnswerKind, AnswerModel, AskConfig, AskResult,
     NoModel, RetrievedItem,
@@ -154,6 +157,76 @@ pub struct IngestInputGql {
     pub tags: Option<Vec<String>>,
     pub source: Option<String>,
     pub residency: Option<String>,
+}
+
+/// Input for connecting a source repository to the filesystem mirror.
+#[derive(InputObject)]
+pub struct RepositoryConnectInputGql {
+    /// Existing local checkout path. Mutually exclusive with `repoUrl`.
+    pub repo_path: Option<String>,
+    /// Clone URL for a public or already-authenticated repository.
+    pub repo_url: Option<String>,
+    /// Optional credential reference for a private repo clone.
+    /// Supported forms are `server:default` and `github-installation:ID`.
+    pub credential_ref: Option<String>,
+    /// GitHub App installation id to resolve at clone time.
+    pub github_installation_id: Option<i64>,
+    /// Optional destination root for real mirrored files.
+    pub workspace_root: Option<String>,
+    /// Optional DocTree/File index prefix. Defaults to the configured connector prefix.
+    pub prefix: Option<String>,
+    pub max_file_bytes: Option<i64>,
+    pub max_total_bytes: Option<i64>,
+}
+
+impl TryFrom<RepositoryConnectInputGql> for RepositoryConnectInput {
+    type Error = Error;
+
+    fn try_from(input: RepositoryConnectInputGql) -> Result<Self> {
+        Ok(Self {
+            repo_path: input.repo_path.map(Into::into),
+            repo_url: input.repo_url,
+            credential_ref: input.credential_ref,
+            github_installation_id: positive_i64_to_u64(
+                "githubInstallationId",
+                input.github_installation_id,
+            )?,
+            workspace_root: input.workspace_root.map(Into::into),
+            prefix: input.prefix,
+            max_file_bytes: positive_i64_to_u64("maxFileBytes", input.max_file_bytes)?,
+            max_total_bytes: positive_i64_to_u64("maxTotalBytes", input.max_total_bytes)?,
+        })
+    }
+}
+
+/// Receipt returned when CommonPlace connects a repository.
+#[derive(SimpleObject)]
+pub struct RepositoryConnectReceiptGql {
+    pub root: String,
+    pub files_mirrored: i32,
+    pub files_indexed: i32,
+    pub files_removed: i32,
+    pub files_skipped: i32,
+    pub bytes_mirrored: i64,
+    pub bytes_indexed: i64,
+    pub paths: Vec<String>,
+    pub clone_ms: i64,
+}
+
+impl From<RepositoryConnectReceipt> for RepositoryConnectReceiptGql {
+    fn from(receipt: RepositoryConnectReceipt) -> Self {
+        Self {
+            root: receipt.root.display().to_string(),
+            files_mirrored: usize_to_i32(receipt.files_mirrored),
+            files_indexed: usize_to_i32(receipt.files_indexed),
+            files_removed: usize_to_i32(receipt.files_removed),
+            files_skipped: usize_to_i32(receipt.files_skipped),
+            bytes_mirrored: u64_to_i64(receipt.bytes_mirrored),
+            bytes_indexed: u64_to_i64(receipt.bytes_indexed),
+            paths: receipt.paths,
+            clone_ms: u64_to_i64(receipt.clone_ms),
+        }
+    }
 }
 
 /// How an ask answer was produced.
@@ -621,6 +694,22 @@ fn store_err(error: rustyred_thg_core::GraphStoreError) -> Error {
     Error::new(format!("{error:?}"))
 }
 
+fn positive_i64_to_u64(field: &str, value: Option<i64>) -> Result<Option<u64>> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|_| Error::new(format!("{field} must be non-negative")))
+        })
+        .transpose()
+}
+
+fn usize_to_i32(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Consumer read API.
 pub struct Query<S, B>(PhantomData<fn() -> (S, B)>);
 
@@ -1013,6 +1102,26 @@ where
         Ok(true)
     }
 
+    /// Connect a repository: land real files in the workspace mirror and build
+    /// the downstream File index.
+    async fn connect_repository(
+        &self,
+        ctx: &Context<'_>,
+        input: RepositoryConnectInputGql,
+    ) -> Result<RepositoryConnectReceiptGql> {
+        principal(ctx)?;
+        let connector = ctx
+            .data_opt::<RepositoryConnectorRef>()
+            .ok_or_else(|| Error::new("repository connector is not configured"))?;
+        let input = RepositoryConnectInput::try_from(input)?;
+        let connector = Arc::clone(connector);
+        let receipt = tokio::task::spawn_blocking(move || connector.connect_repository(input))
+            .await
+            .map_err(|error| Error::new(format!("repository connect task failed: {error}")))?
+            .map_err(|error| Error::new(format!("repository connect failed: {error}")))?;
+        Ok(RepositoryConnectReceiptGql::from(receipt))
+    }
+
     /// Import a JSON export document (from `export`), recreating items and
     /// collections with their original ids so memberships survive.
     async fn import_items(&self, ctx: &Context<'_>, data: String) -> Result<ImportResultGql> {
@@ -1056,9 +1165,26 @@ where
     S: EmbeddingGraphStore + Send + Sync + 'static,
     B: BlobStore + Send + Sync + 'static,
 {
-    Schema::build(Query(PhantomData), Mutation(PhantomData), EmptySubscription)
+    build_schema_with_model_and_repository_connector(store, registry, model, None)
+}
+
+pub fn build_schema_with_model_and_repository_connector<S, B>(
+    store: SharedStore<S, B>,
+    registry: Arc<ApiKeyRegistry>,
+    model: Arc<dyn AnswerModel>,
+    repository_connector: Option<RepositoryConnectorRef>,
+) -> Schema<Query<S, B>, Mutation<S, B>, EmptySubscription>
+where
+    S: EmbeddingGraphStore + Send + Sync + 'static,
+    B: BlobStore + Send + Sync + 'static,
+{
+    let builder = Schema::build(Query(PhantomData), Mutation(PhantomData), EmptySubscription)
         .data(store)
         .data(registry)
-        .data(model)
-        .finish()
+        .data(model);
+    if let Some(repository_connector) = repository_connector {
+        builder.data(repository_connector).finish()
+    } else {
+        builder.finish()
+    }
 }
