@@ -1739,19 +1739,7 @@ impl RedCoreTenantExecutor {
             return Ok(());
         }
 
-        let mut projected_store = InMemoryGraphStore::from_snapshot(writer.graph_snapshot())?;
-        for mutation in &batch.mutations {
-            match mutation {
-                GraphMutation::NodeUpsert(node) => {
-                    projected_store.upsert_node(node.clone())?;
-                }
-                GraphMutation::EdgeUpsert(edge) => {
-                    projected_store.upsert_edge(edge.clone())?;
-                }
-            }
-        }
-
-        let projected_memory = projected_store.stats().memory_bytes;
+        let projected_memory = writer.projected_resident_working_set_bytes_for_batch(batch)?;
         if projected_memory > self.tenant_memory_quota_bytes {
             return Err(GraphStoreError::new(
                 "tenant_memory_quota_exceeded",
@@ -4099,6 +4087,55 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "tenant_memory_quota_exceeded");
+    }
+
+    #[test]
+    fn redcore_executor_quota_allows_small_write_to_large_archived_tenant() {
+        let data_dir = unique_test_dir("redcore-executor-archived-quota");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        let quota_bytes = 4_096;
+        let full_materialization_bytes;
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            for index in 0..24 {
+                store
+                    .upsert_node(NodeRecord::new(
+                        format!("node:archived:{index:02}"),
+                        ["QuotaFixture"],
+                        json!({
+                            "rank": index,
+                            "body": format!("archived-row-{index:02}-{}", "x".repeat(512)),
+                        }),
+                    ))
+                    .unwrap();
+            }
+            full_materialization_bytes = store.stats().unwrap().memory_bytes;
+            assert!(
+                full_materialization_bytes > quota_bytes,
+                "fixture must exceed the resident quota when fully materialized"
+            );
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        let report = store.archive_residency_report();
+        assert!(report.manifest_loaded);
+        assert_eq!(report.hot_overlay_nodes, 0);
+        let executor = RedCoreTenantExecutor::new(store, quota_bytes).unwrap();
+
+        executor
+            .commit_batch(GraphMutationBatch::new([GraphMutation::NodeUpsert(
+                NodeRecord::new("node:small", ["QuotaFixture"], json!({ "rank": 99 })),
+            )]))
+            .unwrap();
+
+        assert!(executor.get_node("node:small").unwrap().is_some());
+        assert_eq!(executor.stats().unwrap().memory_quota_bytes, quota_bytes);
+
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]

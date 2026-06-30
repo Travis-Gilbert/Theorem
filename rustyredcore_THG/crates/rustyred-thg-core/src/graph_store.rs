@@ -4515,12 +4515,30 @@ impl RedCoreGraphStore {
         Ok(())
     }
 
-    fn resident_working_set_bytes(&self) -> GraphStoreResult<usize> {
+    pub fn resident_working_set_bytes(&self) -> GraphStoreResult<usize> {
         Ok(self
             .store
             .stats()
             .memory_bytes
             .saturating_add(self.hot_cache_report()?.resident_bytes))
+    }
+
+    pub fn projected_resident_working_set_bytes_for_batch(
+        &self,
+        batch: &GraphMutationBatch,
+    ) -> GraphStoreResult<usize> {
+        let mut projected_bytes = self.resident_working_set_bytes()?;
+        for mutation in &batch.mutations {
+            projected_bytes = match mutation {
+                GraphMutation::NodeUpsert(node) => {
+                    projected_bytes.saturating_add(resident_node_bytes(node))
+                }
+                GraphMutation::EdgeUpsert(edge) => {
+                    projected_bytes.saturating_add(resident_edge_bytes(edge))
+                }
+            };
+        }
+        Ok(projected_bytes)
     }
 
     fn enforce_resident_budget_after_write(&mut self) -> GraphStoreResult<()> {
@@ -4880,7 +4898,7 @@ impl RedCoreGraphStore {
                 designation.bit_width,
             )?;
         }
-        for designation in self.store.ordered_designations() {
+        for designation in self.ordered_designations() {
             store.designate_ordered_property(&designation.label, &designation.property)?;
         }
         Ok(())
@@ -5938,7 +5956,7 @@ impl RedCoreGraphStore {
             bit_width,
         };
         let txn_id = self.last_txn_id + 1;
-        let mut staged = self.store.clone();
+        let mut staged = self.materialized_store()?;
         staged.designate_vector_property_with_bit_width(
             label,
             property_name,
@@ -5953,10 +5971,12 @@ impl RedCoreGraphStore {
             RedCoreMutation::VectorDesignation(designation),
         )?;
         self.store = staged;
+        self.rebuild_dirty_overlay_frontier_from_store()?;
         self.last_txn_id = txn_id;
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
         }
+        self.enforce_resident_budget_after_write()?;
         Ok(())
     }
 
@@ -6153,7 +6173,7 @@ impl RedCoreGraphStore {
             property: property_name.to_string(),
         };
         let txn_id = self.last_txn_id + 1;
-        let mut staged = self.store.clone();
+        let mut staged = self.materialized_store()?;
         staged.designate_ordered_property(label, property_name)?;
         let graph_version = staged.stats().version;
         let prepublished_snapshot_txn_id = self.persist_before_publish(
@@ -6163,10 +6183,12 @@ impl RedCoreGraphStore {
             RedCoreMutation::OrderedDesignation(designation),
         )?;
         self.store = staged;
+        self.rebuild_dirty_overlay_frontier_from_store()?;
         self.last_txn_id = txn_id;
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
         }
+        self.enforce_resident_budget_after_write()?;
         Ok(())
     }
 
@@ -8339,14 +8361,22 @@ impl GraphStore for RedCoreGraphStore {
         RedCoreGraphStore::upsert_edge(self, edge)
     }
 
-    // Reads serve from the in-memory mirror, which `recover()` rebuilds from the
-    // durable AOF on open and which every committed batch keeps current.
+    // Borrowed-reference reads can only expose the resident overlay because an
+    // archived record materialized on demand would not live long enough for the
+    // trait signature. Owned reads and collection reads below route through the
+    // archive-aware RedCore paths.
     fn get_node(&self, id: &str) -> Option<&NodeRecord> {
         self.store.get_node(id)
     }
 
     fn get_node_record(&self, id: &str) -> Option<NodeRecord> {
-        self.store.nodes.get(id).cloned()
+        RedCoreGraphStore::get_node(self, id).ok().flatten()
+    }
+
+    fn get_node_interval(&self, id: &str) -> Option<TimeInterval> {
+        self.get_node_record(id)
+            .as_ref()
+            .and_then(node_time_interval)
     }
 
     fn get_edge(&self, id: &str) -> Option<&EdgeRecord> {
@@ -8354,7 +8384,7 @@ impl GraphStore for RedCoreGraphStore {
     }
 
     fn get_edge_record(&self, id: &str) -> Option<EdgeRecord> {
-        self.store.edges.get(id).cloned()
+        RedCoreGraphStore::get_edge(self, id).ok().flatten()
     }
 
     fn graph_snapshot(&self) -> GraphStoreResult<GraphSnapshot> {
@@ -8362,19 +8392,21 @@ impl GraphStore for RedCoreGraphStore {
     }
 
     fn query_nodes(&self, query: NodeQuery) -> Vec<NodeRecord> {
-        self.store.query_nodes(query)
+        RedCoreGraphStore::query_nodes(self, query).unwrap_or_default()
     }
 
     fn neighbors(&self, query: NeighborQuery) -> Vec<NeighborHit> {
-        self.store.neighbors(query)
+        RedCoreGraphStore::neighbors(self, query).unwrap_or_default()
     }
 
     fn stats(&self) -> GraphStats {
-        self.store.stats()
+        RedCoreGraphStore::stats(self).unwrap_or_else(|_| self.store.stats())
     }
 
     fn verify(&self) -> VerifyReport {
-        self.store.verify()
+        self.materialized_store()
+            .map(|store| store.verify())
+            .unwrap_or_else(|_| self.store.verify())
     }
 
     fn rebuild_indexes(&mut self) -> GraphStoreResult<GraphRebuildReport> {
@@ -10434,6 +10466,172 @@ mod tests {
         assert_eq!(stats.nodes_total, 2);
         assert_eq!(stats.edges_total, 1);
         assert!(stats.memory_bytes > 0);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_graphstore_trait_reads_archive_records_after_reopen() {
+        let data_dir = unique_test_dir("redcore-archive-trait-reads");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:a",
+                    ["TraitFixture"],
+                    json!({ "rank": 1, "t_start_ms": 10 }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:b",
+                    ["TraitFixture"],
+                    json!({ "rank": 2 }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:ab",
+                    "node:a",
+                    "LINKS",
+                    "node:b",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(
+            store.store.nodes.is_empty(),
+            "archive recovery should leave the hot overlay empty"
+        );
+        assert!(
+            store.store.edges.is_empty(),
+            "archive recovery should leave the hot edge overlay empty"
+        );
+
+        let graph: &dyn GraphStore = &store;
+        let node = graph
+            .get_node_record("node:a")
+            .expect("trait-owned read should materialize archived node");
+        assert_eq!(node.properties["rank"], json!(1));
+        assert_eq!(
+            graph
+                .get_node_interval("node:a")
+                .expect("trait interval should use owned archived node")
+                .start_ms,
+            Some(10)
+        );
+        let edge = graph
+            .get_edge_record("edge:ab")
+            .expect("trait-owned read should materialize archived edge");
+        assert_eq!(edge.to_id, "node:b");
+
+        let nodes = graph.query_nodes(NodeQuery::label("TraitFixture").with_limit(10));
+        assert_eq!(nodes.len(), 2);
+        let neighbors = graph.neighbors(NeighborQuery::out("node:a"));
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, "node:b");
+        let stats = graph.stats();
+        assert_eq!(stats.nodes_total, 2);
+        assert_eq!(stats.edges_total, 1);
+        assert!(graph.verify().ok);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_designation_snapshots_preserve_archived_records() {
+        let data_dir = unique_test_dir("redcore-archive-designation-snapshot");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "doc:a",
+                    ["Doc"],
+                    json!({ "rank": 1.0, "embedding": embedding8(1.0, 0.0) }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "doc:b",
+                    ["Doc"],
+                    json!({ "rank": 2.0, "embedding": embedding8(0.0, 1.0) }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:ab",
+                    "doc:a",
+                    "LINKS",
+                    "doc:b",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            assert!(
+                store.store.nodes.is_empty(),
+                "designation test should start from archive residency"
+            );
+            store
+                .designate_vector_property_with_bit_width("Doc", "embedding", 8, 2)
+                .unwrap();
+        }
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            assert!(
+                store.store.nodes.is_empty(),
+                "vector designation snapshot should recover as archive residency"
+            );
+            assert!(store.get_node("doc:a").unwrap().is_some());
+            assert!(store.get_edge("edge:ab").unwrap().is_some());
+            let vector_hits = store
+                .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 1)
+                .unwrap();
+            assert_eq!(vector_hits[0].0, "doc:a");
+            store.designate_ordered_property("Doc", "rank").unwrap();
+        }
+
+        {
+            let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+            assert!(
+                store.store.nodes.is_empty(),
+                "ordered designation snapshot should recover as archive residency"
+            );
+            let stats = store.stats().unwrap();
+            assert_eq!(stats.nodes_total, 2);
+            assert_eq!(stats.edges_total, 1);
+            assert!(store.get_node("doc:b").unwrap().is_some());
+            let neighbors = store.neighbors(NeighborQuery::out("doc:a")).unwrap();
+            assert_eq!(neighbors.len(), 1);
+            assert_eq!(neighbors[0].node_id, "doc:b");
+            assert_eq!(store.vector_designations().len(), 1);
+            assert_eq!(store.ordered_designations().len(), 1);
+            assert_eq!(
+                store
+                    .ordered_range_by_score("Doc", "rank", 0.0, 10.0, None)
+                    .unwrap(),
+                vec![("doc:a".to_string(), 1.0), ("doc:b".to_string(), 2.0)]
+            );
+            let vector_hits = store
+                .vector_search(Some("Doc"), "embedding", &embedding8(1.0, 0.0), 1)
+                .unwrap();
+            assert_eq!(vector_hits[0].0, "doc:a");
+        }
 
         std::fs::remove_dir_all(data_dir).ok();
     }
