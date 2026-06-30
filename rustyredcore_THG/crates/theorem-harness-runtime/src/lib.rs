@@ -49,6 +49,7 @@ pub mod memory;
 pub mod node_type_binding;
 pub mod overlap;
 pub mod patch_sequencer;
+pub mod prompt_runtime;
 pub mod reasoning_bank;
 pub mod skill_pack;
 pub mod tenant;
@@ -202,6 +203,11 @@ pub use overlap::{
 pub use patch_sequencer::{
     PatchApplyReceipt, PatchApplyStatus, PatchProposal, PatchSequencer, PatchSequencerError,
     PatchSequencerResult,
+};
+pub use prompt_runtime::{
+    capture_prompt_exemplar, recall_prompt_exemplars, CapturePromptExemplarInput,
+    RecallPromptExemplarsInput, DEFAULT_PROMPT_EXEMPLAR_LIMIT, PROMPT_EXEMPLAR_TAG,
+    PROMPT_RUNTIME_SURFACE,
 };
 pub use reasoning_bank::{
     distill_reasoning_strategy, recall_reasoning_strategies, write_reasoning_strategy,

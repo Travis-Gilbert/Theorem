@@ -44,6 +44,18 @@ pub const VERIFIER_HEAD_PROMPT_ADDENDUM: &str = r#"Your task is to try to break 
 
 pub const MODALITY_HEAD_PROMPT_ADDENDUM: &str = r#"You are engaged because the task needs your modality, not because of its difficulty. Do that modality job precisely and write the grounded result into the shared document for the reasoning heads to use. Do not reason about the whole task unless explicitly invoked as a reasoning head."#;
 
+pub const PROPOSAL_ROLE_INSTRUCTION: &str =
+    "attempt the whole task now and write a complete first answer into the shared document.";
+
+pub const CRITIQUE_ROLE_INSTRUCTION: &str =
+    "attempt the whole task through criticism; name concrete gaps, errors, and unsupported claims.";
+
+pub const SYNTHESIS_ROLE_INSTRUCTION: &str =
+    "attempt the whole task by producing the best converged answer from the shared document.";
+
+pub const VERIFICATION_ROLE_INSTRUCTION: &str =
+    "try to falsify the converged answer before publication.";
+
 impl HeadInvocationKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -260,7 +272,10 @@ impl HeadInvocationRequest {
             envelope
                 .as_object_mut()
                 .expect("invocation envelope is a JSON object")
-                .insert("constitution".to_string(), Value::String(constitution.clone()));
+                .insert(
+                    "constitution".to_string(),
+                    Value::String(constitution.clone()),
+                );
         }
         format!("headinvoke:{}", stable_value_hash(&envelope))
     }
@@ -270,18 +285,10 @@ pub fn default_head_system_prompt(head: &ResolvedAgentHead, kind: HeadInvocation
     let mut prompt = String::from(THEOREM_HEAD_SYSTEM_PROMPT_CORE);
     prompt.push_str("\n\nCurrent invocation role: ");
     prompt.push_str(match kind {
-        HeadInvocationKind::Proposal => {
-            "attempt the whole task now and write a complete first answer into the shared document."
-        }
-        HeadInvocationKind::Critique => {
-            "attempt the whole task through criticism; name concrete gaps, errors, and unsupported claims."
-        }
-        HeadInvocationKind::Synthesis => {
-            "attempt the whole task by producing the best converged answer from the shared document."
-        }
-        HeadInvocationKind::Verification => {
-            "try to falsify the converged answer before publication."
-        }
+        HeadInvocationKind::Proposal => PROPOSAL_ROLE_INSTRUCTION,
+        HeadInvocationKind::Critique => CRITIQUE_ROLE_INSTRUCTION,
+        HeadInvocationKind::Synthesis => SYNTHESIS_ROLE_INSTRUCTION,
+        HeadInvocationKind::Verification => VERIFICATION_ROLE_INSTRUCTION,
     });
     if is_fast_first_head(head) && kind == HeadInvocationKind::Proposal {
         prompt.push_str("\n\n");
@@ -377,6 +384,12 @@ impl HeadInvocationReceipt {
         };
         receipt.receipt_hash = receipt.computed_receipt_hash();
         receipt
+    }
+
+    pub fn with_claims(mut self, claims: Vec<GroundedClaim>) -> Self {
+        self.claims = claims;
+        self.receipt_hash = self.computed_receipt_hash();
+        self
     }
 
     pub fn contribution_id(&self) -> String {

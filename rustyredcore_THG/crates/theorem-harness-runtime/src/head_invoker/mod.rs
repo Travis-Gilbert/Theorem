@@ -10,9 +10,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use theorem_harness_core::{
-    default_head_system_prompt, HeadInvocationError, HeadInvocationKind, HeadInvocationReceipt,
-    HeadInvocationRequest, HeadInvoker, HeadKind, HeadTransport,
+    default_head_system_prompt, prompt_instruction_key, HeadInvocationError, HeadInvocationKind,
+    HeadInvocationReceipt, HeadInvocationRequest, HeadInvoker, HeadKind, HeadTransport,
 };
+use theorem_prompt::{MarkerRenderer, PromptSpec, Renderer};
 
 const DEFAULT_PROVIDER_HEAD_COST_UNITS: f64 = 1.0;
 const DEFAULT_LOCAL_OPENAI_CHAT_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
@@ -172,61 +173,26 @@ impl HeadInvoker for RealHeadInvoker {
 pub type ProviderHeadInvoker = RealHeadInvoker;
 
 pub(crate) fn prompt_for_request(request: &HeadInvocationRequest) -> String {
-    let mut prompt = format!("Task:\n{}\n", request.task);
-    prompt.push_str("\nShared CRDT scratchpad:\n");
-    prompt.push_str(&format!(
-        "- kind: {:?}\n- graph_root_id: {}\n- yrs_doc_id: {}\n- stream_topic: {}\n- awareness_log_id: {}\n",
-        request.scratchpad_crdt.kind,
-        request.scratchpad_crdt.graph_root_id,
-        request.scratchpad_crdt.yrs_doc_id,
-        request.scratchpad_crdt.stream_topic,
-        request.scratchpad_crdt.awareness_log_id
-    ));
-    if !request.scratchpad_crdt.text_regions.is_empty() {
-        prompt.push_str("- text_regions:\n");
-        for region in &request.scratchpad_crdt.text_regions {
-            prompt.push_str(&format!(
-                "  - {}: {}\n",
-                region.region_id, region.description
-            ));
-        }
-    }
-    if !request.context_membrane.is_empty() {
-        prompt.push_str("\nContext membrane primes:\n");
-        for prime in &request.context_membrane {
-            prompt.push_str(&format!(
-                "- {} ({}, confidence {:.2}): {}",
-                prime.artifact_id, prime.label, prime.confidence, prime.summary
-            ));
-            if !prime.source.trim().is_empty() {
-                prompt.push_str(&format!(" [{}]", prime.source));
-            }
-            prompt.push('\n');
-        }
-    }
-    if !request.prior_context.is_empty() {
-        prompt.push_str("\nPrior revisions:\n");
-        for context in &request.prior_context {
-            prompt.push_str(&format!(
-                "- {} ({}) {}\n",
-                context.revision_id, context.kind, context.output_summary
-            ));
-            if let Some(text) = context.payload.get("text").and_then(Value::as_str) {
-                prompt.push_str(text);
-                prompt.push('\n');
-            }
-        }
-    }
-    if !request.claims.is_empty() {
-        prompt.push_str("\nSeed grounding claims:\n");
-        for claim in &request.claims {
-            prompt.push_str(&format!("- {} [{}]\n", claim.text, claim.provenance));
-        }
-    }
+    let spec = prompt_spec_for_request(request);
+    let rendered = MarkerRenderer.render(&spec);
+    let mut prompt = rendered
+        .messages
+        .iter()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
     prompt.push_str(
         "\nReturn a concise answer. End with a line `Claims JSON:` followed by a JSON array of objects with `text` and `provenance` fields for the claims you assert.\n",
     );
     prompt
+}
+
+pub(crate) fn prompt_spec_for_request(request: &HeadInvocationRequest) -> PromptSpec {
+    PromptSpec::from_request(
+        request,
+        prompt_instruction_key(&request.head.kind, request.kind),
+        system_instruction_for_request(request),
+    )
 }
 
 pub(crate) fn system_instruction_for_request(request: &HeadInvocationRequest) -> String {

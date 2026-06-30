@@ -49,4 +49,5 @@ theorem-harness
 theorem-harness-core
 theorem-harness-runtime
 theorem-localmodel
+theorem-prompt
 theorem-receiver

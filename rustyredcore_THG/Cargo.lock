@@ -12442,6 +12442,7 @@ dependencies = [
  "serde",
  "serde_json",
  "theorem-harness-core",
+ "theorem-prompt",
  "tokio",
  "tracing",
 ]
@@ -12459,6 +12460,15 @@ dependencies = [
  "theorem-receiver",
  "tokio",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "theorem-prompt"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "theorem-harness-core",
 ]
 
 [[package]]

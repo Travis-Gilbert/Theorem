@@ -46,6 +46,7 @@ pub mod loop_gate;
 pub mod map_artifacts;
 pub mod memory_contracts;
 pub mod metrics_composite;
+pub mod prompt_runtime;
 pub mod provider_head_adapter;
 pub mod replay;
 pub mod scheduler;
@@ -150,6 +151,16 @@ pub use memory_contracts::{
 pub use metrics_composite::{
     composite, composite_with_safety, session_composite_point, CompositeAxes, FitnessTraitScores,
     HarnessComposite, COMPOSITE_VERSION,
+};
+pub use prompt_runtime::{
+    critic_route_for_output, default_prompt_instruction_registry, evaluate_runtime_refinement,
+    exemplar_evidence_from_accepted_run, exemplars_from_evidence, fitness_observations_from_claims,
+    prompt_instruction_key, refine_with_invoker, select_variant_for_task, validate_instruction_key,
+    AbsoluteFitnessBar, AbsoluteFitnessViolation, CriticRoute, ExemplarRecord, OutputKind,
+    PromptInstructionRegistry, PromptInstructionSpec, PromptRuntimeError,
+    ResolvedPromptInstruction, RuntimeRefinementConfig, RuntimeRefinementDecision,
+    RuntimeRefinementResult, TaskVariantSelection, DEFAULT_INVOCATION_SHAPE,
+    EXEMPLAR_EVIDENCE_KIND, INSTRUCTION_KEY_PREFIX,
 };
 pub use provider_head_adapter::ProviderHeadExecutionContext;
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};

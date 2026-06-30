@@ -13,11 +13,13 @@ use crate::agent_binding::{
     ScratchpadRelationKind, ScratchpadRevision, ScratchpadRevisionLink,
 };
 use crate::agent_head_registry::{AgentHeadRegistry, AgentHeadRegistryError, ResolvedAgentHead};
+use crate::config_ledger::ConfigState;
 use crate::constitution::Constitution;
 use crate::head_invocation::{
     ContextMembranePrime, FakeHeadInvoker, GroundedClaim, HeadInvocationError, HeadInvocationKind,
     HeadInvocationReceipt, HeadInvocationRequest, HeadInvoker, RevisionContext,
 };
+use crate::prompt_runtime::{default_prompt_instruction_registry, PromptRuntimeError};
 use crate::state_hash::stable_value_hash;
 use crate::types::Payload;
 use crate::user_model::UserModel;
@@ -32,6 +34,7 @@ pub enum IntraAgentLoopError {
     Binding(BindingError),
     Registry(AgentHeadRegistryError),
     Invocation(HeadInvocationError),
+    PromptRuntime(PromptRuntimeError),
     NotEnoughReasoningHeads { available: usize },
 }
 
@@ -41,6 +44,7 @@ impl fmt::Display for IntraAgentLoopError {
             Self::Binding(error) => write!(f, "{error}"),
             Self::Registry(error) => write!(f, "{error}"),
             Self::Invocation(error) => write!(f, "{error}"),
+            Self::PromptRuntime(error) => write!(f, "{error}"),
             Self::NotEnoughReasoningHeads { available } => write!(
                 f,
                 "fake intra-agent loop requires at least two active non-plugin heads; found {available}"
@@ -66,6 +70,12 @@ impl From<AgentHeadRegistryError> for IntraAgentLoopError {
 impl From<HeadInvocationError> for IntraAgentLoopError {
     fn from(value: HeadInvocationError) -> Self {
         Self::Invocation(value)
+    }
+}
+
+impl From<PromptRuntimeError> for IntraAgentLoopError {
+    fn from(value: PromptRuntimeError) -> Self {
+        Self::PromptRuntime(value)
     }
 }
 
@@ -105,6 +115,8 @@ pub struct FakeIntraAgentLoopInput {
     pub expected_invocation_cost_units: f64,
     #[serde(default)]
     pub user_model: Option<UserModel>,
+    #[serde(default)]
+    pub config_state: ConfigState,
     pub started_at: String,
     pub closed_by: String,
     /// S3 memory continuity: prior `AgentPublished` memory entries to thread
@@ -144,6 +156,7 @@ impl FakeIntraAgentLoopInput {
             expected_value_units: default_expected_value_units(),
             expected_invocation_cost_units: default_expected_invocation_cost_units(),
             user_model: None,
+            config_state: ConfigState::default(),
             started_at: "2026-06-02T00:00:00Z".to_string(),
             closed_by: "fake-loop".to_string(),
             lineage_memory: Vec::new(),
@@ -251,8 +264,7 @@ pub fn run_intra_agent_loop_with_invoker<I: HeadInvoker>(
     if let Some(user_model) = &input.user_model {
         mount_payload.insert(
             "user_model".to_string(),
-            serde_json::to_value(user_model)
-                .expect("UserModel serialization should be infallible"),
+            serde_json::to_value(user_model).expect("UserModel serialization should be infallible"),
         );
     }
     if !input.lineage_memory.is_empty() {
@@ -1019,6 +1031,8 @@ fn invoke_head<I: HeadInvoker>(
         .collect();
     let prior_context = revisions.iter().filter_map(revision_context).collect();
     let policy_decision = constitution.head_turn_decision(binding, &head.head_id, kind);
+    let resolved_instruction =
+        default_prompt_instruction_registry().resolve_for_head(&input.config_state, &head, kind)?;
     // Thread the binding's agent constitution (persona/voice) through every
     // head invocation: proposal, critique, synthesis, and verification. The
     // synthesis step (DRAFTS.SYNTHESIZED) is where voice matters most, but
@@ -1037,6 +1051,7 @@ fn invoke_head<I: HeadInvoker>(
     .with_policy_decision(policy_decision)
     .with_scratchpad_crdt(binding.working_memory_scope.scratchpad.crdt.clone())
     .with_context_membrane(input.context_membrane.clone())
+    .with_head_system_prompt(resolved_instruction.instruction_text)
     .with_constitution(binding.identity.agent_constitution.clone());
     invoker
         .invoke(request)
