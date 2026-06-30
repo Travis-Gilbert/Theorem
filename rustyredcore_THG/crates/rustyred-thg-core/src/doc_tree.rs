@@ -78,6 +78,10 @@ pub struct DocEntry {
     /// Zstd-compressed small body bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline: Option<Vec<u8>>,
+    /// Absolute path to a real filesystem body. Code mirrors use this so the
+    /// DocTree is a view over canonical files, not the canonical byte store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_path: Option<String>,
     #[serde(default)]
     pub inline_compressed: bool,
     pub tier: ColdTierKind,
@@ -175,6 +179,7 @@ impl DocTree {
             DocEntry {
                 content_hash: Some(hash),
                 inline: Some(compress_cold_bytes(body)?),
+                real_path: None,
                 inline_compressed: true,
                 tier,
                 size: body.len() as u64,
@@ -187,6 +192,7 @@ impl DocTree {
             DocEntry {
                 content_hash: Some(stored_hash),
                 inline: None,
+                real_path: None,
                 inline_compressed: false,
                 tier,
                 size: body.len() as u64,
@@ -197,6 +203,31 @@ impl DocTree {
         };
         self.put(path.clone(), entry.clone());
         Ok(self.entries.get(&path).cloned().unwrap_or(entry))
+    }
+
+    pub fn put_real_file(
+        &mut self,
+        path: PathKey,
+        real_path: impl Into<String>,
+        content_hash: String,
+        size: u64,
+        tier: ColdTierKind,
+        created_ms: i64,
+        gist: Option<String>,
+    ) -> DocEntry {
+        let entry = DocEntry {
+            content_hash: Some(content_hash),
+            inline: None,
+            real_path: Some(real_path.into()),
+            inline_compressed: false,
+            tier,
+            size,
+            created_ms,
+            gist,
+            previous_hashes: Vec::new(),
+        };
+        self.put(path.clone(), entry.clone());
+        self.entries.get(&path).cloned().unwrap_or(entry)
     }
 
     pub fn resolve_body(
@@ -277,6 +308,14 @@ fn resolve_entry_body(
         } else {
             Ok(inline.clone())
         };
+    }
+    if let Some(real_path) = entry.real_path.as_ref() {
+        return std::fs::read(real_path).map_err(|error| {
+            GraphStoreError::new(
+                "real_doc_entry_read",
+                format!("reading mirrored body {real_path}: {error}"),
+            )
+        });
     }
     let Some(hash) = entry.content_hash.as_ref() else {
         return Err(GraphStoreError::new(

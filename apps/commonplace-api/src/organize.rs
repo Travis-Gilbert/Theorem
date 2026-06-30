@@ -20,8 +20,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonplace::{
-    BlobStore, Classification, ClassificationRank, Commonplace, EmbeddingGraphStore, IngestPipeline,
-    Item, ItemBody, ItemKind,
+    BlobStore, Classification, ClassificationRank, Commonplace, EmbeddingGraphStore,
+    IngestPipeline, Item, ItemBody, ItemKind,
 };
 use rustyred_thg_core::GraphStoreResult;
 
@@ -507,8 +507,16 @@ mod tests {
                     * [ ] invite finance\n\
                     a plain line that is not a checkbox";
         let subtasks = parse_subtasks(body);
-        assert_eq!(subtasks.len(), 3, "three checkbox lines parse, the plain line is ignored");
-        assert_eq!(subtasks.iter().filter(|s| s.done).count(), 1, "exactly one is done");
+        assert_eq!(
+            subtasks.len(),
+            3,
+            "three checkbox lines parse, the plain line is ignored"
+        );
+        assert_eq!(
+            subtasks.iter().filter(|s| s.done).count(),
+            1,
+            "exactly one is done"
+        );
         // Order preserved, first done.
         assert_eq!(
             subtasks[0],

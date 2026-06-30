@@ -23,8 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyred_code_embedding::{CodeEmbedder, CodeEmbeddingConfig, CodeEmbeddingKind};
 use rustyred_thg_core::{
-    ColdTierKind, DiskObjectStore, DocEntry, DocTree, PathKey, RedCoreDurability,
-    RedCoreGraphStore, RedCoreOptions, DOC_TREE_CONTENT_HASH_PROPERTY, DOC_TREE_PATH_PROPERTY,
+    content_hash_bytes, ColdTierKind, DiskObjectStore, DocEntry, DocTree, PathKey,
+    RedCoreDurability, RedCoreGraphStore, RedCoreOptions, DOC_TREE_CONTENT_HASH_PROPERTY,
+    DOC_TREE_PATH_PROPERTY,
 };
 use rustyred_thg_mcp::{handle_mcp_request, McpServerConfig, SharedStore};
 use serde::Deserialize;
@@ -444,6 +445,53 @@ impl Engine {
             .unwrap_or_default())
     }
 
+    /// Link a DocTree path to a real filesystem file and upsert the downstream
+    /// `File` node without copying the bytes into the DocTree object store.
+    pub fn fs_link_real_file(
+        &self,
+        path: &str,
+        real_path: &Path,
+        content: &[u8],
+    ) -> Result<FileWriteReceipt, EngineError> {
+        let key =
+            PathKey::from_slash_path(path).map_err(|error| EngineError::Open(error.message))?;
+        let content_hash = content_hash_bytes(content);
+        let created_ms = now_ms();
+        let real_path = real_path
+            .canonicalize()
+            .unwrap_or_else(|_| real_path.to_path_buf());
+        {
+            let mut tree = self.doc_tree.borrow_mut();
+            tree.put_real_file(
+                key,
+                real_path.to_string_lossy().into_owned(),
+                content_hash.clone(),
+                content.len() as u64,
+                ColdTierKind::Cold,
+                created_ms,
+                None,
+            );
+        }
+        self.mutate(
+            "mutation($n:JSON!){ bulkNodes(nodes:$n){ inserted } }",
+            json!({ "n": [file_node(
+                path,
+                &content_hash,
+                content,
+                self.file_embedder.as_ref(),
+            )?] }),
+        )?;
+        self.persist_doc_tree()?;
+        Ok(FileWriteReceipt {
+            path: path.to_string(),
+            content_hash,
+        })
+    }
+
+    pub fn file_content_hash(content: &[u8]) -> String {
+        content_hash_bytes(content)
+    }
+
     /// Write multiple files into the folder tree while serializing
     /// `doc-tree.json` exactly once. This is the W0 import seam: the tree borrow
     /// is held for the batch, all `File` nodes are upserted together, and the
@@ -613,6 +661,24 @@ impl Engine {
         debug_assert!(removed, "DocTree path checked before unlink");
         self.persist_doc_tree()?;
         Ok(true)
+    }
+
+    /// Remove a downstream `File` node and any DocTree entry for `path`.
+    /// Unlike `fs_unlink`, this also repairs stale graph-only index rows.
+    pub fn fs_remove_file_index(&self, path: &str) -> Result<bool, EngineError> {
+        let key =
+            PathKey::from_slash_path(path).map_err(|error| EngineError::Open(error.message))?;
+        let node_id = file_node_id(path);
+        let node_removed = self.with_store(|store| {
+            store
+                .delete_node(&node_id)
+                .map_err(|error| EngineError::Graphql(error.message))
+        })?;
+        let entry_removed = self.doc_tree.borrow_mut().remove(&key);
+        if entry_removed {
+            self.persist_doc_tree()?;
+        }
+        Ok(node_removed || entry_removed)
     }
 
     /// Rename one embedded workspace file. The implementation deliberately
@@ -843,6 +909,7 @@ fn directory_entry(created_ms: i64) -> DocEntry {
     DocEntry {
         content_hash: None,
         inline: None,
+        real_path: None,
         inline_compressed: false,
         tier: ColdTierKind::Cold,
         size: 0,

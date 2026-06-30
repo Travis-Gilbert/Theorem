@@ -17,6 +17,7 @@ pub mod discover;
 pub mod mcp;
 pub mod organize;
 pub mod portability;
+pub mod repo_connect;
 pub mod retrieve;
 pub mod schema;
 pub mod serve;
@@ -31,15 +32,21 @@ pub use organize::{
 pub use portability::{
     export, export_json, export_markdown, import, ExportDocument, ImportSummary, EXPORT_VERSION,
 };
+pub use repo_connect::{
+    connector_from_env, EngineRepositoryConnector, EnvGitCredentialResolver,
+    GitCredentialResolverRef, RepositoryConnectInput, RepositoryConnectReceipt,
+    RepositoryConnector, RepositoryConnectorRef,
+};
 pub use retrieve::{
     answer_model_from_env, ask, AnswerKind, AnswerModel, AskConfig, AskResult,
     LocalOpenAiAnswerModel, NoModel, RetrievedItem,
 };
 pub use schema::{
-    build_schema, build_schema_with_model, AnswerKindGql, ApiStore, AskResultGql, BriefingGql,
-    CandidateLinkGql, CollectionGql, ConnectedItemGql, ConsumerSchema, DurableSchema,
-    DurableShared, ExportFormat, ImportResultGql, InMemoryShared, IngestInputGql, ItemGql,
-    Mutation, ProvenanceGql, Query, SearchHitGql, SharedStore,
+    build_schema, build_schema_with_model, build_schema_with_model_and_repository_connector,
+    AnswerKindGql, ApiStore, AskResultGql, BriefingGql, CandidateLinkGql, CollectionGql,
+    ConnectedItemGql, ConsumerSchema, DurableSchema, DurableShared, ExportFormat, ImportResultGql,
+    InMemoryShared, IngestInputGql, ItemGql, Mutation, ProvenanceGql, Query,
+    RepositoryConnectInputGql, RepositoryConnectReceiptGql, SearchHitGql, SharedStore,
 };
 pub use serve::{build_router_with_model, run_from_env, serve_loopback, serve_loopback_with_ready};
 
