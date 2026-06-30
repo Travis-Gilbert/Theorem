@@ -480,6 +480,15 @@ proxy_base_url() {
     printf 'http://127.0.0.1:%s\n' "$port"
 }
 
+# The legacy proxy (`theorem proxy/harness/wrap`, flag `--proxy-port`) defaults to
+# 8484; the new model-path proxy (`theorem up/connect`, flag `--port`) defaults to
+# 8788. They are alternatives, never co-resident, and only the legacy proxy serves
+# `/v1/presence`. Presence/room callers must reach the legacy port, not proxy_base_url.
+legacy_proxy_base_url() {
+    local port="${THEOREM_PROXY_PORT:-8484}"
+    printf 'http://127.0.0.1:%s\n' "$port"
+}
+
 node_base_url() {
     local port="${RUSTY_RED_PORT:-8380}"
     printf 'http://127.0.0.1:%s\n' "$port"
@@ -902,7 +911,7 @@ ensure_proxy_running() {
     fi
 
     local base_url
-    base_url="$(proxy_base_url)"
+    base_url="$(legacy_proxy_base_url)"
     if wait_for_proxy "$base_url"; then
         return 0
     fi
@@ -957,7 +966,7 @@ announce_presence() {
 
     ensure_proxy_running
     local base_url
-    base_url="$(proxy_base_url)"
+    base_url="$(legacy_proxy_base_url)"
 
     local path="${THEOREM_PRESENCE_PATH:-.}"
     local line="${THEOREM_PRESENCE_LINE:-1}"
@@ -1005,7 +1014,7 @@ announce_legacy_room_presence() {
     local ttl=$6
 
     local base_url
-    base_url="$(proxy_base_url)"
+    base_url="$(legacy_proxy_base_url)"
 
     local repo=""
     if repo="$(find_repo 2>/dev/null)"; then
