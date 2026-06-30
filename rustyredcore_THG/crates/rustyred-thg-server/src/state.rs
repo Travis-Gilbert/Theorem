@@ -42,6 +42,7 @@ use crate::browser_pool::{BrowserLiveSessionRecord, LiveBrowserPool, RemoteBrows
 use crate::config::{Config, StorageMode};
 use crate::graph_cache::GraphCacheTenant;
 use crate::observability::Observability;
+use crate::payload_backend::payload_backend_from_env;
 use crate::tenant_router::{tenant_data_dir, tenant_key_segment, TenantId};
 use crate::ttl_sweep::TtlSweepState;
 
@@ -1043,8 +1044,10 @@ impl AppState {
             snapshot_interval_writes: tenant_config.snapshot_interval_writes,
             strict_acid: tenant_config.strict_acid,
         };
+        let mut graph_store = RedCoreGraphStore::open(data_dir, options)?;
+        configure_payload_backend(&mut graph_store)?;
         let store = Arc::new(RedCoreTenantExecutor::new(
-            RedCoreGraphStore::open(data_dir, options)?,
+            graph_store,
             tenant_config.tenant_memory_quota_bytes,
         )?);
         if let Err(err) = store.enable_graph_hooks(
@@ -1087,8 +1090,10 @@ impl AppState {
             return Ok(store.clone());
         }
         let tenant_config = self.config.tenant_config(tenant_id.as_str());
+        let mut graph_store = RedCoreGraphStore::memory();
+        configure_payload_backend(&mut graph_store)?;
         let store = Arc::new(RedCoreTenantExecutor::new(
-            RedCoreGraphStore::memory(),
+            graph_store,
             tenant_config.tenant_memory_quota_bytes,
         )?);
         if let Err(err) = store.enable_graph_hooks(
@@ -1349,6 +1354,7 @@ impl HookStoreAccess for ExecutorHookStore {
 
 impl RedCoreTenantExecutor {
     fn new(store: RedCoreGraphStore, tenant_memory_quota_bytes: usize) -> GraphStoreResult<Self> {
+        store.set_hot_cache_budget_bytes(tenant_memory_quota_bytes)?;
         Ok(Self {
             writer: Mutex::new(store),
             tenant_memory_quota_bytes,
@@ -1524,9 +1530,39 @@ impl RedCoreTenantExecutor {
         }
     }
 
+    pub fn hot_cache_diagnostics(&self) -> Value {
+        match self
+            .lock_writer()
+            .and_then(|writer| writer.hot_cache_report())
+        {
+            Ok(report) => json!(report),
+            Err(error) => json!({
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                },
+            }),
+        }
+    }
+
+    pub fn archive_residency_diagnostics(&self) -> Value {
+        match self.lock_writer() {
+            Ok(writer) => json!(writer.archive_residency_report()),
+            Err(error) => json!({
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                },
+            }),
+        }
+    }
+
     pub fn clear_hot_caches(&self) {
         if let Ok(mut guard) = self.cached_edges.write() {
             *guard = None;
+        }
+        if let Ok(writer) = self.lock_writer() {
+            let _ = writer.clear_hot_cache();
         }
     }
 
@@ -1728,6 +1764,13 @@ impl RedCoreTenantExecutor {
 
         Ok(())
     }
+}
+
+fn configure_payload_backend(store: &mut RedCoreGraphStore) -> GraphStoreResult<()> {
+    if let Some(backend) = payload_backend_from_env()? {
+        store.set_payload_backend(backend);
+    }
+    Ok(())
 }
 
 fn now_millis() -> u64 {
@@ -3195,10 +3238,11 @@ mod tests {
     use super::{
         app_affordance_response_json, normalize_grpc_endpoint, now_millis, AppState,
         InvokeAppAffordanceGrpcResponse, RedCoreTenantExecutor, TenantEngineState,
+        TenantGraphStore,
     };
     use rustyred_thg_core::{
-        EdgeRecord, GraphMutation, GraphMutationBatch, NeighborQuery, NodeRecord,
-        RedCoreDurability, RedCoreGraphStore,
+        EdgeRecord, GraphMutation, GraphMutationBatch, NeighborQuery, NodeQuery, NodeRecord,
+        RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
     };
     use serde_json::json;
     use std::sync::{mpsc, Arc, Barrier};
@@ -3689,6 +3733,126 @@ mod tests {
     }
 
     #[test]
+    fn tenant_residency_soak_tracks_active_working_sets_not_full_graphs() {
+        let data_dir = unique_test_dir("rusty-red-tenant-residency-soak");
+        let tenants = [
+            "tenant-soak-a",
+            "tenant-soak-b",
+            "tenant-soak-c",
+            "tenant-soak-d",
+        ];
+        let nodes_per_tenant = 64;
+        let tenant_budget = 16 * 1024;
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 10_000,
+            strict_acid: false,
+        };
+        let mut full_materialization_baseline = 0_usize;
+
+        for tenant in tenants {
+            let tenant_id = TenantId::new(tenant).unwrap();
+            let tenant_dir = tenant_data_dir(&data_dir, &tenant_id);
+            let mut store = RedCoreGraphStore::open(&tenant_dir, options.clone()).unwrap();
+            for index in 0..nodes_per_tenant {
+                store
+                    .upsert_node(NodeRecord::new(
+                        format!("node:{tenant}:{index:03}"),
+                        ["SoakFixture"],
+                        json!({
+                            "tenant": tenant,
+                            "rank": index,
+                            "title": format!("fixture row {index}"),
+                            "payload": {
+                                "body": format!("tenant={tenant};index={index};{}", "x".repeat(4096)),
+                            },
+                        }),
+                    ))
+                    .unwrap();
+            }
+            full_materialization_baseline =
+                full_materialization_baseline.saturating_add(store.stats().unwrap().memory_bytes);
+            store.snapshot_now().unwrap();
+        }
+
+        let mut config = Config::default_for_tests();
+        config.storage_mode = StorageMode::Embedded;
+        config.data_dir = data_dir.display().to_string();
+        config.durability = RedCoreDurability::AofAlways;
+        config.snapshot_interval_writes = 10_000;
+        config.tenant_memory_quota_bytes = tenant_budget;
+        config.tenant_idle_ms = 60_000;
+        config.tenant_warm_pool_size = 0;
+        let idle_ms = config.tenant_idle_ms;
+        let state = AppState::new(config);
+        let mut warm_floor_sum = 0_usize;
+
+        for tenant in tenants {
+            let store = state.tenant_graph_store(tenant).unwrap();
+            let warm_floor = store.stats().unwrap().memory_bytes;
+            warm_floor_sum = warm_floor_sum.saturating_add(warm_floor);
+            assert!(
+                warm_floor < full_materialization_baseline / tenants.len(),
+                "opening {tenant} should stay below a full-materialized tenant baseline"
+            );
+
+            let nodes = store
+                .query_nodes(NodeQuery::label("SoakFixture").with_limit(nodes_per_tenant))
+                .unwrap();
+            assert_eq!(nodes.len(), nodes_per_tenant);
+            drop(nodes);
+
+            if let TenantGraphStore::RedCore(executor) = &store {
+                let hot_cache = executor.hot_cache_diagnostics();
+                assert!(
+                    hot_cache["resident_bytes"].as_u64().unwrap()
+                        <= hot_cache["budget_bytes"].as_u64().unwrap(),
+                    "tenant {tenant} hot cache exceeded budget after scan: {hot_cache:?}"
+                );
+                assert!(
+                    hot_cache["admissions"].as_u64().unwrap() >= nodes_per_tenant as u64,
+                    "tenant {tenant} scan should admit archived records: {hot_cache:?}"
+                );
+            }
+            drop(store);
+        }
+
+        let reports = state.tenant_engine_reports().unwrap();
+        let active_reports = reports
+            .iter()
+            .filter(|report| report.state == TenantEngineState::Hot)
+            .collect::<Vec<_>>();
+        assert_eq!(active_reports.len(), tenants.len());
+        let active_resident = active_reports
+            .iter()
+            .map(|report| report.resident_memory_bytes)
+            .sum::<usize>();
+        assert!(
+            active_resident <= warm_floor_sum.saturating_add(tenants.len() * tenant_budget),
+            "aggregate resident bytes should track warm floors plus active working sets: active={active_resident}, warm_floor={warm_floor_sum}, budget={tenant_budget}"
+        );
+        assert!(
+            active_resident < full_materialization_baseline / 2,
+            "aggregate resident bytes should stay far below full materialization: active={active_resident}, baseline={full_materialization_baseline}"
+        );
+
+        let sweep = state
+            .sweep_idle_tenant_engines_at(now_millis().saturating_add(idle_ms + 1))
+            .unwrap();
+        assert_eq!(sweep.cooled_to_cold, tenants.len());
+        assert_eq!(state.iter_redcore_tenants().unwrap().len(), 0);
+        let cold_resident = state
+            .tenant_engine_reports()
+            .unwrap()
+            .iter()
+            .map(|report| report.resident_memory_bytes)
+            .sum::<usize>();
+        assert_eq!(cold_resident, 0);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn embedded_readiness_rejects_missing_required_volume() {
         let state = AppState::new(Config {
             host: "127.0.0.1".to_string(),
@@ -3943,6 +4107,64 @@ mod tests {
         let stats = executor.stats().unwrap();
 
         assert_eq!(stats.memory_quota_bytes, 128);
+    }
+
+    #[test]
+    fn redcore_executor_uses_tenant_quota_as_archive_hot_cache_budget() {
+        let data_dir = unique_test_dir("redcore-executor-hot-cache-budget");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            for index in 0..12 {
+                store
+                    .upsert_node(NodeRecord::new(
+                        format!("node:{index:02}"),
+                        ["CacheFixture"],
+                        json!({
+                            "body": format!("executor-cache-row-{index:02}-{}", "x".repeat(96)),
+                        }),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let executor =
+            RedCoreTenantExecutor::new(RedCoreGraphStore::open(&data_dir, options).unwrap(), 1024)
+                .unwrap();
+        let initial = executor.hot_cache_diagnostics();
+        assert_eq!(initial["enabled"], true);
+        assert_eq!(initial["budget_bytes"], 1024);
+        assert_eq!(initial["resident_bytes"], 0);
+
+        for index in 0..12 {
+            let node_id = format!("node:{index:02}");
+            assert!(executor.get_node(&node_id).unwrap().is_some());
+        }
+        let report = executor.hot_cache_diagnostics();
+        assert!(
+            report["resident_bytes"].as_u64().unwrap() <= report["budget_bytes"].as_u64().unwrap(),
+            "hot cache report should remain under budget: {report:?}"
+        );
+        assert!(
+            report["admissions"].as_u64().unwrap() > 0,
+            "archive reads should admit records into the hot cache: {report:?}"
+        );
+        assert!(
+            executor.stats().unwrap().memory_bytes
+                >= report["resident_bytes"].as_u64().unwrap() as usize,
+            "stats should include hot cache resident bytes"
+        );
+
+        executor.clear_hot_caches();
+        let cleared = executor.hot_cache_diagnostics();
+        assert_eq!(cleared["resident_bytes"], 0);
+        assert_eq!(cleared["budget_bytes"], 1024);
+
+        std::fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]

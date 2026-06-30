@@ -206,6 +206,8 @@ pub async fn diagnostics_memory(
                     "stats": stats,
                     "stats_memory_bytes_estimated": false,
                     "cached_edges": executor.cached_edges_diagnostics(),
+                    "hot_cache": executor.hot_cache_diagnostics(),
+                    "archive_residency": executor.archive_residency_diagnostics(),
                 })
             }
             Err(error) => json!({
@@ -215,6 +217,8 @@ pub async fn diagnostics_memory(
                     "message": error.message,
                 },
                 "cached_edges": executor.cached_edges_diagnostics(),
+                "hot_cache": executor.hot_cache_diagnostics(),
+                "archive_residency": executor.archive_residency_diagnostics(),
             }),
         })
         .collect::<Vec<_>>();

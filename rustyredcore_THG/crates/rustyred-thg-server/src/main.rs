@@ -13,9 +13,11 @@ mod items_changefeed;
 mod metrics;
 mod observability;
 mod openapi;
+mod payload_backend;
 mod query_surface;
 mod router;
 mod state;
+mod tenant_router;
 mod ttl_sweep;
 
 use std::net::SocketAddr;

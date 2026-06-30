@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "vector-accelerated")]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,12 +15,13 @@ use serde_json::Value;
 use turbovec::IdMapIndex;
 
 use crate::hooks::{changed_property_keys, HookEmitter, MutationEvent, MutationKind};
-use crate::object_store::DiskObjectStore;
-use crate::ordered::{OrderedDesignation, OrderedIndex};
+use crate::object_store::{content_hash_bytes, DiskObjectStore};
+use crate::ordered::{EvictionFrontier, OrderedDesignation, OrderedIndex};
 use crate::state::stable_hash;
 use crate::versioned_graph::{snapshot_content_objects, GraphObjectKind};
 use crate::zerocopy::{
-    access_graph_archive, archive_content_object, MappedArchive, ZeroCopyArchiveError,
+    archive_content_object, deserialize_graph_archive, GraphArchiveBody, MappedArchive,
+    ZeroCopyArchiveError,
 };
 
 pub const DEFAULT_VECTOR_INDEX_BIT_WIDTH: usize = 4;
@@ -386,6 +387,12 @@ fn validate_vector_values(vector: &[f32]) -> GraphStoreResult<()> {
     Ok(())
 }
 
+fn vector_values_indexable(vector: &[f32]) -> bool {
+    vector
+        .iter()
+        .all(|value| value.is_finite() && value.abs() < 1e16)
+}
+
 fn quantized_vector_bytes_bound(count: usize, dimension: usize, bit_width: usize) -> usize {
     count
         .saturating_mul(dimension)
@@ -394,15 +401,21 @@ fn quantized_vector_bytes_bound(count: usize, dimension: usize, bit_width: usize
         / 8
 }
 
-#[cfg(not(feature = "vector-accelerated"))]
-fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
-    let dot = left
+fn cosine_distance_normalized(left: &[f32], right: &[f32]) -> f32 {
+    let left = VectorPoint::new(left);
+    let right = VectorPoint::new(right);
+    left.as_slice()
         .iter()
-        .zip(right.iter())
+        .zip(right.as_slice().iter())
         .map(|(a, b)| a * b)
         .sum::<f32>()
-        .clamp(-1.0, 1.0);
-    1.0 - dot
+        .clamp(-1.0, 1.0)
+        .mul_add(-1.0, 1.0)
+}
+
+#[cfg(not(feature = "vector-accelerated"))]
+fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
+    cosine_distance_normalized(left, right)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2826,7 +2839,11 @@ const REDCORE_ARCHIVE_DIR: &str = "graph.archive";
 const REDCORE_ARCHIVE_OBJECT_DIR: &str = "objects";
 const REDCORE_ARCHIVE_MANIFEST_FILE: &str = "manifest.json";
 const REDCORE_ARCHIVE_MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
+const REDCORE_ARCHIVE_SERVING_INDEX_FILE: &str = "serving-index.json";
+const REDCORE_ARCHIVE_SERVING_INDEX_TMP_FILE: &str = "serving-index.json.tmp";
 const REDCORE_PAYLOAD_POINTER_TYPE: &str = "redcore.payload_pointer.v1";
+pub const REDCORE_LOCAL_PAYLOAD_BACKEND: &str = "local_data_dir";
+pub const REDCORE_RAILWAY_BUCKETS_PAYLOAD_BACKEND: &str = "railway_buckets";
 
 static REDCORE_PROCESS_LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 static REDCORE_DURABILITY_SYNCER: OnceLock<mpsc::Sender<DurabilitySyncRequest>> = OnceLock::new();
@@ -2972,21 +2989,587 @@ pub struct RedCoreArchiveEntry {
     pub logical_hash: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RedCoreArchiveServingIndex {
+    pub version: u32,
+    pub graph_version: u64,
+    pub snapshot_txn_id: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vector_designations: Vec<VectorDesignation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordered_designations: Vec<OrderedDesignation>,
+    pub nodes: Vec<RedCoreArchiveNodeIndexEntry>,
+    pub edges: Vec<RedCoreArchiveEdgeIndexEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RedCoreArchiveNodeIndexEntry {
+    pub id: String,
+    pub object_hash: String,
+    pub archive_hash: String,
+    pub file: String,
+    pub version: u64,
+    pub tombstone: bool,
+    pub labels: Vec<String>,
+    pub indexed_properties: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexed_vectors: Vec<RedCoreArchiveNodeVectorEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_document: Option<RedCoreArchiveMemoryDocumentIndexEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_expires_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexed_ordered: Vec<RedCoreArchiveNodeOrderedEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RedCoreArchiveNodeVectorEntry {
+    pub label: String,
+    pub property: String,
+    pub dimension: usize,
+    #[serde(default = "default_vector_index_bit_width")]
+    pub bit_width: usize,
+    pub values: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCoreArchiveMemoryDocumentIndexEntry {
+    pub tenant_slug: String,
+    pub updated_at: String,
+    pub node_id: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RedCoreArchiveNodeOrderedEntry {
+    pub label: String,
+    pub property: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RedCoreArchiveEdgeIndexEntry {
+    pub id: String,
+    pub object_hash: String,
+    pub archive_hash: String,
+    pub file: String,
+    pub version: u64,
+    pub tombstone: bool,
+    pub from_id: String,
+    pub to_id: String,
+    pub edge_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_type: Option<EpistemicType>,
+}
+
+#[derive(Clone, Debug)]
+struct RedCoreArchiveServingIndexRuntime {
+    manifest: RedCoreArchiveServingIndex,
+    node_by_id: BTreeMap<String, RedCoreArchiveNodeIndexEntry>,
+    edge_by_id: BTreeMap<String, RedCoreArchiveEdgeIndexEntry>,
+    label_index: BTreeMap<String, BTreeSet<String>>,
+    property_index: BTreeMap<(String, String), BTreeSet<String>>,
+    out_adjacency: BTreeMap<(String, String), BTreeSet<String>>,
+    in_adjacency: BTreeMap<(String, String), BTreeSet<String>>,
+    vector_entries: BTreeMap<(String, String), Vec<RedCoreArchiveVectorCandidate>>,
+    ordered_entries: BTreeMap<(String, String), Vec<RedCoreArchiveOrderedCandidate>>,
+    ordered_scores: BTreeMap<(String, String, String), f64>,
+    memory_document_updated_at_index: BTreeMap<String, BTreeSet<MemoryDocumentIndexEntry>>,
+    memory_document_status_updated_at_index:
+        BTreeMap<(String, String), BTreeSet<MemoryDocumentIndexEntry>>,
+}
+
+#[derive(Clone, Debug)]
+struct RedCoreArchiveVectorCandidate {
+    node_id: String,
+    values: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct RedCoreArchiveOrderedCandidate {
+    node_id: String,
+    score: f64,
+}
+
+impl RedCoreArchiveServingIndexRuntime {
+    fn from_manifest(manifest: RedCoreArchiveServingIndex) -> Self {
+        let mut node_by_id = BTreeMap::new();
+        let mut edge_by_id = BTreeMap::new();
+        let mut label_index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut property_index: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        let mut out_adjacency: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        let mut in_adjacency: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        let mut vector_entries: BTreeMap<(String, String), Vec<RedCoreArchiveVectorCandidate>> =
+            BTreeMap::new();
+        let mut ordered_entries: BTreeMap<(String, String), Vec<RedCoreArchiveOrderedCandidate>> =
+            BTreeMap::new();
+        let mut ordered_scores: BTreeMap<(String, String, String), f64> = BTreeMap::new();
+        let mut memory_document_updated_at_index: BTreeMap<
+            String,
+            BTreeSet<MemoryDocumentIndexEntry>,
+        > = BTreeMap::new();
+        let mut memory_document_status_updated_at_index: BTreeMap<
+            (String, String),
+            BTreeSet<MemoryDocumentIndexEntry>,
+        > = BTreeMap::new();
+
+        for node in &manifest.nodes {
+            if !node.tombstone {
+                for label in &node.labels {
+                    label_index
+                        .entry(label.clone())
+                        .or_default()
+                        .insert(node.id.clone());
+                }
+                for (key, token) in &node.indexed_properties {
+                    property_index
+                        .entry((key.clone(), token.clone()))
+                        .or_default()
+                        .insert(node.id.clone());
+                }
+                for vector in &node.indexed_vectors {
+                    vector_entries
+                        .entry((vector.label.clone(), vector.property.clone()))
+                        .or_default()
+                        .push(RedCoreArchiveVectorCandidate {
+                            node_id: node.id.clone(),
+                            values: vector.values.clone(),
+                        });
+                }
+                for ordered in &node.indexed_ordered {
+                    ordered_entries
+                        .entry((ordered.label.clone(), ordered.property.clone()))
+                        .or_default()
+                        .push(RedCoreArchiveOrderedCandidate {
+                            node_id: node.id.clone(),
+                            score: ordered.score,
+                        });
+                    ordered_scores.insert(
+                        (
+                            ordered.label.clone(),
+                            ordered.property.clone(),
+                            node.id.clone(),
+                        ),
+                        ordered.score,
+                    );
+                }
+                if let Some(memory_document) = &node.memory_document {
+                    let entry = MemoryDocumentIndexEntry {
+                        updated_at: memory_document.updated_at.clone(),
+                        node_id: memory_document.node_id.clone(),
+                        status: memory_document.status.clone(),
+                    };
+                    memory_document_updated_at_index
+                        .entry(memory_document.tenant_slug.clone())
+                        .or_default()
+                        .insert(entry.clone());
+                    memory_document_status_updated_at_index
+                        .entry((
+                            memory_document.tenant_slug.clone(),
+                            memory_document.status.clone(),
+                        ))
+                        .or_default()
+                        .insert(entry);
+                }
+            }
+            node_by_id.insert(node.id.clone(), node.clone());
+        }
+
+        for edge in &manifest.edges {
+            if !edge.tombstone {
+                out_adjacency
+                    .entry((edge.from_id.clone(), edge.edge_type.clone()))
+                    .or_default()
+                    .insert(edge.id.clone());
+                in_adjacency
+                    .entry((edge.to_id.clone(), edge.edge_type.clone()))
+                    .or_default()
+                    .insert(edge.id.clone());
+            }
+            edge_by_id.insert(edge.id.clone(), edge.clone());
+        }
+
+        for candidates in ordered_entries.values_mut() {
+            candidates.sort_by(|left, right| {
+                left.score
+                    .total_cmp(&right.score)
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            });
+        }
+
+        Self {
+            manifest,
+            node_by_id,
+            edge_by_id,
+            label_index,
+            property_index,
+            out_adjacency,
+            in_adjacency,
+            vector_entries,
+            ordered_entries,
+            ordered_scores,
+            memory_document_updated_at_index,
+            memory_document_status_updated_at_index,
+        }
+    }
+
+    fn live_node_entry(
+        &self,
+        id: &str,
+        include_expired: bool,
+    ) -> Option<&RedCoreArchiveNodeIndexEntry> {
+        let entry = self.node_by_id.get(id)?;
+        if entry.tombstone {
+            return None;
+        }
+        if !include_expired && archive_node_is_expired(entry, now_ms()) {
+            return None;
+        }
+        Some(entry)
+    }
+
+    fn live_edge_entry(&self, id: &str) -> Option<&RedCoreArchiveEdgeIndexEntry> {
+        self.edge_by_id.get(id).filter(|entry| !entry.tombstone)
+    }
+
+    fn query_node_ids(&self, query: &NodeQuery) -> Vec<String> {
+        let mut candidate_ids: Option<BTreeSet<String>> = None;
+        if let Some(label) = query.normalized_label() {
+            merge_candidates(&mut candidate_ids, self.label_index.get(&label).cloned());
+        }
+        for (key, value) in &query.properties {
+            let key = key.trim();
+            if key.is_empty() {
+                return Vec::new();
+            }
+            let Some(token) = property_index_token(value) else {
+                return Vec::new();
+            };
+            merge_candidates(
+                &mut candidate_ids,
+                self.property_index.get(&(key.to_string(), token)).cloned(),
+            );
+        }
+
+        let ids = candidate_ids.unwrap_or_else(|| {
+            self.node_by_id
+                .values()
+                .filter(|entry| !entry.tombstone)
+                .map(|entry| entry.id.clone())
+                .collect()
+        });
+        ids.into_iter()
+            .filter(|id| self.live_node_entry(id, query.include_expired).is_some())
+            .take(query.bounded_limit())
+            .collect()
+    }
+
+    fn neighbor_hits(&self, query: &NeighborQuery) -> Vec<NeighborHit> {
+        let mut edge_ids = BTreeSet::new();
+        match &query.edge_type {
+            Some(edge_type) => {
+                let key = (query.node_id.clone(), edge_type.clone());
+                let index = match query.direction {
+                    Direction::Out => &self.out_adjacency,
+                    Direction::In => &self.in_adjacency,
+                };
+                if let Some(index_edge_ids) = index.get(&key) {
+                    edge_ids.extend(index_edge_ids.iter().cloned());
+                }
+            }
+            None => {
+                let index = match query.direction {
+                    Direction::Out => &self.out_adjacency,
+                    Direction::In => &self.in_adjacency,
+                };
+                for ((node_id, _), index_edge_ids) in index {
+                    if node_id == &query.node_id {
+                        edge_ids.extend(index_edge_ids.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        let mut hits = Vec::new();
+        for edge_id in edge_ids {
+            let Some(edge) = self.live_edge_entry(&edge_id) else {
+                continue;
+            };
+            let node_id = match query.direction {
+                Direction::Out => edge.to_id.clone(),
+                Direction::In => edge.from_id.clone(),
+            };
+            if self
+                .live_node_entry(&node_id, query.include_expired)
+                .is_none()
+            {
+                continue;
+            }
+            hits.push(NeighborHit {
+                edge_id: edge.id.clone(),
+                node_id,
+                edge_type: edge.edge_type.clone(),
+                confidence: edge.confidence,
+                epistemic_type: edge.epistemic_type.clone(),
+            });
+        }
+        hits
+    }
+
+    fn memory_document_node_ids(&self, query: &MemoryDocumentQuery) -> Vec<String> {
+        let tenant_slug = query.normalized_tenant_slug();
+        if tenant_slug.is_empty() {
+            return Vec::new();
+        }
+        let entries = match query.normalized_status() {
+            Some(status) => self
+                .memory_document_status_updated_at_index
+                .get(&(tenant_slug.clone(), status))
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                .collect::<Vec<_>>(),
+            None => self
+                .memory_document_updated_at_index
+                .get(&tenant_slug)
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                .collect::<Vec<_>>(),
+        };
+        let since = query.since();
+        let before = query.before();
+        let limit = query.bounded_limit();
+        let mut node_ids = Vec::with_capacity(limit.min(entries.len()));
+        for entry in entries.into_iter().rev() {
+            if !query.include_deleted && entry.status == "deleted" {
+                continue;
+            }
+            if !since.is_empty() && entry.updated_at.as_str() < since {
+                continue;
+            }
+            if !before.is_empty() && entry.updated_at.as_str() >= before {
+                continue;
+            }
+            if self.live_node_entry(&entry.node_id, false).is_none() {
+                continue;
+            }
+            node_ids.push(entry.node_id.clone());
+            if node_ids.len() >= limit {
+                break;
+            }
+        }
+        node_ids
+    }
+
+    fn ordered_designations(&self) -> Vec<OrderedDesignation> {
+        let mut designations = self.manifest.ordered_designations.clone();
+        designations.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then_with(|| left.property.cmp(&right.property))
+        });
+        designations.dedup();
+        designations
+    }
+
+    fn ordered_range_by_score(
+        &self,
+        label: &str,
+        property_name: &str,
+        min: f64,
+        max: f64,
+        limit: Option<usize>,
+    ) -> GraphStoreResult<Vec<(String, f64)>> {
+        if min.is_nan() || max.is_nan() {
+            return Err(GraphStoreError::new(
+                "invalid_ordered_score",
+                "ordered scores must not be NaN".to_string(),
+            ));
+        }
+        if min > max {
+            return Ok(Vec::new());
+        }
+        let Some(candidates) = self
+            .ordered_entries
+            .get(&(label.to_string(), property_name.to_string()))
+        else {
+            return Ok(Vec::new());
+        };
+        let cap = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::new();
+        for candidate in candidates {
+            if candidate.score < min {
+                continue;
+            }
+            if candidate.score > max {
+                break;
+            }
+            if self.live_node_entry(&candidate.node_id, false).is_none() {
+                continue;
+            }
+            out.push((candidate.node_id.clone(), candidate.score));
+            if out.len() >= cap {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn ordered_score(&self, label: &str, property_name: &str, node_id: &str) -> Option<f64> {
+        self.ordered_scores
+            .get(&(
+                label.to_string(),
+                property_name.to_string(),
+                node_id.to_string(),
+            ))
+            .copied()
+            .filter(|_| self.live_node_entry(node_id, false).is_some())
+    }
+
+    fn vector_designations(&self) -> Vec<VectorDesignation> {
+        let mut designations = self.manifest.vector_designations.clone();
+        designations.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then_with(|| left.property.cmp(&right.property))
+        });
+        designations.dedup_by(|left, right| {
+            left.label == right.label
+                && left.property == right.property
+                && left.dimension == right.dimension
+                && left.bit_width == right.bit_width
+        });
+        designations
+    }
+
+    fn vector_index_manifest(&self) -> Vec<VectorIndexManifest> {
+        self.vector_designations()
+            .into_iter()
+            .map(|designation| {
+                let key = (designation.label.clone(), designation.property.clone());
+                let indexed_vectors = self
+                    .vector_entries
+                    .get(&key)
+                    .map(Vec::len)
+                    .unwrap_or_default();
+                VectorIndexManifest {
+                    label: designation.label,
+                    property: designation.property,
+                    dimension: designation.dimension,
+                    bit_width: designation.bit_width,
+                    indexed_vectors,
+                    resident_vector_bytes: quantized_vector_bytes_bound(
+                        indexed_vectors,
+                        designation.dimension,
+                        designation.bit_width,
+                    ),
+                    resident_full_precision_bytes: indexed_vectors
+                        .saturating_mul(designation.dimension)
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                    accelerated: false,
+                }
+            })
+            .collect()
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        hot_ids: &BTreeSet<String>,
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Ok(Vec::new());
+        }
+        for designation in self.vector_designations() {
+            if designation.property != property_name {
+                continue;
+            }
+            if let Some(label) = label {
+                if designation.label != label {
+                    continue;
+                }
+            }
+            if query.len() != designation.dimension {
+                return Err(GraphStoreError::new(
+                    "dimension_mismatch",
+                    format!(
+                        "query dimension {} does not match index dimension {}",
+                        query.len(),
+                        designation.dimension
+                    ),
+                ));
+            }
+        }
+
+        let mut results = Vec::new();
+        for ((candidate_label, candidate_property), candidates) in &self.vector_entries {
+            if candidate_property != property_name {
+                continue;
+            }
+            if let Some(label) = label {
+                if candidate_label != label {
+                    continue;
+                }
+            }
+            for candidate in candidates {
+                if hot_ids.contains(&candidate.node_id) {
+                    continue;
+                }
+                if self.live_node_entry(&candidate.node_id, false).is_none() {
+                    continue;
+                }
+                if candidate.values.len() != query.len() {
+                    continue;
+                }
+                results.push((
+                    candidate.node_id.clone(),
+                    cosine_distance_normalized(query, &candidate.values),
+                ));
+            }
+        }
+        results.sort_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        results.truncate(k);
+        Ok(results)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RedCoreArchiveResidencyReport {
     pub manifest_loaded: bool,
+    pub serving_index_loaded: bool,
     pub graph_version: u64,
     pub snapshot_txn_id: u64,
     pub mapped_objects: usize,
     pub nodes: usize,
     pub edges: usize,
+    pub serving_index_nodes: usize,
+    pub serving_index_edges: usize,
     pub archive_bytes: u64,
+    pub serving_index_bytes: u64,
+    pub hot_overlay_nodes: usize,
+    pub hot_overlay_edges: usize,
+    pub hot_overlay_bytes: usize,
+    pub hot_cache_resident_bytes: usize,
 }
 
 struct RedCoreArchiveResidency {
     manifest: RedCoreArchiveManifest,
-    mapped: BTreeMap<String, MappedArchive>,
+    index: Option<RedCoreArchiveServingIndexRuntime>,
+    archive_dir: PathBuf,
     archive_bytes: u64,
+    serving_index_bytes: u64,
 }
 
 impl std::fmt::Debug for RedCoreArchiveResidency {
@@ -2996,9 +3579,276 @@ impl std::fmt::Debug for RedCoreArchiveResidency {
             .field("graph_version", &self.manifest.graph_version)
             .field("snapshot_txn_id", &self.manifest.snapshot_txn_id)
             .field("entries", &self.manifest.entries.len())
-            .field("mapped", &self.mapped.len())
+            .field("serving_index", &self.index.is_some())
+            .field("mapped", &0_usize)
             .field("archive_bytes", &self.archive_bytes)
+            .field("serving_index_bytes", &self.serving_index_bytes)
             .finish()
+    }
+}
+
+impl RedCoreArchiveResidency {
+    fn has_node(&self, id: &str) -> bool {
+        self.index
+            .as_ref()
+            .is_some_and(|index| index.node_by_id.contains_key(id))
+    }
+
+    fn materialize_node(
+        &self,
+        id: &str,
+        include_expired: bool,
+    ) -> GraphStoreResult<Option<NodeRecord>> {
+        let Some(index) = self.index.as_ref() else {
+            return Ok(None);
+        };
+        let Some(entry) = index.live_node_entry(id, include_expired) else {
+            return Ok(None);
+        };
+        let Some(value) = self.materialize_payload_value(&entry.file)? else {
+            return Ok(None);
+        };
+        serde_json::from_value::<NodeRecord>(value)
+            .map(Some)
+            .map_err(|err| GraphStoreError::io("decode RedCore archive node payload", err))
+    }
+
+    fn materialize_node_unfiltered(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        let Some(index) = self.index.as_ref() else {
+            return Ok(None);
+        };
+        let Some(entry) = index.node_by_id.get(id) else {
+            return Ok(None);
+        };
+        let Some(value) = self.materialize_payload_value(&entry.file)? else {
+            return Ok(None);
+        };
+        serde_json::from_value::<NodeRecord>(value)
+            .map(Some)
+            .map_err(|err| GraphStoreError::io("decode RedCore archive node payload", err))
+    }
+
+    fn materialize_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        let Some(index) = self.index.as_ref() else {
+            return Ok(None);
+        };
+        let Some(entry) = index.live_edge_entry(id) else {
+            return Ok(None);
+        };
+        let Some(value) = self.materialize_payload_value(&entry.file)? else {
+            return Ok(None);
+        };
+        serde_json::from_value::<EdgeRecord>(value)
+            .map(Some)
+            .map_err(|err| GraphStoreError::io("decode RedCore archive edge payload", err))
+    }
+
+    fn materialize_edge_unfiltered(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        let Some(index) = self.index.as_ref() else {
+            return Ok(None);
+        };
+        let Some(entry) = index.edge_by_id.get(id) else {
+            return Ok(None);
+        };
+        let Some(value) = self.materialize_payload_value(&entry.file)? else {
+            return Ok(None);
+        };
+        serde_json::from_value::<EdgeRecord>(value)
+            .map(Some)
+            .map_err(|err| GraphStoreError::io("decode RedCore archive edge payload", err))
+    }
+
+    fn materialize_snapshot_records(&self) -> GraphStoreResult<(Vec<NodeRecord>, Vec<EdgeRecord>)> {
+        let Some(index) = self.index.as_ref() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let mut nodes = Vec::with_capacity(index.node_by_id.len());
+        for id in index.node_by_id.keys() {
+            if let Some(node) = self.materialize_node_unfiltered(id)? {
+                nodes.push(node);
+            }
+        }
+        let mut edges = Vec::with_capacity(index.edge_by_id.len());
+        for id in index.edge_by_id.keys() {
+            if let Some(edge) = self.materialize_edge_unfiltered(id)? {
+                edges.push(edge);
+            }
+        }
+        Ok((nodes, edges))
+    }
+
+    fn query_nodes(
+        &self,
+        query: &NodeQuery,
+        hot_ids: &BTreeSet<String>,
+        remaining: usize,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        if remaining == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(index) = self.index.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut nodes = Vec::new();
+        for id in index.query_node_ids(query) {
+            if hot_ids.contains(&id) {
+                continue;
+            }
+            if let Some(node) = self.materialize_node(&id, query.include_expired)? {
+                nodes.push(node);
+                if nodes.len() >= remaining {
+                    break;
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
+    fn neighbor_hits(
+        &self,
+        query: &NeighborQuery,
+        hot_edge_ids: &BTreeSet<String>,
+    ) -> Vec<NeighborHit> {
+        let Some(index) = self.index.as_ref() else {
+            return Vec::new();
+        };
+        index
+            .neighbor_hits(query)
+            .into_iter()
+            .filter(|hit| !hot_edge_ids.contains(&hit.edge_id))
+            .collect()
+    }
+
+    fn memory_documents_by_updated_at(
+        &self,
+        query: &MemoryDocumentQuery,
+        hot_ids: &BTreeSet<String>,
+    ) -> GraphStoreResult<Vec<NodeRecord>> {
+        let Some(index) = self.index.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut nodes = Vec::new();
+        for id in index.memory_document_node_ids(query) {
+            if hot_ids.contains(&id) {
+                continue;
+            }
+            if let Some(node) = self.materialize_node(&id, false)? {
+                nodes.push(node);
+                if nodes.len() >= query.bounded_limit() {
+                    break;
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property_name: &str,
+        query: &[f32],
+        hot_ids: &BTreeSet<String>,
+        k: usize,
+    ) -> GraphStoreResult<Vec<(String, f32)>> {
+        self.index
+            .as_ref()
+            .map(|index| index.vector_search(label, property_name, query, hot_ids, k))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn vector_designations(&self) -> Vec<VectorDesignation> {
+        self.index
+            .as_ref()
+            .map(RedCoreArchiveServingIndexRuntime::vector_designations)
+            .unwrap_or_default()
+    }
+
+    fn ordered_designations(&self) -> Vec<OrderedDesignation> {
+        self.index
+            .as_ref()
+            .map(RedCoreArchiveServingIndexRuntime::ordered_designations)
+            .unwrap_or_default()
+    }
+
+    fn ordered_range_by_score(
+        &self,
+        label: &str,
+        property_name: &str,
+        min: f64,
+        max: f64,
+        limit: Option<usize>,
+    ) -> GraphStoreResult<Vec<(String, f64)>> {
+        self.index
+            .as_ref()
+            .map(|index| index.ordered_range_by_score(label, property_name, min, max, limit))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn ordered_score(&self, label: &str, property_name: &str, node_id: &str) -> Option<f64> {
+        self.index
+            .as_ref()
+            .and_then(|index| index.ordered_score(label, property_name, node_id))
+    }
+
+    fn vector_index_manifest(&self) -> Vec<VectorIndexManifest> {
+        self.index
+            .as_ref()
+            .map(RedCoreArchiveServingIndexRuntime::vector_index_manifest)
+            .unwrap_or_default()
+    }
+
+    fn labels(&self) -> Vec<String> {
+        self.index
+            .as_ref()
+            .map(|index| index.label_index.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn edge_types(&self) -> Vec<String> {
+        self.index
+            .as_ref()
+            .map(|index| {
+                index
+                    .manifest
+                    .edges
+                    .iter()
+                    .filter(|entry| !entry.tombstone)
+                    .map(|entry| entry.edge_type.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn property_keys(&self) -> Vec<String> {
+        self.index
+            .as_ref()
+            .map(|index| {
+                index
+                    .property_index
+                    .keys()
+                    .map(|(key, _)| key.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn materialize_payload_value(&self, relative_file: &str) -> GraphStoreResult<Option<Value>> {
+        let path = self.archive_dir.join(relative_file);
+        let mapped = MappedArchive::open(path).map_err(zero_copy_error)?;
+        let envelope = deserialize_graph_archive(mapped.as_bytes()).map_err(zero_copy_error)?;
+        let GraphArchiveBody::ContentObject(object) = envelope.body else {
+            return Ok(None);
+        };
+        let Some(payload_json) = object.payload_json else {
+            return Ok(None);
+        };
+        serde_json::from_str::<Value>(&payload_json)
+            .map(Some)
+            .map_err(|err| GraphStoreError::io("decode RedCore archive payload JSON", err))
     }
 }
 
@@ -3045,6 +3895,295 @@ impl RedCorePayloadPointer {
     }
 }
 
+pub trait RedCorePayloadBackend: Send + Sync + std::fmt::Debug {
+    fn backend_name(&self) -> &'static str;
+    fn put_payload_bytes(&self, content_hash: &str, body: &[u8]) -> GraphStoreResult<()>;
+    fn get_payload_bytes(&self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>>;
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RedCoreHotCacheReport {
+    pub enabled: bool,
+    pub budget_bytes: usize,
+    pub resident_bytes: usize,
+    pub nodes: usize,
+    pub edges: usize,
+    pub payloads: usize,
+    pub admissions: u64,
+    pub evictions: u64,
+}
+
+#[derive(Debug)]
+struct RedCoreHotCache {
+    budget_bytes: usize,
+    resident_bytes: usize,
+    nodes: BTreeMap<String, NodeRecord>,
+    edges: BTreeMap<String, EdgeRecord>,
+    payloads: BTreeMap<String, Vec<u8>>,
+    node_bytes: BTreeMap<String, usize>,
+    edge_bytes: BTreeMap<String, usize>,
+    payload_bytes: BTreeMap<String, usize>,
+    frontier: EvictionFrontier,
+    access_sequence: i64,
+    admissions: u64,
+    evictions: u64,
+}
+
+impl RedCoreHotCache {
+    fn disabled() -> Self {
+        Self {
+            budget_bytes: 0,
+            resident_bytes: 0,
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            payloads: BTreeMap::new(),
+            node_bytes: BTreeMap::new(),
+            edge_bytes: BTreeMap::new(),
+            payload_bytes: BTreeMap::new(),
+            frontier: EvictionFrontier::new(),
+            access_sequence: 0,
+            admissions: 0,
+            evictions: 0,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.budget_bytes > 0
+    }
+
+    fn set_budget_bytes(&mut self, budget_bytes: usize) {
+        self.budget_bytes = budget_bytes;
+        if budget_bytes == 0 {
+            self.clear();
+        } else {
+            self.enforce_budget();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.resident_bytes = 0;
+        self.nodes.clear();
+        self.edges.clear();
+        self.payloads.clear();
+        self.node_bytes.clear();
+        self.edge_bytes.clear();
+        self.payload_bytes.clear();
+        self.frontier = EvictionFrontier::new();
+    }
+
+    fn report(&self) -> RedCoreHotCacheReport {
+        RedCoreHotCacheReport {
+            enabled: self.enabled(),
+            budget_bytes: self.budget_bytes,
+            resident_bytes: self.resident_bytes,
+            nodes: self.nodes.len(),
+            edges: self.edges.len(),
+            payloads: self.payloads.len(),
+            admissions: self.admissions,
+            evictions: self.evictions,
+        }
+    }
+
+    fn get_node(
+        &mut self,
+        id: &str,
+        include_expired: bool,
+    ) -> GraphStoreResult<Option<NodeRecord>> {
+        let Some(node) = self.nodes.get(id) else {
+            return Ok(None);
+        };
+        if node.tombstone || (!include_expired && node_is_expired(node, now_ms())) {
+            return Ok(None);
+        }
+        let node = node.clone();
+        self.touch(&hot_cache_node_key(id))?;
+        Ok(Some(node))
+    }
+
+    fn get_edge(&mut self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        let Some(edge) = self.edges.get(id) else {
+            return Ok(None);
+        };
+        if edge.tombstone {
+            return Ok(None);
+        }
+        let edge = edge.clone();
+        self.touch(&hot_cache_edge_key(id))?;
+        Ok(Some(edge))
+    }
+
+    fn get_payload(&mut self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+        let Some(body) = self.payloads.get(content_hash) else {
+            return Ok(None);
+        };
+        let body = body.clone();
+        self.touch(&hot_cache_payload_key(content_hash))?;
+        Ok(Some(body))
+    }
+
+    fn admit_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        if !self.enabled() || node.tombstone {
+            return Ok(());
+        }
+        let id = node.id.clone();
+        self.remove_node(&id);
+        let bytes = resident_node_bytes(&node);
+        self.nodes.insert(id.clone(), node);
+        self.node_bytes.insert(id.clone(), bytes);
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        self.admissions = self.admissions.saturating_add(1);
+        self.touch(&hot_cache_node_key(&id))?;
+        self.enforce_budget();
+        Ok(())
+    }
+
+    fn admit_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
+        if !self.enabled() || edge.tombstone {
+            return Ok(());
+        }
+        let id = edge.id.clone();
+        self.remove_edge(&id);
+        let bytes = resident_edge_bytes(&edge);
+        self.edges.insert(id.clone(), edge);
+        self.edge_bytes.insert(id.clone(), bytes);
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        self.admissions = self.admissions.saturating_add(1);
+        self.touch(&hot_cache_edge_key(&id))?;
+        self.enforce_budget();
+        Ok(())
+    }
+
+    fn admit_payload(&mut self, content_hash: String, body: Vec<u8>) -> GraphStoreResult<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        self.remove_payload(&content_hash);
+        let bytes = resident_payload_bytes(&body);
+        self.payloads.insert(content_hash.clone(), body);
+        self.payload_bytes.insert(content_hash.clone(), bytes);
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        self.admissions = self.admissions.saturating_add(1);
+        self.touch(&hot_cache_payload_key(&content_hash))?;
+        self.enforce_budget();
+        Ok(())
+    }
+
+    fn invalidate_node(&mut self, id: &str) {
+        self.remove_node(id);
+    }
+
+    fn invalidate_edge(&mut self, id: &str) {
+        self.remove_edge(id);
+    }
+
+    fn touch(&mut self, key: &str) -> GraphStoreResult<()> {
+        self.access_sequence = self.access_sequence.saturating_add(1);
+        self.frontier
+            .touch("redcore-hot-cache", key, self.access_sequence)
+    }
+
+    fn enforce_budget(&mut self) {
+        while self.enabled() && self.resident_bytes > self.budget_bytes {
+            let Some((key, _)) = self
+                .frontier
+                .coldest_below("redcore-hot-cache", i64::MAX, 1)
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            let removed = if let Some(id) = key.strip_prefix("node/") {
+                self.remove_node(id)
+            } else if let Some(id) = key.strip_prefix("edge/") {
+                self.remove_edge(id)
+            } else if let Some(content_hash) = key.strip_prefix("payload/") {
+                self.remove_payload(content_hash)
+            } else {
+                self.frontier.forget("redcore-hot-cache", &key)
+            };
+            if removed {
+                self.evictions = self.evictions.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove_node(&mut self, id: &str) -> bool {
+        let existed = self.nodes.remove(id).is_some();
+        if let Some(bytes) = self.node_bytes.remove(id) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+        }
+        self.frontier
+            .forget("redcore-hot-cache", &hot_cache_node_key(id));
+        existed
+    }
+
+    fn remove_edge(&mut self, id: &str) -> bool {
+        let existed = self.edges.remove(id).is_some();
+        if let Some(bytes) = self.edge_bytes.remove(id) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+        }
+        self.frontier
+            .forget("redcore-hot-cache", &hot_cache_edge_key(id));
+        existed
+    }
+
+    fn remove_payload(&mut self, content_hash: &str) -> bool {
+        let existed = self.payloads.remove(content_hash).is_some();
+        if let Some(bytes) = self.payload_bytes.remove(content_hash) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+        }
+        self.frontier
+            .forget("redcore-hot-cache", &hot_cache_payload_key(content_hash));
+        existed
+    }
+}
+
+fn hot_cache_node_key(id: &str) -> String {
+    format!("node/{id}")
+}
+
+fn hot_cache_edge_key(id: &str) -> String {
+    format!("edge/{id}")
+}
+
+fn hot_cache_payload_key(content_hash: &str) -> String {
+    format!("payload/{content_hash}")
+}
+
+const REDCORE_DIRTY_OVERLAY_FRONTIER_SCOPE: &str = "redcore-dirty-overlay";
+
+fn resident_node_bytes(node: &NodeRecord) -> usize {
+    serde_json::to_vec(node)
+        .map(|raw| raw.len().saturating_add(64))
+        .unwrap_or(64)
+}
+
+fn resident_edge_bytes(edge: &EdgeRecord) -> usize {
+    serde_json::to_vec(edge)
+        .map(|raw| raw.len().saturating_add(64))
+        .unwrap_or(64)
+}
+
+fn resident_payload_bytes(body: &[u8]) -> usize {
+    body.len().saturating_add(64)
+}
+
+fn invalidate_hot_cache_for_mutation(cache: &mut RedCoreHotCache, mutation: &RedCoreMutation) {
+    match mutation {
+        RedCoreMutation::NodeUpsert(node) => cache.invalidate_node(&node.id),
+        RedCoreMutation::EdgeUpsert(edge) => cache.invalidate_edge(&edge.id),
+        RedCoreMutation::Batch(mutations) => {
+            for mutation in mutations {
+                invalidate_hot_cache_for_mutation(cache, mutation);
+            }
+        }
+        RedCoreMutation::NodeDelete(id) => cache.invalidate_node(id),
+        RedCoreMutation::VectorDesignation(_) | RedCoreMutation::OrderedDesignation(_) => {}
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct RedCoreAofFrame {
     magic: String,
@@ -3088,6 +4227,10 @@ impl From<GraphMutation> for RedCoreMutation {
 pub struct RedCoreGraphStore {
     store: InMemoryGraphStore,
     archive_residency: Option<RedCoreArchiveResidency>,
+    hot_cache: Mutex<RedCoreHotCache>,
+    dirty_overlay_frontier: EvictionFrontier,
+    dirty_overlay_sequence: i64,
+    payload_backend: Option<Arc<dyn RedCorePayloadBackend>>,
     data_dir: Option<PathBuf>,
     _directory_lock: Option<RedCoreDirectoryLock>,
     options: RedCoreOptions,
@@ -3143,6 +4286,10 @@ impl RedCoreGraphStore {
         Self {
             store: InMemoryGraphStore::new(),
             archive_residency: None,
+            hot_cache: Mutex::new(RedCoreHotCache::disabled()),
+            dirty_overlay_frontier: EvictionFrontier::new(),
+            dirty_overlay_sequence: 0,
+            payload_backend: None,
             data_dir: None,
             _directory_lock: None,
             options: RedCoreOptions {
@@ -3177,6 +4324,10 @@ impl RedCoreGraphStore {
         let mut engine = Self {
             store: InMemoryGraphStore::new(),
             archive_residency: None,
+            hot_cache: Mutex::new(RedCoreHotCache::disabled()),
+            dirty_overlay_frontier: EvictionFrontier::new(),
+            dirty_overlay_sequence: 0,
+            payload_backend: None,
             data_dir: Some(data_dir),
             _directory_lock: Some(directory_lock),
             options,
@@ -3209,6 +4360,10 @@ impl RedCoreGraphStore {
         let Some(residency) = self.archive_residency.as_ref() else {
             return RedCoreArchiveResidencyReport::default();
         };
+        let hot_cache_resident_bytes = self
+            .hot_cache_report()
+            .map(|report| report.resident_bytes)
+            .unwrap_or_default();
         let nodes = residency
             .manifest
             .entries
@@ -3223,13 +4378,235 @@ impl RedCoreGraphStore {
             .count();
         RedCoreArchiveResidencyReport {
             manifest_loaded: true,
+            serving_index_loaded: residency.index.is_some(),
             graph_version: residency.manifest.graph_version,
             snapshot_txn_id: residency.manifest.snapshot_txn_id,
-            mapped_objects: residency.mapped.len(),
+            mapped_objects: 0,
             nodes,
             edges,
+            serving_index_nodes: residency
+                .index
+                .as_ref()
+                .map(|index| index.node_by_id.len())
+                .unwrap_or_default(),
+            serving_index_edges: residency
+                .index
+                .as_ref()
+                .map(|index| index.edge_by_id.len())
+                .unwrap_or_default(),
             archive_bytes: residency.archive_bytes,
+            serving_index_bytes: residency.serving_index_bytes,
+            hot_overlay_nodes: self.store.nodes.len(),
+            hot_overlay_edges: self.store.edges.len(),
+            hot_overlay_bytes: self.store.stats().memory_bytes,
+            hot_cache_resident_bytes,
         }
+    }
+
+    pub fn set_hot_cache_budget_bytes(&self, budget_bytes: usize) -> GraphStoreResult<()> {
+        self.hot_cache_guard()?.set_budget_bytes(budget_bytes);
+        Ok(())
+    }
+
+    pub fn hot_cache_report(&self) -> GraphStoreResult<RedCoreHotCacheReport> {
+        Ok(self.hot_cache_guard()?.report())
+    }
+
+    pub fn clear_hot_cache(&self) -> GraphStoreResult<()> {
+        self.hot_cache_guard()?.clear();
+        Ok(())
+    }
+
+    pub fn set_payload_backend(&mut self, backend: Arc<dyn RedCorePayloadBackend>) {
+        self.payload_backend = Some(backend);
+    }
+
+    pub fn payload_backend_name(&self) -> Option<&'static str> {
+        self.payload_backend
+            .as_ref()
+            .map(|backend| backend.backend_name())
+    }
+
+    fn hot_cache_guard(&self) -> GraphStoreResult<std::sync::MutexGuard<'_, RedCoreHotCache>> {
+        self.hot_cache.lock().map_err(|_| {
+            GraphStoreError::new(
+                "redcore_hot_cache_poisoned",
+                "RedCore hot cache mutex is poisoned".to_string(),
+            )
+        })
+    }
+
+    fn cached_node(&self, id: &str, include_expired: bool) -> GraphStoreResult<Option<NodeRecord>> {
+        self.hot_cache_guard()?.get_node(id, include_expired)
+    }
+
+    fn cached_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        self.hot_cache_guard()?.get_edge(id)
+    }
+
+    fn cached_payload(&self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+        self.hot_cache_guard()?.get_payload(content_hash)
+    }
+
+    fn admit_hot_node(&self, node: &NodeRecord) -> GraphStoreResult<()> {
+        self.hot_cache_guard()?.admit_node(node.clone())
+    }
+
+    fn admit_hot_edge(&self, edge: &EdgeRecord) -> GraphStoreResult<()> {
+        self.hot_cache_guard()?.admit_edge(edge.clone())
+    }
+
+    fn admit_hot_payload(&self, content_hash: &str, body: &[u8]) -> GraphStoreResult<()> {
+        self.hot_cache_guard()?
+            .admit_payload(content_hash.to_string(), body.to_vec())
+    }
+
+    fn invalidate_hot_cache_for_mutation(
+        &self,
+        mutation: &RedCoreMutation,
+    ) -> GraphStoreResult<()> {
+        let mut cache = self.hot_cache_guard()?;
+        invalidate_hot_cache_for_mutation(&mut cache, mutation);
+        Ok(())
+    }
+
+    fn touch_dirty_overlay_node(&mut self, id: &str) -> GraphStoreResult<()> {
+        self.dirty_overlay_sequence = self.dirty_overlay_sequence.saturating_add(1);
+        self.dirty_overlay_frontier.touch(
+            REDCORE_DIRTY_OVERLAY_FRONTIER_SCOPE,
+            &hot_cache_node_key(id),
+            self.dirty_overlay_sequence,
+        )
+    }
+
+    fn touch_dirty_overlay_edge(&mut self, id: &str) -> GraphStoreResult<()> {
+        self.dirty_overlay_sequence = self.dirty_overlay_sequence.saturating_add(1);
+        self.dirty_overlay_frontier.touch(
+            REDCORE_DIRTY_OVERLAY_FRONTIER_SCOPE,
+            &hot_cache_edge_key(id),
+            self.dirty_overlay_sequence,
+        )
+    }
+
+    fn forget_dirty_overlay_node(&mut self, id: &str) {
+        self.dirty_overlay_frontier.forget(
+            REDCORE_DIRTY_OVERLAY_FRONTIER_SCOPE,
+            &hot_cache_node_key(id),
+        );
+    }
+
+    fn forget_dirty_overlay_edge(&mut self, id: &str) {
+        self.dirty_overlay_frontier.forget(
+            REDCORE_DIRTY_OVERLAY_FRONTIER_SCOPE,
+            &hot_cache_edge_key(id),
+        );
+    }
+
+    fn rebuild_dirty_overlay_frontier_from_store(&mut self) -> GraphStoreResult<()> {
+        self.dirty_overlay_frontier = EvictionFrontier::new();
+        let node_ids = self.store.nodes.keys().cloned().collect::<Vec<_>>();
+        let edge_ids = self.store.edges.keys().cloned().collect::<Vec<_>>();
+        for id in node_ids {
+            self.touch_dirty_overlay_node(&id)?;
+        }
+        for id in edge_ids {
+            self.touch_dirty_overlay_edge(&id)?;
+        }
+        Ok(())
+    }
+
+    fn resident_working_set_bytes(&self) -> GraphStoreResult<usize> {
+        Ok(self
+            .store
+            .stats()
+            .memory_bytes
+            .saturating_add(self.hot_cache_report()?.resident_bytes))
+    }
+
+    fn enforce_resident_budget_after_write(&mut self) -> GraphStoreResult<()> {
+        let budget_bytes = self.hot_cache_report()?.budget_bytes;
+        if budget_bytes == 0 || self.data_dir.is_none() {
+            return Ok(());
+        }
+        if self.resident_working_set_bytes()? <= budget_bytes {
+            return Ok(());
+        }
+        self.compact_cold_dirty_overlay_to_archive()?;
+        Ok(())
+    }
+
+    fn compact_cold_dirty_overlay_to_archive(&mut self) -> GraphStoreResult<bool> {
+        let Some(data_dir) = self.data_dir.clone() else {
+            return Ok(false);
+        };
+        if self.last_txn_id == 0 {
+            return Ok(false);
+        }
+        let materialized = self.materialized_store()?;
+        let graph_version = materialized.stats().version;
+        self.write_snapshot_for(self.last_txn_id, &materialized)?;
+        self.snapshot_txn_id = self.last_txn_id;
+        self.archive_residency = load_archive_residency(&data_dir)?;
+        self.clear_hot_cache()?;
+        let evicted = self.evict_cold_dirty_overlay_until_within_budget()?;
+        self.write_manifest_for(graph_version, self.last_txn_id, self.snapshot_txn_id)?;
+        Ok(evicted)
+    }
+
+    fn evict_cold_dirty_overlay_until_within_budget(&mut self) -> GraphStoreResult<bool> {
+        let budget_bytes = self.hot_cache_report()?.budget_bytes;
+        if budget_bytes == 0 {
+            return Ok(false);
+        }
+        let mut evicted_any = false;
+        while self.resident_working_set_bytes()? > budget_bytes {
+            let Some((key, _)) = self
+                .dirty_overlay_frontier
+                .coldest_below(REDCORE_DIRTY_OVERLAY_FRONTIER_SCOPE, i64::MAX, 1)
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            if self.evict_hot_overlay_key(&key) {
+                evicted_any = true;
+            } else {
+                break;
+            }
+        }
+        Ok(evicted_any)
+    }
+
+    fn evict_hot_overlay_key(&mut self, key: &str) -> bool {
+        if let Some(id) = key.strip_prefix("node/") {
+            return self.evict_hot_overlay_node(id);
+        }
+        if let Some(id) = key.strip_prefix("edge/") {
+            return self.evict_hot_overlay_edge(id);
+        }
+        self.dirty_overlay_frontier
+            .forget(REDCORE_DIRTY_OVERLAY_FRONTIER_SCOPE, key);
+        false
+    }
+
+    fn evict_hot_overlay_node(&mut self, id: &str) -> bool {
+        let Some(node) = self.store.nodes.remove(id) else {
+            self.forget_dirty_overlay_node(id);
+            return false;
+        };
+        self.store.remove_node_indexes(&node);
+        self.forget_dirty_overlay_node(id);
+        true
+    }
+
+    fn evict_hot_overlay_edge(&mut self, id: &str) -> bool {
+        let Some(edge) = self.store.edges.remove(id) else {
+            self.forget_dirty_overlay_edge(id);
+            return false;
+        };
+        self.store.remove_edge_indexes(&edge);
+        self.forget_dirty_overlay_edge(id);
+        true
     }
 
     pub fn put_cold_document_bytes(&self, body: &[u8]) -> GraphStoreResult<Option<String>> {
@@ -3250,13 +4627,22 @@ impl RedCoreGraphStore {
         &self,
         body: &[u8],
     ) -> GraphStoreResult<Option<RedCorePayloadPointer>> {
+        if let Some(backend) = self.payload_backend.as_ref() {
+            let content_hash = content_hash_bytes(body);
+            backend.put_payload_bytes(&content_hash, body)?;
+            return Ok(Some(RedCorePayloadPointer::new(
+                content_hash,
+                body.len(),
+                backend.backend_name(),
+            )));
+        }
         let Some(hash) = self.put_cold_document_bytes(body)? else {
             return Ok(None);
         };
         Ok(Some(RedCorePayloadPointer::new(
             hash,
             body.len(),
-            "local_data_dir",
+            REDCORE_LOCAL_PAYLOAD_BACKEND,
         )))
     }
 
@@ -3264,7 +4650,30 @@ impl RedCoreGraphStore {
         &self,
         pointer: &RedCorePayloadPointer,
     ) -> GraphStoreResult<Option<Vec<u8>>> {
-        self.get_cold_document_bytes(&pointer.content_hash)
+        if let Some(body) = self.cached_payload(&pointer.content_hash)? {
+            return Ok(Some(body));
+        }
+        let body = if pointer.backend == REDCORE_LOCAL_PAYLOAD_BACKEND {
+            self.get_cold_document_bytes(&pointer.content_hash)?
+        } else if let Some(backend) = self.payload_backend.as_ref() {
+            if pointer.backend == backend.backend_name() {
+                backend.get_payload_bytes(&pointer.content_hash)?
+            } else {
+                return Err(GraphStoreError::new(
+                    "payload_backend_unavailable",
+                    format!("payload backend {} is not configured", pointer.backend),
+                ));
+            }
+        } else {
+            return Err(GraphStoreError::new(
+                "payload_backend_unavailable",
+                format!("payload backend {} is not configured", pointer.backend),
+            ));
+        };
+        if let Some(body) = body.as_ref() {
+            self.admit_hot_payload(&pointer.content_hash, body)?;
+        }
+        Ok(body)
     }
 
     pub fn upsert_node_with_payload_bytes(
@@ -3387,7 +4796,7 @@ impl RedCoreGraphStore {
                 .data_dir
                 .as_ref()
                 .map(|path| path.display().to_string()),
-            graph_version: self.store.stats().version,
+            graph_version: self.effective_graph_version(),
             last_txn_id: self.last_txn_id,
             snapshot_txn_id: self.snapshot_txn_id,
             txn_lag_since_snapshot: self.last_txn_id.saturating_sub(self.snapshot_txn_id),
@@ -3404,7 +4813,154 @@ impl RedCoreGraphStore {
     }
 
     pub fn graph_snapshot(&self) -> GraphSnapshot {
-        self.store.snapshot()
+        let mut nodes = BTreeMap::new();
+        let mut edges = BTreeMap::new();
+
+        if let Some(residency) = self.archive_residency.as_ref() {
+            if let Ok((archive_nodes, archive_edges)) = residency.materialize_snapshot_records() {
+                for node in archive_nodes {
+                    nodes.insert(node.id.clone(), node);
+                }
+                for edge in archive_edges {
+                    edges.insert(edge.id.clone(), edge);
+                }
+            }
+        }
+
+        for node in self.store.nodes.values() {
+            if node.tombstone {
+                nodes.remove(&node.id);
+            } else {
+                nodes.insert(node.id.clone(), node.clone());
+            }
+        }
+        for edge in self.store.edges.values() {
+            if edge.tombstone {
+                edges.remove(&edge.id);
+            } else {
+                edges.insert(edge.id.clone(), edge.clone());
+            }
+        }
+
+        if self.archive_residency.is_none() {
+            return self.store.snapshot();
+        }
+
+        GraphSnapshot {
+            version: self.effective_graph_version(),
+            nodes: nodes.into_values().collect(),
+            edges: edges.into_values().collect(),
+        }
+    }
+
+    fn effective_graph_version(&self) -> u64 {
+        self.store.version.max(
+            self.archive_residency
+                .as_ref()
+                .map(|residency| residency.manifest.graph_version)
+                .unwrap_or_default(),
+        )
+    }
+
+    fn materialized_store(&self) -> GraphStoreResult<InMemoryGraphStore> {
+        let mut store = InMemoryGraphStore::from_snapshot(self.graph_snapshot())?;
+        self.apply_resident_index_metadata(&mut store)?;
+        Ok(store)
+    }
+
+    fn apply_resident_index_metadata(
+        &self,
+        store: &mut InMemoryGraphStore,
+    ) -> GraphStoreResult<()> {
+        for designation in self.vector_designations() {
+            store.designate_vector_property_with_bit_width(
+                &designation.label,
+                &designation.property,
+                designation.dimension,
+                designation.bit_width,
+            )?;
+        }
+        for designation in self.store.ordered_designations() {
+            store.designate_ordered_property(&designation.label, &designation.property)?;
+        }
+        Ok(())
+    }
+
+    fn effective_node_unfiltered(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
+        if let Some(node) = self.store.nodes.get(id).cloned() {
+            return Ok(Some(node));
+        }
+        self.archive_residency
+            .as_ref()
+            .map(|residency| residency.materialize_node_unfiltered(id))
+            .unwrap_or(Ok(None))
+    }
+
+    fn effective_edge_unfiltered(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
+        if let Some(edge) = self.store.edges.get(id).cloned() {
+            return Ok(Some(edge));
+        }
+        self.archive_residency
+            .as_ref()
+            .map(|residency| residency.materialize_edge_unfiltered(id))
+            .unwrap_or(Ok(None))
+    }
+
+    fn hot_neighbor_hits_effective(
+        &self,
+        query: &NeighborQuery,
+    ) -> GraphStoreResult<Vec<NeighborHit>> {
+        let mut edge_ids = BTreeSet::new();
+        match &query.edge_type {
+            Some(edge_type) => {
+                let key = (query.node_id.clone(), edge_type.clone());
+                let index = match query.direction {
+                    Direction::Out => &self.store.out_adjacency,
+                    Direction::In => &self.store.in_adjacency,
+                };
+                if let Some(index_edge_ids) = index.get(&key) {
+                    edge_ids.extend(index_edge_ids.iter().cloned());
+                }
+            }
+            None => {
+                let index = match query.direction {
+                    Direction::Out => &self.store.out_adjacency,
+                    Direction::In => &self.store.in_adjacency,
+                };
+                for ((node_id, _), index_edge_ids) in index {
+                    if node_id == &query.node_id {
+                        edge_ids.extend(index_edge_ids.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        let mut hits = Vec::new();
+        for edge_id in edge_ids {
+            let Some(edge) = self.store.get_edge(&edge_id) else {
+                continue;
+            };
+            let node_id = match query.direction {
+                Direction::Out => edge.to_id.clone(),
+                Direction::In => edge.from_id.clone(),
+            };
+            let target_visible = if query.include_expired {
+                self.get_node_including_expired(&node_id)?.is_some()
+            } else {
+                self.get_node(&node_id)?.is_some()
+            };
+            if !target_visible {
+                continue;
+            }
+            hits.push(NeighborHit {
+                edge_id: edge.id.clone(),
+                node_id,
+                edge_type: edge.edge_type.clone(),
+                confidence: edge.confidence,
+                epistemic_type: edge.epistemic_type.clone(),
+            });
+        }
+        Ok(hits)
     }
 
     pub fn start_recording_committed_mutations(&mut self) {
@@ -3534,15 +5090,13 @@ impl RedCoreGraphStore {
             return Err(GraphStoreError::empty_field("node.id"));
         }
         let Some(existing) = self
-            .store
-            .get_node_including_expired(id)
+            .effective_node_unfiltered(id)?
             .filter(|node| !node.tombstone)
-            .cloned()
         else {
             return Ok(false);
         };
 
-        let mut staged = self.store.clone();
+        let mut staged = self.materialized_store()?;
         staged.apply_recovered_delete(id)?;
         let txn_id = self.last_txn_id + 1;
         let graph_version = staged.stats().version;
@@ -3554,10 +5108,12 @@ impl RedCoreGraphStore {
         )?;
 
         self.store = staged;
+        self.rebuild_dirty_overlay_frontier_from_store()?;
         self.last_txn_id = txn_id;
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
         }
+        self.invalidate_hot_cache_for_mutation(&RedCoreMutation::NodeDelete(id.to_string()))?;
 
         self.emit_hook_event(
             MutationKind::NodeDeleted,
@@ -3566,6 +5122,7 @@ impl RedCoreGraphStore {
             Vec::new(),
             now_ms().max(0) as u64,
         );
+        self.enforce_resident_budget_after_write()?;
         Ok(true)
     }
 
@@ -3580,8 +5137,7 @@ impl RedCoreGraphStore {
             return Err(GraphStoreError::empty_field("node.id"));
         }
         if self
-            .store
-            .get_node_including_expired(&node.id)
+            .effective_node_unfiltered(&node.id)?
             .is_some_and(|existing| !existing.tombstone)
         {
             return Ok(None);
@@ -3605,10 +5161,8 @@ impl RedCoreGraphStore {
             return Err(GraphStoreError::empty_field("node.property"));
         }
         let mut node = self
-            .store
-            .get_node_including_expired(id)
+            .effective_node_unfiltered(id)?
             .filter(|node| !node.tombstone)
-            .cloned()
             .ok_or_else(|| {
                 GraphStoreError::new("missing_graph_node", format!("node {id} does not exist"))
             })?;
@@ -3656,7 +5210,7 @@ impl RedCoreGraphStore {
             return self.commit_batch_incremental(txn_id, batch);
         }
 
-        let mut staged = self.store.clone();
+        let mut staged = self.materialized_store()?;
         let mut writes = Vec::with_capacity(batch.mutations.len());
         let mut durable_mutations = Vec::with_capacity(batch.mutations.len());
         // Only diff/collect hook events when an emitter is attached: zero
@@ -3719,9 +5273,13 @@ impl RedCoreGraphStore {
             self.persist_before_publish(txn_id, graph_version, &staged, durable_mutation)?;
 
         self.store = staged;
+        self.rebuild_dirty_overlay_frontier_from_store()?;
         self.last_txn_id = txn_id;
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
+        }
+        for mutation in &committed_mutations {
+            self.invalidate_hot_cache_for_mutation(mutation)?;
         }
         self.record_committed_redcore_mutations(&committed_mutations);
 
@@ -3733,6 +5291,7 @@ impl RedCoreGraphStore {
                 self.emit_hook_event(kind, id, labels, changed_props, committed_at_ms);
             }
         }
+        self.enforce_resident_budget_after_write()?;
 
         Ok(GraphTransaction {
             txn_id,
@@ -3764,15 +5323,18 @@ impl RedCoreGraphStore {
         for mutation in &publish_mutations {
             match mutation {
                 RedCoreMutation::NodeUpsert(node) => {
-                    self.store.apply_recovered_node(node.clone())?;
+                    self.apply_recovered_node_overlay(node.clone())?;
                 }
                 RedCoreMutation::EdgeUpsert(edge) => {
-                    self.store.apply_recovered_edge(edge.clone())?;
+                    self.apply_recovered_edge_overlay(edge.clone())?;
                 }
                 _ => {}
             }
         }
         self.last_txn_id = txn_id;
+        for mutation in &publish_mutations {
+            self.invalidate_hot_cache_for_mutation(mutation)?;
+        }
         self.record_committed_redcore_mutations(&publish_mutations);
 
         if emit_hooks && !pending_events.is_empty() {
@@ -3781,6 +5343,7 @@ impl RedCoreGraphStore {
                 self.emit_hook_event(kind, id, labels, changed_props, committed_at_ms);
             }
         }
+        self.enforce_resident_budget_after_write()?;
 
         Ok(GraphTransaction {
             txn_id,
@@ -3794,7 +5357,7 @@ impl RedCoreGraphStore {
         batch: GraphMutationBatch,
         emit_hooks: bool,
     ) -> GraphStoreResult<RedCoreCommitPlan> {
-        let mut graph_version = self.store.version;
+        let mut graph_version = self.effective_graph_version();
         let mut staged_nodes: BTreeMap<String, NodeRecord> = BTreeMap::new();
         let mut staged_edges: BTreeMap<String, EdgeRecord> = BTreeMap::new();
         let mut durable_mutations = Vec::with_capacity(batch.mutations.len());
@@ -3811,8 +5374,10 @@ impl RedCoreGraphStore {
                     let checksum = record.checksum();
                     let id = record.id.clone();
                     if emit_hooks {
-                        let prior = self.store.nodes.get(&id).map(|n| &n.properties);
-                        let changed = changed_property_keys(prior, &record.properties);
+                        let prior = self
+                            .effective_node_unfiltered(&id)?
+                            .map(|node| node.properties);
+                        let changed = changed_property_keys(prior.as_ref(), &record.properties);
                         pending_events.push((
                             MutationKind::NodeUpserted,
                             id.clone(),
@@ -3841,8 +5406,10 @@ impl RedCoreGraphStore {
                     let checksum = record.checksum();
                     let id = record.id.clone();
                     if emit_hooks {
-                        let prior = self.store.edges.get(&id).map(|e| &e.properties);
-                        let changed = changed_property_keys(prior, &record.properties);
+                        let prior = self
+                            .effective_edge_unfiltered(&id)?
+                            .map(|edge| edge.properties);
+                        let changed = changed_property_keys(prior.as_ref(), &record.properties);
                         pending_events.push((
                             MutationKind::EdgeUpserted,
                             id.clone(),
@@ -3893,15 +5460,16 @@ impl RedCoreGraphStore {
         if !node.tombstone {
             self.store.validate_auto_index_vectors(&node)?;
         }
-        let parent_hash = staged_nodes
-            .get(&node.id)
-            .or_else(|| self.store.nodes.get(&node.id))
-            .map(|existing| {
-                existing
-                    .content_hash
-                    .clone()
-                    .unwrap_or_else(|| existing.checksum())
-            });
+        let existing = match staged_nodes.get(&node.id) {
+            Some(existing) => Some(existing.clone()),
+            None => self.effective_node_unfiltered(&node.id)?,
+        };
+        let parent_hash = existing.map(|existing| {
+            existing
+                .content_hash
+                .clone()
+                .unwrap_or_else(|| existing.checksum())
+        });
         node.version = version;
         let content_hash = node.checksum();
         if node.parent_hashes.is_empty() {
@@ -3923,15 +5491,16 @@ impl RedCoreGraphStore {
         validate_edge_shape(&edge)?;
         self.require_live_endpoint_in_plan(&edge, "from", &edge.from_id, staged_nodes)?;
         self.require_live_endpoint_in_plan(&edge, "to", &edge.to_id, staged_nodes)?;
-        let parent_hash = staged_edges
-            .get(&edge.id)
-            .or_else(|| self.store.edges.get(&edge.id))
-            .map(|existing| {
-                existing
-                    .content_hash
-                    .clone()
-                    .unwrap_or_else(|| existing.checksum())
-            });
+        let existing = match staged_edges.get(&edge.id) {
+            Some(existing) => Some(existing.clone()),
+            None => self.effective_edge_unfiltered(&edge.id)?,
+        };
+        let parent_hash = existing.map(|existing| {
+            existing
+                .content_hash
+                .clone()
+                .unwrap_or_else(|| existing.checksum())
+        });
         edge.version = version;
         let content_hash = edge.checksum();
         if edge.parent_hashes.is_empty() {
@@ -3950,10 +5519,11 @@ impl RedCoreGraphStore {
         node_id: &str,
         staged_nodes: &BTreeMap<String, NodeRecord>,
     ) -> GraphStoreResult<()> {
-        let node = staged_nodes
-            .get(node_id)
-            .or_else(|| self.store.nodes.get(node_id))
-            .ok_or_else(|| GraphStoreError::missing_endpoint(&edge.id, endpoint, node_id))?;
+        let node = match staged_nodes.get(node_id) {
+            Some(node) => Some(node.clone()),
+            None => self.effective_node_unfiltered(node_id)?,
+        }
+        .ok_or_else(|| GraphStoreError::missing_endpoint(&edge.id, endpoint, node_id))?;
         if node.tombstone {
             return Err(GraphStoreError::tombstoned_endpoint(
                 &edge.id, endpoint, node_id,
@@ -3963,23 +5533,52 @@ impl RedCoreGraphStore {
     }
 
     pub fn get_node(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
-        Ok(self.store.get_node(id).cloned())
+        if let Some(node) = self.store.get_node(id).cloned() {
+            return Ok(Some(node));
+        }
+        if self.store.nodes.contains_key(id) {
+            return Ok(None);
+        }
+        if let Some(node) = self.cached_node(id, false)? {
+            return Ok(Some(node));
+        }
+        let node = self
+            .archive_residency
+            .as_ref()
+            .map(|residency| residency.materialize_node(id, false))
+            .unwrap_or(Ok(None))?;
+        if let Some(node) = node.as_ref() {
+            self.admit_hot_node(node)?;
+        }
+        Ok(node)
     }
 
     pub fn evict_node(&mut self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
-        self.store.evict_node(id)
+        let node = self.store.evict_node(id)?;
+        if node.is_some() {
+            self.forget_dirty_overlay_node(id);
+        }
+        Ok(node)
     }
 
     pub fn readmit_node(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
-        self.store.readmit_node(node)
+        let id = node.id.clone();
+        self.store.readmit_node(node)?;
+        self.touch_dirty_overlay_node(&id)
     }
 
     pub fn evict_edge(&mut self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
-        self.store.evict_edge(id)
+        let edge = self.store.evict_edge(id)?;
+        if edge.is_some() {
+            self.forget_dirty_overlay_edge(id);
+        }
+        Ok(edge)
     }
 
     pub fn readmit_edge(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
-        self.store.readmit_edge(edge)
+        let id = edge.id.clone();
+        self.store.readmit_edge(edge)?;
+        self.touch_dirty_overlay_edge(&id)
     }
 
     // ---- TTL primitive (decorator pass-throughs) -----------------------
@@ -4011,10 +5610,8 @@ impl RedCoreGraphStore {
         expires_at_ms: Option<i64>,
     ) -> GraphStoreResult<GraphWriteResult> {
         let existing = self
-            .store
-            .get_node(id)
-            .filter(|node| !node.tombstone)
-            .cloned()
+            .effective_node_unfiltered(id)?
+            .filter(|node| !node.tombstone && !node_is_expired(node, now_ms()))
             .ok_or_else(|| {
                 GraphStoreError::new("missing_graph_node", format!("node {id} does not exist"))
             })?;
@@ -4026,7 +5623,24 @@ impl RedCoreGraphStore {
     /// Returns None only when the node was never inserted or has been
     /// tombstoned via a future delete op.
     pub fn get_node_including_expired(&self, id: &str) -> GraphStoreResult<Option<NodeRecord>> {
-        Ok(self.store.get_node_including_expired(id).cloned())
+        if let Some(node) = self.store.get_node_including_expired(id).cloned() {
+            return Ok(Some(node));
+        }
+        if self.store.nodes.contains_key(id) {
+            return Ok(None);
+        }
+        if let Some(node) = self.cached_node(id, true)? {
+            return Ok(Some(node));
+        }
+        let node = self
+            .archive_residency
+            .as_ref()
+            .map(|residency| residency.materialize_node(id, true))
+            .unwrap_or(Ok(None))?;
+        if let Some(node) = node.as_ref() {
+            self.admit_hot_node(node)?;
+        }
+        Ok(node)
     }
 
     /// Return nodes whose `_ttl_expires_at_ms <= ts_ms`, ordered by
@@ -4107,6 +5721,7 @@ impl RedCoreGraphStore {
                     .collect(),
             )
         };
+        let committed_mutation = durable_mutation.clone();
 
         let txn_id = self.last_txn_id + 1;
         let graph_version = staged.stats().version;
@@ -4115,10 +5730,12 @@ impl RedCoreGraphStore {
 
         // Publish only after AOF append succeeded.
         self.store = staged;
+        self.rebuild_dirty_overlay_frontier_from_store()?;
         self.last_txn_id = txn_id;
         if let Some(snapshot_txn_id) = prepublished_snapshot_txn_id {
             self.snapshot_txn_id = snapshot_txn_id;
         }
+        self.invalidate_hot_cache_for_mutation(&committed_mutation)?;
 
         // Post-commit, post-publish NodeDeleted emit (off the critical path).
         if emit_hooks {
@@ -4133,31 +5750,128 @@ impl RedCoreGraphStore {
                 );
             }
         }
+        self.enforce_resident_budget_after_write()?;
 
         Ok(count)
     }
 
     pub fn get_edge(&self, id: &str) -> GraphStoreResult<Option<EdgeRecord>> {
-        Ok(self.store.get_edge(id).cloned())
+        if let Some(edge) = self.store.get_edge(id).cloned() {
+            return Ok(Some(edge));
+        }
+        if self.store.edges.contains_key(id) {
+            return Ok(None);
+        }
+        if let Some(edge) = self.cached_edge(id)? {
+            return Ok(Some(edge));
+        }
+        let edge = self
+            .archive_residency
+            .as_ref()
+            .map(|residency| residency.materialize_edge(id))
+            .unwrap_or(Ok(None))?;
+        if let Some(edge) = edge.as_ref() {
+            self.admit_hot_edge(edge)?;
+        }
+        Ok(edge)
     }
 
     pub fn query_nodes(&self, query: NodeQuery) -> GraphStoreResult<Vec<NodeRecord>> {
-        Ok(self.store.query_nodes(query))
+        let mut nodes = self.store.query_nodes(query.clone());
+        let remaining = query.bounded_limit().saturating_sub(nodes.len());
+        if remaining == 0 {
+            return Ok(nodes);
+        }
+        let Some(residency) = self.archive_residency.as_ref() else {
+            return Ok(nodes);
+        };
+        let hot_ids = self.store.nodes.keys().cloned().collect::<BTreeSet<_>>();
+        let archive_nodes = residency.query_nodes(&query, &hot_ids, remaining)?;
+        for node in &archive_nodes {
+            self.admit_hot_node(node)?;
+        }
+        nodes.extend(archive_nodes);
+        Ok(nodes)
     }
 
     pub fn memory_documents_by_updated_at(
         &self,
         query: MemoryDocumentQuery,
     ) -> GraphStoreResult<Vec<NodeRecord>> {
-        Ok(self.store.memory_documents_by_updated_at(query))
+        let mut nodes = self.store.memory_documents_by_updated_at(query.clone());
+        if let Some(residency) = self.archive_residency.as_ref() {
+            let hot_ids = self.store.nodes.keys().cloned().collect::<BTreeSet<_>>();
+            let archive_nodes = residency.memory_documents_by_updated_at(&query, &hot_ids)?;
+            for node in &archive_nodes {
+                self.admit_hot_node(node)?;
+            }
+            nodes.extend(archive_nodes);
+            sort_memory_document_nodes_desc(&mut nodes);
+            nodes.truncate(query.bounded_limit());
+        }
+        Ok(nodes)
     }
 
     pub fn neighbors(&self, query: NeighborQuery) -> GraphStoreResult<Vec<NeighborHit>> {
-        Ok(self.store.neighbors(query))
+        let mut hits = self.hot_neighbor_hits_effective(&query)?;
+        let Some(residency) = self.archive_residency.as_ref() else {
+            return Ok(hits);
+        };
+        let hot_edge_ids = self.store.edges.keys().cloned().collect::<BTreeSet<_>>();
+        for hit in residency.neighbor_hits(&query, &hot_edge_ids) {
+            if self.get_node(&hit.node_id)?.is_some() {
+                hits.push(hit);
+            }
+        }
+        Ok(hits)
     }
 
     pub fn stats(&self) -> GraphStoreResult<GraphStats> {
-        Ok(self.store.stats())
+        let mut stats = self.store.stats();
+        let hot_cache_resident_bytes = self.hot_cache_report()?.resident_bytes;
+        let Some(residency) = self.archive_residency.as_ref() else {
+            stats.memory_bytes = stats.memory_bytes.saturating_add(hot_cache_resident_bytes);
+            return Ok(stats);
+        };
+        let Some(index) = residency.index.as_ref() else {
+            stats.memory_bytes = stats.memory_bytes.saturating_add(hot_cache_resident_bytes);
+            return Ok(stats);
+        };
+        let hot_node_ids = self.store.nodes.keys().cloned().collect::<BTreeSet<_>>();
+        let hot_edge_ids = self.store.edges.keys().cloned().collect::<BTreeSet<_>>();
+        let cold_nodes_total = index
+            .manifest
+            .nodes
+            .iter()
+            .filter(|entry| !entry.tombstone && !hot_node_ids.contains(&entry.id))
+            .count();
+        let cold_edges_total = index
+            .manifest
+            .edges
+            .iter()
+            .filter(|entry| !entry.tombstone && !hot_edge_ids.contains(&entry.id))
+            .count();
+        let labels = self.labels()?;
+        let edge_types = self.edge_types()?;
+        let property_keys = self.property_keys()?;
+        stats.nodes_total += cold_nodes_total;
+        stats.edges_total += cold_edges_total;
+        stats.labels_total = labels.len();
+        stats.edge_types_total = edge_types.len();
+        stats.property_keys_total = property_keys.len();
+        let mut property_indexes = self
+            .store
+            .property_index
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        property_indexes.extend(index.property_index.keys().cloned());
+        stats.property_indexes_total = property_indexes.len();
+        stats.memory_bytes += serde_json::to_vec(&index.manifest)
+            .map(|raw| raw.len())
+            .unwrap_or_default();
+        stats.memory_bytes = stats.memory_bytes.saturating_add(hot_cache_resident_bytes);
+        Ok(stats)
     }
 
     pub fn verify(&self) -> GraphStoreResult<VerifyReport> {
@@ -4169,15 +5883,31 @@ impl RedCoreGraphStore {
     }
 
     pub fn labels(&self) -> GraphStoreResult<Vec<String>> {
-        Ok(self.store.labels())
+        let mut labels = self.store.labels().into_iter().collect::<BTreeSet<_>>();
+        if let Some(residency) = self.archive_residency.as_ref() {
+            labels.extend(residency.labels());
+        }
+        Ok(labels.into_iter().collect())
     }
 
     pub fn edge_types(&self) -> GraphStoreResult<Vec<String>> {
-        Ok(self.store.edge_types())
+        let mut edge_types = self.store.edge_types().into_iter().collect::<BTreeSet<_>>();
+        if let Some(residency) = self.archive_residency.as_ref() {
+            edge_types.extend(residency.edge_types());
+        }
+        Ok(edge_types.into_iter().collect())
     }
 
     pub fn property_keys(&self) -> GraphStoreResult<Vec<String>> {
-        Ok(self.store.property_keys())
+        let mut property_keys = self
+            .store
+            .property_keys()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if let Some(residency) = self.archive_residency.as_ref() {
+            property_keys.extend(residency.property_keys());
+        }
+        Ok(property_keys.into_iter().collect())
     }
 
     pub fn designate_vector_property(
@@ -4237,7 +5967,19 @@ impl RedCoreGraphStore {
         query: &[f32],
         k: usize,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
-        self.store.vector_search(label, property_name, query, k)
+        let mut results = self.store.vector_search(label, property_name, query, k)?;
+        if let Some(residency) = self.archive_residency.as_ref() {
+            let hot_ids = self.store.nodes.keys().cloned().collect::<BTreeSet<_>>();
+            results.extend(residency.vector_search(label, property_name, query, &hot_ids, k)?);
+            results.sort_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            results.truncate(k);
+        }
+        Ok(results)
     }
 
     pub fn hybrid_search(
@@ -4250,8 +5992,15 @@ impl RedCoreGraphStore {
         max_hops: usize,
         alpha: f32,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
-        self.store
-            .hybrid_search(label, property_name, query, k, graph_seeds, max_hops, alpha)
+        self.hybrid_search_with_config(
+            label,
+            property_name,
+            query,
+            k,
+            graph_seeds,
+            max_hops,
+            &HybridScoringConfig::default().with_alpha(alpha),
+        )
     }
 
     pub fn hybrid_search_with_config(
@@ -4264,23 +6013,134 @@ impl RedCoreGraphStore {
         max_hops: usize,
         config: &HybridScoringConfig,
     ) -> GraphStoreResult<Vec<(String, f32)>> {
-        self.store.hybrid_search_with_config(
-            label,
-            property_name,
-            query,
-            k,
-            graph_seeds,
-            max_hops,
-            config,
-        )
+        let vector_results = self.vector_search(label, property_name, query, k * 2)?;
+        if vector_results.is_empty() {
+            return Ok(Vec::new());
+        }
+        let graph_scores = self.hybrid_graph_scores_effective(graph_seeds, max_hops, config)?;
+        let max_vec_dist = vector_results
+            .iter()
+            .map(|(_, distance)| *distance)
+            .fold(0.0_f32, f32::max)
+            .max(1e-10);
+        let alpha = config.alpha.clamp(0.0, 1.0);
+        let mut scored = vector_results
+            .into_iter()
+            .map(|(node_id, vec_dist)| {
+                let vector_score = 1.0 - (vec_dist / max_vec_dist);
+                let graph_score = graph_scores.get(&node_id).copied().unwrap_or(0.0);
+                let final_score = (1.0 - alpha) * vector_score + alpha * graph_score;
+                (node_id, final_score)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(k);
+        Ok(scored)
+    }
+
+    fn hybrid_graph_scores_effective(
+        &self,
+        graph_seeds: &[String],
+        max_hops: usize,
+        config: &HybridScoringConfig,
+    ) -> GraphStoreResult<HashMap<String, f32>> {
+        let mut best: HashMap<String, f32> = HashMap::new();
+        let mut queue: VecDeque<(String, usize, f32)> = VecDeque::new();
+        for seed in graph_seeds {
+            best.insert(seed.clone(), 1.0);
+            queue.push_back((seed.clone(), 0, 1.0));
+        }
+        while let Some((node_id, depth, path_score)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            for hit in self.neighbors(NeighborQuery::out(&node_id))? {
+                let Some(edge) = self.get_edge(&hit.edge_id)? else {
+                    continue;
+                };
+                let confidence = if config.confidence_weighted_graph_distance {
+                    edge.effective_confidence() as f32
+                } else {
+                    1.0
+                };
+                let edge_weight = config.edge_type_weight(&edge.edge_type);
+                let next_depth = depth + 1;
+                let next_score = path_score * edge_weight * confidence / (1.0 + next_depth as f32);
+                let should_update = best
+                    .get(&edge.to_id)
+                    .map(|current| next_score.abs() > current.abs())
+                    .unwrap_or(true);
+                if should_update {
+                    best.insert(edge.to_id.clone(), next_score.clamp(-1.0, 1.0));
+                    queue.push_back((edge.to_id.clone(), next_depth, next_score));
+                }
+            }
+        }
+        Ok(best)
     }
 
     pub fn vector_designations(&self) -> Vec<VectorDesignation> {
-        self.store.vector_designations()
+        let mut designations = self
+            .store
+            .vector_designations()
+            .into_iter()
+            .map(|designation| {
+                (
+                    (designation.label.clone(), designation.property.clone()),
+                    designation,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let Some(residency) = self.archive_residency.as_ref() {
+            for designation in residency.vector_designations() {
+                designations
+                    .entry((designation.label.clone(), designation.property.clone()))
+                    .or_insert(designation);
+            }
+        }
+        designations.into_values().collect()
     }
 
     pub fn vector_index_manifest(&self) -> Vec<VectorIndexManifest> {
-        self.store.vector_index_manifest()
+        let mut manifests = self
+            .store
+            .vector_index_manifest()
+            .into_iter()
+            .map(|manifest| {
+                (
+                    (manifest.label.clone(), manifest.property.clone()),
+                    manifest,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let Some(residency) = self.archive_residency.as_ref() {
+            for archive_manifest in residency.vector_index_manifest() {
+                manifests
+                    .entry((
+                        archive_manifest.label.clone(),
+                        archive_manifest.property.clone(),
+                    ))
+                    .and_modify(|manifest| {
+                        manifest.indexed_vectors = manifest
+                            .indexed_vectors
+                            .saturating_add(archive_manifest.indexed_vectors);
+                        manifest.resident_vector_bytes = manifest
+                            .resident_vector_bytes
+                            .saturating_add(archive_manifest.resident_vector_bytes);
+                        manifest.resident_full_precision_bytes = manifest
+                            .resident_full_precision_bytes
+                            .saturating_add(archive_manifest.resident_full_precision_bytes);
+                        manifest.accelerated = manifest.accelerated && archive_manifest.accelerated;
+                    })
+                    .or_insert(archive_manifest);
+            }
+        }
+        manifests.into_values().collect()
     }
 
     pub fn designate_ordered_property(
@@ -4311,7 +6171,22 @@ impl RedCoreGraphStore {
     }
 
     pub fn ordered_designations(&self) -> Vec<OrderedDesignation> {
-        self.store.ordered_designations()
+        let mut designations = BTreeMap::new();
+        for designation in self.store.ordered_designations() {
+            designations.insert(
+                (designation.label.clone(), designation.property.clone()),
+                designation,
+            );
+        }
+        if let Some(residency) = self.archive_residency.as_ref() {
+            for designation in residency.ordered_designations() {
+                designations.insert(
+                    (designation.label.clone(), designation.property.clone()),
+                    designation,
+                );
+            }
+        }
+        designations.into_values().collect()
     }
 
     pub fn ordered_range_by_score(
@@ -4322,12 +6197,59 @@ impl RedCoreGraphStore {
         max: f64,
         limit: Option<usize>,
     ) -> GraphStoreResult<Vec<(String, f64)>> {
-        self.store
-            .ordered_range_by_score(label, property_name, min, max, limit)
+        if self.archive_residency.is_none() {
+            return self
+                .store
+                .ordered_range_by_score(label, property_name, min, max, limit);
+        }
+        if min.is_nan() || max.is_nan() {
+            return Err(GraphStoreError::new(
+                "invalid_ordered_score",
+                "ordered scores must not be NaN".to_string(),
+            ));
+        }
+        if min > max {
+            return Ok(Vec::new());
+        }
+
+        let mut scores_by_id = BTreeMap::new();
+        if let Some(residency) = self.archive_residency.as_ref() {
+            for (node_id, score) in
+                residency.ordered_range_by_score(label, property_name, min, max, None)?
+            {
+                scores_by_id.insert(node_id, score);
+            }
+        }
+
+        for node_id in self.store.nodes.keys() {
+            scores_by_id.remove(node_id);
+        }
+        for (node_id, score) in
+            self.store
+                .ordered_range_by_score(label, property_name, min, max, None)?
+        {
+            scores_by_id.insert(node_id, score);
+        }
+
+        let mut results = scores_by_id.into_iter().collect::<Vec<_>>();
+        results.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        if let Some(limit) = limit {
+            results.truncate(limit);
+        }
+        Ok(results)
     }
 
     pub fn ordered_score(&self, label: &str, property_name: &str, node_id: &str) -> Option<f64> {
-        self.store.ordered_score(label, property_name, node_id)
+        if self.archive_residency.is_none() || self.store.nodes.contains_key(node_id) {
+            return self.store.ordered_score(label, property_name, node_id);
+        }
+        self.archive_residency
+            .as_ref()
+            .and_then(|residency| residency.ordered_score(label, property_name, node_id))
     }
 
     pub fn transient_ordered_zadd(
@@ -4375,8 +6297,51 @@ impl RedCoreGraphStore {
         min_confidence: Option<f64>,
         max_depth: Option<usize>,
     ) -> Vec<(EdgeRecord, NodeRecord)> {
-        self.store
-            .epistemic_neighbors(node_id, epistemic_types, min_confidence, max_depth)
+        let max_depth = max_depth.unwrap_or(1);
+        let min_conf = min_confidence.unwrap_or(0.0);
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        let mut results = Vec::new();
+
+        visited.insert(node_id.to_string());
+        queue.push_back((node_id.to_string(), 0));
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            let mut hits = Vec::new();
+            if let Ok(out_hits) = self.neighbors(NeighborQuery::out(&current_id)) {
+                hits.extend(out_hits);
+            }
+            if let Ok(in_hits) = self.neighbors(NeighborQuery::in_(&current_id)) {
+                hits.extend(in_hits);
+            }
+            for hit in hits {
+                if visited.contains(&hit.node_id) {
+                    continue;
+                }
+                let Some(edge) = self.get_edge(&hit.edge_id).ok().flatten() else {
+                    continue;
+                };
+                if edge.effective_confidence() < min_conf {
+                    continue;
+                }
+                if let Some(types) = epistemic_types {
+                    match &edge.epistemic_type {
+                        Some(epistemic_type) if types.contains(epistemic_type) => {}
+                        _ => continue,
+                    }
+                }
+                let Some(node) = self.get_node(&hit.node_id).ok().flatten() else {
+                    continue;
+                };
+                visited.insert(hit.node_id.clone());
+                results.push((edge, node));
+                queue.push_back((hit.node_id, depth + 1));
+            }
+        }
+        results
     }
 
     pub fn snapshot_now(&mut self) -> GraphStoreResult<()> {
@@ -4401,10 +6366,36 @@ impl RedCoreGraphStore {
             }
         }
         self.archive_residency = load_archive_residency(&data_dir)?;
-        if let Some(envelope) = read_latest_valid_snapshot(&data_dir)? {
-            self.snapshot_txn_id = envelope.txn_id;
-            self.last_txn_id = self.last_txn_id.max(envelope.txn_id);
-            self.store = InMemoryGraphStore::from_snapshot(envelope.graph)?;
+        let recovered_from_archive = if let Some(residency) = self.archive_residency.as_ref() {
+            if residency.index.is_some() {
+                self.snapshot_txn_id = residency.manifest.snapshot_txn_id;
+                self.last_txn_id = self.last_txn_id.max(residency.manifest.snapshot_txn_id);
+                self.store.version = self.store.version.max(residency.manifest.graph_version);
+                for designation in residency.vector_designations() {
+                    self.store.designate_vector_property_with_bit_width(
+                        &designation.label,
+                        &designation.property,
+                        designation.dimension,
+                        designation.bit_width,
+                    )?;
+                }
+                for designation in residency.ordered_designations() {
+                    self.store
+                        .designate_ordered_property(&designation.label, &designation.property)?;
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !recovered_from_archive {
+            if let Some(envelope) = read_latest_valid_snapshot(&data_dir)? {
+                self.snapshot_txn_id = envelope.txn_id;
+                self.last_txn_id = self.last_txn_id.max(envelope.txn_id);
+                self.store = InMemoryGraphStore::from_snapshot(envelope.graph)?;
+            }
         }
         self.replay_aof(&data_dir)?;
         Ok(())
@@ -4465,7 +6456,7 @@ impl RedCoreGraphStore {
                 self.aof_replay_bytes = frame_end;
                 continue;
             }
-            self.apply_recovered_mutation(frame.mutation)?;
+            self.apply_recovered_mutation(frame.mutation, frame.graph_version)?;
             self.last_txn_id = self.last_txn_id.max(frame.txn_id);
             self.recovered_frames += 1;
             frame_start = frame_end;
@@ -4474,26 +6465,101 @@ impl RedCoreGraphStore {
         Ok(())
     }
 
+    fn apply_recovered_node_overlay(&mut self, node: NodeRecord) -> GraphStoreResult<()> {
+        let id = node.id.clone();
+        self.store.apply_recovered_node(node)?;
+        self.touch_dirty_overlay_node(&id)
+    }
+
     fn apply_recovered_edge_lossy(&mut self, edge: EdgeRecord) -> GraphStoreResult<()> {
         // Ported from RustyRed-Graph-Database 365d073 "fix(core): tolerate orphan
         // edges during recovery". AOF replay must not let one orphan edge
         // (endpoint missing or tombstoned) make the whole tenant graph
         // unavailable; skip the orphan instead. The strict live-write path
         // (upsert_edge / apply_recovered_edge) is unchanged.
-        match self.store.apply_recovered_edge(edge) {
+        match self.apply_recovered_edge_overlay(edge) {
             Ok(()) => Ok(()),
             Err(error) if is_recoverable_orphan_edge(&error) => Ok(()),
             Err(error) => Err(error),
         }
     }
 
-    fn apply_recovered_mutation(&mut self, mutation: RedCoreMutation) -> GraphStoreResult<()> {
+    fn apply_recovered_edge_overlay(&mut self, mut edge: EdgeRecord) -> GraphStoreResult<()> {
+        validate_edge_shape(&edge)?;
+        if edge.content_hash.is_none() {
+            edge.content_hash = Some(edge.checksum());
+        }
+        if !edge.tombstone {
+            self.require_effective_live_endpoint(&edge, "from", &edge.from_id)?;
+            self.require_effective_live_endpoint(&edge, "to", &edge.to_id)?;
+        }
+        if let Some(existing) = self.store.edges.get(&edge.id).cloned() {
+            self.store.remove_edge_indexes(&existing);
+        }
+        if !edge.tombstone {
+            self.store.add_edge_indexes(&edge);
+        }
+        self.store.version = self.store.version.max(edge.version);
+        let id = edge.id.clone();
+        self.store.edges.insert(id.clone(), edge);
+        self.touch_dirty_overlay_edge(&id)
+    }
+
+    fn require_effective_live_endpoint(
+        &self,
+        edge: &EdgeRecord,
+        endpoint: &str,
+        node_id: &str,
+    ) -> GraphStoreResult<()> {
+        let node = self
+            .effective_node_unfiltered(node_id)?
+            .ok_or_else(|| GraphStoreError::missing_endpoint(&edge.id, endpoint, node_id))?;
+        if node.tombstone {
+            return Err(GraphStoreError::tombstoned_endpoint(
+                &edge.id, endpoint, node_id,
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_recovered_delete_overlay(
+        &mut self,
+        id: &str,
+        graph_version: u64,
+    ) -> GraphStoreResult<()> {
+        if let Some(node) = self.store.nodes.get(id).cloned() {
+            self.store.remove_node_indexes(&node);
+            self.store.nodes.remove(id);
+        }
+        if self
+            .archive_residency
+            .as_ref()
+            .is_some_and(|residency| residency.has_node(id))
+        {
+            let mut tombstone = NodeRecord::new(id, std::iter::empty::<String>(), Value::Null);
+            tombstone.tombstone = true;
+            tombstone.version = graph_version;
+            tombstone.content_hash = Some(tombstone.checksum());
+            self.store.version = self.store.version.max(graph_version);
+            self.store.nodes.insert(id.to_string(), tombstone);
+            self.touch_dirty_overlay_node(id)?;
+        } else {
+            self.forget_dirty_overlay_node(id);
+        }
+        Ok(())
+    }
+
+    fn apply_recovered_mutation(
+        &mut self,
+        mutation: RedCoreMutation,
+        graph_version: u64,
+    ) -> GraphStoreResult<()> {
         match mutation {
-            RedCoreMutation::NodeUpsert(node) => self.store.apply_recovered_node(node),
+            RedCoreMutation::NodeUpsert(node) => self.apply_recovered_node_overlay(node),
             RedCoreMutation::EdgeUpsert(edge) => self.apply_recovered_edge_lossy(edge),
             RedCoreMutation::Batch(mutations) => {
                 for mutation in mutations {
-                    self.apply_recovered_mutation(mutation)?;
+                    self.apply_recovered_mutation(mutation, graph_version)?;
                 }
                 Ok(())
             }
@@ -4508,7 +6574,9 @@ impl RedCoreGraphStore {
             RedCoreMutation::OrderedDesignation(d) => {
                 self.store.designate_ordered_property(&d.label, &d.property)
             }
-            RedCoreMutation::NodeDelete(id) => self.store.apply_recovered_delete(&id),
+            RedCoreMutation::NodeDelete(id) => {
+                self.apply_recovered_delete_overlay(&id, graph_version)
+            }
         }
     }
 
@@ -4631,7 +6699,8 @@ impl RedCoreGraphStore {
 
     fn write_snapshot(&mut self) -> GraphStoreResult<()> {
         let txn_id = self.last_txn_id;
-        self.write_snapshot_for(txn_id, &self.store)?;
+        let store = self.materialized_store()?;
+        self.write_snapshot_for(txn_id, &store)?;
         self.snapshot_txn_id = txn_id;
         Ok(())
     }
@@ -4653,7 +6722,7 @@ impl RedCoreGraphStore {
         if current.exists() {
             preserve_previous_snapshot(data_dir, &current)?;
         }
-        write_archive_for_snapshot(data_dir, txn_id, &envelope.graph)?;
+        write_archive_for_snapshot(data_dir, txn_id, &envelope.graph, store)?;
         write_atomic_file(
             data_dir,
             REDCORE_CURRENT_SNAPSHOT_TMP_FILE,
@@ -5040,6 +7109,7 @@ fn write_archive_for_snapshot(
     data_dir: &Path,
     snapshot_txn_id: u64,
     snapshot: &GraphSnapshot,
+    store: &InMemoryGraphStore,
 ) -> GraphStoreResult<()> {
     let archive_dir = data_dir.join(REDCORE_ARCHIVE_DIR);
     let object_dir = archive_dir.join(REDCORE_ARCHIVE_OBJECT_DIR);
@@ -5080,6 +7150,8 @@ fn write_archive_for_snapshot(
         snapshot_txn_id,
         entries,
     };
+    let serving_index =
+        build_archive_serving_index(snapshot_txn_id, snapshot, store, &manifest.entries);
     let raw = serde_json::to_vec_pretty(&manifest)
         .map_err(|err| GraphStoreError::io("encode RedCore archive manifest", err))?;
     write_atomic_file(
@@ -5088,7 +7160,8 @@ fn write_archive_for_snapshot(
         REDCORE_ARCHIVE_MANIFEST_FILE,
         &raw,
         "RedCore archive manifest",
-    )
+    )?;
+    write_archive_serving_index(&archive_dir, &serving_index)
 }
 
 fn load_archive_residency(data_dir: &Path) -> GraphStoreResult<Option<RedCoreArchiveResidency>> {
@@ -5111,21 +7184,230 @@ fn load_archive_residency(data_dir: &Path) -> GraphStoreResult<Option<RedCoreArc
         ));
     }
 
-    let mut mapped = BTreeMap::new();
     let mut archive_bytes = 0_u64;
     for entry in &manifest.entries {
         let path = archive_dir.join(&entry.file);
-        let mmap = MappedArchive::open(&path).map_err(zero_copy_error)?;
-        access_graph_archive(mmap.as_bytes()).map_err(zero_copy_error)?;
-        archive_bytes = archive_bytes.saturating_add(entry.bytes_len);
-        mapped.insert(entry.object_hash.clone(), mmap);
+        let metadata = path
+            .metadata()
+            .map_err(|err| GraphStoreError::io("stat RedCore archive object", err))?;
+        archive_bytes = archive_bytes.saturating_add(metadata.len());
     }
+    let serving_index_bytes = archive_dir
+        .join(REDCORE_ARCHIVE_SERVING_INDEX_FILE)
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    let index = load_archive_serving_index(&archive_dir, &manifest)?;
 
     Ok(Some(RedCoreArchiveResidency {
         manifest,
-        mapped,
+        index,
+        archive_dir,
         archive_bytes,
+        serving_index_bytes,
     }))
+}
+
+fn build_archive_serving_index(
+    snapshot_txn_id: u64,
+    snapshot: &GraphSnapshot,
+    store: &InMemoryGraphStore,
+    entries: &[RedCoreArchiveEntry],
+) -> RedCoreArchiveServingIndex {
+    let mut archive_entries: BTreeMap<(String, String), &RedCoreArchiveEntry> = BTreeMap::new();
+    for entry in entries {
+        archive_entries.insert((entry.kind.clone(), entry.id.clone()), entry);
+    }
+    let mut vector_designations = store.vector_designations();
+    vector_designations.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.property.cmp(&right.property))
+    });
+    let mut ordered_designations = store.ordered_designations();
+    ordered_designations.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.property.cmp(&right.property))
+    });
+
+    let nodes = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let entry = archive_entries
+                .get(&(GraphObjectKind::Node.as_str().to_string(), node.id.clone()))?;
+            Some(RedCoreArchiveNodeIndexEntry {
+                id: node.id.clone(),
+                object_hash: entry.object_hash.clone(),
+                archive_hash: entry.archive_hash.clone(),
+                file: entry.file.clone(),
+                version: node.version,
+                tombstone: node.tombstone,
+                labels: node.labels.clone(),
+                indexed_properties: indexed_properties(&node.properties),
+                indexed_vectors: archive_node_vectors(node, &vector_designations),
+                memory_document: archive_memory_document_entry(node),
+                ttl_expires_at_ms: node_ttl_expires_at_ms(node),
+                indexed_ordered: archive_node_ordered_entries(node, &ordered_designations),
+            })
+        })
+        .collect();
+
+    let edges = snapshot
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let entry = archive_entries
+                .get(&(GraphObjectKind::Edge.as_str().to_string(), edge.id.clone()))?;
+            Some(RedCoreArchiveEdgeIndexEntry {
+                id: edge.id.clone(),
+                object_hash: entry.object_hash.clone(),
+                archive_hash: entry.archive_hash.clone(),
+                file: entry.file.clone(),
+                version: edge.version,
+                tombstone: edge.tombstone,
+                from_id: edge.from_id.clone(),
+                to_id: edge.to_id.clone(),
+                edge_type: edge.edge_type.clone(),
+                confidence: edge.confidence,
+                epistemic_type: edge.epistemic_type.clone(),
+            })
+        })
+        .collect();
+
+    RedCoreArchiveServingIndex {
+        version: REDCORE_MANIFEST_VERSION,
+        graph_version: snapshot.version,
+        snapshot_txn_id,
+        vector_designations,
+        ordered_designations,
+        nodes,
+        edges,
+    }
+}
+
+fn archive_node_vectors(
+    node: &NodeRecord,
+    designations: &[VectorDesignation],
+) -> Vec<RedCoreArchiveNodeVectorEntry> {
+    if node.tombstone {
+        return Vec::new();
+    }
+    designations
+        .iter()
+        .filter(|designation| {
+            node.labels
+                .iter()
+                .any(|candidate| candidate == &designation.label)
+        })
+        .filter_map(|designation| {
+            let values = extract_float_array(&node.properties, &designation.property)?;
+            if values.len() != designation.dimension || !vector_values_indexable(&values) {
+                return None;
+            }
+            Some(RedCoreArchiveNodeVectorEntry {
+                label: designation.label.clone(),
+                property: designation.property.clone(),
+                dimension: designation.dimension,
+                bit_width: designation.bit_width,
+                values,
+            })
+        })
+        .collect()
+}
+
+fn archive_memory_document_entry(
+    node: &NodeRecord,
+) -> Option<RedCoreArchiveMemoryDocumentIndexEntry> {
+    let (tenant_slug, entry) = memory_document_index_entry(node)?;
+    Some(RedCoreArchiveMemoryDocumentIndexEntry {
+        tenant_slug,
+        updated_at: entry.updated_at,
+        node_id: entry.node_id,
+        status: entry.status,
+    })
+}
+
+fn archive_node_ordered_entries(
+    node: &NodeRecord,
+    designations: &[OrderedDesignation],
+) -> Vec<RedCoreArchiveNodeOrderedEntry> {
+    if node.tombstone {
+        return Vec::new();
+    }
+    designations
+        .iter()
+        .filter(|designation| {
+            node.labels
+                .iter()
+                .any(|candidate| candidate == &designation.label)
+        })
+        .filter_map(|designation| {
+            let score = numeric_property(&node.properties, &designation.property)?;
+            Some(RedCoreArchiveNodeOrderedEntry {
+                label: designation.label.clone(),
+                property: designation.property.clone(),
+                score,
+            })
+        })
+        .collect()
+}
+
+fn write_archive_serving_index(
+    archive_dir: &Path,
+    index: &RedCoreArchiveServingIndex,
+) -> GraphStoreResult<()> {
+    let raw = serde_json::to_vec_pretty(index)
+        .map_err(|err| GraphStoreError::io("encode RedCore archive serving index", err))?;
+    write_atomic_file(
+        archive_dir,
+        REDCORE_ARCHIVE_SERVING_INDEX_TMP_FILE,
+        REDCORE_ARCHIVE_SERVING_INDEX_FILE,
+        &raw,
+        "RedCore archive serving index",
+    )
+}
+
+fn load_archive_serving_index(
+    archive_dir: &Path,
+    manifest: &RedCoreArchiveManifest,
+) -> GraphStoreResult<Option<RedCoreArchiveServingIndexRuntime>> {
+    let path = archive_dir.join(REDCORE_ARCHIVE_SERVING_INDEX_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| GraphStoreError::io("read RedCore archive serving index", err))?;
+    let index: RedCoreArchiveServingIndex = serde_json::from_str(&raw)
+        .map_err(|err| GraphStoreError::io("decode RedCore archive serving index", err))?;
+    if !manifest_version_compatible(index.version) {
+        return Err(GraphStoreError::new(
+            "redcore_archive_index_format_too_new",
+            format!(
+                "On-disk RedCore archive serving index version is {}, this build supports up to {}.",
+                index.version, CURRENT_FORMAT_VERSION
+            ),
+        ));
+    }
+    if index.graph_version != manifest.graph_version
+        || index.snapshot_txn_id != manifest.snapshot_txn_id
+    {
+        return Err(GraphStoreError::new(
+            "redcore_archive_index_stale",
+            "archive serving index does not match archive manifest graph version".to_string(),
+        ));
+    }
+    Ok(Some(RedCoreArchiveServingIndexRuntime::from_manifest(
+        index,
+    )))
+}
+
+fn archive_node_is_expired(entry: &RedCoreArchiveNodeIndexEntry, now_ms: i64) -> bool {
+    entry
+        .ttl_expires_at_ms
+        .map(|expires_at| now_ms > expires_at)
+        .unwrap_or(false)
 }
 
 fn zero_copy_error(error: ZeroCopyArchiveError) -> GraphStoreError {
@@ -6384,6 +8666,16 @@ fn memory_document_index_entry(node: &NodeRecord) -> Option<(String, MemoryDocum
     ))
 }
 
+fn sort_memory_document_nodes_desc(nodes: &mut [NodeRecord]) {
+    nodes.sort_by(|left, right| {
+        let left_entry = memory_document_index_entry(left).map(|(_, entry)| entry);
+        let right_entry = memory_document_index_entry(right).map(|(_, entry)| entry);
+        right_entry
+            .cmp(&left_entry)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
 fn string_property(properties: &Value, key: &str) -> Option<String> {
     properties
         .get(key)?
@@ -6756,6 +9048,7 @@ fn hex_digit(value: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::time::Duration;
 
@@ -6764,11 +9057,49 @@ mod tests {
     #[cfg(feature = "vector-accelerated")]
     use super::VectorIndex;
     use super::{
-        sanitize_tenant_segment, Direction, EdgeRecord, GraphMutation, GraphMutationBatch,
-        GraphSnapshot, GraphStore, InMemoryGraphStore, MemoryDocumentQuery, NeighborQuery,
-        NodeQuery, NodeRecord, RedCoreDurability, RedCoreGraphStore, RedCoreOptions,
+        sanitize_tenant_segment, Direction, EdgeRecord, EpistemicType, GraphMutation,
+        GraphMutationBatch, GraphSnapshot, GraphStore, GraphStoreResult, InMemoryGraphStore,
+        MemoryDocumentQuery, NeighborQuery, NodeQuery, NodeRecord, OrderedDesignation,
+        RedCoreDurability, RedCoreGraphStore, RedCoreOptions, RedCorePayloadBackend,
         RedCorePayloadPointer, RedCoreSyncMode,
     };
+
+    #[derive(Debug, Default)]
+    struct FakePayloadBackend {
+        bytes: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
+        puts: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakePayloadBackend {
+        fn put_count(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn get_count(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl RedCorePayloadBackend for FakePayloadBackend {
+        fn backend_name(&self) -> &'static str {
+            "test_bucket"
+        }
+
+        fn put_payload_bytes(&self, content_hash: &str, body: &[u8]) -> GraphStoreResult<()> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bytes
+                .lock()
+                .unwrap()
+                .insert(content_hash.to_string(), body.to_vec());
+            Ok(())
+        }
+
+        fn get_payload_bytes(&self, content_hash: &str) -> GraphStoreResult<Option<Vec<u8>>> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.bytes.lock().unwrap().get(content_hash).cloned())
+        }
+    }
 
     #[test]
     fn records_have_stable_hashes_and_metadata() {
@@ -8004,9 +10335,777 @@ mod tests {
         assert_eq!(report.snapshot_txn_id, store.status().snapshot_txn_id);
         assert_eq!(report.nodes, 2);
         assert_eq!(report.edges, 1);
-        assert_eq!(report.mapped_objects, 3);
+        assert!(report.serving_index_loaded);
+        assert_eq!(report.serving_index_nodes, 2);
+        assert_eq!(report.serving_index_edges, 1);
+        assert_eq!(
+            report.mapped_objects, 0,
+            "archive object mmaps should be opened lazily on materialization"
+        );
         assert!(report.archive_bytes > 0);
+        assert!(data_dir
+            .join(super::REDCORE_ARCHIVE_DIR)
+            .join(super::REDCORE_ARCHIVE_SERVING_INDEX_FILE)
+            .exists());
         assert!(store.get_node("node:a").unwrap().is_some());
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_archive_serving_index_reads_after_hot_mirror_is_empty() {
+        let data_dir = unique_test_dir("redcore-archive-serving-index");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:a",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 1, "tenant": "a" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:b",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 2, "tenant": "a" }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(
+                    EdgeRecord::new("edge:ab", "node:a", "LINKS", "node:b", json!({}))
+                        .with_confidence(0.75)
+                        .with_epistemic_type(EpistemicType::Supports),
+                )
+                .unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(
+            store.store.nodes.is_empty(),
+            "archive-default recovery should not materialize snapshot nodes into the hot mirror"
+        );
+        assert!(
+            store.store.edges.is_empty(),
+            "archive-default recovery should not materialize snapshot edges into the hot mirror"
+        );
+
+        let node = store
+            .get_node("node:a")
+            .unwrap()
+            .expect("archive node should materialize");
+        assert_eq!(node.properties["rank"], json!(1));
+
+        let nodes = store
+            .query_nodes(
+                NodeQuery::label("ArchiveFixture")
+                    .with_property("rank", json!(2))
+                    .with_limit(10),
+            )
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "node:b");
+
+        let edge = store
+            .get_edge("edge:ab")
+            .unwrap()
+            .expect("archive edge should materialize");
+        assert_eq!(edge.from_id, "node:a");
+        assert_eq!(edge.to_id, "node:b");
+
+        let neighbors = store.neighbors(NeighborQuery::out("node:a")).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, "node:b");
+        assert_eq!(neighbors[0].confidence, Some(0.75));
+        assert_eq!(neighbors[0].epistemic_type, Some(EpistemicType::Supports));
+
+        assert_eq!(store.labels().unwrap(), vec!["ArchiveFixture".to_string()]);
+        assert_eq!(store.edge_types().unwrap(), vec!["LINKS".to_string()]);
+        assert_eq!(
+            store.property_keys().unwrap(),
+            vec!["rank".to_string(), "tenant".to_string()]
+        );
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.nodes_total, 2);
+        assert_eq!(stats.edges_total, 1);
+        assert!(stats.memory_bytes > 0);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_archive_serving_index_serves_semantic_indexes_without_hot_mirror() {
+        let data_dir = unique_test_dir("redcore-archive-semantic-serving-index");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .designate_vector_property_with_bit_width("MemoryDocument", "embedding", 8, 2)
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "seed:semantic",
+                    ["Seed"],
+                    json!({ "title": "semantic seed" }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "memory:document:Tenant-A:older-active",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "Tenant-A",
+                        "doc_id": "older-active",
+                        "kind": "note",
+                        "title": "older-active",
+                        "content": "body older-active",
+                        "status": "active",
+                        "updated_at": "2026-06-27T00:00:01Z",
+                        "created_at": "2026-06-27T00:00:01Z",
+                        "embedding": embedding8(0.0, 1.0),
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "memory:document:Tenant-A:newer-active",
+                    ["HarnessMemory", "MemoryAtom", "MemoryDocument"],
+                    json!({
+                        "tenant_slug": "Tenant-A",
+                        "doc_id": "newer-active",
+                        "kind": "note",
+                        "title": "newer-active",
+                        "content": "body newer-active",
+                        "status": "active",
+                        "updated_at": "2026-06-27T00:00:03Z",
+                        "created_at": "2026-06-27T00:00:03Z",
+                        "embedding": embedding8(1.0, 0.0),
+                    }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(
+                    EdgeRecord::new(
+                        "edge:seed-newer",
+                        "seed:semantic",
+                        "supports",
+                        "memory:document:Tenant-A:newer-active",
+                        json!({}),
+                    )
+                    .with_confidence(1.0)
+                    .with_epistemic_type(EpistemicType::Supports),
+                )
+                .unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(
+            store.store.nodes.is_empty(),
+            "archive semantic index recovery should not hydrate snapshot nodes"
+        );
+        assert!(
+            store.store.edges.is_empty(),
+            "archive semantic index recovery should not hydrate snapshot edges"
+        );
+
+        let designations = store.vector_designations();
+        assert_eq!(designations.len(), 1);
+        assert_eq!(designations[0].label, "MemoryDocument");
+        assert_eq!(designations[0].bit_width, 2);
+        let manifest = store.vector_index_manifest();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].indexed_vectors, 2);
+
+        let vector_hits = store
+            .vector_search(
+                Some("MemoryDocument"),
+                "embedding",
+                &embedding8(1.0, 0.0),
+                2,
+            )
+            .unwrap();
+        assert_eq!(vector_hits[0].0, "memory:document:Tenant-A:newer-active");
+
+        let docs = store
+            .memory_documents_by_updated_at(
+                MemoryDocumentQuery::tenant("Tenant-A")
+                    .with_status("active")
+                    .with_limit(10),
+            )
+            .unwrap();
+        let doc_ids = docs
+            .iter()
+            .map(|node| node.properties["doc_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(doc_ids, vec!["newer-active", "older-active"]);
+
+        let hybrid_hits = store
+            .hybrid_search(
+                Some("MemoryDocument"),
+                "embedding",
+                &embedding8(0.0, 1.0),
+                2,
+                &["seed:semantic".to_string()],
+                1,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(hybrid_hits[0].0, "memory:document:Tenant-A:newer-active");
+
+        let epistemic_hits = store.epistemic_neighbors(
+            "seed:semantic",
+            Some(&[EpistemicType::Supports]),
+            Some(0.5),
+            Some(1),
+        );
+        assert_eq!(epistemic_hits.len(), 1);
+        assert_eq!(epistemic_hits[0].0.id, "edge:seed-newer");
+        assert_eq!(
+            epistemic_hits[0].1.id,
+            "memory:document:Tenant-A:newer-active"
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_archive_serving_index_serves_ordered_indexes_without_hot_mirror() {
+        let data_dir = unique_test_dir("redcore-archive-ordered-serving-index");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 10_000,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new("role:1", ["Role"], json!({ "rank": 2.0 })))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new("role:2", ["Role"], json!({ "rank": 1.0 })))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new("role:3", ["Role"], json!({ "rank": 3.0 })))
+                .unwrap();
+            store.designate_ordered_property("Role", "rank").unwrap();
+            store.snapshot_now().unwrap();
+        }
+
+        let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+        assert!(
+            store.store.nodes.is_empty(),
+            "archive ordered index recovery should not hydrate snapshot nodes"
+        );
+        assert!(
+            store.store.edges.is_empty(),
+            "archive ordered index recovery should not hydrate snapshot edges"
+        );
+        assert_eq!(
+            store.ordered_designations(),
+            vec![OrderedDesignation {
+                label: "Role".to_string(),
+                property: "rank".to_string(),
+            }]
+        );
+        assert_eq!(
+            store
+                .ordered_range_by_score("Role", "rank", 0.0, 10.0, None)
+                .unwrap(),
+            vec![
+                ("role:2".to_string(), 1.0),
+                ("role:1".to_string(), 2.0),
+                ("role:3".to_string(), 3.0),
+            ]
+        );
+        assert_eq!(store.ordered_score("Role", "rank", "role:1"), Some(2.0));
+
+        store
+            .upsert_node(NodeRecord::new("role:1", ["Role"], json!({ "rank": 4.0 })))
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "role:2",
+                ["Role"],
+                json!({ "name": "two" }),
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .ordered_range_by_score("Role", "rank", 0.0, 10.0, None)
+                .unwrap(),
+            vec![("role:3".to_string(), 3.0), ("role:1".to_string(), 4.0)]
+        );
+        assert_eq!(store.ordered_score("Role", "rank", "role:1"), Some(4.0));
+        assert_eq!(store.ordered_score("Role", "rank", "role:2"), None);
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_archive_open_memory_is_bounded_by_serving_index_floor() {
+        let data_dir = unique_test_dir("redcore-archive-large-fixture-floor");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 10_000,
+            strict_acid: false,
+        };
+        let full_materialization_bytes;
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .designate_vector_property_with_bit_width("LargeFixture", "embedding", 8, 2)
+                .unwrap();
+            for index in 0..384 {
+                let embedding = if index == 222 {
+                    embedding8(1.0, 0.0)
+                } else {
+                    embedding8(0.0, 1.0)
+                };
+                store
+                    .upsert_node(NodeRecord::new(
+                        format!("node:{index:03}"),
+                        ["LargeFixture"],
+                        json!({
+                            "rank": index,
+                            "shard": index % 8,
+                            "embedding": embedding,
+                            "payload": {
+                                "body": format!("large archived body {index:03}: {}", "x".repeat(16_384)),
+                            },
+                        }),
+                    ))
+                    .unwrap();
+            }
+            for index in 0..383 {
+                store
+                    .upsert_edge(EdgeRecord::new(
+                        format!("edge:{index:03}"),
+                        format!("node:{index:03}"),
+                        "NEXT",
+                        format!("node:{:03}", index + 1),
+                        json!({ "rank": index }),
+                    ))
+                    .unwrap();
+            }
+            full_materialization_bytes = store.store.stats().memory_bytes;
+            assert!(
+                full_materialization_bytes > 5_000_000,
+                "fixture should be large enough to make materialization visible"
+            );
+            store.snapshot_now().unwrap();
+        }
+
+        let rss_before_open = current_process_resident_bytes();
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        let rss_after_open = current_process_resident_bytes();
+        let report = store.archive_residency_report();
+        assert!(report.manifest_loaded);
+        assert!(report.serving_index_loaded);
+        assert!(report.serving_index_bytes > 0);
+        assert_eq!(report.serving_index_nodes, 384);
+        assert_eq!(report.serving_index_edges, 383);
+        assert_eq!(report.hot_overlay_nodes, 0);
+        assert_eq!(report.hot_overlay_edges, 0);
+        assert_eq!(report.hot_cache_resident_bytes, 0);
+        assert!(
+            store.store.nodes.is_empty(),
+            "open should not rebuild full snapshot nodes into the hot overlay"
+        );
+        assert!(
+            store.store.edges.is_empty(),
+            "open should not rebuild full snapshot edges into the hot overlay"
+        );
+
+        let warm_open_bytes = store.stats().unwrap().memory_bytes;
+        assert!(
+            warm_open_bytes < full_materialization_bytes / 3,
+            "warm open should be bounded by index metadata, not full records: warm={warm_open_bytes}, full={full_materialization_bytes}, report={report:?}"
+        );
+        if let (Some(before), Some(after)) = (rss_before_open, rss_after_open) {
+            let warm_open_rss_delta = after.saturating_sub(before);
+            assert!(
+                warm_open_rss_delta < full_materialization_bytes / 2,
+                "warm open RSS delta should stay below a defined fraction of full materialization: rss_delta={warm_open_rss_delta}, before={before}, after={after}, full={full_materialization_bytes}, report={report:?}"
+            );
+        }
+
+        let filtered = store
+            .query_nodes(
+                NodeQuery::label("LargeFixture")
+                    .with_property("rank", json!(222))
+                    .with_limit(1),
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "node:222");
+        let vector_hits = store
+            .vector_search(Some("LargeFixture"), "embedding", &embedding8(1.0, 0.0), 1)
+            .unwrap();
+        assert_eq!(vector_hits[0].0, "node:222");
+        let neighbors = store.neighbors(NeighborQuery::out("node:222")).unwrap();
+        assert_eq!(neighbors[0].node_id, "node:223");
+        assert!(
+            store.store.nodes.is_empty(),
+            "index-backed reads should not populate the write overlay"
+        );
+        assert!(
+            store.hot_cache_report().unwrap().resident_bytes < full_materialization_bytes / 16,
+            "read-through hot cache should remain far below full materialization"
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_hot_cache_admits_archive_reads_and_evicts_to_budget() {
+        let data_dir = unique_test_dir("redcore-hot-cache-budget");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            for index in 0..20 {
+                store
+                    .upsert_node(NodeRecord::new(
+                        format!("node:{index:02}"),
+                        ["CacheFixture"],
+                        json!({
+                            "rank": index,
+                            "body": format!("archive-backed-cache-row-{index:02}-{}", "x".repeat(96)),
+                        }),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        store.set_hot_cache_budget_bytes(768).unwrap();
+        assert!(store.store.nodes.is_empty());
+        assert_eq!(store.hot_cache_report().unwrap().resident_bytes, 0);
+
+        let first = store
+            .get_node("node:00")
+            .unwrap()
+            .expect("first archive node should read");
+        for index in 1..20 {
+            let node = store
+                .get_node(&format!("node:{index:02}"))
+                .unwrap()
+                .expect("archive node should read");
+            assert_eq!(node.properties["rank"], json!(index));
+        }
+
+        let report = store.hot_cache_report().unwrap();
+        assert!(report.enabled);
+        assert_eq!(report.budget_bytes, 768);
+        assert!(
+            report.resident_bytes <= report.budget_bytes,
+            "hot cache resident bytes must stay within budget: {report:?}"
+        );
+        assert!(
+            report.nodes < 20,
+            "cache should evict during a scan larger than budget: {report:?}"
+        );
+        assert!(
+            report.evictions > 0,
+            "scan should evict least-recently-used entries: {report:?}"
+        );
+        assert!(
+            store.store.nodes.is_empty(),
+            "read-through cache must not hydrate the write overlay"
+        );
+
+        let reread = store
+            .get_node("node:00")
+            .unwrap()
+            .expect("evicted archive node should re-read identically");
+        assert_eq!(reread, first);
+        assert!(
+            store.hot_cache_report().unwrap().resident_bytes <= 768,
+            "re-access should preserve the resident budget"
+        );
+
+        let nodes = store
+            .query_nodes(NodeQuery::label("CacheFixture").with_limit(20))
+            .unwrap();
+        assert_eq!(nodes.len(), 20);
+        assert!(
+            store.hot_cache_report().unwrap().resident_bytes <= 768,
+            "full graph scan should not cause unbounded hot-cache growth"
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_hot_cache_admits_archive_edges_without_rehydrating_overlay() {
+        let data_dir = unique_test_dir("redcore-hot-cache-edge");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::SnapshotOnly,
+            snapshot_interval_writes: 1,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new("node:a", ["CacheFixture"], json!({})))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new("node:b", ["CacheFixture"], json!({})))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:ab",
+                    "node:a",
+                    "LINKS",
+                    "node:b",
+                    json!({ "body": "edge payload" }),
+                ))
+                .unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        store.set_hot_cache_budget_bytes(4096).unwrap();
+        let edge = store
+            .get_edge("edge:ab")
+            .unwrap()
+            .expect("archive edge should read");
+        assert_eq!(edge.to_id, "node:b");
+        let report = store.hot_cache_report().unwrap();
+        assert_eq!(report.edges, 1);
+        assert_eq!(report.admissions, 1);
+        assert!(store.store.edges.is_empty());
+
+        let cached = store
+            .get_edge("edge:ab")
+            .unwrap()
+            .expect("cached edge should read");
+        assert_eq!(cached, edge);
+        assert_eq!(
+            store.hot_cache_report().unwrap().admissions,
+            1,
+            "second read should hit cache rather than admit another copy"
+        );
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_dirty_overlay_compacts_to_archive_when_resident_budget_is_exceeded() {
+        let data_dir = unique_test_dir("redcore-dirty-overlay-budget");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 10_000,
+            strict_acid: false,
+        };
+        let initial_snapshot_txn_id;
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            for index in 0..16 {
+                store
+                    .upsert_node(NodeRecord::new(
+                        format!("node:{index:02}"),
+                        ["DirtyFixture"],
+                        json!({
+                            "rank": index,
+                            "body": format!("initial-{index:02}"),
+                        }),
+                    ))
+                    .unwrap();
+            }
+            store.snapshot_now().unwrap();
+            initial_snapshot_txn_id = store.status().snapshot_txn_id;
+        }
+
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            let budget_bytes = 12_288;
+            store.set_hot_cache_budget_bytes(budget_bytes).unwrap();
+            assert!(store.store.nodes.is_empty());
+            for index in 0..16 {
+                let node = NodeRecord::new(
+                    format!("node:{index:02}"),
+                    ["DirtyFixture"],
+                    json!({
+                        "rank": index,
+                        "body": format!("updated-{index:02}-{}", "x".repeat(2048)),
+                    }),
+                );
+                store.upsert_node(node).unwrap();
+                let report = store.archive_residency_report();
+                assert!(
+                    report.hot_overlay_bytes
+                        <= report.hot_cache_resident_bytes.saturating_add(budget_bytes),
+                    "dirty overlay should not grow without bound: {report:?}"
+                );
+            }
+
+            let report = store.archive_residency_report();
+            assert!(report.manifest_loaded);
+            assert!(report.serving_index_loaded);
+            assert!(
+                report.hot_overlay_nodes < 16,
+                "dirty working set should have evicted through archive compaction: {report:?}"
+            );
+            assert!(
+                report.hot_overlay_bytes <= budget_bytes,
+                "dirty overlay should be back under budget after compaction: {report:?}"
+            );
+            assert!(
+                store.status().snapshot_txn_id > initial_snapshot_txn_id,
+                "dirty compaction should advance the durable archive snapshot"
+            );
+            assert!(
+                !store.store.nodes.contains_key("node:00"),
+                "oldest dirty record should be evicted from the hot overlay"
+            );
+            let retained = store
+                .store
+                .nodes
+                .get("node:15")
+                .expect("most recent dirty record should remain in the hot overlay");
+            assert!(retained.properties["body"]
+                .as_str()
+                .unwrap()
+                .starts_with("updated-15-"));
+            let evicted = store
+                .get_node("node:00")
+                .unwrap()
+                .expect("evicted dirty node should re-read from archive");
+            assert!(evicted.properties["body"]
+                .as_str()
+                .unwrap()
+                .starts_with("updated-00-"));
+            assert!(store.hot_cache_report().unwrap().resident_bytes <= budget_bytes);
+        }
+
+        let reopened = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        for index in 0..16 {
+            let node = reopened
+                .get_node(&format!("node:{index:02}"))
+                .unwrap()
+                .expect("updated node should survive dirty compaction and restart");
+            assert!(node.properties["body"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("updated-{index:02}-")));
+        }
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_archive_default_replays_aof_edge_overlay_without_full_materialization() {
+        let data_dir = unique_test_dir("redcore-archive-aof-edge-overlay");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 2,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:a",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 1 }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:b",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 2 }),
+                ))
+                .unwrap();
+            store
+                .upsert_edge(EdgeRecord::new(
+                    "edge:ab",
+                    "node:a",
+                    "LINKS",
+                    "node:b",
+                    json!({}),
+                ))
+                .unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(
+            store.store.nodes.is_empty(),
+            "AOF replay should not hydrate archived snapshot nodes"
+        );
+        assert_eq!(
+            store.store.edges.len(),
+            1,
+            "AOF edge after the snapshot should live in the hot overlay"
+        );
+        assert_eq!(store.status().snapshot_txn_id, 2);
+        assert_eq!(store.status().last_txn_id, 3);
+        assert_eq!(store.get_node("node:a").unwrap().unwrap().version, 1);
+        assert_eq!(store.get_node("node:b").unwrap().unwrap().version, 2);
+        let neighbors = store.neighbors(NeighborQuery::out("node:a")).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].edge_id, "edge:ab");
+        assert_eq!(neighbors[0].node_id, "node:b");
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_archive_default_replays_delete_as_tombstone_overlay() {
+        let data_dir = unique_test_dir("redcore-archive-delete-overlay");
+        let options = RedCoreOptions {
+            durability: RedCoreDurability::AofAlways,
+            snapshot_interval_writes: 2,
+            strict_acid: false,
+        };
+        {
+            let mut store = RedCoreGraphStore::open(&data_dir, options.clone()).unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:a",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 1 }),
+                ))
+                .unwrap();
+            store
+                .upsert_node(NodeRecord::new(
+                    "node:b",
+                    ["ArchiveFixture"],
+                    json!({ "rank": 2 }),
+                ))
+                .unwrap();
+            store.delete_node("node:b").unwrap();
+        }
+
+        let store = RedCoreGraphStore::open(&data_dir, options).unwrap();
+        assert!(
+            store.store.nodes.contains_key("node:b"),
+            "delete after snapshot should be represented by a hot tombstone overlay"
+        );
+        assert!(
+            store.get_node("node:b").unwrap().is_none(),
+            "hot tombstone must suppress the archived node"
+        );
+        let nodes = store
+            .query_nodes(NodeQuery::label("ArchiveFixture").with_limit(10))
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "node:a");
+        let snapshot = store.graph_snapshot();
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].id, "node:a");
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -8059,6 +11158,102 @@ mod tests {
         );
 
         std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn redcore_payload_backend_keeps_bytes_out_of_traversal_and_vector_paths() {
+        let backend = std::sync::Arc::new(FakePayloadBackend::default());
+        let mut store = RedCoreGraphStore::memory();
+        store.set_payload_backend(backend.clone());
+        store.set_hot_cache_budget_bytes(4_096).unwrap();
+        store
+            .designate_vector_property_with_bit_width("Payload", "embedding", 8, 2)
+            .unwrap();
+        let payload = b"hosted payload bytes should stay outside graph records";
+
+        store
+            .upsert_node_with_payload_bytes(
+                NodeRecord::new(
+                    "node:payload",
+                    ["Payload"],
+                    json!({
+                        "title": "payload pointer",
+                        "embedding": embedding8(1.0, 0.0),
+                    }),
+                ),
+                "payload",
+                payload,
+            )
+            .unwrap();
+        store
+            .upsert_node(NodeRecord::new(
+                "node:neighbor",
+                ["Payload"],
+                json!({ "embedding": embedding8(0.0, 1.0) }),
+            ))
+            .unwrap();
+        store
+            .upsert_edge(EdgeRecord::new(
+                "edge:payload-neighbor",
+                "node:payload",
+                "LINKS",
+                "node:neighbor",
+                json!({}),
+            ))
+            .unwrap();
+
+        let node = store.get_node("node:payload").unwrap().unwrap();
+        let pointer = RedCorePayloadPointer::from_value(&node.properties["payload"]).unwrap();
+        assert_eq!(pointer.backend, "test_bucket");
+        assert_eq!(pointer.byte_len, payload.len());
+        assert!(!node
+            .properties
+            .to_string()
+            .contains("outside graph records"));
+        assert_eq!(backend.put_count(), 1);
+        assert_eq!(backend.get_count(), 0);
+        let before_read_report = store.hot_cache_report().unwrap();
+        assert_eq!(before_read_report.payloads, 0);
+        assert_eq!(before_read_report.resident_bytes, 0);
+
+        let neighbors = store.neighbors(NeighborQuery::out("node:payload")).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        let vector_hits = store
+            .vector_search(Some("Payload"), "embedding", &embedding8(1.0, 0.0), 2)
+            .unwrap();
+        assert_eq!(vector_hits[0].0, "node:payload");
+        assert_eq!(
+            backend.get_count(),
+            0,
+            "traversal and vector search must not fetch payload bytes"
+        );
+
+        assert_eq!(
+            store
+                .read_node_payload_bytes("node:payload", "payload")
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+        assert_eq!(backend.get_count(), 1);
+        let report = store.hot_cache_report().unwrap();
+        assert_eq!(report.payloads, 1);
+        assert!(
+            report.resident_bytes <= report.budget_bytes,
+            "payload bytes should be held inside the bounded hot cache: {report:?}"
+        );
+        assert_eq!(
+            store
+                .read_node_payload_bytes("node:payload", "payload")
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+        assert_eq!(
+            backend.get_count(),
+            1,
+            "second payload read should hit the hot cache, not the backend"
+        );
     }
 
     #[test]
@@ -8302,6 +11497,41 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{label}-{unique}"))
+    }
+
+    fn current_process_resident_bytes() -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                for line in status.lines() {
+                    let Some(rest) = line.strip_prefix("VmRSS:") else {
+                        continue;
+                    };
+                    let kib = rest.split_whitespace().next()?.parse::<usize>().ok()?;
+                    return Some(kib.saturating_mul(1024));
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            let pid = std::process::id().to_string();
+            let output = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let raw = String::from_utf8(output.stdout).ok()?;
+            let kib = raw.split_whitespace().next()?.parse::<usize>().ok()?;
+            return Some(kib.saturating_mul(1024));
+        }
+
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     fn embedding8(x: f32, y: f32) -> Vec<f32> {

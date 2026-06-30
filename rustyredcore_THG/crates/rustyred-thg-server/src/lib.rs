@@ -13,6 +13,7 @@ mod items_changefeed;
 mod metrics;
 mod observability;
 mod openapi;
+mod payload_backend;
 mod query_surface;
 pub mod router;
 pub mod state;
