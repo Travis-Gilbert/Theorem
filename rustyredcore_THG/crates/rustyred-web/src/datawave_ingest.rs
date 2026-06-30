@@ -11,8 +11,9 @@ use rustyred_thg_core::{
     NodeRecord, Predicate, Projection, QueryIr, QueryRelation, RelationalStore, ScalarValue,
 };
 use rustyred_thg_datawave::{
-    DatawaveError, DatawaveIngest, EdgeDef, FieldConfig, FieldType, IndexPolicy, IngestStats,
-    JsonHelper, MaterializeConfig, RawRecord, FIELD_FACT_LABEL,
+    parse_document_with_liteparse, DatawaveError, DatawaveIngest, DocumentParseError,
+    DocumentParseInput, EdgeDef, FieldConfig, FieldType, IndexPolicy, IngestStats, JsonHelper,
+    MaterializeConfig, RawRecord, FIELD_FACT_LABEL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -92,6 +93,24 @@ pub fn rustyweb_datawave_ingest(tenant_id: Option<String>) -> DatawaveIngest {
         .with_edge(EdgeDef::new("PAGE_HAS_CONTENT", "url", "content_hash"))
         .with_edge(EdgeDef::new("PAGE_IN_RUN", "url", "run_id"));
     ingest
+}
+
+pub async fn document_record_from_fetched_pdf(
+    url: impl Into<String>,
+    content_type: impl Into<String>,
+    bytes: Vec<u8>,
+) -> Result<RawRecord, DocumentParseError> {
+    let url = url.into();
+    let content_type = content_type.into();
+    let document_id = format!("rustyweb_pdf:{}", blake3::hash(url.as_bytes()).to_hex());
+    let parsed = parse_document_with_liteparse(DocumentParseInput::PdfBytes {
+        document_id,
+        source_uri: url,
+        content_type,
+        bytes,
+    })
+    .await?;
+    Ok(parsed.to_raw_record(0))
 }
 
 pub fn datawave_records_from_crawl_graph(graph: &CrawlGraph) -> Vec<RawRecord> {
@@ -847,5 +866,36 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, "too_many_rustyweb_query_predicates");
+    }
+
+    #[tokio::test]
+    async fn fetched_pdf_routes_to_document_datawave_record() {
+        let record = document_record_from_fetched_pdf(
+            "https://example.com/blank.pdf",
+            "application/pdf",
+            blank_pdf(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(record.data_type, rustyred_thg_datawave::DOCUMENT_DATA_TYPE);
+        let body = record.body.as_json().unwrap();
+        assert_eq!(body["source_uri"], json!("https://example.com/blank.pdf"));
+        assert_eq!(body["parse_state"], json!("needs_heavy_path"));
+        assert!(body["hard_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "no-text"));
+    }
+
+    fn blank_pdf() -> Vec<u8> {
+        br#"%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF
+"#
+        .to_vec()
     }
 }
