@@ -1,6 +1,6 @@
 use crate::head_invoker::{
-    object_payload, prompt_for_request, provider_send_error, provider_summary,
-    system_instruction_for_request, truncate_detail, CredentialResolver, EndpointMap,
+    object_payload, provider_prompt_for_request, provider_send_error, provider_summary,
+    truncate_detail, CredentialResolver, EndpointMap,
 };
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
@@ -151,8 +151,7 @@ fn invoke_anthropic_messages(
     fallback_cost_units: f64,
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
-    let prompt = prompt_for_request(&request);
-    let system_instruction = system_instruction_for_request(&request);
+    let prompt = provider_prompt_for_request(&request);
     let response = http
         .post(endpoint)
         .header("x-api-key", api_key)
@@ -161,8 +160,8 @@ fn invoke_anthropic_messages(
             "model": request.head.model,
             "max_tokens": 1024,
             "temperature": 0.2,
-            "system": system_instruction,
-            "messages": [{ "role": "user", "content": prompt }]
+            "system": prompt.system_prompt,
+            "messages": [{ "role": "user", "content": prompt.user_prompt }]
         }))
         .send()
         .map_err(|error| provider_send_error(&request, error))?;
@@ -221,8 +220,7 @@ pub(crate) fn invoke_openai_chat_completions(
     fallback_cost_units: f64,
     request: HeadInvocationRequest,
 ) -> Result<HeadInvocationReceipt, HeadInvocationError> {
-    let prompt = prompt_for_request(&request);
-    let system_instruction = system_instruction_for_request(&request);
+    let prompt = provider_prompt_for_request(&request);
     let mut builder = http.post(endpoint);
     if let Some(api_key) = api_key
         .as_deref()
@@ -235,8 +233,8 @@ pub(crate) fn invoke_openai_chat_completions(
         .json(&json!({
             "model": request.head.model,
             "messages": [
-                { "role": "system", "content": system_instruction },
-                { "role": "user", "content": prompt }
+                { "role": "system", "content": prompt.system_prompt },
+                { "role": "user", "content": prompt.user_prompt }
             ],
             "temperature": 0.2,
             "max_tokens": 1024

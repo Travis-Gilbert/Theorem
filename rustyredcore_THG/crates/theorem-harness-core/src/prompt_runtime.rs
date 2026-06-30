@@ -419,6 +419,27 @@ pub fn evaluate_runtime_refinement(
         },
         CriticRoute::EpistemicTraits => {
             let observations = fitness_observations_from_claims(&receipt.claims);
+            if observations.is_empty() {
+                let violations = vec![AbsoluteFitnessViolation {
+                    trait_name: "grounded_claims".to_string(),
+                    observed: 0.0,
+                    minimum: 1.0,
+                }];
+                return RuntimeRefinementDecision {
+                    critic_route: CriticRoute::EpistemicTraits,
+                    should_refine: true,
+                    observations,
+                    scores: Some(FitnessTraitScores {
+                        root_depth: 0.0,
+                        source_independence: 0.0,
+                        support_ratio: 0.0,
+                        claim_specificity: 0.0,
+                        temporal_spread: 0.0,
+                    }),
+                    feedback: refinement_feedback(&violations),
+                    violations,
+                };
+            }
             let scores = measure_fitness_traits(&observations);
             let violations = absolute_violations(&scores, &config.fitness_bar);
             RuntimeRefinementDecision {
@@ -793,6 +814,36 @@ mod tests {
             .violations
             .iter()
             .any(|violation| violation.trait_name == "source_independence"));
+    }
+
+    #[test]
+    fn missing_claim_output_refines_with_grounding_violation() {
+        let request = request_fixture("answer");
+        let initial = HeadInvocationReceipt::from_request(
+            &request,
+            "ungrounded",
+            Map::from_iter([("text".to_string(), json!("ungrounded"))]),
+            1.0,
+        );
+        let invoker = RefiningInvoker::default();
+
+        let result = refine_with_invoker(
+            &invoker,
+            request,
+            initial,
+            OutputKind::ClaimBearing,
+            RuntimeRefinementConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.receipts.len(), 2);
+        assert_eq!(invoker.calls.borrow().len(), 1);
+        assert!(result.decisions[0].should_refine);
+        assert!(result.decisions[0]
+            .violations
+            .iter()
+            .any(|violation| violation.trait_name == "grounded_claims"));
+        assert!(invoker.calls.borrow()[0].contains("grounded_claims"));
     }
 
     #[test]

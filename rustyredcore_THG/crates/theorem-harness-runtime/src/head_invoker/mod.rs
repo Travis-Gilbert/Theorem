@@ -172,19 +172,33 @@ impl HeadInvoker for RealHeadInvoker {
 
 pub type ProviderHeadInvoker = RealHeadInvoker;
 
-pub(crate) fn prompt_for_request(request: &HeadInvocationRequest) -> String {
+pub(crate) struct ProviderPrompt {
+    pub(crate) system_prompt: String,
+    pub(crate) user_prompt: String,
+}
+
+pub(crate) fn provider_prompt_for_request(request: &HeadInvocationRequest) -> ProviderPrompt {
     let spec = prompt_spec_for_request(request);
     let rendered = MarkerRenderer.render(&spec);
-    let mut prompt = rendered
+    let system_prompt = rendered
+        .messages
+        .iter()
+        .find(|message| message.role == "system")
+        .map(|message| message.content.clone())
+        .unwrap_or_else(|| system_instruction_for_request(request));
+    let mut user_prompt = rendered
         .messages
         .iter()
         .find(|message| message.role == "user")
         .map(|message| message.content.clone())
         .unwrap_or_default();
-    prompt.push_str(
+    user_prompt.push_str(
         "\nReturn a concise answer. End with a line `Claims JSON:` followed by a JSON array of objects with `text` and `provenance` fields for the claims you assert.\n",
     );
-    prompt
+    ProviderPrompt {
+        system_prompt,
+        user_prompt,
+    }
 }
 
 pub(crate) fn prompt_spec_for_request(request: &HeadInvocationRequest) -> PromptSpec {
@@ -409,7 +423,7 @@ mod tests {
             0.75,
         )]);
 
-        let prompt = prompt_for_request(&request);
+        let prompt = provider_prompt_for_request(&request).user_prompt;
 
         assert!(prompt.contains("scratchrev:1"));
         assert!(prompt.contains("proposal body"));
@@ -417,6 +431,30 @@ mod tests {
         assert!(prompt.contains("scratchpad.crdt.scratchpad_default"));
         assert!(prompt.contains("Context membrane primes"));
         assert!(prompt.contains("context:ambient"));
+    }
+
+    #[test]
+    fn provider_prompt_preserves_rendered_static_blocks() {
+        let mut head = head("openai", HeadTransport::Api);
+        head.allowed_tools = vec!["ambient_code".to_string()];
+        let request = HeadInvocationRequest::new(
+            head,
+            HeadInvocationKind::Proposal,
+            "draft the adapter",
+            1,
+            Vec::new(),
+            Vec::new(),
+            "2026-06-08T00:00:00Z",
+        )
+        .with_constitution(Some("Keep a careful voice.".to_string()));
+
+        let prompt = provider_prompt_for_request(&request);
+
+        assert!(prompt.system_prompt.contains("ambient_code"));
+        assert!(prompt.system_prompt.contains("Keep a careful voice."));
+        assert!(prompt.system_prompt.contains("claims_json"));
+        assert!(prompt.user_prompt.contains("draft the adapter"));
+        assert!(!prompt.user_prompt.contains("Keep a careful voice."));
     }
 
     fn head(provider: &str, transport: HeadTransport) -> ResolvedAgentHead {
