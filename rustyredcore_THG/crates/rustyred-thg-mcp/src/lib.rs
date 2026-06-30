@@ -1734,6 +1734,18 @@ fn call_tool<P: McpGraphProvider>(
         "read_intents_for_room" | "theorem_harness_read_intents_for_room" => {
             read_intents_payload(&tenant, &backend, &arguments)?
         }
+        "list_wakeable_heads" | "theorem_harness_list_wakeable_heads" => {
+            list_wakeable_heads_payload(&tenant)
+        }
+        "wake_model" | "theorem_harness_wake_model" | "wake_head" | "theorem_harness_wake_head" => {
+            if config.read_only {
+                return Ok(tool_result_error(json!({
+                    "error": "mcp_read_only",
+                    "message": "Model/head wake requests are unavailable while read-only mode is active."
+                })));
+            }
+            wake_model_payload(&tenant, &mut backend, &arguments)?
+        }
         "coordinate" | "theorem_harness_coordinate" => {
             if config.read_only {
                 return Ok(tool_result_error(json!({
@@ -5005,6 +5017,329 @@ fn coordinate_payload(
         "urgency": message.urgency,
         "created_at": message.created_at
     }))
+}
+
+#[derive(Clone, Copy)]
+struct WakeableHeadDefinition {
+    head_id: &'static str,
+    display_name: &'static str,
+    provider: &'static str,
+    model: &'static str,
+    aliases: &'static [&'static str],
+    note: &'static str,
+}
+
+const DEFAULT_WAKE_RUNNER_ACTOR: &str = "theorem";
+const WAKE_ROUTE_THEOREM_COMPOSED_AGENT: &str = "theorem_composed_agent";
+const WAKE_ROUTE_DIRECT_HEAD_MENTIONS: &str = "direct_head_mentions";
+
+const WAKEABLE_HEADS: &[WakeableHeadDefinition] = &[
+    WakeableHeadDefinition {
+        head_id: "mistral",
+        display_name: "Mistral Small",
+        provider: "mistral",
+        model: "mistral-small-latest",
+        aliases: &["mistral", "mistral small", "small", "mistral-small"],
+        note: "Routes through the Harness wake path as the Mistral-family head.",
+    },
+    WakeableHeadDefinition {
+        head_id: "qwen",
+        display_name: "Qwen 3.7 Max",
+        provider: "qwen",
+        model: "qwen3.7-max",
+        aliases: &[
+            "qwen",
+            "qwen 3.7 max",
+            "qwen3.7 max",
+            "qwen3.7-max",
+            "qwen-3.7-max",
+            "quinn",
+            "quinn 3.7 max",
+            "quinn3.7 max",
+            "quinn3.7-max",
+            "quinn-3.7-max",
+        ],
+        note: "Routes Qwen/Quinn spellings to the Qwen-family Harness head.",
+    },
+    WakeableHeadDefinition {
+        head_id: "deepseek",
+        display_name: "DeepSeek",
+        provider: "deepseek",
+        model: "deepseek-reasoner",
+        aliases: &[
+            "deepseek",
+            "deep seek",
+            "deepseek reasoner",
+            "deepseek-reasoner",
+        ],
+        note: "Routes through the Harness wake path; direct DeepSeek MCP may also be present.",
+    },
+];
+
+fn list_wakeable_heads_payload(tenant: &str) -> Value {
+    json!({
+        "tenant": tenant,
+        "default_runner_actor": DEFAULT_WAKE_RUNNER_ACTOR,
+        "default_wake_route": WAKE_ROUTE_THEOREM_COMPOSED_AGENT,
+        "heads": WAKEABLE_HEADS
+            .iter()
+            .map(wakeable_head_definition_json)
+            .collect::<Vec<_>>(),
+        "count": WAKEABLE_HEADS.len()
+    })
+}
+
+fn wake_model_payload(
+    tenant: &str,
+    backend: &mut impl McpGraphBackend,
+    arguments: &Value,
+) -> Result<Value, McpError> {
+    let actor_id = required_text_any(arguments, &["actor", "actor_id", "actorId"], "wake_model")?;
+    let intent = required_text_any(
+        arguments,
+        &["intent", "prompt", "task", "message"],
+        "wake_model",
+    )?;
+    let targets = wake_target_inputs(arguments);
+    if targets.is_empty() {
+        return Err(McpError::invalid_params(
+            "wake_model requires target/model/head or targets/models/heads",
+        ));
+    }
+
+    let resolved_targets = resolve_wake_targets(targets);
+    let wake_target_head_ids = wake_target_head_ids(&resolved_targets);
+    let direct_head_mentions = argument_bool_any(
+        arguments,
+        &[
+            "direct_head_mentions",
+            "directHeadMentions",
+            "direct_actor_mentions",
+            "directActorMentions",
+        ],
+    )
+    .unwrap_or(false);
+    let runner_actor = argument_text(
+        arguments,
+        &["runner_actor", "runnerActor", "wake_actor", "wakeActor"],
+    )
+    .map(|actor| normalize_actor_id(&actor))
+    .filter(|actor| !actor.is_empty())
+    .unwrap_or_else(|| DEFAULT_WAKE_RUNNER_ACTOR.to_string());
+    let wake_route = if direct_head_mentions {
+        WAKE_ROUTE_DIRECT_HEAD_MENTIONS
+    } else {
+        WAKE_ROUTE_THEOREM_COMPOSED_AGENT
+    };
+    let computed_mentions = if direct_head_mentions {
+        wake_target_head_ids.clone()
+    } else {
+        vec![runner_actor.clone()]
+    };
+    let mentions = normalize_actor_vec(
+        computed_mentions
+            .into_iter()
+            .chain(string_array_any(arguments, &["mentions"]))
+            .collect(),
+    );
+    if mentions.is_empty() {
+        return Err(McpError::invalid_params(
+            "wake_model could not resolve any wake targets",
+        ));
+    }
+
+    let room_id = resolved_coordination_room_id(arguments);
+    let message = argument_text(arguments, &["message"]).unwrap_or_else(|| {
+        let mention_text = mentions
+            .iter()
+            .map(|mention| format!("@{mention}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if direct_head_mentions {
+            format!("{mention_text} wake request: {intent}")
+        } else {
+            let target_summary = wake_target_head_ids.join(", ");
+            format!("{mention_text} wake request for {target_summary}: {intent}")
+        }
+    });
+    let mut metadata = argument_object(arguments, "metadata");
+    metadata.insert("wake_tool".to_string(), json!("wake_model"));
+    metadata.insert("wake_route".to_string(), json!(wake_route));
+    metadata.insert("runner_actor".to_string(), json!(runner_actor));
+    metadata.insert(
+        "direct_head_mentions".to_string(),
+        json!(direct_head_mentions),
+    );
+    metadata.insert(
+        "wake_targets".to_string(),
+        Value::Array(resolved_targets.clone()),
+    );
+    metadata.insert(
+        "wake_target_head_ids".to_string(),
+        json!(wake_target_head_ids.clone()),
+    );
+    metadata.insert("intent".to_string(), Value::String(intent));
+    let context_refs = string_array_any(arguments, &["context_refs", "contextRefs", "refs"]);
+    if !context_refs.is_empty() {
+        metadata.insert("context_refs".to_string(), json!(context_refs));
+    }
+
+    let message = write_coordination_message(
+        backend,
+        WriteMessageInput {
+            tenant_slug: tenant.to_string(),
+            room_id: room_id.clone(),
+            actor_id,
+            message_id: argument_text(arguments, &["message_id", "messageId"]).unwrap_or_default(),
+            urgency: argument_text(arguments, &["urgency"]).unwrap_or_else(|| "ask".to_string()),
+            delivery: "wake".to_string(),
+            message,
+            mentions,
+            metadata,
+            created_at: argument_text(arguments, &["created_at", "createdAt"]).unwrap_or_default(),
+        },
+    )?;
+    let (stream_event_id, stream_ordering_token) =
+        persist_coordination_message_stream_event(tenant, backend, &message)?;
+    Ok(json!({
+        "tenant": tenant,
+        "ok": true,
+        "tool": "wake_model",
+        "room_id": room_id,
+        "message_id": message.message_id,
+        "stream_event_id": stream_event_id,
+        "stream_ordering_token": stream_ordering_token,
+        "mentions": message.mentions,
+        "delivery": message.delivery,
+        "unread_count": message.mentions.len(),
+        "urgency": message.urgency,
+        "created_at": message.created_at,
+        "wake_route": wake_route,
+        "runner_actor": runner_actor,
+        "wake_target_head_ids": wake_target_head_ids,
+        "wake_targets": resolved_targets
+    }))
+}
+
+fn wakeable_head_definition_json(definition: &WakeableHeadDefinition) -> Value {
+    json!({
+        "head_id": definition.head_id,
+        "display_name": definition.display_name,
+        "provider": definition.provider,
+        "model": definition.model,
+        "aliases": definition.aliases,
+        "note": definition.note
+    })
+}
+
+fn wake_target_inputs(arguments: &Value) -> Vec<String> {
+    let mut targets = Vec::new();
+    for key in [
+        "target",
+        "model",
+        "head",
+        "target_actor",
+        "targetActor",
+        "target_model",
+        "targetModel",
+    ] {
+        if let Some(value) = argument_text(arguments, &[key]) {
+            targets.push(value);
+        }
+    }
+    for key in [
+        "targets",
+        "models",
+        "heads",
+        "target_actors",
+        "targetActors",
+        "target_models",
+        "targetModels",
+    ] {
+        if let Some(items) = arguments.get(key) {
+            match items {
+                Value::Array(values) => {
+                    targets.extend(
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    );
+                }
+                Value::String(value) if !value.trim().is_empty() => {
+                    targets.push(value.trim().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    normalize_string_vec(targets)
+}
+
+fn resolve_wake_targets(targets: Vec<String>) -> Vec<Value> {
+    targets
+        .into_iter()
+        .map(|input| {
+            if let Some(definition) = wakeable_head_for(&input) {
+                json!({
+                    "input": input,
+                    "head_id": definition.head_id,
+                    "display_name": definition.display_name,
+                    "provider": definition.provider,
+                    "model": definition.model,
+                    "matched": "known_alias"
+                })
+            } else {
+                let head_id = normalize_actor_id(&input);
+                json!({
+                    "input": input,
+                    "head_id": head_id,
+                    "display_name": head_id,
+                    "provider": "harness",
+                    "model": "unknown",
+                    "matched": "literal_actor"
+                })
+            }
+        })
+        .collect()
+}
+
+fn wake_target_head_ids(resolved_targets: &[Value]) -> Vec<String> {
+    normalize_actor_vec(
+        resolved_targets
+            .iter()
+            .filter_map(|target| target.get("head_id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn wakeable_head_for(input: &str) -> Option<&'static WakeableHeadDefinition> {
+    let key = wake_alias_key(input);
+    WAKEABLE_HEADS.iter().find(|definition| {
+        wake_alias_key(definition.head_id) == key
+            || wake_alias_key(definition.display_name) == key
+            || wake_alias_key(definition.model) == key
+            || definition
+                .aliases
+                .iter()
+                .any(|alias| wake_alias_key(alias) == key)
+    })
+}
+
+fn wake_alias_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn argument_bool_any(arguments: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_bool))
 }
 
 fn persist_coordination_message_stream_event(
@@ -11107,6 +11442,10 @@ fn coordination_tool_requires_tenant(tool_name: &str) -> bool {
             | "theorem_harness_write_intent"
             | "read_intents_for_room"
             | "theorem_harness_read_intents_for_room"
+            | "wake_model"
+            | "theorem_harness_wake_model"
+            | "wake_head"
+            | "theorem_harness_wake_head"
             | "coordinate"
             | "theorem_harness_coordinate"
             | "stream_publish"
@@ -13838,6 +14177,17 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
             }),
         ),
         tool(
+            "list_wakeable_heads",
+            "List friendly model/head names the Harness wake surface can resolve before writing a wake request.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
             "stream_read",
             "Pull the append-only coordination events after your stored cursor on your subscribed streams (or explicit streams[]). The passive, cursor-delta read that replaces the room poll; advance=true (default) consumes the window once.",
             json!({
@@ -15080,6 +15430,41 @@ fn tool_definitions(config: &McpServerConfig) -> Vec<Value> {
                     "metadata": { "type": "object" }
                 },
                 "required": ["actor", "message"]
+            }),
+        ));
+        tools.push(tool_write(
+            "wake_model",
+            "Wake one or more Harness model heads by friendly name. Defaults to @theorem so the composed-agent room runner fans out to provider heads; set direct_head_mentions=true for per-head actor runners.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string" },
+                    "tenant_slug": { "type": "string" },
+                    "room_id": { "type": "string" },
+                    "actor": { "type": "string" },
+                    "actor_id": { "type": "string" },
+                    "target": { "type": "string" },
+                    "target_actor": { "type": "string" },
+                    "target_model": { "type": "string" },
+                    "model": { "type": "string" },
+                    "head": { "type": "string" },
+                    "targets": { "type": "array", "items": { "type": "string" } },
+                    "models": { "type": "array", "items": { "type": "string" } },
+                    "heads": { "type": "array", "items": { "type": "string" } },
+                    "runner_actor": { "type": "string", "default": "theorem" },
+                    "runnerActor": { "type": "string" },
+                    "direct_head_mentions": { "type": "boolean", "default": false },
+                    "directHeadMentions": { "type": "boolean" },
+                    "intent": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "task": { "type": "string" },
+                    "message": { "type": "string" },
+                    "urgency": { "type": "string", "enum": ["info", "ask", "block"], "default": "ask" },
+                    "context_refs": { "type": "array", "items": { "type": "string" } },
+                    "mentions": { "type": "array", "items": { "type": "string" } },
+                    "metadata": { "type": "object" }
+                },
+                "required": ["actor"]
             }),
         ));
         tools.push(tool_write(
@@ -18973,6 +19358,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "harness_kg_status"));
         assert!(has_tool(tools, "read_intents_for_room"));
         assert!(has_tool(tools, "read_messages_for_room"));
+        assert!(has_tool(tools, "list_wakeable_heads"));
         assert!(has_tool(tools, "read_records_for_room"));
         assert!(has_tool(tools, "coordination_context"));
         assert!(has_tool(tools, "harness_run"));
@@ -19053,6 +19439,7 @@ mod tests {
         assert!(!has_tool(tools, "presence"));
         assert!(!has_tool(tools, "coordination_intent"));
         assert!(!has_tool(tools, "coordinate"));
+        assert!(!has_tool(tools, "wake_model"));
         assert!(!has_tool(tools, "coordination_record"));
         assert!(!has_tool(tools, "coordination_contribution"));
         assert!(!has_tool(tools, "harness_append_transition"));
@@ -19964,6 +20351,8 @@ mod tests {
         assert!(has_tool(tools, "presence"));
         assert!(has_tool(tools, "coordination_intent"));
         assert!(has_tool(tools, "coordinate"));
+        assert!(has_tool(tools, "wake_model"));
+        assert!(has_tool(tools, "list_wakeable_heads"));
         assert!(has_tool(tools, "rustyweb_search_acquisition"));
         assert!(has_tool(tools, "fractal_expansion"));
         assert!(has_tool(tools, "web_consume"));
@@ -20713,7 +21102,10 @@ mod tests {
         assert_eq!(intent["intent"]["scratchpad_seq"], 1);
         assert_eq!(
             intent["intent"]["binding_active_head_set"],
-            json!(["ai21", "codex", "deepseek", "gemma", "minimax", "mistral", "openai", "zhipu"])
+            json!([
+                "ai21", "codex", "deepseek", "gemma", "minimax", "mistral", "openai", "qwen",
+                "zhipu"
+            ])
         );
 
         let mut room_events = subscribe_coordination_room_events();
@@ -20976,6 +21368,129 @@ mod tests {
             contributions["records"][0]["metadata"]["status"],
             "validated"
         );
+    }
+
+    #[test]
+    fn wake_model_normalizes_friendly_names_and_writes_wake_message() {
+        let (provider, mut config) = fixture();
+        config.read_only = false;
+
+        let heads = call_tool_json(
+            &provider,
+            &config,
+            "list_wakeable_heads",
+            json!({ "tenant": "smoke" }),
+        );
+        assert_eq!(heads["count"], json!(3));
+        assert!(heads["heads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|head| head["head_id"] == "qwen"));
+
+        let wake = call_tool_json(
+            &provider,
+            &config,
+            "wake_model",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "wake-test",
+                "targets": ["Mistral", "Quinn 3.7 Max", "DeepSeek"],
+                "intent": "Review the spreading activation plan.",
+                "context_refs": ["file:.harness/checklist-spreading-nli-completion.json"],
+                "created_at": "2026-06-01T00:07:00Z"
+            }),
+        );
+        assert_eq!(wake["ok"], true);
+        assert_eq!(wake["tool"], "wake_model");
+        assert_eq!(wake["delivery"], "wake");
+        assert_eq!(wake["urgency"], "ask");
+        assert_eq!(wake["wake_route"], "theorem_composed_agent");
+        assert_eq!(wake["runner_actor"], "theorem");
+        assert_eq!(wake["mentions"], json!(["theorem"]));
+        assert_eq!(wake["unread_count"], 1);
+        assert_eq!(
+            wake["wake_target_head_ids"],
+            json!(["mistral", "qwen", "deepseek"])
+        );
+        assert_eq!(wake["wake_targets"][1]["input"], "Quinn 3.7 Max");
+        assert_eq!(wake["wake_targets"][1]["head_id"], "qwen");
+        assert_eq!(wake["wake_targets"][1]["matched"], "known_alias");
+
+        let messages = call_tool_json(
+            &provider,
+            &config,
+            "read_messages_for_room",
+            json!({
+                "tenant": "smoke",
+                "room_id": "wake-test"
+            }),
+        );
+        assert_eq!(messages["count"], 1);
+        assert_eq!(messages["messages"][0]["delivery"], "wake");
+        assert_eq!(
+            messages["messages"][0]["message"],
+            "@theorem wake request for mistral, qwen, deepseek: Review the spreading activation plan."
+        );
+        assert_eq!(
+            messages["messages"][0]["metadata"]["context_refs"],
+            json!(["file:.harness/checklist-spreading-nli-completion.json"])
+        );
+        assert_eq!(
+            messages["messages"][0]["metadata"]["wake_route"],
+            json!("theorem_composed_agent")
+        );
+        assert_eq!(
+            messages["messages"][0]["metadata"]["wake_target_head_ids"],
+            json!(["mistral", "qwen", "deepseek"])
+        );
+
+        let theorem_mentions = call_tool_json(
+            &provider,
+            &config,
+            "mentions",
+            json!({
+                "tenant": "smoke",
+                "actor": "theorem",
+                "consume": false
+            }),
+        );
+        assert_eq!(theorem_mentions["count"], 1);
+        assert_eq!(theorem_mentions["mentions"][0]["actor_id"], "codex");
+        assert_eq!(
+            theorem_mentions["mentions"][0]["metadata"]["wake_targets"][1]["head_id"],
+            "qwen"
+        );
+
+        let direct = call_tool_json(
+            &provider,
+            &config,
+            "wake_model",
+            json!({
+                "tenant": "smoke",
+                "actor": "codex",
+                "room_id": "wake-direct-test",
+                "targets": ["Mistral", "Quinn 3.7 Max"],
+                "intent": "Review as separate visible head actors.",
+                "direct_head_mentions": true
+            }),
+        );
+        assert_eq!(direct["wake_route"], "direct_head_mentions");
+        assert_eq!(direct["mentions"], json!(["mistral", "qwen"]));
+
+        let qwen_mentions = call_tool_json(
+            &provider,
+            &config,
+            "mentions",
+            json!({
+                "tenant": "smoke",
+                "actor": "qwen",
+                "consume": false
+            }),
+        );
+        assert_eq!(qwen_mentions["count"], 1);
+        assert_eq!(qwen_mentions["mentions"][0]["room_id"], "wake-direct-test");
     }
 
     #[test]

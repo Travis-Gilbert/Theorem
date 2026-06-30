@@ -187,17 +187,10 @@ pub fn run_agent_room_cycle<S: GraphStore, I: HeadInvoker>(
     )?;
     let mut turns = Vec::new();
     for mention in mentions {
-        let claims = vec![GroundedClaim::new(
-            mention.message.clone(),
-            format!("coordination_message:{}", mention.message_id),
-        )];
-        let turn = match run_composed_agent_with_claims(
-            store,
-            &binding_id,
-            &mention.message,
-            claims,
-            invoker,
-        ) {
+        let task = task_for_mention(&mention);
+        let claims = claims_for_mention(&mention);
+        let turn = match run_composed_agent_with_claims(store, &binding_id, &task, claims, invoker)
+        {
             Ok(result) if alignment_allowed(&result) => {
                 let contribution =
                     write_contribution(store, &config, &actor_id, &mention, &result)?;
@@ -280,6 +273,44 @@ pub fn run_agent_room_cycle<S: GraphStore, I: HeadInvoker>(
         presence,
         turns,
     })
+}
+
+fn task_for_mention(mention: &CoordinationMessageState) -> String {
+    let mut task = mention.message.clone();
+    if let Some(heads) = wake_target_head_ids(mention) {
+        task.push_str("\n\nRequested provider heads: ");
+        task.push_str(&heads.join(", "));
+        task.push('.');
+    }
+    task
+}
+
+fn claims_for_mention(mention: &CoordinationMessageState) -> Vec<GroundedClaim> {
+    let mut claims = vec![GroundedClaim::new(
+        mention.message.clone(),
+        format!("coordination_message:{}", mention.message_id),
+    )];
+    if let Some(heads) = wake_target_head_ids(mention) {
+        claims.push(GroundedClaim::new(
+            format!("Requested provider heads: {}", heads.join(", ")),
+            format!("coordination_message:{}#wake_targets", mention.message_id),
+        ));
+    }
+    claims
+}
+
+fn wake_target_head_ids(mention: &CoordinationMessageState) -> Option<Vec<String>> {
+    let heads = mention
+        .metadata
+        .get("wake_target_head_ids")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|head| !head.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!heads.is_empty()).then_some(heads)
 }
 
 fn write_contribution<S: GraphStore>(
@@ -495,6 +526,38 @@ mod tests {
                 detail: "simulated upstream provider failure".to_string(),
             })
         }
+    }
+
+    #[test]
+    fn runner_task_and_claims_include_wake_target_metadata() {
+        let mut metadata = Map::new();
+        metadata.insert(
+            "wake_target_head_ids".to_string(),
+            json!(["mistral", "qwen", "deepseek"]),
+        );
+        let mention = CoordinationMessageState {
+            tenant_slug: "tenant-a".to_string(),
+            room_id: "room:a".to_string(),
+            message_id: "msg:wake".to_string(),
+            actor_id: "codex".to_string(),
+            urgency: "ask".to_string(),
+            delivery: "wake".to_string(),
+            message: "@theorem please review".to_string(),
+            mentions: vec!["theorem".to_string()],
+            metadata,
+            consumed_by: Vec::new(),
+            created_at: String::new(),
+        };
+
+        let task = task_for_mention(&mention);
+        let claims = claims_for_mention(&mention);
+
+        assert!(task.contains("Requested provider heads: mistral, qwen, deepseek."));
+        assert_eq!(claims.len(), 2);
+        assert_eq!(
+            claims[1].text,
+            "Requested provider heads: mistral, qwen, deepseek"
+        );
     }
 
     #[test]

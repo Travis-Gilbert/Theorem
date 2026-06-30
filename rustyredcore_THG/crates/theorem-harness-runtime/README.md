@@ -19,12 +19,31 @@ Path deps: `rustyred-thg-affordances`, `rustyred-thg-core`, `theorem-harness-cor
 For the API-backed composed-agent binding:
 
 ```bash
-THEOREM_AGENT_HEADS=deepseek,mistral,minimax
-DEEPSEEK_API_KEY=...   # plus MISTRAL_API_KEY, MINIMAX_API_KEY
+THEOREM_AGENT_HEADS=deepseek,mistral,qwen,minimax
+DEEPSEEK_API_KEY=...   # plus MISTRAL_API_KEY, QWEN_API_KEY or DASHSCOPE_API_KEY, MINIMAX_API_KEY
 THEOREM_HEAD_INVOKER=real
 ```
 
-Override models with `DEEPSEEK_MODEL` / `MISTRAL_MODEL` / `MINIMAX_MODEL`; endpoints with `*_CHAT_URL`. `HeadTransport::Local` uses `THEOREM_LOCAL_OPENAI_URL` (default `http://127.0.0.1:8080/v1/chat/completions`). Production `run_composed_agent` allocates `THEOREM_COMPOSED_AGENT_BUDGET_UNITS` (default 5000).
+Override models with `DEEPSEEK_MODEL` / `MISTRAL_MODEL` / `QWEN_MODEL` / `MINIMAX_MODEL`; endpoints with `*_CHAT_URL`. Qwen defaults to the DashScope OpenAI-compatible endpoint and can be overridden with `QWEN_CHAT_URL`. `HeadTransport::Local` uses `THEOREM_LOCAL_OPENAI_URL` (default `http://127.0.0.1:8080/v1/chat/completions`). Production `run_composed_agent` allocates `THEOREM_COMPOSED_AGENT_BUDGET_UNITS` (default 5000).
+
+## Room runner
+
+`agent_runner.rs` is the Harness-native participation layer. It consumes unhandled room mentions for an actor (default `theorem`), calls `run_composed_agent_with_claims`, and writes an alignment-gated contribution/reflection back to the same room. `wake_model` requests should normally mention `@theorem` and carry requested provider heads in `wake_target_head_ids`; the runner threads those head ids into the task and grounding claims before invoking the composed agent.
+
+Hosted `theorem-harness-server` enables this with:
+
+```bash
+THEOREM_AGENT_ROOM_RUNNER=1
+THEOREM_AGENT_TENANT_SLUG=Travis-Gilbert
+THEOREM_AGENT_ROOM_ID=theorem-spreading-nli-completion
+THEOREM_AGENT_ACTOR_ID=theorem
+THEOREM_AGENT_HEADS=mistral,qwen,deepseek
+MISTRAL_API_KEY=...
+QWEN_API_KEY=...        # or DASHSCOPE_API_KEY
+DEEPSEEK_API_KEY=...
+```
+
+Optional operator knobs: `THEOREM_AGENT_BINDING_ID`, `THEOREM_AGENT_RUNNER_INTERVAL_MS`, `THEOREM_AGENT_SURFACE`, `THEOREM_AGENT_REPO`, `THEOREM_AGENT_BRANCH`, `THEOREM_AGENT_TASK`, `THEOREM_AGENT_WORKTREE`, and `THEOREM_AGENT_REPLY_TO_REQUESTER=1`. Per-head visible room actors can be added later by running separate runners with `THEOREM_AGENT_ACTOR_ID=qwen` plus `THEOREM_AGENT_HEADS=qwen`, but the default `@theorem` runner is the composed-agent path.
 
 ## Build and test
 

@@ -3,8 +3,8 @@
 //! The tracer goal is "pick a configured head, type a task, a real turn comes
 //! back." This test proves the provider path directly through
 //! `RealHeadInvoker`/`ProviderHeadInvoker` and the live provider HTTP profiles
-//! in `head_invoker/api.rs` (anthropic, deepseek, mistral, minimax, zhipu,
-//! openai, ai21, gemma).
+//! in `head_invoker/api.rs` (anthropic, deepseek, mistral, qwen, minimax,
+//! zhipu, openai, ai21, gemma).
 //!
 //! It lowers the bar from the three-key
 //! `composed_agent::tests::live_provider_invoker_runs_three_head_binding_when_enabled`
@@ -17,6 +17,8 @@
 //!   cargo test -p theorem-harness-runtime --test live_single_head_smoke -- --ignored --nocapture
 //!
 //! DeepSeek:      THEOREM_AGENT_HEADS=deepseek DEEPSEEK_API_KEY=...
+//! Qwen:          THEOREM_AGENT_HEADS=qwen QWEN_API_KEY=...
+//!                (or DASHSCOPE_API_KEY; set QWEN_CHAT_URL for custom regions)
 //! Two heads:     THEOREM_AGENT_HEADS=mistral,deepseek (also lets the >=2-head
 //!                consensus gate publish, not just answer).
 //! Local Gemma:   THEOREM_AGENT_HEADS=gemma THEOREM_LOCAL_OPENAI_URL=http://127.0.0.1:8080/v1/chat/completions

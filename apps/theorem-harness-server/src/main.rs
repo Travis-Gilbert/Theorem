@@ -23,7 +23,9 @@
 //! Reads the same store the runtime persists runs to. Set the data dir with
 //! `THEOREM_HARNESS_DATA_DIR` (default `harness-data`) and the port with `PORT`
 //! (default `50080`). Empty store -> empty list (honest; runs appear as the
-//! harness writes them).
+//! harness writes them). Set `THEOREM_AGENT_ROOM_RUNNER=1` to run the
+//! Harness-native `@theorem` room participant: it consumes room mentions and
+//! invokes configured provider heads through `run_composed_agent_with_claims`.
 
 use std::sync::{Arc, Mutex};
 
@@ -276,13 +278,24 @@ fn maybe_spawn_theorem_agent_runner(state: SharedStore) {
         std::env::var("THEOREM_AGENT_ROOM_ID").unwrap_or_else(|_| DEFAULT_JOB_ROOM_ID.to_string());
     let binding_id = std::env::var("THEOREM_AGENT_BINDING_ID")
         .unwrap_or_else(|_| DEFAULT_BINDING_ID.to_string());
+    let actor_id = std::env::var("THEOREM_AGENT_ACTOR_ID")
+        .or_else(|_| std::env::var("THEOREM_AGENT_ACTOR"))
+        .unwrap_or_else(|_| "theorem".to_string());
+    let surface = std::env::var("THEOREM_AGENT_SURFACE")
+        .unwrap_or_else(|_| "theorem-agent-runner".to_string());
+    let repo = std::env::var("THEOREM_AGENT_REPO").unwrap_or_else(|_| "Theorem".to_string());
+    let branch = std::env::var("THEOREM_AGENT_BRANCH").unwrap_or_else(|_| "main".to_string());
+    let task = std::env::var("THEOREM_AGENT_TASK")
+        .unwrap_or_else(|_| "theorem agent room runner".to_string());
+    let worktree = std::env::var("THEOREM_AGENT_WORKTREE").unwrap_or_default();
+    let reply_to_requester = env_truthy("THEOREM_AGENT_REPLY_TO_REQUESTER");
     let interval_ms = std::env::var("THEOREM_AGENT_RUNNER_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(15_000);
 
-    tracing::info!(%tenant_slug, %room_id, %binding_id, interval_ms, "starting Theorem agent room runner");
+    tracing::info!(%tenant_slug, %room_id, %binding_id, %actor_id, interval_ms, "starting Theorem agent room runner");
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
         loop {
@@ -291,13 +304,23 @@ fn maybe_spawn_theorem_agent_runner(state: SharedStore) {
             let tenant_slug = tenant_slug.clone();
             let room_id = room_id.clone();
             let binding_id = binding_id.clone();
+            let actor_id = actor_id.clone();
+            let surface = surface.clone();
+            let repo = repo.clone();
+            let branch = branch.clone();
+            let task = task.clone();
+            let worktree = worktree.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 let invoker = RealHeadInvoker::from_env().map_err(|error| error.to_string())?;
                 let mut store = state.lock().map_err(|_| "store lock".to_string())?;
                 let mut config = AgentRoomRunnerConfig::new(tenant_slug, room_id, binding_id);
-                config.repo = "Theorem".to_string();
-                config.branch = "main".to_string();
-                config.task = "theorem agent room runner".to_string();
+                config.actor_id = actor_id;
+                config.surface = surface;
+                config.repo = repo;
+                config.branch = branch;
+                config.task = task;
+                config.worktree = worktree;
+                config.reply_to_requester = reply_to_requester;
                 run_agent_room_cycle(&mut *store, config, &invoker)
                     .map_err(|error| error.to_string())
             })

@@ -4,7 +4,7 @@ use crate::binding_store::{
 };
 use crate::overlap::{detect_and_emit_overlap_tensions, Footprint};
 use crate::tenant::{normalize_actor_id, normalize_tenant_slug, tenant_slug_aliases};
-use crate::{default_theorem_binding, writing_style, DEFAULT_BINDING_ID};
+use crate::{writing_style, DEFAULT_BINDING_ID};
 use rustyred_thg_core::{
     EdgeRecord, GraphStore, GraphStoreError, GraphStoreResult, HarnessInstantKg, NodeQuery,
     NodeRecord, SessionDelta,
@@ -1278,7 +1278,7 @@ fn default_coordination_binding(
     actor_id: &str,
 ) -> Result<AgentBinding, BindingError> {
     if normalize_agent_id(agent_id) == "theorem" {
-        return default_theorem_binding(binding_id);
+        return default_theorem_coordination_binding(binding_id);
     }
 
     let actor_head = session_actor_head(actor_id);
@@ -1297,6 +1297,27 @@ fn default_coordination_binding(
             heads: vec![actor_head],
         },
         BindingBudgetScope::new(&normalize_agent_id(agent_id), 32_000.0, 8),
+    )?;
+    binding.lifecycle.run_id = binding_id.to_string();
+    Ok(binding)
+}
+
+fn default_theorem_coordination_binding(binding_id: &str) -> Result<AgentBinding, BindingError> {
+    let heads = vec![session_actor_head("claude"), session_actor_head("deepseek")];
+    let active_head_set = heads.iter().map(|head| head.head_id.clone()).collect();
+    let mut binding = AgentBinding::new(
+        BindingIdentity {
+            agent_id: "theorem".to_string(),
+            owner_id: "travis".to_string(),
+            agent_name: "Theorem".to_string(),
+            composition_hash: String::new(),
+            version: 1,
+            trust_tier: "first_party".to_string(),
+            active_head_set,
+            agent_constitution: None,
+        },
+        BindingComposition { heads },
+        BindingBudgetScope::new("theorem", 32_000.0, 8),
     )?;
     binding.lifecycle.run_id = binding_id.to_string();
     Ok(binding)

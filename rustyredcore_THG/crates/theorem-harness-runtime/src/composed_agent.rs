@@ -245,7 +245,7 @@ pub fn default_theorem_binding(binding_id: &str) -> Result<AgentBinding, Binding
 
 fn default_candidate_heads() -> (Vec<String>, Vec<AgentHead>) {
     let heads = [
-        "deepseek", "mistral", "minimax", "openai", "zhipu", "ai21", "gemma",
+        "deepseek", "mistral", "qwen", "minimax", "openai", "zhipu", "ai21", "gemma",
     ]
     .into_iter()
     .map(env_configured_head)
@@ -755,7 +755,7 @@ fn env_configured_head(head_id: &str) -> AgentHead {
         format!("THEOREM_AGENT_HEAD_{head_slug}_CREDENTIAL_REF"),
         format!("THEOREM_AGENT_HEAD_{head_slug}_CREDENTIAL"),
     ])
-    .unwrap_or_else(|| format!("env:{provider_slug}_API_KEY"));
+    .unwrap_or_else(|| default_credential_ref_for_provider(&provider));
     let transport = env_first([
         format!("THEOREM_AGENT_HEAD_{head_slug}_TRANSPORT"),
         format!("{head_slug}_TRANSPORT"),
@@ -824,6 +824,7 @@ fn env_slug(value: &str) -> String {
 fn normalize_provider(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "openapi" => "openai".to_string(),
+        "quinn" | "qwen3" => "qwen".to_string(),
         other => other.to_string(),
     }
 }
@@ -836,10 +837,33 @@ fn default_model_for_provider(provider: &str) -> String {
         "minimax" => "MiniMax-M3".to_string(),
         "mistral" => "mistral-large-latest".to_string(),
         "openai" => "gpt-4.1-mini".to_string(),
+        "qwen" => "qwen3.7-max".to_string(),
         "zhipu" => "glm-4-plus".to_string(),
         "ai21" => "jamba-large".to_string(),
         other => other.to_string(),
     }
+}
+
+fn default_credential_ref_for_provider(provider: &str) -> String {
+    match normalize_provider(provider).as_str() {
+        "qwen" => {
+            if env_credential_available("QWEN_API_KEY") {
+                "env:QWEN_API_KEY".to_string()
+            } else if env_credential_available("DASHSCOPE_API_KEY") {
+                "env:DASHSCOPE_API_KEY".to_string()
+            } else {
+                "env:QWEN_API_KEY".to_string()
+            }
+        }
+        provider => format!("env:{}_API_KEY", env_slug(provider)),
+    }
+}
+
+fn env_credential_available(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn parse_transport(value: &str) -> Option<HeadTransport> {
@@ -983,18 +1007,22 @@ mod tests {
     #[test]
     fn default_binding_uses_env_configured_api_heads() {
         let _env = ScopedEnv::new([
-            (THEOREM_AGENT_HEADS_ENV, "mistral,openai,minimax,deepseek"),
+            (
+                THEOREM_AGENT_HEADS_ENV,
+                "mistral,openai,minimax,deepseek,quinn",
+            ),
             ("MISTRAL_MODEL", "mistral-small-latest"),
             ("OPENAI_MODEL", "gpt-4.1-mini"),
             ("MINIMAX_MODEL", "MiniMax-M3"),
             ("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+            ("QWEN_MODEL", "qwen3.7-max"),
         ]);
 
         let binding = default_theorem_binding("agent:env").unwrap();
 
         assert_eq!(
             binding.identity.active_head_set,
-            vec!["deepseek", "minimax", "mistral", "openai"]
+            vec!["deepseek", "minimax", "mistral", "openai", "quinn"]
         );
         let mistral = binding.head("mistral").unwrap();
         assert_eq!(mistral.provider, "mistral");
@@ -1011,6 +1039,11 @@ mod tests {
         let deepseek = binding.head("deepseek").unwrap();
         assert_eq!(deepseek.model, "deepseek-v4-pro");
         assert_eq!(deepseek.transport, HeadTransport::Api);
+        let qwen = binding.head("quinn").unwrap();
+        assert_eq!(qwen.provider, "qwen");
+        assert_eq!(qwen.model, "qwen3.7-max");
+        assert_eq!(qwen.credential_ref, "env:QWEN_API_KEY");
+        assert_eq!(qwen.transport, HeadTransport::Api);
     }
 
     #[test]
@@ -1021,10 +1054,28 @@ mod tests {
 
         assert!(binding.head("claude").is_none());
         assert!(binding.head("deepseek").is_some());
+        assert!(binding.head("qwen").is_some());
         assert!(binding
             .identity
             .active_head_set
             .contains(&"deepseek".to_string()));
+        assert!(binding
+            .identity
+            .active_head_set
+            .contains(&"qwen".to_string()));
+        assert_eq!(binding.head("qwen").unwrap().model, "qwen3.7-max");
+    }
+
+    #[test]
+    fn qwen_default_credential_can_use_dashscope_key() {
+        let _env = ScopedEnv::new([("DASHSCOPE_API_KEY", "dashscope-test-secret")]);
+
+        let binding = default_theorem_binding("agent:qwen-dashscope").unwrap();
+
+        assert_eq!(
+            binding.head("qwen").unwrap().credential_ref,
+            "env:DASHSCOPE_API_KEY"
+        );
     }
 
     #[test]
@@ -1076,8 +1127,7 @@ mod tests {
         // `consensus_below_threshold` guard accepts its publication; the
         // current single-head run still gets the lineage memory threaded.
         let mut prior = default_theorem_binding_with_two_heads("agent:prior-published");
-        prior.identity.composition_hash =
-            theorem_harness_core::composition_hash(&prior);
+        prior.identity.composition_hash = theorem_harness_core::composition_hash(&prior);
         for (event_type, payload) in lineage_v1_lifecycle_events_for_prior() {
             let transition = BindingTransitionInput::new(
                 event_type,
@@ -1372,14 +1422,17 @@ mod tests {
                 "OPENAI_MODEL".to_string(),
                 "MINIMAX_MODEL".to_string(),
                 "DEEPSEEK_MODEL".to_string(),
+                "QWEN_MODEL".to_string(),
                 "AI21_API_KEY".to_string(),
                 "ANTHROPIC_API_KEY".to_string(),
                 "CLAUDE_API_KEY".to_string(),
+                "DASHSCOPE_API_KEY".to_string(),
                 "DEEPSEEK_API_KEY".to_string(),
                 "GEMMA_API_KEY".to_string(),
                 "MINIMAX_API_KEY".to_string(),
                 "MISTRAL_API_KEY".to_string(),
                 "OPENAI_API_KEY".to_string(),
+                "QWEN_API_KEY".to_string(),
                 "ZHIPU_API_KEY".to_string(),
                 "THEOREM_AGENT_HEAD_OPENAPI_MODEL".to_string(),
                 "THEOREM_AGENT_HEAD_DEEPSEEK_TRANSPORT".to_string(),

@@ -60,6 +60,13 @@ pub fn api_provider_profile(provider: &str) -> Option<ApiProviderProfile> {
             default_endpoint: "https://api.mistral.ai/v1/chat/completions",
             request_shape: ApiRequestShape::OpenAiChatCompletions,
         }),
+        "qwen" | "quinn" | "qwen3" => Some(ApiProviderProfile {
+            provider: "qwen",
+            env_endpoint: "QWEN_CHAT_URL",
+            default_endpoint:
+                "https://dashscope-us.aliyuncs.com/compatible-mode/v1/chat/completions",
+            request_shape: ApiRequestShape::OpenAiChatCompletions,
+        }),
         "ai21" | "jamba" => Some(ApiProviderProfile {
             provider: "ai21",
             env_endpoint: "AI21_CHAT_URL",
@@ -85,6 +92,7 @@ pub fn default_api_profiles() -> Vec<ApiProviderProfile> {
         "zhipu",
         "minimax",
         "mistral",
+        "qwen",
         "ai21",
         "gemma",
     ]
@@ -327,12 +335,27 @@ fn anthropic_text(body: &Value) -> String {
 }
 
 fn openai_chat_text(body: &Value) -> String {
+    if let Some(text) = first_nonempty_text([
+        body.get("output_text"),
+        body.get("text"),
+        body.get("content"),
+    ]) {
+        return text;
+    }
     body.get("choices")
         .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .map(content_text)
+        .and_then(|choices| {
+            choices.iter().find_map(|choice| {
+                let message_text = choice.get("message").and_then(|message| {
+                    first_nonempty_text([
+                        message.get("content"),
+                        message.get("output_text"),
+                        message.get("text"),
+                    ])
+                });
+                message_text.or_else(|| first_nonempty_text([choice.get("text")]))
+            })
+        })
         .unwrap_or_default()
 }
 
@@ -363,8 +386,23 @@ fn content_text(value: &Value) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        Value::Object(_) => first_nonempty_text([
+            value.get("text"),
+            value.get("content"),
+            value.get("output_text"),
+        ])
+        .unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+fn first_nonempty_text<'a>(values: impl IntoIterator<Item = Option<&'a Value>>) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .map(content_text)
+        .map(|text| text.trim().to_string())
+        .find(|text| !text.is_empty())
 }
 
 fn anthropic_cost_units(body: &Value, fallback: f64) -> f64 {
@@ -528,6 +566,9 @@ mod tests {
             "zhipu",
             "minimax",
             "mistral",
+            "qwen",
+            "quinn",
+            "qwen3",
             "ai21",
             "gemma",
         ] {
@@ -550,6 +591,32 @@ mod tests {
         assert_eq!(openai_chat_text(&body), "answer");
         assert_eq!(openai_reasoning_text(&body), "reason");
         assert_eq!(openai_cost_units(&body, 1.0), 5.0);
+    }
+
+    #[test]
+    fn openai_shape_extracts_alternate_text_fields() {
+        assert_eq!(
+            openai_chat_text(&json!({ "output_text": "root text" })),
+            "root text"
+        );
+        assert_eq!(
+            openai_chat_text(&json!({
+                "choices": [{ "message": { "content": [{ "type": "text", "text": "part text" }] } }]
+            })),
+            "part text"
+        );
+        assert_eq!(
+            openai_chat_text(&json!({
+                "choices": [{ "message": { "output_text": "message text" } }]
+            })),
+            "message text"
+        );
+        assert_eq!(
+            openai_chat_text(&json!({
+                "choices": [{ "text": "legacy choice text" }]
+            })),
+            "legacy choice text"
+        );
     }
 
     #[test]

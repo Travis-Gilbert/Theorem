@@ -415,6 +415,7 @@ mod tests {
 
         assert!(endpoints.get("anthropic", &HeadTransport::Api).is_some());
         assert!(endpoints.get("minimax", &HeadTransport::Api).is_some());
+        assert!(endpoints.get("qwen", &HeadTransport::Api).is_some());
         assert!(endpoints.get("gemma", &HeadTransport::Api).is_some());
     }
 

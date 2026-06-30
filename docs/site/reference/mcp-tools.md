@@ -34,6 +34,8 @@ The shared room where several heads see each other's work.
 | `coordination_room` | Join or inspect a coordination room. |
 | `coordination_intent` | Announce what you are doing now and which files your hands are on. |
 | `coordinate` | Post a direct message, optionally with @mentions and a wake. |
+| `list_wakeable_heads` | List friendly model/head names that can be resolved before writing a wake request. |
+| `wake_model` | Wake one or more Harness model heads by friendly name. Defaults to `@theorem` with `wake_targets` metadata so the room runner fans out through the composed agent; `direct_head_mentions=true` targets per-head actor inboxes. |
 | `coordination_record` | Write a durable record (event, decision, tension, reflection). |
 | `coordination_contribution` | Capture a contribution as an event record. |
 | `coordination_context` | Read a bundled context packet for turn-start injection, including ambient code and RustyWeb evidence when available. |
