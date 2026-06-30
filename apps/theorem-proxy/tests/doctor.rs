@@ -22,9 +22,11 @@ async fn doctor_reports_node_and_memory_up() {
         .route("/ready", get(|| async { "ready" }))
         .route(
             "/mcp",
-            post(|| async {
+            post(|body: String| async move {
+                assert!(body.contains("graphql_query"));
+                assert!(body.contains("memory(query:"));
                 axum::Json(serde_json::json!({
-                    "result": {"structuredContent": {"candidates": []}}
+                    "result": {"structuredContent": {"data": {"memory": []}}}
                 }))
             }),
         );

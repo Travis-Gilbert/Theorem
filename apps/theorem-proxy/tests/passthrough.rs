@@ -264,6 +264,84 @@ async fn openai_auth_override_strips_client_key() {
 }
 
 #[tokio::test]
+async fn status_reports_protocol_counters() {
+    let anthropic = Router::new()
+        .route(
+            "/v1/messages",
+            post(|| async { axum::Json(serde_json::json!({"ok": true})) }),
+        )
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data": [{"id": "claude"}]}))
+            }),
+        );
+    let openai = Router::new()
+        .route(
+            "/v1/responses",
+            post(|| async { axum::Json(serde_json::json!({"id": "resp_1"})) }),
+        )
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data": [{"id": "gpt"}]}))
+            }),
+        );
+    let anthropic_addr = spawn(anthropic).await;
+    let openai_addr = spawn(openai).await;
+    let proxy = theorem_proxy::router(theorem_proxy::ProxyConfig {
+        upstream: format!("http://{anthropic_addr}"),
+        openai_upstream: format!("http://{openai_addr}"),
+        ..Default::default()
+    });
+    let proxy_addr = spawn(proxy).await;
+    let client = reqwest::Client::new();
+
+    let before: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["total_requests_seen"], 0);
+    assert!(before["last_request_at"].is_null());
+
+    client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    client
+        .get(format!("http://{proxy_addr}/openai/v1/models"))
+        .send()
+        .await
+        .unwrap();
+
+    let after: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["total_requests_seen"], 3);
+    assert_eq!(after["anthropic_messages_seen"], 1);
+    assert_eq!(after["openai_responses_seen"], 1);
+    assert_eq!(after["openai_models_seen"], 1);
+    assert!(after["last_request_at"].as_u64().is_some());
+}
+
+#[tokio::test]
 async fn streaming_sse_body_pipes_through_in_order() {
     use futures_util::stream;
 

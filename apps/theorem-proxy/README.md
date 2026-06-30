@@ -48,6 +48,26 @@ theorem-proxy proxy --memory-url http://127.0.0.1:8380/mcp
 codex -c 'openai_base_url="http://127.0.0.1:8788/v1"'
 ```
 
+The repo-level wrapper now owns the product commands from
+`SPEC-GRAPHQL-CONTRACT-AND-CLI`:
+
+```bash
+theorem up
+theorem status
+theorem doctor
+theorem connect claude
+theorem connect codex
+theorem connect claude --check
+theorem connect codex --check
+theorem disconnect claude
+theorem disconnect codex
+```
+
+`theorem connect` writes reversible user-level config under `~/.claude`,
+`~/Library/Application Support/Claude-3p`, or `~/.codex` and stores restore
+state in `~/.theorem/connect/`. `--check` uses `/status` counters as the proof
+oracle.
+
 This repo also has a one-shot launcher:
 
 ```bash
@@ -62,7 +82,7 @@ apps/theorem-proxy/scripts/start-proxied-codex-app.sh --restart-codex
 ```
 
 The `--restart-codex` flag quits Codex first so the workspace open happens from
-a clean app process. On current Codex Desktop 0.142.3, `codex app -c openai_base_url=...`
+a clean app process. On current Codex Desktop 0.142.4, `codex app -c openai_base_url=...`
 does not route model traffic. Desktop routing belongs in the GraphQL-contract-first
 `theorem connect codex` path, which will write reversible user-level Codex config
 and verify `/status.openai_responses_seen`. You can also double-click the
@@ -72,9 +92,10 @@ transitional opener:
 apps/theorem-proxy/scripts/RustyRed-Codex.command
 ```
 
-By default, Codex keeps using its normal OpenAI auth and the proxy forwards that
-credential only to `https://api.openai.com`. For sidecar/local-key modes, set the
-proxy-owned upstream key and let the client send a harmless local bearer:
+When the proxy forwards Codex traffic to `https://api.openai.com`, set a
+proxy-owned upstream key. Current Codex 0.142.4 accepts the local provider block
+with `requires_openai_auth = false` and no `env_key`; adding `env_key` makes
+Doctor require that env var. For sidecar/local-key modes:
 
 ```bash
 export THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY=...

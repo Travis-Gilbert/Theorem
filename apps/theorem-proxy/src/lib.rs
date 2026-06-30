@@ -21,8 +21,9 @@ pub mod memory;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -98,6 +99,46 @@ struct ProxyState {
     /// Full content of tool_result blocks the membrane elided, keyed by retrieval id,
     /// served at `GET /tool_result/{id}`.
     tool_results: Arc<Mutex<HashMap<String, String>>>,
+    stats: Arc<ProxyStats>,
+}
+
+struct ProxyStats {
+    started_at: u64,
+    total_requests_seen: AtomicU64,
+    last_request_at: AtomicU64,
+    anthropic_messages_seen: AtomicU64,
+    anthropic_models_seen: AtomicU64,
+    openai_responses_seen: AtomicU64,
+    openai_chat_completions_seen: AtomicU64,
+    openai_models_seen: AtomicU64,
+}
+
+impl ProxyStats {
+    fn new() -> Self {
+        Self {
+            started_at: unix_seconds(),
+            total_requests_seen: AtomicU64::new(0),
+            last_request_at: AtomicU64::new(0),
+            anthropic_messages_seen: AtomicU64::new(0),
+            anthropic_models_seen: AtomicU64::new(0),
+            openai_responses_seen: AtomicU64::new(0),
+            openai_chat_completions_seen: AtomicU64::new(0),
+            openai_models_seen: AtomicU64::new(0),
+        }
+    }
+
+    fn mark(&self, counter: &AtomicU64) {
+        self.total_requests_seen.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.last_request_at.store(unix_seconds(), Ordering::Relaxed);
+    }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Build the proxy router (exposed for tests and for embedding behind another
@@ -121,9 +162,11 @@ pub fn router(config: ProxyConfig) -> Router {
         upstream_beta: config.upstream_beta,
         openai_upstream_api_key: config.openai_upstream_api_key,
         tool_results: Arc::new(Mutex::new(HashMap::new())),
+        stats: Arc::new(ProxyStats::new()),
     };
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/status", get(proxy_status))
         .route("/v1/messages", any(proxy_messages))
         .route("/v1/models", any(proxy_models))
         .route("/v1/responses", any(proxy_openai_responses))
@@ -147,6 +190,7 @@ async fn proxy_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    state.stats.mark(&state.stats.anthropic_messages_seen);
     // D2: membrane the latest turn's oversized tool_result blocks (cache-safe: last
     // message only). The full content is stashed for out-of-band retrieval.
     let body = if state.membrane_threshold > 0 {
@@ -195,6 +239,7 @@ async fn proxy_models(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    state.stats.mark(&state.stats.anthropic_models_seen);
     forward_upstream(state, method, headers, body, "/v1/models").await
 }
 
@@ -204,6 +249,7 @@ async fn proxy_openai_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    state.stats.mark(&state.stats.openai_responses_seen);
     let body = match state.memory.clone() {
         Some(source) => inject_openai_responses_memory(body, source, state.max_memories).await,
         None => body,
@@ -234,6 +280,7 @@ async fn proxy_openai_passthrough(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    state.stats.mark(&state.stats.openai_chat_completions_seen);
     forward_openai_upstream(state, method, headers, body, "/v1/chat/completions").await
 }
 
@@ -243,7 +290,31 @@ async fn proxy_openai_models(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    state.stats.mark(&state.stats.openai_models_seen);
     forward_openai_upstream(state, method, headers, body, "/v1/models").await
+}
+
+async fn proxy_status(State(state): State<ProxyState>) -> Response {
+    let last = state.stats.last_request_at.load(Ordering::Relaxed);
+    let tool_results_available = state
+        .tool_results
+        .lock()
+        .map(|store| store.len())
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "started_at": state.stats.started_at,
+        "uptime_secs": unix_seconds().saturating_sub(state.stats.started_at),
+        "last_request_at": if last == 0 { serde_json::Value::Null } else { serde_json::json!(last) },
+        "total_requests_seen": state.stats.total_requests_seen.load(Ordering::Relaxed),
+        "anthropic_messages_seen": state.stats.anthropic_messages_seen.load(Ordering::Relaxed),
+        "anthropic_models_seen": state.stats.anthropic_models_seen.load(Ordering::Relaxed),
+        "openai_responses_seen": state.stats.openai_responses_seen.load(Ordering::Relaxed),
+        "openai_chat_completions_seen": state.stats.openai_chat_completions_seen.load(Ordering::Relaxed),
+        "openai_models_seen": state.stats.openai_models_seen.load(Ordering::Relaxed),
+        "tool_results_available": tool_results_available
+    }))
+    .into_response()
 }
 
 async fn forward_upstream(
@@ -567,7 +638,13 @@ pub async fn doctor(
 
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": "doctor", "method": "tools/call",
-            "params": {"name": "hippo_retrieve", "arguments": {"query": "doctor", "top_k": 1}}
+            "params": {
+                "name": "graphql_query",
+                "arguments": {
+                    "query": "query($q:String!, $limit:Int!){ memory(query:$q, limit:$limit){ id title contentPreview content } }",
+                    "variables": {"q": "doctor", "limit": 1}
+                }
+            }
         });
         let retrieval = client
             .post(url)
@@ -583,7 +660,7 @@ pub async fn doctor(
             "memory",
             retrieval_ok,
             match &retrieval {
-                Ok(response) => format!("hippo_retrieve -> {}", response.status()),
+                Ok(response) => format!("graphql_query memory -> {}", response.status()),
                 Err(error) => format!("retrieval failed: {error}"),
             },
         ));

@@ -6,11 +6,15 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly DEFAULT_SOURCE_DIR="$HOME/.theorem/source"
 readonly THEOREM_HOME_DIR="${THEOREM_HOME:-$HOME/.theorem}"
 readonly PID_FILE="$THEOREM_HOME_DIR/localmodel.pid"
+readonly NODE_PID_FILE="$THEOREM_HOME_DIR/node.pid"
 readonly PROXY_PID_FILE="$THEOREM_HOME_DIR/proxy.pid"
 readonly OUT_LOG="$THEOREM_HOME_DIR/localmodel.out.log"
 readonly ERR_LOG="$THEOREM_HOME_DIR/localmodel.err.log"
+readonly NODE_OUT_LOG="$THEOREM_HOME_DIR/node.out.log"
+readonly NODE_ERR_LOG="$THEOREM_HOME_DIR/node.err.log"
 readonly PROXY_OUT_LOG="$THEOREM_HOME_DIR/proxy.out.log"
 readonly PROXY_ERR_LOG="$THEOREM_HOME_DIR/proxy.err.log"
+readonly CONNECT_STATE_DIR="$THEOREM_HOME_DIR/connect"
 
 export MISTRALRS_METAL_PRECOMPILE="${MISTRALRS_METAL_PRECOMPILE:-0}"
 export MISTRALRS_METAL_PLATFORMS="${MISTRALRS_METAL_PLATFORMS:-macos}"
@@ -24,7 +28,12 @@ Commands:
   harness [localmodel args...] Start the full local node: proxy plus theorem-localmodel.
   start [localmodel args...]   Start theorem-localmodel in the foreground.
   serve-model [config]     Start the local mistral.rs model host.
+  up                       Start local RustyRed node plus model-path proxy.
   proxy [proxy args...]    Start the Anthropic Messages proxy on localhost.
+  connect <claude|codex> [--check]
+                           Point an agent at the local proxy, reversibly.
+  disconnect <claude|codex>
+                           Restore config changed by `theorem connect`.
   appear [actor] [opts]    Announce a local actor into the harness room.
   codex-endpoint [args...] Start Codex app-server and announce its endpoint.
   wrap <claude|codex>      Start proxy room wiring, then launch the agent CLI.
@@ -105,6 +114,37 @@ find_proxy_bin() {
     if [[ -x "$SCRIPT_DIR/rustyred-proxy" ]]; then
         printf '%s\n' "$SCRIPT_DIR/rustyred-proxy"
         return 0
+    fi
+
+    return 1
+}
+
+find_theorem_proxy_bin() {
+    if [[ -n "${THEOREM_PROXY_BIN:-}" && -x "$THEOREM_PROXY_BIN" ]]; then
+        printf '%s\n' "$THEOREM_PROXY_BIN"
+        return 0
+    fi
+
+    if command -v theorem-proxy >/dev/null 2>&1; then
+        command -v theorem-proxy
+        return 0
+    fi
+
+    if [[ -x "$HOME/.cargo/bin/theorem-proxy" ]]; then
+        printf '%s\n' "$HOME/.cargo/bin/theorem-proxy"
+        return 0
+    fi
+
+    local repo
+    if repo="$(find_repo 2>/dev/null)"; then
+        if [[ -x "$repo/apps/theorem-proxy/target/release/theorem-proxy" ]]; then
+            printf '%s\n' "$repo/apps/theorem-proxy/target/release/theorem-proxy"
+            return 0
+        fi
+        if [[ -x "$repo/apps/theorem-proxy/target/debug/theorem-proxy" ]]; then
+            printf '%s\n' "$repo/apps/theorem-proxy/target/debug/theorem-proxy"
+            return 0
+        fi
     fi
 
     return 1
@@ -436,8 +476,432 @@ wait_for_proxy() {
 }
 
 proxy_base_url() {
+    local port="${THEOREM_PROXY_PORT:-8788}"
+    printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+# The legacy proxy (`theorem proxy/harness/wrap`, flag `--proxy-port`) defaults to
+# 8484; the new model-path proxy (`theorem up/connect`, flag `--port`) defaults to
+# 8788. They are alternatives, never co-resident, and only the legacy proxy serves
+# `/v1/presence`. Presence/room callers must reach the legacy port, not proxy_base_url.
+legacy_proxy_base_url() {
     local port="${THEOREM_PROXY_PORT:-8484}"
     printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+node_base_url() {
+    local port="${RUSTY_RED_PORT:-8380}"
+    printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+proxy_status_json() {
+    local base_url
+    base_url="$(proxy_base_url)"
+    curl -fsS "$base_url/status"
+}
+
+json_field() {
+    local field=$1
+    python3 -c 'import json,sys; data=json.load(sys.stdin); value=data.get(sys.argv[1]); print("" if value is None else value)' "$field"
+}
+
+wait_for_http() {
+    local url=$1
+    local attempt
+    for attempt in $(seq 1 300); do
+        if command -v curl >/dev/null 2>&1 && curl -fsS "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+http_ok() {
+    command -v curl >/dev/null 2>&1 && curl -fsS "$1" >/dev/null 2>&1
+}
+
+start_local_node() {
+    local repo
+    repo="$(find_repo)"
+    local base_url
+    base_url="$(node_base_url)"
+    if wait_for_http "$base_url/ready"; then
+        log "node already ready at $base_url"
+        return 0
+    fi
+
+    mkdir -p "$THEOREM_HOME_DIR"
+    RUSTY_RED_PORT="${RUSTY_RED_PORT:-8380}" \
+        bash "$repo/apps/theorem-proxy/scripts/node-local.sh" \
+        >"$NODE_OUT_LOG" 2>"$NODE_ERR_LOG" </dev/null &
+    local node_pid=$!
+    printf '%s\n' "$node_pid" >"$NODE_PID_FILE"
+    if ! wait_for_http "$base_url/ready"; then
+        kill "$node_pid" 2>/dev/null || true
+        log "node did not become ready at $base_url"
+        log "logs: $NODE_OUT_LOG $NODE_ERR_LOG"
+        return 1
+    fi
+    log "started node pid $node_pid at $base_url"
+}
+
+default_memory_dir_for_repo() {
+    local repo=$1
+    local project_key legacy_project_key default_mem_dir
+    project_key="$(printf '%s' "$repo" | sed 's#/#-#g; s# #-#g')"
+    legacy_project_key="$(printf '%s' "$repo" | sed 's#/#-#g')"
+    default_mem_dir="$HOME/.claude/projects/$project_key/memory"
+    if [[ ! -d "$default_mem_dir" && -d "$HOME/.claude/projects/$legacy_project_key/memory" ]]; then
+        default_mem_dir="$HOME/.claude/projects/$legacy_project_key/memory"
+    fi
+    printf '%s\n' "$default_mem_dir"
+}
+
+start_model_path_proxy() {
+    local repo
+    repo="$(find_repo)"
+    local base_url
+    base_url="$(proxy_base_url)"
+    if wait_for_http "$base_url/healthz"; then
+        log "proxy already healthy at $base_url"
+        return 0
+    fi
+
+    local proxy_bin
+    if proxy_bin="$(find_theorem_proxy_bin)"; then
+        :
+    else
+        log "theorem-proxy not found; build it with: cargo install --path \"$repo/apps/theorem-proxy\" --force"
+        return 1
+    fi
+
+    local node_url memory_dir source_args=()
+    node_url="$(node_base_url)/mcp"
+    if [[ "${THEOREM_USE_NODE_MEMORY:-1}" != "0" ]]; then
+        source_args=(--memory-url "$node_url")
+    else
+        memory_dir="${THEOREM_MEMORY_DIR:-$(default_memory_dir_for_repo "$repo")}"
+        source_args=(--memory-dir "$memory_dir")
+    fi
+
+    local port="${THEOREM_PROXY_PORT:-8788}"
+    mkdir -p "$THEOREM_HOME_DIR"
+    "$proxy_bin" proxy --port "$port" "${source_args[@]}" \
+        >"$PROXY_OUT_LOG" 2>"$PROXY_ERR_LOG" </dev/null &
+    local proxy_pid=$!
+    printf '%s\n' "$proxy_pid" >"$PROXY_PID_FILE"
+    if ! wait_for_http "$base_url/healthz"; then
+        kill "$proxy_pid" 2>/dev/null || true
+        log "proxy did not become healthy at $base_url"
+        log "logs: $PROXY_OUT_LOG $PROXY_ERR_LOG"
+        return 1
+    fi
+    log "started proxy pid $proxy_pid at $base_url"
+}
+
+cmd_up() {
+    start_local_node
+    start_model_path_proxy
+    if [[ "${THEOREM_PROXY_OPENAI_UPSTREAM:-https://api.openai.com}" == "https://api.openai.com" && -z "${THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY:-}" ]]; then
+        log "Codex API/local routing needs THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY, or set THEOREM_PROXY_OPENAI_UPSTREAM to a local OpenAI-compatible host"
+    fi
+    cmd_status
+}
+
+ensure_stack_for_connect() {
+    if [[ "${THEOREM_CONNECT_NO_UP:-0}" == "1" ]]; then
+        return 0
+    fi
+    start_local_node
+    start_model_path_proxy
+}
+
+write_claude_connection() {
+    local base_url=$1
+    local settings_path="$HOME/.claude/settings.json"
+    local desktop_path="$HOME/Library/Application Support/Claude-3p/claude_desktop_config.json"
+    local state_path="$CONNECT_STATE_DIR/claude.json"
+    mkdir -p "$CONNECT_STATE_DIR"
+    python3 - "$settings_path" "$desktop_path" "$state_path" "$base_url" <<'PY'
+import json
+import shutil
+import sys
+import time
+from pathlib import Path
+
+settings_path = Path(sys.argv[1])
+desktop_path = Path(sys.argv[2])
+state_path = Path(sys.argv[3])
+base_url = sys.argv[4].rstrip("/")
+stamp = str(int(time.time()))
+
+def load_json(path):
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+def backup(path, label):
+    backup_path = state_path.parent / f"{label}.{stamp}.bak"
+    if path.exists():
+        shutil.copy2(path, backup_path)
+        existed = True
+    else:
+        backup_path.write_text("")
+        existed = False
+    return {"path": str(path), "backup": str(backup_path), "existed": existed}
+
+state = load_json(state_path) if state_path.exists() else {
+    "created_at": stamp,
+    "files": {
+        "claude_settings": backup(settings_path, "claude-settings"),
+        "claude_desktop_3p": backup(desktop_path, "claude-desktop-3p"),
+    },
+}
+
+settings_path.parent.mkdir(parents=True, exist_ok=True)
+settings = load_json(settings_path)
+env = settings.setdefault("env", {})
+env["ANTHROPIC_BASE_URL"] = base_url
+settings_path.write_text(json.dumps(settings, indent=2, sort_keys=False) + "\n")
+
+desktop_path.parent.mkdir(parents=True, exist_ok=True)
+desktop = load_json(desktop_path)
+desktop["deploymentMode"] = "3p"
+enterprise = desktop.setdefault("enterpriseConfig", {})
+enterprise["inferenceProvider"] = "gateway"
+enterprise["inferenceGatewayBaseUrl"] = base_url
+enterprise.setdefault("inferenceGatewayApiKey", "theorem-local-gateway-key")
+enterprise["inferenceGatewayAuthScheme"] = "bearer"
+enterprise["modelDiscoveryEnabled"] = True
+desktop_path.write_text(json.dumps(desktop, indent=2, sort_keys=False) + "\n")
+
+state["base_url"] = base_url
+state_path.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n")
+PY
+    log "Claude Code env written to $settings_path"
+    log "Claude Desktop 3P gateway config written to $desktop_path"
+}
+
+write_codex_connection() {
+    local base_url=$1
+    local config_path="$HOME/.codex/config.toml"
+    local state_path="$CONNECT_STATE_DIR/codex.json"
+    mkdir -p "$CONNECT_STATE_DIR"
+    python3 - "$config_path" "$state_path" "$base_url" <<'PY'
+import json
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+state_path = Path(sys.argv[2])
+base_url = sys.argv[3].rstrip("/")
+provider_base = f"{base_url}/v1"
+stamp = str(int(time.time()))
+begin = "# BEGIN theorem connect codex"
+end = "# END theorem connect codex"
+
+def backup(path):
+    backup_path = state_path.parent / f"codex-config.{stamp}.bak"
+    if path.exists():
+        shutil.copy2(path, backup_path)
+        existed = True
+    else:
+        backup_path.write_text("")
+        existed = False
+    return {"path": str(path), "backup": str(backup_path), "existed": existed}
+
+state = json.loads(state_path.read_text()) if state_path.exists() else {
+    "created_at": stamp,
+    "files": {"codex_config": backup(config_path)},
+}
+
+text = config_path.read_text() if config_path.exists() else ""
+managed_re = re.compile(rf"\n?{re.escape(begin)}.*?{re.escape(end)}\n?", re.S)
+text = managed_re.sub("\n", text).strip() + "\n"
+lines = text.splitlines()
+first_table = next((idx for idx, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines))
+preamble = lines[:first_table]
+rest = lines[first_table:]
+replaced = False
+for idx, line in enumerate(preamble):
+    if re.match(r"\s*model_provider\s*=", line):
+        preamble[idx] = 'model_provider = "theorem"'
+        replaced = True
+        break
+if not replaced:
+    preamble.append('model_provider = "theorem"')
+
+managed = [
+    "",
+    begin,
+    "[model_providers.theorem]",
+    'name = "Theorem local proxy"',
+    f'base_url = "{provider_base}"',
+    'wire_api = "responses"',
+    "requires_openai_auth = false",
+    end,
+]
+out = "\n".join(preamble + rest + managed).strip() + "\n"
+config_path.parent.mkdir(parents=True, exist_ok=True)
+config_path.write_text(out)
+state["base_url"] = base_url
+state["provider_base_url"] = provider_base
+state_path.write_text(json.dumps(state, indent=2, sort_keys=False) + "\n")
+PY
+    log "Codex user config written to $config_path"
+}
+
+restore_connection() {
+    local agent=$1
+    local state_path="$CONNECT_STATE_DIR/$agent.json"
+    if [[ ! -f "$state_path" ]]; then
+        log "no theorem connection state for $agent at $state_path"
+        return 1
+    fi
+    python3 - "$state_path" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+state = json.loads(state_path.read_text())
+for info in state.get("files", {}).values():
+    path = Path(info["path"])
+    backup = Path(info["backup"])
+    if info.get("existed"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(backup, path)
+    elif path.exists():
+        path.unlink()
+state_path.unlink()
+PY
+    log "restored $agent config from $state_path"
+}
+
+counter_value() {
+    local field=$1
+    proxy_status_json | json_field "$field"
+}
+
+probe_claude_counter() {
+    local base_url
+    base_url="$(proxy_base_url)"
+    curl -fsS -X POST "$base_url/v1/messages" \
+        -H 'content-type: application/json' \
+        -H 'anthropic-version: 2023-06-01' \
+        -H 'x-api-key: theorem-local-check' \
+        --data-binary '{"model":"claude-sonnet-4-5","max_tokens":1,"messages":[{"role":"user","content":"theorem proxy check"}]}' \
+        >/dev/null 2>&1 || true
+}
+
+probe_codex_counter() {
+    local base_url
+    base_url="$(proxy_base_url)"
+    curl -fsS -X POST "$base_url/v1/responses" \
+        -H 'content-type: application/json' \
+        -H 'authorization: Bearer theorem-local-check' \
+        --data-binary '{"model":"gpt-5.5","input":"theorem proxy check","max_output_tokens":1}' \
+        >/dev/null 2>&1 || true
+}
+
+check_counter_increment() {
+    local field=$1
+    local probe=$2
+    wait_for_http "$(proxy_base_url)/healthz" || {
+        log "proxy is not healthy at $(proxy_base_url)"
+        return 1
+    }
+    local before after
+    before="$(counter_value "$field")"
+    "$probe"
+    after="$(counter_value "$field")"
+    if [[ -n "$before" && -n "$after" && "$after" -gt "$before" ]]; then
+        log "$field incremented: $before -> $after"
+        return 0
+    fi
+    log "$field did not increment: $before -> $after"
+    return 1
+}
+
+cmd_connect() {
+    local agent=${1:-}
+    if [[ -z "$agent" ]]; then
+        log "connect requires an agent: claude or codex"
+        return 1
+    fi
+    shift
+    local check=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check)
+                check=true
+                ;;
+            -h | --help)
+                printf 'usage: theorem connect <claude|codex> [--check]\n'
+                return 0
+                ;;
+            *)
+                log "unknown connect flag $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    case "$agent" in
+        claude | claude-code)
+            if [[ "$check" == "true" ]]; then
+                check_counter_increment anthropic_messages_seen probe_claude_counter
+                return
+            fi
+            ensure_stack_for_connect
+            write_claude_connection "$(proxy_base_url)"
+            printf 'Claude Code: restart/open a session; ANTHROPIC_BASE_URL is now %s\n' "$(proxy_base_url)"
+            printf 'Claude Desktop: use the Claude-3p app/config; the gateway base URL is %s\n' "$(proxy_base_url)"
+            ;;
+        codex)
+            if [[ "$check" == "true" ]]; then
+                check_counter_increment openai_responses_seen probe_codex_counter
+                return
+            fi
+            ensure_stack_for_connect
+            write_codex_connection "$(proxy_base_url)"
+            printf 'Codex CLI/Desktop: restart Codex so ~/.codex/config.toml is reloaded.\n'
+            printf 'Provider base URL: %s/v1\n' "$(proxy_base_url)"
+            if [[ "${THEOREM_PROXY_OPENAI_UPSTREAM:-https://api.openai.com}" == "https://api.openai.com" && -z "${THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY:-}" ]]; then
+                printf 'Codex note: API/local mode still needs THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY, or set THEOREM_PROXY_OPENAI_UPSTREAM to a local OpenAI-compatible host.\n'
+            fi
+            ;;
+        *)
+            log "unsupported connect agent $agent"
+            return 1
+            ;;
+    esac
+}
+
+cmd_disconnect() {
+    local agent=${1:-}
+    if [[ -z "$agent" ]]; then
+        log "disconnect requires an agent: claude or codex"
+        return 1
+    fi
+    case "$agent" in
+        claude | claude-code)
+            restore_connection claude
+            ;;
+        codex)
+            restore_connection codex
+            ;;
+        *)
+            log "unsupported disconnect agent $agent"
+            return 1
+            ;;
+    esac
 }
 
 ensure_proxy_running() {
@@ -447,7 +911,7 @@ ensure_proxy_running() {
     fi
 
     local base_url
-    base_url="$(proxy_base_url)"
+    base_url="$(legacy_proxy_base_url)"
     if wait_for_proxy "$base_url"; then
         return 0
     fi
@@ -502,7 +966,7 @@ announce_presence() {
 
     ensure_proxy_running
     local base_url
-    base_url="$(proxy_base_url)"
+    base_url="$(legacy_proxy_base_url)"
 
     local path="${THEOREM_PRESENCE_PATH:-.}"
     local line="${THEOREM_PRESENCE_LINE:-1}"
@@ -550,7 +1014,7 @@ announce_legacy_room_presence() {
     local ttl=$6
 
     local base_url
-    base_url="$(proxy_base_url)"
+    base_url="$(legacy_proxy_base_url)"
 
     local repo=""
     if repo="$(find_repo 2>/dev/null)"; then
@@ -868,6 +1332,17 @@ cmd_wrap() {
 }
 
 cmd_stop() {
+    if [[ -f "$NODE_PID_FILE" ]]; then
+        local node_pid
+        node_pid="$(cat "$NODE_PID_FILE")"
+        if kill -0 "$node_pid" 2>/dev/null; then
+            kill "$node_pid"
+            log "stopped node pid $node_pid"
+        else
+            log "node pid $node_pid is not running"
+        fi
+        rm -f "$NODE_PID_FILE"
+    fi
     if [[ ! -f "$PID_FILE" ]]; then
         log "no pid file at $PID_FILE"
     else
@@ -911,6 +1386,29 @@ cmd_status() {
     else
         printf 'proxy binary: cargo/rustyred-proxy fallback\n'
     fi
+    if find_theorem_proxy_bin >/dev/null; then
+        printf 'theorem-proxy binary: %s\n' "$(find_theorem_proxy_bin)"
+    else
+        printf 'theorem-proxy binary: not found\n'
+    fi
+    if http_ok "$(node_base_url)/ready"; then
+        printf 'node: ready (%s)\n' "$(node_base_url)"
+    elif [[ -f "$NODE_PID_FILE" ]]; then
+        local node_pid
+        node_pid="$(cat "$NODE_PID_FILE")"
+        if kill -0 "$node_pid" 2>/dev/null; then
+            printf 'node: starting or unhealthy (pid %s, %s)\n' "$node_pid" "$(node_base_url)"
+        else
+            printf 'node: stale pid file (%s)\n' "$node_pid"
+        fi
+    else
+        printf 'node: not running (%s)\n' "$(node_base_url)"
+    fi
+    if [[ "${THEOREM_PROXY_OPENAI_UPSTREAM:-https://api.openai.com}" == "https://api.openai.com" && -z "${THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY:-}" ]]; then
+        printf 'codex upstream: missing THEOREM_PROXY_OPENAI_UPSTREAM_API_KEY for api.openai.com\n'
+    else
+        printf 'codex upstream: configured (%s)\n' "${THEOREM_PROXY_OPENAI_UPSTREAM:-https://api.openai.com}"
+    fi
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid="$(cat "$PID_FILE")"
@@ -927,15 +1425,39 @@ cmd_status() {
         proxy_pid="$(cat "$PROXY_PID_FILE")"
         if kill -0 "$proxy_pid" 2>/dev/null; then
             printf 'proxy: running (pid %s, %s)\n' "$proxy_pid" "$(proxy_base_url)"
-            return 0
+        else
+            if http_ok "$(proxy_base_url)/healthz"; then
+                rm -f "$PROXY_PID_FILE"
+                printf 'proxy: running (%s; removed stale pid file %s)\n' "$(proxy_base_url)" "$proxy_pid"
+            else
+                printf 'proxy: stale pid file (%s)\n' "$proxy_pid"
+                printf 'proxy: not running (%s)\n' "$(proxy_base_url)"
+            fi
         fi
-        printf 'proxy: stale pid file (%s)\n' "$proxy_pid"
-        return 0
-    fi
-    if wait_for_proxy "$(proxy_base_url)" 2>/dev/null; then
+    elif http_ok "$(proxy_base_url)/healthz"; then
         printf 'proxy: running (%s)\n' "$(proxy_base_url)"
     else
         printf 'proxy: not started by theorem wrapper\n'
+    fi
+    if http_ok "$(proxy_base_url)/healthz"; then
+        local status_tmp
+        status_tmp="$(mktemp -t theorem-proxy-status.XXXXXX)"
+        if proxy_status_json >"$status_tmp" 2>/dev/null; then
+            python3 - "$status_tmp" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text())
+print(
+    "proxy counters: "
+    f"anthropic_messages={data.get('anthropic_messages_seen', 0)} "
+    f"openai_responses={data.get('openai_responses_seen', 0)} "
+    f"total={data.get('total_requests_seen', 0)}"
+)
+PY
+            rm -f "$status_tmp"
+        fi
     fi
 }
 
@@ -968,6 +1490,20 @@ cmd_doctor() {
         fi
     fi
     if [[ "$ok" == "true" ]]; then
+        log "wrapper prerequisites passed"
+    fi
+
+    local proxy_bin
+    if proxy_bin="$(find_theorem_proxy_bin 2>/dev/null)"; then
+        "$proxy_bin" doctor \
+            --memory-url "$(node_base_url)/mcp" \
+            --proxy-url "$(proxy_base_url)" || ok=false
+    else
+        log "theorem-proxy binary not found"
+        ok=false
+    fi
+
+    if [[ "$ok" == "true" ]]; then
         log "doctor passed"
         return 0
     fi
@@ -993,8 +1529,17 @@ main() {
         serve-model)
             cmd_serve_model "$@"
             ;;
+        up)
+            cmd_up "$@"
+            ;;
         proxy)
             cmd_proxy "$@"
+            ;;
+        connect)
+            cmd_connect "$@"
+            ;;
+        disconnect)
+            cmd_disconnect "$@"
             ;;
         appear)
             cmd_appear "$@"
