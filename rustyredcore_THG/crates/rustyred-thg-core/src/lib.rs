@@ -139,15 +139,15 @@ pub use graph::{
 };
 pub use graph_csr::CsrGraph;
 pub use graph_store::{
-    default_hybrid_edge_type_weights, edge_time_interval, manifest_version_compatible,
-    node_is_expired, node_ttl_expires_at_ms, now_ms, read_manifest, sanitize_tenant_segment,
-    unix_ms, Direction, EdgeRecord, EpistemicType, GraphMutation, GraphMutationBatch,
-    GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError, GraphStoreResult,
-    GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore,
+    default_hybrid_edge_type_weights, default_vector_index_bit_width, edge_time_interval,
+    manifest_version_compatible, node_is_expired, node_ttl_expires_at_ms, now_ms, read_manifest,
+    sanitize_tenant_segment, unix_ms, Direction, EdgeRecord, EpistemicType, GraphMutation,
+    GraphMutationBatch, GraphRebuildReport, GraphSnapshot, GraphStats, GraphStore, GraphStoreError,
+    GraphStoreResult, GraphTransaction, GraphWriteResult, HybridScoringConfig, InMemoryGraphStore,
     MemoryDocumentQuery, NeighborHit, NeighborQuery, NodeQuery, NodeRecord, Provenance,
     RedCoreDurability, RedCoreGraphStore, RedCoreManifest, RedCoreOptions, RedCoreStatus,
-    TimeInterval, VectorDesignation, VectorIndex, VectorPoint, VerifyProblem, VerifyReport,
-    CURRENT_FORMAT_VERSION, TTL_PROPERTY,
+    TimeInterval, VectorDesignation, VectorIndex, VectorIndexManifest, VectorPoint, VerifyProblem,
+    VerifyReport, CURRENT_FORMAT_VERSION, DEFAULT_VECTOR_INDEX_BIT_WIDTH, TTL_PROPERTY,
 };
 #[cfg(feature = "redis-store")]
 pub use graph_store::{RedisGraphKeyspace, RedisGraphStore};
