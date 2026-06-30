@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 pub const INSTRUCTION_KEY_PREFIX: &str = "instruction.";
 pub const USER_PROMPT_IMPROVER_KEY: &str = "instruction.user_prompt_improver";
@@ -574,20 +574,19 @@ fn gepa_delta_id(candidate: &GepaInstructionCandidate) -> String {
 }
 
 fn sanitize_id_part(value: &str) -> String {
-    let cleaned = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    if cleaned.trim_matches('-').is_empty() {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         "unknown".to_string()
     } else {
-        cleaned
+        let mut encoded = String::new();
+        for byte in trimmed.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                encoded.push(byte as char);
+            } else {
+                write!(&mut encoded, "~{byte:02X}").expect("write to string");
+            }
+        }
+        encoded
     }
 }
 
@@ -835,7 +834,7 @@ mod tests {
 
         let delta = ingest_gepa_candidate(&registry, &config, &candidate).unwrap();
 
-        assert_eq!(delta.delta_id, "gepa:run:1:cand:1");
+        assert_eq!(delta.delta_id, "gepa:run~3A1:cand~3A1");
         assert_eq!(delta.values[0].key, USER_PROMPT_IMPROVER_KEY);
         assert_eq!(
             delta.values[0].before,
@@ -843,6 +842,16 @@ mod tests {
         );
         assert_eq!(delta.values[0].after, json!("Rewrite crisply."));
         assert_eq!(delta.inverse().values[0].before, json!("Rewrite crisply."));
+    }
+
+    #[test]
+    fn candidate_delta_id_encodes_delimiters_inside_parts() {
+        let first = prompt_candidate("run:1", "cand:2", "Rewrite crisply.");
+        let second = prompt_candidate("run", "1:cand:2", "Rewrite crisply.");
+
+        assert_eq!(gepa_delta_id(&first), "gepa:run~3A1:cand~3A2");
+        assert_eq!(gepa_delta_id(&second), "gepa:run:1~3Acand~3A2");
+        assert_ne!(gepa_delta_id(&first), gepa_delta_id(&second));
     }
 
     #[test]

@@ -72,13 +72,15 @@ pub fn fitness_gate_from_observations(
 }
 
 pub fn gepa_feedback_point(input: GepaFeedbackInput) -> FeedbackPoint {
-    let (score, axes) = session_composite_point(&input.metric);
+    let (base_score, axes) = session_composite_point(&input.metric);
+    let mut score = base_score;
     let mut feedback = Vec::new();
     let mut signals = Vec::new();
 
     if let Some(fitness) = input.fitness.as_ref() {
         for violation in &fitness.violations {
-            let drop = round6(violation.before - violation.after);
+            let drop = round6((violation.before - violation.after).max(0.0));
+            apply_score_penalty(&mut score, (drop * 0.35).max(0.03));
             feedback.push(format!(
                 "Epistemic fitness trait `{}` dropped from {:.6} to {:.6} (drop {:.6}).",
                 violation.trait_name, violation.before, violation.after, drop
@@ -88,6 +90,11 @@ pub fn gepa_feedback_point(input: GepaFeedbackInput) -> FeedbackPoint {
     }
 
     if input.reservoir.before_unique_source_count > input.reservoir.after_unique_source_count {
+        let source_drop =
+            input.reservoir.before_unique_source_count - input.reservoir.after_unique_source_count;
+        let source_penalty =
+            (source_drop as f64 / input.reservoir.before_unique_source_count as f64) * 0.20;
+        apply_score_penalty(&mut score, source_penalty.max(0.05));
         feedback.push(format!(
             "Reservoir source count dropped from {} unique sources to {}.",
             input.reservoir.before_unique_source_count, input.reservoir.after_unique_source_count
@@ -97,12 +104,14 @@ pub fn gepa_feedback_point(input: GepaFeedbackInput) -> FeedbackPoint {
 
     let mut unsupported_claims = cleaned_sorted(input.reservoir.unsupported_claims);
     for claim in unsupported_claims.drain(..) {
+        apply_score_penalty(&mut score, 0.12);
         feedback.push(format!("Unsupported claim surfaced by reservoir: {claim}."));
         signals.push("reservoir:unsupported_claim".to_string());
     }
 
     let mut contradictions = cleaned_sorted(input.reservoir.contradictions);
     for contradiction in contradictions.drain(..) {
+        apply_score_penalty(&mut score, 0.20);
         feedback.push(format!(
             "Contradiction surfaced by reservoir: {contradiction}."
         ));
@@ -117,6 +126,7 @@ pub fn gepa_feedback_point(input: GepaFeedbackInput) -> FeedbackPoint {
 
     if let Some(shadow) = input.shadow.as_ref() {
         if shadow.verdict == ShadowVerdict::Unsafe {
+            apply_score_penalty(&mut score, 0.30);
             feedback.push(format!(
                 "Shadow evaluation marked delta `{}` unsafe.",
                 shadow.delta_id
@@ -125,6 +135,7 @@ pub fn gepa_feedback_point(input: GepaFeedbackInput) -> FeedbackPoint {
         }
         let mut safety_violations = cleaned_sorted(shadow.safety_violations.clone());
         for violation in safety_violations.drain(..) {
+            apply_score_penalty(&mut score, 0.20);
             feedback.push(format!("Shadow safety violation: {violation}."));
             signals.push("shadow:safety_violation".to_string());
         }
@@ -141,7 +152,7 @@ pub fn gepa_feedback_point(input: GepaFeedbackInput) -> FeedbackPoint {
     if feedback.is_empty() {
         feedback.push(format!(
             "No actionable reservoir-grounded feedback surfaced; productivity score is {:.6}.",
-            score
+            base_score
         ));
         signals.push("feedback:none".to_string());
     }
@@ -191,6 +202,10 @@ fn round6(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
 }
 
+fn apply_score_penalty(score: &mut f64, penalty: f64) {
+    *score = round6((*score - penalty.max(0.0)).clamp(0.0, 1.0));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,8 +223,10 @@ mod tests {
             obs("source:a", 2_000),
         ];
 
+        let metric = metric("session:source-collapse");
+        let (baseline, _) = session_composite_point(&metric);
         let point = gepa_feedback_point(GepaFeedbackInput {
-            metric: metric("session:source-collapse"),
+            metric,
             fitness: Some(fitness_gate_from_observations(&before, &after)),
             shadow: None,
             reservoir: reservoir_feedback_from_observations(&before, &after),
@@ -221,12 +238,15 @@ mod tests {
             .contains("source count dropped from 3 unique sources to 1"));
         assert_eq!(point.signals[0], "fitness:source_independence");
         assert!(point.score > 0.0);
+        assert!(point.score < baseline);
     }
 
     #[test]
     fn unsupported_claims_and_contradictions_are_natural_language_feedback() {
+        let metric = metric("session:unsupported");
+        let (baseline, _) = session_composite_point(&metric);
         let point = gepa_feedback_point(GepaFeedbackInput {
-            metric: metric("session:unsupported"),
+            metric,
             fitness: None,
             shadow: None,
             reservoir: ReservoirFeedback {
@@ -238,6 +258,7 @@ mod tests {
 
         assert!(point.feedback.contains("Unsupported claim surfaced"));
         assert!(point.feedback.contains("Contradiction surfaced"));
+        assert!(point.score < baseline);
     }
 
     fn metric(session_id: &str) -> SessionMetricsState {

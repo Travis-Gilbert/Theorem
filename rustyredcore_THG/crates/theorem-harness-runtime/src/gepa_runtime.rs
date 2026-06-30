@@ -117,9 +117,17 @@ fn input_from_run(run: &RunState, events: &[EventState]) -> Value {
         .iter()
         .find(|event| event.event_type == "RUN.CREATED")
         .and_then(|event| {
+            let scope = event.payload.get("scope").and_then(Value::as_object);
             ["gepa_input", "input", "user_prompt"]
                 .iter()
-                .find_map(|key| event.payload.get(*key).cloned().map(|value| (*key, value)))
+                .find_map(|key| {
+                    event
+                        .payload
+                        .get(*key)
+                        .cloned()
+                        .or_else(|| scope.and_then(|scope| scope.get(*key).cloned()))
+                        .map(|value| (*key, value))
+                })
         })
         .map(|(key, value)| normalize_input_value(key, value))
         .unwrap_or_else(|| json!({ "task": run.task }))
@@ -192,9 +200,13 @@ fn session_metric_from_run(run: &RunState, events: &[EventState]) -> SessionMetr
                 .zip(output_tokens)
                 .map(|(input, output)| input + output)
         })
+        .or(input_tokens)
+        .or(output_tokens)
         .unwrap_or_default();
-    let total_input_tokens = input_tokens.unwrap_or(total_tokens / 2);
-    let total_output_tokens = output_tokens.unwrap_or(total_tokens - total_input_tokens);
+    let total_input_tokens =
+        input_tokens.unwrap_or_else(|| total_tokens.saturating_sub(output_tokens.unwrap_or(0)));
+    let total_output_tokens =
+        output_tokens.unwrap_or_else(|| total_tokens.saturating_sub(total_input_tokens));
 
     SessionMetricsState {
         total_input_tokens,
@@ -318,7 +330,7 @@ fn count_tool_events(events: &[EventState]) -> Option<i64> {
     let count = events
         .iter()
         .filter(|event| {
-            event.event_type.contains("TOOL")
+            (event.event_type.contains("TOOL") && !event.event_type.starts_with("TOOLKIT."))
                 || event.payload.contains_key("tool")
                 || event.payload.contains_key("tool_id")
         })
@@ -418,6 +430,61 @@ mod tests {
         let error = gepa_trainset_for_intent(&store, INTENT_ID).unwrap_err();
 
         assert!(error.to_string().contains("missing captured outcome"));
+    }
+
+    #[test]
+    fn input_fallback_reads_run_created_scope_payload() {
+        let mut run = RunState::new("fallback task", "codex", Map::new());
+        run.run_id = "run-scope-fallback".to_string();
+        let event = serde_json::from_value::<EventState>(json!({
+            "run_id": run.run_id.clone(),
+            "seq": 1,
+            "type": "RUN.CREATED",
+            "payload": {
+                "scope": {
+                    "gepa_input": { "user_prompt": "from created scope" }
+                }
+            }
+        }))
+        .unwrap();
+
+        let input = input_from_run(&run, &[event]);
+
+        assert_eq!(input["user_prompt"], json!("from created scope"));
+    }
+
+    #[test]
+    fn metric_fallback_keeps_tokens_non_negative_and_skips_toolkit_events() {
+        let mut run = RunState::new("improve prompt", "codex", Map::new());
+        run.run_id = "run-metric-fallback".to_string();
+        run.outcome = Some(
+            json!({
+                "accepted": true,
+                "total_input_tokens": 100
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        );
+        let events = vec![
+            event_state(
+                &run.run_id,
+                "TOOLKIT.COMPILED",
+                json!({"selected_tools": ["prompt-improver"]}),
+            ),
+            event_state(
+                &run.run_id,
+                "AGENT.ACTING",
+                json!({"tool": "prompt-improver"}),
+            ),
+        ];
+
+        let metric = session_metric_from_run(&run, &events);
+
+        assert_eq!(metric.total_tokens, 100);
+        assert_eq!(metric.total_input_tokens, 100);
+        assert_eq!(metric.total_output_tokens, 0);
+        assert_eq!(metric.total_tool_calls, 1);
     }
 
     fn persist_prompt_run(store: &mut InMemoryGraphStore, run_id: &str, with_outcome: bool) {
@@ -580,6 +647,16 @@ mod tests {
             idempotency_key: String::new(),
             created_at: TS.to_string(),
         }
+    }
+
+    fn event_state(run_id: &str, event_type: &str, payload: Value) -> EventState {
+        serde_json::from_value(json!({
+            "run_id": run_id,
+            "seq": 1,
+            "type": event_type,
+            "payload": payload
+        }))
+        .unwrap()
     }
 
     fn obs(source_id: &str, observed_at_ms: i64) -> Value {

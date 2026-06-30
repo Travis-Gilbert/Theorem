@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from urllib import request as urlrequest
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -204,7 +205,7 @@ class HarnessHttpEvaluator:
         instruction_key: str,
         timeout_seconds: float = 60.0,
     ) -> None:
-        self.evaluator_url = evaluator_url
+        self.evaluator_url = _require_http_url(evaluator_url, field="evaluator_url")
         self.instruction_key = instruction_key
         self.timeout_seconds = timeout_seconds
 
@@ -246,7 +247,7 @@ def candidate_payload_from_result(
         "candidate_id": str(_get(result, "best_candidate_id", "best")),
         "instruction_key": instruction_key,
         "optimized_instruction": str(candidate[instruction_key]),
-        "parents": list(_get(result, "parents", [])),
+        "parents": _best_candidate_parents(result),
         "val_subscores": _val_subscores(result),
         "lineage": _jsonable(result),
     }
@@ -262,6 +263,7 @@ def load_trainset_jsonl(path: Path) -> list[TrainExample]:
 
 
 def load_trainset_url(url: str, timeout_seconds: float = 60.0) -> list[TrainExample]:
+    url = _require_http_url(url, field="trainset_url")
     with urlrequest.urlopen(url, timeout=timeout_seconds) as response:
         text = response.read().decode("utf-8")
     stripped = text.lstrip()
@@ -286,13 +288,95 @@ def _best_candidate(result: Any) -> dict[str, str] | None:
     return {str(key): str(item) for key, item in dict(value).items()}
 
 
+def _best_candidate_parents(result: Any) -> list[str]:
+    raw = _get(result, "parents", [])
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        selected = raw.get(str(_best_index(result)), raw.get(_best_candidate_id(result), []))
+        return _parent_indexes_to_ids(selected, result)
+    if isinstance(raw, list) and raw and all(isinstance(item, (str, int)) for item in raw):
+        return [str(item) for item in raw]
+    if isinstance(raw, (list, tuple)):
+        best_idx = _best_index(result)
+        selected = raw[best_idx] if 0 <= best_idx < len(raw) else []
+        return _parent_indexes_to_ids(selected, result)
+    return []
+
+
+def _parent_indexes_to_ids(value: Any, result: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        value = [value]
+    candidate_ids = _candidate_ids(result)
+    parents: list[str] = []
+    for item in value:
+        if item is None:
+            continue
+        if isinstance(item, int) and 0 <= item < len(candidate_ids):
+            parents.append(candidate_ids[item])
+        else:
+            parents.append(str(item))
+    return parents
+
+
+def _candidate_ids(result: Any) -> list[str]:
+    raw = _get(result, "candidate_ids", [])
+    if isinstance(raw, (list, tuple)):
+        return [str(item) for item in raw]
+    return []
+
+
+def _best_index(result: Any) -> int:
+    raw = _get(result, "best_idx", _get(result, "best_index", 0))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _best_candidate_id(result: Any) -> str:
+    return str(_get(result, "best_candidate_id", _best_index(result)))
+
+
 def _val_subscores(result: Any) -> dict[str, float]:
+    raw = _get(result, "val_subscores", None)
+    if raw is not None:
+        selected = _select_candidate_indexed_value(raw, result)
+        if isinstance(selected, dict):
+            return {str(key): float(value) for key, value in selected.items()}
+        if isinstance(selected, list):
+            return {f"instance:{index}": float(value) for index, value in enumerate(selected)}
     raw = _get(result, "val_aggregate_scores", {})
     if isinstance(raw, dict):
         return {str(key): float(value) for key, value in raw.items()}
     if isinstance(raw, list):
-        return {f"instance:{index}": float(value) for index, value in enumerate(raw)}
+        best_idx = _best_index(result)
+        if 0 <= best_idx < len(raw):
+            return {"aggregate": float(raw[best_idx])}
     return {}
+
+
+def _select_candidate_indexed_value(raw: Any, result: Any) -> Any:
+    if isinstance(raw, dict):
+        candidate_id = _best_candidate_id(result)
+        if candidate_id in raw:
+            return raw[candidate_id]
+        index_key = str(_best_index(result))
+        return raw.get(index_key, raw)
+    if isinstance(raw, (list, tuple)):
+        best_idx = _best_index(result)
+        if 0 <= best_idx < len(raw):
+            return raw[best_idx]
+    return raw
+
+
+def _require_http_url(url: str, *, field: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field} must be an http(s) URL")
+    return url
 
 
 def _get(value: Any, attr: str, fallback: Any) -> Any:

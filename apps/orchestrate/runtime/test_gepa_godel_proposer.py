@@ -26,6 +26,19 @@ class FakeResult:
     val_aggregate_scores = {"instance:1": 0.8}
 
 
+class FakeGepaResult:
+    best_candidate = {"instruction.user_prompt_improver": "Rewrite with crisp constraints."}
+    best_candidate_id = "cand:best"
+    best_idx = 1
+    candidate_ids = ["cand:seed", "cand:best", "cand:sibling"]
+    parents = [[None], [0, 2], [1]]
+    val_subscores = [
+        {"case:0": 0.2},
+        {"case:0": 0.8, "case:1": 0.9},
+        {"case:0": 0.3},
+    ]
+
+
 class GepaGodelProposerTests(unittest.TestCase):
     def test_adapter_returns_scores_and_reflection_records(self):
         example = _example(score=0.7, feedback="source_independence dropped")
@@ -71,6 +84,23 @@ class GepaGodelProposerTests(unittest.TestCase):
         self.assertEqual(payload["instruction_key"], "instruction.user_prompt_improver")
         self.assertEqual(payload["parents"], ["cand:2"])
         self.assertEqual(payload["val_subscores"], {"instance:1": 0.8})
+
+    def test_candidate_payload_uses_selected_gepa_lineage_and_subscores(self):
+        payload = candidate_payload_from_result(
+            FakeGepaResult(),
+            instruction_key="instruction.user_prompt_improver",
+            gepa_run_id="run:42",
+        )
+
+        self.assertEqual(payload["candidate_id"], "cand:best")
+        self.assertEqual(payload["parents"], ["cand:seed", "cand:sibling"])
+        self.assertEqual(payload["val_subscores"], {"case:0": 0.8, "case:1": 0.9})
+
+    def test_http_urls_reject_non_http_schemes(self):
+        with self.assertRaisesRegex(ValueError, "trainset_url must be an http"):
+            load_trainset_url("file:///tmp/trainset.jsonl")
+        with self.assertRaisesRegex(ValueError, "evaluator_url must be an http"):
+            HarnessHttpEvaluator("file:///tmp/evaluator", "instruction.user_prompt_improver")
 
     def test_dry_run_cli_round_trips_candidate_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
