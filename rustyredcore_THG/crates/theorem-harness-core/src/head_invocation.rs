@@ -38,6 +38,18 @@ The document is conflict-free: structure lives on the graph CRDT and free text l
 
 The harness decides how many heads engage, how much each may spend, which result is selected, and whether a result may be published. Do not orchestrate the other heads or choose what ships. Spend your attention on the problem. Be rigorous and concise. Lead with substance. Ground what you claim."#;
 
+pub const PROPOSAL_ROLE_INSTRUCTION: &str =
+    "attempt the whole task now and write a complete first answer into the shared document.";
+
+pub const CRITIQUE_ROLE_INSTRUCTION: &str =
+    "attempt the whole task through criticism; name concrete gaps, errors, and unsupported claims.";
+
+pub const SYNTHESIS_ROLE_INSTRUCTION: &str =
+    "attempt the whole task by producing the best converged answer from the shared document.";
+
+pub const VERIFICATION_ROLE_INSTRUCTION: &str =
+    "try to falsify the converged answer before publication.";
+
 pub const FAST_FIRST_HEAD_PROMPT_ADDENDUM: &str = r#"You are Theorem's fastest mind, and you answer first. Produce a complete, useful first response immediately. Your answer is not the final word: you are a sensor for the governor and a warm start for heavier heads. If the task looks hard or you are unsure, say so plainly in the shared document."#;
 
 pub const VERIFIER_HEAD_PROMPT_ADDENDUM: &str = r#"Your task is to try to break Theorem's answer, not to agree with it. Where the task has an executable check, run it and report what passes and fails as fact. Where there is no clean check, find the specific unsupported claim, missed case, contradiction, or failure mode. A real defect you find is the most valuable contribution."#;
@@ -260,7 +272,10 @@ impl HeadInvocationRequest {
             envelope
                 .as_object_mut()
                 .expect("invocation envelope is a JSON object")
-                .insert("constitution".to_string(), Value::String(constitution.clone()));
+                .insert(
+                    "constitution".to_string(),
+                    Value::String(constitution.clone()),
+                );
         }
         format!("headinvoke:{}", stable_value_hash(&envelope))
     }
@@ -270,18 +285,10 @@ pub fn default_head_system_prompt(head: &ResolvedAgentHead, kind: HeadInvocation
     let mut prompt = String::from(THEOREM_HEAD_SYSTEM_PROMPT_CORE);
     prompt.push_str("\n\nCurrent invocation role: ");
     prompt.push_str(match kind {
-        HeadInvocationKind::Proposal => {
-            "attempt the whole task now and write a complete first answer into the shared document."
-        }
-        HeadInvocationKind::Critique => {
-            "attempt the whole task through criticism; name concrete gaps, errors, and unsupported claims."
-        }
-        HeadInvocationKind::Synthesis => {
-            "attempt the whole task by producing the best converged answer from the shared document."
-        }
-        HeadInvocationKind::Verification => {
-            "try to falsify the converged answer before publication."
-        }
+        HeadInvocationKind::Proposal => PROPOSAL_ROLE_INSTRUCTION,
+        HeadInvocationKind::Critique => CRITIQUE_ROLE_INSTRUCTION,
+        HeadInvocationKind::Synthesis => SYNTHESIS_ROLE_INSTRUCTION,
+        HeadInvocationKind::Verification => VERIFICATION_ROLE_INSTRUCTION,
     });
     if is_fast_first_head(head) && kind == HeadInvocationKind::Proposal {
         prompt.push_str("\n\n");
