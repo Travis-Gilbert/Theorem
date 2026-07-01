@@ -92,8 +92,38 @@ jobs:
           ref: ${{ github.event.client_payload.branch || github.event.repository.default_branch }}
           fetch-depth: 0
 
+      - name: Create Theorem MCP config
+        run: |
+          cat > /tmp/theorem-mcp.json <<'JSON'
+          {
+            "mcpServers": {
+              "theorems_harness": {
+                "type": "http",
+                "url": "https://rustyredcore-theorem-production.up.railway.app/mcp",
+                "headers": {
+                  "Content-Type": "application/json"
+                }
+              }
+            }
+          }
+          JSON
+
       - name: Run Claude Code on the handoff intent
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: ${{ github.event.client_payload.intent }}
+          prompt: |
+            ${{ github.event.client_payload.intent }}
+
+            Harness callback context:
+            - tenant_slug: ${{ github.event.client_payload.tenant_slug || 'Travis-Gilbert' }}
+            - room_id: ${{ github.event.client_payload.room_id || 'repo:theorem:branch:main' }}
+            - actor: ${{ github.event.client_payload.actor || '@theorem' }}
+            - dispatch_id: ${{ github.event.client_payload.dispatch_id }}
+            - wake_message_id: ${{ github.event.client_payload.wake_message_id }}
+
+            Before ending, use the `theorems_harness` MCP tools to read the room and write a concise receipt back into that same room. Prefer `read_messages_for_room` first, then `coordination_contribution` or `coordination_record` with the tenant_slug, room_id, actor, and a short summary/body.
+          claude_args: |
+            --mcp-config /tmp/theorem-mcp.json
+            --max-turns 12
+            --allowedTools Edit,Read,Write,Bash,mcp__theorems_harness__*
