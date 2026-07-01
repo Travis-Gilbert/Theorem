@@ -178,7 +178,7 @@ pub use prompt_runtime::{
     PromptInstructionRegistry, PromptInstructionSpec, PromptRuntimeError,
     ResolvedPromptInstruction, RuntimeRefinementConfig, RuntimeRefinementDecision,
     RuntimeRefinementResult, TaskVariantSelection, DEFAULT_INVOCATION_SHAPE,
-    EXEMPLAR_EVIDENCE_KIND, INSTRUCTION_KEY_PREFIX,
+    EXEMPLAR_EVIDENCE_KIND,
 };
 pub use provider_head_adapter::ProviderHeadExecutionContext;
 pub use replay::{compare_runs, fork_events, fork_run, replay_events, replay_run, ReplayError};

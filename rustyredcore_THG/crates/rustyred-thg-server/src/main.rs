@@ -16,6 +16,7 @@ mod openapi;
 mod query_surface;
 mod router;
 mod state;
+mod tenant_router;
 mod ttl_sweep;
 
 use std::net::SocketAddr;
