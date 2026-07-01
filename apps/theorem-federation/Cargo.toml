@@ -1,0 +1,37 @@
+[package]
+name = "theorem-federation"
+version = "0.1.0"
+edition = "2021"
+description = "Opt-in direct peer federation lane for Theorem nodes over Iroh."
+license = "MIT"
+rust-version = "1.91"
+
+[[bin]]
+name = "theorem-federation"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+axum = "0.8"
+blake3 = "1.8"
+clap = { version = "4", features = ["derive", "env"] }
+getrandom = "0.3"
+hex = "0.4"
+iroh = "1.0.1"
+iroh-blobs = "0.103.0"
+iroh-gossip = "0.101.0"
+rustyred-thg-core = { path = "../../rustyredcore_THG/crates/rustyred-thg-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+theorem-copresence = { path = "../../rustyredcore_THG/crates/theorem-copresence" }
+thiserror = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tempfile = "3.10"
+
+[workspace]
